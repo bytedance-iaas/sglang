@@ -9,6 +9,8 @@ from sglang.srt.connector.base_connector import (
     BaseKVConnector,
 )
 from sglang.srt.connector.eic import EICConnector
+from sglang.srt.connector.hpkv import HPKVConnector
+from sglang.srt.connector.pris import PrisConnector
 from sglang.srt.connector.redis import RedisConnector
 from sglang.srt.connector.remote_instance import RemoteInstanceConnector
 from sglang.srt.connector.s3 import S3Connector
@@ -33,6 +35,10 @@ def create_remote_connector(url, device, **kwargs) -> BaseConnector:
         return RemoteInstanceConnector(url, device)
     elif connector_type == "eic":
         return EICConnector.instance(url)
+    elif connector_type == "hpkv":
+        return HPKVConnector(url, **kwargs)
+    elif connector_type == "pris":
+        return PrisConnector(url)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
