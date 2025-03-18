@@ -1365,7 +1365,9 @@ class RemoteModelLoader(BaseModelLoader):
                         quant_method.process_weights_after_loading(module)
 
             with create_remote_connector(
-                model_weights, device=device_config.device
+                model_weights,
+                device=device_config.device,
+                rank=get_tensor_model_parallel_rank(),
             ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
