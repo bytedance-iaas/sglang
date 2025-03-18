@@ -1510,7 +1510,9 @@ class RemoteModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config)
 
             with create_remote_connector(
-                model_weights, device=device_config.device
+                model_weights,
+                device=device_config.device,
+                rank=get_tensor_model_parallel_rank(),
             ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
