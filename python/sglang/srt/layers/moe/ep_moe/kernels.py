@@ -667,12 +667,13 @@ def grouped_gemm_triton(
     # Reduce block size to prevent L40 shared memory overflow.
     config = {
         "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         # "GROUP_SIZE_M": 64,
         "num_warps": 4,
         "num_stages": 3,
     }
+
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
     compute_m_num_tiles_indptr[(1,)](
         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
@@ -709,3 +710,232 @@ def grouped_gemm_triton(
         **config,
     )
     return c
+
+
+# @triton.jit
+# def fill_masked_m_triton_kernel(topk_ids, masked_m, num_experts, N, BLOCK_SIZE: tl.constexpr):
+#     expert_id = tl.program_id(0)
+#     masked_m_tensor = 0
+    
+#     for start_off in tl.range(0, N, BLOCK_SIZE):
+#         topk_ids_off = tl.arange(0, BLOCK_SIZE) + start_off
+#         topk_ids_mask = topk_ids_off < N
+#         topk_ids_tensor = tl.load(topk_ids + topk_ids_off, topk_ids_mask, other=num_experts)
+#         masked_m_tensor += tl.sum(tl.where(topk_ids_tensor == expert_id, 1, 0))
+#     tl.store(masked_m + expert_id, masked_m_tensor)
+
+
+# @triton.jit
+# def deepgemm_compute_src2dst_triton_kernel(topk_ids, src2dst, max_m, num_experts, N, BLOCK_SIZE: tl.constexpr):
+#     expert_id = tl.program_id(0)
+#     expert_len = 0
+#     start_dst = max_m * expert_id
+    
+#     for i in tl.range(0, N, BLOCK_SIZE):
+#         off = tl.arange(0, BLOCK_SIZE) + i
+#         mask = off < N
+#         topk_ids_tensor = tl.load(topk_ids + off, mask, other=num_experts)
+#         src2dst_tensor  = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+#         src2dst_mask    = topk_ids_tensor == expert_id
+#         for j in tl.range(0, BLOCK_SIZE):
+#             if topk_ids_tensor[j] == expert_id:
+#                 src2dst_mask[j] = 1
+#                 src2dst_tensor[j] = start_dst + expert_len
+
+#         tl.store(src2dst + off, src2dst_tensor, src2dst_mask)
+
+
+@triton.jit
+def compute_masked_m_triton_kernel(seg_indptr, masked_m, num_experts, N):
+    expert_id = tl.program_id(0)  
+    start = tl.load(seg_indptr + expert_id)
+    end = tl.load(seg_indptr + expert_id + 1)
+    tl.store(masked_m + expert_id, (end - start))
+
+
+@triton.jit
+def deepgemm_compute_src2dst_triton_kernel(
+    topk_ids, reorder_ids, seg_indptr, src2dst, max_m, num_toks, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = dst_id < num_toks
+    src_id = tl.load(reorder_ids + dst_id, mask=mask)
+    expert_id = tl.load(topk_ids + src_id, mask=(src_id < num_toks))
+    expert_dst_start = tl.load(seg_indptr + expert_id)
+    expert_dst_offset = dst_id - expert_dst_start
+    dst_id = expert_id * max_m + expert_dst_offset
+    tl.store(src2dst + src_id, dst_id, mask=mask)   
+  
+
+@triton.jit
+def fill_gateup_input_triton_kernel(
+    input_ptr,
+    scale_ptr,
+    gateup_input_ptr,
+    gateup_input_scale_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    start_expert_id,
+    end_expert_id,
+    topk,
+    m_max,
+    hidden_size,
+    scale_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    src_ptr = input_ptr + src_idx * hidden_size
+    scale_src_ptr = scale_ptr + src_idx * scale_size
+    
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx - start_expert_id * m_max
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                mask = offset < hidden_size
+                in_data = tl.load(src_ptr + offset, mask=mask)
+                tl.store(dst_ptr + offset, in_data, mask=mask)
+            scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
+            for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                mask = offset < scale_size
+                in_scale = tl.load(scale_src_ptr + offset, mask=mask)
+                tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
+            
+
+def exp2_upper(num: int) -> int:
+    for i in range(2, 31):
+        value = pow(2, i)
+        if num <= value:
+            return value
+    return num
+
+
+def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor, 
+                              num_experts: int, 
+                              hidden_states: torch.Tensor, 
+                              top_k: int,  
+                              start_expert_id, 
+                              end_expert_id, 
+                              block_shape,
+                              output_dtype: torch.dtype = torch.float8_e4m3fn,):
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+    masked_m = torch.zeros(num_experts, device=topk_ids.device, dtype=torch.int32)
+
+    compute_seg_indptr_triton_kernel[(num_experts,)](
+        reorder_topk_ids, seg_indptr, topk_ids.numel()
+    )
+    
+    grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
+    compute_masked_m_triton_kernel[(num_experts, )](
+        seg_indptr, masked_m, num_experts, reorder_topk_ids.numel())
+    
+    # m_max = exp2_upper(torch.max(masked_m).item())
+    m_max = exp2_upper(hidden_states.size(0))
+    expected_m = (topk_ids.numel() + num_experts - 1) // num_experts
+    gateup_input = torch.empty(
+        (int(end_expert_id - start_expert_id + 1), m_max, hidden_states.size(1)),
+        device=hidden_states.device,
+        dtype=output_dtype,
+    )
+
+    deepgemm_compute_src2dst_triton_kernel[grid](
+        topk_ids, reorder_ids, seg_indptr, src2dst, m_max, topk_ids.numel(), BLOCK_SIZE=256)
+    
+    if block_shape is not None:
+        assert len(block_shape) == 2
+        block_n, block_k = block_shape[0], block_shape[1]
+        if _is_cuda:
+            hidden_states, scale = sglang_per_token_group_quant_fp8(hidden_states, block_k)
+        else:
+            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    
+        gateup_input_scale = torch.empty((gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+                                        device=hidden_states.device,
+                                        dtype=scale.dtype)
+
+    fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](hidden_states, scale,
+                                    gateup_input,
+                                    gateup_input_scale,
+                                    src2dst,
+                                    topk_ids, 
+                                    start_expert_id, 
+                                    end_expert_id, 
+                                    top_k,
+                                    m_max,
+                                    hidden_states.size(1),
+                                    scale.size(1),
+                                    BLOCK_SIZE=1024)
+    
+    # if hidden_states.get_device() == 0:
+    #         print("begin")
+    #         print("src2dst: ", src2dst)
+    #         print("seg_indptr: ", seg_indptr)
+    #         print("m_max:", m_max)
+    #         print("topk_ids: ", topk_ids)
+    #         print("hidden_state: ", hidden_states)
+    # if hidden_states.get_device() == 7:
+    #         print("masked_m:", masked_m[start_expert_id : (end_expert_id+1)])
+    #         print("gateup_input: ", gateup_input[31])
+    #         print("gateup_input_scale: ", gateup_input_scale[31])
+    #         print("topk: ", top_k)
+
+    return m_max, masked_m[start_expert_id : (end_expert_id+1)], expected_m, src2dst, gateup_input, gateup_input_scale
+
+
+@triton.jit
+def deepgemm_post_reorder_triton_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    start_expert_id,
+    end_expert_id,
+    topk,
+    hidden_size,
+    max_m,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    computed = False
+    store_ptr = output_ptr + src_idx * hidden_size
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+
+        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+        for idx in range(topk):
+            expert_id = tl.load(topk_ids_ptr + idx)
+            if expert_id >= start_expert_id and expert_id <= end_expert_id:
+                computed = True
+                dst_idx = tl.load(src2dst_ptr + idx)
+                dst_idx = dst_idx - start_expert_id * max_m
+                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                load_ptr = down_output_ptr + dst_idx * hidden_size
+                in_data = tl.load(load_ptr + offset, mask=mask)
+                sum_vec += in_data * weigh_scale
+        tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+    if computed == False:
+        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            mask = offset < hidden_size
+            tl.store(
+                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
+            )
