@@ -19,6 +19,15 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from sglang.srt.utils import get_bool_env_var
+
+_SGL_ENABLE_SPARSE_PREFILL = False
+if get_bool_env_var("SGL_ENABLE_SPARSE_PREFILL", "false"):
+    _SGL_ENABLE_SPARSE_PREFILL = True
+    from sglang.srt.layers.attention.blocksparse_attn_backend import (
+        LocalStridedBlockSparseAttn,
+    )
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -333,6 +342,18 @@ class FlashAttentionBackend(AttentionBackend):
             if hasattr(model_runner, "attention_chunk_size")
             else None
         )
+        # import pdb; pdb.set_trace()
+        if _SGL_ENABLE_SPARSE_PREFILL:
+            self.bs_attn_op = LocalStridedBlockSparseAttn(
+                model_runner.model.config.num_attention_heads,
+                model_runner.max_total_num_tokens,
+                local_blocks=16,
+                vert_stride=8,
+                block_size=64,
+                device=model_runner.device,
+                dtype=torch.bfloat16,
+                homo_head=True,
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -650,6 +671,15 @@ class FlashAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
+        if _SGL_ENABLE_SPARSE_PREFILL:
+            output = self.bs_attn_op(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k,
+                v,
+                metadata.cu_seqlens_q,
+                sm_scale=layer.scaling,
+            ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return output
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
