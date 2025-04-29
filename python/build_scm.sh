@@ -1,5 +1,5 @@
 #!/bin/bash
-set -ex
+set -e
 
 ROOT_DIR=$(pwd)
 PYTHON=python3
@@ -37,6 +37,6 @@ else
     for wheel_file in $(find $OUTPUT_DIR -name "*.whl"); do
         echo "Uploading to tos"
         # 上传制品到 tos
-        ./tosutil cp $wheel_file tos://iaas-pypi/packages/sglang/$(basename $wheel_file) -re cn-beijing -e tos-cn-beijing.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+        ./tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sglang/$(basename $wheel_file) -re cn-beijing -e tos-cn-beijing.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
     done
 fi
