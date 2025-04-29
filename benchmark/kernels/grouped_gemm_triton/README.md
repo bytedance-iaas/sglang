@@ -95,4 +95,4 @@ The tuning process works as follows:
 3. Find the configuration with the best performance
 4. Save the configuration to a JSON file
 
-The benchmarking process uses CUDA graphs to measure the performance of the kernel with minimal overhead. 
+The benchmarking process uses CUDA graphs to measure the performance of the kernel with minimal overhead.
