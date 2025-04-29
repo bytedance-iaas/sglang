@@ -3,12 +3,11 @@ import argparse
 import json
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, TypedDict, Optional
+from typing import Dict, List, Tuple, TypedDict, Optional
 import logging
 import os
 
 import torch
-import triton
 import ray
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
