@@ -116,7 +116,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
-
+    scheduler_workload_report_interval: float = 1.0
     # Expert parallelism
     ep_size: int = 1
 
@@ -225,6 +225,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
     pdlb_url: Optional[str] = None
+    disaggregation_with_mla: bool = True
 
     def __post_init__(self):
         # Expert parallelism
@@ -943,6 +944,13 @@ class ServerArgs:
             ],
         )
 
+        parser.add_argument(
+            "--scheduler-workload-report-interval",
+            type=float,
+            default=ServerArgs.scheduler_workload_report_interval,
+            help="The interval (in seconds) to report the workload status to the scheduler. Default to 1.0 second.",
+        )
+
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",
@@ -1485,6 +1493,12 @@ class ServerArgs:
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
+        parser.add_argument(
+            "--disaggregation-with-mla",
+            type=bool,
+            default=ServerArgs.disaggregation_with_mla,
+            help="Enable disaggregation with MLA. Default is True.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1565,7 +1579,8 @@ class PortArgs:
     scheduler_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
-
+    # The ipc filename for scheduler to receive workload status from worker (zmq)
+    worker_workload_status_ipc_name: str
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
@@ -1589,6 +1604,7 @@ class PortArgs:
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                worker_workload_status_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
@@ -1619,6 +1635,8 @@ class PortArgs:
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                # we have to use a fixed port to support multi-nodes inference
+                worker_workload_status_ipc_name=f"tcp://{dist_init_host}:{port_base + 100}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )
