@@ -1356,7 +1356,7 @@ class RemoteModelLoader(BaseModelLoader):
         # 1. Initial weight loading.
         # 2. Post-processing of weights, including assigning specific member variables.
         if hasattr(model, "post_load_weights"):
-            model.post_load_weights()
+            model.post_load_weights(is_nextn=hasattr(model, "is_nextn"))
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
