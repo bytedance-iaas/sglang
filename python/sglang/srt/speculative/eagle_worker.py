@@ -8,10 +8,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_dp_size, get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
@@ -43,6 +40,13 @@ if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
+
+
+def rank0_print(*args):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        print(args)
 
 
 @contextmanager
@@ -218,7 +222,6 @@ class EAGLEWorker(TpModelWorker):
         if self.server_args.disable_cuda_graph:
             return
 
-
         # Capture draft
         tic = time.time()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -280,8 +283,8 @@ class EAGLEWorker(TpModelWorker):
         else:
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.spec_num_draft_tokens = 1
-            logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
-                model_worker_batch
+            logits_output, next_token_ids, _ = (
+                self.target_worker.forward_batch_generation(model_worker_batch)
             )
             return logits_output, next_token_ids, model_worker_batch.bid, 0, False
 
@@ -331,10 +334,8 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_num_draft_tokens = 1
-        logits_output, next_token_ids, _ = (
-            self.target_worker.forward_batch_generation(
+        logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
-            )
         )
         return logits_output, next_token_ids, model_worker_batch.bid
 
@@ -437,9 +438,13 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
         if can_cuda_graph:
-            score_list, token_list, parents_list = self.cuda_graph_runner.replay(
-                forward_batch
+            score_list, token_list, parents_list, next_token_logits_list = (
+                self.cuda_graph_runner.replay(forward_batch)
             )
+            rank0_print("next_token_logits_list", next_token_logits_list)
+            rank0_print("token_list", token_list)
+            rank0_print("parents_list", parents_list)
+
         else:
             if not batch.forward_mode.is_idle():
                 # Initialize attention backend
@@ -448,7 +453,9 @@ class EAGLEWorker(TpModelWorker):
                 model_worker_batch, self.draft_model_runner
             )
             # Run forward steps
-            score_list, token_list, parents_list = self.draft_forward(forward_batch)
+            score_list, token_list, parents_list, next_token_logits_list = (
+                self.draft_forward(forward_batch)
+            )
 
         if not batch.forward_mode.is_idle():
             self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
@@ -485,6 +492,7 @@ class EAGLEWorker(TpModelWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        next_token_logits_list: List[torch.Tensor] = []
 
         # Forward multiple steps
         scores = None
@@ -511,18 +519,20 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
                 spec_info.hidden_states = hidden_states
 
+            # rank0_print(f"step%d: "%i, forward_batch.input_ids, forward_batch.positions)
             # Run forward
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            next_token_logits_list.append(input_ids)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        return score_list, token_list, parents_list
+        return score_list, token_list, parents_list, next_token_logits_list
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
 
@@ -533,7 +543,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
-        logits_output,_ ,can_run_cuda_graph = (
+        logits_output, _, can_run_cuda_graph = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, skip_sample=True
             )

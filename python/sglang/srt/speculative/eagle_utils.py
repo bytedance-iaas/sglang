@@ -751,7 +751,7 @@ def align_evict_mask_to_page_size(
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
 
 
-@torch.compile(dynamic=True)
+# @torch.compile(dynamic=True)
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
