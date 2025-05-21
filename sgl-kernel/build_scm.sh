@@ -70,13 +70,8 @@ sed -i "s|pytorch/manylinux|iaas-gpu-cn-beijing.cr.volces.com/pytorch/manylinux|
 sed -i 's|ARCH=$(uname -i)|ARCH=x86_64|g' build.sh  # DinD 可能不支持 ARCH=$(uname -i)
 
 # 如果是 SCM 构建，则准备 docker 环境
-if [ $SCM_BUILD == "True" ]; then
-    dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock &
-    while ! docker info > /dev/null 2>&1; do
-        sleep 1
-        echo "Waiting for dockerd to start..."
-    done
-    export DOCKER_HOST="tcp://localhost:2375"
+if [[ "${SCM_BUILD}" == "True" ]]; then
+    source /root/start_dockerd.sh
 fi
 
 source build.sh $PYTHON_VERSION $CUDA_VERSION
