@@ -105,9 +105,27 @@ class HPKVConnector(BaseKVConnector):
             rank = int(kwargs.get("rank", 0))
             local_ip = host_nic_list[rank % len(host_nic_list)]
 
-        self.connection = hpkv.HPKVTensorClient(
-            parsed_url.hostname, parsed_url.port, local_ip, 0
-        )
+        hosts_and_ports = parsed_url.netloc.split(";")
+        if not len(hosts_and_ports):
+            raise ValueError("No hosts and ports provided")
+
+        connection = None
+        for host_and_port in hosts_and_ports:
+            host, port = host_and_port.split(":")
+            try:
+                connection = hpkv.HPKVTensorClient(host, int(port), local_ip, 0)
+            except Exception as e:
+                logger.error(
+                    f"Failed to connect to HPKV server {host}:{port}, error: {e}"
+                )
+                continue
+            else:
+                break
+
+        if connection is None:
+            raise ValueError(f"Failed to connect to all HPKV server: {hosts_and_ports}")
+
+        self.connection = connection
         self.model_name = parsed_url.path.lstrip("/")
 
     def get(self, key: str) -> Optional[torch.Tensor]:

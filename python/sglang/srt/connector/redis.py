@@ -21,6 +21,7 @@ class RedisConnector(BaseKVConnector):
         super().__init__(url)
         parsed_url = urlparse(url)
         self.connection = redis.Redis(host=parsed_url.hostname, port=parsed_url.port)
+        self.connection.ping()
         self.model_name = parsed_url.path.lstrip("/")
         # TODO: more serde options
         self.s, self.d = create_serde("safe")

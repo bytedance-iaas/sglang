@@ -22,7 +22,11 @@ import random
 import tempfile
 from typing import List, Literal, Optional
 
-from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
+from sglang.srt.hf_transformers_utils import (
+    check_gguf_file,
+    create_remote_connector,
+    get_config,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -209,8 +213,6 @@ class ServerArgs:
             )
 
         # Set missing default values
-        if self.tokenizer_path is None:
-            self.tokenizer_path = self.model_path
 
         if self.device is None:
             self.device = get_device()
@@ -391,7 +393,25 @@ class ServerArgs:
             self.quantization = self.load_format = "gguf"
 
         if is_remote_url(self.model_path):
-            self.load_format = "remote"
+            try:
+                create_remote_connector(self.model_path)
+            except Exception as e:
+                from urllib.parse import parse_qs, urlparse
+
+                parsed_url = urlparse(self.model_path)
+                query_params = parse_qs(parsed_url.query)
+                if "backup" in query_params:
+                    self.model_path = query_params["backup"][0]
+                    logger.info(f"Using backup model path: {self.model_path}")
+                else:
+                    raise ValueError(
+                        f"Failed to pull model configs from remote. " f"Error: {e}."
+                    )
+            else:
+                self.load_format = "remote"
+
+        if self.tokenizer_path is None:
+            self.tokenizer_path = self.model_path
 
         # AMD-specific Triton attention KV splits default number
         if is_hip():
