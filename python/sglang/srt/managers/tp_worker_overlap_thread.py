@@ -60,10 +60,11 @@ class TpModelWorkerClient:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        skip_sample: bool = False,
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, expert_location_metadata, gpu_id, tp_rank, dp_rank, nccl_port
+            server_args, expert_location_metadata, gpu_id, tp_rank, dp_rank, nccl_port, skip_sample=skip_sample
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -145,29 +146,40 @@ class TpModelWorkerClient:
 
             # Run forward
             logits_output, next_token_ids = self.worker.forward_batch_generation(
-                model_worker_batch, self.launch_done
+                model_worker_batch, self.launch_done, skip_sample=self.worker.skip_sample
             )
 
             # Update the future token ids map
-            bs = len(model_worker_batch.seq_lens)
-            self.future_token_ids_map[
-                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = next_token_ids
+            if next_token_ids is not None:
+                bs = len(model_worker_batch.seq_lens)
+                self.future_token_ids_map[
+                    future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
+                ] = next_token_ids
 
-            # Copy results to the CPU
-            if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
-                )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                # Copy results to the CPU
+                if model_worker_batch.return_logprob:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.to("cpu", non_blocking=True)
                     )
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states.to(
-                    "cpu", non_blocking=True
-                )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+                    if logits_output.input_token_logprobs is not None:
+                        logits_output.input_token_logprobs = (
+                            logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                        )
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states.to(
+                        "cpu", non_blocking=True
+                    )
+
+                # import time
+                # start = time.perf_counter()
+                next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+                # end = time.perf_counter()
+                # print(f"Transfer to CPU took {(end - start):.3f} s")
+                
+            else: 
+                # give a fake result as it is to be discarded
+                next_token_ids = torch.zeros(1, device = "cpu", dtype = torch.int64)
+
             copy_done.record()
 
             self.output_queue.put((copy_done, logits_output, next_token_ids))
@@ -187,6 +199,13 @@ class TpModelWorkerClient:
                 )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids
+    
+    def forward_batch_sampling(
+        self,
+        batch,
+    ) -> None:
+        
+        return self.worker.forward_batch_sampling(batch)
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.

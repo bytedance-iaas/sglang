@@ -75,15 +75,20 @@ class PrefillBootstrapQueue:
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
         self.scheduler = scheduler
+        self.skip_sample_on_prefill = scheduler.skip_sample_on_prefill
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
-
+    
     def store_prefill_results(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
         output_id_buffer = self.metadata_buffers[0]
         output_id_buffer[idx] = token_id
+
+    def store_prefill_logits_output(self, idx: int, logits: torch.Tensor):
+        assert logits.shape == self.metadata_buffers[0][idx].shape
+        self.metadata_buffers[0][idx].copy_(logits)
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
@@ -114,6 +119,7 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             # self.scheduler.disagg_launch_done,
+            self.skip_sample_on_prefill,
         )
         return kv_manager
 
@@ -153,6 +159,7 @@ class PrefillBootstrapQueue:
 
             # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
+
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
 
@@ -161,6 +168,7 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -300,27 +308,42 @@ class SchedulerDisaggregationPrefillMixin:
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
         else:
             next_token_ids = result.next_token_ids.tolist()
 
         if self.disagg_launch_done is not None:
             self.disagg_launch_done.clear()
 
-        for req, next_token_id in zip(batch.reqs, next_token_ids, strict=True):
-            req: Req
-            if req.is_chunked <= 0:
-                # There is no output_ids for prefill
-                req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
-                self.send_kv_chunk(req, token_id=next_token_id)
-                self.disagg_prefill_inflight_queue.append(req)
-            else:
-                # being chunked reqs' prefill is not finished
-                req.is_chunked -= 1
+        if not self.skip_sample_on_prefill:
+            for req, next_token_id in zip(batch.reqs, next_token_ids, strict=True):
+                req: Req
+                if req.is_chunked <= 0:
+                    # There is no output_ids for prefill
+                    req.output_ids.append(next_token_id)
+                    self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                    self.send_kv_chunk(req, token_id=next_token_id)
+                    self.disagg_prefill_inflight_queue.append(req)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
 
-                if self.enable_overlap:
-                    self.send_kv_chunk(req, end_idx=req.tmp_end_idx)
+                    if self.enable_overlap:
+                        self.send_kv_chunk(req, end_idx=req.tmp_end_idx)
+        else:
+            assert logits_output is not None
+            for index, req in enumerate(batch.reqs):
+                req: Req
+                if req.is_chunked <= 0:
+                    self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                    self.send_kv_chunk(req, logits_output = logits_output.next_token_logits[index])
+                    self.disagg_prefill_inflight_queue.append(req)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+
+                    if self.enable_overlap:
+                        self.send_kv_chunk(req, end_idx=req.tmp_end_idx)
 
     def process_disagg_prefill_inflight_queue(self: Scheduler) -> None:
         """
@@ -382,6 +405,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         token_id: Optional[int] = None,
         end_idx: Optional[int] = None,
+        logits_output: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -395,7 +419,7 @@ class SchedulerDisaggregationPrefillMixin:
             if end_idx is not None
             else min(len(req.fill_ids), len(req.origin_input_ids))
         )
-        last_chunk = token_id is not None
+        last_chunk = token_id is not None or logits_output is not None
 
         if (not last_chunk) and (
             end_idx % page_size != 0
@@ -411,10 +435,16 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
+
         if last_chunk is True:
-            self.disagg_prefill_bootstrap_queue.store_prefill_results(
-                req.metadata_buffer_index, token_id
-            )
+            if self.skip_sample_on_prefill:
+                self.disagg_prefill_bootstrap_queue.store_prefill_logits_output(
+                    req.metadata_buffer_index, logits_output
+                )
+            else:
+                self.disagg_prefill_bootstrap_queue.store_prefill_results(
+                    req.metadata_buffer_index, token_id
+                )
         page_indices = kv_to_page_indices(kv_indices, page_size)
 
         page_start_idx = start_idx // page_size

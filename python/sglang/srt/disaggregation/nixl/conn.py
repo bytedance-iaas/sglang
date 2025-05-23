@@ -11,6 +11,7 @@ import uuid
 from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
+import torch
 
 import numpy as np
 import numpy.typing as npt
@@ -83,6 +84,7 @@ class NixlKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        skip_sample_on_prefill: bool = False,
     ):
         try:
             from nixl._api import nixl_agent
@@ -100,6 +102,7 @@ class NixlKVManager(BaseKVManager):
         self.dist_init_addr = server_args.dist_init_addr
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        self.skip_sample_on_prefill = skip_sample_on_prefill
         self.register_buffer_to_engine()
 
         self.rank_port = get_free_port()
@@ -128,12 +131,17 @@ class NixlKVManager(BaseKVManager):
         self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
+        
         aux_addrs = []
         for aux_data_ptr, aux_data_len in zip(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
-        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
+    
+        aux_memory_location = "VRAM" if self.skip_sample_on_prefill else "DRAM"
+
+        self.aux_descs = self.agent.register_memory(aux_addrs, aux_memory_location,
+                                                    is_sorted=True)
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
@@ -196,6 +204,7 @@ class NixlKVManager(BaseKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
         notif: str,
+        mem_type: str = "DRAM",
     ):
         # Make descs
         aux_item_len = self.kv_args.aux_item_lens[0]
@@ -205,8 +214,9 @@ class NixlKVManager(BaseKVManager):
         decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
         src_addrs = [(prefill_aux_addr, aux_item_len, 0)]
         dst_addrs = [(decode_aux_addr, aux_item_len, 0)]
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM", is_sorted=True)
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM", is_sorted=True)
+        
+        src_descs = self.agent.get_xfer_descs(src_addrs, mem_type, is_sorted=True)
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, mem_type, is_sorted=True)
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
@@ -256,14 +266,17 @@ class NixlKVManager(BaseKVManager):
         handles = [kv_xfer_handle]
         # Only the last chunk we need to send the aux data.
         if is_last:
+            mem_type = "VRAM" if self.skip_sample_on_prefill else "DRAM"
             aux_xfer_handle = self.send_aux(
                 peer_name,
                 aux_index,
                 req.dst_aux_ptrs,
                 req.dst_aux_index,
                 str(req.room) + "_aux",
+                mem_type = mem_type,
             )
             handles.append(aux_xfer_handle)
+
         return handles
 
     def update_transfer_status(self):

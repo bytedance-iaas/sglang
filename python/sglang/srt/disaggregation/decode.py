@@ -82,6 +82,7 @@ class DecodePreallocQueue:
         tp_size: int,
         bootstrap_port: int,
         transfer_backend: TransferBackend,
+        skip_sample_on_prefill: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -105,6 +106,7 @@ class DecodePreallocQueue:
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.transfer_backend = transfer_backend
+        self.skip_sample_on_prefill = skip_sample_on_prefill
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
@@ -131,7 +133,8 @@ class DecodePreallocQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
-            kv_args, DisaggregationMode.DECODE, self.scheduler.server_args
+            kv_args, DisaggregationMode.DECODE, self.scheduler.server_args,
+            self.skip_sample_on_prefill
         )
         return kv_manager
 
@@ -310,11 +313,13 @@ class DecodeTransferQueue:
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: torch.Tensor,
+        skip_sample_on_prefill: bool = False,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.metadata_buffers = metadata_buffers
+        self.skip_sample_on_prefill = skip_sample_on_prefill
 
     def add(self, req_conn: DecodeRequest) -> None:
         self.queue.append(req_conn)
@@ -338,13 +343,18 @@ class DecodeTransferQueue:
             elif poll == KVPoll.Success:
                 # pop and push it to waiting queue
                 idx = decode_req.metadata_buffer_index
-                assert len(decode_req.req.output_ids) == 0
-                output_id_buffer = self.metadata_buffers[0]
-                # the last dimension is padded by the same values.
-                output_id = output_id_buffer[idx][0].item()
-                assert len(decode_req.req.output_ids) == 0
-                assert decode_req.req.transferred_output_id is None
-                decode_req.req.transferred_output_id = output_id
+                if not self.skip_sample_on_prefill:
+                    assert len(decode_req.req.output_ids) == 0
+                    output_id_buffer = self.metadata_buffers[0]
+                    # the last dimension is padded by the same values.
+                    output_id = output_id_buffer[idx][0].item()
+                    assert len(decode_req.req.output_ids) == 0
+                    assert decode_req.req.transferred_output_id is None
+                    decode_req.req.transferred_output_id = output_id
+                else:
+                    logits_buffer = self.metadata_buffers[0]
+                    logits = logits_buffer[idx]
+                    decode_req.req.transferred_logits = logits.clone()
                 transferred_reqs.append(decode_req)
                 indices_to_remove.add(i)
             elif poll in [
@@ -450,9 +460,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 # resumed retracted req
                 self.output_ids.append(req.output_ids[-1])
             else:
-                assert req.transferred_output_id is not None
-                req.output_ids.append(req.transferred_output_id)
-                self.output_ids.append(req.transferred_output_id)
+                assert req.transferred_output_id is not None or req.transferred_logits is not None
+                if req.transferred_output_id is not None:
+                    req.output_ids.append(req.transferred_output_id)
+                    self.output_ids.append(req.transferred_output_id)
             self.tree_cache.cache_unfinished_req(req)
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
@@ -542,6 +553,8 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
+                    if self.skip_sample_on_prefill:
+                        self.tp_worker.forward_batch_sampling(batch)
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
                     if prepare_dp_attn_flag:

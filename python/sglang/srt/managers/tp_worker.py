@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class TpModelWorker:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        skip_sample: bool = False,
     ):
         # Parse args
         self.tp_rank = tp_rank
@@ -140,6 +142,7 @@ class TpModelWorker:
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
+        self.skip_sample = skip_sample
 
     def get_worker_info(self):
         return (
@@ -171,6 +174,22 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def forward_batch_sampling(
+        self,
+        batch,
+    ) -> None:
+        
+        logits_list = [req.transferred_logits for req in batch.reqs]
+        logits_output = LogitsProcessorOutput(torch.stack(logits_list, dim=0))
+        sampling_info = batch.sampling_info
+
+        next_token_ids = self.model_runner.forward_batch_sampling(logits_output, sampling_info)
+
+        for index, req in enumerate(batch.reqs):
+            req.output_ids.append(next_token_ids[index])
+
+        batch.output_ids = next_token_ids
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -178,7 +197,9 @@ class TpModelWorker:
         skip_sample: bool = False,
     ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+
         logits_output = self.model_runner.forward(forward_batch)
+
         if launch_done:
             launch_done.set()
 

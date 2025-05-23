@@ -288,6 +288,14 @@ class Scheduler(
         # ################################################################################
 
         # try:
+        self.skip_sample_on_prefill = os.getenv("SKIP_SAMPLE_ON_PREFILL") == "1"
+        skip_sample = False
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL and self.skip_sample_on_prefill:
+            skip_sample = DecodeTransferQueue
+
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             expert_location_metadata=expert_location_metadata,
@@ -295,6 +303,7 @@ class Scheduler(
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
+            skip_sample = skip_sample,
         )
         # except Exception as e:
         #     print(f"HACK!!!! see error but continue {e=}")
@@ -475,9 +484,6 @@ class Scheduler(
             ]
         )
 
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
         self.init_disaggregation()
 
     def init_tokenizer(self):
@@ -593,24 +599,37 @@ class Scheduler(
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            aux_dtype = torch.int32
-            # A list of metadata buffers. The shape is (b, metadata_size) where
-            # b corresponds to a max running requests. The last shape * dtype.itemsize
-            # should be larger than 64 bytes to work with RDMA, so we pad it.
-            output_id_buffer = torch.zeros(
-                (buffer_size, 16), dtype=aux_dtype, device="cpu"
-            )
-            metadata_buffers = [output_id_buffer]
+            if not self.skip_sample_on_prefill:
+                buffer_size = (self.req_to_token_pool.size) * 2
+                req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    buffer_size
+                )
+                aux_dtype = torch.int32
+                # A list of metadata buffers. The shape is (b, metadata_size) where
+                # b corresponds to a max running requests. The last shape * dtype.itemsize
+                # should be larger than 64 bytes to work with RDMA, so we pad it.
+                output_id_buffer = torch.zeros(
+                    (buffer_size, 16), dtype=aux_dtype, device="cpu"
+                )
+                metadata_buffers = [output_id_buffer]
+            else:            
+                aux_dtype = self.model_config.hf_config.torch_dtype
+
+                # should be larger than 64 bytes to work with RDMA.
+                assert self.model_config.vocab_size > 64
+                
+                logits_buffer = torch.zeros(
+                    (self.max_running_requests, self.model_config.vocab_size), dtype=aux_dtype, device="cuda:0"
+                    )
+                metadata_buffers = [logits_buffer]
+                req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(self.max_running_requests)
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
+                skip_sample_on_prefill=self.skip_sample_on_prefill,
             )
 
             # The decode requests pending for pre-allocation
@@ -628,6 +647,7 @@ class Scheduler(
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
+                skip_sample_on_prefill=self.skip_sample_on_prefill,
             )
 
             # Metric for pre-allocation
@@ -635,18 +655,30 @@ class Scheduler(
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            aux_dtype = torch.int32
-            # A list of metadata buffers. The shape is (b, metadata_size) where
-            # b corresponds to a max running requests. The last shape * dtype.itemsize
-            # should be larger than 64 bytes to work with RDMA, so we pad it.
-            output_id_buffer = torch.zeros(
-                (buffer_size, 16), dtype=aux_dtype, device="cpu"
-            )
-            metadata_buffers = [output_id_buffer]
+            if not self.skip_sample_on_prefill:
+                buffer_size = self.max_running_requests * 2
+                req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    buffer_size
+                )
+                aux_dtype = torch.int32
+                # A list of metadata buffers. The shape is (b, metadata_size) where
+                # b corresponds to a max running requests. The last shape * dtype.itemsize
+                # should be larger than 64 bytes to work with RDMA, so we pad it.
+                output_id_buffer = torch.zeros(
+                    (buffer_size, 16), dtype=aux_dtype, device="cpu"
+                )
+                metadata_buffers = [output_id_buffer]
+            else:
+                aux_dtype = self.model_config.hf_config.torch_dtype
+
+                # should be larger than 64 bytes to work with RDMA.
+                assert self.model_config.vocab_size > 64
+                
+                logits_buffer = torch.zeros(
+                    (self.max_running_requests, self.model_config.vocab_size), dtype=aux_dtype, device="cpu"
+                )
+                metadata_buffers = [logits_buffer]
+                req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(self.max_running_requests)
 
             if not self.enable_overlap:
                 self.disagg_launch_done = threading.Event()
@@ -663,7 +695,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 transfer_backend=self.transfer_backend,
-                scheduler=self,
+                scheduler=self
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
