@@ -183,6 +183,7 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
+    enable_eic_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
@@ -432,6 +433,9 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1246,6 +1250,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+
+        parser.add_argument(
+            "--enable-eic-cache",
+            action="store_true",
+            help="Enable EIC cache",
         )
 
         # Disaggregation

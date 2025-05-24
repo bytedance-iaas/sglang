@@ -13,8 +13,10 @@
 # ==============================================================================
 """Request scheduler policy"""
 
+import logging
 import os
 import random
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -30,6 +32,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+
+logger = logging.getLogger(__name__)
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -447,7 +451,11 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, enable_hierarchical_cache: bool = False
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        enable_hierarchical_cache: bool = False,
+        enable_eic_cache: bool = False,
     ):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
@@ -473,9 +481,64 @@ class PrefillAdder:
                 and req.last_node_global is not None
                 and req.last_node_global.evicted
             ):
+                prev_prefix_indices = req.prefix_indices
                 req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
                     req.last_node_global, req.prefix_indices
                 )
+                if enable_eic_cache and self.tree_cache.tp_size > 1:
+                    prefix_len_tensor = torch.tensor(
+                        [len(req.prefix_indices)], device="cpu"
+                    )
+                    torch.distributed.all_reduce(
+                        prefix_len_tensor,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.tree_cache.tp_group,
+                    )
+                    if (
+                        prefix_len_tensor.item()
+                        != len(req.prefix_indices) * self.tree_cache.tp_size
+                    ):
+                        logger.error("prefix len is not consistent")
+                logger.debug(
+                    f"req {req.rid} init load back, last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
+                )
+                if enable_eic_cache:
+                    loading_check_start_ts = time.perf_counter()
+                    while not self.tree_cache.loading_complete(req.last_node):
+                        time.sleep(0.01)
+                    load_flag = 100 if (req.last_node.value is None) else 0
+                    load_sucess = True
+                    if self.tree_cache.tp_size > 1:
+                        load_flag_tensor = torch.tensor([load_flag], device="cpu")
+                        torch.distributed.all_reduce(
+                            load_flag_tensor,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self.tree_cache.tp_group,
+                        )
+                        if load_flag_tensor.item() > 0:
+                            logger.error("eic load back failed")
+                            load_sucess = False
+                    else:
+                        if load_flag > 0:
+                            logger.error("eic load back failed")
+                            load_sucess = False
+                    if not load_sucess:
+                        last_gpu_node = req.last_node
+                        while last_gpu_node.evicted:
+                            last_gpu_node = last_gpu_node.parent
+                        req.last_node = last_gpu_node
+                        req.prefix_indices = prev_prefix_indices
+                        logger.error(
+                            f"req {req.rid} after load back failed, last node:{last_gpu_node.id}"
+                        )
+                    loading_check_end_ts = time.perf_counter()
+                    logger.debug(
+                        f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
+                    )
+                logger.debug(
+                    f"after eic sync, req {req.rid} last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
+                )
+
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 input_tokens = req.extend_input_len
                 prefix_len = len(req.prefix_indices)
