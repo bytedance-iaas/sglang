@@ -86,8 +86,16 @@ def scale_shape(shape, group_shape):
         x_vals=[1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
         x_log=False,
         line_arg="provider",
-        line_vals=["vllm", "sgl-kernel", "triton", "deepgemm"],
-        line_names=["vllm", "sgl-kernel", "sglang triton", "deepgemm"],
+        line_vals=(
+            ["vllm", "sgl-kernel", "triton", "deepgemm"]
+            if torch.cuda.get_device_capability()[0] >= 9
+            else ["sgl-kernel", "triton"]
+        ),
+        line_names=(
+            ["vllm", "sgl-kernel", "sglang triton", "deepgemm"]
+            if torch.cuda.get_device_capability()[0] >= 9
+            else ["sgl-kernel", "sglang triton"]
+        ),
         styles=[("blue", "-"), ("orange", "-"), ("red", "-"), ("yellow", "-")],
         ylabel="GB/s",
         plot_name="fp8 blockwise scaled matmul",
