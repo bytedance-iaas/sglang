@@ -39,13 +39,24 @@ RUN dpkg -i gdrcopy_*.deb
 
 ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 
+# ep statistics
+WORKDIR /sgl-workspace
+RUN wget https://github.com/user-attachments/files/20036217/attachment_ep_statistics.zip \
+    && unzip attachment_ep_statistics.zip \
+    && rm attachment_ep_statistics.zip \
+    && mv attachment_ep_statistics /sgl-workspace/eps
+
 # IBGDA dependency
 RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 RUN apt-get install -y libfabric-dev
+WORKDIR /sgl-workspace
+RUN git clone https://github.com/deepseek-ai/FlashMLA.git
+WORKDIR /sgl-workspace/FlashMLA
+RUN python3 setup.py install
 
 # DeepEP
 WORKDIR /sgl-workspace
-RUN git clone https://github.com/deepseek-ai/DeepEP.git
+RUN git clone --branch h20_support https://github.com/bytedance-iaas/DeepEP.git
 
 # NVSHMEM
 WORKDIR /sgl-workspace
@@ -76,6 +87,9 @@ RUN NVSHMEM_SHMEM_SUPPORT=0 \
 WORKDIR /sgl-workspace/DeepEP
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install --break-system-packages .
+
+# Install mooncake
+RUN python3 -m pip install mooncake-transfer-engine
 
 # Set workspace
 WORKDIR /sgl-workspace
