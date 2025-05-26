@@ -34,7 +34,7 @@
 
 using namespace cute;
 
-template <typename OutType, typename TileShape, int PipelineStages, typename ClusterShape>
+template <typename OutType, typename TileShape, int PipelineStages, int ScaleGranularityK>
 void launch_sm89_fp8_blockwise_scaled_mm(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -55,8 +55,8 @@ void launch_sm89_fp8_blockwise_scaled_mm(
   using LayoutD = cutlass::layout::RowMajor;
   constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-  using ScaleTileShape = Shape<_1, _128, _128>;
-  using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(ScaleTileShape{}));
+  using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(
+      Shape<_1, Int<ScaleGranularityK>, Int<ScaleGranularityK>>{}));
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -73,16 +73,19 @@ void launch_sm89_fp8_blockwise_scaled_mm(
       Layout<Shape<_2, _2, _1>>,  // 2x2x1 thread group
       Tile<_32, _32, _32>>;
 
-  using SmemLayoutAtomA = decltype(composition(Swizzle<2, 4, 3>{}, Layout<Shape<_8, _128>, Stride<_128, _1>>{}));
+  using SmemLayoutAtomA = decltype(composition(
+      Swizzle<2, 4, 3>{}, Layout<Shape<_8, Int<ScaleGranularityK>>, Stride<Int<ScaleGranularityK>, _1>>{}));
   using GmemTiledCopyA = decltype(make_tiled_copy(
       Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, ElementA>{},
-      Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+      Layout<
+          Shape<Int<128 * AlignmentA / ScaleGranularityK>, Int<ScaleGranularityK / AlignmentA>>,
+          Stride<Int<ScaleGranularityK / AlignmentA>, _1>>{},
       Layout<Shape<_1, Int<AlignmentA>>>{}));
   using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, ElementA>;
 
   using SmemLayoutAtomB = SmemLayoutAtomA;
   using GmemTiledCopyB = GmemTiledCopyA;
-  using SmemCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, ElementB>;
+  using SmemCopyAtomB = SmemCopyAtomA;
 
   // Mainloop
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
@@ -447,12 +450,10 @@ void sm89_fp8_blockwise_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b) {
   using ClusterShape = Shape<_1, _1, _1>;
-  if (a.size(0) <= 16) {
-    launch_sm89_fp8_blockwise_scaled_mm<OutType, Shape<_16, _128, _128>, 5, ClusterShape>(
-        out, a, b, scales_a, scales_b);
+  if (a.size(1) == scales_a.size(1) * 128) {
+    launch_sm89_fp8_blockwise_scaled_mm<OutType, Shape<_64, _128, _128>, 4, 128>(out, a, b, scales_a, scales_b);
   } else {
-    launch_sm89_fp8_blockwise_scaled_mm<OutType, Shape<_64, _128, _128>, 4, ClusterShape>(
-        out, a, b, scales_a, scales_b);
+    launch_sm89_fp8_blockwise_scaled_mm<OutType, Shape<_128, _64, _64>, 4, 64>(out, a, b, scales_a, scales_b);
   }
 }
 
@@ -529,19 +530,24 @@ torch::Tensor fp8_blockwise_scaled_mm(
            (t.dim() == 1 || (t.dim() == 2 && *std::min_element(t_sizes.begin(), t_sizes.end()) == 1));
   };
 
+  auto sm_version = getSMVersion();
+  auto scale_granularity_k = mat_a.size(1) / scales_a.size(1);
+
   TORCH_CHECK(mat_a.size(0) == scales_a.size(0), "size of scales_a is not matched");
-  TORCH_CHECK(mat_a.size(1) / 128 == scales_a.size(1), "size of scales_a is not matched");
+  if (sm_version == 89) {
+    TORCH_CHECK(scale_granularity_k == 128 || scale_granularity_k == 64, "Scale granularity must be 64 or 128");
+  } else {
+    TORCH_CHECK(scale_granularity_k == 128, "Scale granularity must be 128");
+  }
   TORCH_CHECK(scales_a.stride(0) == 1 || is_contiguous_vector(scales_a), "scales_a must be M major");
-  TORCH_CHECK(mat_b.size(0) / 128 == scales_b.size(0), "size of scales_b is not matched");
-  TORCH_CHECK(mat_b.size(1) / 128 == scales_b.size(1), "size of scales_b is not matched");
+  TORCH_CHECK(mat_b.size(0) / scale_granularity_k == scales_b.size(0), "size of scales_b is not matched");
+  TORCH_CHECK(mat_b.size(1) / scale_granularity_k == scales_b.size(1), "size of scales_b is not matched");
   TORCH_CHECK(scales_b.stride(0) == 1 || is_contiguous_vector(scales_b), "scales_b must be K major");
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
   torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
-
-  auto sm_version = getSMVersion();
 
   int64_t original_rows = mat_a.size(0);
   torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
