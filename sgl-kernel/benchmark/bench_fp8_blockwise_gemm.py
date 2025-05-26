@@ -113,8 +113,9 @@ def benchmark(batch_size, provider, N, K):
     b_fp32 = (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-    scale_a_group_shape = (1, 128)
-    scale_b_group_shape = (128, 128)
+    scale_ranularity_k = 128
+    scale_a_group_shape = (1, scale_ranularity_k)
+    scale_b_group_shape = (scale_ranularity_k, scale_ranularity_k)
     scale_a_shape = scale_shape(a_fp8.shape, scale_a_group_shape)
     scale_b_shape = scale_shape(b_fp8.shape, scale_b_group_shape)
 
@@ -141,7 +142,12 @@ def benchmark(batch_size, provider, N, K):
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: w8a8_block_fp8_matmul(
-                a_fp8, b_fp8, scale_a, scale_b, [128, 128], torch.float16
+                a_fp8,
+                b_fp8,
+                scale_a,
+                scale_b,
+                [scale_ranularity_k, scale_ranularity_k],
+                torch.float16,
             ),
             quantiles=quantiles,
         )
