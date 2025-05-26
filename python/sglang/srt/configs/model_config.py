@@ -350,6 +350,7 @@ class ModelConfig:
             "w8a8_fp8",
             "moe_wna16",
             "qoq",
+            "fp8_moe_int4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],

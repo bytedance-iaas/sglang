@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_moe_int4 import Fp8MoEInt4Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
     GPTQMarlinConfig,
@@ -82,6 +83,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
+    "fp8_moe_int4": Fp8MoEInt4Config,
 }
 
 # VLLM-dependent quantization methods
