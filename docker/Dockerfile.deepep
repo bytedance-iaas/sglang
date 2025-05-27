@@ -89,7 +89,7 @@ ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install --break-system-packages .
 
 # Install mooncake
-RUN python3 -m pip install mooncake-transfer-engine
+RUN python3 -m pip install mooncake-transfer-engine --extra-index-url https://bytedpypi.byted.org/simple
 
 # Set workspace
 WORKDIR /sgl-workspace
