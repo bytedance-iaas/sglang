@@ -578,6 +578,7 @@ class ServerArgs:
                 "w8a8_fp8",
                 "moe_wna16",
                 "qoq",
+                "fp8_moe_int4",
             ],
             help="The quantization method.",
         )
