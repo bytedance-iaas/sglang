@@ -297,7 +297,7 @@ class EICHiRadixCache(RadixCache):
         heapq.heapify(leaves)
 
         num_evicted = 0
-        pending_nodes = []
+        write_back_nodes = []
         idx = 0
 
         while num_evicted < num_tokens and len(leaves):
@@ -325,19 +325,18 @@ class EICHiRadixCache(RadixCache):
                         self.cache_controller.mem_pool_host.free(x.host_value)
                         x.host_value = None
 
-            if x.host_value is None:
+            if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
+                    # write to host if the node is not backuped
                     num_evicted += self.write_backup(x)
-                elif self.cache_controller.write_policy == "write_through_selective":
-                    num_evicted += self._evict_write_through_selective(x)
+                    write_back_nodes.append(x)
                 else:
-                    # wright through but set eic failed
-                    num_evicted += self._evict_write_through_selective(x)
+                    num_evicted += self._evict_regular(x)
             else:
-                num_evicted += self._evict_write_through(x)
+                num_evicted += self._evict_backuped(x)
 
             for child in x.parent.children.values():
-                if child in pending_nodes:
+                if child in write_back_nodes:
                     continue
                 if not child.evicted:
                     break
@@ -349,24 +348,29 @@ class EICHiRadixCache(RadixCache):
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 self.writing_check()
-                time.sleep(0.1)
+                time.sleep(0.01)
+            for node in write_back_nodes:
+                if node.backuped:
+                    self._evict_backuped(node)
+                else:
+                    self._evict_regular(node)
 
-    def _evict_write_through(self, node: TreeNode):
+    def _evict_backuped(self, node: TreeNode):
         if node.host_value is None:
             logger.error(f"host value is None for node {node.id}")
-            return self._evict_write_through_selective(node)
+            return self._evict_regular(node)
         state = self.cache_controller.mem_pool_host.get_state(node.host_value)
         if state != MemoryStateInt.SYNCED:
             self.cache_controller.mem_pool_host.free(node.host_value)
             logger.error(f"unexpected unsynced host value {node.host_value} {state}")
-            return self._evict_write_through_selective(node)
+            return self._evict_regular(node)
         num_evicted = self.cache_controller.evict_device(node.value, node.host_value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
         return num_evicted
 
-    def _evict_write_through_selective(self, node: TreeNode):
+    def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)

@@ -677,10 +677,6 @@ class EICBaseTokenToKVPoolHost:
 
     @synchronized()
     def protect_load(self, indices: torch.Tensor):
-        assert self.is_backup(indices), (
-            f"The host memory slots should be in BACKUP state before load operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
     @synchronized()
