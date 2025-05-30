@@ -5,7 +5,6 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-import tensorrt_llm
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -417,11 +416,6 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
 
-    @staticmethod
-    def postprocess(w):
-            packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
-            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
-            return packer(unpacker(w.cpu().T.contiguous()).T.contiguous())
 
     def _load_w13(
         self,
@@ -431,25 +425,12 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.tensor,
         tp_rank: int,
     ):
-
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
         weight_shard_size = shard_size
-        if self.quant_config is not None and \
-            self.quant_config.get_name() == "fp8_moe_int4" and \
-            expert_data.dtype == torch.int8:
-            weight_shard_size = weight_shard_size // 2
         loaded_weight = loaded_weight.narrow(shard_dim, weight_shard_size * tp_rank,
                                              weight_shard_size)
-        # int4 weight postprocess
-        if self.quant_config is not None and self.quant_config.get_name() == "fp8_moe_int4" and expert_data.dtype == torch.int8:
-            loaded_weight = self.postprocess(loaded_weight)
-
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
 
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
@@ -474,20 +455,10 @@ class FusedMoE(torch.nn.Module):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
-        if self.quant_config is not None and \
-            self.quant_config.get_name() == "fp8_moe_int4" and \
-            expert_data.dtype == torch.int8:
-            shard_size = shard_size * 2
-
         if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
                 shard_dim, shard_size * tp_rank, shard_size
             )
-
-        if self.quant_config is not None and \
-            self.quant_config.get_name() == "fp8_moe_int4" and \
-            expert_data.dtype == torch.int8:
-            loaded_weight = self.postprocess(loaded_weight)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 

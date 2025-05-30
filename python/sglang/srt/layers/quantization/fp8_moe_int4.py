@@ -123,6 +123,7 @@ class Fp8MoEInt4Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "Fp8MoEInt4Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
+
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         is_moe_w4a8_serialized = "moe_int4" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
@@ -136,19 +137,6 @@ class Fp8MoEInt4Config(QuantizationConfig):
             weight_block_size,
         )
 
-    @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "Fp8MoEInt4Config":
-        quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp8_serialized = "fp8" in quant_method
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
-        weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
-        return cls(
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
-            activation_scheme=activation_scheme,
-            ignored_layers=ignored_layers,
-            weight_block_size=weight_block_size,
-        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -187,7 +175,7 @@ class Fp8MoEInt4MoEMethod:
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size_per_partition * 2,
+                intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=torch.int8,
             ),
