@@ -191,7 +191,7 @@ def rebalance_experts(
     """
     num_layers, num_logical_experts = weight.shape
     weight = weight.float().cpu()
-    if num_groups % num_nodes == 0:
+    if num_groups / 4 % num_nodes == 0:
         # use hierarchical load-balance policy
         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
             weight, num_replicas, num_groups, num_nodes, num_gpus

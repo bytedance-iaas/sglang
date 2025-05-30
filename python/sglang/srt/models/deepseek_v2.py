@@ -549,7 +549,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_dispatch_a_part_one(self, state):
         state.topk_weights, state.topk_idx = self._forward_deepep_dispatch_a_part_one(
-            forward_mode=state.forward_batch.forward_mode,
+            forward_batch=state.forward_batch,
             hidden_states=state.hidden_states_after_post_attn_ln,
             router_logits=state.pop("router_logits"),
         )

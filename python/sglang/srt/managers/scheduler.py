@@ -229,6 +229,14 @@ class Scheduler(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
+            if server_args.load_balance_method == "shortest_queue":
+                self.send_to_dp_controller = get_zmq_socket(
+                    context, zmq.PUSH, port_args.worker_workload_status_ipc_name, False
+                )
+
+                self.report_thread = threading.Thread(target=self._report_workload_status_thread)
+                self.report_thread.start()
+
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
                 self.send_to_detokenizer = get_zmq_socket(
@@ -377,14 +385,6 @@ class Scheduler(
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
         
-        if self.attn_tp_rank == 0:
-            if server_args.load_balance_method == "shortest_queue":
-                self.send_to_dp_controller = get_zmq_socket(
-                    context, zmq.PUSH, port_args.worker_workload_status_ipc_name, False
-                )
-
-                self.report_thread = threading.Thread(target=self._report_workload_status_thread)
-                self.report_thread.start()
         # Init session info
         self.sessions: Dict[str, Session] = {}
 
@@ -752,6 +752,7 @@ class Scheduler(
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    # logger.info(f"[hanhan] req id: {recv_req.rid} recv_req bootstrap room: {recv_req.bootstrap_room}")
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
@@ -822,6 +823,7 @@ class Scheduler(
                 continue
 
             output = self._request_dispatcher(recv_req)
+            # logger.info(f"[hanhan] output: {output}")
             if output is not None:
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:

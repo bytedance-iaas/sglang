@@ -96,6 +96,7 @@ class MiniLoadBalancer:
         )
 
 
+
 app = FastAPI()
 load_balancer = None
 
@@ -184,7 +185,7 @@ async def handle_generate_request(request_data: dict):
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
                 "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
+                    (await _generate_next_bootstrap_room(prefill_server) if neat_room else _generate_bootstrap_room()) for _ in range(batch_size)
                 ],
             }
         )
@@ -193,7 +194,7 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
+                "bootstrap_room": await _generate_next_bootstrap_room(prefill_server) if neat_room else _generate_bootstrap_room(),
             }
         )
 
@@ -217,11 +218,12 @@ async def handle_completion_request(request_data: dict, request: Request):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
+
     modified_request.update(
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": await _generate_next_bootstrap_room(prefill_server) if neat_room else _generate_bootstrap_room(),
         }
     )
 
@@ -239,6 +241,23 @@ async def handle_completion_request(request_data: dict, request: Request):
             decode_server,
             endpoint=path,
         )
+
+_counter_lock = asyncio.Lock()
+bootstrap_room_counters = {}
+MAX_ROOMS_PER_SERVER = 2**32  # Each server gets 2^32 rooms
+
+async def _generate_next_bootstrap_room(prefill_url: str):
+    global bootstrap_room_counters
+    async with _counter_lock:
+        if prefill_url not in bootstrap_room_counters:
+            # For two prefill servers, first one starts at 0, second one starts at 2^32
+            server_index = len(bootstrap_room_counters)
+            bootstrap_room_counters[prefill_url] = server_index * MAX_ROOMS_PER_SERVER
+        
+        room = bootstrap_room_counters[prefill_url]
+        bootstrap_room_counters[prefill_url] = (bootstrap_room_counters[prefill_url] + 1) % (2**63)
+        print(f"[hanhan] mini lb bootstrap room for {prefill_url}: {room}")
+        return room
 
 
 def _generate_bootstrap_room():
@@ -275,6 +294,7 @@ def run(prefill_configs, decode_addrs, host, port):
     load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
     uvicorn.run(app, host=host, port=port)
 
+neat_room = False
 
 if __name__ == "__main__":
     import argparse
@@ -297,8 +317,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--port", type=int, default=8000, help="Port to bind the server (default: 8000)"
     )
+    parser.add_argument(
+        "--neat-room", action="store_true", help="use increment id as bootstrap room"
+    )
+
     args = parser.parse_args()
 
+    neat_room = args.neat_room
     prefill_urls = args.prefill.split(",")
     bootstrap_ports = [int(p) for p in args.prefill_bootstrap_ports.split(",")]
 
