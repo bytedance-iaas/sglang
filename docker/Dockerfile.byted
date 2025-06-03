@@ -26,7 +26,7 @@ RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://
 ARG branch=release_0.0.2
 RUN cd /tmp && git clone https://github.com/bytedance-iaas/sglang.git -b ${branch} && \
     rm -rf /root/sglang/examples && \
-    mv /tmp/sglang/examples /root/sglang/examples && \
+    mv /tmp/sglang/examples /sgl-workspace/sglang/examples && \
     rm -rf /tmp/sglang
 
 # onion 安装
