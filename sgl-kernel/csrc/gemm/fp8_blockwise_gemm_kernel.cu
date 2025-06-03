@@ -110,20 +110,14 @@ void launch_sm89_fp8_blockwise_scaled_mm(
   using ElementBlockScale =
       typename CollectiveMainloop::ElementBlockScale;  // Element type for blockscaling during accumulation
 
-  //
-  // Assembling the Collective Epilogue Type
-  //
-
+  // round_to_nearest (default) doesn't work well. round_half_ulp_truncate seems to provide better precision.
   using CollectiveEpilogue = cutlass::epilogue::collective::DefaultEpilogue<
       ElementD,
       cutlass::detail::TagToStrideC_t<LayoutC>,
       cutlass::detail::TagToStrideC_t<LayoutD>,
-      cutlass::epilogue::thread::Convert<ElementD, AlignmentD, ElementAccumulator>,
+      cutlass::epilogue::thread::
+          Convert<ElementD, AlignmentD, ElementAccumulator, cutlass::FloatRoundStyle::round_half_ulp_truncate>,
       cutlass::gemm::EpilogueDefault>;
-
-  //
-  // Assembling the GemmKernel
-  //
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
@@ -546,13 +540,13 @@ torch::Tensor fp8_blockwise_scaled_mm(
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
-  torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
-  TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
-
   int64_t original_rows = mat_a.size(0);
   torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
   torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
-  torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
+  torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+  TORCH_CHECK(
+      (out_padded.size(1) * out_padded.element_size()) % 16 == 0,
+      "out_padded must be multiple of 16 bytes for memory alignment");
 
 #if defined(CUTLASS_ARCH_MMA_F32_SM89_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
