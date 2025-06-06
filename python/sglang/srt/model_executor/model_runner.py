@@ -145,6 +145,9 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.decode_attn_backend = None
 
+        if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8"):
+            logger.info("SGL_USE_CUTLASS_MOE_FP8 is enabled")
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
