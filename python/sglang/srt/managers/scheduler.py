@@ -63,6 +63,7 @@ from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    DPWorkerPayloadStatus,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -100,7 +101,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
     WorkerPayloadStatus,
-    DPWorkerPayloadStatus,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -204,10 +204,10 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
-        
-        #self.waiting_queue: List[Req] = []
-        #self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        
+
+        # self.waiting_queue: List[Req] = []
+        # self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+
         # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -376,14 +376,16 @@ class Scheduler(
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
-        
+
         if self.attn_tp_rank == 0:
             if server_args.load_balance_method == "shortest_queue":
                 self.send_to_dp_controller = get_zmq_socket(
                     context, zmq.PUSH, port_args.worker_workload_status_ipc_name, False
                 )
 
-                self.report_thread = threading.Thread(target=self._report_workload_status_thread)
+                self.report_thread = threading.Thread(
+                    target=self._report_workload_status_thread
+                )
                 self.report_thread.start()
         # Init session info
         self.sessions: Dict[str, Session] = {}
@@ -2169,15 +2171,20 @@ class Scheduler(
                     DPWorkerPayloadStatus(
                         dp_rank=self.dp_rank,
                         status=WorkerPayloadStatus(
-                            running_reqs=len(self.running_batch.reqs) if self.running_batch else 0,
-                            queued_reqs=len(self.waiting_queue)
-                        )
+                            running_reqs=(
+                                len(self.running_batch.reqs)
+                                if self.running_batch
+                                else 0
+                            ),
+                            queued_reqs=len(self.waiting_queue),
+                        ),
                     )
                 )
             except zmq.ZMQError as e:
-                logger.warn(f'failed to report workload status, ignore, e: {e}')
+                logger.warn(f"failed to report workload status, ignore, e: {e}")
             finally:
                 time.sleep(self.server_args.scheduler_workload_report_interval)
+
 
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")

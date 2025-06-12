@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import time
 from functools import lru_cache
 from typing import Optional, Tuple
 
+import nvtx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +53,7 @@ class VisionAttention(nn.Module):
         softmax_in_single_precision: bool = False,
         flatten_batch: bool = False,
         prefix: str = "",
+        mask_container=[],
     ):
         super().__init__()
         self.use_context_forward = use_context_forward
@@ -74,6 +77,7 @@ class VisionAttention(nn.Module):
                 softmax_in_single_precision=softmax_in_single_precision,
             )
 
+        self.mask_container = mask_container
         self.use_qkv_parallel = use_qkv_parallel
         if use_qkv_parallel:
             self.qkv_proj = QKVParallelLinear(
@@ -113,7 +117,9 @@ class VisionAttention(nn.Module):
         """
         bsz, s, _ = x.shape
         head = self.num_attention_heads_per_partition
+        # with nvtx.annotate("qkv-linear", color="red"):
         if self.use_qkv_parallel:
+            # print("use qkv parallel")
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.chunk(3, dim=-1)
@@ -141,6 +147,7 @@ class VisionAttention(nn.Module):
             ]
 
         if position_embeddings is not None:
+            # with nvtx.annotate("rope", color="blue"):
             cos, sin = position_embeddings
             original_shape = q.shape
             # [total_tokens, head, head_size]
@@ -158,7 +165,7 @@ class VisionAttention(nn.Module):
             # [b, s, head, head_size] --> [b * s, head, head_size]
             q, k, v = [rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v]]
 
-        output = self.qkv_backend.forward(q, k, v, bsz, cu_seqlens, attention_mask)
+        output = self.qkv_backend.forward(q, k, v, bsz, cu_seqlens, self.mask_container)
 
         if self.use_qkv_parallel:
             # [b * s, h, head_size] --> [b, s, h * head_size]
@@ -263,7 +270,7 @@ class VisionSdpaAttention(nn.Module):
         v: torch.Tensor,
         bsz: int,
         cu_seqlens: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_container: list = None,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -271,10 +278,10 @@ class VisionSdpaAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-
         s = q.shape[0] // bsz
 
         # [b, 1, s, s]
+        attention_mask = None
         if attention_mask is None:
             attention_mask = self.generate_patch_attention_mask(
                 s, cu_seqlens, flatten_batch=self.flatten_batch
@@ -284,8 +291,16 @@ class VisionSdpaAttention(nn.Module):
             if self.softmax_in_single_precision:
                 raise RuntimeError("Empty attention mask")
         else:
-            attention_mask = attention_mask.to(device=q.device)
-
+            # torch.cuda.synchronize()
+            # start_t = time.time()
+            if len(attention_mask_container) == 0:
+                attention_mask_container.append(attention_mask.to(device=q.device))
+            if attention_mask_container[0].shape != attention_mask.shape:
+                attention_mask_container.clear()
+                attention_mask_container.append(attention_mask.to(device=q.device))
+            # torch.cuda.synchronize()
+            # end_t = time.time()
+            # print("h2d cost {} ms".format((end_t - start_t)* 1000))
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
 
         if self.softmax_in_single_precision:
@@ -293,9 +308,11 @@ class VisionSdpaAttention(nn.Module):
             k_transposed = rearrange(k, "b h s d -> b h d s")
             attn_weights = torch.matmul(q, k_transposed) * scale
             del k, k_transposed
-            attention_mask = (~attention_mask) * torch.finfo(q.dtype).min
-            attn_weights = attn_weights + attention_mask
-            del attention_mask
+            attention_mask_container[0] = (~attention_mask_container[0]) * torch.finfo(
+                q.dtype
+            ).min
+            attn_weights = attn_weights + attention_mask_container[0]
+            # del attention_mask
             # full-precision
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
@@ -312,7 +329,7 @@ class VisionSdpaAttention(nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=attention_mask,
+                attn_mask=attention_mask_container[0],
                 dropout_p=self.dropout,
                 is_causal=False,
             )

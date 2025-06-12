@@ -5,6 +5,7 @@ import dataclasses
 import logging
 import os
 import queue
+import random
 import socket
 import struct
 import threading
@@ -16,7 +17,7 @@ import numpy.typing as npt
 import requests
 import zmq
 from aiohttp import web
-import random
+
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -528,10 +529,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # NOTE: only support MLA for now: select one prefill rank as real rank
             assert (
                 self.kv_mgr.with_mla == True
-                ), "Only support MLA for decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank"
+            ), "Only support MLA for decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank"
             self.target_tp_rank = np.random.choice(self.target_tp_ranks)
 
-        self.target_tp_ranks = [self.target_tp_rank] if len(self.target_tp_ranks) == 0 else self.target_tp_ranks
+        self.target_tp_ranks = (
+            [self.target_tp_rank]
+            if len(self.target_tp_ranks) == 0
+            else self.target_tp_ranks
+        )
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr and engine_rank
@@ -546,7 +551,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 )
                 if bootstrap_info is not None:
                     # NOTE: only support MLA for now: select one prefill rank as real rank
-                    bootstrap_info["is_dummy"] = not bool(target_tp_rank == self.target_tp_rank or self.target_tp_rank is None)
+                    bootstrap_info["is_dummy"] = not bool(
+                        target_tp_rank == self.target_tp_rank
+                        or self.target_tp_rank is None
+                    )
                     bootstrap_infos.append(bootstrap_info)
                 else:
                     logger.error(
@@ -625,7 +633,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
-                        packed_aux_data_ptrs
+                        packed_aux_data_ptrs,
                     ]
                 )
 

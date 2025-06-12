@@ -147,7 +147,7 @@ def grouped_topk(
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
-    #return topk_weights, topk_ids
+    # return topk_weights, topk_ids
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
@@ -215,7 +215,7 @@ def biased_grouped_topk_impl(
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
-    #return topk_weights, topk_ids
+    # return topk_weights, topk_ids
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
@@ -223,6 +223,7 @@ def biased_grouped_topk_impl(
 
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
+
 
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
@@ -232,6 +233,7 @@ def _mask_topk_ids_padded_region(
         return
     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
     topk_ids[indices >= num_token_non_padded, :] = -1
+
 
 def biased_grouped_topk(
     hidden_states: torch.Tensor,

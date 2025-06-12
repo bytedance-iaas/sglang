@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import time
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -118,6 +119,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mask_container=[],
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -147,6 +149,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             flatten_batch=flatten_batch,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            mask_container=mask_container,
         )
         self.mlp = Qwen2_5_VLMLP(
             dim,
@@ -164,6 +167,7 @@ class Qwen2_5_VisionBlock(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+        # with nvtx.annotate("attn", "red"):
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -252,6 +256,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             embed_dim=hidden_size,
         )
 
+        self.mask_container = []
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = hidden_size // num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
@@ -266,6 +271,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
+                    mask_container=self.mask_container,
                 )
                 for i in range(depth)
             ]
@@ -415,13 +421,10 @@ class Qwen2_5_VisionTransformer(nn.Module):
             x = blk(
                 x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
             )
-
-        # adapter
         x = self.merger(x)
 
         reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
-
         return x
 
 

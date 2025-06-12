@@ -13,17 +13,17 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import heapq
 import logging
 import multiprocessing as mp
 import signal
 import threading
+import time
 from enum import Enum, auto
 from typing import Optional
 
-import heapq
 import psutil
 import setproctitle
-import time
 import zmq
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -119,20 +119,27 @@ class DataParallelController:
 
             if self.load_balance_method == LoadBalanceMethod.SHORTEST_QUEUE:
                 # no need to lock here, because we read & write in the same thread
-                self.dp_workload_status = [WorkerPayloadStatus(0, 0) for _ in range(server_args.dp_size)]
-                self.dp_workload_status_heap = self.build_dp_workload_status_heap_nolock()
+                self.dp_workload_status = [
+                    WorkerPayloadStatus(0, 0) for _ in range(server_args.dp_size)
+                ]
+                self.dp_workload_status_heap = (
+                    self.build_dp_workload_status_heap_nolock()
+                )
 
                 self.recv_from_workers = get_zmq_socket(
-                    self.context, zmq.PULL, port_args.worker_workload_status_ipc_name, True
+                    self.context,
+                    zmq.PULL,
+                    port_args.worker_workload_status_ipc_name,
+                    True,
                 )
 
         self.max_req_input_len = None
-    
+
     def build_dp_workload_status_heap_nolock(self):
         workload_heap = [
             # put queued_reqs first, then running_reqs, the order is important
             (status.queued_reqs, status.running_reqs, i)
-                for i, status in enumerate(self.dp_workload_status)
+            for i, status in enumerate(self.dp_workload_status)
         ]
         heapq.heapify(workload_heap)
         return workload_heap
@@ -148,7 +155,9 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
-            tmp_port_args.worker_workload_status_ipc_name = port_args.worker_workload_status_ipc_name
+            tmp_port_args.worker_workload_status_ipc_name = (
+                port_args.worker_workload_status_ipc_name
+            )
             dp_port_args.append(tmp_port_args)
 
             # This port is checked free in PortArgs.init_new.
@@ -253,8 +262,10 @@ class DataParallelController:
                 # Data parallelism resues the tensor parallelism group,
                 # so all dp ranks should use the same nccl port.
                 rank_port_args.nccl_port = port_args.nccl_port
-                 # also use the same worker workload status ipc name
-                rank_port_args.worker_workload_status_ipc_name = port_args.worker_workload_status_ipc_name
+                # also use the same worker workload status ipc name
+                rank_port_args.worker_workload_status_ipc_name = (
+                    port_args.worker_workload_status_ipc_name
+                )
 
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = (
@@ -297,13 +308,18 @@ class DataParallelController:
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
-        queued_reqs, running_reqs, shortest_queue_worker_rank = heapq.heappop(self.dp_workload_status_heap)
+        queued_reqs, running_reqs, shortest_queue_worker_rank = heapq.heappop(
+            self.dp_workload_status_heap
+        )
 
         self.workers[shortest_queue_worker_rank].send_pyobj(req)
 
         new_queued = queued_reqs + 1
         self.dp_workload_status[shortest_queue_worker_rank].queued_reqs = new_queued
-        heapq.heappush(self.dp_workload_status_heap, (new_queued, running_reqs, shortest_queue_worker_rank))
+        heapq.heappush(
+            self.dp_workload_status_heap,
+            (new_queued, running_reqs, shortest_queue_worker_rank),
+        )
 
     def event_loop(self):
         last_scheduler_status_check_time = time.time()
@@ -335,7 +351,10 @@ class DataParallelController:
 
             # check scheduler status
             now = time.time()
-            if now - last_scheduler_status_check_time > self.server_args.scheduler_workload_report_interval:
+            if (
+                now - last_scheduler_status_check_time
+                > self.server_args.scheduler_workload_report_interval
+            ):
                 all_workload_status = []
                 while True:
                     try:
@@ -347,7 +366,9 @@ class DataParallelController:
                 for status in all_workload_status:
                     self.dp_workload_status[status.dp_rank] = status.status
                 # rebuild heap
-                self.dp_workload_status_heap = self.build_dp_workload_status_heap_nolock()
+                self.dp_workload_status_heap = (
+                    self.build_dp_workload_status_heap_nolock()
+                )
 
                 last_scheduler_status_check_time = now
 

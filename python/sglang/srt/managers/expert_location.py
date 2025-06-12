@@ -166,8 +166,8 @@ class ExpertLocationMetadata:
             logical_count = torch.tensor(logical_count)
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        #print('-----------------------')
-        #print(logical_count)
+        # print('-----------------------')
+        # print(logical_count)
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             deepseek_eplb.rebalance_experts(
                 weight=logical_count,
