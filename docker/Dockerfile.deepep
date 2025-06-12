@@ -7,7 +7,7 @@ RUN apt-get update \
 build-essential \
 wget \
 libssl-dev \
-&& wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh \
+&& wget https://ghfast.top/github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh \
 && chmod +x cmake-3.27.4-linux-x86_64.sh \
 && ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local \
 && rm cmake-3.27.4-linux-x86_64.sh
