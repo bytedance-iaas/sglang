@@ -1,5 +1,5 @@
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE} AS BASE
+FROM ${BASE_IMAGE} AS base
 
 # CMake
 RUN apt-get update \
@@ -87,7 +87,7 @@ RUN NVSHMEM_SHMEM_SUPPORT=0 \
     && cd build \
     && make install -j
 
-FROM BASE
+FROM base
 
 WORKDIR /sgl-workspace/DeepEP
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
