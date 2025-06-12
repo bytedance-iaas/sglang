@@ -1,6 +1,17 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE} AS base
 
+# 使用构建参数设置代理环境变量
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+# 如果参数存在，则设置环境变量
+ENV HTTP_PROXY=$HTTP_PROXY
+ENV HTTPS_PROXY=$HTTPS_PROXY
+ENV NO_PROXY=$NO_PROXY
+
+
 # CMake
 RUN apt-get update \
 && apt-get install -y --no-install-recommends \
