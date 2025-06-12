@@ -50,10 +50,10 @@ RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libm
 RUN apt-get install -y libfabric-dev
 
 # flash MLA
-WORKDIR /sgl-workspace
-RUN git clone --branch support_fp8  https://ghfast.top/github.com/bytedance-iaas/FlashMLA.git
-WORKDIR /sgl-workspace/FlashMLA
-RUN pip install . --break-system-packages
+# WORKDIR /sgl-workspace
+# RUN git clone --branch support_fp8  https://ghfast.top/github.com/bytedance-iaas/FlashMLA.git
+# WORKDIR /sgl-workspace/FlashMLA
+# RUN pip install . --break-system-packages
 
 # DeepEP
 WORKDIR /sgl-workspace
