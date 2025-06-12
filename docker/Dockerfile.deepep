@@ -109,5 +109,10 @@ RUN unset HTTP_PROXY \
     && unset HTTPS_PROXY \
     && unset NO_PROXY
 
+RUN HTTP_PROXY= \
+    && HTTPS_PROXY= \
+    && NO_PROXY= \
+    && echo "Proxy environment variables unset."
+
 # Set workspace
 WORKDIR /sgl-workspace
