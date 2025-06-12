@@ -18,7 +18,7 @@ RUN apt-get update \
 build-essential \
 wget \
 libssl-dev \
-&& wget https://ghfast.top/github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh \
+&& wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh \
 && chmod +x cmake-3.27.4-linux-x86_64.sh \
 && ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local \
 && rm cmake-3.27.4-linux-x86_64.sh
@@ -32,7 +32,7 @@ RUN apt-get update \
 
 # GDRCopy
 WORKDIR /tmp
-RUN git clone https://ghfast.top/github.com/NVIDIA/gdrcopy.git
+RUN git clone https://github.com/NVIDIA/gdrcopy.git
 WORKDIR /tmp/gdrcopy
 RUN git checkout v2.4.4
 
@@ -53,7 +53,7 @@ ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 # ep statistics
 WORKDIR /sgl-workspace
 RUN mkdir tmp && cd tmp \
-    && git clone -b ep_main --depth 1 https://ghfast.top/github.com/bytedance-iaas/sglang.git && mv sglang/benchmark/config/*.json /sgl-workspace/ && cd .. && rm -rf tmp
+    && git clone -b ep_main --depth 1 https://github.com/bytedance-iaas/sglang.git && mv sglang/benchmark/config/*.json /sgl-workspace/ && cd .. && rm -rf tmp
 
 
 # IBGDA dependency
@@ -62,13 +62,13 @@ RUN apt-get install -y libfabric-dev
 
 # flash MLA
 WORKDIR /sgl-workspace
-RUN git clone --branch support_fp8  https://ghfast.top/github.com/bytedance-iaas/FlashMLA.git
+RUN git clone --branch support_fp8  https://github.com/bytedance-iaas/FlashMLA.git
 WORKDIR /sgl-workspace/FlashMLA
 RUN pip install . --break-system-packages
 
 # DeepEP
 WORKDIR /sgl-workspace
-RUN git clone --branch h20_support https://ghfast.top/github.com/bytedance-iaas/DeepEP.git
+RUN git clone --branch h20_support https://github.com/bytedance-iaas/DeepEP.git
 
 # NVSHMEM
 WORKDIR /sgl-workspace
