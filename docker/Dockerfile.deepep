@@ -105,5 +105,9 @@ RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install . --break-system-pack
 # Install mooncake
 RUN python3 -m pip install mooncake-transfer-engine --break-system-packages
 
+RUN unset HTTP_PROXY \
+    && unset HTTPS_PROXY \
+    && unset NO_PROXY
+
 # Set workspace
 WORKDIR /sgl-workspace
