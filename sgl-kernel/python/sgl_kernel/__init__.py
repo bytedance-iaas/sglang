@@ -43,6 +43,7 @@ from sgl_kernel.gemm import (
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
+    sgl_silu_and_mul_per_token_group_quant_fp8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
 )
