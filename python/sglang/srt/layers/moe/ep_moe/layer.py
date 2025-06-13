@@ -19,6 +19,7 @@ try:
 
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
+        sglang_silu_and_mul_per_token_group_quant_fp8,
     )
 
     use_deep_gemm = True
@@ -55,12 +56,23 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    DeepEPMode,
+    dispose_tensor,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import ep_moe_pre_reorder as sgl_ep_moe_pre_reorder
 
 logger = logging.getLogger(__name__)
 
@@ -288,19 +300,32 @@ class EPMoE(torch.nn.Module):
                 self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
         # PreReorder
-        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            src2dst,
-            topk_ids,
-            self.w13_input_scale,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
-            use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-        )
+        if _is_cuda:
+            sgl_ep_moe_pre_reorder(
+                hidden_states,
+                gateup_input,
+                src2dst,
+                topk_ids,
+                self.w13_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.top_k,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+            )
+        else:
+            pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+                hidden_states,
+                gateup_input,
+                src2dst,
+                topk_ids,
+                self.w13_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.top_k,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+            )
         dispose_tensor(hidden_states)
 
         if (
@@ -1157,17 +1182,14 @@ class DeepEPMoE(EPMoE):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
-        del gateup_output
+        down_input_fp8, down_input_scale = sglang_silu_and_mul_per_token_group_quant_fp8(Add commentMore actions
+            gateup_output.view(-1, N), down_input, scale_block_size
+        )
         down_output = torch.empty(
             (all_tokens, K),
             device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
-        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input, scale_block_size
-        )
-        del down_input
         down_input_scale = tma_align_input_scale(down_input_scale)
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (down_input_fp8, down_input_scale),

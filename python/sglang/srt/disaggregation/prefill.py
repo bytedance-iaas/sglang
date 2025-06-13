@@ -127,6 +127,7 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.scheduler.disagg_launch_done,
         )
         return kv_manager
 
@@ -233,8 +234,17 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                # NOTE: never influence the kernel launch
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.clear()
                 result = self.run_batch(batch)
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.set()
                 self.process_batch_result_disagg_prefill(batch, result)
+            else:
+                # NOTE: no batch to forward, release the event
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.set()
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
@@ -340,6 +350,9 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+        if self.disagg_launch_done is not None:
+            self.disagg_launch_done.clear()
+            
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):

@@ -1,5 +1,16 @@
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS base
+
+# 使用构建参数设置代理环境变量
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+# 如果参数存在，则设置环境变量
+ENV HTTP_PROXY=$HTTP_PROXY
+ENV HTTPS_PROXY=$HTTPS_PROXY
+ENV NO_PROXY=$NO_PROXY
+
 
 # CMake
 RUN apt-get update \
@@ -41,25 +52,23 @@ ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 
 # ep statistics
 WORKDIR /sgl-workspace
+RUN mkdir tmp && cd tmp \
+    && git clone -b ep_main --depth 1 https://github.com/bytedance-iaas/sglang.git && mv sglang/benchmark/config/*.json /sgl-workspace/ && cd .. && rm -rf tmp
 
-RUN wget https://github.com/bytedance-iaas/sglang/blob/ep_main/benchmark/config/DeepSeek-R1_decode_ep32_3500_1500.json \
-    && wget  https://github.com/bytedance-iaas/sglang/blob/ep_main/benchmark/config/DeepSeek-R1_prefill_ep16_3500_1500.json
 
 # IBGDA dependency
-RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 RUN apt-get install -y libfabric-dev
 
 # flash MLA
 WORKDIR /sgl-workspace
 RUN git clone --branch support_fp8  https://github.com/bytedance-iaas/FlashMLA.git
 WORKDIR /sgl-workspace/FlashMLA
-RUN pip install .
+RUN pip install . --break-system-packages
 
 # DeepEP
 WORKDIR /sgl-workspace
 RUN git clone --branch h20_support https://github.com/bytedance-iaas/DeepEP.git
-
-RUN wget https://github.com/bytedance-iaas/sglang/blob/ep_main/benchmark/config/deepep_tuned_H20_4rnic.json 
 
 # NVSHMEM
 WORKDIR /sgl-workspace
@@ -87,12 +96,23 @@ RUN NVSHMEM_SHMEM_SUPPORT=0 \
     && cd build \
     && make install -j
 
+FROM base
+
 WORKDIR /sgl-workspace/DeepEP
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
-RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install --break-system-packages .
+RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install . --break-system-packages
 
 # Install mooncake
-RUN python3 -m pip install mooncake-transfer-engine 
+RUN python3 -m pip install mooncake-transfer-engine --break-system-packages
+
+RUN unset HTTP_PROXY \
+    && unset HTTPS_PROXY \
+    && unset NO_PROXY
+
+RUN HTTP_PROXY= \
+    && HTTPS_PROXY= \
+    && NO_PROXY= \
+    && echo "Proxy environment variables unset."
 
 # Set workspace
 WORKDIR /sgl-workspace
