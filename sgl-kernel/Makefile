@@ -9,6 +9,12 @@ check-deps: ## Check and install required Python formatting dependencies
 	@command -v isort >/dev/null 2>&1 || (echo "Installing isort..." && pip install isort)
 	@command -v black >/dev/null 2>&1 || (echo "Installing black..." && pip install black)
 
+GROUPED_GEMM_URL := git+https://github.com/kousakawang/grouped_gemm.git@main
+PYPI_MIRROR := -i http://pypi.mirrors.ustc.edu.cn/simple/ --trusted-host pypi.mirrors.ustc.edu.cn
+
+install-grouped-gemm: ## Install grouped_gemm from GitHub
+	pip install --verbose $(GROUPED_GEMM_URL) $(PYPI_MIRROR)
+
 install-deps: ## Install Python formatting tools (isort and black)
 	pip install scikit-build-core isort black
 
@@ -25,7 +31,7 @@ ln: submodule ## Create compilation database
 install: submodule ## Install package in development mode
 	@pip install -e . --no-build-isolation
 
-build: install-deps submodule ## Build and install wheel package
+build: install-deps submodule install-grouped-gemm## Build and install wheel package
 	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
