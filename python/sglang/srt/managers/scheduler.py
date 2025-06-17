@@ -153,6 +153,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -622,7 +623,8 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            hidden_size=AutoConfig.from_pretrained(self.server_args.model_path).hidden_size
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size,hidden_size)
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -632,6 +634,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                server_args=self.server_args,
             )
 
             # The decode requests pending for pre-allocation
@@ -669,7 +672,8 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            hidden_size=AutoConfig.from_pretrained(self.server_args.model_path).hidden_size
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size,hidden_size)
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1406,8 +1410,6 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-
-        # TODO(ch-wan): minor refactor is needed here to improve readability
         any_new_batch = (
             self.server_args.enable_dp_attention
             and not self.spec_algorithm.is_none()
