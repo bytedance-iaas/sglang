@@ -84,6 +84,11 @@ class DeepseekModelNextN(nn.Module):
                 input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
+        
+        # print("before forward_batch.spec_info.hidden_states.dtype: ", forward_batch.spec_info.hidden_states.dtype)
+        # print("before self.hnorm.weight.dtype: ", self.hnorm.weight.dtype)
+        forward_batch.spec_info.hidden_states = forward_batch.spec_info.hidden_states.to(self.hnorm.weight.dtype)
+        # print("after forward_batch.spec_info.hidden_states.dtype: ", forward_batch.spec_info.hidden_states.dtype)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
