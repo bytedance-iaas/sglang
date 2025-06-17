@@ -128,6 +128,7 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        launch_kernel_done: Optional[threading.Event] = None,
     ):
         self.kv_args = args
         self.engine = MooncakeTransferEngine(
@@ -154,6 +155,7 @@ class MooncakeKVManager(BaseKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+            self.disagg_launch_done = launch_kernel_done
             self.start_prefill_thread()
             self._register_to_bootstrap()
             self.session_failures = defaultdict(int)
@@ -238,6 +240,10 @@ class MooncakeKVManager(BaseKVManager):
         dst_kv_indices: npt.NDArray[np.int64],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        # NOTE: When preparing the meatadata, we also need to wait for the kernel launch
+        if self.disagg_launch_done is not None:
+            self.disagg_launch_done.wait()
+        
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -259,6 +265,10 @@ class MooncakeKVManager(BaseKVManager):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
+
+                # FIXME: remove the GIL in transfer_sync
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.wait()
 
                 status = self.engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length

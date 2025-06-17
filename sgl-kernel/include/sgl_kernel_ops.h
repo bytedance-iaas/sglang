@@ -105,7 +105,8 @@ void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& q_nope,
+    torch::Tensor const& q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
@@ -185,6 +186,13 @@ void sgl_per_token_group_quant_int8(
     double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void sgl_silu_and_mul_per_token_group_quant_fp8(at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double fp8_min,
+    double fp8_max);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
