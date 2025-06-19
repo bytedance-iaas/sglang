@@ -670,6 +670,7 @@ class Scheduler(
             self.etcd_client = etcd3.client(host=etcd_endpoint.split(":")[0],
                                         port=int(etcd_endpoint.split(":")[1]))
             self.remote_agent_map = {}
+            self.remote_engine_configs = {}
             self.nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
 
     @DynamicGradMode()
