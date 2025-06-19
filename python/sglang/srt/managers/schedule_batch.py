@@ -98,6 +98,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "triton_attention_reduce_in_fp32",
     "ep_num_redundant_experts",
     "mm_attention_backend",
+    "tp_size"
 ]
 
 # Put some global args for easy access
