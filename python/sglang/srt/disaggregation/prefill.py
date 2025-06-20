@@ -654,10 +654,13 @@ class SchedulerDisaggregationPrefillMixin:
             import nats
 
             nats_client = await nats.connect(self.nats_endpoint)
+            js = nats_client.jetstream()
 
-            sub = await nats_client.subscribe(queue_name)
+            sub = await js.subscribe(queue_name)
+
             while True:
                 msg = await sub.next_msg(timeout=None)
+                await msg.ack()
                 remote_prefill_req: RemotePrefillReq = pickle.loads(msg.data)
                 logger.debug(f"Recv request {remote_prefill_req.rid} and bootstrap room: {remote_prefill_req.bootstrap_room}.")
                 self.remote_prefill_reqs.append(remote_prefill_req)

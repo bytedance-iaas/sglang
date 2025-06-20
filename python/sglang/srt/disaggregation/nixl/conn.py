@@ -532,11 +532,20 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(f"Send request and kv indices to queue: {queue_name} with len: {len(remote_prefill_req_data)} and boostrap room: {req.bootstrap_room}")
             nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
             nats_client = await nats.connect(nats_endpoint)
+            js = nats_client.jetstream()
+            await js.add_stream(
+                name=queue_name,
+                subjects=[queue_name],
+                max_age=60 * 60 * 24,  # 1 day
+                max_bytes=1024 * 1024 * 1024,  # 1 GB
+                max_msgs=1000000,  # 1 million messages
+            )
 
-            await nats_client.publish(
+            ark = await js.publish(
                 queue_name,
                 remote_prefill_req_data
             )
+            logger.debug(f"Published request to NATS with ark: {ark}")
 
         asyncio.run_coroutine_threadsafe(send_to_nats(), self.send_to_queue_loop)
         logger.debug(f"Send request to queue succeed!")
