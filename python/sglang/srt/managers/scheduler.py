@@ -883,14 +883,14 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req, (TokenizedGenerateReqInput, RemotePrefillReq, TokenizedEmbeddingReqInput)
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req, (TokenizedGenerateReqInput, RemotePrefillReq, TokenizedEmbeddingReqInput)
                     )
                 ]
             else:

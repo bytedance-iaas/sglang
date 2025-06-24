@@ -489,7 +489,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
     def _start_send_to_queue_thread(self, event_loop):
         """Start a thread to send requests to the queue."""
-        if self.kv_mgr.engine_rank != 0:
+        per_dp_tp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
+        if self.kv_mgr.engine_rank % per_dp_tp_rank != 0:
             return
 
         def start_async_loop(loop):
@@ -545,11 +546,12 @@ class NixlKVReceiver(CommonKVReceiver):
                 queue_name,
                 remote_prefill_req_data
             )
+
+            self.started_transfer = True
             logger.debug(f"Published request to NATS with ark: {ark}")
 
         asyncio.run_coroutine_threadsafe(send_to_nats(), self.send_to_queue_loop)
         logger.debug(f"Send request to queue succeed!")
-        self.started_transfer = True
 
     def init(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         if self.is_remote_prefill:

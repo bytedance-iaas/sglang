@@ -223,10 +223,8 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         # only start the queue thread on rank 0
-        if self.is_remote_prefill:
-            per_dp_tp_size = self.tp_size // self.dp_size
-            if self.tp_rank % per_dp_tp_size == 0:
-                self._start_queue_thread()
+        if self.is_remote_prefill and self.attn_tp_rank == 0:
+            self._start_queue_thread()
 
         while True:
             recv_reqs = self.recv_requests()
@@ -265,7 +263,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
-        if self.is_remote_prefill:
+        if self.is_remote_prefill and self.attn_tp_rank == 0:
             self._start_queue_thread()
 
         while True:
@@ -547,7 +545,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.remote_engine_configs.get(engine_id) is None:
             # only load on first time
-            data = self.etcd_client.get(f"/engine_config/{self.model_name_hash}/{engine_id}")
+            data = self.etcd_client.get(f"/decode/{self.model_name_hash}/{engine_id}")
             engine_config = json.loads(data[0])
             self.remote_engine_configs[engine_id] = engine_config
 
@@ -595,9 +593,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
             kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
         else:
-            if self.tp_rank % prefill_per_dp_tp_size != 0:
-                kv_mgr.update_status(bootstrap_room, KVPoll.Success)
-                return
             # first tp rank in each dp group will send kv chunk to all decode ranks
             target_tp_ranks = [
                 offset + remote_prefill_req.engine_rank
@@ -617,6 +612,9 @@ class SchedulerDisaggregationPrefillMixin:
                 assert isinstance(kv_sender, NixlKVSender), \
                     f"Expect NixlKVSender but got {type(kv_sender)} for remote prefill request {remote_prefill_req.rid}"
 
+                dst_kv_indices = np.frombuffer(kv_indices, dtype=np.int64) \
+                    if self.attn_tp_rank == 0 else np.array([], dtype=np.int64)
+
                 agent_name = agent_info["agent_name"]
                 agent_key = f"{agent_name}_{target_tp_rank}"
                 logger.debug(f"rank {self.tp_rank} with agent name: {agent_name}")
@@ -627,10 +625,10 @@ class SchedulerDisaggregationPrefillMixin:
                     room =remote_prefill_req.bootstrap_room,
                     endpoint=remote_prefill_req.rank_ip,
                     dst_port=remote_prefill_req.rank_port,
-                    agent_metadata= agent_info["agent_metadata"],
+                    agent_metadata=agent_info["agent_metadata"],
                     agent_name=agent_name,
                     dst_kv_ptrs=agent_info["kv_data_ptrs"],
-                    dst_kv_indices= np.frombuffer(kv_indices, dtype=np.int64),
+                    dst_kv_indices=dst_kv_indices,
                     dst_aux_ptrs=agent_info["aux_data_ptrs"],
                     dst_aux_index=remote_prefill_req.aux_index,
                     dst_gpu_id=agent_info["gpu_id"],
@@ -656,7 +654,15 @@ class SchedulerDisaggregationPrefillMixin:
             nats_client = await nats.connect(self.nats_endpoint)
             js = nats_client.jetstream()
 
-            sub = await js.subscribe(queue_name)
+            await js.add_stream(
+                name=queue_name,
+                subjects=[queue_name],
+                max_age=60 * 60 * 24,  # 1 day
+                max_bytes=1024 * 1024 * 1024,  # 1 GB
+                max_msgs=1000000,  # 1 million messages
+            )
+
+            sub = await js.subscribe(queue_name, queue=queue_name)
 
             while True:
                 msg = await sub.next_msg(timeout=None)
