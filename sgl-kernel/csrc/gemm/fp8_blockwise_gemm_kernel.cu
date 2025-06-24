@@ -24,13 +24,13 @@
 #include <cute/tensor.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 // #include <cutlass/epilogue/collective/default_epilogue.hpp>
-#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/epilogue/collective/default_epilogue.hpp>
+#include <cutlass_extensions/epilogue/collective/default_epilogue.hpp>
 #include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
-#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/collective/collective_builder.hpp>
-#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/dispatch_policy_extention.hpp>
-#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/kernel/gemm_universal.hpp>
+#include <cutlass_extensions/sm89/collective/collective_builder.hpp>
+#include <cutlass_extensions/sm89/dispatch_policy_extention.hpp>
+#include <cutlass_extensions/sm89/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
-#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/epilogue/thread/conversion_op.h>
+#include <cutlass_extensions/epilogue/thread/conversion_op.h>
 
 #include "utils.h"
 

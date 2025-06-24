@@ -35,7 +35,7 @@
 
 #include "cutlass/cutlass.h"
 // #include "cutlass/gemm/dispatch_policy.hpp"
-#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/dispatch_policy_extention.hpp>
+#include <cutlass_extensions/sm89/dispatch_policy_extention.hpp>
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
