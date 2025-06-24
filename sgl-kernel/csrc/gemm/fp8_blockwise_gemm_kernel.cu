@@ -23,12 +23,14 @@
 
 #include <cute/tensor.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
-#include <cutlass/epilogue/collective/default_epilogue.hpp>
+// #include <cutlass/epilogue/collective/default_epilogue.hpp>
+#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/epilogue/collective/default_epilogue.hpp>
 #include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
-#include <cutlass/gemm/collective/collective_builder.hpp>
-#include <cutlass/gemm/dispatch_policy.hpp>
-#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/collective/collective_builder.hpp>
+#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/dispatch_policy_extention.hpp>
+#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/sm89/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
+#include </root/sglang-iaas/sgl-kernel/csrc/cutlass_extensions/epilogue/thread/conversion_op.h>
 
 #include "utils.h"
 
@@ -65,7 +67,7 @@ void launch_sm89_fp8_blockwise_scaled_mm(
   //
 
   // Number of pipelines you want to use
-  using DispatchPolicy = cutlass::gemm::MainloopSm80CpAsyncBlockScaling<PipelineStages>;
+  using DispatchPolicy = cutlass::gemm::MainloopSm80CpAsyncBlockScalingExtension<PipelineStages>;
 
   // This code section describes the MMA op and the tile size a warp will compute
   using TiledMma = TiledMMA<
@@ -116,7 +118,7 @@ void launch_sm89_fp8_blockwise_scaled_mm(
       cutlass::detail::TagToStrideC_t<LayoutC>,
       cutlass::detail::TagToStrideC_t<LayoutD>,
       cutlass::epilogue::thread::
-          Convert<ElementD, AlignmentD, ElementAccumulator, cutlass::FloatRoundStyle::round_half_ulp_truncate>,
+          Convert_extension<ElementD, AlignmentD, ElementAccumulator, cutlass::FloatRoundStyle::round_half_ulp_truncate>,
       cutlass::gemm::EpilogueDefault>;
 
   using GemmKernel =
