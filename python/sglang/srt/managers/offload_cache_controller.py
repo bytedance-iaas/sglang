@@ -9,10 +9,8 @@ from typing import Iterable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPoolHost,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +237,7 @@ class OffloadCacheController(HiCacheController):
         """
         torch.cuda.set_stream(self.write_stream)
         while not self.stop_event.is_set():
-            #logger.debug("wirte thread eventloop running")
+            # logger.debug("wirte thread eventloop running")
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
                 if self.write_policy == "write_through":
@@ -256,7 +254,7 @@ class OffloadCacheController(HiCacheController):
         """
         torch.cuda.set_stream(self.load_stream)
         while not self.stop_event.is_set():
-            #logger.debug("load thread eventloop running")
+            # logger.debug("load thread eventloop running")
             # self.load_cache_event.wait(timeout=1)
             # if not self.load_cache_event.is_set():
             #     continue
@@ -328,7 +326,13 @@ class OffloadCacheController(HiCacheController):
             )
         )
         return device_indices
-    def evict_host(self, host_indices: torch.Tensor, content_hash: Optional[List[int]], backup_only: bool = True) -> int:
+
+    def evict_host(
+        self,
+        host_indices: torch.Tensor,
+        content_hash: Optional[List[int]],
+        backup_only: bool = True,
+    ) -> int:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 

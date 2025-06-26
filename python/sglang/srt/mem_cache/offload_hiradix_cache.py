@@ -10,16 +10,16 @@ from sglang.srt.managers.offload_cache_controller import (
     OffloadCacheController,
     get_content_hash,
 )
-from sglang.srt.mem_cache.offload_memory_pool import (
-    OffloadMHATokenToKVPoolHost,
-    OffloadMLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
-    MemoryStateInt,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
-    TokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.memory_pool_host import MemoryStateInt
+from sglang.srt.mem_cache.offload_memory_pool import (
+    OffloadMHATokenToKVPoolHost,
+    OffloadMLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.mem_cache.radix_cache import _key_match_page_size1 as _key_match
@@ -237,10 +237,12 @@ class OffloadHiRadixCache(RadixCache):
                     )
                     != MemoryStateInt.IDLE
                 ):
-                    logger.info(f"try to free memory ongoing_write_through {ack_id} 's  memory, size of content_hash is {len(self.ongoing_write_through[ack_id].content_hash)}, size of host_value is {len(self.ongoing_write_through[ack_id].host_value)}")
+                    logger.info(
+                        f"try to free memory ongoing_write_through {ack_id} 's  memory, size of content_hash is {len(self.ongoing_write_through[ack_id].content_hash)}, size of host_value is {len(self.ongoing_write_through[ack_id].host_value)}"
+                    )
                     self.cache_controller.mem_pool_host.free(
                         self.ongoing_write_through[ack_id].host_value,
-                        self.ongoing_write_through[ack_id].content_hash
+                        self.ongoing_write_through[ack_id].content_hash,
                     )
                 self.ongoing_write_through[ack_id].host_value = None
             if not write_back:
@@ -365,8 +367,10 @@ class OffloadHiRadixCache(RadixCache):
             return self._evict_regular(node)
         state = self.cache_controller.mem_pool_host.get_state(node.host_value)
         if state != MemoryStateInt.SYNCED:
-            logger.info(f"try to free memory unsynced memory, size of content_hash is {len(node.content_hash)}, size of host_value is {len(node.host_value)}")
-            self.cache_controller.mem_pool_host.free(node.host_value , node.content_hash)
+            logger.info(
+                f"try to free memory unsynced memory, size of content_hash is {len(node.content_hash)}, size of host_value is {len(node.host_value)}"
+            )
+            self.cache_controller.mem_pool_host.free(node.host_value, node.content_hash)
             logger.error(f"unexpected unsynced host value {node.host_value} {state}")
             return self._evict_regular(node)
         num_evicted = self.cache_controller.evict_device(node.value, node.host_value)
@@ -512,18 +516,13 @@ class OffloadHiRadixCache(RadixCache):
             while last_node.evicted:
                 last_node = last_node.parent
         if self.tp_size > 1:
-            prefix_len_tensor = torch.tensor(
-                [len(prefix_indices)], device="cpu"
-            )
+            prefix_len_tensor = torch.tensor([len(prefix_indices)], device="cpu")
             torch.distributed.all_reduce(
                 prefix_len_tensor,
                 op=torch.distributed.ReduceOp.SUM,
                 group=self.tp_group,
             )
-            if (
-                prefix_len_tensor.item()
-                != len(prefix_indices) * self.tp_size
-            ):
+            if prefix_len_tensor.item() != len(prefix_indices) * self.tp_size:
                 logger.error("prefix len is not consistent")
         logger.debug(
             f"req init load back, last node:{last_node.id}, prefix len:{len(prefix_indices)}"
@@ -553,9 +552,7 @@ class OffloadHiRadixCache(RadixCache):
                 last_gpu_node = last_gpu_node.parent
             last_node = last_gpu_node
             prefix_indices = prev_prefix_indices
-            logger.error(
-                f"after load back failed, last node:{last_gpu_node.id}"
-            )
+            logger.error(f"after load back failed, last node:{last_gpu_node.id}")
         loading_check_end_ts = time.perf_counter()
         logger.debug(
             f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
@@ -812,8 +809,8 @@ class OffloadPagedHiRadixCache(OffloadHiRadixCache):
             f"few cache in radix, try load from offload, cache len {cache_prefix_len}, total len {len(key)}"
         )
         need_compute_key = key[cache_prefix_len:]
-        offload_hash, offload_key = self.cache_controller.find_longest_prefix_in_offload(
-            need_compute_key
+        offload_hash, offload_key = (
+            self.cache_controller.find_longest_prefix_in_offload(need_compute_key)
         )
         if self.tp_size > 1:
             offload_hash_len_tensor = torch.tensor(

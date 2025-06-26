@@ -4,20 +4,18 @@ import threading
 import time
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pris
 import torch
 import yaml
-import numpy as np
-
 
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
-    MemoryStateInt,
     MHATokenToKVPool,
     MLATokenToKVPool,
     debug_timing,
-    synchronized,
 )
+from sglang.srt.mem_cache.memory_pool_host import MemoryStateInt, synchronized
 
 logger = logging.getLogger(__name__)
 G_TensorPoolSize = 2048
@@ -32,10 +30,12 @@ G_EnableKVGetGPUDirect = False
 
 
 class FlexibleKVCacheMemoryPool:
-    def __init__(self, client: pris.PrisClient, device: str, kv_cache_shape, kv_cache_dtype):
+    def __init__(
+        self, client: pris.PrisClient, device: str, kv_cache_shape, kv_cache_dtype
+    ):
         self._init = False
         self.client = client
-        self.device = device 
+        self.device = device
         """ (num_layer, 2, chunk_size, num_kv_head, head_size) """
         self.kv_cache_shape = kv_cache_shape
         self.kv_cache_dtype = kv_cache_dtype
@@ -54,8 +54,7 @@ class FlexibleKVCacheMemoryPool:
 
         # Register memory with PrisClient
         self.mr_mem = self.client.reg_memory(
-            self.mempool.data_ptr(),
-            self.mempool.numel() * self.mempool.element_size()
+            self.mempool.data_ptr(), self.mempool.numel() * self.mempool.element_size()
         )
         if self.mr_mem == 0:
             logger.error("Failed to register memory with PrisClient")
@@ -98,7 +97,9 @@ class PrisKVClient:
 
     def __init__(self, endpoint: str, kv_cache_dtype, kv_cache_shape, device="cpu"):
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect, G_TensorPoolSize
-        config_file = os.environ.get(REMOTE_OFFLOAD_YAML_ENV_VAR, "/sgl-workspace/config/remote-offload.yaml")
+        config_file = os.environ.get(
+            REMOTE_OFFLOAD_YAML_ENV_VAR, "/sgl-workspace/config/remote-offload.yaml"
+        )
         if not os.path.exists(config_file):
             logger.error(f"Config file {config_file} does not exist")
             exit(1)
@@ -127,7 +128,9 @@ class PrisKVClient:
         self.kv_cache_dtype = kv_cache_dtype
 
         # Use GPU if G_EnableKVGetGPUDirect is True, else CPU
-        kv_get_device = "cuda" if G_EnableKVGetGPUDirect and torch.cuda.is_available() else "cpu"
+        kv_get_device = (
+            "cuda" if G_EnableKVGetGPUDirect and torch.cuda.is_available() else "cpu"
+        )
 
         self.kv_cache_mem_pool = FlexibleKVCacheMemoryPool(
             self.client,
@@ -137,7 +140,9 @@ class PrisKVClient:
         )
 
         # Use GPU if G_EnableKVSetGPUDirect is True, else CPU
-        kv_set_device = "cuda" if G_EnableKVSetGPUDirect and torch.cuda.is_available() else "cpu"
+        kv_set_device = (
+            "cuda" if G_EnableKVSetGPUDirect and torch.cuda.is_available() else "cpu"
+        )
         self.kv_cache_write_mem_pool = FlexibleKVCacheMemoryPool(
             self.client,
             kv_set_device,
@@ -151,7 +156,7 @@ class PrisKVClient:
 
     def exists_batch(self, keys: List[str]) -> List[bool]:
         logger.debug(f"Pris exists {len(keys)}")
-        
+
         ret = []
         for key in keys:
             r = self.client.exist(key)
@@ -181,24 +186,30 @@ class PrisKVClient:
             else:
                 obj = item
             objs.append(obj)
-            sgls.append(pris.SGL(
-                obj.data_ptr(),
-                obj.element_size() * obj.numel(),
-                self.kv_cache_mem_pool.mr_mem
-            ))
+            sgls.append(
+                pris.SGL(
+                    obj.data_ptr(),
+                    obj.element_size() * obj.numel(),
+                    self.kv_cache_mem_pool.mr_mem,
+                )
+            )
 
         # Get data
         status, lengths = self.client.mget(keys, sgls)
         get_data_end_time = time.perf_counter()
         get_data_execution_time = (get_data_end_time - get_data_start_time) * 1e6
-        logger.debug("Pris mget操作详情:\n"
-             f"- 总键数量: {len(keys)}\n"
-             f"- 状态码: {status}\n"
-             f"- 完整键列表: {keys}")
+        logger.debug(
+            "Pris mget操作详情:\n"
+            f"- 总键数量: {len(keys)}\n"
+            f"- 状态码: {status}\n"
+            f"- 完整键列表: {keys}"
+        )
         if status != 0:
             logger.error(f"Pris mget {keys} failed, status {status}")
             return None
-        logger.info(f"Pris mget | keys={len(keys)} | shapes={self.kv_cache_shape} | status={status} | time={get_data_execution_time:.2f}µs")
+        logger.info(
+            f"Pris mget | keys={len(keys)} | shapes={self.kv_cache_shape} | status={status} | time={get_data_execution_time:.2f}µs"
+        )
 
         # Ensure the output tensor is on the target device
         result = torch.stack(objs)
@@ -227,15 +238,17 @@ class PrisKVClient:
 
         sgls = []
         for i in range(count):
-            sgls.append(pris.SGL(
-                objs[i].data_ptr(),
-                objs[i].element_size() * objs[i].numel(),
-                self.kv_cache_mem_pool.mr_mem
-            ))
+            sgls.append(
+                pris.SGL(
+                    objs[i].data_ptr(),
+                    objs[i].element_size() * objs[i].numel(),
+                    self.kv_cache_mem_pool.mr_mem,
+                )
+            )
 
         ret = []
-        for key,sgl in zip(keys, sgls):
-            length= 0
+        for key, sgl in zip(keys, sgls):
+            length = 0
             # 0 is ok, > 0  is not ok
             status = self.client.get(key, sgl, length)
             if status == 0:
@@ -245,14 +258,18 @@ class PrisKVClient:
         while len(ret) < len(keys):
             ret.append(False)
         success_mask = ret
-        
+
         get_data_end_time = time.perf_counter()
         get_data_execution_time = (get_data_end_time - get_data_start_time) * 1e6
-        logger.info("Pris batch_get detail info:\n"
-             f"- total key nums: {len(keys)}\n"
-             f"- success key nums: {len(ret)}")
+        logger.info(
+            "Pris batch_get detail info:\n"
+            f"- total key nums: {len(keys)}\n"
+            f"- success key nums: {len(ret)}"
+        )
         logger.debug(f"- success key list: {keys}")
-        logger.debug(f"Pris get {count} keys data cost %.2f us", get_data_execution_time)
+        logger.debug(
+            f"Pris get {count} keys data cost %.2f us", get_data_execution_time
+        )
 
         # Ensure the output tensor is on the target device
         # if self.kv_cache_mem_pool.device != self.device:
@@ -277,19 +294,21 @@ class PrisKVClient:
         for i, _ in enumerate(keys):
             temp = objs[i].reshape(obj_inputs[i].shape).contiguous()
             temp.copy_(obj_inputs[i])
-            sgls.append(pris.SGL(
-                temp.data_ptr(),
-                temp.element_size() * temp.numel(),
-                self.kv_cache_write_mem_pool.mr_mem
-            ))
+            sgls.append(
+                pris.SGL(
+                    temp.data_ptr(),
+                    temp.element_size() * temp.numel(),
+                    self.kv_cache_write_mem_pool.mr_mem,
+                )
+            )
 
         # 多线程set实现
         from concurrent.futures import ThreadPoolExecutor
-        
+
         def _set_single(key, sgl):
             logger.debug(f"Pris set {key}")
             return self.client.set(key, sgl)
-            
+
         with ThreadPoolExecutor() as executor:
             results = list(executor.map(_set_single, keys, sgls))
 
@@ -298,27 +317,31 @@ class PrisKVClient:
 
         # # Set data
         # status = self.client.mset(keys, sgls)
-        logger.debug("Pris mset info:\n"
-             f"- total keys: {len(keys)}\n"
-             f"- summary results: {status}\n"
-             f"- keys info: {keys}\n"
-             f"- status info: {results} \n"
-             f"- success count: {success_count}")
+        logger.debug(
+            "Pris mset info:\n"
+            f"- total keys: {len(keys)}\n"
+            f"- summary results: {status}\n"
+            f"- keys info: {keys}\n"
+            f"- status info: {results} \n"
+            f"- success count: {success_count}"
+        )
         elapsed_us = (time.perf_counter() - start_time) * 1e6
-        logger.info(f"Pris mset | keys={len(keys)} | shapes={self.kv_cache_shape} | status={status} | time={elapsed_us:.2f}µs")
+        logger.info(
+            f"Pris mset | keys={len(keys)} | shapes={self.kv_cache_shape} | status={status} | time={elapsed_us:.2f}µs"
+        )
         if not status:
             logger.error(f"Pris mset {len(keys)} failed, status {status}")
             return False
         return True
-    
-    def delete(self,  keys: List[str]) -> bool:
-          # 多线程del实现
+
+    def delete(self, keys: List[str]) -> bool:
+        # 多线程del实现
         from concurrent.futures import ThreadPoolExecutor
-        
+
         def _del_single(key):
             logger.debug(f"Pris del single {key}")
             return self.client.delete(key)
-            
+
         with ThreadPoolExecutor() as executor:
             results = list(executor.map(_del_single, keys))
 
@@ -326,12 +349,13 @@ class PrisKVClient:
         status = success_count == len(results)
         logger.info(f"Pris mdel {len(keys)} keys,  successfully {success_count}")
         if not status:
-            logger.error(f"Pris mdel {len(keys)} failed, status {status}\n"
-            f"- status info: {results}")
+            logger.error(
+                f"Pris mdel {len(keys)} failed, status {status}\n"
+                f"- status info: {results}"
+            )
             return False
         logger.info(f"Pris mdel {len(keys)} keys successfully, status {status}")
         return True
-
 
 
 class OffloadBaseTokenToKVPoolHost:
@@ -356,7 +380,9 @@ class OffloadBaseTokenToKVPoolHost:
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         self.size = self.size - (self.size % self.page_size)
-        logger.info(f"OffloadBaseTokenToKVPoolHost init,{self.size=},{host_size=},{self.size_per_token=}")
+        logger.info(
+            f"OffloadBaseTokenToKVPoolHost init,{self.size=},{host_size=},{self.size_per_token=}"
+        )
         # Initialize memory states and tracking structures
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
@@ -382,6 +408,7 @@ class OffloadBaseTokenToKVPoolHost:
 
     def _get_host_ip(self):
         import socket
+
         return socket.gethostbyname(socket.gethostname())
 
     def _get_deploy_info(self):
@@ -413,7 +440,9 @@ class OffloadBaseTokenToKVPoolHost:
             key = keys[i : i + bs]
             objs, success_mask = self.pris_client.batch_get(key)
             if objs is None:
-                logger.error(f"Get flat data keys {key} failed, pris_client returned None")
+                logger.error(
+                    f"Get flat data keys {key} failed, pris_client returned None"
+                )
                 return None, []
             copy_objs = objs.clone()
             ret.extend([copy_objs[i] for i in range(copy_objs.shape[0])])
@@ -429,7 +458,9 @@ class OffloadBaseTokenToKVPoolHost:
         return flat_data, masks
 
     def assign_flat_data(self, indices, flat_data):
-        logger.debug(f"Assign flat data indices {indices},shape={flat_data.shape},split_dim={self.split_dim}")
+        logger.debug(
+            f"Assign flat data indices {indices},shape={flat_data.shape},split_dim={self.split_dim}"
+        )
         start_time = time.perf_counter()
 
         keys = self._encode_key_exclusive(indices)
@@ -482,7 +513,9 @@ class OffloadBaseTokenToKVPoolHost:
             key = keys[i : i + bs]
             objs, success_mask = self.pris_client.batch_get(key)
             if objs is None:
-                logger.error(f"Get flat data keys {key} failed, pris_client returned None")
+                logger.error(
+                    f"Get flat data keys {key} failed, pris_client returned None"
+                )
                 return None, []
             copy_objs = objs.clone()
             ret.extend([copy_objs[i] for i in range(copy_objs.shape[0])])
@@ -647,8 +680,6 @@ class OffloadMHATokenToKVPoolHost(OffloadBaseTokenToKVPoolHost):
         self.pris_client = PrisKVClient(
             None, self.dtype, self.kvcache_shape, device_pool.device
         )
-
-
 
 
 class OffloadMLATokenToKVPoolHost(OffloadBaseTokenToKVPoolHost):
