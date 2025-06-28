@@ -593,15 +593,15 @@ class Scheduler(
                     self.tree_cache = HiRadixCache(
                         req_to_token_pool=self.req_to_token_pool,
                         token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                        tp_cache_group=tp_cpu_group,
+                        tp_cache_group=tp_cache_group,
                         page_size=self.page_size,
                         hicache_ratio=server_args.hicache_ratio,
                         hicache_size=server_args.hicache_size,
                         hicache_write_policy=server_args.hicache_write_policy,
                     )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
-                )
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
 
             else:
                 self.tree_cache = RadixCache(

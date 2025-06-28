@@ -8,7 +8,11 @@ from typing import Iterable, List, Optional
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.cache_controller import (
+    CacheOperation,
+    HiCacheController,
+    LayerDoneCounter,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 
@@ -70,6 +74,8 @@ class OffloadCacheController(HiCacheController):
         self.write_policy = write_policy
         self.page_size = page_size
         self.load_cache_event = load_cache_event
+        self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
+        # self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
             "write_through",

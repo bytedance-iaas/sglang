@@ -11,6 +11,7 @@ from sglang.srt.managers.offload_cache_controller import (
     get_content_hash,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -495,80 +496,90 @@ class OffloadHiRadixCache(RadixCache):
     def init_load_back(
         self,
         last_node: TreeNode,
-        prefix_indices: torch.Tensor,
+        host_hit_length: int,
         mem_quota: Optional[int] = None,
     ):
-        assert (
-            len(prefix_indices) == 0 or prefix_indices.is_cuda
-        ), "indices of device kV caches should be on GPU"
-        prev_prefix_indices = prefix_indices
+        _ = host_hit_length  # unused
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
-                prefix_indices = (
-                    loading_values
-                    if len(prefix_indices) == 0
-                    else torch.cat([prefix_indices, loading_values])
-                )
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for last node {last_node.id}"
                 )
+                # sync
+                if self.tp_size > 1:
+                    prefix_len_tensor = torch.tensor(
+                        [len(loading_values)], device="cpu"
+                    )
+                    torch.distributed.all_reduce(
+                        prefix_len_tensor,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.tp_group,
+                    )
+                    if prefix_len_tensor.item() != len(loading_values) * self.tp_size:
+                        logger.error("prefix len is not consistent")
+                logger.debug(
+                    f"req init load back, last node:{last_node.id}, prefix len:{len(prefix_indices)}"
+                )
+                # wait load finish
+                loading_check_start_ts = time.perf_counter()
+                while not self.loading_complete(last_node):
+                    time.sleep(0.01)
+                load_flag = 100 if (last_node.value is None) else 0
+                load_sucess = True
+                if self.tp_size > 1:
+                    load_flag_tensor = torch.tensor([load_flag], device="cpu")
+                    torch.distributed.all_reduce(
+                        load_flag_tensor,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.tp_group,
+                    )
+                    if load_flag_tensor.item() > 0:
+                        logger.error("offload load back failed")
+                        load_sucess = False
+                else:
+                    if load_flag > 0:
+                        logger.error("offload load back failed")
+                        load_sucess = False
+                if not load_sucess:
+                    last_gpu_node = last_node
+                    while last_gpu_node.evicted:
+                        last_gpu_node = last_gpu_node.parent
+                    last_node = last_gpu_node
+                    logger.error(
+                        f"after load back failed, last node:{last_gpu_node.id}"
+                    )
+                loading_check_end_ts = time.perf_counter()
+                logger.debug(
+                    f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
+                )
+
+                return loadding_values, last_node
             while last_node.evicted:
                 last_node = last_node.parent
-        if self.tp_size > 1:
-            prefix_len_tensor = torch.tensor([len(prefix_indices)], device="cpu")
-            torch.distributed.all_reduce(
-                prefix_len_tensor,
-                op=torch.distributed.ReduceOp.SUM,
-                group=self.tp_group,
-            )
-            if prefix_len_tensor.item() != len(prefix_indices) * self.tp_size:
-                logger.error("prefix len is not consistent")
-        logger.debug(
-            f"req init load back, last node:{last_node.id}, prefix len:{len(prefix_indices)}"
+        return (
+            torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_node,
         )
-        loading_check_start_ts = time.perf_counter()
-        while not self.loading_complete(last_node):
-            time.sleep(0.01)
-        load_flag = 100 if (last_node.value is None) else 0
-        load_sucess = True
-        if self.tp_size > 1:
-            load_flag_tensor = torch.tensor([load_flag], device="cpu")
-            torch.distributed.all_reduce(
-                load_flag_tensor,
-                op=torch.distributed.ReduceOp.SUM,
-                group=self.tp_group,
-            )
-            if load_flag_tensor.item() > 0:
-                logger.error("offload load back failed")
-                load_sucess = False
-        else:
-            if load_flag > 0:
-                logger.error("offload load back failed")
-                load_sucess = False
-        if not load_sucess:
-            last_gpu_node = last_node
-            while last_gpu_node.evicted:
-                last_gpu_node = last_gpu_node.parent
-            last_node = last_gpu_node
-            prefix_indices = prev_prefix_indices
-            logger.error(f"after load back failed, last node:{last_gpu_node.id}")
-        loading_check_end_ts = time.perf_counter()
-        logger.debug(
-            f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
-        )
-        return last_node, prefix_indices
 
-    def ready_to_load_cache(self):
+    def ready_to_load_host_cache(self):
+        producer_index = self.cache_controller.layer_done_counter.next_producer()
         self.load_cache_event.set()
+        return producer_index
 
-    def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
+    def check_hicache_events(self):
+        self.writing_check()
+        self.loading_check()
+
+    def match_prefix(self, key: List[int]):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
-            if include_evicted:
-                return empty_value, self.root_node, self.root_node
-            else:
-                return empty_value, self.root_node
+            return MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_hit_length=0,
+            )
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
@@ -580,14 +591,17 @@ class OffloadHiRadixCache(RadixCache):
         else:
             value = empty_value
 
+        host_hit_length = 0
         last_node_global = last_node
         while last_node.evicted:
+            host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
-
-        if include_evicted:
-            return value, last_node, last_node_global
-        else:
-            return value, last_node
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node_global,
+            host_hit_length=host_hit_length,
+        )
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.time()
@@ -623,6 +637,7 @@ class OffloadHiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.loading = child.loading
+        new_node.hit_count = child.hit_count
 
         # split value and host value if exists
         if child.evicted:
@@ -853,10 +868,12 @@ class OffloadPagedHiRadixCache(OffloadHiRadixCache):
     def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
-            if include_evicted:
-                return empty_value, self.root_node, self.root_node
-            else:
-                return empty_value, self.root_node
+            return MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_hit_length=0,
+            )
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
@@ -870,16 +887,19 @@ class OffloadPagedHiRadixCache(OffloadHiRadixCache):
 
         # try to load from offload
         last_node = self.match_prefix_extend(key, last_node)
-
+        host_hit_length = 0
         last_node_global = last_node
         while last_node.evicted:
+            host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
-        if include_evicted:
-            return value, last_node, last_node_global
-        else:
-            return value, last_node
-
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node_global,
+            host_hit_length=host_hit_length,
+        )
+       
     def write_backup(self, node: TreeNode, write_back=False):
         if _need_calculate_hash(node, self.page_size):
             self._calculate_content_hash(node)
