@@ -1317,6 +1317,7 @@ class RemoteModelLoader(BaseModelLoader):
                         ".pt",
                         ".safetensors",
                         ".jpg",  # ignore jpg file
+                        ".png",
                     ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
