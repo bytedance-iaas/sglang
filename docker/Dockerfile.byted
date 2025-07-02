@@ -11,7 +11,9 @@ ARG branch=
 # 编译之前，将源统一设置成内网的
 RUN pip config set global.index-url https://bytedpypi.byted.org/simple
 RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
+    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/ivolces.com/byted.org/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/ivolces.com/byted.org/g' /etc/apt/sources.list
 
 # ep statistics
 WORKDIR /sgl-workspace
