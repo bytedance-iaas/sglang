@@ -213,6 +213,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     enable_eic_cache: bool = False
     disable_eic_shared: bool = False
+    enable_offload_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
@@ -565,6 +566,8 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
+        if self.enable_offload_cache and not self.enable_hierarchical_cache:
             self.enable_hierarchical_cache = True
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
@@ -1482,6 +1485,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-offload-cache",
+            action="store_true",
+            help="Enable Offload cache",
         )
         parser.add_argument(
             "--hicache-ratio",
