@@ -112,4 +112,4 @@ class TestAbortAll(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    print(2)
+    print(3)
