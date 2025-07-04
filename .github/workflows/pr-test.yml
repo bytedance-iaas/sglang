@@ -52,7 +52,7 @@ jobs:
   unit-test-backend-1-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 1-gpu-runner
+    runs-on: h20
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +74,7 @@ jobs:
   unit-test-backend-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 2-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     needs: [unit-test-frontend, unit-test-backend-2-gpu]
-    runs-on: 4-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -112,7 +112,7 @@ jobs:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     needs: [unit-test-frontend, unit-test-backend-2-gpu]
-    runs-on: 8-gpu-runner
+    runs-on: h20
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +134,7 @@ jobs:
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 1-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -184,7 +184,7 @@ jobs:
   performance-test-1-gpu-part-2:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 1-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -226,7 +226,7 @@ jobs:
   performance-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 2-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -274,7 +274,7 @@ jobs:
   accuracy-test-1-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 1-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -295,7 +295,7 @@ jobs:
   accuracy-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: 2-gpu-runner
+    runs-on: h20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
