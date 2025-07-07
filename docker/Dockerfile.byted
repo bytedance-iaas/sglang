@@ -4,6 +4,7 @@ FROM ${BASE_IMAGE}
 ARG sglang_version=
 ARG sgl_kernel_version=
 ARG gdkv_sdk_version=
+ARG pris_sdk_version=
 ARG eic_sdk_version=
 ARG absl_version=2.3.0
 ARG branch=
@@ -35,6 +36,9 @@ RUN http_proxy='' pip install sgl_kernel==${sgl_kernel_version} --extra-index-ur
 
 # gdkv sdk安装
 RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# pris sdk安装
+RUN http_proxy='' pip install pris==${pris_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
 # eic sdk安装
 RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
