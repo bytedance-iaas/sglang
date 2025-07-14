@@ -8,7 +8,7 @@ if [ ${#models[@]} -eq 0 ]; then
     exit 1
 fi
 
-cache_dir="${DEFAULT_MODEL_CACHE_DIR:-}"
+cache_dir="${HF_HOME:-}"
 
 if [ -z "$cache_dir" ]; then
     echo "DEFAULT_MODEL_CACHE_DIR environment variable is not set."
