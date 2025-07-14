@@ -1,33 +1,18 @@
-/***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #pragma once
 
 #include "cute/algorithm/functional.hpp"
@@ -51,6 +36,35 @@
 
 namespace cutlass::gemm::collective {
 using namespace cute;
+
+template <int N>
+CUTE_HOST_DEVICE void warpgroup_wait_() {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  cutlass::arch::synclog_emit_warpgroup_wait(__LINE__, N);
+  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+#else
+  CUTE_INVALID_CONTROL_PATH("Attempting to use wgmma.wait_group<N> without CUTE_ARCH_MMA_SM90A_ENABLED");
+#endif
+}
+
+CUTLASS_DEVICE void warpgroup_wait_dispatch(int onthefly_count) {
+  switch (onthefly_count) {
+    case 0:
+      warpgroup_wait_<0>();
+      break;
+    case 4:
+      warpgroup_wait_<4>();
+      break;
+    case 8:
+      warpgroup_wait_<8>();
+      break;
+    case 12:
+      warpgroup_wait_<12>();
+      break;
+    default:
+      assert(false && "Invalid onthefly_count value");
+  }
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -131,8 +145,8 @@ struct CollectiveMmaArrayMixedInput<
  public:
   static_assert(
       cute::is_tuple<ElementAOptionalTuple>::value ^ cute::is_tuple<ElementBOptionalTuple>::value,
-      "Either A OR B must be a tuple. It must take the from {ElementOperand, [ElementScale], [ElementZero]}. Inputs in "
-      "[] are optional.");
+      "Either A OR B must be a tuple. It must take the from {ElementOperand, [ElementScale], [ElementZero]}. Inputs "
+      "in [] are optional.");
 
   using ElementA = detail::deduce_mixed_width_dtype_t<0, ElementAOptionalTuple>;
   using ElementB = detail::deduce_mixed_width_dtype_t<0, ElementBOptionalTuple>;
@@ -301,9 +315,11 @@ struct CollectiveMmaArrayMixedInput<
   struct SharedStorage {
     static constexpr int scale_elements = Utils::elements_per_smem_scale();
     static constexpr int zero_elements = Utils::elements_per_smem_zero();
+
     struct TensorStorage {
       CUTE_ALIGNAS(SmemAlignmentA) cute::ArrayEngine<RealSwappedElementA, cute::cosize_v<SmemLayoutA>> smem_A;
-      CUTE_ALIGNAS(SmemAlignmentB) cute::ArrayEngine<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
+      CUTE_ALIGNAS(SmemAlignmentB)
+      cute::ArrayEngine<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
       cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
       cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
     } tensors;
@@ -318,6 +334,7 @@ struct CollectiveMmaArrayMixedInput<
     using PipelineStorage = typename MainloopPipeline::SharedStorage;
     PipelineStorage pipeline;
   };
+
   using TensorStorage = typename SharedStorage::TensorStorage;
   using TensorMapStorage = typename SharedStorage::TensorMapStorage;
   using PipelineStorage = typename SharedStorage::PipelineStorage;
@@ -405,8 +422,8 @@ struct CollectiveMmaArrayMixedInput<
 
   template <class ProblemShape>
   static constexpr Params to_underlying_arguments(ProblemShape problem_shapes, Arguments const& args, void* workspace) {
-    // These tensor shapes (only applicable for grouped gemm) and pointers are only used to create tensormap/tma desc.
-    // These will be replaced with correct values before the initial tma load.
+    // These tensor shapes (only applicable for grouped gemm) and pointers are only used to create tensormap/tma
+    // desc. These will be replaced with correct values before the initial tma load.
     auto init_shape = repeat_like(typename ProblemShape::UnderlyingProblemShape{}, int32_t(1));
     auto init_M = get<0>(init_shape);
     auto init_N = get<1>(init_shape);
@@ -566,7 +583,6 @@ struct CollectiveMmaArrayMixedInput<
                             fake_scale_k,
                             args.chunk_size,
                             (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}));
-
       } else {
         static_assert(
             cutlass::detail::dependent_false<KernelSchedule>,
@@ -643,8 +659,8 @@ struct CollectiveMmaArrayMixedInput<
           implementable = implementable && (args.ptr_S == nullptr);
           implementable = implementable && (args.ptr_Z == nullptr);
         } else if constexpr (ModeHasScales) {
-          const int scale_mn = SwapAB ? N : M;
-          const int scale_k = (K + args.chunk_size - 1) / args.chunk_size;
+          int const scale_mn = SwapAB ? N : M;
+          int const scale_k = (K + args.chunk_size - 1) / args.chunk_size;
           constexpr int min_tma_aligned_elements_scale = tma_alignment_bits / cutlass::sizeof_bits<ElementScale>::value;
           implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scale>(
                                                cute::make_shape(scale_mn, scale_k, L), StrideScale{});
@@ -844,9 +860,9 @@ struct CollectiveMmaArrayMixedInput<
         auto tSsS = get<1>(extra_input_partitions);
 
         // Temporary factor which will determine which k tile to reload from gmem. Needed so we don't modify tma
-        // transaction bytes on the fly. We must do a ceiling divide here to correctly handle with chunk_size == K. In
-        // that case, we don't require that K is a multiple of the threadblock tile K
-        const int scale_load_k = *k_tile_iter / 1;
+        // transaction bytes on the fly. We must do a ceiling divide here to correctly handle with chunk_size ==
+        // K. In that case, we don't require that K is a multiple of the threadblock tile K
+        int const scale_load_k = *k_tile_iter / 1;
         // const int scale_load_k = *k_tile_iter / mainloop_params.reload_factor; // This will always be 0 when
         // chunk_size == K.
         if (cute::elect_one_sync()) {
@@ -881,6 +897,7 @@ struct CollectiveMmaArrayMixedInput<
       ++smem_pipe_write;
     }
   }
+
   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   // Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
   CUTLASS_DEVICE void load_tail(MainloopPipeline pipeline, PipelineState smem_pipe_write) {
@@ -896,6 +913,7 @@ struct CollectiveMmaArrayMixedInput<
       pipeline.producer_tail(smem_pipe_write);
     }
   }
+
   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
@@ -1063,6 +1081,7 @@ struct CollectiveMmaArrayMixedInput<
 
       CUTLASS_PRAGMA_UNROLL
       for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+        warpgroup_wait_dispatch((NumChunksPerTileK - chunk_id_ - 1) * NumMMAsPerChunk);
         warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
         // Apply the group-wise scaling
@@ -1093,8 +1112,8 @@ struct CollectiveMmaArrayMixedInput<
 
       --k_tile_count;
       if (k_tile_count > 0) {
-        // Wait for K_BLOCK_MAX - 1 to be in flight to ensure that it is safe to overwrite the A registers for the first
-        // mma.
+        // Wait for K_BLOCK_MAX - 1 to be in flight to ensure that it is safe to overwrite the A registers for
+        // the first mma.
         pipeline.consumer_wait(smem_pipe_read, barrier_token);
 
         Utils::copy_tensors_MK(
@@ -1149,8 +1168,8 @@ struct CollectiveMmaArrayMixedInput<
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
           warpgroup_commit_batch();
 
-          warpgroup_wait<K_WAIT_MAX>();  // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage, so we can
-                                         // release prior barrier
+          warpgroup_wait<K_WAIT_MAX>();  // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage,
+                                         // so we can release prior barrier
           if (k_block == K_BLOCK_MAX - 1) {
             pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
             ++smem_pipe_release;
@@ -1165,6 +1184,7 @@ struct CollectiveMmaArrayMixedInput<
 
             CUTLASS_PRAGMA_UNROLL
             for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+              warpgroup_wait_dispatch((NumChunksPerTileK - chunk_id_ - 1) * NumMMAsPerChunk);
               warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
               // Apply the group-wise scaling
@@ -1265,6 +1285,8 @@ struct CollectiveMmaArrayMixedInput<
 
         if ((k_block + 1) % NumMMAsPerChunk == 0) {
           tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+          warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
 
           // Apply the group-wise scaling
@@ -1287,6 +1309,7 @@ struct CollectiveMmaArrayMixedInput<
       }
     }
   }
+
   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   /// Perform a Consumer Epilogue to release all buffers
   CUTLASS_DEVICE void mma_tail(MainloopPipeline pipeline, PipelineState smem_pipe_release, int k_tile_count) {
@@ -1304,6 +1327,7 @@ struct CollectiveMmaArrayMixedInput<
       ++smem_pipe_release;
     }
   }
+
   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //
   // Methods to perform different parts of TMA/Tensormap modifications

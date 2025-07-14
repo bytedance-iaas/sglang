@@ -157,6 +157,7 @@ struct MixedGroupedGemmInputUtils {
       Tensor<EngineScale, LayoutScale> const& scales_pos) {
     lookup_table_convert(src, dst, scales_neg, scales_pos);
   }
+
   template <class EngineIn, class LayoutIn, class EngineOut, class LayoutOut, class EngineScale, class LayoutScale>
   CUTLASS_DEVICE static void lookup_table_convert(
       Tensor<EngineIn, LayoutIn> const& src,
@@ -212,11 +213,13 @@ struct MixedGroupedGemmInputUtils {
         shape<0>(Layout{}) >= 4 && stride<0>(Layout{}) == 0,
         "At least 4 adjacent weights in a thread must share the same scale.");
   }
+
   template <class Engine, class Layout>
   CUTLASS_DEVICE static void static_check_scale(Tensor<Engine, Layout> const& tensor) {
     static_check_scale(flatten(Layout{}));
   }
 
+  // dequantize_A_kblock is here!!!
   template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
   CUTLASS_DEVICE static void dequantize_A_kblock(
       Tensor<EngineIn, LayoutIn> const& tCrA_load,
@@ -247,6 +250,8 @@ struct MixedGroupedGemmInputUtils {
         LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
       }
     } else if constexpr (UseScaleLookupTable) {
+      // this path
+
       constexpr int num_elements = decltype(size(src))::value;
       static_assert(
           is_same_v<RealSwappedElementA, cutlass::int4b_t>,
@@ -357,6 +362,7 @@ struct MixedGroupedGemmInputUtils {
     static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
     static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
     using SrcType = typename EngineIn::value_type;
+    using DstType = typename EngineOut::value_type;
 
     Tensor src = tCrA_load(_, _, k_block);
     Tensor dst = tCrA_mma(_, _, k_block);
