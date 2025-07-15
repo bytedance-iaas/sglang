@@ -257,8 +257,6 @@ set(SOURCES
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/kvcacheio/transfer.cu"
     "csrc/quantization/cutlass/scaled_mm_entry.cu"
-    "csrc/quantization/cutlass/cutlass_w4a8/w4a8_moe_data.cu"
-    "csrc/quantization/cutlass/cutlass_w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/quantization/cutlass/cutlass_w8a8/moe/moe_data.cu"
     "csrc/quantization/cutlass/cutlass_w8a8/moe/grouped_mm_c3x.cu"
     "csrc/common_extension.cc"
