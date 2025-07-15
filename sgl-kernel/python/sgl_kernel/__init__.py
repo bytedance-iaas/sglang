@@ -20,6 +20,7 @@ from sgl_kernel.attention import (
     merge_state_v2,
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
+from sgl_kernel.cutlass_moe_mm import cutlass_moe_mm, get_cutlass_moe_mm_data
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
@@ -89,12 +90,6 @@ from sgl_kernel.speculative import (
     verify_tree_greedy,
 )
 from sgl_kernel.top_k import fast_topk
-from sgl_kernel.cutlass_moe_mm import (
-    get_cutlass_moe_mm_data,
-    get_cutlass_w4a8_moe_mm_data,
-    cutlass_moe_mm,
-    cutlass_w4a8_moe_mm,
-)
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

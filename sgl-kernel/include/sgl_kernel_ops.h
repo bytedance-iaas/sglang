@@ -477,37 +477,30 @@ void transfer_kv_all_layer_mla_direct(
     int64_t num_layers);
 
 /*
- * From csrc/quantization/cutlass/cutlass_w4a8
- */
-void get_cutlass_w4a8_moe_mm_data(
-    const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation, torch::Tensor& output_permutation,
-    const int64_t num_experts, const int64_t n, const int64_t k);
-
-void cutlass_w4a8_moe_mm(
-    torch::Tensor& d_tensors, torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides, torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides, int64_t chunk_size, int64_t topk);
-
-/*
  * From csrc/quantization/cutlass/cutlass_w8a8
  */
 void get_cutlass_moe_mm_data(
-    const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation, torch::Tensor& output_permutation,
-    const int64_t num_experts, const int64_t n, const int64_t k);
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
 
 void cutlass_moe_mm(
-    torch::Tensor& out_tensors, torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides, torch::Tensor const& c_strides);
+    torch::Tensor& out_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& c_strides);
 
 /*
  * From csrc/moe/cutlass_moe/w4a8
