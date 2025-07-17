@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -5,13 +7,17 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+
 from python.sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
@@ -63,7 +69,7 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W4AFp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> W4AFp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method
@@ -80,7 +86,8 @@ class W4AFp8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.managers.schedule_batch import global_server_args_dict
 
@@ -122,8 +129,7 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
     return scales_interleaved.contiguous()
 
 
-class W4AFp8EPMoEMethod:
-
+class W4AFp8EPMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
@@ -277,13 +283,7 @@ class W4AFp8EPMoEMethod:
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
 
-class W4AFp8TPMoEMethod:
-    """Tp method for MOE W4A8 FP8 quantization.
-
-    Args:
-        quant_config: The MOE W4A8 FP8 quantization config.
-    """
-
+class W4AFp8TPMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
