@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+from sglang.srt.mem_cache.hicache_storage_priskv import PrisKVClient
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +247,13 @@ class HiCacheController:
         if storage_backend is not None:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
+                self.enable_storage = True
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = prefetch_threshold
+            elif storage_backend == "pris":
+                self.storage_backend = PrisKVClient(
+                    None, mem_pool_host.dtype, self.mem_pool_device, self.page_size
+                )
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
