@@ -96,7 +96,7 @@ class MooncakeTransferEngine:
                 session_id,
                 peer_buffer_address,
             )
-
+        print(1)
         return ret
 
     def batch_transfer_sync(
