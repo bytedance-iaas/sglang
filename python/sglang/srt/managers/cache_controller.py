@@ -256,6 +256,14 @@ class HiCacheController:
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            elif storage_backend == "pris":
+                from sglang.srt.mem_cache.hicache_storage_priskv import PrisKVClient
+                self.storage_backend = PrisKVClient(
+                    None, mem_pool_host.dtype, self.mem_pool_device, self.page_size
+                )
+                self.enable_storage = True
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
