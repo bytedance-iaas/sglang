@@ -138,6 +138,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
+    eic_cache_hit_rate: float = 0.0
     num_grammar_queue_reqs: int = 0
     spec_accept_length: float = 0.0
     avg_request_queue_latency: float = 0.0
@@ -201,6 +202,13 @@ class SchedulerMetricsCollector:
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.eic_cache_hit_rate = Gauge(
+            name="sglang:eic_cache_hit_rate",
+            documentation="The EIC cache hit rate.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -278,6 +286,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.eic_cache_hit_rate, stats.eic_cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
 
         # Disaggregation metrics

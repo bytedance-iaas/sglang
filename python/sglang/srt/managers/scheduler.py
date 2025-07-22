@@ -199,6 +199,7 @@ class KvMetrics:
         self.num_requests_waiting = None
         self.gpu_cache_usage_perc = None
         self.gpu_prefix_cache_hit_rate = None
+        self.eic_cache_hit_rate = None
         self.data_parallel_rank = None
 
 
@@ -1322,6 +1323,7 @@ class Scheduler(
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
+        kv_metrics.eic_cache_hit_rate = self.stats.eic_cache_hit_rate
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
 
         if not self.send_metrics_from_scheduler.closed:
@@ -1384,6 +1386,9 @@ class Scheduler(
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.eic_hit_rate = adder.log_hit_eic_tokens / (
+                adder.log_input_tokens + adder.log_hit_tokens
+            )
 
             total_queue_latency = 0
             for req in can_run_list:
@@ -1458,6 +1463,7 @@ class Scheduler(
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = num_used / self.max_total_num_tokens
             self.stats.cache_hit_rate = 0.0
+            self.stats.eic_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
