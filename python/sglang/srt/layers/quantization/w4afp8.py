@@ -281,6 +281,78 @@ class W4AFp8EPMoEMethod(FusedMoEMethodBase):
             [w2_input_scale_max], dtype=dtype, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
+    
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        start_expert_id: int,
+        end_expert_id: int,
+        renormalize: bool,
+        expert_map: Optional[torch.Tensor] = None,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+
+    ) -> torch.Tensor:
+        # avoid circular import
+        from sglang.srt.layers.moe.topk import select_experts
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=stopk_group,
+            num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            correction_bias=correction_bias,
+            custom_routing_function=custom_routing_function,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        local_topk_ids = topk_ids
+        if self.expert_map is not None:
+            "Translate info from expert_map to topk_ids"
+            local_topk_ids = torch.where(
+                self.expert_map[topk_ids] != self.num_experts,
+                self.expert_map[topk_ids],
+                self.num_experts,
+            )
+        output = cutlass_w4a8_moe(
+                start_expert_id,
+                end_expert_id,
+                self.num_experts,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_ids,
+                local_topk_ids,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                self.w13_input_scale,
+                self.w2_input_scale,
+            )
+        return output
 
 
 class W4AFp8TPMoEMethod(FusedMoEMethodBase):
