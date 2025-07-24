@@ -1834,13 +1834,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 [q_a_proj_weight, kv_a_proj_weight], dim=0
                             )
 
-                            param_name = name.replace(
-                                "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                            )
+                            # param_name = name.replace(
+                            #     "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                            # )
                             
-                            # The code is attempting to access a value from a dictionary `params_dict`
-                            # using the key `param_name` and assign it to the variable `param`.
-                            # param = params_dict[param_name]
+                            # 
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
@@ -1848,6 +1846,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
                                 )
                             )
+                            param = params_dict[param_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
