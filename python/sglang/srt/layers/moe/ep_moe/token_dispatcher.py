@@ -294,7 +294,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if os.getenv("USE_W4A8") == "1":
+        if get_bool_env_var("SGLANG_USE_W4A8"):
             hidden_states = hidden_states
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             # TODO hard code 128 block quant,use fp8 communication
@@ -368,7 +368,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             expert_alignment=(
                 128
                 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and os.getenv("USE_W4A8") != "1"
+                and not get_bool_env_var("SGLANG_USE_W4A8")
                 else 1
             ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
@@ -396,7 +396,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         if (
-            os.getenv("USE_W4A8") != "1" and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            not get_bool_env_var("SGLANG_USE_W4A8")
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         ) or _use_aiter:
             output = hidden_states
         else:
