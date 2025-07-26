@@ -70,6 +70,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    DisableEICReqInput,
+    EICSwitchOutput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -130,6 +133,11 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICHiRadixCacheBuilder,
+    EICPagedHiRadixCache,
+)
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -265,6 +273,11 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
+        self.enable_eic_cache = (
+            server_args.enable_eic_cache if self.enable_hierarchical_cache else False
+        )
+
+        # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -530,6 +543,8 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (EnableEICReqInput, self.enable_eic_cache_wrapped),
+                (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
         )
 
@@ -586,40 +601,72 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if self.is_hybrid:
-                ChunkCacheClass = SWAChunkCache
-            else:
-                ChunkCacheClass = ChunkCache
-            self.tree_cache = ChunkCacheClass(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
-        else:
-            if self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
+            if self.enable_eic_cache:
+                from sglang.srt.mem_cache.eic_chunk_cache import (
+                    EICChunkCache,
+                    EICSWAChunkCache,
+                )
+
+                logger.info(f"use EICChunkCache for decode save")
+                if self.model_config.is_hybrid:
+                    ChunkCacheClass = EICSWAChunkCache
+                else:
+                    ChunkCacheClass = EICChunkCache
+                self.tree_cache = ChunkCacheClass(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=(
-                        self.attn_tp_cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_cpu_group
-                    ),
                     page_size=self.page_size,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    hicache_io_backend=(
-                        "direct"
-                        if server_args.attention_backend
-                        == "fa3"  # hot fix for incompatibility
-                        else server_args.hicache_io_backend
-                    ),
-                    hicache_storage_backend=server_args.hicache_storage_backend,
+                    tp_cache_group=tp_cache_group,
+                    server_args=server_args,
                 )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
+            else:
+                if self.model_config.is_hybrid:
+                    ChunkCacheClass = SWAChunkCache
+                else:
+                    ChunkCacheClass = ChunkCache
+                self.tree_cache = ChunkCacheClass(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
                 )
+        else:
+            if self.enable_hierarchical_cache:
+                tp_cache_group = (
+                    self.attn_tp_cpu_group
+                    if server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                )
+                if self.enable_eic_cache:
+                    self.tree_cache = EICHiRadixCacheBuilder.build(
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tp_cache_group=tp_cache_group,
+                        page_size=self.page_size,
+                        hicache_ratio=server_args.hicache_ratio,
+                        hicache_size=server_args.hicache_size,
+                        hicache_write_policy=server_args.hicache_write_policy,
+                        server_args=server_args,
+                    )
+                else:
+                    self.tree_cache = HiRadixCache(
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tp_cache_group=self.tp_cpu_group,
+                        page_size=self.page_size,
+                        hicache_ratio=server_args.hicache_ratio,
+                        hicache_size=server_args.hicache_size,
+                        hicache_write_policy=server_args.hicache_write_policy,
+                        hicache_io_backend=(
+                            "direct"
+                            if server_args.attention_backend
+                            == "fa3"  # hot fix for incompatibility
+                            else server_args.hicache_io_backend
+                        ),
+                        hicache_storage_backend=server_args.hicache_storage_backend,
+                    )
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
             elif self.is_hybrid:
                 assert (
                     self.server_args.disaggregation_mode == "null"
@@ -1334,6 +1381,7 @@ class Scheduler(
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
+        kv_metrics.eic_cache_hit_rate = self.stats.eic_cache_hit_rate
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
 
         if not self.send_metrics_from_scheduler.closed:
@@ -1372,6 +1420,7 @@ class Scheduler(
             token_msg = f"token usage: {token_usage:.2f}, "
 
         num_new_seq = len(can_run_list)
+
         f = (
             f"Prefill batch. "
             f"#new-seq: {num_new_seq}, "
@@ -1379,6 +1428,17 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"{token_msg}"
         )
+
+        if self.enable_hierarchical_cache:
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            f += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#gpu_hit_rate: {adder.log_hit_gpu_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#eic_hit_rate: {adder.log_hit_eic_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+            )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -1400,6 +1460,9 @@ class Scheduler(
             self.stats.token_usage = round(token_usage, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.eic_hit_rate = adder.log_hit_eic_tokens / (
+                adder.log_input_tokens + adder.log_hit_tokens
+            )
 
             total_queue_latency = 0
             for req in can_run_list:
@@ -1465,6 +1528,16 @@ class Scheduler(
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
+        if self.enable_hierarchical_cache and not isinstance(
+            self.tree_cache, ChunkCache
+        ):
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            msg += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+            )
+
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
@@ -1477,6 +1550,7 @@ class Scheduler(
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(token_usage, 2)
             self.stats.cache_hit_rate = 0.0
+            self.stats.eic_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -1664,6 +1738,7 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1700,6 +1775,7 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            self.enable_eic_cache,
         )
 
         if self.chunked_req is not None:
@@ -1708,6 +1784,10 @@ class Scheduler(
 
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
+
+        if isinstance(self.tree_cache, EICPagedHiRadixCache):
+            # for batch exists from EIC cache
+            self.tree_cache.match_from_remote(self.waiting_queue)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -1813,7 +1893,6 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
-
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -2525,6 +2604,70 @@ class Scheduler(
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
+
+    def enable_eic_cache_wrapped(self, recv_req: EnableEICReqInput) -> EICSwitchOutput:
+        if not isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot enable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot enable EIC cache while there are pending requests. Please flush the cache first.'",
+                )
+
+            self.enable_eic_cache = True
+            self.enable_hierarchical_cache = True
+            self.server_args.enable_hierarchical_cache = True
+            self.server_args.enable_eic_cache = True
+            self.init_memory_pool_and_cache()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+            message = "EIC cache enabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
+
+    def disable_eic_cache_wrapped(
+        self, recv_req: DisableEICReqInput
+    ) -> EICSwitchOutput:
+        if isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot disable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot disable EIC cache while there are pending requests. Please flush the cache first.'",
+                )
+
+            self.enable_eic_cache = False
+            self.enable_hierarchical_cache = False
+            self.server_args.enable_hierarchical_cache = False
+            self.server_args.enable_eic_cache = False
+            self.init_memory_pool_and_cache()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+            message = "EIC cache disabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags

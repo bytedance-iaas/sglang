@@ -70,7 +70,10 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    DisableEICReqInput,
+    EICSwitchOutput,
     EmbeddingReqInput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -358,6 +361,10 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
 
+        self.eic_switch_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -428,6 +435,7 @@ class TokenizerManager:
                     self.update_lora_adapter_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
+                (EICSwitchOutput, self.eic_switch_communicator.handle_recv),
             ]
         )
 
@@ -1368,6 +1376,12 @@ class TokenizerManager:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.perf_counter()
+
+    async def enable_eic_cache(self) -> EICSwitchOutput:
+        return (await self.eic_switch_communicator(EnableEICReqInput()))[0]
+
+    async def disable_eic_cache(self) -> EICSwitchOutput:
+        return (await self.eic_switch_communicator(DisableEICReqInput()))[0]
 
     def _handle_batch_output(
         self,

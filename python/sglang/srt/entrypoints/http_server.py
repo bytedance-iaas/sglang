@@ -410,6 +410,26 @@ async def flush_cache():
     )
 
 
+@app.api_route("/enable_eic", methods=["GET", "POST"])
+async def enable_eic_cache():
+    ret = await _global_state.tokenizer_manager.enable_eic_cache()
+    return Response(
+        content="Enable eic cache.\nPlease check backend logs for more details. "
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/disable_eic", methods=["GET", "POST"])
+async def disable_eic_cache():
+    ret = await _global_state.tokenizer_manager.disable_eic_cache()
+    return Response(
+        content="disable eic cache.\nPlease check backend logs for more details. "
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
