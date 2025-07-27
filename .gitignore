@@ -261,3 +261,6 @@ outputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
+# docker
+docker/eic*
+docker/config
