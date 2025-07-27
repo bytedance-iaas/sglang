@@ -10,7 +10,7 @@ fi
 
 failed_models=()
 for model in "${models[@]}"; do
-    echo "Caching model: $model to HF_HOME"
+    echo "Caching model: $model to ${HF_HOME:-~/.cache/huggingface}"
 
     if ! huggingface-cli download "$model" 2>/dev/null; then
         echo "WARNING: Failed to cache model: $model"
