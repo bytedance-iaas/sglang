@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -49,6 +50,7 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
+    log_hit_eic_tokens: int
     new_token_ratio: float
     running_bs: int
     num_new_seqs: int  # len(can_run_list)
@@ -221,6 +223,26 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
+        if self.enable_hierarchical_cache and self.enable_eic_cache:
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+
+            if num_write_queue_size:
+                msg += f"#write-queue: {num_write_queue_size}, "
+            if num_load_queue_size:
+                msg += f"#load-queue: {num_load_queue_size}, "
+
+            total_hit_rate = prefill_stats.log_hit_tokens / (
+                prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            )
+            gpu_hit_rate = total_hit_rate - prefill_stats.log_hit_eic_tokens / (
+                prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            )
+            eic_hit_rate = prefill_stats.log_hit_eic_tokens / (
+                prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            )
+            msg += f"#hit_rate(total/gpu/eic): {total_hit_rate:.2f}/{gpu_hit_rate:.2f}/{eic_hit_rate:.2f}, "
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
@@ -266,6 +288,9 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.eic_cache_hit_rate = prefill_stats.log_hit_eic_tokens / (
+                prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            )
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
@@ -408,6 +433,16 @@ class SchedulerMetricsMixin:
                 "npu": "npu graph",
             },
         )
+        if self.enable_hierarchical_cache and isinstance(
+            self.tree_cache, EICChunkCache
+        ):
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            msg += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+            )
+
         msg += (
             f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
@@ -426,6 +461,8 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            self.stats.cache_hit_rate = 0.0
+            self.stats.eic_cache_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
@@ -519,6 +556,7 @@ class SchedulerMetricsMixin:
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
+        kv_metrics.eic_cache_hit_rate = self.stats.eic_cache_hit_rate
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
 
         if not self.send_metrics_from_scheduler.closed:
