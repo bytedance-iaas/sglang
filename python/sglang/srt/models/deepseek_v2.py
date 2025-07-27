@@ -46,8 +46,8 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
 )
+
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
