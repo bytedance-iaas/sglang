@@ -244,6 +244,13 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    enable_hierarchical_cache: bool = False
+    enable_eic_cache: bool = False
+    disable_eic_shared: bool = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -678,6 +685,12 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
+
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1853,6 +1866,18 @@ class ServerArgs:
             "--debug-tensor-dump-prefill-only",
             action="store_true",
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
+        )
+
+        parser.add_argument(
+            "--enable-eic-cache",
+            action="store_true",
+            help="Enable EIC cache",
+        )
+
+        parser.add_argument(
+            "--disable-eic-shared",
+            action="store_true",
+            help="Disable EIC shared cache, which is used to share the cache between multiple servers.",
         )
 
         # PD disaggregation

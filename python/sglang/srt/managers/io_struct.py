@@ -1128,3 +1128,19 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
+
+
+@dataclass
+class EnableEICReqInput:
+    pass
+
+
+@dataclass
+class DisableEICReqInput:
+    pass
+
+
+@dataclass
+class EICSwitchOutput:
+    success: bool
+    message: str

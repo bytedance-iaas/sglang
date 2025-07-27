@@ -7,6 +7,7 @@ from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBa
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
 
@@ -97,6 +98,17 @@ class SchedulerMetricsMixin:
             f"{token_msg}"
         )
 
+        if self.enable_hierarchical_cache:
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            f += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#gpu_hit_rate: {adder.log_hit_gpu_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#eic_hit_rate: {adder.log_hit_eic_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+            )
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
@@ -119,6 +131,9 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = round(token_usage, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.eic_hit_rate = adder.log_hit_eic_tokens / (
+                adder.log_input_tokens + adder.log_hit_tokens
+            )
 
             total_queue_latency = 0
             for req in can_run_list:
@@ -184,6 +199,16 @@ class SchedulerMetricsMixin:
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
+        if self.enable_hierarchical_cache and isinstance(
+            self.tree_cache, EICChunkCache
+        ):
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            msg += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+            )
+
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
@@ -196,6 +221,7 @@ class SchedulerMetricsMixin:
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(token_usage, 2)
             self.stats.cache_hit_rate = 0.0
+            self.stats.eic_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -216,6 +242,7 @@ class SchedulerMetricsMixin:
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
+        kv_metrics.eic_cache_hit_rate = self.stats.eic_cache_hit_rate
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
 
         if not self.send_metrics_from_scheduler.closed:
