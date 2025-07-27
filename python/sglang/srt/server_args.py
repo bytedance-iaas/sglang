@@ -409,6 +409,13 @@ class ServerArgs:
     enable_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    enable_hierarchical_cache: bool = False
+    enable_eic_cache: bool = False
+    disable_eic_shared: bool = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -1234,6 +1241,11 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
+
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
 
         if (
             self.disaggregation_decode_enable_offload_kvcache
@@ -2708,6 +2720,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
             help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+        )
+
+        parser.add_argument(
+            "--enable-eic-cache",
+            action="store_true",
+            help="Enable EIC cache",
+        )
+
+        parser.add_argument(
+            "--disable-eic-shared",
+            action="store_true",
+            help="Disable EIC shared cache, which is used to share the cache between multiple servers.",
         )
 
         # PD disaggregation

@@ -1415,6 +1415,21 @@ class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
 
 
+@dataclass
+class EnableEICReqInput(BaseReq):
+    pass
+
+
+class DisableEICReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class EICSwitchOutput(BaseReq):
+    success: bool
+    message: str
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect

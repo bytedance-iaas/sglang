@@ -94,8 +94,12 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.perf_counter()
+                        if self.server_args.enable_eic_cache:
+                            self.tree_cache.cache_finished_req(req, False)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
+                        req.time_stats.completion_time = time.time()
+
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -191,7 +195,10 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        if self.server_args.enable_eic_cache:
+                            self.tree_cache.cache_finished_req(req, False)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -257,6 +264,8 @@ class SchedulerOutputProcessorMixin:
                     # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.tree_cache.cache_finished_req(req)
+                elif self.server_args.enable_eic_cache:
+                    self.tree_cache.cache_finished_req(req, True)
                 else:
                     self.tree_cache.cache_finished_req(req)
 
