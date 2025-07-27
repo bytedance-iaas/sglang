@@ -22,6 +22,8 @@ import fastapi
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    DisableEICReqInput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -155,6 +157,9 @@ class TokenizerCommunicatorMixin:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.eic_switch_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -216,6 +221,14 @@ class TokenizerCommunicatorMixin:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    EnableEICReqInput,
+                    self.eic_switch_communicator.handle_recv,
+                ),
+                (
+                    DisableEICReqInput,
+                    self.eic_switch_communicator.handle_recv,
                 ),
             ]
         )
