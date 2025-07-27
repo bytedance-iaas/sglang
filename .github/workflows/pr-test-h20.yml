@@ -4,13 +4,13 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/sglang/srt/models/deepseek_v2.py"
+      - "python/sglang/srt/models/deepseek*"
       - "python/sglang/srt/layers/moe/**"
       - ".github/workflows/pr-test-h20.yml"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/sglang/srt/models/deepseek_v2.py"
+      - "python/sglang/srt/models/deepseek*"
       - "python/sglang/srt/layers/moe/**"
       - ".github/workflows/pr-test-h20.yml"
   workflow_dispatch:
