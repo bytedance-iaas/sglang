@@ -1,0 +1,67 @@
+name: PR Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/srt/models/deepseek_v2.py"
+      - "python/sglang/srt/layers/moe/**"
+      - ".github/workflows/pr-test-h20.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/srt/models/deepseek_v2.py"
+      - "python/sglang/srt/layers/moe/**"
+      - ".github/workflows/pr-test-h20.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "FlashInfer version"
+        required: true
+        type: choice
+        default: 'release'
+        options:
+          - 'release'
+          - 'nightly'
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test-deepep-8-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: 8-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_deepep.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu-deepep
+
+  finish:
+    if: always()
+    needs: [
+      unit-test-deepep-8-gpu,
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
