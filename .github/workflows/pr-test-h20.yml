@@ -1,4 +1,4 @@
-name: PR Test H20
+name: PR Test (H20)
 
 on:
   push:
