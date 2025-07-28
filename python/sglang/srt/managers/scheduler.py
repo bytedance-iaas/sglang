@@ -1399,7 +1399,7 @@ class Scheduler(
             total_tokens = adder.log_input_tokens + adder.log_hit_tokens
 
             cache_hit_rate = (
-                adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+                adder.log_hit_tokens / total_tokens * 100 if total_tokens > 0 else 0.0
             )
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
@@ -1413,6 +1413,7 @@ class Scheduler(
             self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
+            self.metrics_collector.log_prefill_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
 

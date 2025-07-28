@@ -278,6 +278,9 @@ class SchedulerMetricsCollector:
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def log_prefill_stats(self, stats: SchedulerStats) -> None:
+        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -285,7 +288,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
-        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
 
