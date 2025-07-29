@@ -944,7 +944,7 @@ class DeepEPMoE(EPMoE):
 
         return output
 
-    def forward_normal(
+    def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
