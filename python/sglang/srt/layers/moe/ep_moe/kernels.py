@@ -1410,7 +1410,6 @@ def compute_expert_offsets_w4a8(
 
 def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     masked_m,
-    expert_offsets,
     problem_sizes1,
     problem_sizes2,
     num_experts,
@@ -1420,9 +1419,7 @@ def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     problem_sizes1, problem_sizes2 = compute_problem_sizes_w4a8(
         masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
     )
-    expert_offsets = compute_expert_offsets_w4a8(problem_sizes1, expert_offsets)
     return (
-        expert_offsets.to(torch.int32),
         problem_sizes1.to(torch.int32),
         problem_sizes2.to(torch.int32),
     )

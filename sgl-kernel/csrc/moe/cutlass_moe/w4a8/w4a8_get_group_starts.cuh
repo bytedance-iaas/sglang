@@ -36,7 +36,6 @@ __global__ void int4_fp8_get_group_gemm_starts(
 
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator>
 __global__ void int4_fp8_get_group_gemm_starts_3d(
-    int32_t* expert_offsets,
     ElementA** a_offsets,
     ElementB** b_offsets,
     ElementC** out_offsets,
@@ -55,12 +54,11 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
     int num_experts) {
   int expert_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (expert_id >= num_experts) return;
-  int32_t expert_offset = expert_offsets[expert_id];
 
   int64_t a_offset = expert_id * m * k;
   int64_t b_offset = expert_id * k * n / 2;
   int64_t out_offset = expert_id * m * n;
-  int64_t a_scales_offset = per_act_token ? expert_offset : 0;
+  int64_t a_scales_offset = 0;
   int64_t b_scales_offset = per_out_ch ? expert_id * n * 4 * k / 512 : expert_id;
 
   a_offsets[expert_id] = a_base_as_int + a_offset;
@@ -74,7 +72,6 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
   else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                           \
     int4_fp8_get_group_gemm_starts_3d<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float> \
         <<<1, num_experts, 0, stream>>>(                                                     \
-            static_cast<int32_t*>(expert_offsets.data_ptr()),                                \
             static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                         \
             static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                               \
             static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                      \

@@ -114,7 +114,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1) if ep_mode == "ep" else 1
+    topk = topk_ids_.size(1) if ep_mode == "ep" else 8
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -144,28 +144,19 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
-    elif ep_mode == "deepep_ll":
-        # total_m=torch.sum(local_topk_ids).item()
-        num_tokens = a.size(1)
-
-    else:
-        raise ValueError(f"Invalid ep_mode: {ep_mode}")
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
     if ep_mode == "deepep_ll":
 
-        expert_offsets, problem_sizes1, problem_sizes2 = (
-            deepep_ll_get_cutlass_w4a8_moe_mm_data(
-                local_topk_ids,
-                expert_offsets,
-                problem_sizes1,
-                problem_sizes2,
-                num_experts,
-                n,
-                k,
-            )
+        problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
+            local_topk_ids,
+            problem_sizes1,
+            problem_sizes2,
+            num_experts,
+            n,
+            k,
         )
 
         gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
@@ -174,7 +165,6 @@ def cutlass_w4a8_moe(
         c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.half)
         c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.half)
         intermediate = torch.empty((num_experts, m, n), device=device, dtype=torch.half)
-        expert_offsets[:-1] = local_topk_ids
 
     else:
         a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
@@ -191,8 +181,9 @@ def cutlass_w4a8_moe(
             k,
         )
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
-    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
+        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
+        c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
+        intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
 
     cutlass_w4a8_moe_mm(
         c1,
@@ -210,7 +201,6 @@ def cutlass_w4a8_moe(
         topk,
     )
 
-    intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     silu_and_mul(c1, intermediate)
 
     intermediate_q = torch.empty(
