@@ -158,7 +158,6 @@ def cutlass_w4a8_moe(
 
         expert_offsets, problem_sizes1, problem_sizes2 = (
             deepep_ll_get_cutlass_w4a8_moe_mm_data(
-                # a,
                 local_topk_ids,
                 expert_offsets,
                 problem_sizes1,
@@ -249,18 +248,6 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
-    elif ep_mode == "deepep_ll":
-        output = torch.zeros(
-            (len(local_topk_ids), num_tokens, k), device=device, dtype=c2.dtype
-        )
-        non_zero_indices = torch.nonzero(local_topk_ids, as_tuple=True)[0]
-        c2_index = 0
-        for expert_idx in non_zero_indices:
-            num_non_zero_rows = local_topk_ids[expert_idx].item()
-            output[expert_idx, :num_non_zero_rows] = c2[
-                c2_index : c2_index + num_non_zero_rows
-            ]
-            c2_index += num_non_zero_rows
     else:
         output = c2
-    return output
+    return output.to(torch.bfloat16)

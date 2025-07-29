@@ -898,7 +898,7 @@ class DeepEPMoE(EPMoE):
         elif dispatch_output.format.is_deepep_ll():
             if self.use_w4afp8:
                 return self.forward_cutlass_w4a8_masked(
-                    hidden_states, masked_m, ep_mode="deepep_ll"
+                    dispatch_output, ep_mode="deepep_ll"
                 )
             else:
                 return self.forward_deepgemm_masked(dispatch_output)
@@ -907,12 +907,10 @@ class DeepEPMoE(EPMoE):
 
     def forward_cutlass_w4a8_masked(
         self,
-        hidden_states: torch.Tensor,
-        masked_m: torch.Tensor,
-        expected_m: int,
+        dispatch_output: DeepEPLLOutput,
         ep_mode: str,
     ):
-
+        hidden_states, _, _, masked_m, _ = dispatch_output
         output = cutlass_w4a8_moe(
             self.start_expert_id,
             self.end_expert_id,

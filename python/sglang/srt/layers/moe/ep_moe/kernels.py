@@ -1409,7 +1409,6 @@ def compute_expert_offsets_w4a8(
 
 
 def deepep_ll_get_cutlass_w4a8_moe_mm_data(
-    # hidden_states,
     masked_m,
     expert_offsets,
     problem_sizes1,
