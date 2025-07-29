@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import logging
 import os
 from dataclasses import dataclass
@@ -294,9 +293,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if get_bool_env_var("SGLANG_USE_W4A8"):
-            hidden_states = hidden_states
-        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
+            "SGLANG_USE_W4A8"
+        ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,

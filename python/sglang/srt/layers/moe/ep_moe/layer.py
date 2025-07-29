@@ -896,7 +896,7 @@ class DeepEPMoE(EPMoE):
         if dispatch_output.format.is_deepep_normal():
             if self.use_w4afp8:
                 return self.forward_cutlass_w4a8(
-                    hidden_states, topk_idx, topk_weights, ep_mode="deepep_normal"
+                    dispatch_output, ep_mode="deepep_normal"
                 )
             elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
                 return self.forward_deepgemm_contiguous(dispatch_output)
@@ -909,11 +909,14 @@ class DeepEPMoE(EPMoE):
 
     def forward_cutlass_w4a8(
         self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        dispatch_output: DeepEPNormalOutput,
         ep_mode: str,
     ):
+        hidden_states, topk_idx, topk_weights = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_idx,
+            dispatch_output.topk_weights,
+        )
         local_topk_ids = topk_idx
         # hidden_states,hidden_states_scale=hidden_states
         local_topk_ids = (
@@ -956,9 +959,83 @@ class DeepEPMoE(EPMoE):
     def combine(
         self,
         hidden_states: torch.Tensor,
-        reorder_topk_ids: torch.Tensor,
-        seg_indptr: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
     ):
+        return self.deepep_dispatcher.combine(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+        )
+
+    def _prepare_for_normal(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+    ):
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_permute_triton_kernel,
+            deepep_run_moe_deep_preprocess,
+        )
+
+        if hidden_states.shape[0] == 0:
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (self.num_experts + 1,),
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+            return reorder_topk_ids, seg_indptr, hidden_states
+        else:
+            if _use_aiter:
+                # skip permutation here as aiter fused_moe has fused inside
+                reorder_topk_ids = torch.empty(
+                    (0,), device=hidden_states.device, dtype=torch.int64
+                )
+                seg_indptr = torch.zeros(
+                    (self.num_experts + 1,),
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
+                return reorder_topk_ids, seg_indptr, hidden_states
+
+            reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+                topk_idx, self.num_experts
+            )
+            num_total_tokens = reorder_topk_ids.numel()
+            gateup_input = torch.empty(
+                (int(num_total_tokens), hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            # PreReorder
+            deepep_permute_triton_kernel[(hidden_states.shape[0],)](
+                hidden_states,
+                gateup_input,
+                self.src2dst,
+                topk_idx,
+                None,
+                self.router_topk,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+            )
+            return reorder_topk_ids, seg_indptr, gateup_input
+
+    def forward_normal(
+        self,
+        dispatch_output: DeepEPNormalOutput,
+    ):
+        hidden_states, topk_idx = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_idx,
+        )
+        reorder_topk_ids, seg_indptr, hidden_states = self._prepare_for_normal(
+            hidden_states, topk_idx
+        )
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
 
