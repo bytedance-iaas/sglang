@@ -109,7 +109,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1) if ep_mode == "ep" else 1
+    topk = topk_ids_.size(1) if ep_mode == "ep" else 8
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
