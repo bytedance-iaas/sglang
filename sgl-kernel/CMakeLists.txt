@@ -203,6 +203,11 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+
+list(APPEND SGL_KERNEL_CUDA_FLAGS "-DENABLE_SCALED_MM_SM90=1")
+list(APPEND SGL_KERNEL_CUDA_FLAGS "-DENABLE_CUTLASS_MOE_SM90=1")
+# TODO: use SGL_KERNEL_ENABLE_SM90A in CMakeLists.txt e.g., make build -DSGL_KERNEL_ENABLE_SM90A. And check SGL_KERNEL_ENABLE_SM90A in scaled_mm_enty.cu
+
 string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__"       "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
@@ -229,6 +234,7 @@ set(SOURCES
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
     "csrc/gemm/nvfp4_expert_quant.cu"
+    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu"
     "csrc/gemm/nvfp4_quant_entry.cu"
     "csrc/gemm/nvfp4_quant_kernels.cu"
     "csrc/gemm/nvfp4_scaled_mm_entry.cu"
@@ -241,6 +247,7 @@ set(SOURCES
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/balance_topk_ids.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
@@ -255,6 +262,8 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+    "csrc/quantization/cutlass_w8a8/moe/moe_data.cu"
+    "csrc/quantization/cutlass_w8a8/moe/grouped_mm_c3x.cu"
     "csrc/common_extension.cc"
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"

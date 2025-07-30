@@ -20,6 +20,7 @@ from sgl_kernel.attention import (
     merge_state_v2,
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
+from sgl_kernel.cutlass_moe_mm import cutlass_moe_mm, get_cutlass_moe_mm_data
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
