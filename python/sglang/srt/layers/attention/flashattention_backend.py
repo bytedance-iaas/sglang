@@ -12,6 +12,10 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.layers.attention.triton_ops.flex_prefill_attention import (
+    check_if_use_flexprefill,
+    flex_prefill_attention,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -650,6 +654,22 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+
+        if check_if_use_flexprefill(forward_batch):
+            out = flex_prefill_attention(
+                q.view(
+                    forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
+                ),
+                k.view(
+                    forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
+                ),
+                v.view(
+                    forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
+                ),
+                softmax_scale=layer.scaling,
+            )
+
+            return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
