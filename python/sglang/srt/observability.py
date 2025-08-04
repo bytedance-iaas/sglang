@@ -324,8 +324,8 @@ class SpanAttributes:
     # Attribute names copied from here to avoid version conflicts:
     # https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md
     GEN_AI_USAGE_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
-    GEN_AI_USAGE_COMPLETION_TOKENS = "gen_ai.usage.completion_tokens"
-    GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
+    GEN_AI_USAGE_COMPLETION_TOKENS = "gen_ai.usage.output_tokens"
+    GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.input_tokens"
     GEN_AI_SYSTEM = "gen_ai.system"
     GEN_AI_PROMPTS = "gen_ai.prompt"
     GEN_AI_COMPLETIONS = "gen_ai.completion"
