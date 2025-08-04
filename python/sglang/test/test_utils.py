@@ -78,6 +78,7 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -102,15 +103,6 @@ def is_in_ci():
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
     return get_bool_env_var("SGLANG_AMD_CI")
-
-
-def _use_cached_default_models(model_repo: str):
-    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
-    if cache_dir and model_repo:
-        model_path = os.path.join(cache_dir, model_repo)
-        if os.path.isdir(model_path):
-            return os.path.abspath(model_path)
-    return ""
 
 
 if is_in_ci():
@@ -452,11 +444,6 @@ def _get_default_models():
             else:
                 default_models.add(value.strip())
     return json.dumps(list(default_models))
-
-
-def try_cached_model(model_repo: str):
-    model_dir = _use_cached_default_models(model_repo)
-    return model_dir if model_dir else model_repo
 
 
 def popen_launch_server(
