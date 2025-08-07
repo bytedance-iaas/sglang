@@ -87,6 +87,7 @@ def get_torch_distributed_pg_options(group_name=None):
     options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
     return options
 
+from triton_dist.utils import init_nvshmem_by_torch_process_group
 
 @dataclass
 class GraphCaptureContext:
@@ -1838,6 +1839,11 @@ def initialize_model_parallel(
         pynccl_use_current_stream=duplicate_tp_group,
     )
 
+    global _TP_GLOO
+    _TP_GLOO = torch.distributed.new_group(ranks=group_ranks[0], backend='gloo')
+    torch.distributed.barrier(_TP_GLOO)
+    init_nvshmem_by_torch_process_group(_TP_GLOO)
+
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
         assert (
@@ -2227,7 +2233,11 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
-
+    global _TP_GLOO
+    if _TP_GLOO:
+        _TP_GLOO.destory()
+    _TP_GLOO = None
+    
     global _PP
     if _PP:
         _PP.destroy()

@@ -735,6 +735,7 @@ class Engine(EngineBase):
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
+        print("DEBUGG kill_process_tree {}".format(os.getpid()))
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
