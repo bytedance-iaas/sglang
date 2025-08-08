@@ -68,7 +68,7 @@ if [ ! -z "$https_proxy" ]; then
 fi
 
 sed -i "s|docker run --rm|docker run --rm --network=host $proxy_args|" build.sh
-sed -i "s|pytorch/manylinux|iaas-gpu-cn-beijing.cr.volces.com/pytorch/manylinux|g" build.sh
+sed -i "s|pytorch/manylinux|hub.byted.org/iaas/pytorch/manylinux|g" build.sh
 sed -i 's|ARCH=$(uname -i)|ARCH=x86_64|g' build.sh  # DinD 可能不支持 ARCH=$(uname -i)
 
 # 如果是 SCM 构建，则准备 docker 环境
