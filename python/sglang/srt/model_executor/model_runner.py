@@ -1866,6 +1866,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         from triton_dist.layers.nvidia import GemmARLayer
+        from triton_dist.utils import init_nvshmem_by_torch_process_group
 
         _TP_OVERLAP_GROUP = torch.distributed.new_group(
             ranks=self.tp_group.ranks, backend="gloo"
