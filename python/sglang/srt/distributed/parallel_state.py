@@ -2227,7 +2227,6 @@ def destroy_model_parallel():
         _TP.destroy()
     _TP = None
 
-    
     global _PP
     if _PP:
         _PP.destroy()
