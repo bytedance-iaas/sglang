@@ -256,6 +256,9 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 logger = logging.getLogger(__name__)
 
+from triton_dist.utils import init_nvshmem_by_torch_process_group
+import nvshmem.core.utils
+nvshmem.core.utils._configure_logging(level="DEBUG")
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
@@ -445,8 +448,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
+        self.gemm_ar_overlap_group = None
         self.gemm_ar_attn_op = None
         self.gemm_ar_mlp_op = None
+        
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -520,6 +525,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
 
+        if self.device == 'cuda':
+            self.init_overlap_gemm_allreduce_operator()
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
             and self.remote_instance_transfer_engine is not None
@@ -646,7 +653,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_overlap_gemm_allreduce_operator()
             self.kernel_warmup()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
@@ -1867,19 +1873,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         from sglang.srt.distributed import parallel_state as ps
         from triton_dist.layers.nvidia import GemmARLayer
+        
+        _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=self.tp_group.ranks, backend='gloo')
+        torch.distributed.barrier(_TP_OVERLAP_GROUP)
+        init_nvshmem_by_torch_process_group(_TP_OVERLAP_GROUP)
 
         self.gemm_ar_attn_op = GemmARLayer(
-            tp_group=ps._TP_OVERLAP_GROUP,
+            tp_group=_TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.hidden_size // self.tp_size),
             input_dtype=self.model_config.dtype,
             output_dtype=self.model_config.dtype,
             local_world_size=self.tp_size, persistent=True, copy_to_local=False,
-            use_ll_kernel=False, NUM_COMM_SMS=2)
-        torch.distributed.breakpoint()
+            use_ll_kernel=True, NUM_COMM_SMS=2)
         self.gemm_ar_mlp_op = GemmARLayer(
-            tp_group=ps._TP_OVERLAP_GROUP,
+            tp_group=_TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.intermediate_size // self.tp_size),
