@@ -162,8 +162,8 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_int_env_var,
     get_cpu_ids_by_node,
+    get_int_env_var,
     init_custom_process_group,
     is_hip,
     is_host_cpu_arm64,
@@ -255,8 +255,9 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 logger = logging.getLogger(__name__)
 
-from triton_dist.utils import init_nvshmem_by_torch_process_group
 import nvshmem.core.utils
+from triton_dist.utils import init_nvshmem_by_torch_process_group
+
 nvshmem.core.utils._configure_logging(level="DEBUG")
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -264,7 +265,6 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
     return model.model
-
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -449,9 +449,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        
-        
-
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -523,10 +520,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
 
-        if self.device == 'cuda' and get_int_env_var('SGL_USE_TP_OVERLAP', 0) == 1:
-            logger.info(
-                f"Initialize Gemm-AllReduce Overlap Operator..."
-            )
+        if self.device == "cuda" and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            logger.info(f"Initialize Gemm-AllReduce Overlap Operator...")
             self.init_overlap_gemm_allreduce_operator()
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
@@ -1866,42 +1861,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
-
     def init_overlap_gemm_allreduce_operator(self):
-        if get_int_env_var('SGL_USE_TP_OVERLAP', 0) != 1:
+        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) != 1:
             return
-        
+
         from triton_dist.layers.nvidia import GemmARLayer
-        
-        _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=self.tp_group.ranks, backend='gloo')
+
+        _TP_OVERLAP_GROUP = torch.distributed.new_group(
+            ranks=self.tp_group.ranks, backend="gloo"
+        )
         torch.distributed.barrier(_TP_OVERLAP_GROUP)
         init_nvshmem_by_torch_process_group(_TP_OVERLAP_GROUP)
 
         self.gemm_ar_attn_op = GemmARLayer(
             tp_group=_TP_OVERLAP_GROUP,
-            max_M=self.model_config.hf_config.max_position_embeddings, 
-            N=self.model_config.hf_config.hidden_size, 
+            max_M=self.model_config.hf_config.max_position_embeddings,
+            N=self.model_config.hf_config.hidden_size,
             K=(self.model_config.hf_config.hidden_size // self.tp_size),
             input_dtype=self.model_config.dtype,
             output_dtype=self.model_config.dtype,
-            local_world_size=self.tp_size, persistent=True, copy_to_local=False,
-            use_ll_kernel=True, NUM_COMM_SMS=2)
+            local_world_size=self.tp_size,
+            persistent=True,
+            copy_to_local=False,
+            use_ll_kernel=True,
+            NUM_COMM_SMS=2,
+        )
         self.gemm_ar_mlp_op = GemmARLayer(
             tp_group=_TP_OVERLAP_GROUP,
-            max_M=self.model_config.hf_config.max_position_embeddings, 
-            N=self.model_config.hf_config.hidden_size, 
+            max_M=self.model_config.hf_config.max_position_embeddings,
+            N=self.model_config.hf_config.hidden_size,
             K=(self.model_config.hf_config.intermediate_size // self.tp_size),
             input_dtype=self.model_config.dtype,
             output_dtype=self.model_config.dtype,
-            local_world_size=self.tp_size, persistent=True, copy_to_local=False,
-            use_ll_kernel=False, NUM_COMM_SMS=2)
-        
+            local_world_size=self.tp_size,
+            persistent=True,
+            copy_to_local=False,
+            use_ll_kernel=False,
+            NUM_COMM_SMS=2,
+        )
+
         for each in self.model.model.layers:
             if each.self_attn.o_proj:
                 each.self_attn.o_proj.gemm_ar_attn_op = self.gemm_ar_attn_op
             if each.mlp.down_proj:
                 each.mlp.down_proj.gemm_ar_mlp_op = self.gemm_ar_mlp_op
-        
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
