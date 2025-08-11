@@ -10,7 +10,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
 from __future__ import annotations
@@ -347,6 +346,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.gemm_ar_attn_op = None
+        self.gemm_ar_mlp_op = None
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -448,9 +449,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        self.gemm_ar_overlap_group = None
-        self.gemm_ar_attn_op = None
-        self.gemm_ar_mlp_op = None
+        
         
 
     def init_mindspore_runner(self):
@@ -514,7 +513,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
-
         # Load the expert backup client
         self.expert_backup_client = (
             ExpertBackupClient(self.server_args, self)
@@ -525,7 +523,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
 
-        if self.device == 'cuda':
+        if self.device == 'cuda' and get_int_env_var('SGL_USE_TP_OVERLAP', 0) == 1:
+            logger.info(
+                f"Initialize Gemm-AllReduce Overlap Operator..."
+            )
             self.init_overlap_gemm_allreduce_operator()
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
@@ -603,7 +604,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-
         # Init Double Sparsity
         if server_args.enable_double_sparsity:
             if server_args.ds_heavy_channel_type is None:
@@ -1870,8 +1870,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_overlap_gemm_allreduce_operator(self):
         if get_int_env_var('SGL_USE_TP_OVERLAP', 0) != 1:
             return
-
-        from sglang.srt.distributed import parallel_state as ps
+        
         from triton_dist.layers.nvidia import GemmARLayer
         
         _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=self.tp_group.ranks, backend='gloo')
@@ -1902,6 +1901,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 each.self_attn.o_proj.gemm_ar_attn_op = self.gemm_ar_attn_op
             if each.mlp.down_proj:
                 each.mlp.down_proj.gemm_ar_mlp_op = self.gemm_ar_mlp_op
+        
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
