@@ -2273,15 +2273,10 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    
-
     global _WORLD
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
-
-
-
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
