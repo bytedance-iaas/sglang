@@ -1860,20 +1860,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
 
     def init_overlap_gemm_allreduce_operator(self):
+        if get_int_env_var('SGL_USE_TP_OVERLAP', 0) != 1:
+            return
+
         from sglang.srt.distributed import parallel_state as ps
         from triton_dist.layers.nvidia import GemmARLayer
-        from triton_dist.utils import (
-            is_nvshmem_multimem_supported, 
-            assert_allclose, 
-            dist_print, 
-            generate_data, 
-            group_profile,
-            initialize_distributed, 
-            nvshmem_barrier_all_on_stream, 
-            perf_func, 
-            finalize_distributed,
-            sleep_async
-        )
 
         self.gemm_ar_attn_op = GemmARLayer(
             tp_group=ps._TP_GLOO,
