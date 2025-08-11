@@ -29,6 +29,7 @@ WORKDIR /sgl-workspace/FlashMLA
 RUN pip install . --break-system-packages
 
 # sglang 安装
+RUN pip install flashinfer_python==0.2.7.post1 -i https://mirrors.volces.com/pypi/simple
 RUN http_proxy='' pip index versions sglang -i https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/
 RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
