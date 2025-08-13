@@ -1,5 +1,10 @@
 ARG CUDA_VERSION=12.6.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
+# 使用已缓存好的base镜像
+FROM hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
+
+# 编译之前，将源统一设置成内网的
+RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
@@ -21,6 +26,9 @@ RUN apt update && apt install wget -y && apt install software-properties-common 
  && update-alternatives --set python3 /usr/bin/python3.12 \
  && wget https://bootstrap.pypa.io/get-pip.py \
  && python3 get-pip.py
+
+# 在安装pip后，设置pip源为火山内网源
+RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -47,6 +55,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && ln -sf /usr/bin/python3.12 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
+
+# 设置pip源为内网
+RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
@@ -205,14 +216,19 @@ RUN curl -LSso /usr/local/bin/clang-format https://github.com/muttleyxd/clang-to
     && chmod +x /usr/local/bin/clang-format
 
 # Install clangd
-RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+# 使用clangd的缓存包加速编译
+RUN wget https://ai-infra.tos-cn-beijing.volces.com/servingkit-build/clangd-linux-18.1.3.zip \
+    && mv clangd-linux-18.1.3.zip clangd.zip \
+#RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
     && unzip clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
+# 使用cmake的缓存包加速编译
+RUN wget https://ai-infra.tos-cn-beijing.volces.com/servingkit-build/cmake-3.31.1-linux-x86_64.tar.gz \
+# RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
     && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
     && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
@@ -384,8 +400,16 @@ setopt HIST_FIND_NO_DUPS
 setopt INC_APPEND_HISTORY
 EOF
 
-RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+# 使用pip安装just，加速编译流程
+#RUN set -euxo ; \
+#    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+RUN pip install rust-just
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
+
+# 将源统一切换成火山源
+RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
+RUN rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list
