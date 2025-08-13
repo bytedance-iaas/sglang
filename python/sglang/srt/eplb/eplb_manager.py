@@ -49,6 +49,59 @@ class EPLBManager:
 
             yield from self.rebalance()
 
+
+    def _export_expert_metadata(self, expert_location_metadata):
+        """Export expert location metadata to JSON file if enabled by environment variable"""
+        if not os.environ.get("EXPORT_EXPERT_METADATA", "0") == "1":
+            return
+
+        try:
+            output_dir = os.environ.get(
+                "EXPERT_METADATA_OUTPUT_DIR", "/tmp/expert_location_metadata"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+
+            rank = torch.distributed.get_rank()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_path = os.path.join(
+                output_dir, f"expert_metadata_rank_{rank}_{timestamp}.json"
+            )
+
+            data_to_save = {
+                "physical_to_logical_map": expert_location_metadata.physical_to_logical_map.cpu()
+                .numpy()
+                .tolist(),
+                "logical_to_all_physical_map": expert_location_metadata.logical_to_all_physical_map.cpu()
+                .numpy()
+                .tolist(),
+                "logical_to_all_physical_map_num_valid": expert_location_metadata.logical_to_all_physical_map_num_valid.cpu()
+                .numpy()
+                .tolist(),
+            }
+
+            if (
+                expert_location_metadata.logical_to_rank_dispatch_physical_map
+                is not None
+            ):
+                data_to_save["logical_to_rank_dispatch_physical_map"] = (
+                    expert_location_metadata.logical_to_rank_dispatch_physical_map.cpu()
+                    .numpy()
+                    .tolist()
+                )
+
+            with open(file_path, "w") as f:
+                json.dump(data_to_save, f, indent=4)
+
+            logger.info(
+                f"[EPLBManager] Saved expert location metadata for rank {rank} to {file_path}"
+            )
+        except Exception as e:
+            logger.error(
+                f"[EPLBManager] Error saving expert metadata: {e}", exc_info=True
+            )
+
+
+
     def rebalance(self):
         logger.info("[EPLBManager] rebalance start")
 
@@ -64,6 +117,7 @@ class EPLBManager:
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
             self._server_args, self._model_runner.model_config, logical_count
         )
+        self._export_expert_metadata(expert_location_metadata)
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
