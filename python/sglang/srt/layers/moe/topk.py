@@ -94,7 +94,10 @@ class TopK(CustomOp):
             assert num_expert_group is not None and topk_group is not None
         self.top_k = top_k
         self.use_grouped_topk = use_grouped_topk
-        self.renormalize = renormalize
+        if get_bool_env_var("SGL_USE_FAST_TOPK"):
+            self.renormalize = False
+        else:
+            self.renormalize = renormalize
         self.topk_group = topk_group
         self.num_expert_group = num_expert_group
         self.num_fused_shared_experts = num_fused_shared_experts
@@ -500,7 +503,7 @@ def biased_grouped_topk_gpu(
         _is_cuda
         and gating_output.shape[1] // num_expert_group
         <= MAX_VPT_SUPPORTED  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT now.
-        #and is_power_of_two(correction_bias.shape[0])
+        # and is_power_of_two(correction_bias.shape[0])
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
