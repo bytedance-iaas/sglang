@@ -1,0 +1,79 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG sglang_version=
+ARG sgl_kernel_version=
+ARG sglang_router_version=
+ARG gdkv_sdk_version=
+ARG pris_sdk_version=
+ARG eic_sdk_version=
+ARG absl_version=2.3.0
+ARG branch=
+
+# 编译之前，将源统一设置成内网的
+RUN pip config set global.index-url https://bytedpypi.byted.org/simple
+RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/ivolces.com/byted.org/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/ivolces.com/byted.org/g' /etc/apt/sources.list
+
+# ep statistics
+WORKDIR /sgl-workspace
+RUN wget -O DeepSeek-R1_prefill_ep16_3500_1500.json https://github.com/user-attachments/files/20903459/DeepSeek-R1_prefill_ep16_3500_1500.json
+RUN wget -O DeepSeek-R1_decode_ep32_3500_1500.json https://github.com/user-attachments/files/20903460/DeepSeek-R1_decode_ep32_3500_1500.json
+
+# flash MLA
+WORKDIR /sgl-workspace
+RUN git clone --branch support_fp8  https://github.com/bytedance-iaas/FlashMLA.git
+WORKDIR /sgl-workspace/FlashMLA
+RUN pip install . --break-system-packages
+
+# sglang 安装
+RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-build-isolation
+
+# sgl-kernel安装
+RUN http_proxy='' pip install sgl_kernel==${sgl_kernel_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# sglang-router安装
+RUN http_proxy='' pip install sglang_router --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# gdkv sdk安装
+RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# pris sdk安装
+RUN http_proxy='' pip install pris==${pris_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# eic sdk安装
+RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# group_gemm依赖安装
+RUN http_proxy='' pip install absl-py==${absl_version} --extra-index-url https://bytedpypi.byted.org/simple
+
+# group_gemm 安装
+RUN pip install --verbose git+https://github.com/bytedance-iaas/grouped_gemm@dev
+
+# examples 覆盖
+RUN cd /tmp && git clone https://github.com/bytedance-iaas/sglang.git -b ${branch} && \
+    rm -rf /sgl-workspace/sglang/examples && \
+    mkdir -p /sgl-workspace/sglang && \
+    cp -r /tmp/sglang/examples /sgl-workspace/sglang/examples && \
+    rm -rf /tmp/sglang
+
+# onion 安装
+RUN curl -fsSL https://mirrors.byted.org/extra-tools/ubuntu/GPG-KEY-system | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.byted.org/extra-tools/ubuntu jammy main" > /etc/apt/sources.list.d/volctools.list && \ 
+    apt update && apt install -y onion-ai-data
+
+# entrypoint
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT [ "/entrypoint.sh" ]
+
+# Set workspace directory
+WORKDIR /sgl-workspace/sglang
+
+# 将源统一还原成火山的源
+RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
+RUN rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list
