@@ -28,10 +28,9 @@ _is_npu = is_npu()
 try:
     from deep_ep import Buffer, Config
 
-    if not _is_npu:
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 
     use_deepep = True
 except ImportError:
@@ -94,7 +93,6 @@ class AscendDeepEPLLOutput(NamedTuple):
 
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
-assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
@@ -340,7 +338,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        logger.info(f"normal hidden_states.shape{hidden_states.shape}")
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
+            "SGLANG_USE_W4A8"
+        ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -386,7 +387,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -409,10 +409,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                128
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and not get_bool_env_var("SGLANG_USE_W4A8")
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
-
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -525,7 +529,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            use_fp8=False if get_bool_env_var("SGLANG_USE_W4A8") else True,
         )
         return (
             hidden_states,
@@ -553,24 +557,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        if _is_npu:
-            deepep_output = AscendDeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                self.handle[1],
-                expected_m,
-            )
-        else:
-            deepep_output = DeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                expected_m,
-            )
-        return deepep_output
+        return DeepEPLLOutput(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
 
     def _dispatch_core(
         self,
