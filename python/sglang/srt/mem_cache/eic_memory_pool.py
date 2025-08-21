@@ -32,6 +32,8 @@ G_EnableGPUNicAffinity = False
 # async kv set
 G_EnableAsyncKVSet = False
 
+G_KVSetTTLOption = -1
+
 # default H20 gpu nic affinity
 GPUNicAffinity = {
     "cuda:0": "eth1",
@@ -161,7 +163,7 @@ class EICKVClient:
 
     def __init__(self, kv_cache_dtype, kv_cache_shape, device="cpu"):
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect, G_EnableAsyncKVSet
-        global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity
+        global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
 
         config_file = get_eic_config_file_path()
         if os.path.exists(config_file) is False:
@@ -217,6 +219,10 @@ class EICKVClient:
         logger.info(f"eic enable_gpu_nic_affinity: {G_EnableGPUNicAffinity}")
         self.enable_gpu_nic_affinity = G_EnableGPUNicAffinity
 
+        G_KVSetTTLOption = config.get("kv_set_ttl_option", -1)
+        logger.info(f"eic kv set ttl: {G_KVSetTTLOption}")
+        self.kv_set_ttl_option = G_KVSetTTLOption
+
         if G_EnableGPUNicAffinity:
             if "gpu_nic_affinity_config" in config:
                 GPUNicAffinity = json.loads(config["gpu_nic_affinity_config"])
@@ -231,6 +237,10 @@ class EICKVClient:
         eic_namespace = config.get("eic_namespace", "")
         logger.info(f"eic namespace: {eic_namespace}")
         self.eic_namespace = eic_namespace
+
+        # other configurations
+        self.eic_check_bs = config.get("eic_check_bs", 2048)
+        logger.debug(f"eic check bs: {self.eic_check_bs}")
 
         if not os.path.exists(eic_log_dir) and not os.path.isdir(eic_log_dir):
             os.makedirs(eic_log_dir, exist_ok=True)
@@ -357,6 +367,8 @@ class EICKVClient:
         keys = eic.StringVector()
         keys.append(key)
         exist_option = eic.ExistOption()
+        exist_option.ns = self.eic_namespace
+
         status_code, exist_outcome = self.connection.mexist(keys, exist_option)
         if status_code != eic.StatusCode.SUCCESS:
             logger.debug(f"eic exists {key} failed, status_code {status_code}")
@@ -375,6 +387,8 @@ class EICKVClient:
         for key in keys:
             keys_vec.append(key)
         exist_option = eic.ExistOption()
+        exist_option.ns = self.eic_namespace
+
         status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
         if status_code != eic.StatusCode.SUCCESS:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
@@ -510,7 +524,7 @@ class EICKVClient:
         # set options
         set_option = eic.SetOption()
         set_option.ns = self.eic_namespace
-        set_option.ttl_second = -1
+        set_option.ttl_second = self.kv_set_ttl_option
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
         if status_code != eic.StatusCode.SUCCESS:
             logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
@@ -548,7 +562,7 @@ class EICKVClient:
         # set options
         set_option = eic.SetOption()
         set_option.ns = self.eic_namespace
-        set_option.ttl_second = -1
+        set_option.ttl_second = self.kv_set_ttl_option
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
 
         if status_code != eic.StatusCode.SUCCESS:
@@ -712,12 +726,12 @@ class EICBaseTokenToKVPoolHost:
         """
         for multi prompt detect prefix key
         """
-        batch_size = TensorPoolSize // 2
+        batch_size = self.eic_client.eic_check_bs
         keys = self._encode_key_shared(content_hashes)
 
         exist_result = []
         for i in range(0, len(keys), batch_size):
-            batch_ret = self.eic_client.exists_batch(keys[i: i + batch_size])
+            batch_ret = self.eic_client.exists_batch(keys[i : i + batch_size])
             exist_result.extend(batch_ret)
         return exist_result
 

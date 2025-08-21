@@ -791,6 +791,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         self.calculate_hash_fn = get_content_hash
         self.load_remote_threshold = 100
         self.match_req_set = []
+        self.eic_check_max_num = -1
         super().__init__(
             req_to_token_pool,
             token_to_kv_pool_allocator,
@@ -809,6 +810,10 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         )
         logger.info(
             f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold}"
+        )
+        self.eic_check_max_num = config.get("eic_check_max_num", -1)
+        logger.info(
+            f"EICPagedHiRadixCache eic_check_max_num set to {self.eic_check_max_num}"
         )
 
     def _calculate_content_hash(self, node: TreeNode):
@@ -990,6 +995,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         fetch_list = []
         if len(self.match_req_set) > 1000:
             self.match_req_set = self.match_req_set[500:]
+        eic_keys = 0
         for req in waiting_queue:
             logger.debug(f"req {req.rid} match from eic")
             if req.rid in self.match_req_set:
@@ -1013,6 +1019,12 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             )
             fetch_list.append((last_node, req, local_prefix_len, local_evict_len))
             self.match_req_set.append(req.rid)
+            eic_keys += (len(key) - local_prefix_len) // self.page_size
+            if self.eic_check_max_num > 0 and eic_keys >= self.eic_check_max_num:
+                logger.info(
+                    f"eic check max num {self.eic_check_max_num} reached, stop matching"
+                )
+                break
         if len(fetch_list) == 0:
             return
         # batch exist
