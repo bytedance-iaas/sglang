@@ -8,8 +8,8 @@ from sglang.srt.connector.base_connector import (
     BaseFileConnector,
     BaseKVConnector,
 )
+from sglang.srt.connector.hpkv import HPKVConnector, HPKVFSConnector
 from sglang.srt.connector.pris import PrisConnector
-from sglang.srt.connector.hpkv import HPKVConnector
 from sglang.srt.connector.redis import RedisConnector
 from sglang.srt.connector.s3 import S3Connector
 from sglang.srt.utils import parse_connector_type
@@ -32,6 +32,8 @@ def create_remote_connector(url, **kwargs) -> BaseConnector:
         return HPKVConnector(url, **kwargs)
     elif connector_type == "pris":
         return PrisConnector(url)
+    elif connector_type == "hpkvfs":
+        return HPKVFSConnector(url, **kwargs)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 

@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import hpkv
 import torch
 
-from sglang.srt.connector import BaseKVConnector
+from sglang.srt.connector import BaseFileConnector, BaseKVConnector
 from sglang.srt.connector.utils import pull_files_from_db
 
 logger = logging.getLogger(__name__)
@@ -167,6 +167,97 @@ class HPKVConnector(BaseKVConnector):
         ignore_pattern: Optional[list[str]] = None,
     ) -> None:
         pull_files_from_db(self, self.model_name, allow_pattern, ignore_pattern)
+
+    def close(self):
+        self.connection.close()
+        super().close()
+
+
+class HPKVFSConnector(BaseFileConnector):
+    def __init__(self, url: str, **kwargs) -> None:
+        super().__init__(url)
+        parsed_url = urlparse(url)
+        self.device = "cpu"  # kwargs.get("device", "cpu")
+        query_params = parse_qs(parsed_url.query)
+        host_nic_list = []
+        if "host-nic" in query_params:
+            host_nic = query_params["host-nic"][0]
+            host_nic_list = host_nic.split(";")
+
+        if "reg_threads" in query_params:
+            self.reg_thread = int(query_params["reg_threads"][0])
+        else:
+            self.reg_thread = 64
+
+        if "batch" in query_params:
+            self.batch = int(query_params["batch"][0])
+        else:
+            self.batch = 4
+
+        local_ip = None
+        if len(host_nic_list) > 0:
+            rank = int(kwargs.get("rank", 0))
+            local_ip = host_nic_list[rank % len(host_nic_list)]
+
+        self.workers = 64
+        self.hostname = parsed_url.hostname
+        self.port = int(parsed_url.port)
+        self.model_name = parsed_url.path.lstrip("/")
+        self.connection = hpkv.HPKVTensorClient(
+            self.hostname, self.port, local_ip, 0, 4
+        )
+
+    def glob(self, allow_pattern: Optional[list[str]] = None) -> list[str]:
+        pass
+
+    def pull_files(
+        self,
+        allow_pattern: Optional[list[str]] = None,
+        ignore_pattern: Optional[list[str]] = None,
+    ) -> None:
+        pull_files_from_db(self, self.model_name, allow_pattern, ignore_pattern)
+
+    def list(self, prefix: str) -> list[str]:
+        return self.connection.keys(f"{prefix}.*")
+
+    def getstr(
+        self,
+        key,
+    ):
+        ret = self.connection.getstr(key)
+        if ret is None:
+            logger.error("Key %s not found", key)
+            return None
+
+        return ret
+
+    def _alloc(self, key: str):
+        meta_key = key + "/metadata"
+        meta = torch.empty(METADATA_LENGTH, dtype=METADATA_DTYPE, device="cpu")
+        ret = self.connection.get(meta_key, meta)
+        if ret != 0:
+            logger.error(f"Failed to get metadata for key {key}, ret = {ret}")
+            return None
+
+        return _parse_metadata(meta, device=self.device)
+
+    def weight_iterator(self):
+        keys = self.list(f"{self.model_name}/keys/")
+        keys = [key for key in keys if not key.endswith("/metadata")]
+
+        def _split_list(lst, n):
+            k, m = divmod(len(lst), n)
+            return [
+                lst[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(n)
+            ]
+
+        split_keys = _split_list(keys, self.batch)
+        for keys in split_keys:
+            values = [self._alloc(key) for key in keys]
+            self.connection.batch_get(keys, values, reg_threads=self.reg_thread)
+            for key, value in zip(keys, values):
+                name = key.removeprefix(f"{self.model_name}/keys/")
+                yield name, value
 
     def close(self):
         self.connection.close()
