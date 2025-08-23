@@ -665,8 +665,8 @@ class EICBaseTokenToKVPoolHost:
             )
             return None, []
 
-        flat_data = torch.cat(ret, dim=self.split_dim)
-        return flat_data, masks
+        # flat_data = torch.cat(ret, dim=self.split_dim)
+        return ret, masks
 
     def assign_flat_data(self, indices, flat_data):
         logger.debug(f"assign_flat_data indices {indices}")
@@ -759,8 +759,8 @@ class EICBaseTokenToKVPoolHost:
             )
             return None, []
 
-        flat_data = torch.cat(ret, dim=self.split_dim)
-        return flat_data, masks
+        # flat_data = torch.cat(ret, dim=self.split_dim)
+        return ret, masks
 
     def assign_page_data(self, content_hashes, flat_data):
         logger.debug(f"assign_page_data hashes {content_hashes}")

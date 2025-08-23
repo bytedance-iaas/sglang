@@ -544,17 +544,25 @@ class PrefillAdder:
                     while not self.tree_cache.loading_complete(req.last_node):
                         time.sleep(0.01)
                     load_sucess = req.last_node.value is not None
+                    complete_token_num = len(new_indices)
                     if not load_sucess:
                         last_gpu_node = req.last_node
                         while last_gpu_node.evicted:
+                            complete_token_num -= len(last_gpu_node.key)
                             last_gpu_node = last_gpu_node.parent
+                        assert complete_token_num >= 0
                         req.last_node = last_gpu_node
-                        new_indices = torch.empty(
-                            (0,), dtype=torch.int64, device=req.prefix_indices.device
-                        )
                         logger.error(
-                            f"req {req.rid} after load back failed, last node:{last_gpu_node.id}"
+                            f"req {req.rid} after load back failed, last node:{last_gpu_node.id}, complete_token_num:{complete_token_num}"
                         )
+                        if complete_token_num > 0:
+                            new_indices = new_indices[:complete_token_num]
+                        else:
+                            new_indices = torch.empty(
+                                (0,),
+                                dtype=torch.int64,
+                                device=req.prefix_indices.device,
+                            )
                     loading_check_end_ts = time.perf_counter()
                     logger.debug(
                         f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
