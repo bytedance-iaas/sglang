@@ -19,8 +19,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
-
 logger = logging.getLogger(__name__)
 
 
@@ -99,15 +97,6 @@ def cutlass_w4a8_moe(
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
-    assert (
-        w1_scale.shape[1] == w1_q.shape[2] * 2 / 512
-        and w1_scale.shape[2] == w1_q.shape[1] * 4
-    ), "W1 scale shape mismatch"
-    assert (
-        w2_scale.shape[1] == w2_q.shape[2] * 2 / 512
-        and w2_scale.shape[2] == w2_q.shape[1] * 4
-    ), "W2 scale shape mismatch"
-
     assert a_strides1.shape[0] == w1_q.shape[0], "A Strides 1 expert number mismatch"
     assert b_strides1.shape[0] == w1_q.shape[0], "B Strides 1 expert number mismatch"
     assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number  mismatch"
@@ -151,7 +140,7 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
-    elif deepep_mode == DeepEPMode.NORMAL:
+    elif deepep_mode.is_deepep_normal():
         reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
             topk_ids_, num_experts
         )
@@ -260,7 +249,7 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
-    elif deepep_mode == DeepEPMode.NORMAL:
+    elif deepep_mode.is_deepep_normal():
         num_tokens = src2dst.shape[0] // topk
         output = torch.empty(
             (num_tokens, c2.shape[1]),

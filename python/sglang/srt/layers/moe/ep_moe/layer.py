@@ -115,8 +115,6 @@ class EPMoE(FusedMoE):
             with_bias=with_bias,
         )
 
-        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
-        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
 
         self.intermediate_size = intermediate_size
 
@@ -770,7 +768,7 @@ class DeepEPMoE(EPMoE):
                 self.quant_method.problem_sizes2,
                 self.w13_input_scale,
                 self.w2_input_scale,
-                deepep_mode=self.deepep_mode,
+                deepep_mode=dispatch_output.format,
             )
             return output
         else:
