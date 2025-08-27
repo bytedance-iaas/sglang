@@ -9,6 +9,8 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+from sglang.jack_utils import hcdprint
+
 import os
 from dataclasses import dataclass
 from functools import partial
@@ -73,7 +75,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
-        print(f"[horenc] class FlashInferMLAAttnBackend:__init__(): OOOOOO")
+        hcdprint(f"[horenc] class FlashInferMLAAttnBackend:__init__(): OOOOOO")
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -386,19 +388,19 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
 
-        # print(f"
+        # hcdprint(f"
         # "k = {k} save_kv_cache = {save_kv_cache} k_rope = {k_rope}")
         # Save kv cache
         if save_kv_cache and k is not None:
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    print(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL set_mla_kv_buffer() = SET2")
+                    hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL set_mla_kv_buffer() = SET2")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer, cache_loc, k, k_rope
                     )
                 else:
-                    print(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL set_kv_buffer() = SET1")
+                    hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL set_kv_buffer() = SET1")
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -423,7 +425,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            print(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL get_key_buffer() XXXXX")
+            hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL get_key_buffer() XXXXX")
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
@@ -459,12 +461,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 
-        print(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE (gpt oss)")
+        hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE (gpt oss)")
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    print(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE set_mla_kv_buffer() = SET2")
+                    hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE set_mla_kv_buffer() = SET2")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
@@ -472,7 +474,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         k_rope,
                     )
                 else:
-                    print(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE set_kv_buffer() = SET1")
+                    hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE set_kv_buffer() = SET1")
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
@@ -491,17 +493,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        print(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE get_key_buffer()")
-        # print(f"[horenc] self.dtype = {self.dtype}")
-        print(f"[horenc] GET forward_batch.token_to_kv_pool.dtype = {forward_batch.token_to_kv_pool.dtype}")
+        hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE get_key_buffer()")
+        # hcdprint(f"[horenc] self.dtype = {self.dtype}")
+        hcdprint(f"[horenc] GET forward_batch.token_to_kv_pool.dtype = {forward_batch.token_to_kv_pool.dtype}")
         if forward_batch.token_to_kv_pool.dtype != torch.float4_e2m1fn_x2:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
         else:
             #  TODO
-            print(f"[horenc] TODO:MLA:Attn TODO dequant")
-            print(f"k type: = {type(k)}  k dtype: = {k.dtype}  k shape: = {k.shape}")  # check if the same shape as quant so that I can do dequant here in attn
+            hcdprint(f"[horenc] TODO:MLA:Attn TODO dequant")
+            hcdprint(f"k type: = {type(k)}  k dtype: = {k.dtype}  k shape: = {k.shape}")  # check if the same shape as quant so that I can do dequant here in attn
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
@@ -533,7 +535,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        print(f"[horenc] class FlashInferMLAIndicesUpdaterDecode:__init__(): ")
+        hcdprint(f"[horenc] class FlashInferMLAIndicesUpdaterDecode:__init__(): ")
         # Parse Constants
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -643,7 +645,7 @@ class FlashInferMLAIndicesUpdaterDecode:
 
 class FlashInferMLAIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        print(f"[horenc] class FlashInferMLAIndicesUpdaterPrefill:__init__(): ")
+        hcdprint(f"[horenc] class FlashInferMLAIndicesUpdaterPrefill:__init__(): ")
         # Parse Constants
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -790,7 +792,7 @@ class FlashInferMLAMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
-        print(f"[horenc] class FlashInferMLAMultiStepDraftBackend:__init__(): ")
+        hcdprint(f"[horenc] class FlashInferMLAMultiStepDraftBackend:__init__(): ")
         if topk > 1:
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"

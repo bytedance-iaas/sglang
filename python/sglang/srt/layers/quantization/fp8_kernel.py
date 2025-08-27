@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from sglang.jack_utils import hcdprint
 
 import functools
 import json
@@ -227,7 +228,7 @@ def per_token_group_quant_fp8(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    print(f"[horenc][triton] def per_token_group_quant_fp8()")
+    hcdprint(f"[horenc][triton] def per_token_group_quant_fp8()")
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
@@ -350,7 +351,7 @@ def sglang_per_token_group_quant_fp8(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
 ):
-    print(f"[horenc][cuda] sglang_per_token_group_quant_fp8()")
+    hcdprint(f"[horenc][cuda] sglang_per_token_group_quant_fp8()")
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
@@ -378,7 +379,7 @@ def sglang_per_token_quant_fp8(
     x: torch.Tensor,
     dtype: torch.dtype = fp8_dtype,
 ):
-    print(f"[horenc][cuda] sglang_per_token_quant_fp8()")
+    hcdprint(f"[horenc][cuda] sglang_per_token_quant_fp8()")
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
@@ -456,7 +457,7 @@ def static_quant_fp8(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    print(f"[horenc][triton] static_quant_fp8()")
+    hcdprint(f"[horenc][triton] static_quant_fp8()")
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
 

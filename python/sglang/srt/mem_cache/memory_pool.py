@@ -537,12 +537,12 @@ class MHATokenToKVPool(KVCache):
             ):
                 hcdprint(f"[horenc] class MHATokenToKVPool:_create_buffers(): self.store_dtype = {self.store_dtype}")
                 if self.store_dtype == torch.float4_e2m1fn_x2:
-                    print(f"[horenc] class MHATokenToKVPool:_create_buffers(): Jack hack - "
+                    hcdprint(f"[horenc] class MHATokenToKVPool:_create_buffers(): Jack hack - "
                             f"force torch.uint8 + dividiveby2 for matching fp4 shape[42, 8, 64] (ori:[42, 8, 128])")  
                     m = self.size + self.page_size
                     n = self.head_num
                     k = self.head_dim
-                    print(f"[horenc] class MHATokenToKVPool:_create_buffers(): Jack hack - "
+                    hcdprint(f"[horenc] class MHATokenToKVPool:_create_buffers(): Jack hack - "
                             f"Milestone1 layout: m={m}, n={n}, k={k}, per-layer buffer_size = {(m) * (n) * (k // 2)}")
                     self.k_buffer = [
                         torch.zeros( # TODO change this 3D to 1D
@@ -577,7 +577,7 @@ class MHATokenToKVPool(KVCache):
 
                         # debug
                         scale_buffer_size = m * n * (k // scale_block_size)
-                        print(f"[horenc] class MHATokenToKVPool:_create_buffers(): Jack - "
+                        hcdprint(f"[horenc] class MHATokenToKVPool:_create_buffers(): Jack - "
                         f"Allocate KV scale buffer layout: m={m}, n={n}, k={k}, per-layer buffer_size = {scale_buffer_size}")
                         
                         self.k_scale_buffer = [
@@ -910,7 +910,7 @@ class MHATokenToKVPool(KVCache):
         hcdprint(f"[horenc] MHATokenToKVPool:set_kv_buffer() cache_k.dtype = {cache_k.dtype}")
         hcdprint(f"[horenc] MHATokenToKVPool:set_kv_buffer() self.dtype = {self.dtype}")
         hcdprint(f"[horenc] MHATokenToKVPool:set_kv_buffer() k_scale = {k_scale}")
-        # print(f"\t [horenc]  Quantized k/v check")
+        # hcdprint(f"\t [horenc]  Quantized k/v check")
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -959,8 +959,8 @@ class MHATokenToKVPool(KVCache):
                 hcdprint(f"\t [horenc]  Q self.k_buffer[layer_id - self.start_layer].shape = {self.k_buffer[layer_id - self.start_layer].shape}")
                 hcdprint(f"\t [horenc]  Q self.k_buffer[layer_id - self.start_layer][loc].shape = {self.k_buffer[layer_id - self.start_layer][loc].shape}")  
 
-        # print("[debug] cache_k.shape =", cache_k.shape)
-        # print("[debug] target shape =", self.k_buffer[layer_id - self.start_layer][loc].shape)
+        # hcdprint("[debug] cache_k.shape =", cache_k.shape)
+        # hcdprint("[debug] target shape =", self.k_buffer[layer_id - self.start_layer][loc].shape)
             
         hcdprint(f"[horenc] MHATokenToKVPool:set_kv_buffer() self.store_dtype = {self.store_dtype}")
         if self.store_dtype != self.dtype:
@@ -1134,7 +1134,7 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
             # while other backends remain unchanged.
-            print(f"[horenc] AscendTokenToKVPool CREATE kv$ buffer XXXXXXX")
+            hcdprint(f"[horenc] AscendTokenToKVPool CREATE kv$ buffer XXXXXXX")
             self.kv_buffer = torch.zeros(
                 (
                     2,
@@ -1328,7 +1328,7 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # TODO
-                print(f"[horenc] TODO:MLA TODO:MLA MLATokenToKVPool CREATE kv$ buffer 1")
+                hcdprint(f"[horenc] TODO:MLA TODO:MLA MLATokenToKVPool CREATE kv$ buffer 1")
                 if self.dtype != torch.float4_e2m1fn_x2:
                     # The padded slot 0 is used for writing dummy outputs from padded tokens.
                     self.kv_buffer = [
@@ -1340,12 +1340,12 @@ class MLATokenToKVPool(KVCache):
                         for _ in range(layer_num)
                     ]
                 else:
-                    print(f"[horenc] TODO:MLA TODO:MLA USE uint8 // 2 self.store_dtype = {self.store_dtype}")
+                    hcdprint(f"[horenc] TODO:MLA TODO:MLA USE uint8 // 2 self.store_dtype = {self.store_dtype}")
                     m = size + page_size
                     n = 1 # head_num
                     # k = self.head_dim
                     k = kv_lora_rank + qk_rope_head_dim # head_dim # k = 576 (512 + 64)
-                    print(f"[horenc] TODO:MLA __init__ create kv kv_scale buffer m = {m} ({size} + {page_size}) n = {n} k = {k} ({kv_lora_rank} + {qk_rope_head_dim})")
+                    hcdprint(f"[horenc] TODO:MLA __init__ create kv kv_scale buffer m = {m} ({size} + {page_size}) n = {n} k = {k} ({kv_lora_rank} + {qk_rope_head_dim})")
 
                     scale_block_size = 16
                     self.store_dtype = torch.uint8
@@ -1379,9 +1379,9 @@ class MLATokenToKVPool(KVCache):
                         )
                         for _ in range(layer_num)
                     ]
-                    print(f"[horenc] TODO:MLA TODO:MLA TODO:MLA for SET2 3rd global_sf")
-                    print(f"learn from this way: set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4)")
-                    print(f"Not sure if need to + page_size (1) ")
+                    hcdprint(f"[horenc] TODO:MLA TODO:MLA TODO:MLA for SET2 3rd global_sf")
+                    hcdprint(f"learn from this way: set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4)")
+                    hcdprint(f"Not sure if need to + page_size (1) ")
                     self.kv_globalsf_buffer = [
                         torch.zeros(
                             (2),
@@ -1410,7 +1410,7 @@ class MLATokenToKVPool(KVCache):
 
     def get_kv_size_bytes(self):
         # if self.dtype != torch.float4_e2m1fn_x2:
-        print(f"[horenc] TODO:MLA:CHECK MLATokenToKVPool CREATE kv$ buffer related - "
+        hcdprint(f"[horenc] TODO:MLA:CHECK MLATokenToKVPool CREATE kv$ buffer related - "
               f"get_kv_size_bytes()")
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
@@ -1421,9 +1421,9 @@ class MLATokenToKVPool(KVCache):
     # for disagg
     def get_contiguous_buf_infos(self):
         if self.dtype != torch.float4_e2m1fn_x2:
-            print(f"kv4 doesn't support disagg yet")
-        print(f"[horenc] TODO:MLA:CHECK MLATokenToKVPool CREATE kv$ buffer related - "
-              f"get_contiguous_buf_infos()")
+            hcdprint(f"kv4 doesn't support disagg yet")
+        hcdprint(f"[horenc] TODO:MLA:CHECK MLATokenToKVPool CREATE kv$ buffer related - "
+                f"get_contiguous_buf_infos()")
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
         kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
         kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
@@ -1440,7 +1440,7 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         # Get kv together
-        print(f"[horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): Jack - GET key"
+        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): Jack - GET key"
                 f" {self.store_dtype} != {self.dtype} TODO:MLA")
         # 16: bfloat16 != bfloat16
         # 8: torch.uint8 != torch.float8_e4m3fn
@@ -1448,7 +1448,7 @@ class MLATokenToKVPool(KVCache):
             if self.dtype != torch.float4_e2m1fn_x2:
                 return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
             else:
-                print(f"[horenc]({layer_id}) TODO:MLA GET KEY but actually get kv at the same time")
+                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET KEY but actually get kv at the same time")
                 # origin
                 # global_sf = (448 * 6) / tensor_bf16.abs().max().float()
                 # sf_vec_size = 16
@@ -1459,52 +1459,52 @@ class MLATokenToKVPool(KVCache):
                 # tensor_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
                 #     tensor_fp4, scale_factors, global_sf, torch.bfloat16
                 # )
-                print(f"[horenc]({layer_id}) TODO:MLA GET kv - self.kv_buffer[layer_id - self.start_layer].dtype = {self.kv_buffer[layer_id - self.start_layer].dtype} .shape = {self.kv_buffer[layer_id - self.start_layer].shape}")
+                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - self.kv_buffer[layer_id - self.start_layer].dtype = {self.kv_buffer[layer_id - self.start_layer].dtype} .shape = {self.kv_buffer[layer_id - self.start_layer].shape}")
                 # cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(self.dtype) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
                 # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(self.dtype) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
                 cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(torch.uint8) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
                 # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(torch.uint8) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
-                cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer] # follow dequant and buffer init = uint8                print(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
-                print(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
-                print(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
-                # print(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape}")
-                # print(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype}")
+                cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer] # follow dequant and buffer init = uint8   hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
+                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
+                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
+                # hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape}")
+                # hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype}")
 
 
                 global_sf = 111.222
-                print(f"[horenc]({layer_id}) global_sf = {global_sf}   type(global_sf) = {type(global_sf)}")
+                hcdprint(f"[horenc]({layer_id}) global_sf = {global_sf}   type(global_sf) = {type(global_sf)}")
                 # global_sf = self.kv_globalsf_buffer[layer_id - self.start_layer]
                 global_sf = self.kv_globalsf_buffer[layer_id - self.start_layer][0]
-                print(f"[horenc]({layer_id}) global_sf = {global_sf} global_sf.shape = {global_sf.shape} global_sf.dtype = {global_sf.dtype} type(global_sf) = {type(global_sf)}")
+                hcdprint(f"[horenc]({layer_id}) global_sf = {global_sf} global_sf.shape = {global_sf.shape} global_sf.dtype = {global_sf.dtype} type(global_sf) = {type(global_sf)}")
                 # global_sf = self.kv_globalsf_buffer[layer_id - self.start_layer][0].item()
-                # print(f"[horenc]({layer_id}) global_sf.item() = {global_sf}   type(global_sf) = {type(global_sf)}")
+                # hcdprint(f"[horenc]({layer_id}) global_sf.item() = {global_sf}   type(global_sf) = {type(global_sf)}")
                 # summary float doesn't have shape/dtype.
                 # batched_dequantize's global_sf requires  type(global_scale) = <class 'torch.Tensor'>
 
                 # Dequant
                 # no tensor_bf16....
-                print(f"[horenc]({layer_id}) TODO:MLA GET global_sf from 3rd cache")
+                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET global_sf from 3rd cache")
                 # global_sf = (448 * 6) / tensor_bf16.abs().max().float()
                 sf_vec_size = 16
                 
 
-                print(f"[horenc]({layer_id}) 1 cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
-                print(f"[horenc]({layer_id}) 2 cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
-                print(f"[horenc]({layer_id}) 3-1 global_sf = {global_sf} global_sf.shape = {global_sf.shape} global_sf.dtype = {global_sf.dtype} type(global_sf) = {type(global_sf)}")
-                # print(f"[horenc]({layer_id}) 3-2 global_sf.item() = {global_sf}   type(global_sf) = {type(global_sf)}")
+                hcdprint(f"[horenc]({layer_id}) 1 cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
+                hcdprint(f"[horenc]({layer_id}) 2 cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
+                hcdprint(f"[horenc]({layer_id}) 3-1 global_sf = {global_sf} global_sf.shape = {global_sf.shape} global_sf.dtype = {global_sf.dtype} type(global_sf) = {type(global_sf)}")
+                # hcdprint(f"[horenc]({layer_id}) 3-2 global_sf.item() = {global_sf}   type(global_sf) = {type(global_sf)}")
                 from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil # need to delayed import
                 cache_k_nope_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
                     cache_k_nope_fp4, cache_k_nope_fp4_sf, global_sf, torch.bfloat16
                 )
-                print(f"[horenc]({layer_id}) GET - cache_k_nope_fp4_dequant.shape = {cache_k_nope_fp4_dequant.shape}")
-                print(f"[horenc]({layer_id}) GET done")
+                hcdprint(f"[horenc]({layer_id}) GET - cache_k_nope_fp4_dequant.shape = {cache_k_nope_fp4_dequant.shape}")
+                hcdprint(f"[horenc]({layer_id}) GET done")
                 return cache_k_nope_fp4_dequant
 
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
         # XXXXX: Never come
-        print(f"XXX [horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): Jack - GET val XXXXX"
+        hcdprint(f"XXX [horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): Jack - GET val XXXXX"
                 f" {self.store_dtype} != {self.dtype} XXXXX")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -1530,7 +1530,7 @@ class MLATokenToKVPool(KVCache):
             if self.dtype != torch.float4_e2m1fn_x2:
                 cache_k = cache_k.to(self.dtype)
             else:
-                print(f"[horenc] TODO:MLA SET1 fp4 - replace with NVFP4QuantizeUtil.batched_quantize()")
+                hcdprint(f"[horenc] TODO:MLA SET1 fp4 - replace with NVFP4QuantizeUtil.batched_quantize()")
                 # cache_k = cache_k.to(self.dtype)
                 
                 # global_sf = (448 * 6) / tensor_bf16.abs().max().float()
@@ -1541,12 +1541,12 @@ class MLATokenToKVPool(KVCache):
 
                 """
                 # debug cache_k
-                print("cache_k type:", type(cache_k))
-                print("cache_k shape:", cache_k.shape)
-                print("cache_k dtype:", cache_k.dtype)
-                print("cache_k device:", cache_k.device)
+                hcdprint("cache_k type:", type(cache_k))
+                hcdprint("cache_k shape:", cache_k.shape)
+                hcdprint("cache_k dtype:", cache_k.dtype)
+                hcdprint("cache_k device:", cache_k.device)
                 num_elements = cache_k.numel()
-                print("Number of elements:", num_elements)
+                hcdprint("Number of elements:", num_elements)
                 =>
                     cache_k type: <class 'torch.Tensor'>
                     cache_k shape: torch.Size([7, 1, 576])
@@ -1563,17 +1563,17 @@ class MLATokenToKVPool(KVCache):
                 global_sf = (448 * 6) / cache_k.abs().max().float()
                 # global_sf = (448 * 6) / cache_k.abs().max().float().to(torch.float32)
                 sf_vec_size = 16
-                print(f"[horenc] bf cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, contiguous = {cache_k.is_contiguous()}")
-                print(f"[horenc] cache_k.contiguous is needed, otherwise fail!!")
+                hcdprint(f"[horenc] bf cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, contiguous = {cache_k.is_contiguous()}")
+                hcdprint(f"[horenc] cache_k.contiguous is needed, otherwise fail!!")
                 cache_k = cache_k.contiguous() # horenc this hack works: PASS
-                print(f"[horenc] af cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, contiguous = {cache_k.is_contiguous()}")
+                hcdprint(f"[horenc] af cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, contiguous = {cache_k.is_contiguous()}")
                 # RuntimeError: self must be contiguous
                 from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil # need to delayed import
                 cache_k_fp4, cache_k_fp4_sf = NVFP4QuantizeUtil.batched_quantize(
                         cache_k, global_sf, sf_vec_size
                 )
 
-        print(f"[horenc]({layer_id}) class MLATokenToKVPool:set_kv_buffer(): "
+        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_kv_buffer(): "
                 f"Jack - SET1 - PREFILL (pytorch) "
                 f"cache_k.dtype {cache_k.dtype} != self.dtype {self.dtype}, "
                 f"self.store_dtype {self.store_dtype} != self.dtype {self.dtype} TODO:MLA")
@@ -1582,20 +1582,20 @@ class MLATokenToKVPool(KVCache):
         if self.store_dtype != self.dtype:
             # if cache_k.dtype != self.dtype: # save kv4 scales
             if self.dtype == torch.float4_e2m1fn_x2: # save kv4 scales
-                print(f"[horenc] TODO:MLA no need kv4")
-                print(f"cache_k_fp4.shape = {cache_k_fp4.shape}")
+                hcdprint(f"[horenc] TODO:MLA no need kv4")
+                hcdprint(f"cache_k_fp4.shape = {cache_k_fp4.shape}")
                 # self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                 #     self.store_dtype
                 # )
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
                     self.store_dtype
                 )
-                print(f"[horenc] TODO:MLA no need save kv4 scales")
+                hcdprint(f"[horenc] TODO:MLA no need save kv4 scales")
                 # self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                 #     self.store_dtype
                 # )
-                print(f"cache_k_fp4_sf.shape = {cache_k_fp4_sf.shape}")
-                print(f"self.kv_scale_buffer[layer_id - self.start_layer][loc].shape = {self.kv_scale_buffer[layer_id - self.start_layer][loc].shape}") 
+                hcdprint(f"cache_k_fp4_sf.shape = {cache_k_fp4_sf.shape}")
+                hcdprint(f"self.kv_scale_buffer[layer_id - self.start_layer][loc].shape = {self.kv_scale_buffer[layer_id - self.start_layer][loc].shape}") 
                 """
                 [horenc] TODO:MLA __init__ create kv kv_scale buffer m = 1206597 n = 1 k = 576 (512 + 64)
                 cache_k_fp4.shape = torch.Size([7, 1, 288])
@@ -1606,29 +1606,28 @@ class MLATokenToKVPool(KVCache):
                     self.store_dtype
                 )
 
-                # print(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # print(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # print(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # print(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # print(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                print(f"[horenc] TODO:MLA SET1 - global_sf = {global_sf} global_sf.dtype = {global_sf.dtype}")
-                print(f"[horenc] TODO:MLA SET1 - type(global_sf) = {type(global_sf)} global_sf.shape = {global_sf.shape}")
+                # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
+                # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
+                # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
+                # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
+                # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
+                hcdprint(f"[horenc] TODO:MLA SET1 - global_sf = {global_sf} global_sf.dtype = {global_sf.dtype}")
+                hcdprint(f"[horenc] TODO:MLA SET1 - type(global_sf) = {type(global_sf)} global_sf.shape = {global_sf.shape}")
                 # global is per layer, no loc
-                # print(f"[horenc] debug {type(self.kv_globalsf_buffer[layer_id])}")
-                # print(self.kv_globalsf_buffer[layer_id].shape if isinstance(self.kv_globalsf_buffer[layer_id], torch.Tensor) else "not a tensor") # debug
-                print("DEBUG:", type(self.kv_globalsf_buffer[layer_id]), self.kv_globalsf_buffer[layer_id])
+                # hcdprint(f"[horenc] debug {type(self.kv_globalsf_buffer[layer_id])}")
+                # hcdprint(self.kv_globalsf_buffer[layer_id].shape if isinstance(self.kv_globalsf_buffer[layer_id], torch.Tensor) else "not a tensor") # debug
+                hcdprint(f"DEBUG: {type(self.kv_globalsf_buffer[layer_id])}, {self.kv_globalsf_buffer[layer_id]}")
                 # self.kv_globalsf_buffer[layer_id - self.start_layer] = global_sf # .view(torch.float32)沒用的
                 # self.kv_globalsf_buffer[layer_id - self.start_layer] = global_sf.item()
                 # self.kv_globalsf_buffer[layer_id - self.start_layer] = global_sf.detach()
-                # print(f"[horenc] TODO:MLA SET1 HACK HACK HACK set [layer_id][1] in case (not helpful)")
+                # hcdprint(f"[horenc] TODO:MLA SET1 HACK HACK HACK set [layer_id][1] in case (not helpful)")
                 # self.kv_globalsf_buffer[layer_id - self.start_layer][1] = global_sf
                 self.kv_globalsf_buffer[layer_id - self.start_layer][0] = global_sf.item()
 
                 # test
                 # self.kv_globalsf_buffer[layer_id - self.start_layer] = 114.118
 
-
-                print(f"[horenc] TODO:MLA SET1 done")
+                hcdprint(f"[horenc] TODO:MLA SET1 done")
                 
             else: # fp8
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
@@ -1645,9 +1644,9 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        print(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
+        hcdprint(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
                 f"-> set_mla_kv_buffer_triton() (USE TRITON writh kv$)")
-        print(f"[horenc] SET2 ({layer_id}) loc = {loc}\t "
+        hcdprint(f"[horenc] SET2 ({layer_id}) loc = {loc}\t "
                 f"{cache_k_nope.dtype} != {self.dtype}, "
                 f"{self.store_dtype} != {self.dtype} TODO:MLA")
         if cache_k_nope.dtype != self.dtype:
@@ -1660,18 +1659,25 @@ class MLATokenToKVPool(KVCache):
                 # k_nope_global_sf = (448 * 6) / cache_k_nope.abs().max().float().to(torch.float32)
                 sf_vec_size = 16
                 from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil # need to delayed import
+                hcdprint(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
+                        f"-> cache_k_nope.is_contiguous() = {cache_k_nope.is_contiguous()} cache_k_nope.shape = {cache_k_nope.shape}")
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = NVFP4QuantizeUtil.batched_quantize(
                         cache_k_nope, k_nope_global_sf, sf_vec_size
                 )
-                
+
                 # cache_k_rope = cache_k_rope.to(self.dtype)
                 k_rope_global_sf = (448 * 6) / cache_k_rope.abs().max().float()
                 # k_rope_global_sf = (448 * 6) / cache_k_rope.abs().max().float().to(torch.float32)
                 # sf_vec_size = 16
+                hcdprint(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
+                        f"-> cache_k_rope.is_contiguous() = {cache_k_rope.is_contiguous()} cache_k_rope.shape = {cache_k_rope.shape}")
+                #                cache_k = cache_k.contiguous() # horenc this hack works: PASS
+                # Same as SET1's cache_k, cache_k_rope may not be contiguous and thus trt will report error
+                cache_k_rope = cache_k_rope.contiguous()
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = NVFP4QuantizeUtil.batched_quantize(
                         cache_k_rope, k_rope_global_sf, sf_vec_size
                 )
-                # print(f"[horenc]({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
+                # hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
                         # f" TODO:MLA SET 3rd global_sf")
                 # learn from this way: set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4)
             else:
@@ -1689,23 +1695,23 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             # TODO
-            print(f"[horenc]({layer_id}) TODO:MLA SET2 - DECODE (triton) WIP ")
+            hcdprint(f"[horenc]({layer_id}) TODO:MLA SET2 - DECODE (triton) WIP ")
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4
             )
             set_mla_kv_buffer_triton(
                 self.kv_scale_buffer[layer_id], loc, cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
             )
-            print(f"[horenc] TODO:MLA SET2 - k_nope_global_sf = {k_nope_global_sf} k_nope_global_sf.dtype ={k_nope_global_sf.dtype}")
-            print(f"[horenc] TODO:MLA SET2 - k_rope_global_sf = {k_rope_global_sf} k_rope_global_sf.dtype = {k_rope_global_sf.dtype}")
+            hcdprint(f"[horenc] TODO:MLA SET2 - k_nope_global_sf = {k_nope_global_sf} k_nope_global_sf.dtype ={k_nope_global_sf.dtype}")
+            hcdprint(f"[horenc] TODO:MLA SET2 - k_rope_global_sf = {k_rope_global_sf} k_rope_global_sf.dtype = {k_rope_global_sf.dtype}")
             # set_mla_kv_buffer_triton( # global is per layer, no loc
             #     self.kv_globalsf_buffer[layer_id], 0, k_nope_global_sf, k_rope_global_sf
             # )
             # self.kv_globalsf_buffer[layer_id - self.start_layer][loc] = global_sf # This can only fit one, unless figure this out
 
-            print(f"[horenc] TODO:MLA SET2 - HACK HACK HACK HACK HACK HACK")
-            print(f"[horenc] k_nope_global_sf = {k_nope_global_sf}, k_nope_global_sf.shape = {k_nope_global_sf.shape}, type(k_nope_global_sf) = {type(k_nope_global_sf)}")
-            print(f"[horenc] self.kv_globalsf_buffer[layer_id] = {self.kv_globalsf_buffer[layer_id]}, self.kv_globalsf_buffer[layer_id].shape = {self.kv_globalsf_buffer[layer_id].shape}")
+            hcdprint(f"[horenc] TODO:MLA SET2 - HACK HACK HACK HACK HACK HACK")
+            hcdprint(f"[horenc] k_nope_global_sf = {k_nope_global_sf}, k_nope_global_sf.shape = {k_nope_global_sf.shape}, type(k_nope_global_sf) = {type(k_nope_global_sf)}")
+            hcdprint(f"[horenc] self.kv_globalsf_buffer[layer_id] = {self.kv_globalsf_buffer[layer_id]}, self.kv_globalsf_buffer[layer_id].shape = {self.kv_globalsf_buffer[layer_id].shape}")
             # self.kv_globalsf_buffer[layer_id][0] = k_nope_global_sf
             # self.kv_globalsf_buffer[layer_id][1] = k_rope_global_sf
             self.kv_globalsf_buffer[layer_id][0] = k_nope_global_sf.item()
