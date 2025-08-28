@@ -232,6 +232,7 @@ def cutlass_moe(
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        None,
         a1_scale,
         a2_scale,
         apply_router_weight_on_input,

@@ -338,6 +338,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self.expert_offsets,
             self.problem_sizes1,
             self.problem_sizes2,
+            None,
             layer.w13_input_scale,
             layer.w2_input_scale,
         )

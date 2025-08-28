@@ -54,17 +54,12 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
+    int64_t topk,
+    int64_t expected_m_per_group) {
   using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
 
-  uint32_t const num_experts = expert_offsets.size(0);
-  uint32_t m = 0;
-  if (a_tensors.dim() == 3) {
-    m = a_tensors.size(1);
-  } else {
-    m = a_tensors.size(0) / num_experts;
-  }
+  uint32_t const m = expected_m_per_group;
   uint32_t const n = d_tensors.size(1);
   uint32_t const k = a_tensors.size(1);
 
@@ -286,7 +281,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
+    int64_t topk,
+    int64_t expected_m_per_group) {
   dispatch_w4a8_moe_mm_sm90(
       d_tensors,
       a_tensors,
@@ -300,5 +296,6 @@ void cutlass_w4a8_moe_mm_sm90(
       d_strides,
       s_strides,
       chunk_size,
-      topk);
+      topk,
+      expected_m_per_group);
 }

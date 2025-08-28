@@ -48,6 +48,7 @@ def cutlass_w4a8_moe(
     expert_offsets: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
+    masked_m: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
@@ -110,6 +111,7 @@ def cutlass_w4a8_moe(
     assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number mismatch"
     assert b_strides2.shape[0] == w2_q.shape[0], "B Strides 2 expert number mismatch"
     num_experts = w1_q.size(0)
+    # logger.info(f"cutlass_w4a8_moe input hidden_states, shape: {a.shape}")
     m = a.size(0) if not deepep_mode or deepep_mode.is_deepep_normal() else a.size(1)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
@@ -148,7 +150,10 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
+
+        expected_m_per_group = int(m * topk / total_num_experts)
     elif deepep_mode.is_deepep_normal():
+        # TODO: ep mode的preprocess是否可以和normal的合并？如果可以合并的话也不需要再做local_topk_ids里面 -1 到 num_experts的转换？
         reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
             topk_ids_, num_experts
         )
@@ -159,6 +164,7 @@ def cutlass_w4a8_moe(
             dtype=a.dtype,
         )
         # PreReorder
+        # 这个pre reorder和ep mode pre reorder的区别是这个里面没有做activation的scale，ep mode的做了
         deepep_permute_triton_kernel[(a.shape[0],)](
             a,
             gateup_input_pre_reorder,
@@ -180,6 +186,8 @@ def cutlass_w4a8_moe(
         local_topk_ids = (
             torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
         ).contiguous()
+
+        expected_m_per_group = int(m / num_experts)
 
     if not deepep_mode or deepep_mode.is_deepep_normal():
         # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
@@ -205,7 +213,7 @@ def cutlass_w4a8_moe(
 
     elif deepep_mode.is_deepep_ll():
         problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
-            local_topk_ids,
+            masked_m,
             problem_sizes1,
             problem_sizes2,
             num_experts,
@@ -213,6 +221,7 @@ def cutlass_w4a8_moe(
             k,
         )
 
+        expected_m_per_group = torch.mean(masked_m.to(torch.float32)).to(torch.int32)
         gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
         sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
         c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
@@ -235,6 +244,7 @@ def cutlass_w4a8_moe(
         s_strides13,
         128,
         topk,
+        expected_m_per_group,
     )
     silu_and_mul(c1, intermediate)
 
@@ -257,6 +267,7 @@ def cutlass_w4a8_moe(
         s_strides2,
         128,
         topk,
+        expected_m_per_group,
     )
 
     if not deepep_mode:
