@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
@@ -28,9 +29,10 @@ _is_npu = is_npu()
 try:
     from deep_ep import Buffer, Config
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
+    if not _is_npu:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
 
     use_deepep = True
 except ImportError:
@@ -338,9 +340,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        logger.info(f"normal hidden_states.shape{hidden_states.shape}")
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
-            "SGLANG_USE_W4A8"
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and not get_moe_runner_backend().is_cutlass_w4afp8()
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -412,7 +414,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             expert_alignment=(
                 128
                 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and not get_bool_env_var("SGLANG_USE_W4A8")
+                and not get_moe_runner_backend().is_cutlass_w4afp8()
                 else 1
             ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
@@ -529,7 +531,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=False if get_bool_env_var("SGLANG_USE_W4A8") else True,
+            use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
         )
         return (
             hidden_states,
@@ -557,13 +559,24 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        return DeepEPLLOutput(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            masked_m,
-            expected_m,
-        )
+        if _is_npu:
+            deepep_output = AscendDeepEPLLOutput(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                masked_m,
+                self.handle[1],
+                expected_m,
+            )
+        else:
+            deepep_output = DeepEPLLOutput(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                masked_m,
+                expected_m,
+            )
+        return deepep_output
 
     def _dispatch_core(
         self,
