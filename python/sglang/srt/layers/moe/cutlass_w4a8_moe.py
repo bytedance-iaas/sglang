@@ -48,7 +48,7 @@ def cutlass_w4a8_moe(
     expert_offsets: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
-    masked_m: torch.Tensor,
+    masked_m: torch.Tensor = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
