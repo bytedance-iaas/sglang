@@ -55,6 +55,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
+        print(f"[horenc] class TRTLLMHAAttnBackend:__init__(): (only gpt-oss)")
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, q_indptr_decode_buf)
 
         config = model_runner.model_config
@@ -225,6 +226,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
+
+        print(f"[horenc] class TRTLLMHAAttnBackend:forward_decode():  OOO (only gpt-oss) self.data_type = {self.data_type} q.dtype = {q.dtype}")
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache and k is not None:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -233,6 +236,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # k_cache = k_cache.to(q.dtype) # horenc fp8 support
+        # v_cache = v_cache.to(q.dtype) # horenc fp8 support
         # shape conversion:
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache = k_cache.view(
@@ -283,6 +288,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        print(f"[horenc] class TRTLLMHAAttnBackend:forward_extend(): OOO (only gpt-oss) self.data_type = {self.data_type} q.dtype = {q.dtype}")
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache and k is not None:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -291,6 +297,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # k_cache = k_cache.to(q.dtype) # horenc fp8 support
+        # v_cache = v_cache.to(q.dtype) # horenc fp8 support
         k_cache = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
