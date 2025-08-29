@@ -1279,6 +1279,139 @@ def set_mla_kv_buffer_triton(
         BLOCK=BLOCK,
     )
 
+# @triton.jit
+# def set_mla_kv_scale_buffer_kernel(
+#     kv_buffer_ptr,
+#     cache_k_nope_ptr,
+#     cache_k_rope_ptr,
+#     loc_ptr,
+#     buffer_stride: tl.constexpr,
+#     nope_stride: tl.constexpr,
+#     rope_stride: tl.constexpr,
+#     nope_dim: tl.constexpr,
+#     rope_dim: tl.constexpr,
+#     BLOCK: tl.constexpr,
+# ):
+#     pid_loc = tl.program_id(0)
+#     pid_blk = tl.program_id(1)
+
+#     base = pid_blk * BLOCK
+#     offs = base + tl.arange(0, BLOCK)
+
+#     # buffer 的最大可寫入尺寸
+#     total_dim = nope_dim + rope_dim
+#     buffer_dim = tl.load(kv_buffer_ptr)  # 不確定可讀 buffer_shape, 我們用 mask 限制
+#     # mask 限制不要越界
+#     mask_nope = offs < nope_dim
+#     mask_rope = offs - nope_dim < rope_dim
+#     mask_buffer = offs < buffer_dim
+#     mask = mask_buffer
+
+#     loc = tl.load(loc_ptr + pid_loc)
+#     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+#     # 複製 nope 部分
+#     src_nope = tl.load(cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask_nope & mask)
+#     tl.store(dst_ptr, src_nope, mask=mask_nope & mask)
+
+#     # 複製 rope 部分
+#     offs_rope = offs - nope_dim
+#     src_rope = tl.load(cache_k_rope_ptr + pid_loc * rope_stride + offs_rope, mask=mask_rope & mask)
+#     tl.store(dst_ptr, src_rope, mask=mask_rope & mask)
+
+# def set_mla_kv_scale_buffer_triton(
+#     kv_buffer: torch.Tensor,
+#     loc: torch.Tensor,
+#     cache_k_nope: torch.Tensor,
+#     cache_k_rope: torch.Tensor,
+# ):
+#     nope_dim = cache_k_nope.shape[-1]
+#     rope_dim = cache_k_rope.shape[-1]
+#     total_dim = nope_dim + rope_dim
+#     BLOCK = 16
+#     n_loc = loc.numel()
+#     grid = (n_loc, triton.cdiv(kv_buffer.shape[-1], BLOCK))
+
+#     set_mla_kv_scale_buffer_kernel[grid](
+#         kv_buffer,
+#         cache_k_nope,
+#         cache_k_rope,
+#         loc,
+#         kv_buffer.stride(0),
+#         cache_k_nope.stride(0),
+#         cache_k_rope.stride(0),
+#         nope_dim,
+#         rope_dim,
+#         BLOCK=BLOCK,
+#     )
+
+@triton.jit
+def set_mla_kv_scale_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim  # Make sure don't cross the boundary
+
+    loc = tl.load(loc_ptr + pid_loc)
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    # Check each offs should read 'nope' or 'rope'
+    is_nope = offs < nope_dim
+    src_nope = tl.load(
+        cache_k_nope_ptr + pid_loc * nope_stride + offs,
+        mask=mask & is_nope,
+        other=0.0
+    )
+    src_rope = tl.load(
+        cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+        mask=mask & ~is_nope,
+        other=0.0
+    )
+
+    # Combine nope + rope
+    src = src_nope + src_rope
+    tl.store(dst_ptr, src, mask=mask)
+
+def set_mla_kv_scale_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    total_dim = nope_dim + rope_dim
+    BLOCK = 128  # Keep origin, works for smaller total_dim as well.
+    n_loc = loc.numel() 
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
+
+    set_mla_kv_scale_buffer_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=BLOCK,
+    )
+
 
 class MLATokenToKVPool(KVCache):
     def __init__(
@@ -1371,7 +1504,7 @@ class MLATokenToKVPool(KVCache):
                         torch.zeros(
                             # (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
                             # (m, n, k // scale_block_size),
-                            (m, k // scale_block_size),
+                            (m, n, k // scale_block_size),
                             # bateched quant shape
                             # (m, math.ceil(n / 128) * 128 * math.ceil(k / 16 / 4) * 4),
                             # dtype=self.store_dtype, # store_dtype = fp4
@@ -1380,21 +1513,21 @@ class MLATokenToKVPool(KVCache):
                         )
                         for _ in range(layer_num)
                     ]
-                    hcdprint(f"[horenc] TODO:MLA TODO:MLA TODO:MLA for SET2 3rd global_sf")
-                    hcdprint(f"learn from this way: set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4)")
-                    hcdprint(f"Not sure if need to + page_size (1) ")
-                    self.kv_globalsf_buffer = [
-                        torch.zeros(
-                            (2),
-                            # 2 + page_size, # because of set_mla_kv_buffer_triton(..., k_nope, k_rope) # Need to check if how this func reads the buffer. 
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        for _ in range(layer_num)
-                    ]
-                    # set_mla_kv_buffer_triton(
-                    #     self.kv_globalsf_buffer[layer_id], loc, k_nope_global_sf, k_rope_global_sf
-                    # )
+                    # hcdprint(f"[horenc] TODO:MLA TODO:MLA TODO:MLA for SET2 3rd global_sf")
+                    # hcdprint(f"learn from this way: set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4)")
+                    # hcdprint(f"Not sure if need to + page_size (1) ")
+                    # self.kv_globalsf_buffer = [
+                    #     torch.zeros(
+                    #         (2),
+                    #         # 2 + page_size, # because of set_mla_kv_buffer_triton(..., k_nope, k_rope) # Need to check if how this func reads the buffer. 
+                    #         dtype=torch.float32,
+                    #         device=device,
+                    #     )
+                    #     for _ in range(layer_num)
+                    # ]
+                    # # set_mla_kv_buffer_triton(
+                    # #     self.kv_globalsf_buffer[layer_id], loc, k_nope_global_sf, k_rope_global_sf
+                    # # )
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -1441,69 +1574,67 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         # Get kv together
-        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): Jack - GET key"
-                f" {self.store_dtype} != {self.dtype} TODO:MLA")
+        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): GET key"
+                f" {self.store_dtype} != {self.dtype}")
         # 16: bfloat16 != bfloat16
         # 8: torch.uint8 != torch.float8_e4m3fn
         if self.store_dtype != self.dtype:
             if self.dtype != torch.float4_e2m1fn_x2:
                 return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
             else:
-                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET KEY but actually get kv at the same time")
-                # origin
-                # global_sf = (448 * 6) / tensor_bf16.abs().max().float()
-                # sf_vec_size = 16
-                # tensor_fp4, scale_factors = NVFP4QuantizeUtil.batched_quantize(
-                #     tensor_bf16, global_sf, sf_vec_size
-                # )
-                #
-                # tensor_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
-                #     tensor_fp4, scale_factors, global_sf, torch.bfloat16
-                # )
-                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - self.kv_buffer[layer_id - self.start_layer].dtype = {self.kv_buffer[layer_id - self.start_layer].dtype} .shape = {self.kv_buffer[layer_id - self.start_layer].shape}")
+                hcdprint(f"[horenc]({layer_id}) GET key but actually get kv at the same time")
+                hcdprint(f"[horenc]({layer_id}) MLA GET kv - self.kv_buffer[layer_id - self.start_layer].dtype = {self.kv_buffer[layer_id - self.start_layer].dtype} .shape = {self.kv_buffer[layer_id - self.start_layer].shape}")
                 # cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(self.dtype) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
-                # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(self.dtype) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
                 cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(torch.uint8) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
+                # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(self.dtype) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
                 # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(torch.uint8) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
                 cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer] # follow dequant and buffer init = uint8   hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
-                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
-                hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
-                # hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape}")
-                # hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype}")
+                hcdprint(f"[horenc]({layer_id}) 1 MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
+                hcdprint(f"[horenc]({layer_id}) 2 MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
 
-
-                # global_sf = 111.222
-                # hcdprint(f"[horenc]({layer_id}) global_sf = {global_sf}   type(global_sf) = {type(global_sf)}")
-                # # global_sf = self.kv_globalsf_buffer[layer_id - self.start_layer]
-                # global_sf = self.kv_globalsf_buffer[layer_id - self.start_layer][0]
-                # hcdprint(f"[horenc]({layer_id}) global_sf = {global_sf} global_sf.shape = {global_sf.shape} global_sf.dtype = {global_sf.dtype} type(global_sf) = {type(global_sf)}")
-                # # global_sf = self.kv_globalsf_buffer[layer_id - self.start_layer][0].item()
-                # # hcdprint(f"[horenc]({layer_id}) global_sf.item() = {global_sf}   type(global_sf) = {type(global_sf)}")
-                # # summary float doesn't have shape/dtype.
-                # # batched_dequantize's global_sf requires  type(global_scale) = <class 'torch.Tensor'>
-
-                # # Dequant
-                # # no tensor_bf16....
-                # hcdprint(f"[horenc]({layer_id}) TODO:MLA GET global_sf from 3rd cache")
-                # # global_sf = (448 * 6) / tensor_bf16.abs().max().float()
-                # sf_vec_size = 16
-                
-
-                hcdprint(f"[horenc]({layer_id}) 1 cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
-                hcdprint(f"[horenc]({layer_id}) 2 cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
-                # hcdprint(f"[horenc]({layer_id}) 3-1 global_sf = {global_sf} global_sf.shape = {global_sf.shape} global_sf.dtype = {global_sf.dtype} type(global_sf) = {type(global_sf)}")
-                # hcdprint(f"[horenc]({layer_id}) 3-2 global_sf.item() = {global_sf}   type(global_sf) = {type(global_sf)}")
-                # from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil # need to delayed import
-                # cache_k_nope_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
-                # cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
-                #     cache_k_nope_fp4, cache_k_nope_fp4_sf, global_sf, torch.bfloat16
-                # )
+                cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.squeeze(1) # horenc25827 [m, 1, k] -> [m, k]
+
+
+                # DEBUG kv_buffer
+                if layer_id == 0 or layer_id == 1:
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[29] shape: {cache_k_nope_fp4[29].shape}, "
+                            f"cache_k_nope_fp4[29] values: {cache_k_nope_fp4[29]}") # shape: [1, 36]
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[30] shape: {cache_k_nope_fp4[30].shape}, "
+                            f"cache_k_nope_fp4[30] values: {cache_k_nope_fp4[30]}") # shape: [1, 36]
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[31] shape: {cache_k_nope_fp4[31].shape}, "
+                            f"cache_k_nope_fp4[31] values: {cache_k_nope_fp4[31]}") # shape: [1, 36]
+
+                # Debug e.g., (0) loc = tensor([29
+                # Debug e.g., (0) loc = tensor([29
+                # Debug e.g., (0) loc = tensor([29
+                # if layer_id == 0 and loc.numel() == 1 and int(loc.item()) == 29:
+                # if layer_id == 0:
+                if layer_id == 0 or layer_id == 1:
+                    # hcdprint(f"Jack DEBUG GET - cache_k_nope_fp4_sf = {cache_k_nope_fp4_sf}")
+                    # hcdprint(f"Jack DEBUG GET - cache_k_nope_fp4_sf[29] = {cache_k_nope_fp4_sf[29]}")
+                    # slot_tensor = cache_k_nope_fp4_sf[29]  # shape: [1, 36]
+                    # hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[1] shape: {cache_k_nope_fp4_sf[1].shape}" # shape: [1, 36]
+                    #         f"cache_k_nope_fp4_sf[1] values: {cache_k_nope_fp4_sf[1]}")
+                    # hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[2] shape: {cache_k_nope_fp4_sf[2].shape}, "  # shape: [1, 36]
+                    #         f"cache_k_nope_fp4_sf[2] values: {cache_k_nope_fp4_sf[2]}")
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[16] shape: {cache_k_nope_fp4_sf[16].shape}, "  # shape: [1, 36]
+                            f"cache_k_nope_fp4_sf[16] values: {cache_k_nope_fp4_sf[16]}")
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[17] shape: {cache_k_nope_fp4_sf[17].shape}, "  # shape: [1, 36]
+                            f"cache_k_nope_fp4_sf[17] values: {cache_k_nope_fp4_sf[17]}")
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[18] shape: {cache_k_nope_fp4_sf[18].shape}, "  # shape: [1, 36]
+                            f"cache_k_nope_fp4_sf[18] values: {cache_k_nope_fp4_sf[18]}")
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[29] shape: {cache_k_nope_fp4_sf[29].shape}, "
+                            f"cache_k_nope_fp4_sf[29] values: {cache_k_nope_fp4_sf[29]}") # shape: [1, 36]
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[30] shape: {cache_k_nope_fp4_sf[30].shape}, "
+                            f"cache_k_nope_fp4_sf[30] values: {cache_k_nope_fp4_sf[30]}") # shape: [1, 36]
+                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[31] shape: {cache_k_nope_fp4_sf[31].shape}, "
+                            f"cache_k_nope_fp4_sf[31] values: {cache_k_nope_fp4_sf[31]}") # shape: [1, 36]
+
                 cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
                     cache_k_nope_fp4, cache_k_nope_fp4_sf
                 )
-                hcdprint(f"[horenc]({layer_id}) GET - cache_k_nope_fp4_dequant.shape = {cache_k_nope_fp4_dequant.shape}")
-                hcdprint(f"[horenc]({layer_id}) GET done")
+                hcdprint(f"[horenc]({layer_id}) GET done go attn - cache_k_nope_fp4_dequant.shape = {cache_k_nope_fp4_dequant.shape}")
                 return cache_k_nope_fp4_dequant
 
         return self.kv_buffer[layer_id - self.start_layer]
@@ -1536,15 +1667,6 @@ class MLATokenToKVPool(KVCache):
             if self.dtype != torch.float4_e2m1fn_x2:
                 cache_k = cache_k.to(self.dtype)
             else:
-                hcdprint(f"[horenc] TODO:MLA SET1 fp4 - replace with NVFP4QuantizeUtil.batched_quantize()")
-                # cache_k = cache_k.to(self.dtype)
-                
-                # global_sf = (448 * 6) / tensor_bf16.abs().max().float()
-                # sf_vec_size = 16
-                # tensor_fp4, scale_factors = NVFP4QuantizeUtil.batched_quantize(
-                #         tensor_bf16, global_sf, sf_vec_size
-                # )
-
                 """
                 # debug cache_k
                 hcdprint("cache_k type:", type(cache_k))
@@ -1565,83 +1687,64 @@ class MLATokenToKVPool(KVCache):
                     cache_k device: cuda:3
                     Number of elements: 4032
                 """
+                # cache_k = cache_k.to(self.dtype) # ori
+                # hcdprint(f"[horenc] TODO:MLA SET1 fp4 - replace with NVFP4QuantizeUtil.batched_quantize()")
 
-                # global_sf = (448 * 6) / cache_k.abs().max().float()
-                # # global_sf = (448 * 6) / cache_k.abs().max().float().to(torch.float32)
-                # sf_vec_size = 16
-                hcdprint(f"[horenc] bf cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, contiguous = {cache_k.is_contiguous()}")
+                hcdprint(f"[horenc] bf cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, cache_k.is_contiguous = {cache_k.is_contiguous()}")
                 hcdprint(f"[horenc] cache_k.contiguous is needed, otherwise fail!!")
-                # cache_k = cache_k.contiguous() # horenc this hack works: PASS
-                hcdprint(f"[horenc] af cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, contiguous = {cache_k.is_contiguous()}")
-                # # RuntimeError: self must be contiguous
-                # # from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil # need to delayed import
-                # # cache_k_fp4, cache_k_fp4_sf = NVFP4QuantizeUtil.batched_quantize(
-                # from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
-                # cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
-                #         cache_k, global_sf, sf_vec_size
-                # )
+                cache_k = cache_k.contiguous() # horenc this hack works: PASS
+                hcdprint(f"[horenc] af cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, cache_k.is_contiguous = {cache_k.is_contiguous()}")
 
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
                 cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k
                 )
+                cache_k_fp4_sf = cache_k_fp4_sf.unsqueeze(1) # horenc25827 [m, k] -> [m, 1, k]
 
         hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_kv_buffer(): "
-                f"Jack - SET1 - PREFILL (pytorch) "
+                f"Jack - SET1 - PREFILL (pytorch) loc = {loc}, "
                 f"cache_k.dtype {cache_k.dtype} != self.dtype {self.dtype}, "
                 f"self.store_dtype {self.store_dtype} != self.dtype {self.dtype} TODO:MLA")
-        # 16: bfloat16 != bfloat16
-        # fp8: torch.uint8 != torch.float8_e4m3fn
+
         if self.store_dtype != self.dtype:
+            #       self.store_dtype != self.dtype
+            # fp16: bfloat16 != bfloat16
+            # fp8:  torch.uint8 != torch.float8_e4m3fn
+            # fp4:  torch.uint8 != torch.float4_e2m1fn_x2
             # if cache_k.dtype != self.dtype: # save kv4 scales
             if self.dtype == torch.float4_e2m1fn_x2: # save kv4 scales
-                hcdprint(f"[horenc] TODO:MLA no need kv4")
-                hcdprint(f"cache_k_fp4.shape = {cache_k_fp4.shape}")
-                # self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                hcdprint(f"[horenc] cache_k_fp4.dtype = {cache_k_fp4.dtype}, cache_k_fp4.is_contiguous() = {cache_k_fp4.is_contiguous()}")
+                hcdprint(f"[horenc] cache_k_fp4.shape = {cache_k_fp4.shape}")
+                # self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view( # ori
                 #     self.store_dtype
                 # )
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
                     self.store_dtype
                 )
-                hcdprint(f"[horenc] TODO:MLA no need save kv4 scales")
-                # self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                #     self.store_dtype
-                # )
-                hcdprint(f"cache_k_fp4_sf.shape = {cache_k_fp4_sf.shape}")
+                hcdprint(f"[horenc] cache_k_fp4_sf.dtype = {cache_k_fp4_sf.dtype}, cache_k_fp4_sf.is_contiguous() = {cache_k_fp4_sf.is_contiguous()}")
+                hcdprint(f"[horenc] cache_k_fp4_sf.shape = {cache_k_fp4_sf.shape}")
                 hcdprint(f"self.kv_scale_buffer[layer_id - self.start_layer][loc].shape = {self.kv_scale_buffer[layer_id - self.start_layer][loc].shape}") 
                 """
                 [horenc] TODO:MLA __init__ create kv kv_scale buffer m = 1206597 n = 1 k = 576 (512 + 64)
-                cache_k_fp4.shape = torch.Size([7, 1, 288])
-                cache_k_fp4_sf.shape = torch.Size([7, 4608])
-                self.kv_scale_buffer[layer_id - self.start_layer][loc].shape = torch.Size([7, 1, 36])
+                cache_k_fp4.shape = torch.Size([7, 1, 288]) dtype? contiguous?
+                cache_k_fp4_sf.shape = torch.Size([7, 4608]) dtype? contiguous?
+                (old) self.kv_scale_buffer[layer_id - self.start_layer][loc].shape = torch.Size([7, 1, 36])
                 """
+                hcdprint(f"[horenc] self.store_dtype = {self.store_dtype}")
                 self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf.view(
                     self.store_dtype
                 )
+                hcdprint(f"[horenc] MLA SET1 done")
 
-                # # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # # hcdprint(f"[horenc] WIP WIP WIP SIGFAULT SIGFAULT SIGFAULT")
-                # hcdprint(f"[horenc] TODO:MLA SET1 - global_sf = {global_sf} global_sf.dtype = {global_sf.dtype}")
-                # hcdprint(f"[horenc] TODO:MLA SET1 - type(global_sf) = {type(global_sf)} global_sf.shape = {global_sf.shape}")
-                # # global is per layer, no loc
-                # # hcdprint(f"[horenc] debug {type(self.kv_globalsf_buffer[layer_id])}")
-                # # hcdprint(self.kv_globalsf_buffer[layer_id].shape if isinstance(self.kv_globalsf_buffer[layer_id], torch.Tensor) else "not a tensor") # debug
-                # hcdprint(f"DEBUG: {type(self.kv_globalsf_buffer[layer_id])}, {self.kv_globalsf_buffer[layer_id]}")
-                # # self.kv_globalsf_buffer[layer_id - self.start_layer] = global_sf # .view(torch.float32)沒用的
-                # # self.kv_globalsf_buffer[layer_id - self.start_layer] = global_sf.item()
-                # # self.kv_globalsf_buffer[layer_id - self.start_layer] = global_sf.detach()
-                # # hcdprint(f"[horenc] TODO:MLA SET1 HACK HACK HACK set [layer_id][1] in case (not helpful)")
-                # # self.kv_globalsf_buffer[layer_id - self.start_layer][1] = global_sf
-                # self.kv_globalsf_buffer[layer_id - self.start_layer][0] = global_sf.item()
+                # Debug e.g., (0) loc = tensor([29
+                # Debug e.g., (0) loc = tensor([29
+                # Debug e.g., (0) loc = tensor([29
+                # After warmup first loc = tensor([16, 17, 18, 19, 20, 21, 22, 23, 24] this is SET2
+                # if layer_id == 0 and loc.numel() == 1 and int(loc.item()) == 29:
+                # if layer_id == 0 and loc.numel() == 1: # only debug case = [1, n, k]
+                if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 1 or int(loc.item()) == 2): #loc < prompt# will not enter here
+                    hcdprint(f"{layer_id} Jack DEBUG SET1 - cache_k_fp4_sf[{int(loc.item())}] = {cache_k_fp4_sf}")
 
-                # test
-                # self.kv_globalsf_buffer[layer_id - self.start_layer] = 114.118
-
-                hcdprint(f"[horenc] TODO:MLA SET1 done")
-                
             else: # fp8
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                     self.store_dtype
@@ -1657,55 +1760,100 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        hcdprint(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
+        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): SET2 "
                 f"-> set_mla_kv_buffer_triton() (USE TRITON writh kv$)")
-        hcdprint(f"[horenc] SET2 ({layer_id}) loc = {loc}\t "
+        hcdprint(f"[horenc]({layer_id}) loc = {loc}\t "
                 f"{cache_k_nope.dtype} != {self.dtype}, "
                 f"{self.store_dtype} != {self.dtype} TODO:MLA")
         if cache_k_nope.dtype != self.dtype:
             if self.dtype == torch.float4_e2m1fn_x2: # save kv4 scales
-                # cache_k_nope = cache_k_nope.to(self.dtype)
-                # cache_k_rope = cache_k_rope.to(self.dtype)
+                # cache_k_nope = cache_k_nope.to(self.dtype) # ori
+                # cache_k_rope = cache_k_rope.to(self.dtype) # ori
 
-                # cache_k_nope = cache_k_nope.to(self.dtype)
-                # k_nope_global_sf = (448 * 6) / cache_k_nope.abs().max().float()
-                # k_nope_global_sf = (448 * 6) / cache_k_nope.abs().max().float().to(torch.float32)
-                # sf_vec_size = 16
-                hcdprint(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
-                        f"-> cache_k_nope.is_contiguous() = {cache_k_nope.is_contiguous()} cache_k_nope.shape = {cache_k_nope.shape}")
-                # from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil # need to delayed import
-                # cache_k_nope_fp4, cache_k_nope_fp4_sf = NVFP4QuantizeUtil.batched_quantize(
-                # from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
-                # cache_k_nope_fp4, cache_k_nope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
-                #         cache_k_nope, k_nope_global_sf, sf_vec_size
-                # )
-
+                hcdprint(f"[horenc]({layer_id}) SET2 - "
+                        f"cache_k_nope.dtype = {cache_k_nope.dtype}, cache_k_nope.is_contiguous() = {cache_k_nope.is_contiguous()}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope.shape = {cache_k_nope.shape}")
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k_nope
                 )
+                cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.unsqueeze(1) # horenc25827 [m, k] -> [m, 1, k]
 
-                # # cache_k_rope = cache_k_rope.to(self.dtype)
-                # k_rope_global_sf = (448 * 6) / cache_k_rope.abs().max().float()
-                # # k_rope_global_sf = (448 * 6) / cache_k_rope.abs().max().float().to(torch.float32)
-                # # sf_vec_size = 16
-                hcdprint(f"[horenc] SET2 ({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
-                        f"-> cache_k_rope.is_contiguous() = {cache_k_rope.is_contiguous()} cache_k_rope.shape = {cache_k_rope.shape}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - "
+                        f"cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype}, cache_k_nope_fp4.is_contiguous() = {cache_k_nope_fp4.is_contiguous()}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - "
+                        f"cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype}, cache_k_nope_fp4_sf.is_contiguous() = {cache_k_nope_fp4_sf.is_contiguous()}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape}")
+                """
+                input:
+                    [horenc](60) SET2 - cache_k_nope.dtype = torch.bfloat16, cache_k_nope.is_contiguous() = True
+                    [horenc](60) SET2 - cache_k_nope.shape = torch.Size([1, 1, 512])
+                output:
+                    [horenc](60) SET2 - cache_k_nope_fp4.dtype = torch.uint8, cache_k_nope_fp4.is_contiguous() = True
+                    [horenc](60) SET2 - cache_k_nope_fp4.shape = torch.Size([1, 1, 256])
+                    [horenc](60) SET2 - cache_k_nope_fp4_sf.dtype = torch.uint8, cache_k_nope_fp4_sf.is_contiguous() = True
+                    [horenc](60) SET2 - cache_k_nope_fp4_sf.shape = torch.Size([1, 32])
+                """
+
+                hcdprint(f"[horenc]({layer_id}) SET2 - "
+                        f"cache_k_rope.dtype = {cache_k_rope.dtype}, cache_k_rope.is_contiguous() = {cache_k_rope.is_contiguous()}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope.shape = {cache_k_rope.shape}")
                 # #                cache_k = cache_k.contiguous() # horenc this hack works: PASS
                 # # Same as SET1's cache_k, cache_k_rope may not be contiguous and thus trt will report error
-                # cache_k_rope = cache_k_rope.contiguous() # horenc this hack works: PASS
-                # # cache_k_rope_fp4, cache_k_rope_fp4_sf = NVFP4QuantizeUtil.batched_quantize(
-                # cache_k_rope_fp4, cache_k_rope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
-                #         cache_k_rope, k_rope_global_sf, sf_vec_size
-                # )
-                # # hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): Jack - SET2 "
-                #         # f" TODO:MLA SET 3rd global_sf")
-                # # learn from this way: set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4)
-
-
+                cache_k_rope = cache_k_rope.contiguous() # horenc this hack works: PASS
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k_rope
                 )
+                cache_k_rope_fp4_sf = cache_k_rope_fp4_sf.unsqueeze(1) # horenc25827 [m, k] -> [m, 1, k]
+                hcdprint(f"[horenc]({layer_id}) SET2 - "
+                        f"cache_k_rope_fp4.dtype = {cache_k_rope_fp4.dtype}, cache_k_rope_fp4.is_contiguous() = {cache_k_rope_fp4.is_contiguous()}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4.shape = {cache_k_rope_fp4.shape}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - "
+                        f"cache_k_rope_fp4_sf.dtype = {cache_k_rope_fp4_sf.dtype}, cache_k_rope_fp4_sf.is_contiguous() = {cache_k_rope_fp4_sf.is_contiguous()}")
+                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4_sf.shape = {cache_k_rope_fp4_sf.shape}")
+                """
+                    input:
+                    [horenc](60) SET2 - cache_k_rope.dtype = torch.bfloat16, cache_k_rope.is_contiguous() = True
+                    [horenc](60) SET2 - cache_k_rope.shape = torch.Size([1, 1, 64])
+                    output:
+                    [horenc](60) SET2 - cache_k_rope_fp4.dtype = torch.uint8, cache_k_rope_fp4.is_contiguous() = True
+                    [horenc](60) SET2 - cache_k_rope_fp4.shape = torch.Size([1, 1, 32])
+                    [horenc](60) SET2 - cache_k_rope_fp4_sf.dtype = torch.uint8, cache_k_rope_fp4_sf.is_contiguous() = True
+                    [horenc](60) SET2 - cache_k_rope_fp4_sf.shape = torch.Size([1, 4])
+                """
+
+                # Debug e.g., (0) loc = tensor([29
+                # Debug e.g., (0) loc = tensor([29
+                # Debug e.g., (0) loc = tensor([29
+                # After warmup first loc = tensor([16, 17, 18, 19, 20, 21, 22, 23, 24] this is SET2
+                # if layer_id == 0 and loc.numel() == 1 and int(loc.item()) == 29:
+                # if layer_id == 0 and loc.numel() == 1 and int(loc.item()) == 29:
+                # if layer_id == 0 and loc.numel() == 1: # only debug case = [1, n, k]
+                # if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 16 or int(loc.item()) == 17 or int(loc.item()) == 29): #loc < prompt# will not enter here
+
+
+
+                # DEBUG kv cache []
+                if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 29 or int(loc.item()) == 30 or int(loc.item()) == 31): #loc < prompt# will not enter here
+                    hcdprint(f"{layer_id} Jack DEBUG SET2 DECODE - cache_k_nope_fp4[{int(loc.item())}] = {cache_k_nope_fp4}, cache_k_rope_fp4[{int(loc.item())}] = {cache_k_rope_fp4}") # 512/2 + 64/2 = 256 + 32
+
+
+                # # PREFILL: loc.numel() >= 1
+                # if (layer_id == 0 or layer_id == 1) and (int(loc.item()) >= 16): #loc < prompt# will not enter here
+                if (layer_id == 0 or layer_id == 1):
+                    if (torch.any(loc == 16) or torch.any(loc == 17) or torch.any(loc == 18)): #loc < prompt# will not enter here
+                        for i, idx in enumerate(loc):
+                            layer_loc = int(idx.item())
+                            hcdprint(f"{layer_id} Jack DEBUG SET2 PREFILL - i={i}, layer_loc[{layer_loc}]=quant[{i}], cache_k_nope_fp4_sf[{layer_loc}] = {cache_k_nope_fp4_sf[i]}, cache_k_rope_fp4_sf[{layer_loc}] = {cache_k_rope_fp4_sf[i]}")
+                        # for idx in loc:
+                        #     i = int(idx.item())
+                        #     hcdprint(f"{layer_id} Jack DEBUG SET2 PREFILL - cache_k_nope_fp4_sf[{i}] = {cache_k_nope_fp4_sf[i]}, cache_k_rope_fp4_sf[{i}] = {cache_k_rope_fp4_sf[i]}")
+
+                # DECODE: loc.numel() == 1 
+                if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 29 or int(loc.item()) == 30 or int(loc.item()) == 31): #loc < prompt# will not enter here
+                    hcdprint(f"{layer_id} Jack DEBUG SET2 DECODE - cache_k_nope_fp4_sf[{int(loc.item())}] = {cache_k_nope_fp4_sf}, cache_k_rope_fp4_sf[{int(loc.item())}] = {cache_k_rope_fp4_sf}") # 512/16 + 64/16 = 32+4
+
             else:
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 cache_k_rope = cache_k_rope.to(self.dtype)
@@ -1713,40 +1861,21 @@ class MLATokenToKVPool(KVCache):
             cache_k_nope = cache_k_nope.view(self.store_dtype)
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-        # 16: bfloat16 != bfloat16
+        # fp16: bfloat16 != bfloat16
         # fp8: torch.uint8 != torch.float8_e4m3fn
         if self.dtype != torch.float4_e2m1fn_x2:
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
             )
         else:
-            # TODO
-            hcdprint(f"[horenc]({layer_id}) TODO:MLA SET2 - DECODE (triton) WIP ")
+            hcdprint(f"[horenc]({layer_id}) SET2 - DECODE (MLA/triton) - REAL WRITE")
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id], loc, cache_k_nope_fp4, cache_k_rope_fp4
             )
-            set_mla_kv_buffer_triton(
+            # set_mla_kv_buffer_triton(
+            set_mla_kv_scale_buffer_triton(
                 self.kv_scale_buffer[layer_id], loc, cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
             )
-            # hcdprint(f"[horenc] TODO:MLA SET2 - k_nope_global_sf = {k_nope_global_sf} k_nope_global_sf.dtype ={k_nope_global_sf.dtype}")
-            # hcdprint(f"[horenc] TODO:MLA SET2 - k_rope_global_sf = {k_rope_global_sf} k_rope_global_sf.dtype = {k_rope_global_sf.dtype}")
-            # # set_mla_kv_buffer_triton( # global is per layer, no loc
-            # #     self.kv_globalsf_buffer[layer_id], 0, k_nope_global_sf, k_rope_global_sf
-            # # )
-            # # self.kv_globalsf_buffer[layer_id - self.start_layer][loc] = global_sf # This can only fit one, unless figure this out
-
-            # hcdprint(f"[horenc] TODO:MLA SET2 - HACK HACK HACK HACK HACK HACK")
-            # hcdprint(f"[horenc] k_nope_global_sf = {k_nope_global_sf}, k_nope_global_sf.shape = {k_nope_global_sf.shape}, type(k_nope_global_sf) = {type(k_nope_global_sf)}")
-            # hcdprint(f"[horenc] self.kv_globalsf_buffer[layer_id] = {self.kv_globalsf_buffer[layer_id]}, self.kv_globalsf_buffer[layer_id].shape = {self.kv_globalsf_buffer[layer_id].shape}")
-            # # self.kv_globalsf_buffer[layer_id][0] = k_nope_global_sf
-            # # self.kv_globalsf_buffer[layer_id][1] = k_rope_global_sf
-            # self.kv_globalsf_buffer[layer_id][0] = k_nope_global_sf.item()
-            # self.kv_globalsf_buffer[layer_id][1] = k_rope_global_sf.item()
-            # # self.kv_globalsf_buffer[layer_id][0] = k_nope_global_sf.detach()
-            # # self.kv_globalsf_buffer[layer_id][1] = k_rope_global_sf.detach()
-            # # self.kv_globalsf_buffer[layer_id][0:1] = k_nope_global_sf.unsqueeze(0)
-            # # self.kv_globalsf_buffer[layer_id][1:2] = k_rope_global_sf.unsqueeze(0)
-            
 
 
     def get_cpu_copy(self, indices):

@@ -1,4 +1,4 @@
-DEBUG = 1  # Global debugging knob
+DEBUG = 0  # Global debugging knob
 
 def hcdprint(msg):
     if DEBUG:
