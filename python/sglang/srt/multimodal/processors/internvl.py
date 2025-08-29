@@ -1,5 +1,7 @@
 # Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_intern_vit.py
 
+import hashlib
+
 import numpy as np
 import torch
 from decord import VideoReader, cpu
@@ -13,6 +15,16 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
+MAX_CACHE_MM_ITEM_NUM = 128
+def fast_image_hash(img: Image.Image, hash_type: str = "int") -> int | str:
+    small_img = img.resize((8, 8), Image.Resampling.BILINEAR).convert('L')
+    pixel_data = small_img.tobytes()
+    hash_obj = hashlib.md5(pixel_data)
+    
+    if hash_type == "int":
+        return int.from_bytes(hash_obj.digest(), byteorder='little', signed=False)
+    else:
+        return hash_obj.hexdigest()
 
 class InternVLImageProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel, InternS1ForConditionalGeneration]
@@ -47,6 +59,9 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             image_token="<IMG_CONTEXT>",
             image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN),
         ).build(_image_processor)
+        
+        
+        self.mm_cache = {}
 
     @staticmethod
     def build_transform(input_size):
@@ -199,24 +214,45 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             pixel_values = [transform(image) for image in images]
             pixel_values = torch.stack(pixel_values)
             return pixel_values
+        # [TODO]  a temp solution for intern. should update to a formal version
+        
+        def list_to_hash(int_list):
+            return hash(tuple(int_list))
+        image_hash_list = []
+        for image_idx, image in enumerate(base_output.images):
+            image_hash_list.append(fast_image_hash(image))
+        
+        hash_key = list_to_hash(image_hash_list)
+        
+        store_new_item = len(self.mm_cache) <= MAX_CACHE_MM_ITEM_NUM
+        is_cached_data = True
+        if hash_key not in self.mm_cache or (not store_new_item):
+            is_cached_data = False
+            # create new:           
+            num_patches_list = []
+            pixel_values = []
+            # Process each input with allocated frames
+            for image_index, (image) in enumerate(base_output.images):
+                # print("type:", type(image))
+                # print("image", image)
+                try:
+                    # TODO: video input
+                    raw_image = process_image_internvl(image)
+                    pixel_value = [raw_image.to(torch.bfloat16)]
+                    pixel_values += pixel_value
+                    num_patches = raw_image.shape[0]
+                    num_patches_list += [num_patches]
 
-        num_patches_list = []
-        pixel_values = []
-        # Process each input with allocated frames
-        for image_index, (image) in enumerate(base_output.images):
-            try:
-                # TODO: video input
-                raw_image = process_image_internvl(image)
-                pixel_value = [raw_image.to(torch.bfloat16)]
-                pixel_values += pixel_value
-                num_patches = raw_image.shape[0]
-                num_patches_list += [num_patches]
+                except FileNotFoundError as e:
+                    print(e)
+                    return None
 
-            except FileNotFoundError as e:
-                print(e)
-                return None
-
-        pixel_values = torch.cat(pixel_values, dim=0)
+            pixel_values = torch.cat(pixel_values, dim=0)
+            
+            if store_new_item:
+                self.mm_cache[hash_key] = (pixel_value, num_patches_list)
+        else:
+            pixel_values , num_patches_list = self.mm_cache[hash_key]
 
         original_placeholder = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
         input_text = input_text.replace(self.IMG_CONTEXT_TOKEN, original_placeholder)
@@ -238,14 +274,24 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             input_ids=input_ids,
             mm_token_id=self.mm_tokens.image_token_id,
         )
+        
+        send_ret = None
+        if not store_new_item:
+            send_ret = pixel_values
+        elif not is_cached_data:
+            send_ret = [pixel_values, hash_key]
+        else:
+            send_ret = [hash_key]
+        
         items = [
             MultimodalDataItem(
-                feature=pixel_values,
+                feature=send_ret,
                 modality=Modality.IMAGE,
                 offsets=image_offsets,
             )
         ]
-
+        
+        # print("chek intern VL process results: {}".format(items))
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": items,

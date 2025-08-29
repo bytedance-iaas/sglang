@@ -56,9 +56,41 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
 logger = logging.getLogger(__name__)
+
+def print_gpu_memory_usage(messeage : str) -> None:
+    print("=========check {} ========= gpu use status".format(messeage))
+    
+    if not torch.cuda.is_available():
+        print("⚠️  无可用GPU设备")
+        return
+    
+    device_id = torch.cuda.current_device()
+    if device_id >= torch.cuda.device_count():
+        print(f"⚠️  GPU设备ID {device_id} 不存在，可用设备数：{torch.cuda.device_count()}")
+        return
+    
+    device = torch.device(f"cuda:{device_id}")
+    torch.cuda.set_device(device)
+    
+    allocated = torch.cuda.memory_allocated(device)  # 已分配的显存（模型参数、计算中间变量等）
+    reserved = torch.cuda.memory_reserved(device)    # 已保留的显存（PyTorch为设备预分配的总显存）
+    total = torch.cuda.get_device_properties(device).total_memory  # 设备总显存
+    
+    def convert_unit(byte: int) -> str:
+        gb = byte / (1024 ** 3)
+        if gb >= 1:
+            return f"{gb:.2f} GB"
+        return f"{byte / (1024 ** 2):.2f} MB"
+    
+    print(f"📊 GPU {device_id} ({torch.cuda.get_device_name(device)}) 显存使用：")
+    print(f"  - 已分配显存: {convert_unit(allocated)}")
+    print(f"  - 已保留显存: {convert_unit(reserved)}")
+    print(f"  - 总显存:     {convert_unit(total)}")
+    print(f"  - 剩余显存:   {convert_unit(total - allocated)}")  # 近似剩余（实际剩余需考虑reserved）
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -91,6 +123,7 @@ class Qwen2_5_VLMLP(nn.Module):
             hidden_features,
             in_features,
             bias=bias,
+            reduce_results= False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
@@ -103,6 +136,40 @@ class Qwen2_5_VLMLP(nn.Module):
         x_parallel = x_parallel_gate * x_parallel_up
         x, _ = self.down_proj(x_parallel)
         return x
+    
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        token_size = x.shape[0]
+        chunk_1_size = token_size//2
+        chunk_2_size = token_size  - chunk_1_size
+        
+        x_1 = x[:chunk_1_size, :, :]
+        x_2 = x[chunk_1_size:, :, :]
+        current_stream = torch.cuda.current_stream()
+        
+        x_parallel_gate_1, _ = self.gate_proj(x_1)
+        x_parallel_gate_1 = self.act(x_parallel_gate_1)
+        x_parallel_up_1, _ = self.up_proj(x_1)
+        x_parallel_1 = x_parallel_gate_1 * x_parallel_up_1
+        x_1, _ = self.down_proj(x_parallel_1)
+        self.cal_done_event.record()
+        x_1 = tensor_model_parallel_all_reduce(x_1)
+        self.comm_done_event.record()
+        
+        with torch.cuda.stream(self.async_stream):
+            self.async_stream.wait_event(self.cal_done_event)
+            x_parallel_gate_2, _ = self.gate_proj(x_2)
+            x_parallel_gate_2 = self.act(x_parallel_gate_2)
+            x_parallel_up_2, _ = self.up_proj(x_2)
+            x_parallel_2 = x_parallel_gate_2 * x_parallel_up_2
+            x_2, _ = self.down_proj(x_parallel_2)
+            self.async_stream.wait_event(self.comm_done_event)
+            x_2 = tensor_model_parallel_all_reduce(x_2)
+            self.comm_done_event.record()
+        
+        current_stream.wait_event(self.comm_done_event)
+        
+                
+        return torch.cat([x_1, x_2])
 
 
 class Qwen2_5_VisionBlock(nn.Module):
@@ -118,6 +185,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         num_dummy_heads: int = 0,
+        async_stream = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -167,6 +235,13 @@ class Qwen2_5_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
+        
+        self.async_stream = async_stream
+        self.cal_done_event = torch.cuda.Event(enable_timing= False)
+        self.comm_done_event = torch.cuda.Event(enable_timing = False)
+        self.post_done_event = torch.cuda.Event(enable_timing= False)
+        self.cal2_done_event = torch.cuda.Event(enable_timing= False)
+        
 
     def forward(
         self,
@@ -182,11 +257,63 @@ class Qwen2_5_VisionBlock(nn.Module):
             position_embeddings=position_embeddings,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
-        x = x + attn
-        norm2 = self.norm2(x)
-        mlp = self.mlp(norm2)
-        x = x + mlp
-        return x
+
+        
+        if get_bool_env_var("SGL_GEMM_AR_PIP"):
+            token_size = x.shape[0]
+            chunk_1_size = token_size//2
+            current_stream = torch.cuda.current_stream()
+            
+            attn_1 = attn[:chunk_1_size, :, :]
+            attn_2 = attn[chunk_1_size:, :, :]
+            return_x = torch.empty(x.shape, device = x.device, dtype = x.dtype).contiguous()
+            x_1 = x[:chunk_1_size, :, :]
+            x_2 = x[chunk_1_size:, :, :]
+            attn_1 = tensor_model_parallel_all_reduce(attn_1)
+            self.comm_done_event.record()
+            x_1 = x_1 + attn_1
+            self.cal_done_event.record()
+            
+            with torch.cuda.stream(self.async_stream):
+                self.async_stream.wait_event(self.comm_done_event)
+                attn_2 = tensor_model_parallel_all_reduce(attn_2)
+                self.async_stream.wait_event(self.cal_done_event)
+                x_2 = x_2 + attn_2
+                self.cal_done_event.record()
+            
+            current_stream.wait_event(self.cal_done_event)
+            
+            norm2_1 = self.norm2(x_1)
+            mlp_1 = self.mlp(norm2_1)
+            self.cal_done_event.record()
+            mlp_1 = tensor_model_parallel_all_reduce(mlp_1)
+            self.comm_done_event.record()
+            # current_stream.wait_event(self.cal2_done_event)
+            return_x[:chunk_1_size, :, :] = x_1 + mlp_1
+            self.post_done_event.record()
+            
+            with torch.cuda.stream(self.async_stream):
+                self.async_stream.wait_event(self.cal_done_event)
+                norm2_2 = self.norm2(x_2)
+                mlp_2 = self.mlp(norm2_2)
+                # self.cal2_done_event.record()
+                self.async_stream.wait_event(self.comm_done_event)
+                mlp_2 = tensor_model_parallel_all_reduce(mlp_2)
+                self.async_stream.wait_event(self.post_done_event)
+                return_x[chunk_1_size:, :, :] = x_2 + mlp_2
+                self.post_done_event.record()
+            
+            current_stream.wait_event(self.post_done_event)
+            
+            return return_x
+        else:
+            attn = tensor_model_parallel_all_reduce(attn)
+            x = x + attn
+            norm2 = self.norm2(x)
+            mlp = self.mlp(norm2)
+            mlp = tensor_model_parallel_all_reduce(mlp)
+            x = x + mlp
+            return x
 
 
 class Qwen2_5_VisionPatchMerger(nn.Module):
@@ -263,7 +390,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
             in_channels=in_channels,
             embed_dim=hidden_size,
         )
-
+        
+        async_stream = torch.cuda.Stream()
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = hidden_size // num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
@@ -277,6 +405,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
+                    async_stream = async_stream,
                 )
                 for i in range(depth)
             ]
