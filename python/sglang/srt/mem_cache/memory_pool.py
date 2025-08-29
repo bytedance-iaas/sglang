@@ -1509,67 +1509,70 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         # Get kv together
-        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): GET key"
-                f" {self.store_dtype} != {self.dtype}")
+        # hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:get_key_buffer(): GET key"
+        #         f" {self.store_dtype} != {self.dtype}")
         # 16: bfloat16 != bfloat16
         # 8: torch.uint8 != torch.float8_e4m3fn
         if self.store_dtype != self.dtype:
             if self.dtype != torch.float4_e2m1fn_x2:
                 return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
             else:
-                hcdprint(f"[horenc]({layer_id}) GET key but actually get kv at the same time")
-                hcdprint(f"[horenc]({layer_id}) MLA GET kv - self.kv_buffer[layer_id - self.start_layer].dtype = {self.kv_buffer[layer_id - self.start_layer].dtype} .shape = {self.kv_buffer[layer_id - self.start_layer].shape}")
-                # cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(self.dtype) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
                 cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(torch.uint8) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
-                # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(self.dtype) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
-                # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(torch.uint8) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
+
                 cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer] # follow dequant and buffer init = uint8   hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
-                hcdprint(f"[horenc]({layer_id}) 1 MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
-                hcdprint(f"[horenc]({layer_id}) 2 MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
+
+                # hcdprint(f"[horenc]({layer_id}) GET key but actually get kv at the same time")
+                # hcdprint(f"[horenc]({layer_id}) MLA GET kv - self.kv_buffer[layer_id - self.start_layer].dtype = {self.kv_buffer[layer_id - self.start_layer].dtype} .shape = {self.kv_buffer[layer_id - self.start_layer].shape}")
+                # # cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(self.dtype) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
+                # cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(torch.uint8) # k_nope + k_rope = cache_k_nope_fp4, cache_k_rope_fp4
+                # # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(self.dtype) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
+                # # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer].view(torch.uint8) # scale of (k_nope + k_rope) = cache_k_nope_fp4_sf, cache_k_rope_fp4_sf
+                # cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer] # follow dequant and buffer init = uint8   hcdprint(f"[horenc]({layer_id}) TODO:MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
+                # hcdprint(f"[horenc]({layer_id}) 1 MLA GET kv - cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype} cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape} type(cache_k_nope_fp4) = {type(cache_k_nope_fp4)}")
+                # hcdprint(f"[horenc]({layer_id}) 2 MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
+
+                # # cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.squeeze(1) # horenc25827 for debug [m, 1, k] -> [m, k]
+
+                # # DEBUG kv_buffer
+                # if layer_id == 0 or layer_id == 1:
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[29] shape: {cache_k_nope_fp4[29].shape}, "
+                #             f"cache_k_nope_fp4[29] values: {cache_k_nope_fp4[29]}") # shape: [1, 36]
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[30] shape: {cache_k_nope_fp4[30].shape}, "
+                #             f"cache_k_nope_fp4[30] values: {cache_k_nope_fp4[30]}") # shape: [1, 36]
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[31] shape: {cache_k_nope_fp4[31].shape}, "
+                #             f"cache_k_nope_fp4[31] values: {cache_k_nope_fp4[31]}") # shape: [1, 36]
+
+                # # Debug e.g., (0) loc = tensor([29
+                # # Debug e.g., (0) loc = tensor([29
+                # # Debug e.g., (0) loc = tensor([29
+                # # if layer_id == 0 and loc.numel() == 1 and int(loc.item()) == 29:
+                # # if layer_id == 0:
+                # if layer_id == 0 or layer_id == 1:
+                #     # hcdprint(f"Jack DEBUG GET - cache_k_nope_fp4_sf = {cache_k_nope_fp4_sf}")
+                #     # hcdprint(f"Jack DEBUG GET - cache_k_nope_fp4_sf[29] = {cache_k_nope_fp4_sf[29]}")
+                #     # slot_tensor = cache_k_nope_fp4_sf[29]  # shape: [1, 36]
+                #     # hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[1] shape: {cache_k_nope_fp4_sf[1].shape}" # shape: [1, 36]
+                #     #         f"cache_k_nope_fp4_sf[1] values: {cache_k_nope_fp4_sf[1]}")
+                #     # hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[2] shape: {cache_k_nope_fp4_sf[2].shape}, "  # shape: [1, 36]
+                #     #         f"cache_k_nope_fp4_sf[2] values: {cache_k_nope_fp4_sf[2]}")
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[16] shape: {cache_k_nope_fp4_sf[16].shape}, "  # shape: [1, 36]
+                #             f"cache_k_nope_fp4_sf[16] values: {cache_k_nope_fp4_sf[16]}")
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[17] shape: {cache_k_nope_fp4_sf[17].shape}, "  # shape: [1, 36]
+                #             f"cache_k_nope_fp4_sf[17] values: {cache_k_nope_fp4_sf[17]}")
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[18] shape: {cache_k_nope_fp4_sf[18].shape}, "  # shape: [1, 36]
+                #             f"cache_k_nope_fp4_sf[18] values: {cache_k_nope_fp4_sf[18]}")
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[29] shape: {cache_k_nope_fp4_sf[29].shape}, "
+                #             f"cache_k_nope_fp4_sf[29] values: {cache_k_nope_fp4_sf[29]}") # shape: [1, 36]
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[30] shape: {cache_k_nope_fp4_sf[30].shape}, "
+                #             f"cache_k_nope_fp4_sf[30] values: {cache_k_nope_fp4_sf[30]}") # shape: [1, 36]
+                #     hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[31] shape: {cache_k_nope_fp4_sf[31].shape}, "
+                #             f"cache_k_nope_fp4_sf[31] values: {cache_k_nope_fp4_sf[31]}") # shape: [1, 36]
 
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
-                # cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.squeeze(1) # horenc25827 for debug [m, 1, k] -> [m, k]
-
-
-                # DEBUG kv_buffer
-                if layer_id == 0 or layer_id == 1:
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[29] shape: {cache_k_nope_fp4[29].shape}, "
-                            f"cache_k_nope_fp4[29] values: {cache_k_nope_fp4[29]}") # shape: [1, 36]
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[30] shape: {cache_k_nope_fp4[30].shape}, "
-                            f"cache_k_nope_fp4[30] values: {cache_k_nope_fp4[30]}") # shape: [1, 36]
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4[31] shape: {cache_k_nope_fp4[31].shape}, "
-                            f"cache_k_nope_fp4[31] values: {cache_k_nope_fp4[31]}") # shape: [1, 36]
-
-                # Debug e.g., (0) loc = tensor([29
-                # Debug e.g., (0) loc = tensor([29
-                # Debug e.g., (0) loc = tensor([29
-                # if layer_id == 0 and loc.numel() == 1 and int(loc.item()) == 29:
-                # if layer_id == 0:
-                if layer_id == 0 or layer_id == 1:
-                    # hcdprint(f"Jack DEBUG GET - cache_k_nope_fp4_sf = {cache_k_nope_fp4_sf}")
-                    # hcdprint(f"Jack DEBUG GET - cache_k_nope_fp4_sf[29] = {cache_k_nope_fp4_sf[29]}")
-                    # slot_tensor = cache_k_nope_fp4_sf[29]  # shape: [1, 36]
-                    # hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[1] shape: {cache_k_nope_fp4_sf[1].shape}" # shape: [1, 36]
-                    #         f"cache_k_nope_fp4_sf[1] values: {cache_k_nope_fp4_sf[1]}")
-                    # hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[2] shape: {cache_k_nope_fp4_sf[2].shape}, "  # shape: [1, 36]
-                    #         f"cache_k_nope_fp4_sf[2] values: {cache_k_nope_fp4_sf[2]}")
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[16] shape: {cache_k_nope_fp4_sf[16].shape}, "  # shape: [1, 36]
-                            f"cache_k_nope_fp4_sf[16] values: {cache_k_nope_fp4_sf[16]}")
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[17] shape: {cache_k_nope_fp4_sf[17].shape}, "  # shape: [1, 36]
-                            f"cache_k_nope_fp4_sf[17] values: {cache_k_nope_fp4_sf[17]}")
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[18] shape: {cache_k_nope_fp4_sf[18].shape}, "  # shape: [1, 36]
-                            f"cache_k_nope_fp4_sf[18] values: {cache_k_nope_fp4_sf[18]}")
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[29] shape: {cache_k_nope_fp4_sf[29].shape}, "
-                            f"cache_k_nope_fp4_sf[29] values: {cache_k_nope_fp4_sf[29]}") # shape: [1, 36]
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[30] shape: {cache_k_nope_fp4_sf[30].shape}, "
-                            f"cache_k_nope_fp4_sf[30] values: {cache_k_nope_fp4_sf[30]}") # shape: [1, 36]
-                    hcdprint(f"{layer_id} Jack DEBUG GET - cache_k_nope_fp4_sf[31] shape: {cache_k_nope_fp4_sf[31].shape}, "
-                            f"cache_k_nope_fp4_sf[31] values: {cache_k_nope_fp4_sf[31]}") # shape: [1, 36]
-
                 cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
                     cache_k_nope_fp4, cache_k_nope_fp4_sf
                 )
-                hcdprint(f"[horenc]({layer_id}) GET done go attn - cache_k_nope_fp4_dequant.shape = {cache_k_nope_fp4_dequant.shape}")
+                # hcdprint(f"[horenc]({layer_id}) GET done go attn - cache_k_nope_fp4_dequant.shape = {cache_k_nope_fp4_dequant.shape}")
                 return cache_k_nope_fp4_dequant
 
         return self.kv_buffer[layer_id - self.start_layer]
