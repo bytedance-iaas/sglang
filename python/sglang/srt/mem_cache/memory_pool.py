@@ -1279,71 +1279,6 @@ def set_mla_kv_buffer_triton(
         BLOCK=BLOCK,
     )
 
-# @triton.jit
-# def set_mla_kv_scale_buffer_kernel(
-#     kv_buffer_ptr,
-#     cache_k_nope_ptr,
-#     cache_k_rope_ptr,
-#     loc_ptr,
-#     buffer_stride: tl.constexpr,
-#     nope_stride: tl.constexpr,
-#     rope_stride: tl.constexpr,
-#     nope_dim: tl.constexpr,
-#     rope_dim: tl.constexpr,
-#     BLOCK: tl.constexpr,
-# ):
-#     pid_loc = tl.program_id(0)
-#     pid_blk = tl.program_id(1)
-
-#     base = pid_blk * BLOCK
-#     offs = base + tl.arange(0, BLOCK)
-
-#     # buffer 的最大可寫入尺寸
-#     total_dim = nope_dim + rope_dim
-#     buffer_dim = tl.load(kv_buffer_ptr)  # 不確定可讀 buffer_shape, 我們用 mask 限制
-#     # mask 限制不要越界
-#     mask_nope = offs < nope_dim
-#     mask_rope = offs - nope_dim < rope_dim
-#     mask_buffer = offs < buffer_dim
-#     mask = mask_buffer
-
-#     loc = tl.load(loc_ptr + pid_loc)
-#     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
-
-#     # 複製 nope 部分
-#     src_nope = tl.load(cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask_nope & mask)
-#     tl.store(dst_ptr, src_nope, mask=mask_nope & mask)
-
-#     # 複製 rope 部分
-#     offs_rope = offs - nope_dim
-#     src_rope = tl.load(cache_k_rope_ptr + pid_loc * rope_stride + offs_rope, mask=mask_rope & mask)
-#     tl.store(dst_ptr, src_rope, mask=mask_rope & mask)
-
-# def set_mla_kv_scale_buffer_triton(
-#     kv_buffer: torch.Tensor,
-#     loc: torch.Tensor,
-#     cache_k_nope: torch.Tensor,
-#     cache_k_rope: torch.Tensor,
-# ):
-#     nope_dim = cache_k_nope.shape[-1]
-#     rope_dim = cache_k_rope.shape[-1]
-#     total_dim = nope_dim + rope_dim
-#     BLOCK = 16
-#     n_loc = loc.numel()
-#     grid = (n_loc, triton.cdiv(kv_buffer.shape[-1], BLOCK))
-
-#     set_mla_kv_scale_buffer_kernel[grid](
-#         kv_buffer,
-#         cache_k_nope,
-#         cache_k_rope,
-#         loc,
-#         kv_buffer.stride(0),
-#         cache_k_nope.stride(0),
-#         cache_k_rope.stride(0),
-#         nope_dim,
-#         rope_dim,
-#         BLOCK=BLOCK,
-#     )
 
 @triton.jit
 def set_mla_kv_scale_buffer_kernel(
@@ -1503,8 +1438,8 @@ class MLATokenToKVPool(KVCache):
                     self.kv_scale_buffer = [
                         torch.zeros(
                             # (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
-                            # (m, n, k // scale_block_size),
-                            (m, n, k // scale_block_size),
+                            # (m, n, k // scale_block_size), # horenc25827 for debug [m, k] => [m, 1, k]
+                            (m, k // scale_block_size), # horenc25827 match quant/dequant function [m, 1, k] => [m, k]
                             # bateched quant shape
                             # (m, math.ceil(n / 128) * 128 * math.ceil(k / 16 / 4) * 4),
                             # dtype=self.store_dtype, # store_dtype = fp4
@@ -1593,7 +1528,7 @@ class MLATokenToKVPool(KVCache):
                 hcdprint(f"[horenc]({layer_id}) 2 MLA GET kv - cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype} cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape} type(cache_k_nope_fp4_sf) = {type(cache_k_nope_fp4_sf)}")
 
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
-                cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.squeeze(1) # horenc25827 [m, 1, k] -> [m, k]
+                # cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.squeeze(1) # horenc25827 for debug [m, 1, k] -> [m, k]
 
 
                 # DEBUG kv_buffer
@@ -1692,14 +1627,14 @@ class MLATokenToKVPool(KVCache):
 
                 hcdprint(f"[horenc] bf cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, cache_k.is_contiguous = {cache_k.is_contiguous()}")
                 hcdprint(f"[horenc] cache_k.contiguous is needed, otherwise fail!!")
-                cache_k = cache_k.contiguous() # horenc this hack works: PASS
+                # cache_k = cache_k.contiguous() # horenc this hack works: PASS
                 hcdprint(f"[horenc] af cache_k.shape = {cache_k.shape}, dtype = {cache_k.dtype}, cache_k.is_contiguous = {cache_k.is_contiguous()}")
 
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
                 cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k
                 )
-                cache_k_fp4_sf = cache_k_fp4_sf.unsqueeze(1) # horenc25827 [m, k] -> [m, 1, k]
+                # cache_k_fp4_sf = cache_k_fp4_sf.unsqueeze(1) # horenc25827 for debug [m, k] -> [m, 1, k]
 
         hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_kv_buffer(): "
                 f"Jack - SET1 - PREFILL (pytorch) loc = {loc}, "
@@ -1777,7 +1712,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k_nope
                 )
-                cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.unsqueeze(1) # horenc25827 [m, k] -> [m, 1, k]
+                # cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.unsqueeze(1) # horenc25827 for debug [m, k] -> [m, 1, k]
 
                 hcdprint(f"[horenc]({layer_id}) SET2 - "
                         f"cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype}, cache_k_nope_fp4.is_contiguous() = {cache_k_nope_fp4.is_contiguous()}")
@@ -1801,11 +1736,11 @@ class MLATokenToKVPool(KVCache):
                 hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope.shape = {cache_k_rope.shape}")
                 # #                cache_k = cache_k.contiguous() # horenc this hack works: PASS
                 # # Same as SET1's cache_k, cache_k_rope may not be contiguous and thus trt will report error
-                cache_k_rope = cache_k_rope.contiguous() # horenc this hack works: PASS
+                # cache_k_rope = cache_k_rope.contiguous() # horenc this hack works: PASS
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k_rope
                 )
-                cache_k_rope_fp4_sf = cache_k_rope_fp4_sf.unsqueeze(1) # horenc25827 [m, k] -> [m, 1, k]
+                # cache_k_rope_fp4_sf = cache_k_rope_fp4_sf.unsqueeze(1) # horenc25827 for debug [m, k] -> [m, 1, k]
                 hcdprint(f"[horenc]({layer_id}) SET2 - "
                         f"cache_k_rope_fp4.dtype = {cache_k_rope_fp4.dtype}, cache_k_rope_fp4.is_contiguous() = {cache_k_rope_fp4.is_contiguous()}")
                 hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4.shape = {cache_k_rope_fp4.shape}")
