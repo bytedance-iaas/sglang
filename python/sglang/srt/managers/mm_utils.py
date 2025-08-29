@@ -733,6 +733,13 @@ def data_hash(data) -> int:
         assert "hash_keys" in data, "invalid dict data"
         hash_keys = data["hash_keys"]
         return list_to_hash(hash_keys)
+    elif isinstance(data, list):
+        if isinstance(data[-1], int):
+            return data[-1]
+        if isinstance(data[0], int):
+            return data[0]
+        hash_bytes = hashlib.sha256(data[0]).digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
     else:
         hash_bytes = hashlib.sha256(data).digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -765,7 +772,7 @@ def tensor_hash(tensor_list) -> int:
 
 
 def hash_feature(f):
-    if isinstance(f, list):
+    if isinstance(f, list) and not(isinstance(f[0], int)) and not(isinstance(f[-1], int)):
         if isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))

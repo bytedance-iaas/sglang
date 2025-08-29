@@ -50,6 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
 Qwen2Config = None
 
@@ -79,6 +80,7 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results= False,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -150,6 +152,7 @@ class Qwen2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results= False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -227,6 +230,11 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        
+        self.async_stream = alt_stream
+        self.cal_done_event = torch.cuda.Event(enable_timing= False)
+        self.comm_done_event = torch.cuda.Event(enable_timing= False)
+        self.comm2_done_event = torch.cuda.Event(enable_timing= False)
 
     def forward(
         self,
@@ -246,11 +254,45 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        # [TODO] open here if dma comm is enable
+        if hidden_states.shape[0] <=256 or True:
+        
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            return hidden_states, residual
+        else :
+            token_nums = hidden_states.shape[0]
+            chunk_1_size = token_nums//2
+            hs_1 = hidden_states[:chunk_1_size, :]
+            res_1 = residual[:chunk_1_size, :]
+            hs_2 = hidden_states[chunk_1_size:, :]
+            res_2 = residual[chunk_1_size:, :]
+            current_stream = torch.cuda.current_stream()
+            
+            hs_1 =  tensor_model_parallel_all_reduce(hs_1)
+            self.comm_done_event.record()
+            hs_1, res_1 = self.post_attention_layernorm(hs_1, res_1)
+            hs_1 = self.mlp(hs_1)
+            self.cal_done_event.record()
+            hs_1 = tensor_model_parallel_all_reduce(hs_1)
+            self.comm2_done_event.record()
+            
+            with torch.cuda.stream(self.async_stream):
+                self.async_stream.wait_event(self.comm_done_event)
+                hs_2 = tensor_model_parallel_all_reduce(hs_2)
+                self.async_stream.wait_event(self.cal_done_event)
+                hs_2, res_2 = self.post_attention_layernorm(hs_2, res_2)
+                hs_2 = self.mlp(hs_2)
+                self.async_stream.wait_event(self.comm2_done_event)
+                hs_2 = tensor_model_parallel_all_reduce(hs_2)
+                self.comm2_done_event.record()
+            current_stream.wait_event(self.comm2_done_event)            
+            
+            return torch.cat([hs_1, hs_2]), torch.cat([res_1, res_2])
 
 
 class Qwen2Model(nn.Module):
@@ -280,6 +322,8 @@ class Qwen2Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
+        if alt_stream == None:
+            alt_stream = torch.cuda.Stream()
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

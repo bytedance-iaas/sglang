@@ -1328,6 +1328,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self.mminput_cache.pop(delete_key)
 
                     mm_item.feature = torch.cat(real_pixel_values)
+
+                elif isinstance(pixel_values, list):
+                    if len(pixel_values) == 1:
+                        mm_item.feature =  self.mminput_cache[pixel_values[0]]
+                    elif len(pixel_values) == 2:
+                        mm_item.feature = pixel_values[0].to(self.device, non_blocking=True)
+                        self.mminput_cache[pixel_values[1]] = mm_item.feature
+                         
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
