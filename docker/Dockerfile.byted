@@ -40,8 +40,6 @@ RUN http_proxy='' pip install sglang_router --extra-index-url https://scqq9isgq3
 # gdkv sdk安装
 RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
-RUN http_proxy='' pip install pris==${pris_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
-
 
 # eic sdk安装
 RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
