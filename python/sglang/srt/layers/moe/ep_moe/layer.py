@@ -736,24 +736,6 @@ class DeepEPMoE(EPMoE):
 
         hidden_states, _, _, masked_m, _ = dispatch_output
 
-        hidden_states_fp8, hidden_states_fp8_scale = hidden_states
-        logger.info(f"self.w13_input_scale {self.w13_input_scale}")
-        import time
-
-        start = time.time()
-        scale_max = hidden_states_fp8_scale.max().item()
-        t1 = time.time()
-        scale_mean = hidden_states_fp8_scale.mean().item()
-        t2 = time.time()
-        sorted_scale = torch.sort(hidden_states_fp8_scale)[0]
-        scale_trim = sorted_scale[1:-1].mean().item()
-        t3 = time.time()
-        dt_max = (t1 - start) * 1000
-        dt_mean = (t2 - t1) * 1000
-        dt_trim = (t3 - t2) * 1000
-        logger.info(f"Max:     scale={scale_max:.6f},  time={dt_max:.4f} ms")
-        logger.info(f"Mean:    scale={scale_mean:.6f},  time={dt_mean:.4f} ms")
-        logger.info(f"Trim:    scale={scale_trim:.6f},  time={dt_trim:.4f} ms")
         output = cutlass_w4a8_moe(
             self.start_expert_id,
             self.end_expert_id,
@@ -820,7 +802,6 @@ class DeepEPMoE(EPMoE):
                 self.quant_method.expert_offsets,
                 self.quant_method.problem_sizes1,
                 self.quant_method.problem_sizes2,
-                None,
                 self.w13_input_scale,
                 self.w2_input_scale,
                 deepep_mode=dispatch_output.format,

@@ -48,9 +48,8 @@ def cutlass_w4a8_moe(
     expert_offsets: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
-    masked_m: torch.Tensor = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor],
+    a2_scale: Optional[torch.Tensor],
     apply_router_weight_on_input: bool = False,
     deepep_mode: str = None,
 ) -> torch.Tensor:
@@ -213,7 +212,7 @@ def cutlass_w4a8_moe(
 
     elif deepep_mode.is_deepep_ll():
         problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
-            masked_m,
+            local_topk_ids,
             problem_sizes1,
             problem_sizes2,
             num_experts,
