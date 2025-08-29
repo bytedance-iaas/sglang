@@ -1695,31 +1695,31 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): SET2 "
-                f"-> set_mla_kv_buffer_triton() (USE TRITON writh kv$)")
-        hcdprint(f"[horenc]({layer_id}) loc = {loc}\t "
-                f"{cache_k_nope.dtype} != {self.dtype}, "
-                f"{self.store_dtype} != {self.dtype} TODO:MLA")
+        # hcdprint(f"[horenc]({layer_id}) class MLATokenToKVPool:set_mla_kv_buffer(): SET2 "
+        #         f"-> set_mla_kv_buffer_triton() (USE TRITON writh kv$)")
+        # hcdprint(f"[horenc]({layer_id}) loc = {loc}\t "
+        #         f"{cache_k_nope.dtype} != {self.dtype}, "
+        #         f"{self.store_dtype} != {self.dtype} TODO:MLA")
         if cache_k_nope.dtype != self.dtype:
             if self.dtype == torch.float4_e2m1fn_x2: # save kv4 scales
                 # cache_k_nope = cache_k_nope.to(self.dtype) # ori
                 # cache_k_rope = cache_k_rope.to(self.dtype) # ori
 
-                hcdprint(f"[horenc]({layer_id}) SET2 - "
-                        f"cache_k_nope.dtype = {cache_k_nope.dtype}, cache_k_nope.is_contiguous() = {cache_k_nope.is_contiguous()}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope.shape = {cache_k_nope.shape}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - "
+                #         f"cache_k_nope.dtype = {cache_k_nope.dtype}, cache_k_nope.is_contiguous() = {cache_k_nope.is_contiguous()}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope.shape = {cache_k_nope.shape}")
                 from sglang.srt.layers.quantization.nvfp4_tensor import KVFP4QuantizeUtil # need to delayed import
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                         cache_k_nope
                 )
                 # cache_k_nope_fp4_sf = cache_k_nope_fp4_sf.unsqueeze(1) # horenc25827 for debug [m, k] -> [m, 1, k]
 
-                hcdprint(f"[horenc]({layer_id}) SET2 - "
-                        f"cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype}, cache_k_nope_fp4.is_contiguous() = {cache_k_nope_fp4.is_contiguous()}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - "
-                        f"cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype}, cache_k_nope_fp4_sf.is_contiguous() = {cache_k_nope_fp4_sf.is_contiguous()}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - "
+                #         f"cache_k_nope_fp4.dtype = {cache_k_nope_fp4.dtype}, cache_k_nope_fp4.is_contiguous() = {cache_k_nope_fp4.is_contiguous()}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope_fp4.shape = {cache_k_nope_fp4.shape}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - "
+                #         f"cache_k_nope_fp4_sf.dtype = {cache_k_nope_fp4_sf.dtype}, cache_k_nope_fp4_sf.is_contiguous() = {cache_k_nope_fp4_sf.is_contiguous()}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_nope_fp4_sf.shape = {cache_k_nope_fp4_sf.shape}")
                 """
                 input:
                     [horenc](60) SET2 - cache_k_nope.dtype = torch.bfloat16, cache_k_nope.is_contiguous() = True
@@ -1731,9 +1731,9 @@ class MLATokenToKVPool(KVCache):
                     [horenc](60) SET2 - cache_k_nope_fp4_sf.shape = torch.Size([1, 32])
                 """
 
-                hcdprint(f"[horenc]({layer_id}) SET2 - "
-                        f"cache_k_rope.dtype = {cache_k_rope.dtype}, cache_k_rope.is_contiguous() = {cache_k_rope.is_contiguous()}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope.shape = {cache_k_rope.shape}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - "
+                #         f"cache_k_rope.dtype = {cache_k_rope.dtype}, cache_k_rope.is_contiguous() = {cache_k_rope.is_contiguous()}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope.shape = {cache_k_rope.shape}")
                 # #                cache_k = cache_k.contiguous() # horenc this hack works: PASS
                 # # Same as SET1's cache_k, cache_k_rope may not be contiguous and thus trt will report error
                 # cache_k_rope = cache_k_rope.contiguous() # horenc this hack works: PASS
@@ -1741,12 +1741,12 @@ class MLATokenToKVPool(KVCache):
                         cache_k_rope
                 )
                 # cache_k_rope_fp4_sf = cache_k_rope_fp4_sf.unsqueeze(1) # horenc25827 for debug [m, k] -> [m, 1, k]
-                hcdprint(f"[horenc]({layer_id}) SET2 - "
-                        f"cache_k_rope_fp4.dtype = {cache_k_rope_fp4.dtype}, cache_k_rope_fp4.is_contiguous() = {cache_k_rope_fp4.is_contiguous()}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4.shape = {cache_k_rope_fp4.shape}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - "
-                        f"cache_k_rope_fp4_sf.dtype = {cache_k_rope_fp4_sf.dtype}, cache_k_rope_fp4_sf.is_contiguous() = {cache_k_rope_fp4_sf.is_contiguous()}")
-                hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4_sf.shape = {cache_k_rope_fp4_sf.shape}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - "
+                #         f"cache_k_rope_fp4.dtype = {cache_k_rope_fp4.dtype}, cache_k_rope_fp4.is_contiguous() = {cache_k_rope_fp4.is_contiguous()}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4.shape = {cache_k_rope_fp4.shape}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - "
+                #         f"cache_k_rope_fp4_sf.dtype = {cache_k_rope_fp4_sf.dtype}, cache_k_rope_fp4_sf.is_contiguous() = {cache_k_rope_fp4_sf.is_contiguous()}")
+                # hcdprint(f"[horenc]({layer_id}) SET2 - cache_k_rope_fp4_sf.shape = {cache_k_rope_fp4_sf.shape}")
                 """
                     input:
                     [horenc](60) SET2 - cache_k_rope.dtype = torch.bfloat16, cache_k_rope.is_contiguous() = True
@@ -1769,25 +1769,25 @@ class MLATokenToKVPool(KVCache):
 
 
 
-                # DEBUG kv cache []
-                if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 29 or int(loc.item()) == 30 or int(loc.item()) == 31): #loc < prompt# will not enter here
-                    hcdprint(f"{layer_id} Jack DEBUG SET2 DECODE - cache_k_nope_fp4[{int(loc.item())}] = {cache_k_nope_fp4}, cache_k_rope_fp4[{int(loc.item())}] = {cache_k_rope_fp4}") # 512/2 + 64/2 = 256 + 32
+                # # DEBUG kv cache []
+                # if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 29 or int(loc.item()) == 30 or int(loc.item()) == 31): #loc < prompt# will not enter here
+                #     hcdprint(f"{layer_id} Jack DEBUG SET2 DECODE - cache_k_nope_fp4[{int(loc.item())}] = {cache_k_nope_fp4}, cache_k_rope_fp4[{int(loc.item())}] = {cache_k_rope_fp4}") # 512/2 + 64/2 = 256 + 32
 
 
-                # # PREFILL: loc.numel() >= 1
-                # if (layer_id == 0 or layer_id == 1) and (int(loc.item()) >= 16): #loc < prompt# will not enter here
-                if (layer_id == 0 or layer_id == 1):
-                    if (torch.any(loc == 16) or torch.any(loc == 17) or torch.any(loc == 18)): #loc < prompt# will not enter here
-                        for i, idx in enumerate(loc):
-                            layer_loc = int(idx.item())
-                            hcdprint(f"{layer_id} Jack DEBUG SET2 PREFILL - i={i}, layer_loc[{layer_loc}]=quant[{i}], cache_k_nope_fp4_sf[{layer_loc}] = {cache_k_nope_fp4_sf[i]}, cache_k_rope_fp4_sf[{layer_loc}] = {cache_k_rope_fp4_sf[i]}")
-                        # for idx in loc:
-                        #     i = int(idx.item())
-                        #     hcdprint(f"{layer_id} Jack DEBUG SET2 PREFILL - cache_k_nope_fp4_sf[{i}] = {cache_k_nope_fp4_sf[i]}, cache_k_rope_fp4_sf[{i}] = {cache_k_rope_fp4_sf[i]}")
+                # # # PREFILL: loc.numel() >= 1
+                # # if (layer_id == 0 or layer_id == 1) and (int(loc.item()) >= 16): #loc < prompt# will not enter here
+                # if (layer_id == 0 or layer_id == 1):
+                #     if (torch.any(loc == 16) or torch.any(loc == 17) or torch.any(loc == 18)): #loc < prompt# will not enter here
+                #         for i, idx in enumerate(loc):
+                #             layer_loc = int(idx.item())
+                #             hcdprint(f"{layer_id} Jack DEBUG SET2 PREFILL - i={i}, layer_loc[{layer_loc}]=quant[{i}], cache_k_nope_fp4_sf[{layer_loc}] = {cache_k_nope_fp4_sf[i]}, cache_k_rope_fp4_sf[{layer_loc}] = {cache_k_rope_fp4_sf[i]}")
+                #         # for idx in loc:
+                #         #     i = int(idx.item())
+                #         #     hcdprint(f"{layer_id} Jack DEBUG SET2 PREFILL - cache_k_nope_fp4_sf[{i}] = {cache_k_nope_fp4_sf[i]}, cache_k_rope_fp4_sf[{i}] = {cache_k_rope_fp4_sf[i]}")
 
-                # DECODE: loc.numel() == 1 
-                if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 29 or int(loc.item()) == 30 or int(loc.item()) == 31): #loc < prompt# will not enter here
-                    hcdprint(f"{layer_id} Jack DEBUG SET2 DECODE - cache_k_nope_fp4_sf[{int(loc.item())}] = {cache_k_nope_fp4_sf}, cache_k_rope_fp4_sf[{int(loc.item())}] = {cache_k_rope_fp4_sf}") # 512/16 + 64/16 = 32+4
+                # # DECODE: loc.numel() == 1 
+                # if (layer_id == 0 or layer_id == 1) and loc.numel() == 1 and (int(loc.item()) == 29 or int(loc.item()) == 30 or int(loc.item()) == 31): #loc < prompt# will not enter here
+                #     hcdprint(f"{layer_id} Jack DEBUG SET2 DECODE - cache_k_nope_fp4_sf[{int(loc.item())}] = {cache_k_nope_fp4_sf}, cache_k_rope_fp4_sf[{int(loc.item())}] = {cache_k_rope_fp4_sf}") # 512/16 + 64/16 = 32+4
 
             else:
                 cache_k_nope = cache_k_nope.to(self.dtype)
