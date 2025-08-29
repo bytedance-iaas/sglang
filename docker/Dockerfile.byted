@@ -40,8 +40,8 @@ RUN http_proxy='' pip install sglang_router --extra-index-url https://scqq9isgq3
 # gdkv sdk安装
 RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
-# pris sdk安装
 RUN http_proxy='' pip install pris==${pris_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
 
 # eic sdk安装
 RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
@@ -59,9 +59,30 @@ RUN cd /tmp && git clone https://github.com/bytedance-iaas/sglang.git -b ${branc
     cp -r /tmp/sglang/examples /sgl-workspace/sglang/examples && \
     rm -rf /tmp/sglang
 
+# Triton-Distributed安装
+
+WORKDIR /sgl-workspace
+RUN git clone https://github.com/ByteDance-Seed/Triton-distributed.git
+WORKDIR /sgl-workspace/Triton-distributed
+RUN git submodule deinit --all -f
+RUN rm -rf 3rdparty/triton
+RUN git submodule update --init --recursive
+RUN pip3 install -v cuda-python ninja cmake wheel pybind11 numpy chardet pytest nvidia-ml-py>=12
+RUN pip3 install -v 'nvidia-nvshmem-cu12' 'cuda.core==0.2.0' "Cython>=0.29.24"
+RUN CPPFLAGS="-I/usr/local/cuda/include" pip3 install https://developer.download.nvidia.com/compute/nvshmem/redist/nvshmem_python/source/nvshmem_python-source-0.1.0.36132199_cuda12-archive.tar.xz -v
+
+RUN pip3 install black "clang-format==19.1.2" pre-commit ruff yapf==0.43
+RUN apt update
+RUN apt install -y wget
+RUN wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | gpg -o /etc/apt/keyrings/llvm-snapshot.gpg --dearmor
+RUN echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] https://mirrors.tuna.tsinghua.edu.cn/llvm-apt/jammy/ llvm-toolchain-jammy-19 main" >> /etc/apt/sources.list.d/llvm-apt.list
+RUN apt update && apt install -y clang-19 llvm-19 libclang-19-dev
+RUN pip uninstall triton -y && pip uninstall triton_dist -y
+RUN USE_TRITON_DISTRIBUTED_AOT=0 pip3 install -e python --verbose --no-build-isolation --use-pep517
+
 # onion 安装
 RUN curl -fsSL https://mirrors.byted.org/extra-tools/ubuntu/GPG-KEY-system | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.byted.org/extra-tools/ubuntu jammy main" > /etc/apt/sources.list.d/volctools.list && \ 
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.byted.org/extra-tools/ubuntu jammy main" > /etc/apt/sources.list.d/volctools.list && \
     apt update && apt install -y onion-ai-data
 
 # entrypoint
