@@ -659,6 +659,8 @@ def get_dataset(args, tokenizer):
             output_len=args.random_output_len,
             num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
+            input_len_probability=args.random_input_len_probability,
+            output_len_probability=args.random_output_len_probability,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
@@ -1032,21 +1034,51 @@ def sample_random_requests(
     output_len: int,
     num_prompts: int,
     range_ratio: float,
+    input_len_probability: list,
+    output_len_probability: list,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
     random_sample: bool = True,
     return_text: bool = True,
 ) -> List[DatasetRow]:
-    input_lens = np.random.randint(
-        max(int(input_len * range_ratio), 1),
-        input_len + 1,
-        size=num_prompts,
-    )
-    output_lens = np.random.randint(
-        int(output_len * range_ratio),
-        output_len + 1,
-        size=num_prompts,
-    )
+    if input_len_probability is not None and len(input_len_probability) > 0:
+        input_len_probability_ranges = parse_len_probability(input_len_probability)
+        input_lens = []
+        for min_len, max_len, prob in input_len_probability_ranges:
+            num_prompts_per_range = round(num_prompts * prob)
+            if num_prompts_per_range == 0:
+                continue
+            input_lens_per_range = np.random.randint(
+                min_len,
+                max_len,
+                size=num_prompts_per_range,
+            )
+            input_lens.extend(input_lens_per_range)
+    else:
+        input_lens = np.random.randint(
+            max(int(input_len * range_ratio), 1),
+            input_len + 1,
+            size=num_prompts,
+        )
+    if output_len_probability is not None and len(output_len_probability) > 0:
+        output_len_probability_ranges = parse_len_probability(output_len_probability)
+        output_lens = []
+        for min_len, max_len, prob in output_len_probability_ranges:
+            num_prompts_per_range = round(num_prompts * prob)
+            if num_prompts_per_range == 0:
+                continue
+            output_lens_per_range = np.random.randint(
+                min_len,
+                max_len,
+                size=num_prompts_per_range,
+            )
+            output_lens.extend(output_lens_per_range)
+    else:
+        output_lens = np.random.randint(
+            int(output_len * range_ratio),
+            output_len + 1,
+            size=num_prompts,
+        )
 
     if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
@@ -1129,6 +1161,25 @@ def sample_random_requests(
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
 
+def parse_len_probability(
+    len_probability: list,
+):
+    total_prob = 0
+    len_probability_ranges = []
+    for item in len_probability:
+        if ":" not in item:
+            raise ValueError(f"Invalid len_probability item: {item}")
+        range_str, prob_str = item.split(":")
+        if "~" not in range_str:
+            raise ValueError(f"Invalid len_probability range: {range_str}")
+        min_len, max_len = range_str.split("~")
+        total_prob += float(prob_str)
+        len_probability_ranges.append(
+            (int(min_len), int(max_len), float(prob_str))
+        )
+    if total_prob != 1:
+        raise ValueError(f"Invalid total len_probability prob: {total_prob}")
+    return len_probability_ranges
 
 def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
     """Parse image resolution into (width, height).
@@ -1684,6 +1735,8 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            "random_input_len_probability": args.random_input_len_probability,
+            "random_output_len_probability": args.random_output_len_probability,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -1729,7 +1782,19 @@ async def benchmark(
                 f"{args.random_image_resolution}.jsonl"
             )
         elif args.dataset_name.startswith("random"):
-            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
+            if args.random_input_len_probability or args.random_output_len_probability:
+                output_file_name = f"{args.backend}_{now}_{args.num_prompts}"
+                if args.random_input_len_probability:
+                    output_file_name += "_[" + "][".join(args.random_input_len_probability) + "]"
+                else:
+                    output_file_name += f"_{args.random_input_len}"
+                if args.random_output_len_probability:
+                    output_file_name += "_[" + "][".join(args.random_output_len_probability) + "]"
+                else:
+                    output_file_name += f"_{args.random_output_len}"
+                output_file_name += ".jsonl"
+            else:
+                output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
 
@@ -2027,6 +2092,18 @@ if __name__ == "__main__":
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
+    )
+    parser.add_argument(
+        "--random-input-len-probability",
+        nargs="+",
+        required=False,
+        help="Probability distribution of input tokens per request, used only for random dataset. Example: 0~1000:0.6 1000~2000:0.4",
+    )
+    parser.add_argument(
+        "--random-output-len-probability",
+        nargs="+",
+        required=False,
+        help="Probability distribution of output tokens per request, used only for random dataset. Example: 0~1000:0.6 1000~2000:0.4",
     )
     # random-image dataset args
     parser.add_argument(
