@@ -500,6 +500,68 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     } else {
       TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
     }
+  } else if (num_experts == 128 && num_expert_group == 1) {
+    constexpr int THREADS_PER_ROW = 1;
+    constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
+    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
+    int64_t rows_per_warp = ROWS_PER_WARP;
+    int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
+    int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
+
+    if (input.scalar_type() == at::kBFloat16) {
+      moe_fused_gate_kernel_tiled_static<
+          bfloat16_t,
+          64,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
+    } else if (input.scalar_type() == at::kHalf) {
+      moe_fused_gate_kernel_tiled_static<
+          float16_t,
+          64,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
+    } else if (input.scalar_type() == at::kFloat) {
+      moe_fused_gate_kernel_tiled_static<
+          float32_t,
+          64,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
+    } else {
+      TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
+    }
   } else {
     TORCH_CHECK(false, "moe_fused_gate_tiled_static: unsupported combination");
   }
