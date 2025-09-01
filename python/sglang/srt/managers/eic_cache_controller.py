@@ -54,6 +54,7 @@ class EICCacheOperation(CacheOperation):
         priority: Optional[int] = None,
     ):
         self.content_hash = content_hash
+        self.node_id = node_id
         super().__init__(
             host_indices=host_indices,
             device_indices=device_indices,
@@ -68,6 +69,7 @@ class EICCacheController(HiCacheController):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: EICBaseTokenToKVPoolHost,
         page_size: int,
+        tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through",
         server_args: Optional[ServerArgs] = None,
@@ -102,6 +104,17 @@ class EICCacheController(HiCacheController):
         self.write_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
         self.device = token_to_kv_pool_allocator.device
+
+        # for TP synchronize
+        self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
+        if self.tp_world_size > 1:
+            group_ranks = torch.distributed.get_process_group_ranks(tp_group)
+            self.write_tp_group = torch.distributed.new_group(
+                group_ranks, backend="gloo"
+            )
+            self.load_tp_group = torch.distributed.new_group(
+                group_ranks, backend="gloo"
+            )
 
         # synchronize for write or load operation
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
@@ -227,33 +240,56 @@ class EICCacheController(HiCacheController):
             )
         ret = self.mem_pool_host.transfer(operation.host_indices, operation.data)
         if not ret:
-            logger.error(f"Failed to write to host memory {operation.node_ids}")
-            self.mem_pool_host.free(operation.host_indices)
-            for node_id in operation.node_ids:
-                if node_id != 0:
-                    self.ack_write_queue.put((node_id, False))
-            return
-        self.mem_pool_host.complete_io(operation.host_indices)
-        for node_id in operation.node_ids:
-            if node_id != 0:
-                self.ack_write_queue.put((node_id, True))
+            logger.error(f"Failed to write to host memory {operation.node_id}")
+        result = 0 if ret else 1
+        if self.tp_world_size > 1:
+            temp_tensor = torch.tensor(result, device="cpu", dtype=torch.int32)
+            torch.distributed.all_reduce(
+                temp_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.write_tp_group,
+            )
+            result = temp_tensor.item()
+        ret = result == 0
+        self.ack_write_queue.put((operation.node_id, ret))
 
     def load_operation_exclusive(self, operation: EICCacheOperation):
         """
         Load the KV cache from host memory to device memory.
         """
         operation.data, mask = self.mem_pool_host.get_flat_data(operation.host_indices)
-        if operation.data is None:
-            logger.error(f"Failed to load from host memory {operation.node_ids}")
-            for node_id in operation.node_ids:
-                if node_id != 0:
-                    self.ack_load_queue.put((node_id, False))
-            return
-        self.mem_pool_device.transfer(operation.device_indices, operation.data)
-        self.mem_pool_host.complete_io(operation.host_indices)
-        for node_id in operation.node_ids:
-            if node_id != 0:
-                self.ack_load_queue.put((node_id, True))
+        completed_tokens = 0
+        if operation.data is None or not all(mask):
+            logger.warning(f"Failed to load from eic, node: {operation.node_id}")
+            for ret in mask:
+                if ret:
+                    completed_tokens += 1
+                else:
+                    break
+        else:
+            completed_tokens = len(operation.host_indices)
+
+        if self.tp_world_size > 1:
+            temp_tensor = torch.tensor(
+                completed_tokens, device="cpu", dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                temp_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.load_tp_group,
+            )
+            completed_tokens = temp_tensor.item()
+        if completed_tokens > 0:
+            logger.debug(
+                f"completed tokens: {completed_tokens}, get data len: {len(operation.data)}"
+            )
+            completed_device_indices = operation.device_indices[:completed_tokens]
+            flat_data = torch.cat(
+                operation.data[:completed_tokens],
+                dim=self.mem_pool_host.split_dim,
+            )
+            self.mem_pool_device.transfer(completed_device_indices, flat_data)
+        self.ack_load_queue.put((operation.node_id, completed_tokens))
 
     def write_operation_shared(self, operation: EICCacheOperation):
         """
@@ -273,14 +309,18 @@ class EICCacheController(HiCacheController):
             operation.content_hash, operation.data
         )
         if not ret:
-            logger.error(f"Failed to write to host memory {operation.node_ids}")
-            for node_id in operation.node_ids:
-                if node_id != 0:
-                    self.ack_write_queue.put((node_id, False))
-            return
-        for node_id in operation.node_ids:
-            if node_id != 0:
-                self.ack_write_queue.put((node_id, True))
+            logger.error(f"Failed to write to host memory {operation.node_id}")
+        result = 0 if ret else 1
+        if self.tp_world_size > 1:
+            temp_tensor = torch.tensor(result, device="cpu", dtype=torch.int32)
+            torch.distributed.all_reduce(
+                temp_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.write_tp_group,
+            )
+            result = temp_tensor.item()
+        ret = result == 0
+        self.ack_write_queue.put((operation.node_id, ret))
 
     def load_operation_shared(self, operation: EICCacheOperation):
         """
@@ -290,16 +330,38 @@ class EICCacheController(HiCacheController):
             operation.content_hash
         )
         operation.data, mask = self.mem_pool_host.get_page_data(operation.content_hash)
+        completed_tokens = 0
         if operation.data is None or not all(mask):
-            logger.error(f"Failed to load from host memory {operation.node_ids}")
-            for node_id in operation.node_ids:
-                if node_id != 0:
-                    self.ack_load_queue.put((node_id, False))
-            return
-        self.mem_pool_device.transfer(operation.device_indices, operation.data)
-        for node_id in operation.node_ids:
-            if node_id != 0:
-                self.ack_load_queue.put((node_id, True))
+            logger.warning(f"Failed to load from eic, node: {operation.node_id}")
+            for ret in mask:
+                if ret:
+                    completed_tokens += self.page_size
+                else:
+                    break
+        else:
+            completed_tokens = len(operation.host_indices)
+
+        if self.tp_world_size > 1:
+            temp_tensor = torch.tensor(
+                completed_tokens, device="cpu", dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                temp_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.load_tp_group,
+            )
+            completed_tokens = temp_tensor.item()
+        if completed_tokens > 0:
+            logger.debug(
+                f"completed tokens: {completed_tokens}, get data len: {len(operation.data)}"
+            )
+            completed_device_indices = operation.device_indices[:completed_tokens]
+            flat_data = torch.cat(
+                operation.data[: completed_tokens // self.page_size],
+                dim=self.mem_pool_host.split_dim,
+            )
+            self.mem_pool_device.transfer(completed_device_indices, flat_data)
+        self.ack_load_queue.put((operation.node_id, completed_tokens))
 
     def write_to_eic(self, operation: EICCacheOperation):
         """

@@ -150,6 +150,7 @@ class EICHiRadixCache(RadixCache):
             token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
             page_size,
+            tp_group=tp_cache_group,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
             server_args=server_args,
@@ -313,6 +314,7 @@ class EICHiRadixCache(RadixCache):
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
+        # may skip synchronize queue_size for write
         if torch.distributed.get_world_size(group=self.tp_group) > 1:
             # synchrnoize TP workers to make the same update to radix cache
             torch.distributed.all_reduce(
@@ -326,7 +328,6 @@ class EICHiRadixCache(RadixCache):
             ack_id, success = self.cache_controller.ack_write_queue.get_nowait()
             ack_list.append(ack_id)
             flags.append(success)
-        flags = self.get_tp_result(flags)
         for ack_id, success in zip(ack_list, flags):
             if (
                 not success
@@ -368,21 +369,33 @@ class EICHiRadixCache(RadixCache):
                 group=self.tp_group,
             )
         ack_list = []
-        flags = []
+        complete_tokens = []
         for _ in range(queue_size.item()):
-            ack_id, success = self.cache_controller.ack_load_queue.get_nowait()
+            ack_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
             ack_list.append(ack_id)
-            flags.append(success)
-        flags = self.get_tp_result(flags)
-        for ack_id, success in zip(ack_list, flags):
-            start_node, end_node = self.ongoing_load_back[ack_id]
+            complete_tokens.append(complete_token)
+        for ack_id, complete_token in zip(ack_list, complete_tokens):
+            start_node, end_node, total_token_num = self.ongoing_load_back[ack_id]
             self.dec_lock_ref(end_node)
+            failed_token_num = total_token_num - complete_token
             while end_node != start_node:
                 assert end_node.loading
-                if not success:
+                if failed_token_num >= len(end_node.value):
+                    # node load back full fail
+                    # no need to delete failed node because the kvcache will be set after compute
                     self.cache_controller.mem_pool_device_allocator.free(end_node.value)
                     self.evictable_size_ -= len(end_node.value)
+                    failed_token_num -= len(end_node.value)
                     end_node.value = None
+                elif failed_token_num > 0:
+                    # node load back partial fail, split node
+                    split_len = len(end_node.value) - failed_token_num
+                    self._split_node(end_node.key, end_node, split_len)
+                    self.evictable_size_ -= failed_token_num
+                    self.cache_controller.mem_pool_device_allocator.free(end_node.value)
+                    failed_token_num -= len(end_node.value)
+                    end_node.value = None
+                    assert failed_token_num == 0, "failed_token_num should be zero"
                 end_node.loading = False
                 end_node = end_node.parent
             # clear the reference
@@ -541,7 +554,11 @@ class EICHiRadixCache(RadixCache):
             # no sufficient GPU memory to load back KV caches
             return None
 
-        self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
+        self.ongoing_load_back[last_hit_node.id] = (
+            ancester_node,
+            last_hit_node,
+            len(device_indices),
+        )
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
@@ -815,6 +832,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         logger.info(
             f"EICPagedHiRadixCache eic_check_max_num set to {self.eic_check_max_num}"
         )
+        self.load_back_check = config.get("load_back_check", False)
 
     def _calculate_content_hash(self, node: TreeNode):
         if _need_calculate_hash(node.parent, self.page_size):
@@ -1144,6 +1162,28 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         for n in nodes_to_load:
             host_content_hash.extend(n.content_hash)
 
+        # check key existed
+        if self.load_back_check:
+            check_keys = host_content_hash[
+                : self.load_back_threshold // self.page_size + 1
+            ]
+            mask = self.cache_controller.mem_pool_host.batch_exist_page(check_keys)
+            check_ret = all(mask)
+            if self.tp_size > 1:
+                check_tensor = torch.tensor(
+                    0 if check_ret else 1, dtype=torch.bool, device="cpu"
+                )
+                torch.distributed.all_reduce(
+                    check_tensor,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.tp_group,
+                )
+                check_ret = check_tensor.item() == 0
+            if not check_ret:
+                logger.warning(f"key has been evicted, skip load back")
+                self.dec_lock_ref(ancester_node)
+                return None
+
         device_indices = self.cache_controller.load_page(
             host_indices=host_indices,
             node_id=last_hit_node.id,
@@ -1161,7 +1201,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             # no sufficient GPU memory to load back KV caches
             return None
 
-        self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
+        self.ongoing_load_back[last_hit_node.id] = (
+            ancester_node,
+            last_hit_node,
+            len(device_indices),
+        )
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]

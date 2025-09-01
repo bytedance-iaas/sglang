@@ -131,7 +131,7 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = round(token_usage, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.eic_hit_rate = adder.log_hit_eic_tokens / (
+            self.stats.eic_cache_hit_rate = adder.log_hit_eic_tokens / (
                 adder.log_input_tokens + adder.log_hit_tokens
             )
 
@@ -221,7 +221,7 @@ class SchedulerMetricsMixin:
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(token_usage, 2)
             self.stats.cache_hit_rate = 0.0
-            self.stats.eic_hit_rate = 0.0
+            self.stats.eic_cache_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
