@@ -161,6 +161,7 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    draft_attention_backend: Optional[str] = None
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -1351,6 +1352,34 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
+            "--draft-attention-backend",
+            type=str,
+            choices=[
+                "fa3",
+                "flashinfer",
+                "flashmla",
+                "triton",
+            ],
+            default=ServerArgs.draft_attention_backend,
+            help="Choose the kernels for draft attention layers. Default to the same as attention backend.",
+        )
+        parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+
+        parser.add_argument(
+>>>>>>> 81ed6506e (Support 360 qwen3 235 performance enhancement (#263))
             "--prefill-attention-backend",
             type=str,
             choices=ATTN_BACKENDS,
