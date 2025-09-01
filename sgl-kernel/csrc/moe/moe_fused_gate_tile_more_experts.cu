@@ -511,7 +511,7 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     if (input.scalar_type() == at::kBFloat16) {
       moe_fused_gate_kernel_tiled_static<
           bfloat16_t,
-          64,
+          128,
           THREADS_PER_ROW,
           ROWS_PER_WARP,
           ROWS_PER_CTA,
@@ -528,7 +528,7 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     } else if (input.scalar_type() == at::kHalf) {
       moe_fused_gate_kernel_tiled_static<
           float16_t,
-          64,
+          128,
           THREADS_PER_ROW,
           ROWS_PER_WARP,
           ROWS_PER_CTA,
@@ -545,7 +545,7 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     } else if (input.scalar_type() == at::kFloat) {
       moe_fused_gate_kernel_tiled_static<
           float32_t,
-          64,
+          128,
           THREADS_PER_ROW,
           ROWS_PER_WARP,
           ROWS_PER_CTA,
