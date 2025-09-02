@@ -6,6 +6,7 @@ Now there are two backends: FlashInfer and Triton.
 FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
+from sglang.jack_utils import hcdprint
 
 import os
 from dataclasses import dataclass
@@ -79,7 +80,7 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
-        print(f"[horenc] class FlashInferAttnBackend:__init__(): OOO (only gpt-oss)")
+        hcdprint(f"[horenc] class FlashInferAttnBackend:__init__(): OOO (only gpt-oss)")
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
@@ -457,7 +458,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # [horenc] 拿此層的what?
+        # [horenc] take this layer's what?
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer) #層
         ]
@@ -470,7 +471,7 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        print(f"[horenc] Flashinfer:forward_extend(): self.forward_metadata.use_ragged "
+        hcdprint(f"[horenc] Flashinfer:forward_extend(): self.forward_metadata.use_ragged "
                 f"= {self.forward_metadata.use_ragged}")
         if not self.forward_metadata.use_ragged: # horenc llama3+kv8 XXX
             if k is not None:
@@ -496,10 +497,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 save_kv_cache = False
                 causal = False
 
-            print(f"[horenc] FlashInferAttnBackend:forward_extend(): self.forward_metadata.extend_no_prefix "
+            hcdprint(f"[horenc] FlashInferAttnBackend:forward_extend(): self.forward_metadata.extend_no_prefix "
                     f"= {self.forward_metadata.extend_no_prefix} "
                 )
-            print(f"[horenc] FlashInferAttnBackend:forward_extend(): "
+            hcdprint(f"[horenc] FlashInferAttnBackend:forward_extend(): "
                     f"self.prefill_wrapper_ragged = {self.prefill_wrapper_ragged} "
                 )
             if self.forward_metadata.extend_no_prefix: # horenc llama3+kv8 OOO
@@ -539,7 +540,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-            # print(f"[horenc] Flashinfer:forward_extend(): save_kv_cache "
+            # hcdprint(f"[horenc] Flashinfer:forward_extend(): save_kv_cache "
             #         f"= {save_kv_cache} "
             #         f"q = {q} "
             #         f"k = {k} "
@@ -559,8 +560,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        print(f"[horenc] FlashInferAttnBackend:forward_decode(): 111111111111111 ")
-        # print(f"[horenc] Flashinfer:forward_decode(): save_kv_cache "
+        hcdprint(f"[horenc] FlashInferAttnBackend:forward_decode(): 111111111111111 ")
+        # hcdprint(f"[horenc] Flashinfer:forward_decode(): save_kv_cache "
         #         f"= {save_kv_cache} "
         #         f"q = {q} "
         #         f"k = {k} "
@@ -585,7 +586,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        print(f"[horenc] FlashInferAttnBackend:forward_decode(): decode_wrapper "
+        hcdprint(f"[horenc] FlashInferAttnBackend:forward_decode(): decode_wrapper "
                  f"= {decode_wrapper} "
             )
 
@@ -615,7 +616,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        print(f"[horenc] class FlashInferIndicesUpdaterDecode:__init__() OOO (only gpt-oss)")
+        hcdprint(f"[horenc] class FlashInferIndicesUpdaterDecode:__init__() OOO (only gpt-oss)")
         # Parse Constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -806,7 +807,7 @@ class FlashInferIndicesUpdaterDecode:
 
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        print(f"[horenc] class FlashInferIndicesUpdaterPrefill:__init__() OOO (only gpt-oss inherits)")
+        hcdprint(f"[horenc] class FlashInferIndicesUpdaterPrefill:__init__() OOO (only gpt-oss inherits)")
         # Parse Constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -1074,7 +1075,7 @@ class FlashInferMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
-        print(f"[horenc] class FlashInferMultiStepDraftBackend:__init__() XXX")
+        hcdprint(f"[horenc] class FlashInferMultiStepDraftBackend:__init__() XXX")
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
