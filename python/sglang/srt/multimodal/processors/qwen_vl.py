@@ -8,6 +8,13 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+import numpy as np
+
+use_cv2 = True
+try:
+  import cv2
+except:
+  use_cv2 = False
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -16,7 +23,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import image_to_int, get_img_height_in_tensor
 from sglang.utils import logger
+from sglang.srt.utils import get_bool_env_var
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -32,6 +41,9 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+PER_TOKEN_PATCH_NUM = 4
+PATCH_PIXEL_NUM = 14 * 14.0
+PATCH_SHAPE_SIZE = 14
 
 
 def smart_resize(
@@ -78,8 +90,28 @@ def resize_image(image, size_factor: int = IMAGE_FACTOR) -> Image.Image:
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
-    image = image.resize((resized_width, resized_height))
+    # print("before resized h and w : {} {} after resized h and w : {} {}".format(height, width,  resized_height, resized_width))
+    # s_time = time.time()
+    # image = image.resize((resized_width, resized_height)) 
+    if height != resized_height or width !=resized_width:
+        if use_cv2:
+            arr = np.array(image)  # convert PIL → NumPy
+            resized = cv2.resize(arr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+            image = Image.fromarray(resized)
+        else:
+            image = image.resize((resized_width, resized_height))
+            
+    # e_time = time.time()
+    # print("image resize cost time {} ms".format((e_time - s_time) * 1000) )
     return image
+
+
+def get_img_height_from_raw_img(img: Image):
+    resize_h, resize_w = smart_resize(img.size[0], img.size[1], IMAGE_FACTOR, MIN_PIXELS, MAX_PIXELS)
+    ret = int((resize_h * resize_w) / PATCH_PIXEL_NUM)
+    if ret < 1:
+        raise ValueError("invalid image height")
+    return ret, resize_h, resize_w
 
 
 def round_by_factor(number: int, factor: int) -> int:
@@ -238,19 +270,81 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        # Qwen-specific: resize images if they are raw Image objects
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
+        cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
+        if cache_mm_image_items:
+            images = base_output.images
 
-        if base_output.videos:
-            base_output.videos = [
-                await preprocess_video(video) for video in base_output.videos
-            ]
+            img_hash_keys = []
+            img_heights = []
+            new_processed_imgs = []
+            new_processed_img_idxes = []
+            img_token_nums = []
+            remove_image_idx = []
+            image_grid_thw_lists = []
+            
+            for img_idx in range(len(images)):
+                hash_key = image_to_int(images[img_idx])
+                img_hash_keys.append(hash_key)
+                img_height, resize_h, resize_w = get_img_height_from_raw_img(images[img_idx])
+                img_token_num = int(img_height / PER_TOKEN_PATCH_NUM)
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+                image_grid_thw_lists.append(
+                    [
+                        1,
+                        int(resize_h // PATCH_SHAPE_SIZE),
+                        int(resize_w // PATCH_SHAPE_SIZE),
+                    ]
+                )
+
+                if img_token_num < 1:
+                    raise ValueError("invalid img token num")
+
+                if self.hash_table.get(hash_key) is None:
+                    new_processed_img_idxes.append(img_idx)
+                    new_processed_imgs.append(images[img_idx])
+                else:
+                    remove_image_idx.append(img_idx)
+
+                img_heights.append(img_height)
+                img_token_nums.append(img_token_num)
+            
+            # Qwen-specific: resize images if they are raw Image objects
+            if len(new_processed_imgs)!= 0  and isinstance(new_processed_imgs[0], Image.Image):
+                resize_tasks = [resize_image_async(image) for image in new_processed_imgs]
+                new_processed_imgs = await asyncio.gather(*resize_tasks)
+            
+            if base_output.videos:
+                base_output.videos = [
+                    await preprocess_video(video) for video in base_output.videos
+                ]
+            
+            args_dict = {"img_hash_keys": img_hash_keys, 
+                        "img_heights":img_heights, 
+                        "new_processed_imgs":new_processed_imgs,
+                        "new_processed_img_idxes": new_processed_img_idxes,
+                        "img_token_nums":img_token_nums,
+                        "remove_image_idx" :remove_image_idx, 
+                        "image_grid_thw_lists" : image_grid_thw_lists }
+            
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens, **args_dict
+            )
+
+        else:
+            # Qwen-specific: resize images if they are raw Image objects
+            if base_output.images and isinstance(base_output.images[0], Image.Image):
+                resize_tasks = [resize_image_async(image) for image in base_output.images]
+                base_output.images = await asyncio.gather(*resize_tasks)
+
+            if base_output.videos:
+                base_output.videos = [
+                    await preprocess_video(video) for video in base_output.videos
+                ]
+
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
+        
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
