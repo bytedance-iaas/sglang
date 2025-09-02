@@ -445,9 +445,9 @@ impl PDRouter {
 
         // Start health checkers for both worker pools
         let prefill_health_checker =
-            crate::core::start_health_checker(Arc::clone(&prefill_workers), interval_secs);
+            crate::core::start_health_checker(Arc::clone(&prefill_workers), worker_startup_check_interval_secs);
         let decode_health_checker =
-            crate::core::start_health_checker(Arc::clone(&decode_workers), interval_secs);
+            crate::core::start_health_checker(Arc::clone(&decode_workers), worker_startup_check_interval_secs);
 
         // Build a dedicated prefill client for fire-and-forget semantics
         let prefill_client = reqwest::Client::builder()
