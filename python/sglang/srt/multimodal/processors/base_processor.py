@@ -368,6 +368,7 @@ class BaseMultimodalProcessor(ABC):
             processor.image_processor,
             transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast,
         )
+        
 
         if cache_mm_image_items and is_qwen2_processor:
 
@@ -378,31 +379,15 @@ class BaseMultimodalProcessor(ABC):
                 IMG_PAD_TOKEN,
                 VISION_END_TOKEN,
             )
-
-            img_hash_keys = []
-            img_heights = []
-            new_processed_imgs = []
-            new_processed_img_idxes = []
-            img_token_nums = []
-            remove_image_idx = []
+           
+            img_hash_keys = kwargs["img_hash_keys"]
+            img_heights = kwargs["img_heights"]
+            new_processed_imgs = kwargs["new_processed_imgs"]
+            new_processed_img_idxes = kwargs["new_processed_img_idxes"]
+            img_token_nums = kwargs["img_token_nums"]
+            remove_image_idx = kwargs["remove_image_idx"]
+            image_grid_thw_lists = kwargs["image_grid_thw_lists"]
             processed_img_heights = []
-            for img_idx in range(len(images)):
-                hash_key = image_to_int(images[img_idx])
-                img_hash_keys.append(hash_key)
-                img_height = get_img_height_in_tensor(images[img_idx])
-                img_token_num = int(img_height / QWEN2_PER_TOKEN_PATCH_NUM)
-
-                if img_token_num < 1:
-                    raise ValueError("invalid img token num")
-
-                if self.hash_table.get(hash_key) is None:
-                    new_processed_img_idxes.append(img_idx)
-                    new_processed_imgs.append(images[img_idx])
-                else:
-                    remove_image_idx.append(img_idx)
-
-                img_heights.append(img_height)
-                img_token_nums.append(img_token_num)
 
             processed_text = operate_substrings(
                 input_text, to_replace_str, remove_image_idx, repalce_str
@@ -426,7 +411,6 @@ class BaseMultimodalProcessor(ABC):
             start_height = 0
             end_height = 0
             tensor_lists = []
-            image_grid_thw_lists = []
             use_cache_mark = []
             delete_keys = []
             for img_idx in range(len(images)):
@@ -444,13 +428,6 @@ class BaseMultimodalProcessor(ABC):
                     if delete_key:
                         delete_keys.append(delete_key)
                     tensor_lists.append(to_cache_tensor)
-                    image_grid_thw_lists.append(
-                        [
-                            1,
-                            int(images[img_idx].size[1] // QWEN2_PATCH_SIZE),
-                            int(images[img_idx].size[0] // QWEN2_PATCH_SIZE),
-                        ]
-                    )
                     use_cache_mark.append(False)
                 # add input ids and insert tensor
                 else:
@@ -469,13 +446,6 @@ class BaseMultimodalProcessor(ABC):
                         v_end_token,
                         img_pad_token,
                         insert_cached_ids,
-                    )
-                    image_grid_thw_lists.append(
-                        [
-                            1,
-                            int(images[img_idx].size[1] // QWEN2_PATCH_SIZE),
-                            int(images[img_idx].size[0] // QWEN2_PATCH_SIZE),
-                        ]
                     )
                     use_cache_mark.append(True)
             # result["pixel_values"] = torch.concat(tensor_lists, dim = 0)
