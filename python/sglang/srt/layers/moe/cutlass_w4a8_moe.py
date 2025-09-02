@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_cutlass_moe_ep_preproess,
 )
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -219,16 +220,21 @@ def cutlass_w4a8_moe(
             n,
             k,
         )
-
-        expected_m_per_group = torch.mean(masked_m.to(torch.float32)).to(torch.int32)
-        gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+        expected_m_per_group = (
+            global_server_args_dict["max_running_requests"] * topk // num_experts
+        )
+        # expected_m_per_group = max(1, int(torch.mean(local_topk_ids.to(torch.float32)).item()))
+        gateup_input = a
+        # logger.info(f"deepep_ll mode - a.shape: {a.shape}")
+        # logger.info(f"gateup_input.shape: {gateup_input.shape}")
+        # logger.info(f"gateup_input.dtype: {gateup_input.dtype}")
+        # gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
+        # sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
         c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
         c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
         intermediate = torch.empty(
             (num_experts, m, n), device=device, dtype=torch.bfloat16
         )
-
     cutlass_w4a8_moe_mm(
         c1,
         gateup_input,
@@ -246,6 +252,8 @@ def cutlass_w4a8_moe(
         expected_m_per_group,
     )
     silu_and_mul(c1, intermediate)
+
+    del c1, gateup_input
 
     intermediate_q = torch.empty(
         intermediate.shape, dtype=torch.float8_e4m3fn, device=device

@@ -305,6 +305,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        static_scale: torch.Tensor = None,
     ):
         raise NotImplementedError
 
@@ -338,6 +339,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        static_scale: torch.Tensor = None,
     ):
         topk_idx = topk_idx.to(torch.int64)
         if (
@@ -521,6 +523,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        static_scale: torch.Tensor = None,
     ):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
@@ -532,6 +535,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             topk_idx,
             use_fp8=True,
+            static_scale=static_scale,
             # use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
         )
         return (
@@ -584,6 +588,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         use_fp8: bool = False,
+        static_scale: torch.Tensor = None,
     ):
         buffer = self._get_buffer()
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
@@ -593,6 +598,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
+                use_per_tensor_quantization=get_moe_runner_backend().is_cutlass_w4afp8(),
+                static_scale=static_scale,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -709,12 +716,14 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        static_scale: torch.Tensor = None,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl(forward_batch).dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            static_scale=static_scale,
         )
         self._dispatch_intermediate_state = forward_batch, inner_state
 

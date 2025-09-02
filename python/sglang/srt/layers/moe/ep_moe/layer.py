@@ -735,6 +735,7 @@ class DeepEPMoE(EPMoE):
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
         hidden_states, _, _, masked_m, _ = dispatch_output
+        hidden_states_fp8, _ = hidden_states
 
         output = cutlass_w4a8_moe(
             self.start_expert_id,
