@@ -1,7 +1,7 @@
 """
 Multi-modality utils
 """
-
+#/usr/local/lib/python3.12/dist-packages/sglang/srt/managers/mm_utils.py
 import hashlib
 import pickle
 from abc import abstractmethod
@@ -724,15 +724,42 @@ def get_multimodal_data_bounds(
     valid_pairs_tensor = torch.as_tensor(valid_pairs, device=input_ids.device)
     return valid_pairs_tensor
 
+def reconstruct_tensor_from_infos( ts_infos:dict):
+    device = ts_infos["device"]
+    dtype =  ts_infos["dtype"]
+    ipc_handle_list = ts_infos["ipc_handle_list"]
+    shape_list = ts_infos["shape_list"]
+    stride_list = ts_infos["stride_list"]
+    
+    ts_list = []
+    for idx in range(len(ipc_handle_list)):
+        ipc_handle = ipc_handle_list[idx]
+        shape = shape_list[idx]
+        stride = stride_list[idx]
+        with torch.cuda.device(device):
+            storage = torch.UntypedStorage._new_shared_cuda(*ipc_handle)
+            recreated_tensor = torch.empty(
+                0, dtype=dtype, device= device
+            ).set_(storage, storage_offset=0, size=shape, stride=stride)
+            ts_list.append(recreated_tensor)
+    
+    return ts_list
 
 def data_hash(data) -> int:
     def list_to_hash(int_list):
         return hash(tuple(int_list))
 
     if isinstance(data, dict):
+        # assert "hash_keys" in data, "invalid dict data"
+        # hash_keys = data["hash_keys"]
+        # return list_to_hash(hash_keys)
+        new_tensor = torch.cat(reconstruct_tensor_from_infos(data))
+        # print("new tensor {}".format(new_tensor))
+        data["pixel_values"] = new_tensor
         assert "hash_keys" in data, "invalid dict data"
         hash_keys = data["hash_keys"]
         return list_to_hash(hash_keys)
+      
     elif isinstance(data, list):
         if isinstance(data[-1], int):
             return data[-1]

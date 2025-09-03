@@ -51,6 +51,31 @@ def image_to_int(img: Image.Image) -> int:
     return int.from_bytes(hash_bytes, byteorder="big")
 
 
+def generate_reconstruct_cudatensor_infos( tensor_list: List[torch.Tensor]):
+    if len(tensor_list) == 0:
+        return {}
+    
+    ipc_handle_list = []
+    shape_list = []
+    stride_list = []
+    device = tensor_list[0].device
+    dtype = tensor_list[0].dtype
+    
+    for ts in tensor_list:
+        storage = ts.untyped_storage()
+        ipc_handle_list.append(storage._share_cuda_())
+        shape_list.append(ts.shape)
+        stride_list.append(ts.stride())
+    
+    rs_infos = {}
+    rs_infos["ipc_handle_list"] = ipc_handle_list
+    rs_infos["shape_list"] = shape_list
+    rs_infos["stride_list"] = stride_list
+    rs_infos["device"] = device
+    rs_infos["dtype"] = dtype
+    return rs_infos
+
+
 class FIFOHashTable:
     def __init__(self, max_size: int):
         self.max_size = max_size
@@ -75,6 +100,11 @@ class FIFOHashTable:
 
     def erase(self, key: int):
         self.hash_map.pop(key)
+        
+    def pop_until(self, limit_size):
+        while len(self.hash_map) > limit_size:
+            oldest_key = self.order.pop(0)
+            self.erase(oldest_key)
 
 
 def operate_substrings(original_str, target_sub, indices, replace_str=""):
@@ -368,7 +398,6 @@ class BaseMultimodalProcessor(ABC):
             processor.image_processor,
             transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast,
         )
-        
 
         if cache_mm_image_items and is_qwen2_processor:
 
@@ -405,14 +434,16 @@ class BaseMultimodalProcessor(ABC):
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(
                     result[feature_name], torch.Tensor
-                ):
+                ):  
+                    # not do D2H for pixel_values 
+                    if feature_name == "pixel_values":
+                        continue
                     result[feature_name] = result[feature_name].to("cpu")
 
             start_height = 0
             end_height = 0
             tensor_lists = []
-            use_cache_mark = []
-            delete_keys = []
+ 
             for img_idx in range(len(images)):
                 # cache Tensor
                 if img_idx in new_processed_img_idxes:
@@ -425,17 +456,15 @@ class BaseMultimodalProcessor(ABC):
                     delete_key = self.hash_table.add(
                         img_hash_keys[img_idx], to_cache_tensor
                     )
-                    if delete_key:
-                        delete_keys.append(delete_key)
+
                     tensor_lists.append(to_cache_tensor)
-                    use_cache_mark.append(False)
                 # add input ids and insert tensor
                 else:
                     cached_tensor = self.hash_table.get(img_hash_keys[img_idx])
                     assert isinstance(
                         cached_tensor, torch.Tensor
                     ), "invalid cached_tensor"
-                    # tensor_lists.append(cached_tensor)
+                    tensor_lists.append(cached_tensor)
                     insert_cached_ids = (
                         [v_start_token]
                         + img_token_nums[img_idx] * [img_pad_token]
@@ -447,23 +476,17 @@ class BaseMultimodalProcessor(ABC):
                         img_pad_token,
                         insert_cached_ids,
                     )
-                    use_cache_mark.append(True)
+            
+            
             # result["pixel_values"] = torch.concat(tensor_lists, dim = 0)
-            send_pixel_values = (
-                torch.concat(tensor_lists, dim=0) if len(tensor_lists) > 0 else None
-            )
-            proxy_pixel_values = {}
-            proxy_pixel_values["send_data"] = send_pixel_values
-            proxy_pixel_values["use_cache_mark"] = use_cache_mark
+   
+            proxy_pixel_values =  generate_reconstruct_cudatensor_infos(tensor_lists)
             proxy_pixel_values["hash_keys"] = img_hash_keys
-            proxy_pixel_values["img_heights"] = processed_img_heights
-            proxy_pixel_values["delete_keys"] = delete_keys
             result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
                 torch.int32
             )
             result["pixel_values"] = proxy_pixel_values
-            for delete_key in delete_keys:
-                self.hash_table.erase(delete_key)
+
 
         else:
             result = processor.__call__(

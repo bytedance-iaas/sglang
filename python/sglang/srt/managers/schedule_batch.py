@@ -1295,40 +1295,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
                 elif isinstance(pixel_values, dict):
-                    use_cache_marks = pixel_values["use_cache_mark"]
-                    hash_keys = pixel_values["hash_keys"]
-                    split_tensors = pixel_values["send_data"]
-                    take_to_idx = pixel_values["img_heights"]
-                    delete_keys = pixel_values["delete_keys"]
+                    # use_cache_marks = pixel_values["use_cache_mark"]
+                    # hash_keys = pixel_values["hash_keys"]
+                    # split_tensors = pixel_values["send_data"]
+                    # take_to_idx = pixel_values["img_heights"]
+                    # delete_keys = pixel_values["delete_keys"]
 
-                    real_pixel_values = []
-                    take_start_idx = 0
-                    take_end_idx = 0
-                    take_idx = 0
-                    for send_idx in range(len(use_cache_marks)):
-                        if use_cache_marks[send_idx]:
-                            real_pixel_values.append(
-                                self.mminput_cache[hash_keys[send_idx]]
-                            )
+                    # real_pixel_values = []
+                    # take_start_idx = 0
+                    # take_end_idx = 0
+                    # take_idx = 0
+                    # for send_idx in range(len(use_cache_marks)):
+                    #     if use_cache_marks[send_idx]:
+                    #         real_pixel_values.append(
+                    #             self.mminput_cache[hash_keys[send_idx]]
+                    #         )
 
-                        else:
-                            take_start_idx = take_end_idx
-                            take_end_idx = take_start_idx + take_to_idx[take_idx]
-                            real_pixel_values.append(
-                                split_tensors[take_start_idx:take_end_idx].to(
-                                    self.device, non_blocking=True
-                                )
-                            )
-                            self.mminput_cache[hash_keys[send_idx]] = real_pixel_values[
-                                -1
-                            ]
-                            take_idx += 1
-                    # synchoronize hash_table with processor
-                    for delete_key in delete_keys:
-                        self.mminput_cache.pop(delete_key)
+                    #     else:
+                    #         take_start_idx = take_end_idx
+                    #         take_end_idx = take_start_idx + take_to_idx[take_idx]
+                    #         real_pixel_values.append(
+                    #             split_tensors[take_start_idx:take_end_idx].to(
+                    #                 self.device, non_blocking=True
+                    #             )
+                    #         )
+                    #         self.mminput_cache[hash_keys[send_idx]] = real_pixel_values[
+                    #             -1
+                    #         ]
+                    #         take_idx += 1
+                    # # synchoronize hash_table with processor
+                    # for delete_key in delete_keys:
+                    #     self.mminput_cache.pop(delete_key)
 
-                    mm_item.feature = torch.cat(real_pixel_values)
-
+                    mm_item.feature = pixel_values["pixel_values"]
                 elif isinstance(pixel_values, list):
                     if len(pixel_values) == 1:
                         mm_item.feature =  self.mminput_cache[pixel_values[0]]

@@ -45,6 +45,8 @@ PER_TOKEN_PATCH_NUM = 4
 PATCH_PIXEL_NUM = 14 * 14.0
 PATCH_SHAPE_SIZE = 14
 
+CACHED_IMAGE_MAX_NUM = 128
+
 
 def smart_resize(
     height: int,
@@ -273,7 +275,12 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
         if cache_mm_image_items:
             images = base_output.images
-
+            if len(images) > CACHED_IMAGE_MAX_NUM:
+                raise RuntimeError("input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE)")
+            
+            # print("hash table data size {}".format(self.hash_table.size()))
+            self.hash_table.pop_until(CACHED_IMAGE_MAX_NUM - len(images))
+            
             img_hash_keys = []
             img_heights = []
             new_processed_imgs = []
