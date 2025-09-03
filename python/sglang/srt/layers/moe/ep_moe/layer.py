@@ -447,6 +447,7 @@ class DeepEPMoE(EPMoE):
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            static_scale=self.w13_input_scale.float(),
             forward_batch=forward_batch,
         )
 

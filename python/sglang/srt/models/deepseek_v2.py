@@ -739,6 +739,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_batch=state.forward_batch,
+                static_scale=self.experts.w13_input_scale.float(),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -763,7 +764,6 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx=state.dispatch_output.topk_idx,
                 topk_weights=state.dispatch_output.topk_weights,
                 forward_batch=state.forward_batch,
-                static_scale=self.experts.w13_input_scale.float(),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
