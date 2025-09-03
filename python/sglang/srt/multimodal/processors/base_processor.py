@@ -398,6 +398,7 @@ class BaseMultimodalProcessor(ABC):
             processor.image_processor,
             transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast,
         )
+        
 
         if cache_mm_image_items and is_qwen2_processor:
 
