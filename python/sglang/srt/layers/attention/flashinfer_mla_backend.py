@@ -9,8 +9,6 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
-from sglang.jack_utils import hcdprint
-
 import os
 from dataclasses import dataclass
 from functools import partial
@@ -75,7 +73,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
-        hcdprint(f"[horenc] class FlashInferMLAAttnBackend:__init__(): OOOOOO")
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -388,19 +385,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
 
-        hcdprint(f"[horenc] FlashInferMLAAttnBackend:forward_extend(): PREFILL k is not None = {k is not None}, "
-                 f"save_kv_cache = {save_kv_cache}, k_rope is not None = {k_rope is not None}")
         # Save kv cache
         if save_kv_cache and k is not None:
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    hcdprint(f"[horenc] PREFILL set_mla_kv_buffer() = SET2 (k_rope not None, not use v)")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer, cache_loc, k, k_rope
                     )
                 else:
-                    hcdprint(f"[horenc] PREFILL set_kv_buffer() = SET1 (k_rope is None, use v) XXXXXXXXX ")
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -425,7 +418,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_extend(): PREFILL get_key_buffer() (kv slicing) layer.v_head_dim = {layer.v_head_dim} OOOO")
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
@@ -461,12 +453,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 
-        hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE (gpt oss) k is not None = {k is not None}, save_kv_cache = {save_kv_cache}, k_rope is not None = {k_rope is not None}")
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    hcdprint(f"[horenc] DECODE set_mla_kv_buffer() = SET2 (k_rope not None, not use v)")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
@@ -474,7 +464,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         k_rope,
                     )
                 else:
-                    hcdprint(f"[horenc] DECODE set_kv_buffer() = SET1 (k_rope is None, use v) XXXXXX")
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
@@ -493,32 +482,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        hcdprint(f"[horenc] class FlashInferMLAAttnBackend:forward_decode(): DECODE get_key_buffer() OOO")
-        # hcdprint(f"[horenc] self.dtype = {self.dtype}")
-        hcdprint(f"[horenc] GET forward_batch.token_to_kv_pool.dtype = {forward_batch.token_to_kv_pool.dtype}")
-        if forward_batch.token_to_kv_pool.dtype != torch.float4_e2m1fn_x2:
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
-        else:
-            #  TODO
-            hcdprint(f"[horenc] TODO:MLA:Attn TODO dequant")
-            hcdprint(f"k type: = {type(k)}  k dtype: = {k.dtype}  k shape: = {k.shape} (kv slicing) layer.v_head_dim = {layer.v_head_dim}")  # check if the same shape as quant so that I can do dequant here in attn
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
-            # from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil
-            # k_buffer_fp4 = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            # global_sf = (448 * 6) / tensor_bf16.abs().max().float() # From .cpp
-            # return1, return2
-            # sf_vec_size = 16
-            # tensor_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
-            #             xxx_tensor_fp4, xxx_scale_factors, global_sf, torch.bfloat16, sf_vec_size
-            #         )
-            #
-            # tensor_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
-            #             tensor_fp4, scale_factors, global_sf, torch.bfloat16
-            #         )
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+            q.dtype
+        )
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
@@ -535,7 +501,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        hcdprint(f"[horenc] class FlashInferMLAIndicesUpdaterDecode:__init__(): ")
         # Parse Constants
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -645,7 +610,6 @@ class FlashInferMLAIndicesUpdaterDecode:
 
 class FlashInferMLAIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        hcdprint(f"[horenc] class FlashInferMLAIndicesUpdaterPrefill:__init__(): ")
         # Parse Constants
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -792,7 +756,6 @@ class FlashInferMLAMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
-        hcdprint(f"[horenc] class FlashInferMLAMultiStepDraftBackend:__init__(): ")
         if topk > 1:
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
