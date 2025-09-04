@@ -14,6 +14,7 @@ class LBArgs:
     decode_infos: list = dataclasses.field(default_factory=list)
     log_interval: int = 5
     timeout: int = 600
+    neat_room: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -21,6 +22,11 @@ class LBArgs:
             "--rust-lb",
             action="store_true",
             help="Deprecated, please use SGLang Router instead, this argument will have no effect.",
+        )
+        parser.add_argument(
+            "--neat-room",
+            action="store_true",
+            help="use increment id as bootstrap room",
         )
         parser.add_argument(
             "--host",
@@ -100,6 +106,7 @@ class LBArgs:
             decode_infos=args.decode,
             log_interval=args.log_interval,
             timeout=args.timeout,
+            neat_room=args.neat_room,
         )
 
     def __post_init__(self):
@@ -124,6 +131,7 @@ def main():
         lb_args.host,
         lb_args.port,
         lb_args.timeout,
+        lb_args.neat_room,
     )
 
 

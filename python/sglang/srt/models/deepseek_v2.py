@@ -87,8 +87,8 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, is_sm100_supported
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -114,6 +114,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
+    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -683,6 +684,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_batch=state.forward_batch,
+                static_scale=self.experts.w13_input_scale.float(),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -994,7 +996,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.current_attention_backend = attention_backend
 
         if attention_backend == "ascend":
-            return AttnForwardMethod.MLA
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
         elif (
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
@@ -1292,6 +1301,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             or self.current_attention_backend == "flashinfer"
             or self.current_attention_backend == "cutlass_mla"
             or self.current_attention_backend == "trtllm_mla"
+            or self.current_attention_backend == "ascend"
         ):
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
