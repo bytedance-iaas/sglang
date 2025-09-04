@@ -72,7 +72,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty
+from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, get_bool_env_var
 
 Qwen3MoeConfig = None
 
@@ -96,10 +96,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}."
             )
-
+        
+        renormalize = config.norm_topk_prob
+        
+        if get_bool_env_var("FORCE_RENORMAL_OFF"):
+            renormalize = False    
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
+            renormalize=renormalize,
             use_grouped_topk=False,
         )
 

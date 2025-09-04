@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+MAX_TRITON_SHAPE = 512
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -1027,11 +1028,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return ret
 
+        is_decode = x.shape[0] <= MAX_TRITON_SHAPE
+        
         if (
             get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
             and (is_sm100_supported() or is_sm90_supported())
+            and is_decode
         ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
