@@ -460,7 +460,7 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         # [horenc] take this layer's what?
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer) #層
+            self._get_wrapper_idx(layer) # layer
         ]
         cache_loc = (
             forward_batch.out_cache_loc

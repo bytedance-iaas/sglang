@@ -509,7 +509,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             # from sglang.srt.layers.quantization.nvfp4_tensor import NVFP4QuantizeUtil
             # k_buffer_fp4 = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            # global_sf = (448 * 6) / tensor_bf16.abs().max().float() # 從.cpp來的
+            # global_sf = (448 * 6) / tensor_bf16.abs().max().float() # From .cpp
             # return1, return2
             # sf_vec_size = 16
             # tensor_fp4_dequant = NVFP4QuantizeUtil.batched_dequantize(
