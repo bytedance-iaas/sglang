@@ -959,8 +959,7 @@ class ModelRunner:
         return result
 
     def profile_max_num_token(self, total_gpu_memory: int):
-        hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"")
+        hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): ")
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -975,6 +974,15 @@ class ModelRunner:
             )
         else:
             num_layers = self.num_effective_layers
+        print(f"[horenc] ModelRunner:profile_max_num_token(): "
+                f"self.* = {self.__dict__} ")
+        # print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                # f"max_num_token = {max_num_token} horenc HACK HACK HACK HACK HACK This requires carfully calculation.")
+        print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                f"self.model_config.get_num_kv_heads(get_attention_tp_size()) = {self.model_config.get_num_kv_heads(get_attention_tp_size())} "
+                f"self.model_config.head_dim = {self.model_config.head_dim}"
+                f"k = {(self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)} "
+                f"m = size(=cell_size) + self.page_size({self.page_size})")  
         if self.use_mla_backend:
             # FIXME: pipeline parallelism is not compatible with mla backend
             assert self.pp_size == 1
@@ -983,14 +991,37 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
-            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"MLA self.model_config.kv_lora_rank = {self.model_config.kv_lora_rank}"
-                f"self.model_config.qk_rope_head_dim = {self.model_config.qk_rope_head_dim}")
-            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"MLA cell_size = {cell_size}")
-            # cell_size *= 2
-            # hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
-            #     f"MLA cell_size = {cell_size} horenc HACK HACK HACK HACK HACK")
+            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                    f"self.model_config.kv_lora_rank = {self.model_config.kv_lora_rank}"
+                    f"self.model_config.qk_rope_head_dim = {self.model_config.qk_rope_head_dim}")
+            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                    f"cell_size = {cell_size}")
+
+            # if self.dtype == torch.float4_e2m1fn_x2:
+            # if self.kv_cache_dtype == 'fp4_e2m1':
+            if self.kv_cache_dtype == torch.float4_e2m1fn_x2:
+                print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                        f"FP4 FP4 FP4 FP4 FP4 FP4 FP4 FP4 FP4")
+
+                print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                        f"bf ++kv_scale_buffer_cell_size cell_size[layers] = {cell_size} // size(self.kv_cache_dtype) == {(cell_size // torch._utils._element_size(self.kv_cache_dtype))}")
+
+                # kv_scale_buffer
+                scale_block_size = 16
+                # max_num_token -= (self.size + self.page_size) * (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                # cell_size = (
+                #     ((cell_size // torch._utils._element_size(self.kv_cache_dtype)) + self.page_size) *
+                #     ((self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim) // scale_block_size) *
+                #     torch._utils._element_size(self.kv_cache_dtype)
+                # )
+                cell_size += (
+                    ((self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim) // scale_block_size) *
+                    num_layers *
+                    torch._utils._element_size(self.kv_cache_dtype)
+                )
+
+                print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
+                        f"af ++kv_scale_buffer_cell_size cell_size[layers] = {cell_size} // size(self.kv_cache_dtype) == {(cell_size // torch._utils._element_size(self.kv_cache_dtype))}")
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -1004,14 +1035,11 @@ class ModelRunner:
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
-        hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
+        print(f"[horenc] ModelRunner:profile_max_num_token(): "
                 f"rest_memory = {rest_memory} G")
-        hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
+        print(f"[horenc] ModelRunner:profile_max_num_token(): "
                 f"mem_fraction_static ~= 1.0 => more memory for kv cache")
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
-        max_num_token //= 200
-        hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"MLA max_num_token = {max_num_token} horenc HACK HACK HACK HACK HACK This requires carfully calculation.")
         return max_num_token
 
     def set_num_token_hybrid(self):

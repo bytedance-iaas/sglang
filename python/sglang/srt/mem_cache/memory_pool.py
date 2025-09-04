@@ -1413,7 +1413,7 @@ class MLATokenToKVPool(KVCache):
                     n = 1 # head_num
                     # k = self.head_dim
                     k = kv_lora_rank + qk_rope_head_dim # head_dim # k = 576 (512 + 64)
-                    hcdprint(f"[horenc] TODO:MLA __init__ create kv kv_scale buffer m = {m} ({size} + {page_size}) n = {n} k = {k} ({kv_lora_rank} + {qk_rope_head_dim})")
+                    print(f"[horenc] TODO:MLA __init__ create kv kv_scale buffer m = {m} ({size} + {page_size}) n = {n} k = {k} ({kv_lora_rank} + {qk_rope_head_dim})")
 
                     scale_block_size = 16
                     self.store_dtype = torch.uint8
