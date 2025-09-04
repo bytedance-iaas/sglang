@@ -403,6 +403,11 @@ class Scheduler(
                 f"available_gpu_mem={avail_mem:.2f} GB"
             )
 
+
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+        self.init_kv_events(server_args.kv_events_config)
+
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
@@ -495,10 +500,6 @@ class Scheduler(
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
             else None
         )
-
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_kv_events(server_args.kv_events_config)
 
         # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -653,6 +654,7 @@ class Scheduler(
                         hicache_size=server_args.hicache_size,
                         hicache_write_policy=server_args.hicache_write_policy,
                         server_args=server_args,
+                        scheduler_metric_collector=self.metrics_collector,
                     )
                 else:
                     self.tree_cache = HiRadixCache(
@@ -667,6 +669,7 @@ class Scheduler(
                         hicache_mem_layout=server_args.hicache_mem_layout,
                         hicache_storage_backend=server_args.hicache_storage_backend,
                         hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
+                        scheduler_metric_collector=self.metrics_collector,
                     )
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
@@ -1665,6 +1668,7 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
+                req.prefill_loop_count += 1
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)

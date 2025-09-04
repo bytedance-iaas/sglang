@@ -9,6 +9,7 @@ from typing import List, Optional
 import torch
 import yaml
 
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.managers.eic_cache_controller import (
     EICCacheController,
     get_content_hash,
@@ -44,6 +45,7 @@ class EICHiRadixCacheBuilder:
         hicache_size: int,
         hicache_write_policy: str,
         server_args: ServerArgs,
+        scheduler_metric_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         if server_args.disable_eic_shared:
             return EICHiRadixCache(
@@ -55,6 +57,7 @@ class EICHiRadixCacheBuilder:
                 hicache_size,
                 hicache_write_policy,
                 server_args,
+                scheduler_metric_collector,
             )
         else:
             return EICPagedHiRadixCache(
@@ -66,6 +69,7 @@ class EICHiRadixCacheBuilder:
                 hicache_size,
                 hicache_write_policy,
                 server_args,
+                scheduler_metric_collector,
             )
 
 
@@ -113,6 +117,7 @@ class EICHiRadixCache(RadixCache):
         hicache_size: int,
         hicache_write_policy: str,
         server_args: ServerArgs,
+        scheduler_metric_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.tp_group = tp_cache_group
         self.tp_size = self.tp_group.size()
@@ -165,6 +170,7 @@ class EICHiRadixCache(RadixCache):
             1 if hicache_write_policy == "write_through" else 3
         )
         self.load_back_threshold = 10
+        self.scheduler_metrics_collector = scheduler_metric_collector
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
         )
@@ -412,6 +418,7 @@ class EICHiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_tokens: int, evict_callback=None, retry_times: int = 3):
+        start_time = time.perf_counter()
         while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
             self.writing_check()
             self.loading_check()
@@ -471,6 +478,8 @@ class EICHiRadixCache(RadixCache):
                     f"only evicted {num_evicted} tokens, less than requested {num_tokens}"
                 )
             else:
+                if self.scheduler_metrics_collector is not None:
+                    self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
                 return
 
     def _evict_backuped(self, node: TreeNode):
@@ -517,7 +526,7 @@ class EICHiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
-
+        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -566,6 +575,9 @@ class EICHiRadixCache(RadixCache):
             node.loading = True
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        if self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_load_back_duration(time.perf_counter() - start_time)
 
         return device_indices
 
@@ -804,6 +816,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         hicache_size: int,
         hicache_write_policy: str,
         server_args: ServerArgs,
+        scheduler_metric_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.calculate_hash_fn = get_content_hash
         self.load_remote_threshold = 100
@@ -818,6 +831,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             hicache_size,
             hicache_write_policy,
             server_args,
+            scheduler_metric_collector,
         )
 
     def init_hyper_params(self, config):
@@ -1135,7 +1149,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
-
+        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -1213,5 +1227,8 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             node.loading = True
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        if self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_load_back_duration(time.perf_counter() - start_time)
 
         return device_indices
