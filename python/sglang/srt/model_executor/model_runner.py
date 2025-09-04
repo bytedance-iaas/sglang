@@ -134,7 +134,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
 
-from sglang.jack_utils import hcdprint
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -458,8 +457,6 @@ class ModelRunner:
                         "MLA optimization not supported on CPU except for intel_amx backend."
                     )
 
-        hcdprint(f"[horenc] ModelRunner:model_specific_adjustment(): "
-            f"server_args.attention_backend = {server_args.attention_backend}")
         if (
             server_args.attention_backend == "fa3"
             and server_args.kv_cache_dtype == "fp8_e5m2"
@@ -651,9 +648,6 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
-        hcdprint(f"[horenc] ModelRunner:load_model(): self.server_args.attention_backend = {self.server_args.attention_backend}")
-        hcdprint(f"[horenc] ModelRunner:load_model(): self.server_args.kv_cache_dtype = {self.server_args.kv_cache_dtype}")
-        hcdprint(f"[horenc] ModelRunner:load_model(): self.server_args.quantization_param_path = {self.server_args.quantization_param_path}")
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
@@ -959,7 +953,6 @@ class ModelRunner:
         return result
 
     def profile_max_num_token(self, total_gpu_memory: int):
-        hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): ")
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -974,15 +967,6 @@ class ModelRunner:
             )
         else:
             num_layers = self.num_effective_layers
-        print(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"self.* = {self.__dict__} ")
-        # print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                # f"max_num_token = {max_num_token} horenc HACK HACK HACK HACK HACK This requires carfully calculation.")
-        print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                f"self.model_config.get_num_kv_heads(get_attention_tp_size()) = {self.model_config.get_num_kv_heads(get_attention_tp_size())} "
-                f"self.model_config.head_dim = {self.model_config.head_dim}"
-                f"k = {(self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)} "
-                f"m = size(=cell_size) + self.page_size({self.page_size})")  
         if self.use_mla_backend:
             # FIXME: pipeline parallelism is not compatible with mla backend
             assert self.pp_size == 1
@@ -991,37 +975,15 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
-            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                    f"self.model_config.kv_lora_rank = {self.model_config.kv_lora_rank}"
-                    f"self.model_config.qk_rope_head_dim = {self.model_config.qk_rope_head_dim}")
-            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                    f"cell_size = {cell_size}")
 
-            # if self.dtype == torch.float4_e2m1fn_x2:
-            # if self.kv_cache_dtype == 'fp4_e2m1':
             if self.kv_cache_dtype == torch.float4_e2m1fn_x2:
-                print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                        f"FP4 FP4 FP4 FP4 FP4 FP4 FP4 FP4 FP4")
-
-                print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                        f"bf ++kv_scale_buffer_cell_size cell_size[layers] = {cell_size} // size(self.kv_cache_dtype) == {(cell_size // torch._utils._element_size(self.kv_cache_dtype))}")
-
                 # kv_scale_buffer
                 scale_block_size = 16
-                # max_num_token -= (self.size + self.page_size) * (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                # cell_size = (
-                #     ((cell_size // torch._utils._element_size(self.kv_cache_dtype)) + self.page_size) *
-                #     ((self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim) // scale_block_size) *
-                #     torch._utils._element_size(self.kv_cache_dtype)
-                # )
                 cell_size += (
                     ((self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim) // scale_block_size) *
                     num_layers *
                     torch._utils._element_size(self.kv_cache_dtype)
                 )
-
-                print(f"[horenc] ModelRunner:profile_max_num_token(): MLA "
-                        f"af ++kv_scale_buffer_cell_size cell_size[layers] = {cell_size} // size(self.kv_cache_dtype) == {(cell_size // torch._utils._element_size(self.kv_cache_dtype))}")
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -1030,21 +992,13 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
-            hcdprint(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"!MLA cell_size = {cell_size}")
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
-        print(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"rest_memory = {rest_memory} G")
-        print(f"[horenc] ModelRunner:profile_max_num_token(): "
-                f"mem_fraction_static ~= 1.0 => more memory for kv cache")
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def set_num_token_hybrid(self):
-        hcdprint(f"[horenc] ModelRunner:set_num_token_hybrid(): "
-                f"only when self.is_hybrid = true")
         if (
             "Llama4ForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1132,9 +1086,6 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
-        hcdprint(f"[horenc] ModelRunner:init_memory_pool(): "
-                f"self.server_args.attention_backend = "
-                f"{self.server_args.attention_backend}")
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -1149,28 +1100,12 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             self.kv_cache_dtype = torch.float4_e2m1fn_x2
-            #horenc jack
-            # self.kv_cache_dtype = torch.float4_e2m1 #horenc jack
-            # self.kv_cache_dtype = torch.float4_e2m1fn_x2 #horenc jack
-
-
-                
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        # hcdprint(f"[horenc] ModelRunner:init_memory_pool(): "
-        #         f"bf self.max_total_num_tokens = "
-        #         f"{self.max_total_num_tokens}")
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        hcdprint(f"[horenc] ModelRunner:init_memory_pool(): "
-                f"Set self.max_total_num_tokens = "
-                f"{self.max_total_num_tokens}")
-        logger.info(
-            f"Memory pool begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1258,7 +1193,6 @@ class ModelRunner:
             assert self.is_draft_worker
 
         if self.server_args.attention_backend == "ascend" and not self.use_mla_backend:
-            hcdprint(f"[horenc] self.token_to_kv_pool = AscendTokenToKVPoo XXX")
             self.token_to_kv_pool = AscendTokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1270,7 +1204,6 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
         elif self.server_args.attention_backend == "ascend" and self.use_mla_backend:
-            hcdprint(f"[horenc] self.token_to_kv_pool = AscendMLAPagedTokenToKVPool XXX")
             self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1284,7 +1217,6 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         elif self.use_mla_backend:
-            hcdprint(f"[horenc] self.token_to_kv_pool = MLATokenToKVPool (Only MLA)")
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1298,7 +1230,6 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         elif self.server_args.enable_double_sparsity:
-            hcdprint(f"[horenc] self.token_to_kv_pool = DoubleSparseTokenToKVPool XXX")
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1314,7 +1245,6 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
-                hcdprint(f"[horenc] self.token_to_kv_pool = SWAKVPool XXX")
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1329,7 +1259,6 @@ class ModelRunner:
                     device=self.device,
                 )
             else:
-                hcdprint(f"[horenc] self.token_to_kv_pool = MHATokenToKVPool (Only MHA)")
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1348,7 +1277,6 @@ class ModelRunner:
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
                 if self.is_hybrid:
-                    hcdprint(f"[horenc] self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator XXX")
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
@@ -1357,7 +1285,6 @@ class ModelRunner:
                         kvcache=self.token_to_kv_pool,
                     )
                 else:
-                    hcdprint(f"[horenc] self.token_to_kv_pool_allocator = TokenToKVPoolAllocator OOO")
                     self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
@@ -1366,7 +1293,6 @@ class ModelRunner:
                     )
             else:
                 if _is_npu:
-                    hcdprint(f"[horenc] self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator XXX")
                     self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -1375,7 +1301,6 @@ class ModelRunner:
                         kvcache=self.token_to_kv_pool,
                     )
                 else:
-                    hcdprint(f"[horenc] self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator OOO (Only gpt-oss)")
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -1455,10 +1380,6 @@ class ModelRunner:
                 "prefill_attention_backend": self.prefill_attention_backend_str,
             }
         )
-        # After creation
-        hcdprint(f"[horenc] ModelRunner:_get_attention_backend(): global_server_args_dict.update "
-            f"decode = {global_server_args_dict['decode_attention_backend']}, "
-            f"prefill = {global_server_args_dict['prefill_attention_backend']}")
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):
