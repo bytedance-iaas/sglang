@@ -469,6 +469,18 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
 
+  struct MmaConfig_h20 {
+    using ElementA = cutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_64, _128, _128>;
+    using ClusterShape = Shape<_1, _2, _1>;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
+
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+
   struct MmaConfig1 {
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_128, _128, _128>;
@@ -484,8 +496,40 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
   int num_experts = (int)expert_offsets.size(0);
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
-
-  if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
+  bool use_h20_config = getenv("SGL_CUTLASS_TUNE") ? true : false;
+  
+  if ( use_h20_config ) {
+      run_get_group_gemm_starts<MmaConfig_h20::LayoutSFA, MmaConfig_h20::LayoutSFB, MmaConfig_h20::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig_h20, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+  } else if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
     // For H20 with K > 128, use Pingpong Schedule
     run_get_group_gemm_starts<MmaConfig0::LayoutSFA, MmaConfig0::LayoutSFB, MmaConfig0::ScaleConfig>(
         expert_offsets,
