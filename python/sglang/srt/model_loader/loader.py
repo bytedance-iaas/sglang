@@ -11,6 +11,8 @@ import logging
 import math
 import os
 import time
+import ctypes
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -35,9 +37,11 @@ from sglang.srt.connector import (
     get_connector_type,
 )
 from sglang.srt.connector.utils import parse_model_name
+from sglang.srt.connector.eic import *
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_pp_group,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
@@ -716,6 +720,11 @@ class ShardedStateLoader(BaseModelLoader):
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a
                         # narrowed view of the parameter data.
+                        if key not in state_dict:
+                            logger.warning(f"Key '{key}' not found in state_dict")
+                            if "self_attn.attn_mha." in key:
+                                true_key = key.replace("self_attn.attn_mha.", "self_attn.")
+                                key = true_key
                         param_data = state_dict[key].data
                         param_shape = state_dict[key].shape
                         for dim, size in enumerate(tensor.shape):
@@ -1357,11 +1366,22 @@ class GGUFModelLoader(BaseModelLoader):
 
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
-
+    BATCH_SET_SIZE = 20 * 1024 * 1024
+    DATA_SPLIT_SIZE = 20 * 1024 * 1024
+    META_APPROXIMATE_SIZE = 10 * 1024 * 1024
+    META_PREFIX_MAX_LENGTH = 16
+    META_PREFIX = "._meta"
+    ENABLE_ZERO_COPY = True
+    ENABLE_THREADING = False
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         # TODO @DellCurry: move to s3 connector only
         set_runai_streamer_env(load_config)
+        self.loaded_kv: dict[str, Any] = {}
+        self.perf_statistics: dict[str, Any] = {}
+        self.thread_num = 4
+        self.zero_copy_ptrs = []
+        self.split_tensors = []
 
     def _get_weights_iterator_kv(
         self,
@@ -1383,6 +1403,149 @@ class RemoteModelLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         pass
 
+    def _write_huge_kv(
+        client: EICConnector,
+        model_name: str,
+        key: str,
+        tensor: torch.Tensor,
+        data_split_size: int,
+    ) -> None:
+        # split tensor
+        tensor_size = tensor.nelement() * tensor.element_size()
+        split_num = math.ceil(tensor_size / data_split_size)
+        for i in range(split_num):
+            start = i * data_split_size
+            end = min((i + 1) * data_split_size, tensor_size)
+            split_tensor = tensor.view(
+                tensor.nelement()).view(torch.int8)[start: end]
+            split_key = os.path.join(model_name, key, str(i))
+            client.mset([split_key], [split_tensor])
+
+    def save_eic_model(client: EICConnector,
+                       model: torch.nn.Module,
+                       local_model_path: str,
+                       model_name: str) -> None:
+        start_time = time.perf_counter()
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        pp = get_pp_group().world_size
+        pp_rank = get_pp_group().rank_in_group
+        # eic model prefix name
+        model_prefix = f"{model_name}-pp{pp}-rank{pp_rank}-tp{tp}-rank{rank}"
+        logger.info(f"model_prefix is {model_prefix}")
+        # root: ( k = model_prefix , v = { kv_num, meta_number, data_split_size, meta_prefix_name, kv_num_per_meta[] } )
+        root_json = {
+            "kv_num": 0,
+            "meta_num": 0,
+            "data_split_size": RemoteModelLoader.DATA_SPLIT_SIZE,
+            "meta_prefix_name": RemoteModelLoader.META_PREFIX,
+            "kv_num_per_meta": [],
+        }
+
+        # meta:( k = model_prefix/meta_prefix_name/{index} , v = { kv_num, key[], tensor_meta[], value_length[] })
+        meta_size = 0
+        meta_json = {
+            "kv_num": 0,
+            "key": [],
+            "tensor_meta": [],
+            "value_length": [],
+        }
+        # data: ( k = key, v = tensor )
+        # set tensors
+        keys: List[str] = []
+        tensors: List[torch.Tensor] = []
+        batch_size = 0
+        for key, tensor in state_dict.items():
+            should_write_data = False
+            # update meta
+            root_json["kv_num"] += 1
+            meta_json["kv_num"] += 1
+            tensor_size = tensor.nelement() * tensor.element_size()
+            meta_json["value_length"].append(tensor_size)
+            tensor_meta = generate_tensor_metadata(tensor)
+            meta_json["tensor_meta"].append(tensor_meta)
+            meta_json["key"].append(key)
+            # logger.info(f"model_prefix {model_prefix} save key {key} tensor_size {tensor_size} tensor_meta {tensor_meta}")
+            meta_size += len(key)
+            if tensor_size > RemoteModelLoader.DATA_SPLIT_SIZE:
+                should_write_data = True
+                RemoteModelLoader._write_huge_kv(
+                    client,
+                    model_prefix,
+                    key,
+                    tensor,
+                    RemoteModelLoader.DATA_SPLIT_SIZE,
+                )
+            else:
+                # append to write batch
+                keys.append(os.path.join(model_prefix, key))
+                tensors.append(tensor)
+                batch_size = batch_size + tensor_size
+                if batch_size >= RemoteModelLoader.BATCH_SET_SIZE:
+                    should_write_data = True
+                    client.mset(keys, tensors)
+                    keys.clear()
+                    tensors.clear()
+                    batch_size = 0
+            # write meta if needed
+            if should_write_data and meta_size >= RemoteModelLoader.META_APPROXIMATE_SIZE:
+                meta_name = os.path.join(
+                    model_prefix, RemoteModelLoader.META_PREFIX, str(root_json["meta_num"]))
+                meta_bytes = json.dumps(meta_json).encode()
+                meta_buffer = torch.from_numpy(np.frombuffer(
+                    meta_bytes, dtype=np.int8).copy())
+                client.mset([meta_name], [meta_buffer])
+                # update root
+                root_json["kv_num_per_meta"].append(meta_json["kv_num"])
+                root_json["meta_num"] += 1
+                # reset counters
+                meta_json["kv_num"] = 0
+                meta_json["value_length"].clear()
+                meta_json["tensor_meta"].clear()
+                meta_json["key"].clear()
+                meta_size = 0
+
+        # write last data
+        if batch_size > 0:
+            client.mset(keys, tensors)
+        # write last meta
+        if meta_json["kv_num"] > 0:
+            meta_name = os.path.join(
+                model_prefix, RemoteModelLoader.META_PREFIX, str(root_json["meta_num"]))
+            meta_bytes = json.dumps(meta_json).encode()
+            meta_buffer = torch.from_numpy(np.frombuffer(
+                meta_bytes, dtype=np.int8).copy())
+            client.mset([meta_name], [meta_buffer])
+            # update root
+            root_json["kv_num_per_meta"].append(meta_json["kv_num"])
+            root_json["meta_num"] += 1
+        # write root
+        logger.info(
+            f"write root {model_prefix}, content: {root_json}"
+        )
+        root_bytes = json.dumps(root_json).encode()
+        root_buffer = torch.from_numpy(np.frombuffer(
+            root_bytes, dtype=np.int8).copy())
+        client.mset([model_prefix], [root_buffer])
+
+        # upload files
+        file_list: List[str] = []
+        for root, _, files in os.walk(local_model_path):
+            for file_name in files:
+                # ignore hidden files
+                if file_name.startswith("."):
+                    continue
+                if os.path.splitext(file_name)[1] in (".jpg"):
+                    continue
+                if os.path.splitext(file_name)[1] not in (".bin", ".pt", ".safetensors"):
+                    file_list.append(os.path.join(root, file_name))
+        client.upload_model_config(model_name, file_list)
+        end_time = time.perf_counter()
+        logger.info(
+            f"save model on rank{rank} to eic cost {end_time - start_time}s")
+        time.sleep(180)
+
     @staticmethod
     def save_model(
         model: torch.nn.Module,
@@ -1394,6 +1557,11 @@ class RemoteModelLoader(BaseModelLoader):
             model_name = parse_model_name(url)
             rank = get_tensor_model_parallel_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+            if isinstance(client, EICConnector):
+                model_name = url.removeprefix("eic://")
+                RemoteModelLoader.save_eic_model(
+                    client, model, model_path, model_name)
+                return
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
                 client.set(r_key, tensor)
@@ -1491,7 +1659,11 @@ class RemoteModelLoader(BaseModelLoader):
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
-                    self._load_model_from_remote_kv(model, client)
+                    if isinstance(client, EICConnector):
+                        self._load_model_from_eic(
+                            model, client, model_config)
+                    else:
+                        self._load_model_from_remote_kv(model, client)
                 elif connector_type == ConnectorType.FS:
                     self._load_model_from_remote_fs(
                         model, client, model_config, device_config
@@ -1501,6 +1673,296 @@ class RemoteModelLoader(BaseModelLoader):
         logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
         return model.eval()
 
+    def _load_eic_worker(self, client, model_name, state_dict, sub_items: list[tuple[str, Any]], thread_index):
+        # iterate all keys
+        batch_size = 0
+        eic_keys = []
+        state_dict_keys = []
+        tensor_metas = []
+        for key, meta in sub_items:
+            # logger.info(f"model_name {model_name} load key {key} meta {meta}")
+            value_length = meta[0]
+            tensor_meta = meta[1]
+            if value_length > self.data_split_size:
+                # read and copy tensor to state_dict
+                self._read_huge_kv(client, state_dict, key, os.path.join(
+                    model_name, key), value_length, tensor_meta, thread_index)
+            else:
+                eic_keys.append(os.path.join(model_name, key))
+                state_dict_keys.append(key)
+                batch_size = batch_size + value_length
+                tensor_metas.append(tensor_meta)
+                if batch_size > RemoteModelLoader.BATCH_SET_SIZE:
+                    tensors = self._read_kv(client, eic_keys, tensor_metas)
+                    for i, tensor in enumerate(tensors):
+                        self._load_tensor(
+                            state_dict, state_dict_keys[i], tensor)
+                    # reset
+                    batch_size = 0
+                    eic_keys.clear()
+                    state_dict_keys.clear()
+                    tensor_metas.clear()
+        if batch_size > 0:
+            tensors = self._read_kv(client, eic_keys, tensor_metas)
+            for i, tensor in enumerate(tensors):
+                self._load_tensor(state_dict, state_dict_keys[i], tensor)
+
+    def _load_model_from_eic(
+        self,
+        model: nn.Module,
+        client: EICConnector,
+        model_config: ModelConfig,
+    ) -> nn.Module:
+        start_time = time.perf_counter()
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        pp = get_pp_group().world_size
+        pp_rank = get_pp_group().rank_in_group
+        model_name = client.url.removeprefix("eic://")
+        model_prefix = f"{model_name}-pp{pp}-rank{pp_rank}-tp{tp}-rank{rank}"
+
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        # read root
+        self._read_root(client, model_prefix)
+        # read meta
+        self._read_meta(client, model_prefix)
+        # iterate all keys
+        batch_size = 0
+        eic_keys = []
+        state_dict_keys = []
+        tensor_metas = []
+        if RemoteModelLoader.ENABLE_THREADING:
+            items = list(self.loaded_kv.items())
+            chunk_size = (len(items) + self.thread_num - 1) // self.thread_num
+            threads = []
+            for i in range(self.thread_num):
+                start = i * chunk_size
+                end = min(start + chunk_size, len(items))
+                sub_items = items[start:end]
+                thread = threading.Thread(target=self._load_eic_worker,
+                                          args=(client, model_prefix, state_dict, sub_items, i))
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
+        else:
+            for key, meta in self.loaded_kv.items():
+                # logger.info(f"model_prefix {model_prefix} load key {key} meta {meta}")
+                value_length = meta[0]
+                tensor_meta = meta[1]
+                if value_length > self.data_split_size:
+                    # read and copy tensor to state_dict
+                    self._read_huge_kv(client, state_dict, key, os.path.join(
+                        model_prefix, key), value_length, tensor_meta, 0)
+                else:
+                    eic_keys.append(os.path.join(model_prefix, key))
+                    state_dict_keys.append(key)
+                    batch_size = batch_size + value_length
+                    tensor_metas.append(tensor_meta)
+                    if batch_size > RemoteModelLoader.BATCH_SET_SIZE:
+                        tensors = self._read_kv(client, eic_keys, tensor_metas)
+                        for i, tensor in enumerate(tensors):
+                            self._load_tensor(state_dict, state_dict_keys[i], tensor)
+                        # reset
+                        batch_size = 0
+                        eic_keys.clear()
+                        state_dict_keys.clear()
+                        tensor_metas.clear()
+            if batch_size > 0:
+                tensors = self._read_kv(client, eic_keys, tensor_metas)
+                for i, tensor in enumerate(tensors):
+                    self._load_tensor(state_dict, state_dict_keys[i], tensor)
+
+        if state_dict:
+            raise ValueError(
+                f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        post_load_weights(model, model_config)
+
+        if RemoteModelLoader.ENABLE_ZERO_COPY:
+            for i in range(self.thread_num):
+                client.release_zero_copy_buffer(
+                    self.zero_copy_ptrs[i], self.data_split_size)
+            self.split_tensors = []
+            self.zero_copy_ptrs = []
+        else:
+            self.split_tensor = None
+        end_time = time.perf_counter()
+        self.perf_statistics["load_model_s"] = end_time - start_time
+        logger.info(
+            f"load model on rank{rank} from eic, perf_stat: {self.perf_statistics}")
+        return model
+
+    def _load_tensor(self, state_dict, key: str, tensor: torch.Tensor):
+
+        if key not in state_dict:
+            logger.warning(f"Key '{key}' not found in state_dict.")
+            if "self_attn.attn_mha." in key:
+                true_key = key.replace("self_attn.attn_mha.", "self_attn.")
+                key = true_key
+
+        param_data = state_dict[key].data
+        param_shape = state_dict[key].shape
+        # If loading with LoRA enabled, additional padding may
+        # be added to certain parameters. We only load into a
+        # narrowed view of the parameter data.
+        for dim, size in enumerate(tensor.shape):
+            if size < param_shape[dim]:
+                param_data = param_data.narrow(
+                    dim, 0, size)
+        if tensor.shape != param_shape:
+            logger.warning(
+                "loading tensor of shape %s into "
+                "parameter '%s' of shape %s",
+                tensor.shape,
+                key,
+                param_shape,
+            )
+        param_data.copy_(tensor)
+        state_dict.pop(key)
+
+    def _read_huge_kv(
+        self,
+        client: EICConnector,
+        state_dict: Dict[str, torch.Tensor],
+        dict_key: str,
+        key: str,
+        value_length: int,
+        tensor_meta: Dict[str, any],
+        thread_index,
+    ) -> torch.Tensor:
+        start_time = time.perf_counter()
+        # read tensor
+        param_data = state_dict[dict_key].data
+        param_shape = state_dict[dict_key].shape
+        # If loading with LoRA enabled, additional padding may
+        # be added to certain parameters. We only load into a
+        # narrowed view of the parameter data.
+        for dim, size in enumerate(tensor_meta["shape"]):
+            if size < param_shape[dim]:
+                param_data = param_data.narrow(
+                    dim, 0, size)
+        if torch.Size(tensor_meta["shape"]) != param_shape:
+            logger.warning(
+                "loading tensor of shape %s into "
+                "parameter '%s' of shape %s",
+                tensor_meta["shape"],
+                key,
+                param_shape,
+            )
+        split_num = math.ceil(value_length / self.data_split_size)
+        for i in range(split_num):
+            split_start_time = time.perf_counter()
+            split_key = os.path.join(key, str(i))
+            start = i * self.data_split_size
+            end = min((i + 1) * self.data_split_size, value_length)
+            client.mget([split_key], [self.split_tensors[thread_index][0: end - start]])
+            split_end_time = time.perf_counter()
+            self.perf_statistics["read_huge_kv_split_s"] = self.perf_statistics.get(
+                "read_huge_kv_split_s", 0) + split_end_time - split_start_time
+            self.perf_statistics["read_huge_kv_split_ops"] = self.perf_statistics.get(
+                "read_huge_kv_split_ops", 0) + 1
+            param_data.view(torch.int8).view(value_length)[
+            start:end].copy_(self.split_tensors[thread_index][0: end - start])
+            load_end_time = time.perf_counter()
+            self.perf_statistics["read_huge_kv_copy_split_s"] = self.perf_statistics.get(
+                "read_huge_kv_copy_split_s", 0) + load_end_time - split_end_time
+        end_time = time.perf_counter()
+        self.perf_statistics["read_huge_kv_s"] = self.perf_statistics.get(
+            "read_huge_kv_s", 0) + end_time - start_time
+        self.perf_statistics["read_huge_kv_ops"] = self.perf_statistics.get(
+            "read_huge_kv_ops", 0) + 1
+        state_dict.pop(dict_key)
+        return
+
+    def _read_kv(
+        self,
+        client: EICConnector,
+        keys: List[str],
+        tensor_metas: List[Dict[str, any]],
+    ) -> List[torch.Tensor]:
+        start_time = time.perf_counter()
+        tensors: List[torch.Tensor] = []
+        for i, meta in enumerate(tensor_metas):
+            tensors.append(get_tensor_from_metadata(meta))
+        client.mget(keys, tensors)
+        end_time = time.perf_counter()
+        self.perf_statistics["read_multi_kv_s"] = self.perf_statistics.get(
+            "read_multi_kv_s", 0) + end_time - start_time
+        self.perf_statistics["read_multi_kv_ops"] = self.perf_statistics.get(
+            "read_multi_kv_ops", 0) + 1
+        return tensors
+
+    def _read_meta(
+        self,
+        client: EICConnector,
+        model_name: str,
+    ) -> None:
+        start_time = time.perf_counter()
+        # read meta and load to dict loader_kv
+        for i in range(self.meta_num):
+            meta_name = os.path.join(
+                model_name, self.meta_prefix, str(i))
+            tensors = client.mget([meta_name])
+            if len(tensors) == 0:
+                raise ValueError(f"Meta {meta_name} not found!")
+            meta_bytes = tensors[0].numpy().tobytes()
+            meta_json = json.loads(meta_bytes.decode())
+            meta_kv_num = meta_json["kv_num"]
+            if meta_kv_num != self.kv_per_meta[i]:
+                raise ValueError(
+                    f"Meta {meta_name} kv num {meta_kv_num} "
+                    f"not equal to root kv_per_meta {self.kv_per_meta[i]}")
+            for j in range(meta_kv_num):
+                key = meta_json["key"][j]
+                value_length = meta_json["value_length"][j]
+                tensor_meta = meta_json["tensor_meta"][j]
+                self.loaded_kv[key] = (value_length, tensor_meta)
+        end_time = time.perf_counter()
+        self.perf_statistics["read_meta_latency_s"] = end_time - start_time
+
+    def _read_root(
+        self,
+        client: EICConnector,
+        root_name: str,
+    ) -> None:
+        start_time = time.perf_counter()
+        tensors = client.mget([root_name])
+        if len(tensors) == 0:
+            raise ValueError(f"Root {root_name} not found!")
+        root_bytes = tensors[0].numpy().tobytes()
+        root_json = json.loads(root_bytes.decode())
+        logger.info(
+            f"read root {root_name}, content: {root_json}"
+        )
+        self.kv_num = root_json["kv_num"]
+        self.meta_num = root_json["meta_num"]
+        self.data_split_size = root_json["data_split_size"]
+        self.meta_prefix = root_json["meta_prefix_name"]
+        self.kv_per_meta = root_json["kv_num_per_meta"]
+        end_time = time.perf_counter()
+        self.perf_statistics["read_root_latency_s"] = end_time - start_time
+        if RemoteModelLoader.ENABLE_ZERO_COPY:
+            if not RemoteModelLoader.ENABLE_THREADING:
+                self.thread_num = 1
+            for i in range(self.thread_num):
+                zero_copy_ptr = client.allocate_zero_copy_buffer(
+                    self.data_split_size)
+                ubyte_ptr = ctypes.cast(
+                    zero_copy_ptr, ctypes.POINTER(ctypes.c_ubyte))
+                byte_array = (
+                    ctypes.c_ubyte * self.data_split_size).from_address(ctypes.addressof(ubyte_ptr.contents))
+                data_bytes = memoryview(byte_array)
+                split_tensor = torch.frombuffer(data_bytes, dtype=torch.int8)
+                self.zero_copy_ptrs.append(zero_copy_ptr)
+                self.split_tensors.append(split_tensor)
+        else:
+            if not RemoteModelLoader.ENABLE_THREADING:
+                self.thread_num = 1
+            for i in range(self.thread_num):
+                split_tensor = torch.empty(
+                    self.data_split_size, dtype=torch.int8)
+                self.split_tensors.append(split_tensor)
 
 def load_model_with_cpu_quantization(
     self,
