@@ -284,12 +284,24 @@ class DataParallelController:
             return
 
         if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+            if req.data_parallel_rank is not None:
+                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                self.workers[req.data_parallel_rank].send_pyobj(req)
+            else:
+                self.workers[self.round_robin_counter].send_pyobj(req)
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
         else:
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            if req.data_parallel_rank is not None:
+                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                self.workers[req.data_parallel_rank].send_pyobj(req)
+            else:
+                counter = req.bootstrap_room % len(self.workers)
+                self.workers[counter].send_pyobj(req)
+                logger.debug(
+                    f"req id: {req.rid}, bootstrap room: {req.bootstrap_room}, Round robin scheduler: {counter}"
+                )
 
     def shortest_queue_scheduler(self, input_requests):
         if self.maybe_external_dp_rank_routing(req):
