@@ -1028,14 +1028,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return ret
 
-        is_decode = x.shape[0] <= MAX_TRITON_SHAPE
+        is_prefill = x.shape[0] >= MAX_TRITON_SHAPE
         
         if (
             get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
             and (is_sm100_supported() or is_sm90_supported())
-            and is_decode
+            and is_prefill
         ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
