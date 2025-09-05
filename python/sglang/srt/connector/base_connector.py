@@ -32,6 +32,11 @@ class BaseConnector(ABC):
     def get_local_dir(self):
         return self.local_dir
 
+    def set_local_dir(self, local_dir: str):
+        if not os.path.exists(local_dir):
+            os.makedirs(local_dir)
+        self.local_dir = local_dir
+
     @abstractmethod
     def weight_iterator(
         self, rank: int = 0
