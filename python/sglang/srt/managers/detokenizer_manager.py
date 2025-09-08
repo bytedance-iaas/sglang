@@ -31,10 +31,13 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    MultiTokenizerRegisterReq,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    get_worker_ids_from_req_rids,
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
@@ -65,7 +68,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager:
+class DetokenizerManager(MultiTokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -100,6 +103,7 @@ class DetokenizerManager:
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
+                (MultiTokenizerRegisterReq, lambda x: x),
             ]
         )
 
@@ -110,6 +114,39 @@ class DetokenizerManager:
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
 
+    def multi_tokenizer_manager_event_loop(self):
+        """The event loop that handles requests, for multi tokenizer manager mode only"""
+        self.create_sockets_mapping()
+        while True:
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            output = self._request_dispatcher(recv_obj)
+            if output is None:
+                continue
+            # Extract worker_id from rid
+            if isinstance(recv_obj.rids, list):
+                worker_ids = get_worker_ids_from_req_rids(recv_obj.rids)
+            else:
+                raise RuntimeError(
+                    f"for tokenizer_worker_num > 1, recv_obj.rids must be a list"
+                )
+
+            # Send data using the corresponding socket
+            for i, worker_id in enumerate(worker_ids):
+                if isinstance(recv_obj, MultiTokenizerRegisterReq):
+                    if self.register_tokenizer_ipc(recv_obj, worker_id):
+                        logger.info(
+                            f"DetokenizerManager Created ZMQ socket for worker {worker_id}"
+                        )
+                    continue
+                else:
+                    if worker_id not in self.tokenizer_mapping:
+                        logger.error(
+                            f"Tokenizer Worker ID {worker_id} not registered. Check if the server Process {worker_id} is alive"
+                        )
+                        continue
+                    new_output = self._handle_output_by_index(output, i)
+                    self.tokenizer_mapping[worker_id].send_pyobj(new_output)
+    
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
@@ -272,8 +309,12 @@ def run_detokenizer_process(
 
     try:
         manager = DetokenizerManager(server_args, port_args)
-        manager.event_loop()
+        if server_args.tokenizer_worker_num > 1:
+            manager.multi_tokenizer_manager_event_loop()
+        else:
+            manager.event_loop()
     except Exception:
+        manager.clear_tokenizer_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
