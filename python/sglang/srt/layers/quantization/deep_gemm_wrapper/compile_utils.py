@@ -51,7 +51,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         # m_max = 1024 * 64
         m_max = 16
     elif server_args.chunked_prefill_size > 8192:
-        m_max = server_args.chunked_prefill_size * 2
+        m_max = 16
     m_max = min(1024 * 128, m_max)
     _BUILTIN_M_LIST = list(range(1, m_max + 1))
 
