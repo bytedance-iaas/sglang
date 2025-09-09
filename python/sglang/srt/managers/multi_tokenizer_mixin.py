@@ -479,6 +479,40 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         _Communicator.enable_multi_tokenizer = True
         await self.register_multi_tokenizer_communicator(req)
 
+class SocketMapping:
+    def __init__(self):
+        self._zmq_context = zmq.Context()
+        self._mapping: Dict[str, zmq.Socket] = {}
+
+    def clear_all_sockets(self):
+        for socket in self._mapping.values():
+            socket.close()
+        self._mapping.clear()
+
+    def register_ipc_mapping(
+        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, is_tokenizer: bool
+    ):
+        type_str = "tokenizer" if is_tokenizer else "detokenizer"
+        if worker_id in self._mapping:
+            logger.warning(
+                f"{type_str} already registered with worker {worker_id}, skipping..."
+            )
+            return
+        logger.info(
+            f"{type_str} not registered with worker {worker_id}, registering..."
+        )
+        socket = get_zmq_socket(self._zmq_context, zmq.PUSH, recv_obj.ipc_name, False)
+        self._mapping[worker_id] = socket
+        self._mapping[worker_id].send_pyobj(recv_obj)
+
+    def send_output(self, worker_id: str, output: Any):
+        if worker_id not in self._mapping:
+            logger.error(
+                f"worker ID {worker_id} not registered. Check if the server Process is alive"
+            )
+            return
+        self._mapping[worker_id].send_pyobj(output)
+
 class MultiDetokenizerRouter:
     """A router to receive requests from Scheduler and route to DetokenizerManager"""
 
