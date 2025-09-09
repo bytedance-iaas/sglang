@@ -644,6 +644,7 @@ class Scheduler(
                     if server_args.enable_dp_attention
                     else self.tp_cpu_group
                 )
+                metric_collector = self.metrics_collector if self.enable_metrics else None
                 if self.enable_eic_cache:
                     self.tree_cache = EICHiRadixCacheBuilder.build(
                         req_to_token_pool=self.req_to_token_pool,
@@ -654,7 +655,7 @@ class Scheduler(
                         hicache_size=server_args.hicache_size,
                         hicache_write_policy=server_args.hicache_write_policy,
                         server_args=server_args,
-                        scheduler_metric_collector=self.metrics_collector,
+                        scheduler_metric_collector=metric_collector,
                     )
                 else:
                     self.tree_cache = HiRadixCache(
@@ -669,7 +670,7 @@ class Scheduler(
                         hicache_mem_layout=server_args.hicache_mem_layout,
                         hicache_storage_backend=server_args.hicache_storage_backend,
                         hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
-                        scheduler_metric_collector=self.metrics_collector,
+                        scheduler_metric_collector=metric_collector,
                     )
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
