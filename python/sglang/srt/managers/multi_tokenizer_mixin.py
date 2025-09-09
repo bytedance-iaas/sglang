@@ -538,7 +538,7 @@ class MultiDetokenizerRouter:
                         self.socket_mapping.send_output(ipc_name, recv_obj)
                     else:
                         self.socket_mapping.register_ipc_mapping(
-                            recv_obj, ipc_name, type_id=2
+                            recv_obj, ipc_name, is_tokenizer=False
                         )
                     self.worker_id_to_ipc_mapping[worker_id] = ipc_name
                     self.ipc_name_index = (
