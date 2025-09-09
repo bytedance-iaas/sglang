@@ -527,6 +527,266 @@ class MultiDetokenizerRouter:
         self.ipc_name_index = 0
         self.detokenizer_worker_num = len(ipc_name_list)
 
+    def _handle_output_by_index(self, output, i):
+        """NOTE: A maintainable method is better here."""
+        if isinstance(output, BatchTokenIDOut):
+            new_output = BatchTokenIDOut(
+                rids=[output.rids[i]],
+                finished_reasons=(
+                    [output.finished_reasons[i]]
+                    if len(output.finished_reasons) > i
+                    else None
+                ),
+                decoded_texts=(
+                    [output.decoded_texts[i]] if len(output.decoded_texts) > i else None
+                ),
+                decode_ids=(
+                    [output.decode_ids[i]] if len(output.decode_ids) > i else None
+                ),
+                read_offsets=(
+                    [output.read_offsets[i]] if len(output.read_offsets) > i else None
+                ),
+                output_ids=(
+                    [output.output_ids[i]]
+                    if output.output_ids and len(output.output_ids) > i
+                    else None
+                ),
+                skip_special_tokens=(
+                    [output.skip_special_tokens[i]]
+                    if len(output.skip_special_tokens) > i
+                    else None
+                ),
+                spaces_between_special_tokens=(
+                    [output.spaces_between_special_tokens[i]]
+                    if len(output.spaces_between_special_tokens) > i
+                    else None
+                ),
+                no_stop_trim=(
+                    [output.no_stop_trim[i]] if len(output.no_stop_trim) > i else None
+                ),
+                prompt_tokens=(
+                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+                ),
+                completion_tokens=(
+                    [output.completion_tokens[i]]
+                    if len(output.completion_tokens) > i
+                    else None
+                ),
+                cached_tokens=(
+                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+                ),
+                spec_verify_ct=(
+                    [output.spec_verify_ct[i]]
+                    if len(output.spec_verify_ct) > i
+                    else None
+                ),
+                input_token_logprobs_val=(
+                    [output.input_token_logprobs_val[i]]
+                    if output.input_token_logprobs_val
+                    else None
+                ),
+                input_token_logprobs_idx=(
+                    [output.input_token_logprobs_idx[i]]
+                    if output.input_token_logprobs_idx
+                    else None
+                ),
+                output_token_logprobs_val=(
+                    [output.output_token_logprobs_val[i]]
+                    if output.output_token_logprobs_val
+                    else None
+                ),
+                output_token_logprobs_idx=(
+                    [output.output_token_logprobs_idx[i]]
+                    if output.output_token_logprobs_idx
+                    else None
+                ),
+                input_top_logprobs_val=(
+                    [output.input_top_logprobs_val[i]]
+                    if output.input_top_logprobs_val
+                    else None
+                ),
+                input_top_logprobs_idx=(
+                    [output.input_top_logprobs_idx[i]]
+                    if output.input_top_logprobs_idx
+                    else None
+                ),
+                output_top_logprobs_val=(
+                    [output.output_top_logprobs_val[i]]
+                    if output.output_top_logprobs_val
+                    else None
+                ),
+                output_top_logprobs_idx=(
+                    [output.output_top_logprobs_idx[i]]
+                    if output.output_top_logprobs_idx
+                    else None
+                ),
+                input_token_ids_logprobs_val=(
+                    [output.input_token_ids_logprobs_val[i]]
+                    if output.input_token_ids_logprobs_val
+                    else None
+                ),
+                input_token_ids_logprobs_idx=(
+                    [output.input_token_ids_logprobs_idx[i]]
+                    if output.input_token_ids_logprobs_idx
+                    else None
+                ),
+                output_token_ids_logprobs_val=(
+                    [output.output_token_ids_logprobs_val[i]]
+                    if output.output_token_ids_logprobs_val
+                    else None
+                ),
+                output_token_ids_logprobs_idx=(
+                    [output.output_token_ids_logprobs_idx[i]]
+                    if output.output_token_ids_logprobs_idx
+                    else None
+                ),
+                output_hidden_states=(
+                    [output.output_hidden_states[i]]
+                    if output.output_hidden_states
+                    else None
+                ),
+            )
+        elif isinstance(output, BatchEmbeddingOut):
+            new_output = BatchEmbeddingOut(
+                rids=[output.rids[i]],
+                finished_reasons=(
+                    [output.finished_reasons[i]]
+                    if len(output.finished_reasons) > i
+                    else None
+                ),
+                embeddings=(
+                    [output.embeddings[i]] if len(output.embeddings) > i else None
+                ),
+                prompt_tokens=(
+                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+                ),
+                cached_tokens=(
+                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+                ),
+            )
+        elif isinstance(output, BatchStrOut):
+            new_output = BatchStrOut(
+                rids=[output.rids[i]],
+                finished_reasons=(
+                    [output.finished_reasons[i]]
+                    if len(output.finished_reasons) > i
+                    else None
+                ),
+                output_strs=(
+                    [output.output_strs[i]] if len(output.output_strs) > i else None
+                ),
+                output_ids=(
+                    [output.output_ids[i]]
+                    if output.output_ids and len(output.output_ids) > i
+                    else None
+                ),
+                prompt_tokens=(
+                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+                ),
+                completion_tokens=(
+                    [output.completion_tokens[i]]
+                    if len(output.completion_tokens) > i
+                    else None
+                ),
+                cached_tokens=(
+                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+                ),
+                spec_verify_ct=(
+                    [output.spec_verify_ct[i]]
+                    if len(output.spec_verify_ct) > i
+                    else None
+                ),
+                input_token_logprobs_val=(
+                    [output.input_token_logprobs_val[i]]
+                    if output.input_token_logprobs_val
+                    else None
+                ),
+                input_token_logprobs_idx=(
+                    [output.input_token_logprobs_idx[i]]
+                    if output.input_token_logprobs_idx
+                    else None
+                ),
+                output_token_logprobs_val=(
+                    [output.output_token_logprobs_val[i]]
+                    if output.output_token_logprobs_val
+                    else None
+                ),
+                output_token_logprobs_idx=(
+                    [output.output_token_logprobs_idx[i]]
+                    if output.output_token_logprobs_idx
+                    else None
+                ),
+                input_top_logprobs_val=(
+                    [output.input_top_logprobs_val[i]]
+                    if output.input_top_logprobs_val
+                    else None
+                ),
+                input_top_logprobs_idx=(
+                    [output.input_top_logprobs_idx[i]]
+                    if output.input_top_logprobs_idx
+                    else None
+                ),
+                output_top_logprobs_val=(
+                    [output.output_top_logprobs_val[i]]
+                    if output.output_top_logprobs_val
+                    else None
+                ),
+                output_top_logprobs_idx=(
+                    [output.output_top_logprobs_idx[i]]
+                    if output.output_top_logprobs_idx
+                    else None
+                ),
+                input_token_ids_logprobs_val=(
+                    [output.input_token_ids_logprobs_val[i]]
+                    if output.input_token_ids_logprobs_val
+                    else None
+                ),
+                input_token_ids_logprobs_idx=(
+                    [output.input_token_ids_logprobs_idx[i]]
+                    if output.input_token_ids_logprobs_idx
+                    else None
+                ),
+                output_token_ids_logprobs_val=(
+                    [output.output_token_ids_logprobs_val[i]]
+                    if output.output_token_ids_logprobs_val
+                    else None
+                ),
+                output_token_ids_logprobs_idx=(
+                    [output.output_token_ids_logprobs_idx[i]]
+                    if output.output_token_ids_logprobs_idx
+                    else None
+                ),
+                output_hidden_states=(
+                    [output.output_hidden_states[i]]
+                    if output.output_hidden_states
+                    else None
+                ),
+            )
+        elif isinstance(output, BatchMultimodalOut):
+            new_output = BatchMultimodalOut(
+                rids=[output.rids[i]],
+                finished_reasons=(
+                    [output.finished_reasons[i]]
+                    if len(output.finished_reasons) > i
+                    else None
+                ),
+                outputs=([output.outputs[i]] if len(output.outputs) > i else None),
+                prompt_tokens=(
+                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+                ),
+                completion_tokens=(
+                    [output.completion_tokens[i]]
+                    if len(output.completion_tokens) > i
+                    else None
+                ),
+                cached_tokens=(
+                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+                ),
+            )
+        else:
+            new_output = output
+        return new_output
+
     def event_loop(self):
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
