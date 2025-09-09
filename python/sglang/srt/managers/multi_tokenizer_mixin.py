@@ -24,6 +24,7 @@ import threading
 from multiprocessing import shared_memory
 from typing import Any, Dict, List
 
+import setproctitle
 import psutil
 import zmq
 import zmq.asyncio
