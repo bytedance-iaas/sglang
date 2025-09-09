@@ -310,36 +310,22 @@ class DataParallelController:
                 
                 # Check if current node is a prefill node and set prefill_dp_balance_id
                 if self.server_args.disaggregation_mode == "prefill":
-                    req.prefill_dp_balance_id = balance_id
-                    
-                    # Send the mapping relationship to decode node
-                    mapping_data = {
-                        "bootstrap_room": req.bootstrap_room,
-                        "prefill_dp_balance_id": req.prefill_dp_balance_id
-                    }
-                    self.prefill_to_decode_socket.send_pyobj(mapping_data)
-                    logger.info(f"Prefill node sent mapping: bootstrap_room={req.bootstrap_room}, prefill_dp_balance_id={req.prefill_dp_balance_id}")
+                    self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
                 
                 target_worker = balance_id % len(self.workers)
                 
                 # If decode node, check if we have the mapping for this request
                 if self.server_args.disaggregation_mode == "decode":
+                    target_worker = self.round_robin_counter
+                    logger.info(f"Round-robin scheduler: Routing request {req.rid} to worker {target_worker} (round-robin)")
+                    self.workers[target_worker].send_pyobj(req)
+                    self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                        self.workers
+                    )
                     # Try to receive mapping data from prefill node before processing the request
-                    self._receive_mapping_data()
-                    
-                    # Only dispatch the request if we have the mapping for this bootstrap_room
-                    if req.bootstrap_room in self.bootstrap_room_mapping:
-                        req.prefill_dp_balance_id = self.bootstrap_room_mapping[req.bootstrap_room]
-                        logger.info(f"Round-robin scheduler: Routing request {req.rid} to worker {target_worker} based on bootstrap_room {req.bootstrap_room} prefill_dp_balance_id {req.prefill_dp_balance_id} (disaggregation mode)")
-                        self.workers[target_worker].send_pyobj(req)
-                    else:
-                        logger.warning(f"Decode node waiting for mapping for bootstrap_room={req.bootstrap_room}, request {req.rid} added to waiting list")
-                        # Add the request to the waiting list
-                        self.waiting_requests.append((req, target_worker, req.bootstrap_room))
                 else:
                     # Prefill node directly dispatches the request
-                    logger.info(f"Round-robin scheduler: Routing request {req.rid} to worker {target_worker} based on bootstrap_room {req.bootstrap_room} prefill_dp_balance_id {req.prefill_dp_balance_id} (disaggregation mode)")
-                    self.workers[target_worker].send_pyobj(req)
+                    self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def _receive_mapping_data(self):
         """Receive mapping data from prefill node and update the mapping dictionary."""
