@@ -433,6 +433,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        prefill_dp_balance_id: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -466,7 +467,7 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.lora_id = lora_id
-
+        self.prefill_dp_balance_id = prefill_dp_balance_id
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
 

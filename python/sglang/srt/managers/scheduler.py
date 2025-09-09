@@ -1090,6 +1090,10 @@ class Scheduler(
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
+            # Check if the request has prefill_dp_balance_id attribute before accessing it
+            prefill_dp_id = getattr(recv_req, 'prefill_dp_balance_id', 'N/A')
+            logger.info(f"Received request of type: {type(recv_req)} rid={recv_req.rid} prefill_dp_id={prefill_dp_id}") 
+
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
@@ -1136,6 +1140,7 @@ class Scheduler(
         recv_req: TokenizedGenerateReqInput,
     ):
         self.maybe_update_dp_balance_data(recv_req)
+        logger.info(f"recv_req.prefill_dp_balance_id: {recv_req.prefill_dp_balance_id}")
 
         # Create a new request
         if (
@@ -1172,6 +1177,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                prefill_dp_balance_id=recv_req.prefill_dp_balance_id,
             )
             req.tokenizer = self.tokenizer
 

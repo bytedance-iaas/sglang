@@ -88,6 +88,22 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            
+            # Create ZMQ sockets for prefill-decode communication
+            if server_args.disaggregation_mode == "prefill":
+                # Prefill node sends balance ID mapping
+                self.prefill_to_decode_socket = get_zmq_socket(
+                    self.context, zmq.PUSH, port_args.prefill_decode_ipc_name, True
+                )
+            elif server_args.disaggregation_mode == "decode":
+                # Decode node receives balance ID mapping
+                self.decode_from_prefill_socket = get_zmq_socket(
+                    self.context, zmq.PULL, port_args.prefill_decode_ipc_name, False
+                )
+                # Dictionary to store the mapping between bootstrap_room and prefill_dp_balance_id
+                self.bootstrap_room_mapping = {}
+                # List to store requests waiting for mapping information
+                self.waiting_requests = []
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -269,19 +285,93 @@ class DataParallelController:
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
             if req.data_parallel_rank is not None:
-                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                logger.info(f"Round-robin scheduler: Direct routing request {req.rid} to DP rank {req.data_parallel_rank}")
                 self.workers[req.data_parallel_rank].send_pyobj(req)
             else:
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                target_worker = self.round_robin_counter
+                logger.info(f"Round-robin scheduler: Routing request {req.rid} to worker {target_worker} (round-robin)")
+                self.workers[target_worker].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
         else:
+            def get_next_global_balance_id() -> int:
+                INT32_MAX = 2147483647
+                current_id = self.global_balance_id
+                self.global_balance_id = (self.global_balance_id + 1) % INT32_MAX
+                return current_id
+
             if req.data_parallel_rank is not None:
-                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                logger.info(f"Round-robin scheduler: Direct routing request {req.rid} to DP rank {req.data_parallel_rank} (disaggregation mode)")
                 self.workers[req.data_parallel_rank].send_pyobj(req)
             else:
-                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+                balance_id = get_next_global_balance_id()
+                req.dp_balance_id = balance_id
+                
+                # Check if current node is a prefill node and set prefill_dp_balance_id
+                if self.server_args.disaggregation_mode == "prefill":
+                    req.prefill_dp_balance_id = balance_id
+                    
+                    # Send the mapping relationship to decode node
+                    mapping_data = {
+                        "bootstrap_room": req.bootstrap_room,
+                        "prefill_dp_balance_id": req.prefill_dp_balance_id
+                    }
+                    self.prefill_to_decode_socket.send_pyobj(mapping_data)
+                    logger.info(f"Prefill node sent mapping: bootstrap_room={req.bootstrap_room}, prefill_dp_balance_id={req.prefill_dp_balance_id}")
+                
+                target_worker = balance_id % len(self.workers)
+                
+                # If decode node, check if we have the mapping for this request
+                if self.server_args.disaggregation_mode == "decode":
+                    # Try to receive mapping data from prefill node before processing the request
+                    self._receive_mapping_data()
+                    
+                    # Only dispatch the request if we have the mapping for this bootstrap_room
+                    if req.bootstrap_room in self.bootstrap_room_mapping:
+                        req.prefill_dp_balance_id = self.bootstrap_room_mapping[req.bootstrap_room]
+                        logger.info(f"Round-robin scheduler: Routing request {req.rid} to worker {target_worker} based on bootstrap_room {req.bootstrap_room} prefill_dp_balance_id {req.prefill_dp_balance_id} (disaggregation mode)")
+                        self.workers[target_worker].send_pyobj(req)
+                    else:
+                        logger.warning(f"Decode node waiting for mapping for bootstrap_room={req.bootstrap_room}, request {req.rid} added to waiting list")
+                        # Add the request to the waiting list
+                        self.waiting_requests.append((req, target_worker, req.bootstrap_room))
+                else:
+                    # Prefill node directly dispatches the request
+                    logger.info(f"Round-robin scheduler: Routing request {req.rid} to worker {target_worker} based on bootstrap_room {req.bootstrap_room} prefill_dp_balance_id {req.prefill_dp_balance_id} (disaggregation mode)")
+                    self.workers[target_worker].send_pyobj(req)
+
+    def _receive_mapping_data(self):
+        """Receive mapping data from prefill node and update the mapping dictionary."""
+        if self.server_args.disaggregation_mode == "decode":
+            while True:
+                try:
+                    mapping_data = self.decode_from_prefill_socket.recv_pyobj(zmq.NOBLOCK)
+                    self.bootstrap_room_mapping[mapping_data["bootstrap_room"]] = mapping_data["prefill_dp_balance_id"]
+                    logger.info(f"Decode node received mapping: bootstrap_room={mapping_data['bootstrap_room']}, prefill_dp_balance_id={mapping_data['prefill_dp_balance_id']}")
+                    
+                    # Check if this mapping matches any request in the waiting list
+                    self._process_waiting_requests()
+                except zmq.ZMQError:
+                    break
+
+    def _process_waiting_requests(self):
+        """Process requests in the waiting list that now have mapping information."""
+        # Create a new list for requests that still don't have mapping information
+        still_waiting = []
+        
+        for req, target_worker, bootstrap_room in self.waiting_requests:
+            if bootstrap_room in self.bootstrap_room_mapping:
+                # We now have the mapping for this request, dispatch it
+                req.prefill_dp_balance_id = self.bootstrap_room_mapping[bootstrap_room]
+                logger.info(f"Processing waiting request {req.rid} to worker {target_worker} with prefill_dp_balance_id {req.prefill_dp_balance_id}")
+                self.workers[target_worker].send_pyobj(req)
+            else:
+                # Still waiting for mapping information
+                still_waiting.append((req, target_worker, bootstrap_room))
+        
+        # Update the waiting list
+        self.waiting_requests = still_waiting
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
@@ -296,6 +386,19 @@ class DataParallelController:
             return current_id
 
         req.dp_balance_id = get_next_global_balance_id()
+        
+        # Check if current node is a prefill node and set prefill_dp_balance_id
+        if self.server_args.disaggregation_mode == "prefill":
+            req.prefill_dp_balance_id = req.dp_balance_id
+            
+            # Send the mapping relationship to decode node
+            mapping_data = {
+                "bootstrap_room": req.bootstrap_room,
+                "prefill_dp_balance_id": req.prefill_dp_balance_id
+            }
+            self.prefill_to_decode_socket.send_pyobj(mapping_data)
+            logger.info(f"Prefill node sent mapping in minimum_tokens_scheduler: bootstrap_room={req.bootstrap_room}, prefill_dp_balance_id={req.prefill_dp_balance_id}")
+        
         with self.balance_meta.mutex:
             # 1. local_tokens represents the tokens currently inferring on the worker,
             #  while onfly refers to the requests dispatched by the dispatcher but not yet received by the scheduler.
@@ -311,10 +414,34 @@ class DataParallelController:
             self.balance_meta.set_shared_onfly_info(onfly_info)
 
         # logger.info(f"dp workers {local_tokens=}, {onfly_info=}, {target_worker=}")
-        self.workers[target_worker].send_pyobj(req)
+        
+        # If decode node, check if we have the mapping for this request
+        if self.server_args.disaggregation_mode == "decode":
+            # Try to receive mapping data from prefill node before processing the request
+            self._receive_mapping_data()
+            
+            # Only dispatch the request if we have the mapping for this bootstrap_room
+            if req.bootstrap_room in self.bootstrap_room_mapping:
+                req.prefill_dp_balance_id = self.bootstrap_room_mapping[req.bootstrap_room]
+                logger.info(f"Minimum tokens scheduler: Routing request {req.rid} to worker {target_worker} "
+                           f"(balance_id={req.dp_balance_id}, input_tokens={len(req.input_ids)}, "
+                           f"local_tokens={local_tokens[target_worker]}, onfly_tokens={sum(onfly_info[target_worker].values())}, "
+                           f"bootstrap_room={req.bootstrap_room}, prefill_dp_balance_id={req.prefill_dp_balance_id})")
+                self.workers[target_worker].send_pyobj(req)
+            else:
+                logger.warning(f"Decode node waiting for mapping for bootstrap_room={req.bootstrap_room}, request {req.rid} added to waiting list in minimum_tokens_scheduler")
+                # Add the request to the waiting list
+                self.waiting_requests.append((req, target_worker, req.bootstrap_room))
+        else:
+            # Prefill node directly dispatches the request
+            logger.info(f"Minimum tokens scheduler: Routing request {req.rid} to worker {target_worker} "
+                       f"(balance_id={req.dp_balance_id}, input_tokens={len(req.input_ids)}, "
+                       f"local_tokens={local_tokens[target_worker]}, onfly_tokens={sum(onfly_info[target_worker].values())})")
+            self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
         while True:
+            # Process regular requests
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)

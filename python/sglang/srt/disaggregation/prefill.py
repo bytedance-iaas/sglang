@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -155,6 +156,9 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        # 记录请求到达时间，用于后续跟踪引导时间
+        req.arrival_time = time.time()
+        
         if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
             kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
         else:
@@ -169,8 +173,21 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
+        
+        # 添加日志记录请求添加到引导队列的信息
+        logger.info(f"Adding request {req.rid} to bootstrap queue. "
+                    f"Bootstrap room: {req.bootstrap_room}, "
+                    f"Bootstrap host: {req.bootstrap_host}, "
+                    f"Bootstrap port: {req.bootstrap_port}, "
+                    f"Input length: {len(req.origin_input_ids)}, "
+                    f"Queue length before add: {len(self.queue)}")
+        
         self._process_req(req)
         self.queue.append(req)
+        
+        # 添加日志记录队列状态
+        logger.info(f"Request {req.rid} added to bootstrap queue. "
+                    f"Current queue length: {len(self.queue)}")
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -226,6 +243,14 @@ class PrefillBootstrapQueue:
                 assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
+                # 检查请求在引导队列中停留的时间
+                if hasattr(req, 'arrival_time'):
+                    bootstrap_time = time.time() - req.arrival_time
+                    if bootstrap_time > 200:  # 如果引导时间超过30秒，记录警告
+                        logger.warning(f"Request {req.rid} has been bootstrapping for {bootstrap_time:.1f}s. "
+                                     f"Bootstrap room: {req.bootstrap_room}, "
+                                     f"Bootstrap host: {req.bootstrap_host}, "
+                                     f"Bootstrap port: {req.bootstrap_port}")
                 continue
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
@@ -233,7 +258,15 @@ class PrefillBootstrapQueue:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.error(error_message)
+                logger.error(f"{error_message}. Queue length: {len(self.queue)}, TP rank: {self.tp_rank}, TP size: {self.tp_size}")
+                # 添加更多调试信息
+                logger.error(f"Debug info for failed request: input_length={len(req.origin_input_ids)}, "
+                            f"bootstrap_host={req.bootstrap_host}, bootstrap_port={req.bootstrap_port}, "
+                            f"metadata_buffer_index={getattr(req, 'metadata_buffer_index', 'N/A')}")
+                # 记录引导失败的时间
+                if hasattr(req, 'arrival_time'):
+                    bootstrap_time = time.time() - req.arrival_time
+                    logger.error(f"Request {req.rid} failed after {bootstrap_time:.1f}s in bootstrap queue")
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -247,6 +280,7 @@ class PrefillBootstrapQueue:
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                logger.warning(f"No available metadata buffer index allocator slots. Breaking early.")
                 break
 
             req.metadata_buffer_index = (
@@ -255,6 +289,14 @@ class PrefillBootstrapQueue:
             assert req.metadata_buffer_index is not None
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            
+            # 记录引导成功的信息
+            if hasattr(req, 'arrival_time'):
+                bootstrap_time = time.time() - req.arrival_time
+                logger.info(f"Request {req.rid} bootstrapped successfully after {bootstrap_time:.1f}s. "
+                           f"Bootstrap room: {req.bootstrap_room}, "
+                           f"Allocating {num_pages} pages for {num_kv_indices} tokens")
+            
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)

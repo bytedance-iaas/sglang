@@ -231,31 +231,50 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
+        logger.info(f"DecodePreallocQueue: Adding request {req.rid} to decode prealloc queue, "
+                   f"is_retracted={is_retracted}, bootstrap_room={req.bootstrap_room}, "
+                   f"bootstrap_host={req.bootstrap_host}, bootstrap_port={req.bootstrap_port}, "
+                   f"data_parallel_rank={req.data_parallel_rank}, "
+                   f"input_ids_length={len(req.origin_input_ids)}, "
+                   f"output_ids_length={len(req.output_ids)}")
+        
         if self._check_if_req_exceed_kv_capacity(req):
+            logger.warning(f"DecodePreallocQueue: Request {req.rid} exceeds KV capacity, not adding to queue")
             return
 
         if is_retracted:
             self.retracted_queue.append(req)
+            if len(self.retracted_queue) > 0:
+                logger.info(f"DecodePreallocQueue: Request {req.rid} added to retracted queue, "
+                           f"retracted_queue_size={len(self.retracted_queue)}")
         else:
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
                 )
+                logger.info(f"DecodePreallocQueue: Using FAKE transfer backend for request {req.rid}")
             else:
                 kv_receiver_class = get_kv_class(
                     self.transfer_backend, KVClassType.RECEIVER
                 )
+                logger.info(f"DecodePreallocQueue: Using {self.transfer_backend} transfer backend for request {req.rid}")
 
             kv_receiver = kv_receiver_class(
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 data_parallel_rank=req.data_parallel_rank,
+                prefill_dp_balance_id=req.prefill_dp_balance_id,
             )
+            logger.info(f"DecodePreallocQueue: Created KV receiver for request {req.rid}, "
+                       f"bootstrap_addr={req.bootstrap_host}:{req.bootstrap_port},prefill_dp_balance_id={req.prefill_dp_balance_id}")
 
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
+            if len(self.queue) > 0:
+                logger.info(f"DecodePreallocQueue: Request {req.rid} added to prealloc queue, "
+                           f"queue_size={len(self.queue)}")
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -268,8 +287,16 @@ class DecodePreallocQueue:
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
-        for req in reqs:
+        logger.info(f"DecodePreallocQueue: Extending {len(reqs)} requests to decode prealloc queue, "
+                   f"is_retracted={is_retracted}")
+        
+        for i, req in enumerate(reqs):
+            logger.info(f"DecodePreallocQueue: Processing request {i+1}/{len(reqs)}: {req.rid}")
             self.add(req, is_retracted=is_retracted)
+        
+        if len(self.queue) > 0 or len(self.retracted_queue) > 0:
+            logger.info(f"DecodePreallocQueue: Finished extending {len(reqs)} requests to decode prealloc queue, "
+                       f"queue_size={len(self.queue)}, retracted_queue_size={len(self.retracted_queue)}")
 
     def resume_retracted_reqs(self) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
@@ -343,6 +370,10 @@ class DecodePreallocQueue:
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        if len(self.queue) > 0:
+            logger.info(f"pop_preallocated: Starting to pop preallocated requests, "
+                       f"queue_size={len(self.queue)}")
+        
         self._update_handshake_waiters()
 
         preallocated_reqs = []
@@ -357,13 +388,23 @@ class DecodePreallocQueue:
         allocatable_tokens = self._allocatable_tokens(
             retractable_tokens=retractable_tokens, count_retracted=True
         )
+        if len(self.queue) > 0:
+            logger.info(f"pop_preallocated: allocatable_tokens={allocatable_tokens}, "
+                       f"retractable_tokens={retractable_tokens}")
+        
         # First, remove all failed requests from the queue
+        failed_count = 0
         for i, decode_req in enumerate(self.queue):
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                logger.warning(f"pop_preallocated: Removing failed request {decode_req.req.rid}")
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 indices_to_remove.add(i)
+                failed_count += 1
+        
+        if failed_count > 0:
+            logger.info(f"pop_preallocated: Removed {failed_count} failed requests")
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -371,12 +412,15 @@ class DecodePreallocQueue:
                 continue
 
             if not decode_req.waiting_for_input:
+                logger.info(f"pop_preallocated: Request {decode_req.req.rid} is not waiting for input, skipping")
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                logger.info(f"pop_preallocated: req_to_token_pool is full, stopping allocation")
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                logger.info(f"pop_preallocated: req_to_metadata_buffer_idx_allocator is full, stopping allocation")
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -398,11 +442,18 @@ class DecodePreallocQueue:
                 )
                 > allocatable_tokens
             ):
+                logger.info(f"pop_preallocated: Request {decode_req.req.rid} requires more tokens than available, "
+                           f"required={max(required_tokens_for_request, origin_input_len + min(decode_req.req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN) - retractable_tokens)}, "
+                           f"allocatable={allocatable_tokens}")
                 break
             if required_tokens_for_request > allocatable_tokens:
+                logger.info(f"pop_preallocated: Request {decode_req.req.rid} requires more tokens than available, "
+                           f"required={required_tokens_for_request}, allocatable={allocatable_tokens}")
                 break
 
             allocatable_tokens -= required_tokens_for_request
+            logger.info(f"pop_preallocated: Pre-allocating memory for request {decode_req.req.rid}, "
+                       f"allocatable_tokens remaining={allocatable_tokens}")
             self._pre_alloc(decode_req.req)
 
             kv_indices = (
@@ -420,14 +471,21 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
+            logger.info(f"pop_preallocated: Initializing KV receiver for request {decode_req.req.rid}, "
+                       f"metadata_buffer_index={decode_req.metadata_buffer_index}")
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            logger.info(f"pop_preallocated: Successfully preallocated request {decode_req.req.rid}")
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
-
+        
+        if len(preallocated_reqs) > 0 or len(self.queue) > 0:
+            logger.info(f"pop_preallocated: Finished popping preallocated requests, "
+                       f"popped_count={len(preallocated_reqs)}, remaining_queue_size={len(self.queue)}")
+        
         return preallocated_reqs
 
     @property
@@ -573,13 +631,24 @@ class DecodeTransferQueue:
 
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
+            logger.debug("pop_transferred: Transfer queue is empty, returning empty list")
             return []
+            
+        if len(self.queue) > 0:
+            logger.debug(f"pop_transferred: Starting to pop transferred requests, "
+                       f"queue_size={len(self.queue)}")
+        
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
         transferred_reqs = []
         indices_to_remove = set()
+        failed_count = 0
+        transferring_count = 0
+        bootstrapping_count = 0
+        waiting_for_input_count = 0
+        
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -599,10 +668,12 @@ class DecodeTransferQueue:
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
+                failed_count += 1
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                logger.info(f"pop_transferred: Request {decode_req.req.rid} transfer succeeded")
 
                 idx = decode_req.metadata_buffer_index
                 (
@@ -640,6 +711,7 @@ class DecodeTransferQueue:
 
                 # special handling for sampling_params.max_new_tokens == 1
                 if decode_req.req.sampling_params.max_new_tokens == 1:
+                    logger.info(f"pop_transferred: Request {decode_req.req.rid} has max_new_tokens=1, finishing immediately")
                     # finish immediately
                     decode_req.req.check_finished()
                     self.scheduler.stream_output(
@@ -647,15 +719,16 @@ class DecodeTransferQueue:
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
                 else:
+                    logger.debug(f"pop_transferred: Request {decode_req.req.rid} is ready for decode")
                     transferred_reqs.append(decode_req.req)
 
                 indices_to_remove.add(i)
-            elif poll in [
-                KVPoll.Bootstrapping,
-                KVPoll.WaitingForInput,
-                KVPoll.Transferring,
-            ]:
-                pass
+            elif poll == KVPoll.Bootstrapping:
+                bootstrapping_count += 1
+            elif poll == KVPoll.WaitingForInput:
+                waiting_for_input_count += 1
+            elif poll == KVPoll.Transferring:
+                transferring_count += 1
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -667,6 +740,12 @@ class DecodeTransferQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        
+        # if len(transferred_reqs) > 0 or failed_count > 0 or len(self.queue) > 0:
+        #     logger.info(f"pop_transferred: Finished popping transferred requests, "
+        #                f"transferred_count={len(transferred_reqs)}, failed_count={failed_count}, "
+        #                f"bootstrapping_count={bootstrapping_count}, waiting_for_input_count={waiting_for_input_count}, "
+        #                f"transferring_count={transferring_count}, remaining_queue_size={len(self.queue)}")
 
         return transferred_reqs
 
@@ -879,16 +958,62 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        if (len(self.disagg_decode_prealloc_queue.queue) > 0 or 
+            len(self.disagg_decode_prealloc_queue.retracted_queue) > 0 or
+            len(self.disagg_decode_transfer_queue.queue) > 0 or
+            len(self.waiting_queue) > 0):
+            logger.debug(f"process_decode_queue: Starting to process decode queue, "
+                       f"prealloc_queue_size={len(self.disagg_decode_prealloc_queue.queue)}, "
+                       f"retracted_queue_size={len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+                       f"transfer_queue_size={len(self.disagg_decode_transfer_queue.queue)}, "
+                       f"waiting_queue_size={len(self.waiting_queue)}")
+        
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        if len(resumed_reqs) > 0:
+            logger.info(f"process_decode_queue: Resumed {len(resumed_reqs)} retracted requests, "
+                       f"retracted_queue_size={len(self.disagg_decode_prealloc_queue.retracted_queue)}")
+            for req in resumed_reqs:
+                logger.debug(f"process_decode_queue: Resumed request {req.rid}")
         self.waiting_queue.extend(resumed_reqs)
+        
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
+            logger.debug(f"process_decode_queue: Still have {len(self.disagg_decode_prealloc_queue.retracted_queue)} "
+                       f"retracted requests, skipping new allocation")
             return
 
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+        if len(req_conns) > 0:
+            logger.info(f"process_decode_queue: Popped {len(req_conns)} preallocated requests, "
+                       f"prealloc_queue_size={len(self.disagg_decode_prealloc_queue.queue)}")
+            for decode_req in req_conns:
+                logger.debug(f"process_decode_queue: Popped request {decode_req.req.rid}, "
+                           f"waiting_for_input={decode_req.waiting_for_input}")
+        
         self.disagg_decode_transfer_queue.extend(req_conns)
+        if len(req_conns) > 0:
+            logger.debug(f"process_decode_queue: Extended transfer queue with {len(req_conns)} requests, "
+                       f"transfer_queue_size={len(self.disagg_decode_transfer_queue.queue)}")
+        
         alloc_reqs = (
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
+        if len(alloc_reqs) > 0:
+            logger.info(f"process_decode_queue: Popped {len(alloc_reqs)} transferred requests, "
+                       f"transfer_queue_size={len(self.disagg_decode_transfer_queue.queue)}")
+            
         self.waiting_queue.extend(alloc_reqs)
+        if len(alloc_reqs) > 0:
+            logger.info(f"process_decode_queue: Added {len(alloc_reqs)} requests to waiting queue, "
+                       f"waiting_queue_size={len(self.waiting_queue)}")
+        
+        if (len(self.disagg_decode_prealloc_queue.queue) > 0 or 
+            len(self.disagg_decode_prealloc_queue.retracted_queue) > 0 or
+            len(self.disagg_decode_transfer_queue.queue) > 0 or
+            len(self.waiting_queue) > 0):
+            logger.debug(f"process_decode_queue: Finished processing decode queue, "
+                       f"prealloc_queue_size={len(self.disagg_decode_prealloc_queue.queue)}, "
+                       f"retracted_queue_size={len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+                       f"transfer_queue_size={len(self.disagg_decode_transfer_queue.queue)}, "
+                       f"waiting_queue_size={len(self.waiting_queue)}")

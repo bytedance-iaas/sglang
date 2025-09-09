@@ -123,6 +123,36 @@ class SchedulerMetricsMixin:
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
             f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            
+            # 添加队列状态变化的详细日志
+            if len(self.disagg_prefill_bootstrap_queue.queue) > 10:
+                logger.warning(f"Large number of unbootstrapped requests: {len(self.disagg_prefill_bootstrap_queue.queue)}")
+            if len(self.waiting_queue) > 10:
+                logger.warning(f"Large number of waiting requests: {len(self.waiting_queue)}")
+            if len(self.disagg_prefill_inflight_queue) > 10:
+                logger.warning(f"Large number of transferring requests: {len(self.disagg_prefill_inflight_queue)}")
+                
+            # 记录队列中最老的请求的等待时间
+            if self.disagg_prefill_bootstrap_queue.queue:
+                oldest_req = self.disagg_prefill_bootstrap_queue.queue[0]
+                if hasattr(oldest_req, 'arrival_time'):
+                    wait_time = time.time() - oldest_req.arrival_time
+                    if wait_time > 30:  # 如果等待超过30秒，记录警告
+                        logger.warning(f"Request {oldest_req.rid} has been in bootstrap queue for {wait_time:.1f}s")
+                        
+            if self.waiting_queue:
+                oldest_req = self.waiting_queue[0]
+                if hasattr(oldest_req, 'queue_time_start'):
+                    wait_time = time.time() - oldest_req.queue_time_start
+                    if wait_time > 30:  # 如果等待超过30秒，记录警告
+                        logger.warning(f"Request {oldest_req.rid} has been in waiting queue for {wait_time:.1f}s")
+                        
+            if self.disagg_prefill_inflight_queue:
+                oldest_req = self.disagg_prefill_inflight_queue[0]
+                if hasattr(oldest_req, 'transfer_start_time'):
+                    wait_time = time.time() - oldest_req.transfer_start_time
+                    if wait_time > 30:  # 如果等待超过30秒，记录警告
+                        logger.warning(f"Request {oldest_req.rid} has been in inflight queue for {wait_time:.1f}s")
         else:
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "

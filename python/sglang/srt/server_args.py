@@ -2531,6 +2531,9 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
+    
+    # The ipc filename for prefill and decode data parallel controllers to communicate
+    prefill_decode_ipc_name: str
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
@@ -2556,6 +2559,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=None,
+                prefill_decode_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2579,8 +2583,12 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+                # Prefill to Decode communication
+                prefill_decode_port = port_base + 25
             else:
                 scheduler_input_port = port_base + 4 + 1 + dp_rank
+                # Prefill to Decode communication - unique for each dp_rank
+                prefill_decode_port = port_base + 25 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
@@ -2590,6 +2598,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=None,
+                prefill_decode_ipc_name=f"tcp://{dist_init_host}:{prefill_decode_port}",
             )
 
 

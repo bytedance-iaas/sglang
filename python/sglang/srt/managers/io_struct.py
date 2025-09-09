@@ -127,6 +127,8 @@ class GenerateReqInput:
 
     # For background responses (OpenAI responses API)
     background: bool = False
+    dp_balance_id : int = -1
+    prefill_dp_balance_id: int = -1
 
     def contains_mm_input(self) -> bool:
         return (
@@ -532,6 +534,9 @@ class TokenizedGenerateReqInput:
     # For dp balance
     dp_balance_id: int = -1
 
+    prefill_dp_balance_id: int = -1
+
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput:
@@ -681,6 +686,8 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+
+    prefill_dp_balance_id: int = -1
 
 
 @dataclass
