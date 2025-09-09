@@ -515,7 +515,6 @@ class SocketMapping:
 
 class MultiDetokenizerRouter:
     """A router to receive requests from Scheduler and route to DetokenizerManager"""
-
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
         self.ipc_name_list = ipc_name_list
         self.socket_mapping = SocketMapping()
