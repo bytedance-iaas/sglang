@@ -220,9 +220,7 @@ def cutlass_w4a8_moe(
             n,
             k,
         )
-        expected_m_per_group = (
-            global_server_args_dict["max_running_requests"] * topk // num_experts
-        )
+        expected_m_per_group = 32
         # expected_m_per_group = max(1, int(torch.mean(local_topk_ids.to(torch.float32)).item()))
         gateup_input = a
         # logger.info(f"deepep_ll mode - a.shape: {a.shape}")
