@@ -812,7 +812,7 @@ class MultiDetokenizerRouter:
                             f"Detokenizer Worker ID {worker_id} not registered in MultiDetokenizerRouter."
                         )
                         continue
-                    new_recv_obj = _handle_output_by_index(recv_obj, i)
+                    new_recv_obj = self._handle_output_by_index(recv_obj, i)
                     self.socket_mapping.send_output(
                         self.worker_id_to_ipc_mapping[worker_id], new_recv_obj
                     )
