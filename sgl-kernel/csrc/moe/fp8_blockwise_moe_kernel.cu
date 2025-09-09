@@ -437,6 +437,166 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
   }
 }
 
+struct MmaConfig0 {
+  using ElementA = cutlass::float_e4m3_t;
+  using MmaTileShape = Shape<_64, _128, _128>;
+  using ClusterShape = Shape<_2, _1, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+  using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
+
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+};
+
+struct MmaConfig1 {
+  using ElementA = cutlass::float_e4m3_t;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using ClusterShape = Shape<_1, _2, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+  using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
+
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+};
+
+#define JOIN_STRUCT_PP_NAME(m, n, k, a, b, c) \
+    sm90_fp8_pp_config##_##m##_##n##_##k##_##a##_##b##_##c
+
+#define JOIN_STRUCT_CO_NAME(m, n, k, a, b, c) \
+    sm90_fp8_co_config##_##m##_##n##_##k##_##a##_##b##_##c
+
+
+#define GENERATE_SM90_FP8_PP_CONFIG(M, N, K, A, B, C) \
+struct JOIN_STRUCT_PP_NAME(M, N, K, A, B, C) { \
+  using ElementA = cutlass::float_e4m3_t; \
+  using MmaTileShape = Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>; \
+  using ClusterShape = Shape<cute::Int<A>, cute::Int<B>, cute::Int<C>>; \
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;\
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;\
+  using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;\
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());\
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());\
+};
+
+
+#define GENERATE_SM90_FP8_CO_CONFIG(M, N, K, A, B, C) \
+struct JOIN_STRUCT_CO_NAME(M, N, K, A, B, C) { \
+  using ElementA = cutlass::float_e4m3_t; \
+  using MmaTileShape = Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>; \
+  using ClusterShape = Shape<cute::Int<A>, cute::Int<B>, cute::Int<C>>; \
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;\
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;\
+  using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;\
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());\
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());\
+};
+
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,1,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,1,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,1,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,1,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,1,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,2,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,2,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,2,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,2,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,2,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,2,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,4,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,4,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,4,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,4,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,4,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(64,128,128,4,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,1,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,1,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,1,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,1,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,1,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,2,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,2,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,2,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,2,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,2,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,2,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,4,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,4,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,4,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,4,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,4,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(128,128,128,4,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,1,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,1,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,1,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,1,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,1,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,1,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,2,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,2,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,2,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,2,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,2,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,2,4,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,4,1,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,4,1,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,4,2,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,4,2,2)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,4,4,1)
+GENERATE_SM90_FP8_PP_CONFIG(256,128,128,4,4,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,1,1,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,1,1,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,1,2,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,1,2,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,1,4,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,1,4,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,2,1,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,2,1,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,2,2,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,2,2,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,2,4,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,2,4,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,4,1,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,4,1,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,4,2,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,4,2,2)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,4,4,1)
+GENERATE_SM90_FP8_CO_CONFIG(128,128,128,4,4,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,1,1,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,1,1,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,1,2,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,1,2,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,1,4,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,1,4,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,2,1,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,2,1,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,2,2,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,2,2,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,2,4,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,2,4,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,4,1,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,4,1,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,4,2,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,4,2,2)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,4,4,1)
+GENERATE_SM90_FP8_CO_CONFIG(256,128,128,4,4,2)
+
+/* tuning label list：
+
+[ 
+  122112, 122121, 122122, 122141, 122142, 122211, 122212, 122221, 122222, 122241, 122242, 122411, 122412, 
+  122421, 122422, 122441, 122442, 222112, 222121, 222122, 222141, 222142, 222211, 222212, 222221, 222222, 222241, 
+  222242, 222411, 222412, 222421, 222422, 222441, 222442, 422111, 422112, 422121, 422122, 422141, 422142, 422211, 
+  422212, 422221, 422222, 422241, 422242, 422411, 422412, 422421, 422422, 422441, 422442, -222111, -222112, -222121, 
+  -222122, -222141, -222142, -222211, -222212, -222221, -222222, -222241, -222242, -222411, -222412, -222421, 
+  -222422, -222441, -222442, -422111, -422112, -422121, -422122, -422141, -422142, -422211, -422212, -422221, -422222,
+  -422241, -422242, -422411, -422412, -422421, -422422, -422441, -422442
+]
+
+*/
+
+
 template <typename OutType>
 void sm90_fp8_blockwise_group_mm_dispatch_shape(
     torch::Tensor& output,
@@ -457,33 +617,3017 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace) {
-  struct MmaConfig0 {
-    using ElementA = cutlass::float_e4m3_t;
-    using MmaTileShape = Shape<_64, _128, _128>;
-    using ClusterShape = Shape<_2, _1, _1>;
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
-    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
 
-    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
-    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
-  };
-
-  struct MmaConfig1 {
-    using ElementA = cutlass::float_e4m3_t;
-    using MmaTileShape = Shape<_128, _128, _128>;
-    using ClusterShape = Shape<_1, _2, _1>;
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
-
-    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
-    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
-  };
 
   int num_experts = (int)expert_offsets.size(0);
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
+
+  
+  auto tune_mode = getenv("TUNE_MODE") ? atoi(getenv("TUNE_MODE")) : 0;
+  if (tune_mode) {
+    auto kernel_label =  atoi(getenv("LABEL"));
+    switch (kernel_label)
+    {
+    case 122112: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_1_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122121: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_1_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122122: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_1_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122141: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_1_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122142: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_1_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122211: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_2_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122212: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_2_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122221: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_2_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122222: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_2_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122241: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_2_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122242: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_2_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122411: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_4_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122412: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_4_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122421: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_4_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122422: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_4_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122441: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_4_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 122442: {
+    using execute_gemm_config = sm90_fp8_pp_config_64_128_128_4_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222112: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_1_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222121: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_1_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222122: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_1_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222141: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_1_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222142: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_1_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222211: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_2_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222212: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_2_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222221: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_2_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222222: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_2_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222241: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_2_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222242: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_2_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222411: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_4_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222412: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_4_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222421: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_4_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222422: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_4_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222441: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_4_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 222442: {
+    using execute_gemm_config = sm90_fp8_pp_config_128_128_128_4_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422111: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_1_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422112: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_1_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422121: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_1_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422122: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_1_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422141: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_1_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422142: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_1_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422211: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_2_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422212: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_2_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422221: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_2_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422222: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_2_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422241: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_2_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422242: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_2_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422411: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_4_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422412: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_4_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422421: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_4_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422422: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_4_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422441: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_4_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case 422442: {
+    using execute_gemm_config = sm90_fp8_pp_config_256_128_128_4_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222111: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_1_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222112: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_1_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222121: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_1_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222122: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_1_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222141: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_1_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222142: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_1_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222211: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_2_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222212: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_2_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222221: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_2_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222222: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_2_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222241: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_2_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222242: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_2_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222411: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_4_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222412: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_4_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222421: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_4_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222422: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_4_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222441: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_4_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -222442: {
+    using execute_gemm_config = sm90_fp8_co_config_128_128_128_4_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422111: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_1_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422112: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_1_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422121: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_1_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422122: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_1_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422141: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_1_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422142: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_1_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422211: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_2_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422212: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_2_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422221: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_2_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422222: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_2_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422241: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_2_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422242: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_2_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422411: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_4_1_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422412: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_4_1_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422421: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_4_2_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422422: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_4_2_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422441: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_4_4_1;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+    case -422442: {
+    using execute_gemm_config = sm90_fp8_co_config_256_128_128_4_4_2;
+    run_get_group_gemm_starts<execute_gemm_config::LayoutSFA, execute_gemm_config::LayoutSFB, execute_gemm_config::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace);
+        break;
+    }
+
+    default: {
+        printf("no kernel was executed!!!!!");
+        
+    }
+    }
+  } else {
 
   if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
     // For H20 with K > 128, use Pingpong Schedule
@@ -550,6 +3694,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         expert_offsets,
         workspace);
   }
+ }
 }
 
 /**
