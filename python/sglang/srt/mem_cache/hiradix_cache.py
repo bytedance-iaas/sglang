@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
@@ -39,6 +40,7 @@ class HiRadixCache(RadixCache):
         hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
+        scheduler_metric_collector: Optional[SchedulerMetricsCollector] = None,
     ):
 
         if hicache_io_backend == "direct":
@@ -75,7 +77,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout = 3  # seconds
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
-
+        self.scheduler_metrics_collector = scheduler_metric_collector
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator,
@@ -210,6 +212,7 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
@@ -245,6 +248,9 @@ class HiRadixCache(RadixCache):
             for node in write_back_nodes:
                 assert node.backuped
                 self._evict_backuped(node)
+
+        if num_evicted >0 and self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -292,7 +298,7 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
-
+        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -337,6 +343,9 @@ class HiRadixCache(RadixCache):
             node.loading = True
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        if self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_load_back_duration(time.perf_counter() - start_time)
 
         return device_indices
 
