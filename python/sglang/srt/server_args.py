@@ -51,6 +51,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -714,6 +715,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager. tokenizer num % detokenizer num must == 0",
         )
         parser.add_argument(
             "--tokenizer-mode",
