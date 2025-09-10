@@ -28,7 +28,7 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 from sglang.srt.multimodal.mm_utils import fast_image_hash, image_to_int, generate_reconstruct_cudatensor_infos, operate_substrings, insert_input_ids
 from sglang.srt.managers.mm_utils import FIFOTensorCache, reconstruct_tensor_from_infos
 from sglang.utils import logger
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -44,7 +44,7 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
-CACHED_IMAGE_MAX_NUM = 128
+CACHED_IMAGE_MAX_NUM = 1024
 
 
 def smart_resize(
@@ -412,10 +412,18 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
         if cache_mm_image_items:
             images = base_output.images
-            if len(images) > CACHED_IMAGE_MAX_NUM:
-                raise RuntimeError("input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE)")
             
-            self.image_cache_table.pop_until(CACHED_IMAGE_MAX_NUM - len(images))
+            max_image_num = CACHED_IMAGE_MAX_NUM
+            if get_int_env_var("SGL_IMAGE_CACHE_NUM"):
+                max_image_num = get_int_env_var("SGL_IMAGE_CACHE_NUM")
+
+            if len(images) > max_image_num:
+                raise RuntimeError(
+                    "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE) or increase image cache num by set SGL_IMAGE_CACHE_NUM"
+                )
+
+            self.image_cache_table.pop_until(max_image_num - len(images))
+
             
             img_hash_keys = []
             img_heights = []

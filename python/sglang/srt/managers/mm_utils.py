@@ -47,7 +47,7 @@ class FIFOTensorCache:
         self.order.append(key)
         if len(self.hash_map) > self.max_size:
             oldest_key = self.order.pop(0)
-            return oldest_key
+            self.hash_map.pop(oldest_key)
         return None
 
     def get(self, key: int):
@@ -58,15 +58,20 @@ class FIFOTensorCache:
 
     def erase(self, key: int):
         self.hash_map.pop(key)
-        
+
     def pop_until(self, limit_size):
         while len(self.hash_map) > limit_size:
             oldest_key = self.order.pop(0)
             self.erase(oldest_key)
-    
+
     def print_infos(self):
         for key in self.hash_map:
-            print("check key {} pixel_values_shape {}".format(key, self.hash_map[key]["pixel_values"].shape))
+            print(
+                "check key {} pixel_values_shape {}".format(
+                    key, self.hash_map[key]["pixel_values"].shape
+                )
+            )
+
 
 class TransportProxyTensor(torch.Tensor):
     """
