@@ -395,7 +395,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         hidden_states, topk_idx, _, masked_m, _ = dispatch_output
 
         output = cutlass_w4a8_moe_deepep_ll(
-            hidden_states,
+            hidden_states[0],
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,
