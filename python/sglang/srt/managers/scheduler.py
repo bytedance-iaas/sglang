@@ -82,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MultiTokenizerRegisterReq,
+    MultiTokenizerWarpper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -536,6 +538,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (EnableEICReqInput, self.enable_eic_cache_wrapped),
                 (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
@@ -1120,6 +1123,17 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
+                    
+            # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWarpper):
+                worker_id = recv_req.worker_id
+                recv_req = recv_req.obj
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    output = MultiTokenizerWarpper(worker_id, output)
+                    self.send_to_tokenizer.send_pyobj(output)
+                continue
+                
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -2470,7 +2484,11 @@ class Scheduler(
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
-
+        
+    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return recv_req
+        
     def enable_eic_cache_wrapped(self, recv_req: EnableEICReqInput) -> EICSwitchOutput:
         if not isinstance(self.tree_cache, EICHiRadixCache):
             success = self.flush_cache()

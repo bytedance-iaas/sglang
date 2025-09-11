@@ -925,6 +925,11 @@ class AbortReq:
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
+    # used in MultiTokenzierManager mode
+    rids: Optional[Union[List[str], str]] = None
+
+    def __post_init__(self):
+        self.rids = self.rid
 
 
 @dataclass
@@ -1119,6 +1124,16 @@ class LoRAUpdateResult:
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 
+@dataclass
+class MultiTokenizerRegisterReq:
+    rids: Optional[Union[List[str], str]] = None
+    ipc_name: Optional[str] = None
+
+
+@dataclass
+class MultiTokenizerWarpper:
+    worker_id: int
+    obj: Optional[Any] = None
 
 class BlockReqType(Enum):
     BLOCK = 1
