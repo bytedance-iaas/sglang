@@ -24,6 +24,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import tempfile
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -57,6 +58,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+)
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
@@ -781,26 +786,63 @@ def _launch_subprocesses(
         return None, None, None
 
     # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
+    if server_args.detokenizer_worker_num > 1:
+        detoken_procs = []
+        ipc_name_list = []
+        detokenizer_ipc_name = port_args.detokenizer_ipc_name
+        # Launch multi detokenizer processes
+        for i in range(server_args.detokenizer_worker_num):
+            port_args.detokenizer_ipc_name = (
+                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}")
+            detoken_proc = mp.Process(
+                target=run_detokenizer_process,
+                args=(
+                    server_args,
+                    port_args,
+                ),
+            )
+            detoken_proc.start()
+            detoken_procs.append(detoken_proc)
+            ipc_name_list.append(port_args.detokenizer_ipc_name)
+        # Launch multi-detokenizer router
+        port_args.detokenizer_ipc_name = detokenizer_ipc_name
+        detoken_router_proc = mp.Process(
+            target=run_multi_detokenizer_router_process,
+            args=(
+                ipc_name_list,
+                server_args,
+                port_args,
+            ),
+        )
+        detoken_router_proc.start()
+    else:
+        detoken_proc = mp.Process(
+            target=run_detokenizer_process,
+            args=(
+                server_args,
+                port_args,
+            ),
+        )
+        detoken_proc.start()
 
-    # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    if server_args.tokenizer_worker_num > 1:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
 
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
+        # Initialize templates
+        template_manager = None
+    else:
+        # Launch tokenizer process
+        tokenizer_manager = TokenizerManager(server_args, port_args)
+
+        # Initialize templates
+        template_manager = TemplateManager()
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
