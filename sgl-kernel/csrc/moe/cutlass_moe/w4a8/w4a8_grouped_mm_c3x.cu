@@ -2,8 +2,6 @@
 #include <cudaTypedefs.h>
 #include <torch/all.h>
 
-#include <type_traits>
-
 #include "cutlass/cutlass.h"
 #include "w4a8_grouped_mm_c3x.cuh"
 
@@ -141,7 +139,8 @@ void dispatch_w4a8_moe_mm_sm90(
           s_strides,
           chunk_size);
     } else {
-      invoke_gemm<SM90_CO<128, 64, 512, 1, 1, 1>>(
+      using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME_CO(128, 64, 512, 1, 1, 1)::Cutlass3xW4A8Gemm;
+      cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -234,37 +233,20 @@ void dispatch_w4a8_moe_mm_sm90(
           chunk_size);
     }
   } else {
-    if (k % 512 == 0) {
-      using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME_CO(128, 64, 512, 2, 1, 1)::Cutlass3xW4A8Gemm;
-      cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else {
-      using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME_CO(128, 64, 512, 2, 1, 1)::Cutlass3xW4A8Gemm;
-      cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    }
+    using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME_CO(128, 32, 512, 1, 1, 1)::Cutlass3xW4A8Gemm;
+    cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
+        d_tensors,
+        a_tensors,
+        b_tensors,
+        a_scales,
+        b_scales,
+        expert_offsets,
+        problem_sizes,
+        a_strides,
+        b_strides,
+        d_strides,
+        s_strides,
+        chunk_size);
   }
 }
 

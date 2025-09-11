@@ -536,7 +536,6 @@ def post_reorder_triton_kernel(
     topk_weights_ptr,
     start_expert_id,
     end_expert_id,
-    num_experts,
     topk,
     hidden_size,
     dst_start,
@@ -562,7 +561,7 @@ def post_reorder_triton_kernel(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
         for idx in range(topk):
             expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id != num_experts:
+            if expert_id >= start_expert_id and expert_id <= end_expert_id:
                 computed = True
                 dst_idx_int32 = tl.load(src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
@@ -580,6 +579,49 @@ def post_reorder_triton_kernel(
             tl.store(
                 store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
             )
+
+
+@triton.jit
+def post_reorder_triton_kernel_for_cutlass_moe(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    num_experts,
+    topk,
+    hidden_size,
+    dst_start,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    store_ptr = output_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + vec
+        mask = offset < hidden_size
+
+        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+        for idx in range(topk):
+            expert_id = tl.load(topk_ids_ptr + idx)
+            if expert_id != num_experts:
+                dst_idx_int32 = tl.load(src2dst_ptr + idx)
+                dst_idx = dst_idx_int32.to(tl.int64)
+                dst_idx = dst_idx - dst_start
+                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                load_ptr = down_output_ptr + dst_idx * hidden_size
+                in_data = tl.load(load_ptr + offset, mask=mask)
+                sum_vec += in_data * weigh_scale
+        tl.store(store_ptr + offset, sum_vec, mask=mask)
 
 
 @triton.jit
@@ -1536,3 +1578,127 @@ def silu_mul_and_per_tensor_static_quant_fwd(
         num_warps=1,
     )
     return
+
+
+@triton.jit
+def _silu_and_mul_post_per_tensor_quant_kernel(
+    input_ptr,
+    stride_input_expert,
+    stride_input_token,
+    stride_input_dim,
+    output_ptr,
+    stride_output_expert,
+    stride_output_token,
+    stride_output_dim,
+    scale_ptr,
+    masked_m_ptr,
+    inner_dim,
+    fp8_max,
+    fp8_min,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    """
+    Triton kernel: fused SiLU(gate) * up + per-tensor FP8 quantization.
+
+    Shape:
+        input:  [E, T_padded, 2*D]  -> gate: [:,:,D], up: [:,:,D]
+        output: [E, T_padded, D], dtype=float8_e4m3fn
+    """
+    expert_id = tl.program_id(2)
+    block_id_token = tl.program_id(1)
+    block_id_dim = tl.program_id(0)
+
+    num_token_blocks = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    scale = 1.0 / tl.load(scale_ptr).to(tl.float32)
+
+    stride_input_expert = tl.cast(stride_input_expert, tl.int32)
+    stride_output_expert = tl.cast(stride_output_expert, tl.int32)
+    stride_input_token = tl.cast(stride_input_token, tl.int32)
+    stride_output_token = tl.cast(stride_output_token, tl.int32)
+
+    offset_d = block_id_dim * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_d = offset_d < inner_dim
+
+    # 计算 base pointers for current expert and dim block
+    input_base_offs = input_ptr + expert_id * stride_input_expert + offset_d
+    output_base_offs = output_ptr + expert_id * stride_output_expert + offset_d
+
+    for token_idx in tl.range(
+        block_id_token, token_num_cur_expert, num_token_blocks, num_stages=NUM_STAGE
+    ):
+        gate_ptr = input_base_offs + token_idx * stride_input_token
+        up_ptr = gate_ptr + inner_dim
+        gate = tl.load(gate_ptr, mask=mask_d, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr, mask=mask_d, other=0.0).to(tl.float32)
+
+        # SiLU: x * sigmoid(x)
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+
+        scaled = gate_up * scale
+        output_q = tl.clamp(scaled, fp8_min, fp8_max).to(output_ptr.dtype.element_ty)
+        out_ptr = output_base_offs + token_idx * stride_output_token
+        tl.store(out_ptr, output_q, mask=mask_d)
+
+
+def silu_and_mul_masked_post_per_tensor_quant_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Fused SiLU + Mul + Per-Tensor Quantization to FP8.
+
+    Args:
+        input: [expert_num, token_num_padded, 2 * inner_dim]
+        output: [expert_num, token_num_padded, inner_dim], dtype=torch.float8_e4m3fn
+        masked_m: [expert_num], actual token count for each expert
+        scale: [1] or [expert_num], quantization scale (per-tensor or per-expert)
+
+    Returns:
+        output tensor
+    """
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert input.ndim == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+    assert scale.numel() == 1 or scale.shape[0] == input.shape[0]
+
+    expert_num = input.shape[0]
+    #  3584
+    inner_dim = input.shape[-1] // 2
+
+    BLOCK_N = 256
+    BLOCK_M = 64 if expert_num < 4 else 32
+    NUM_STAGES = 3
+    # 14
+    hidden_dim_split_block_num = triton.cdiv(inner_dim, BLOCK_N)
+
+    # grid (14, 64, 32)
+    grid = (hidden_dim_split_block_num, BLOCK_M, expert_num)
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+
+    _silu_and_mul_post_per_tensor_quant_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        scale,
+        masked_m,
+        inner_dim,
+        fp8_max,
+        fp8_min,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+    )
+    return output
