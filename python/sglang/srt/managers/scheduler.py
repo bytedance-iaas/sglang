@@ -628,7 +628,20 @@ class Scheduler(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
+                    tp_cache_group=tp_cache_group,
+                    server_args=server_args,
                 )
+            else:
+                if self.model_config.is_hybrid:
+                    ChunkCacheClass = SWAChunkCache
+                else:
+                    ChunkCacheClass = ChunkCache
+                self.tree_cache = ChunkCacheClass(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                )
+
         else:
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
