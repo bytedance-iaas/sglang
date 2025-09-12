@@ -233,6 +233,7 @@ class EAGLEWorker(TpModelWorker):
             "fa3": self._create_fa3_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+            "flashmla": self._create_flashmla_decode_backend,
         }
         backend_name = (
             "decode_attention_backend"
