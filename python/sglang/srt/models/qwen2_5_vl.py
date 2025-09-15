@@ -164,6 +164,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
+    # @torch.compile(dynamic = True)
     def forward(
         self,
         x: torch.Tensor,
@@ -176,17 +177,20 @@ class Qwen2_5_VisionBlock(nn.Module):
         hidden_states = self.norm1(x2d).reshape(S, B, H)
 
         # Attention expects [B, S, H]
-        hidden_states = rearrange(hidden_states, "s b h -> b s h")
+        # hidden_states = rearrange(hidden_states, "s b h -> b s h")
+        # hidden_states = hidden_states.transpose(0,1)
         attn = self.attn(
-            hidden_states,
+            hidden_states.transpose(0, 1),
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        attn = rearrange(attn, "b s h -> s b h")
+        # attn = rearrange(attn, "b s h -> s b h")
 
         # norm2 with fused residual-add: also 2D
-        attn2d = attn.reshape(-1, H)
-        x_norm_2d, x_after_add_2d = self.norm2(x2d, residual=attn2d)
+        attn2d = attn.transpose(0, 1).reshape(-1, H)
+        x_norm_2d, x_after_add_2d = self.norm2(
+            x2d, residual=attn2d, use_fuse_allreduce=True
+        )
         x_norm = x_norm_2d.reshape(S, B, H)
         x_after_add = x_after_add_2d.reshape(S, B, H)
 
@@ -390,8 +394,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
     ) -> torch.Tensor:
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
+        # print(x.shape)
         x = self.patch_embed(x)
-
+        # print("after patch,", x.shape)
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -445,16 +450,20 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
+            # print("before block: ", x.shape)
+            # print("cur_seq_now: ", cu_seqlens_now)
             x = blk(
                 x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
             )
+            # print(x.shape)
 
+        # print("blocks F######")
         # adapter
         x = self.merger(x)
 
         reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
-
+        # print("vision F######")
         return x
 
 

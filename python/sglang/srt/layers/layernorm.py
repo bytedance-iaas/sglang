@@ -81,11 +81,16 @@ class RMSNorm(CustomOp):
         if _use_aiter:
             self._forward_method = self.forward_aiter
 
+        # print(self._forward_method)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        use_fuse_allreduce=False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if use_fuse_allreduce:
+            return self.forward_with_allreduce_fusion(x, residual)
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
         if residual is not None:
@@ -229,7 +234,11 @@ class RMSNorm(CustomOp):
                 else flashinfer_allreduce_residual_rmsnorm
             )
 
+            print("support ?", supports_custom_op())
+
             if get_tensor_model_parallel_world_size() > 1:
+                torch.cuda.synchronize()
+                print("fused_op executing...")
                 fused_result = fused_op(
                     input_tensor=x,
                     residual=residual,
@@ -237,6 +246,7 @@ class RMSNorm(CustomOp):
                     eps=self.variance_epsilon,
                 )
                 if fused_result[0] is not None:
+                    print("fused_op execute finished")
                     return fused_result
 
         return self.forward(x, residual)

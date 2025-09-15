@@ -414,18 +414,23 @@ def _get_chunked_prefill_embedding(
     embedding_list = []
     # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
     max_iterations = min(len(items_size) - 1, len(prefix_length))
+    # print("#####new_request_max_iterations : {}".format(max_iterations))
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
+        # print(len(embedding_items_per_req))
+        # print(embedding_items_per_req)
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
+            # print("#####compute new embedding#####")
             embedding_per_req = data_embedding_func(embedding_items_per_req)
             if not embedding_cache.put(embedding_items_hash, embedding_per_req):
                 print_warning_once(
@@ -434,6 +439,9 @@ def _get_chunked_prefill_embedding(
                     "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
                     "embedding size."
                 )
+        else:
+            pass
+            # print("####use embedding####")
 
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
             embedding=embedding_per_req,

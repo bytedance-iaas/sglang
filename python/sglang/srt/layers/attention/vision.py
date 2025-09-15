@@ -318,6 +318,12 @@ class VisionFlash3Attention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
+        # print(cu_seqlens)
+        # print(max_seqlen)
+        # print("q k v shape")
+        # print(q.shape)
+        # print(k.shape)
+        # print(v.shape)
         output = flash_attn_varlen_func(
             q,
             k,
