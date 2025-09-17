@@ -41,6 +41,10 @@ RUN if [ "x$sglang_router_version" = "x"  ]; then \
         http_proxy='' pip install sglang_router==${sglang_router_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple; \
     fi
 
+# sglang-router依赖安装
+RUN wget  https://nz2.archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb && \
+    dpkg -i libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb
+
 # gdkv sdk安装
 RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
