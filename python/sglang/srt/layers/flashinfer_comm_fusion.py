@@ -112,6 +112,12 @@ def ensure_workspace_initialized(
         not _workspace_manager.initialized
         or _workspace_manager.world_size != world_size
     ):
+        max_token_num = 8192
+        print(
+            "check initialize world_size {} rank {} max_token_num {} hidden_dim {} ".format(
+                world_size, rank, max_token_num, hidden_dim
+            )
+        )
         _workspace_manager.initialize(
             world_size=world_size,
             rank=rank,
