@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -78,6 +79,7 @@ class Qwen2MLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
@@ -149,6 +151,7 @@ class Qwen2Attention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -234,13 +237,16 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        comm_in_mlp=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, force_fused=True
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -248,7 +254,9 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, force_fused=True
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -330,6 +338,7 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        print("hidden_states shape {}".format(hidden_states.shape))
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
@@ -337,12 +346,17 @@ class Qwen2Model(nn.Module):
                     hidden_states + residual if residual is not None else hidden_states
                 )
             layer = self.layers[i]
+            # print(type(layer))
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
+        # should add allreduce if tp_num >=2
+        if get_tensor_model_parallel_world_size() > 1:
+            print(get_tensor_model_parallel_world_size())
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
