@@ -454,7 +454,7 @@ class DeepEPMoE(EPMoE):
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            static_scale=self.w13_input_scale.float(),
+            static_scale=self.w13_input_scale.float() if self.use_w4afp8 else None,
             forward_batch=forward_batch,
         )
 
@@ -676,7 +676,6 @@ class DeepEPMoE(EPMoE):
             gateup_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         dispose_tensor(hidden_states_fp8[0])
 
@@ -717,9 +716,7 @@ class DeepEPMoE(EPMoE):
             (
                 down_input_scale
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
-                    down_input_scale
-                )
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
             ),
         )
         down_output = torch.empty(
@@ -731,7 +728,6 @@ class DeepEPMoE(EPMoE):
             down_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
 
         return down_output
