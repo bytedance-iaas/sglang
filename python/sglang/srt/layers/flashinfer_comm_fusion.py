@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_flashinfer_available,
@@ -112,12 +113,6 @@ def ensure_workspace_initialized(
         not _workspace_manager.initialized
         or _workspace_manager.world_size != world_size
     ):
-        max_token_num = 8192
-        print(
-            "check initialize world_size {} rank {} max_token_num {} hidden_dim {} ".format(
-                world_size, rank, max_token_num, hidden_dim
-            )
-        )
         _workspace_manager.initialize(
             world_size=world_size,
             rank=rank,
@@ -155,6 +150,10 @@ def flashinfer_allreduce_residual_rmsnorm(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
+
+    if max_token_num < global_server_args_dict["chunked_prefill_size"]:
+        max_token_num = global_server_args_dict["chunked_prefill_size"]
+
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
             "FlashInfer not available, falling back to standard " "implementation"

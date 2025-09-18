@@ -87,7 +87,6 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
         force_fused=False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # print("rms norm forward cuda")
         if force_fused:
             return self.forward_with_allreduce_fusion(x, residual)
         if self.variance_size_override is not None:
@@ -162,7 +161,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        print("rmsnorm forward_native")
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = x.dtype
@@ -242,8 +240,6 @@ class RMSNorm(CustomOp):
                     eps=self.variance_epsilon,
                 )
 
-                # print("fused len : {}".format(len(fused_result)))
-                # print("shape 1 {} shape 2 {}".format(fused_result[0].shape, fused_result[1].shape))
                 if fused_result[0] is not None:
                     return fused_result
 
