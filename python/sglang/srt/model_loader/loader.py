@@ -1428,7 +1428,12 @@ class RemoteModelLoader(BaseModelLoader):
                     # ignore hidden files
                     if file_name.startswith("."):
                         continue
-                    if os.path.splitext(file_name)[1] in (".json", ".py"):
+                    if os.path.splitext(file_name)[1] in (
+                        ".json",
+                        ".py",
+                        ".model",
+                        ".jinja",
+                    ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
@@ -1510,7 +1515,9 @@ class RemoteModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config)
 
             with create_remote_connector(
-                model_weights, device=device_config.device
+                model_weights,
+                device=device_config.device,
+                rank=get_tensor_model_parallel_rank(),
             ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
