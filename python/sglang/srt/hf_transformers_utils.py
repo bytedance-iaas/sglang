@@ -300,15 +300,9 @@ def get_tokenizer(
         # with statement to avoid closing the client.
         if is_eic(tokenizer_name):
             from sglang.srt.connector.eic import pull_files_from_eic
-            model_name = tokenizer_name.removeprefix("eic://")
-            local_dir = "/tmp/" + "_".join([model_name, str(os.getpid())])
-            os.makedirs(local_dir, exist_ok=True)
-            logger.info(
-                f"pull_files_from_eic tokenizer start is_eic PID = {os.getpid()}, path {local_dir}")
-            pull_files_from_eic(tokenizer_name, local_dir)
+            local_dir = pull_files_from_eic(tokenizer_name)
             tokenizer_name = local_dir
-            logger.info(
-                f"pull_files_from_eic to tokenizer end is_eic PID = {os.getpid()}, path {local_dir}")
+            logger.info(f"pull_files_from_eic tokenizer start is_eic PID = {os.getpid()}, path {local_dir}")
         else:
             client = create_remote_connector(tokenizer_name)
             client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
