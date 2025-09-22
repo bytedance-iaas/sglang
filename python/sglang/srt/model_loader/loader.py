@@ -1706,6 +1706,10 @@ class RemoteModelLoader(BaseModelLoader):
         model_name = client.url.removeprefix("eic://")
         model_prefix = f"{model_name}-pp{pp}-rank{pp_rank}-tp{tp}-rank{rank}"
 
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
         # read root
         self._read_root(client, model_prefix)
