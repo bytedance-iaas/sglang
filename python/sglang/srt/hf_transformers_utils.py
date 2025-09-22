@@ -47,7 +47,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, is_eic
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -298,9 +298,21 @@ def get_tokenizer(
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
         # with statement to avoid closing the client.
-        client = create_remote_connector(tokenizer_name)
-        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
-        tokenizer_name = client.get_local_dir()
+        if is_eic(tokenizer_name):
+            from sglang.srt.connector.eic import pull_files_from_eic
+            model_name = tokenizer_name.removeprefix("eic://")
+            local_dir = "/tmp/" + "_".join([model_name, str(os.getpid())])
+            os.makedirs(local_dir, exist_ok=True)
+            logger.info(
+                f"pull_files_from_eic tokenizer start is_eic PID = {os.getpid()}, path {local_dir}")
+            pull_files_from_eic(tokenizer_name, local_dir)
+            tokenizer_name = local_dir
+            logger.info(
+                f"pull_files_from_eic to tokenizer end is_eic PID = {os.getpid()}, path {local_dir}")
+        else:
+            client = create_remote_connector(tokenizer_name)
+            client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+            tokenizer_name = client.get_local_dir()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(

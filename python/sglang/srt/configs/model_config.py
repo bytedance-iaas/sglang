@@ -590,15 +590,29 @@ class ModelConfig:
 
         """
         from sglang.srt.connector import create_remote_connector
-        from sglang.srt.utils import is_remote_url
+        from sglang.srt.utils import is_remote_url, is_eic
 
         if is_remote_url(self.model_path):
             logger.info("Pulling model configs from remote...")
             # BaseConnector implements __del__() to clean up the local dir.
             # Since config files need to exist all the time, so we DO NOT use
             # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
-            if is_remote_url(self.model_path):
+            if is_eic(self.model_path):
+                from sglang.srt.connector.eic import pull_files_from_eic
+                model_name = self.model_path.removeprefix("eic://")
+                local_dir = "/tmp/" + "_".join([model_name, str(os.getpid())])
+                os.makedirs(local_dir, exist_ok=True)
+                logger.info(
+                    f"pull_files_from_eic model config start is_eic PID = {os.getpid()}, path {local_dir}")
+                assert os.path.isdir(local_dir), "dir not created!"
+                pull_files_from_eic(self.model_path, local_dir)
+                self.model_weights = self.model_path
+                self.model_path = local_dir
+                logger.info(
+                    f"pull_files_from_eic model config end is_eic PID = {os.getpid()}, path {local_dir}")
+
+            else:
+                client = create_remote_connector(self.model_path)
                 client.pull_files(allow_pattern=["*config.json"])
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
