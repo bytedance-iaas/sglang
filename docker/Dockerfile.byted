@@ -54,6 +54,9 @@ RUN http_proxy='' pip install pris==${pris_sdk_version} --extra-index-url https:
 # eic sdk安装
 RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
+# eic sdk依赖安装
+RUN http_proxy='' pip install boto3 --extra-index-url https://bytedpypi.byted.org/simple
+
 # group_gemm依赖安装
 RUN http_proxy='' pip install absl-py==${absl_version} --extra-index-url https://bytedpypi.byted.org/simple
 
