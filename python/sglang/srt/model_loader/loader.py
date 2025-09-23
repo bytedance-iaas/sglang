@@ -45,9 +45,11 @@ from sglang.srt.connector import (
     get_connector_type,
 )
 from sglang.srt.connector.utils import parse_model_name
+from sglang.srt.connector.eic import *
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_pp_group,
 )
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
@@ -738,6 +740,11 @@ class ShardedStateLoader(BaseModelLoader):
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a
                         # narrowed view of the parameter data.
+                        if key not in state_dict:
+                            logger.warning(f"Key '{key}' not found in state_dict, replace key.")
+                            if "self_attn.attn_mha." in key:
+                                true_key = key.replace("self_attn.attn_mha.", "self_attn.")
+                                key = true_key
                         param_data = state_dict[key].data
                         param_shape = state_dict[key].shape
                         for dim, size in enumerate(tensor.shape):
@@ -1382,7 +1389,6 @@ class GGUFModelLoader(BaseModelLoader):
 
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
-
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         # TODO @DellCurry: move to s3 connector only
@@ -1408,6 +1414,20 @@ class RemoteModelLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         pass
 
+    def _save_model_to_eic(client: EICConnector,
+                       model: torch.nn.Module,
+                       local_model_path: str,
+                       model_name: str) -> None:
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        pp = get_pp_group().world_size
+        pp_rank = get_pp_group().rank_in_group
+        # eic model prefix name
+        model_prefix = f"{model_name}-pp{pp}-rank{pp_rank}-tp{tp}-rank{rank}"
+        logger.info(f"model_prefix is {model_prefix}")
+        client.save_model(model_prefix, model_name, local_model_path, rank, state_dict)
+
     @staticmethod
     def save_model(
         model: torch.nn.Module,
@@ -1419,6 +1439,11 @@ class RemoteModelLoader(BaseModelLoader):
             model_name = parse_model_name(url)
             rank = get_tensor_model_parallel_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+            if isinstance(client, EICConnector):
+                model_name = url.removeprefix("eic://")
+                RemoteModelLoader._save_model_to_eic(
+                    client, model, model_path, model_name)
+                return
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
                 client.set(r_key, tensor)
@@ -1491,6 +1516,28 @@ class RemoteModelLoader(BaseModelLoader):
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
 
+    def _load_model_from_eic(
+        self,
+        model: nn.Module,
+        client: EICConnector,
+        model_config: ModelConfig,
+    ) -> nn.Module:
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        pp = get_pp_group().world_size
+        pp_rank = get_pp_group().rank_in_group
+        model_name = client.url.removeprefix("eic://")
+        model_prefix = f"{model_name}-pp{pp}-rank{pp_rank}-tp{tp}-rank{rank}"
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        client.load_model(model_prefix, state_dict, rank)
+        post_load_weights(model, model_config)
+        return model
+
     def load_model(
         self,
         *,
@@ -1521,7 +1568,10 @@ class RemoteModelLoader(BaseModelLoader):
             ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
-                    self._load_model_from_remote_kv(model, model_config, client)
+                    if isinstance(client, EICConnector):
+                        self._load_model_from_eic(model, client, model_config)
+                    else:
+                        self._load_model_from_remote_kv(model, model_config, client)
                 elif connector_type == ConnectorType.FS:
                     self._load_model_from_remote_fs(
                         model, client, model_config, device_config
