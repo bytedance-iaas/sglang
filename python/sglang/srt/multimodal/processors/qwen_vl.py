@@ -259,6 +259,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         ).build(_processor)
         
         self.image_cache_table = FIFOTensorCache(CACHED_IMAGE_MAX_NUM)
+        self._cache_lock = asyncio.Lock()
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -421,65 +422,69 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 raise RuntimeError(
                     "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE) or increase image cache num by set SGL_IMAGE_CACHE_NUM"
                 )
-
-            self.image_cache_table.pop_until(max_image_num - len(images))
-
             
-            img_hash_keys = []
-            img_heights = []
-            new_processed_imgs = []
-            new_processed_img_idxes = []
-            img_token_nums = []
-            remove_image_idx = []
-            image_grid_thw_lists = []
-            
-            for img_idx in range(len(images)):
-                hash_key = image_to_int(images[img_idx])
-                img_hash_keys.append(hash_key)
-                img_height, resize_h, resize_w = get_img_height_from_raw_img(images[img_idx], self.PATCH_PIXEL_NUMS)
-                img_token_num = int(img_height / self.MERGE_PATCH_NUMS)
+            async with self._cache_lock:
+            # if True:
+                reserved_image_nums = max_image_num - len(images)
+                # print("pop until {}".format(reserved_image_nums))
+                self.image_cache_table.pop_until(reserved_image_nums)
 
-                image_grid_thw_lists.append(
-                    [
-                        1,
-                        int(resize_w // self.PATCH_SIZE),
-                        int(resize_h // self.PATCH_SIZE),
+                
+                img_hash_keys = []
+                img_heights = []
+                new_processed_imgs = []
+                new_processed_img_idxes = []
+                img_token_nums = []
+                remove_image_idx = []
+                image_grid_thw_lists = []
+                
+                for img_idx in range(len(images)):
+                    hash_key = image_to_int(images[img_idx])
+                    img_hash_keys.append(hash_key)
+                    img_height, resize_h, resize_w = get_img_height_from_raw_img(images[img_idx], self.PATCH_PIXEL_NUMS)
+                    img_token_num = int(img_height / self.MERGE_PATCH_NUMS)
+
+                    image_grid_thw_lists.append(
+                        [
+                            1,
+                            int(resize_w // self.PATCH_SIZE),
+                            int(resize_h // self.PATCH_SIZE),
+                        ]
+                    )
+
+                    if img_token_num < 1:
+                        raise ValueError("invalid img token num")
+
+                    if self.image_cache_table.get(hash_key) is None:
+                        new_processed_img_idxes.append(img_idx)
+                        new_processed_imgs.append(images[img_idx])
+                    else:
+                        remove_image_idx.append(img_idx)
+
+                    img_heights.append(img_height)
+                    img_token_nums.append(img_token_num)
+                
+                # Qwen-specific: resize images if they are raw Image objects
+                if len(new_processed_imgs)!= 0  and isinstance(new_processed_imgs[0], Image.Image):
+                    resize_tasks = [resize_image_async(image) for image in new_processed_imgs]
+                    new_processed_imgs = await asyncio.gather(*resize_tasks)
+                
+                if base_output.videos:
+                    base_output.videos = [
+                        await preprocess_video(video) for video in base_output.videos
                     ]
+                
+                args_dict = {"img_hash_keys": img_hash_keys, 
+                            "img_heights":img_heights, 
+                            "new_processed_imgs":new_processed_imgs,
+                            "new_processed_img_idxes": new_processed_img_idxes,
+                            "img_token_nums":img_token_nums,
+                            "remove_image_idx" :remove_image_idx, 
+                            "image_grid_thw_lists" : image_grid_thw_lists }
+                
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, **args_dict
                 )
-
-                if img_token_num < 1:
-                    raise ValueError("invalid img token num")
-
-                if self.image_cache_table.get(hash_key) is None:
-                    new_processed_img_idxes.append(img_idx)
-                    new_processed_imgs.append(images[img_idx])
-                else:
-                    remove_image_idx.append(img_idx)
-
-                img_heights.append(img_height)
-                img_token_nums.append(img_token_num)
-            
-            # Qwen-specific: resize images if they are raw Image objects
-            if len(new_processed_imgs)!= 0  and isinstance(new_processed_imgs[0], Image.Image):
-                resize_tasks = [resize_image_async(image) for image in new_processed_imgs]
-                new_processed_imgs = await asyncio.gather(*resize_tasks)
-            
-            if base_output.videos:
-                base_output.videos = [
-                    await preprocess_video(video) for video in base_output.videos
-                ]
-            
-            args_dict = {"img_hash_keys": img_hash_keys, 
-                        "img_heights":img_heights, 
-                        "new_processed_imgs":new_processed_imgs,
-                        "new_processed_img_idxes": new_processed_img_idxes,
-                        "img_token_nums":img_token_nums,
-                        "remove_image_idx" :remove_image_idx, 
-                        "image_grid_thw_lists" : image_grid_thw_lists }
-            
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens, **args_dict
-            )
 
         else:
             # Qwen-specific: resize images if they are raw Image objects

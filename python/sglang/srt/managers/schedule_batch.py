@@ -1294,7 +1294,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
                 elif isinstance(pixel_values, dict):
                     assert "pixel_values" in  pixel_values, "cache image mode should load image data directly"                    
-                    mm_item.feature = pixel_values["pixel_values"].to(self.device, non_blocking = True)
+                    mm_item.feature = pixel_values["pixel_values"]
                          
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor

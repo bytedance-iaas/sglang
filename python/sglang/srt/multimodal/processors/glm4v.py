@@ -1,6 +1,7 @@
 import re
 from typing import List, Union
 import math
+import asyncio
 
 from decord import VideoReader
 from transformers.video_utils import VideoMetadata
@@ -100,6 +101,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         ).build(_processor)
         
         self.image_cache_table = FIFOTensorCache(CACHED_IMAGE_MAX_NUM)
+        self._cache_lock = asyncio.Lock()
 
     # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
     async def preprocess_video(self, vr: VideoReader):
@@ -298,82 +300,96 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 raise RuntimeError(
                     "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE) or increase image cache num by set SGL_IMAGE_CACHE_NUM"
                 )
+            async with self._cache_lock:
+                self.image_cache_table.pop_until(max_image_num - len(images))
 
-            self.image_cache_table.pop_until(max_image_num - len(images))
+                img_hash_keys = []
+                img_heights = []
+                new_processed_imgs = []
+                new_processed_img_idxes = []
+                img_token_nums = []
+                remove_image_idx = []
+                image_grid_thw_lists = []
+                
+                target_height, target_width = 0, 0
+                for image in images:
+                    height, width = smart_resize(self.TEMP_FACTOR, image.size[0], image.size[1])
+                    target_height , target_width = max(height, target_height), max(width, target_width)
+                
+                for img_idx in range(len(images)):
+                    hash_key = str(image_to_int(images[img_idx]))
+                    target_shape_str = "_" + str(target_height) + "_" + str(target_width)
+                    hash_key+=target_shape_str
+                    
+                    img_hash_keys.append(hash_key)
+                    image_height =  (target_width // self.PATCH_SIZE) * (target_height // self.PATCH_SIZE)
+                    # ref: transformers  
+                    img_token_num =  image_height // (self.MERGE_NUM * self.MERGE_NUM)
+                    
+                    # all images should hold same image_grid_thw
+                    image_grid_thw_lists.append(
+                        [
+                            1,
+                            int(target_width // self.PATCH_SIZE),
+                            int(target_height // self.PATCH_SIZE),
+                        ]
+                    )
 
-            img_hash_keys = []
-            img_heights = []
-            new_processed_imgs = []
-            new_processed_img_idxes = []
-            img_token_nums = []
-            remove_image_idx = []
-            image_grid_thw_lists = []
-            
-            target_height, target_width = 0, 0
-            for image in images:
-                height, width = smart_resize(self.TEMP_FACTOR, image.size[0], image.size[1])
-                target_height , target_width = max(height, target_height), max(width, target_width)
-            
-            for img_idx in range(len(images)):
-                hash_key = str(image_to_int(images[img_idx]))
-                target_shape_str = "_" + str(target_height) + "_" + str(target_width)
-                hash_key+=target_shape_str
+                    if img_token_num < 1:
+                        raise ValueError("invalid img token num")
+                    
+                    cached_item = self.image_cache_table.get(hash_key)
+                    
+                    if cached_item is None :
+                        new_processed_img_idxes.append(img_idx)
+                        new_processed_imgs.append(images[img_idx])
+                    else:
+                        remove_image_idx.append(img_idx)
+
+                    img_heights.append(image_height)
+                    img_token_nums.append(img_token_num)
                 
-                img_hash_keys.append(hash_key)
-                image_height =  (target_width // self.PATCH_SIZE) * (target_height // self.PATCH_SIZE)
-                # ref: transformers  
-                img_token_num =  image_height // (self.MERGE_NUM * self.MERGE_NUM)
-                
-                # all images should hold same image_grid_thw
-                image_grid_thw_lists.append(
-                    [
-                        1,
-                        int(target_width // self.PATCH_SIZE),
-                        int(target_height // self.PATCH_SIZE),
+                # 
+                args_dict = {"img_hash_keys": img_hash_keys, 
+                            "target_shape": (target_height, target_width), 
+                            "new_processed_imgs":new_processed_imgs,
+                            "new_processed_img_idxes": new_processed_img_idxes,
+                            "img_token_nums":img_token_nums,
+                            "remove_image_idx" :remove_image_idx, 
+                            "image_grid_thw_lists" : image_grid_thw_lists }
+
+                video_metadata = None
+
+                if base_output.videos:
+                    videos_processed = [
+                        await self.preprocess_video(video) for video in base_output.videos
                     ]
+                    base_output.videos, video_metadata = map(list, zip(*videos_processed))
+                    # transformer requires the video inputs to be under this format
+                    base_output.videos = [base_output.videos]
+                    video_metadata = [video_metadata]
+
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, video_metadata=video_metadata, **args_dict
                 )
 
-                if img_token_num < 1:
-                    raise ValueError("invalid img token num")
-                
-                cached_item = self.image_cache_table.get(hash_key)
-                
-                if cached_item is None :
-                    new_processed_img_idxes.append(img_idx)
-                    new_processed_imgs.append(images[img_idx])
-                else:
-                    remove_image_idx.append(img_idx)
-
-                img_heights.append(image_height)
-                img_token_nums.append(img_token_num)
-            
-            # 
-            args_dict = {"img_hash_keys": img_hash_keys, 
-                        "target_shape": (target_height, target_width), 
-                        "new_processed_imgs":new_processed_imgs,
-                        "new_processed_img_idxes": new_processed_img_idxes,
-                        "img_token_nums":img_token_nums,
-                        "remove_image_idx" :remove_image_idx, 
-                        "image_grid_thw_lists" : image_grid_thw_lists }
         else:
             args_dict = {}
-                
-        
-        
-        video_metadata = None
+            video_metadata = None
 
-        if base_output.videos:
-            videos_processed = [
-                await self.preprocess_video(video) for video in base_output.videos
-            ]
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
-            # transformer requires the video inputs to be under this format
-            base_output.videos = [base_output.videos]
-            video_metadata = [video_metadata]
+            if base_output.videos:
+                videos_processed = [
+                    await self.preprocess_video(video) for video in base_output.videos
+                ]
+                base_output.videos, video_metadata = map(list, zip(*videos_processed))
+                # transformer requires the video inputs to be under this format
+                base_output.videos = [base_output.videos]
+                video_metadata = [video_metadata]
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens, video_metadata=video_metadata, **args_dict
-        )
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens, video_metadata=video_metadata, **args_dict
+            )
+
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
