@@ -74,6 +74,11 @@ RUN cd /tmp && git clone https://github.com/bytedance-iaas/sglang.git -b ${branc
     cp -r /tmp/sglang/examples /sgl-workspace/sglang/examples && \
     rm -rf /tmp/sglang
 
+# deepgemm jit cache安装
+RUN wget https://tosv.byted.org/obj/iaas-servingkit/deep_gemm_cache_all_r1_0528.tar.gz && \
+    tar -C /root -xzvf deep_gemm_cache_all_r1_0528.tar.gz && \
+    rm -f deep_gemm_cache_all_r1_0528.tar.gz    
+
 # onion 安装
 RUN curl -fsSL https://mirrors.byted.org/extra-tools/ubuntu/GPG-KEY-system | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.byted.org/extra-tools/ubuntu jammy main" > /etc/apt/sources.list.d/volctools.list && \ 
