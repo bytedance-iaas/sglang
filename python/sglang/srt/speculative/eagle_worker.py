@@ -191,8 +191,8 @@ class EAGLEWorker(TpModelWorker):
         # Initialize decode attention backend
         self.draft_attn_backend = self._create_decode_backend()
 
-        # Initialize draft extend attention backend (respects speculative_attention_mode setting)
-        self.draft_extend_attn_backend = self._create_draft_extend_backend()
+        # # Initialize draft extend attention backend (respects speculative_attention_mode setting)
+        # self.draft_extend_attn_backend = self._create_draft_extend_backend()
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
@@ -401,20 +401,20 @@ class EAGLEWorker(TpModelWorker):
             f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-        # Capture extend
-        if self.draft_extend_attn_backend:
-            tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-            )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-            )
+        # # Capture extend
+        # if self.draft_extend_attn_backend:
+        #     tic = time.perf_counter()
+        #     before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        #     logger.info(
+        #         f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        #     )
+        #     self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
+        #         self
+        #     )
+        #     after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        #     logger.info(
+        #         f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+        #     )
 
     @property
     def draft_model_runner(self):
