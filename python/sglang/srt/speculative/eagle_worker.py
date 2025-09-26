@@ -14,7 +14,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -54,7 +53,7 @@ from sglang.srt.utils import (
 )
 
 if is_cuda():
-    from sgl_kernel import segment_packbits
+    pass
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
@@ -237,6 +236,7 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
+            "flashmla": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": (
                 self._create_fa3_prefill_backend
                 if not is_blackwell()
