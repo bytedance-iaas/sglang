@@ -236,7 +236,7 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
-            "flashmla": self._create_fa3_prefill_backend,
+            "flashmla": self._create_flashinfer_prefill_backend,
             "hybrid_linear_attn": (
                 self._create_fa3_prefill_backend
                 if not is_blackwell()
