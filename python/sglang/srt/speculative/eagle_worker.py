@@ -52,7 +52,7 @@ from sglang.srt.utils import (
 )
 
 if is_cuda():
-    pass
+    from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
@@ -325,7 +325,7 @@ class EAGLEWorker(TpModelWorker):
         return TRTLLMMLAMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
-    
+
 
     def _create_flashinfer_prefill_backend(self):
         if not global_server_args_dict["use_mla_backend"]:
