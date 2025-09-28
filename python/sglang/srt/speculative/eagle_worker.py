@@ -14,7 +14,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -53,7 +52,7 @@ from sglang.srt.utils import (
 )
 
 if is_cuda():
-    from sgl_kernel import segment_packbits
+    pass
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
@@ -233,6 +232,7 @@ class EAGLEWorker(TpModelWorker):
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_fa3_prefill_backend,
+            "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
@@ -325,6 +325,14 @@ class EAGLEWorker(TpModelWorker):
         return TRTLLMMLAMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
+    
+    def _create_flashmla_prefill_backend(self):
+        from sglang.srt.layers.attention.flashmla_backend import (
+            FlashMLABackend,
+        )
+
+        return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
+
 
     def _create_flashinfer_prefill_backend(self):
         if not global_server_args_dict["use_mla_backend"]:
