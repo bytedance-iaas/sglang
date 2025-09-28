@@ -205,7 +205,7 @@ class EAGLEWorker(TpModelWorker):
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 
-        return backend_map[backend_type]()
+        return backend_map[backend_type]() if backend_map[backend_type] else None
 
     def _create_decode_backend(self):
         backend_map = {
@@ -232,7 +232,7 @@ class EAGLEWorker(TpModelWorker):
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_fa3_prefill_backend,
-            "flashmla": self._create_flashmla_prefill_backend,
+            "flashmla": None,         
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
@@ -326,13 +326,6 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
     
-    def _create_flashmla_prefill_backend(self):
-        from sglang.srt.layers.attention.flashmla_backend import (
-            FlashMLABackend,
-        )
-
-        return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
-
 
     def _create_flashinfer_prefill_backend(self):
         if not global_server_args_dict["use_mla_backend"]:
