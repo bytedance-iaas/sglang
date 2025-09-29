@@ -205,6 +205,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
+            )            
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata = FlashMLADecodeMetadata(
