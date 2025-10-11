@@ -2262,6 +2262,14 @@ def is_remote_url(url: Union[str, Path]) -> bool:
     return m is not None
 
 
+def is_eic(url: str) -> bool:
+    """
+    Check if the URL is a eic URL of the format:
+    eic://<model_name>
+    """
+    return url.startswith("eic://")
+
+
 def parse_connector_type(url: str) -> str:
     """
     Parse the connector type from the URL of the format:

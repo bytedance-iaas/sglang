@@ -85,6 +85,9 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        self.backuped_storage = False
+        # for block-wise cache
+        self.content_hash = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
