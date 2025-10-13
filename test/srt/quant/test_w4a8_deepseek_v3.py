@@ -139,8 +139,6 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             "--dp",
             "8",
             "--enable-dp-attention",
-            "--moe-dense-tp-size",
-            "1",
             "--moe-runner-backend",
             "cutlass",
         ]
