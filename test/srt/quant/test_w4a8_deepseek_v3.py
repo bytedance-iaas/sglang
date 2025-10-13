@@ -117,6 +117,7 @@ class TestDeepseekV3W4Afp8Mtp(CustomTestCase):
             self.assertGreater(metrics["accuracy"], 0.935)
             self.assertGreater(avg_spec_accept_length, 2.9)
 
+
 class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -138,7 +139,6 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             "--dp",
             "8",
             "--enable-dp-attention",
-
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
