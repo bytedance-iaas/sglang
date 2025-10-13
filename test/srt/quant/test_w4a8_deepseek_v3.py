@@ -135,6 +135,10 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             "deepep",
             "--deepep-mode",
             "normal",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
