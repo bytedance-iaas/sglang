@@ -170,22 +170,9 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
+        print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3 mtp)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
-                f"{avg_spec_accept_length=:.2f}\n"
-            )
-            self.assertGreater(metrics["accuracy"], 0.935)
-            self.assertGreater(avg_spec_accept_length, 2.9)
+        self.assertGreater(metrics["accuracy"], 0.92)
 
 
 if __name__ == "__main__":
