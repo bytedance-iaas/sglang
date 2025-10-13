@@ -139,6 +139,10 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             "--dp",
             "8",
             "--enable-dp-attention",
+            "--moe-dense-tp-size",
+            "1",
+            "--moe-runner-backend",
+            "cutlass",
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
