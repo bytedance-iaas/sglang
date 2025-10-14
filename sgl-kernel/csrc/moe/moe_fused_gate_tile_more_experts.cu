@@ -624,7 +624,7 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     } else {
       TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
     }
-    else {
+   } else {
     TORCH_CHECK(false, "moe_fused_gate_tiled_static: unsupported combination");
   }
 
