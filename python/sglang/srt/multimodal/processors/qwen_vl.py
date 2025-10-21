@@ -3,12 +3,14 @@ import math
 import os
 import re
 from typing import List, Union
+from unittest import result
 
 import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
+from python.sglang.srt.utils import dataclass_to_string_truncated
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -237,11 +239,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             video_data=request_obj.video_data,
             multimodal_tokens=self.mm_tokens,
         )
+        # print(f"process_mm_data_async: base_output {dataclass_to_string_truncated(base_output)}")
 
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
+        # print(f"process_mm_data_async: base_output after resize {dataclass_to_string_truncated(base_output)}")
 
         if base_output.videos:
             base_output.videos = [
@@ -251,8 +255,12 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+        # print(f"process_mm_data_async: mm_items after process_and_combine_mm_data {dataclass_to_string_truncated(mm_items)}")
 
         input_ids = input_ids.flatten()
+        # print(f"process_mm_data_async: input_ids after process_and_combine_mm_data {dataclass_to_string_truncated(input_ids)}, input_ids len {len(input_ids)}")
+        # print(f"process_mm_data_async: ret after process_and_combine_mm_data {dataclass_to_string_truncated(ret)}")
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -268,6 +276,18 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
+
+        # result = {
+        #     "input_ids": input_ids.tolist(),
+        #     "mm_items": mm_items,
+        #     "im_start_id": self.IM_START_TOKEN_ID,
+        #     "im_end_id": self.IM_END_TOKEN_ID,
+        #     "im_token_id": self.mm_tokens.image_token_id,
+        #     "video_token_id": self.mm_tokens.video_token_id,
+        #     "mrope_positions": mrope_positions,
+        #     "mrope_position_delta": mrope_position_delta,
+        # }
+        # print(f"process_mm_data_async result {dataclass_to_string_truncated(result)}")
 
         return {
             "input_ids": input_ids.tolist(),

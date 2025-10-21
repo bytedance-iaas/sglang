@@ -57,13 +57,7 @@ class FakeKVSender(BaseKVSender):
 
 
 class FakeKVReceiver(BaseKVReceiver):
-    def __init__(
-        self,
-        mgr: BaseKVManager,
-        bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
-    ):
+    def __init__(self, **kwargs):
         self.has_init = False
 
     def poll(self) -> KVPoll:

@@ -108,6 +108,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
     "enable_multimodal",
+    "disaggregation_mode",
+    "encoder_disaggregated",
 ]
 
 # Put some global args for easy access
@@ -209,6 +211,9 @@ class MultimodalDataItem:
     modality: Modality
     hash: int = None
     pad_value: int = None
+    # the token len of this item in final embedding
+    token_len: int = None
+    image_sizes: Tuple[int, int] = None
     offsets: Optional[list] = None
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
@@ -277,18 +282,10 @@ class MultimodalDataItem:
         return self.is_image() or self.is_video() or self.is_audio()
 
     def validate(self):
+        # print(f"{self.offsets=}")
+        self.token_len = sum(e - s + 1 for s, e in self.offsets)
         ...
         # TODO
-
-    @staticmethod
-    def from_dict(obj: dict):
-        kwargs = dict(obj)
-        modality = kwargs.pop("modality")
-        if isinstance(modality, str):
-            modality = Modality[modality]
-        ret = MultimodalDataItem(modality=modality, **kwargs)
-        ret.validate()
-        return ret
 
     def merge(self, other):
         self.feature += other.feature
@@ -500,6 +497,7 @@ class Req:
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        self.mm_embedding_indices: Optional[np.ndarray] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -597,6 +595,11 @@ class Req:
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+
+        self.bootstrap_host_encode: str = bootstrap_host
+        self.bootstrap_port_encode: Optional[int] = bootstrap_port
+        self.bootstrap_room: Optional[int] = bootstrap_room
+
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # For data parallel rank routing
@@ -615,15 +618,27 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
+        # for encoder-disaggregation
+        self.mm_embedding_lens = []
+        # self.mm_embedding_token_sum = []
+        self.mm_hashes = []
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
 
-    def extend_image_inputs(self, image_inputs):
+    def extend_mm_inputs(self, mm_inputs: MultimodalInputs):
         if self.multimodal_inputs is None:
-            self.multimodal_inputs = image_inputs
+            self.multimodal_inputs = mm_inputs
         else:
-            self.multimodal_inputs.merge(image_inputs)
+            self.multimodal_inputs.merge(mm_inputs)
+
+        self.mm_hashes = [mm_item.hash for mm_item in self.multimodal_inputs.mm_items]
+        self.mm_embedding_lens = [
+            mm_item.token_len for mm_item in self.multimodal_inputs.mm_items
+        ]
+        # print(f"{self.mm_embedding_lens=}")
+        self.cu_mm_embedding_len = sum(self.mm_embedding_lens)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -677,6 +692,7 @@ class Req:
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def check_finished(self):
+        # logger.info(f"enter check_finished")
         if self.finished():
             return
 
@@ -686,10 +702,12 @@ class Req:
             )
             return
 
+        # logger.info(f"sampling_params.max_new_tokens {self.sampling_params.max_new_tokens}")
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
+            # logger.info(f"finished_reason = FINISH_LENGTH return, {self.finished_reason.to_json()}")
             return
 
         if self.grammar is not None:
@@ -784,6 +802,12 @@ class Req:
         self.return_logprob = False
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+
+    def contains_mm_input(self) -> bool:
+        return (
+            self.multimodal_inputs is not None
+            and self.multimodal_inputs.contains_mm_input()
         )
 
     def __repr__(self):
@@ -911,6 +935,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
         chunked_req: Optional[Req] = None,
+        device=None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -932,11 +957,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
-            device=req_to_token_pool.device,
+            device=device or req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             chunked_req=chunked_req,
+            # to work with decode node with VLM
+            # it's going to be set in `prepare_for_extend` later and then be pickled anyway, so this won't introduce overhead
+            multimodal_inputs=[req.multimodal_inputs for req in reqs],
         )
 
     def batch_size(self):
@@ -1115,28 +1143,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, should_set_req_pool_indices=True):
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        # print(f"bs {bs}")
+        if should_set_req_pool_indices:
+            req_pool_indices = self.alloc_req_slots(bs)
 
         # Init tensors
         reqs = self.reqs
+        # print(f"reqs {reqs}")
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        # print(f"input_ids {input_ids}")
         extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # print(f"extend_num_tokens {extend_num_tokens}")
         seq_lens = [len(r.fill_ids) for r in reqs]
+        # print(f"seq_lens {seq_lens}")
         prefix_lens = [len(r.prefix_indices) for r in reqs]
+        # print(f"prefix_lens {prefix_lens}")
         extend_lens = [r.extend_input_len for r in reqs]
+        # print(f"extend_lens {extend_lens}")
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
 
-        req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
-        )
+        if should_set_req_pool_indices:
+            req_pool_indices_tensor = torch.tensor(
+                req_pool_indices, dtype=torch.int64
+            ).to(self.device, non_blocking=True)
         input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1161,22 +1198,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            if should_set_req_pool_indices:
+                req.req_pool_idx = req_pool_indices[i]
+                assert seq_len - pre_len == req.extend_input_len
 
-            if pre_len > 0:
-                self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
-                )
-                if isinstance(self.tree_cache, SWAChunkCache):
-                    self.tree_cache.evict_swa(
-                        req, pre_len, self.model_config.attention_chunk_size
+                if pre_len > 0:
+                    self.req_to_token_pool.write(
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                     )
+                    if isinstance(self.tree_cache, SWAChunkCache):
+                        self.tree_cache.evict_swa(
+                            req, pre_len, self.model_config.attention_chunk_size
+                        )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+            # print(f"{req.multimodal_inputs=}")
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1240,28 +1279,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids = None
 
         # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-        else:
-            last_loc = get_last_loc(
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_tensor,
-                prefix_lens_tensor,
-            )
-            out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
-            )
+        if should_set_req_pool_indices:
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            else:
+                last_loc = get_last_loc(
+                    self.req_to_token_pool.req_to_token,
+                    req_pool_indices_tensor,
+                    prefix_lens_tensor,
+                )
+                out_cache_loc = self.alloc_paged_token_slots_extend(
+                    prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
+                )
 
         # Set fields
         self.input_ids = input_ids_tensor
-        self.req_pool_indices = req_pool_indices_tensor
+        if should_set_req_pool_indices:
+            self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
-        self.out_cache_loc = out_cache_loc
+        if should_set_req_pool_indices:
+            self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
             else None
         )
+        # print(f"{multimodal_inputs=}")
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -1283,27 +1326,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        # Write to req_to_token_pool
-        if support_triton(global_server_args_dict.get("attention_backend")):
-            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
+        if should_set_req_pool_indices:
+            # Write to req_to_token_pool
+            if support_triton(global_server_args_dict.get("attention_backend")):
+                # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
-            write_req_to_token_pool_triton[(bs,)](
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_tensor,
-                prefix_lens_tensor,
-                seq_lens_tensor,
-                extend_lens_tensor,
-                out_cache_loc,
-                self.req_to_token_pool.req_to_token.shape[1],
-            )
-        else:
-            pt = 0
-            for i in range(bs):
-                self.req_to_token_pool.write(
-                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                    out_cache_loc[pt : pt + extend_lens[i]],
+                write_req_to_token_pool_triton[(bs,)](
+                    self.req_to_token_pool.req_to_token,
+                    req_pool_indices_tensor,
+                    prefix_lens_tensor,
+                    seq_lens_tensor,
+                    extend_lens_tensor,
+                    out_cache_loc,
+                    self.req_to_token_pool.req_to_token.shape[1],
                 )
-                pt += extend_lens[i]
+            else:
+                pt = 0
+                for i in range(bs):
+                    self.req_to_token_pool.write(
+                        (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                        out_cache_loc[pt : pt + extend_lens[i]],
+                    )
+                    pt += extend_lens[i]
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -1345,6 +1389,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
         )
         self.extend_lens.extend([1] * running_bs)
+        # print(f"ScheduleBatch.extend_lens {self.extend_lens}")
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
@@ -1690,27 +1735,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.forward_mode.is_decode_or_idle():
-            attention_backend_str = global_server_args_dict["decode_attention_backend"]
-        else:
-            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
-        # Create seq_lens_cpu when needed
-        if (
-            attention_backend_str == "fa3"
-            or (
-                global_server_args_dict["use_mla_backend"]
-                and attention_backend_str == "flashinfer"
-            )
-            or attention_backend_str == "flashmla"
-            or attention_backend_str == "cutlass_mla"
-            or attention_backend_str == "ascend"
-            or global_server_args_dict["enable_two_batch_overlap"]
-        ):
-            seq_lens_cpu = (
-                seq_lens_cpu_cache
-                if seq_lens_cpu_cache is not None
-                else self.seq_lens.cpu()
-            )
+        use_causal_attn = global_server_args_dict["disaggregation_mode"] != "encode"
+        if use_causal_attn:
+            if self.forward_mode.is_decode_or_idle():
+                attention_backend_str = global_server_args_dict[
+                    "decode_attention_backend"
+                ]
+            else:
+                attention_backend_str = global_server_args_dict[
+                    "prefill_attention_backend"
+                ]
+            # Create seq_lens_cpu when needed
+            if (
+                attention_backend_str == "fa3"
+                or (
+                    global_server_args_dict["use_mla_backend"]
+                    and attention_backend_str == "flashinfer"
+                )
+                or attention_backend_str == "flashmla"
+                or attention_backend_str == "cutlass_mla"
+                or attention_backend_str == "ascend"
+                or global_server_args_dict["enable_two_batch_overlap"]
+            ):
+                seq_lens_cpu = (
+                    seq_lens_cpu_cache
+                    if seq_lens_cpu_cache is not None
+                    else self.seq_lens.cpu()
+                )
+            else:
+                seq_lens_cpu = None
         else:
             seq_lens_cpu = None
 
@@ -1786,6 +1839,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            multimodal_inputs=self.multimodal_inputs,
         )
 
     def _evict_tree_cache_if_needed(
@@ -1839,6 +1893,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
+            f" req_ids={[r.rid for r in self.reqs]}"
+            # f" input_ids={self.input_ids}, shape={self.input_ids.shape}"
+            f" seq_lens={self.seq_lens}"
+            f" output_ids={self.output_ids}"
+            f" prefix_lens={self.prefix_lens}"
+            f" extend_lens={self.extend_lens}"
+            f" extend_num_tokens={self.extend_num_tokens}"
+            f" return_logprob={self.return_logprob}"
         )
 
 

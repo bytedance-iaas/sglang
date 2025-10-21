@@ -266,7 +266,7 @@ class TestFlashAttentionBackend(CustomTestCase):
         )
 
         # Set the prefix KV cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        forward_batch.mm_embedding_pool.set_kv_buffer(
             layer,
             torch.arange(self.batch_size * cache_len, device=self.device),
             cache_k,

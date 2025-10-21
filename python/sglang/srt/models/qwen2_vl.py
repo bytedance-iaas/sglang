@@ -45,7 +45,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    global_server_args_dict,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -172,6 +176,7 @@ class Qwen2VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -179,6 +184,7 @@ class Qwen2VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -404,15 +410,23 @@ class Qwen2VisionTransformer(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = (
+            torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+            .cumsum(dim=0, dtype=torch.int32)
+            .to(self.device)
+        )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         # transformers
         x = x.unsqueeze(1)
         for blk in self.blocks:
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                max_seqlen=max_seqlen,
+            )
 
         # adapter
         x = self.merger(x)
@@ -451,14 +465,19 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen2VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
+        self.is_encoder = global_server_args_dict["disaggregation_mode"] == "encode"
+        self.should_load_vision_model = (
+            self.is_encoder or not global_server_args_dict["encoder_disaggregated"]
         )
+        if self.should_load_vision_model:
+            self.visual = Qwen2VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+            )
 
         self.model = Qwen2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -533,18 +552,20 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
+        if self.is_encoder:
+            pass
+        else:
             if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
+                positions = forward_batch.mrope_positions
+                if not (
+                    forward_batch.forward_mode.is_decode()
+                    or not forward_batch.contains_image_inputs()
+                ):
+                    assert positions.ndim == 2 and positions.size(0) == 3, (
+                        "multimodal section rotary embedding requires "
+                        f"(3, seq_len) positions, but got {positions.size()}"
+                    )
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -552,8 +573,9 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
         )
-
-        if get_embedding:
+        if self.is_encoder:
+            return hidden_states[0]
+        elif get_embedding:
             return self.pooler(hidden_states, forward_batch)
         else:
             return self.logits_processor(
@@ -574,6 +596,12 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
+            if "visual" in name:
+                if not self.should_load_vision_model:
+                    continue
+            elif self.is_encoder:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

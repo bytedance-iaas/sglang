@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict
+import time
 from typing import Dict, List, Union
 
 import psutil
@@ -107,7 +108,9 @@ class DetokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            # logger.info(f"detokenizer receive from scheduler, cur time is {time.time()}")
             output = self._request_dispatcher(recv_obj)
+            # logger.info(f"detokenizer send to tokenizer, cur time is {time.time()}")
             self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(

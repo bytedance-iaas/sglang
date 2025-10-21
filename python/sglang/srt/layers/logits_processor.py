@@ -258,6 +258,8 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
+                # print("11111111")
+                # print(f"logits_metadata.extend_seq_lens", logits_metadata.extend_seq_lens)
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
@@ -272,7 +274,12 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
-            pruned_states = hidden_states[last_index]
+            # pruned_states = hidden_states[last_index]
+            # 检查hidden_states是否为列表，如果是则先获取第一个元素再进行索引
+            if isinstance(hidden_states, list):
+                pruned_states = hidden_states[0][last_index]
+            else:
+                pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None

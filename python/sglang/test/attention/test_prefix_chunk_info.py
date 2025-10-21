@@ -114,7 +114,7 @@ class MockReqToTokenPool:
 def check_kv_indices(forward_batch):
     for i in range(forward_batch.num_prefix_chunks):
         computed_kv_indices = forward_batch.prefix_chunk_kv_indices[i]
-        req_to_token = forward_batch.req_to_token_pool.req_to_token[
+        req_to_token = forward_batch.mm_embedding_pool.req_to_token[
             : forward_batch.batch_size, :
         ]
         ref_kv_indices = torch.empty(

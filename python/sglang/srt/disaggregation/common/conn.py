@@ -5,10 +5,8 @@ import logging
 import socket
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
-import numpy as np
-import numpy.typing as npt
 import requests
 import zmq
 from aiohttp import web
@@ -17,7 +15,6 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
     BaseKVReceiver,
-    BaseKVSender,
     KVArgs,
     KVPoll,
 )
@@ -47,7 +44,7 @@ class CommonKVManager(BaseKVManager):
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.bootstrap_port = server_args.get_bootstrap_sending_port()
         self.dist_init_addr = server_args.dist_init_addr
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
@@ -86,7 +83,7 @@ class CommonKVManager(BaseKVManager):
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
         payload = {
-            "role": "Prefill",
+            "role": self.disaggregation_mode.role_str,
             "tp_size": self.tp_size,
             "dp_size": self.dp_size,
             "rank_ip": get_local_ip_by_remote(),
@@ -343,11 +340,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
         role = data["role"]
-        tp_size = data["tp_size"]
-        dp_size = data["dp_size"]
-        rank_ip = data["rank_ip"]
-        rank_port = int(data["rank_port"])
-        engine_rank = int(data["engine_rank"])
+        tp_size = data.get("tp_size", None)
+        dp_size = data.get("dp_size", None)
+        rank_ip = data.get("rank_ip", None)
+        rank_port = data.get("rank_port", None)
+        engine_rank = int(data.get("engine_rank", "-1"))
 
         if self.tp_size is None:
             self.tp_size = tp_size
@@ -360,7 +357,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self.tp_size_per_dp_rank = tp_size_per_dp_rank
 
         # Add lock to make sure thread-safe
-        if role == "Prefill":
+        if role == DisaggregationMode.PREFILL.role_str:
             dp_group = engine_rank // tp_size_per_dp_rank
             tp_rank_in_dp_group = engine_rank % tp_size_per_dp_rank
 

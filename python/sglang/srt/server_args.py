@@ -73,6 +73,8 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    # the fraction of size of encoder mm embedding pool in all runtime cache pool (including KVCacche)
+    encoder_mem_fraction: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
@@ -252,10 +254,13 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_bootstrap_port_encode: int = 8999
     disaggregation_decode_tp: Optional[int] = None
     disaggregation_decode_dp: Optional[int] = None
+    disaggregation_encode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
+    encoder_disaggregated: Optional[bool] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
 
@@ -337,7 +342,9 @@ class ServerArgs:
             from sglang.srt.configs.model_config import ModelConfig
 
             model_config = ModelConfig.from_server_args(self)
-            if model_config.is_multimodal:
+            if model_config.is_multimodal and not (
+                self.disaggregation_mode == "encode" or self.encoder_disaggregated
+            ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # Set chunked prefill size, which depends on the gpu memory capacity
@@ -579,8 +586,27 @@ class ServerArgs:
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
+        elif self.disaggregation_mode == "encode":
+            if not self.disable_overlap_schedule:
+                self.disable_overlap_schedule = True
+                print(f"Automatically turn off overlap schedule for encoder")
+
+            # self.disable_cuda_graph = True
+            # print(f"Automatically turn off cuda graph for encoder")
+
+            if self.disaggregation_decode_tp is None:
+                self.disaggregation_decode_tp = self.tp_size
+            if self.disaggregation_encode_dp is None:
+                self.disaggregation_encode_dp = self.dp_size
+
             self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled for prefill server")
+            logger.warning("Cuda graph is disabled for encode server")
+
+            # self.disaggregation_prefill_pp = self.pp_size
+            self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
+
+            # self.disable_cuda_graph = True
+            # logger.warning("Cuda graph is disabled for encode server")
 
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -590,6 +616,10 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        # EPD
+        if self.disaggregation_mode == "text":
+            self.encoder_disaggregated = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -798,6 +828,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--encoder-mem-fraction",
+            type=float,
+            default=ServerArgs.encoder_mem_fraction,
+            help="The fraction of size of encoder mm embedding pool in all runtime cache pool (including KVCacche)",
         )
         parser.add_argument(
             "--max-running-requests",
@@ -1720,8 +1756,8 @@ class ServerArgs:
             "--disaggregation-mode",
             type=str,
             default="null",
-            choices=["null", "prefill", "decode"],
-            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+            choices=["null", "prefill", "decode", "encode", "text"],
+            help='Only used for PD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for encode-only server. If not specified, it is not PD disaggregated',
         )
         parser.add_argument(
             "--disaggregation-transfer-backend",
@@ -1731,10 +1767,22 @@ class ServerArgs:
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
+            "--encoder-disaggregated",
+            action="store_true",
+            default=ServerArgs.encoder_disaggregated,
+            help="Indicate the P&D, that this is an EPD Disaggregation",
+        )
+        parser.add_argument(
             "--disaggregation-bootstrap-port",
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-port-encode",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_port_encode,
+            help="Bootstrap server port on the prefill server. Default is 8999.",
         )
         parser.add_argument(
             "--disaggregation-decode-tp",
@@ -1747,6 +1795,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_dp,
             help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-encode-dp",
+            type=int,
+            default=ServerArgs.disaggregation_encode_dp,
+            help="Encode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
         )
         parser.add_argument(
             "--disaggregation-prefill-pp",
@@ -1982,13 +2036,31 @@ class ServerArgs:
             f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
         )
 
+    def get_bootstrap_sending_port(self) -> int:
+        """
+        bootstrap port varies in encode and prefill servers
+        """
+        return (
+            self.disaggregation_bootstrap_port_encode
+            if self.disaggregation_mode == "encode"
+            else self.disaggregation_bootstrap_port
+        )
+
+    # def get_bootstrap_sending_port(self) -> int:
+    #     """
+    #         bootstrap port varies in encode and prefill servers
+    #     """
+    #     return self.disaggregation_bootstrap_port_encode if (
+    #             self.disaggregation_mode == "prefill" or self.disaggregation_mode == "text") \
+    #         else self.disaggregation_bootstrap_port
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
 
     Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
             to ensure compatibility with `parse_args` when no arguments are passed.
 
     Returns:

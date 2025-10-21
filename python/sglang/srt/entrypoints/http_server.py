@@ -26,7 +26,7 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -287,7 +287,7 @@ async def get_model_info():
 
 @app.get("/get_server_info")
 async def get_server_info():
-    # Returns interna states per DP.
+    # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
@@ -1004,7 +1004,10 @@ def _execute_server_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        if server_args.disaggregation_mode == "null":
+        if (
+            server_args.disaggregation_mode == "null"
+            or server_args.disaggregation_mode == "text"
+        ):
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -1014,30 +1017,35 @@ def _execute_server_warmup(
             assert res.status_code == 200, f"{res}"
         else:
             logger.info(f"Start of prefill warmup ...")
-            json_data = {
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 8,
-                    "ignore_eos": True,
-                },
-                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                # This is a hack to ensure fake transfer is enabled during prefill warmup
-                # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                    for i in range(server_args.dp_size)
-                ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
-            }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
-            )
-            logger.info(
-                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
-            )
+
+            if server_args.disaggregation_mode == "encode":
+                # TODO
+                pass
+            else:
+                json_data = {
+                    "sampling_params": {
+                        "temperature": 0.0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                    "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                    # This is a hack to ensure fake transfer is enabled during prefill warmup
+                    # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                    "bootstrap_room": [
+                        i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                        for i in range(server_args.dp_size)
+                    ],
+                    "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                }
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=1800,  # because of deep gemm precache is very long if not precache.
+                )
+                logger.info(
+                    f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+                )
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -1079,7 +1087,7 @@ def _wait_and_warmup(
         register_disaggregation_server(
             server_args.disaggregation_mode,
             server_args.port,
-            server_args.disaggregation_bootstrap_port,
+            server_args.get_bootstrap_sending_port(),
             server_args.pdlb_url,
         )
 

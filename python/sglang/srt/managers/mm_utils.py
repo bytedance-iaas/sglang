@@ -5,7 +5,7 @@ Multi-modality utils
 import hashlib
 import pickle
 from abc import abstractmethod
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -18,9 +18,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
+from sglang.srt.mem_cache.multimodal_cache import (
+    MultimodalCache,
+    MultiModalStaticCache,
+    PagedMultiModalEmbeddingPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, print_info_once, print_warning_once
 from sglang.utils import logger
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -282,17 +286,13 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
-embedding_cache: Optional[MultiModalCache] = None
+embedding_cache: Optional[MultimodalCache] = None
+is_epd = False
 
 
 def init_embedding_cache(max_size: int = 0):
     global embedding_cache
-    embedding_cache = MultiModalCache(max_size)
-
-
-def get_embedding_hash(embedding_items: List[MultimodalDataItem]) -> int:
-    hash_list = [item.hash for item in embedding_items]
-    return hash(tuple(hash_list))
+    embedding_cache = MultiModalStaticCache(max_size)
 
 
 def get_embedding_chunk(
@@ -364,40 +364,81 @@ def _get_precomputed_embedding(
 def _get_chunked_prefill_embedding(
     data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
     embedding_items: List[MultimodalDataItem],
-    items_size: List[int],
+    cu_items_size: List[int],
+    item_token_lens: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    disaggregation_mode: Optional[str] = "null",
+    mm_embedding_pool: Optional[PagedMultiModalEmbeddingPool] = None,
+    mm_embedding_allocator=None,
 ) -> Optional[torch.Tensor]:
+    """
+    :param mm_embedding_pool: If not none, mm embeddings are already presented in this pool
+    """
+
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
     # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    max_iterations = min(len(cu_items_size) - 1, len(prefix_length))
     for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
+        token_length = item_token_lens[i]
+        if cu_items_size[i] == cu_items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        embedding_items_per_req = embedding_items[
+            cu_items_size[i] : cu_items_size[i + 1]
+        ]
+        mm_hashes = [item.hash for item in embedding_items_per_req]
+        combined_hash = embedding_cache.combine_hashes(mm_hashes)
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
-        embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
-        if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
-                )
 
+        embedding_per_req = embedding_cache.get_mm_embedding(mm_hashes)
+        if embedding_per_req is None:
+            if global_server_args_dict["encoder_disaggregated"]:
+                mm_embedding_pool = mm_embedding_allocator.get_kvcache()
+                assert mm_embedding_pool
+                embedding_per_req = mm_embedding_pool.get_mm_embedding(
+                    mm_hashes, combined_hash
+                )
+                # print(f"mm_utils 410 | {mm_hashes=} {combined_hash=}")
+                # print(f"{embedding_per_req.shape=}")
+            else:
+                if disaggregation_mode != "encode" and disaggregation_mode != "null":
+                    print("NO!!!!!!!!!!!!!!!!!")
+                    raise RuntimeError("Non-Encode should not call data_embedding_func")
+                embedding_per_req = data_embedding_func(embedding_items_per_req)
+                # print(f"embedding_cache {embedding_cache}"). embedding_cache is MultiModalStaticCache
+                if not embedding_cache.set_mm_embedding(
+                    combined_hash, embedding_per_req, mm_embedding_allocator
+                ):
+                    print_info_once(
+                        "Multimodal embedding cache is full. Consider increasing the "
+                        "`SGLANG_MM_CACHE_SIZE_MB` environment variable."
+                    )
+
+        assert embedding_per_req is not None
+        if disaggregation_mode == "encode":
+            logger.debug(f"mm_utils 419 | {combined_hash}")
+            assert isinstance(embedding_per_req, torch.Tensor)
+            mm_embedding_pool = mm_embedding_allocator.get_kvcache()
+            mm_embedding_pool.set_mm_embedding(
+                combined_hash, embedding_per_req, mm_embedding_allocator
+            )
+            embedding_list.append(
+                embedding_per_req
+            )  # FIXME(encode's model should early exit)
+            continue
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
             embedding=embedding_per_req,
             extend_prefix_len=prefix_length[i],
             extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
             items_offset=items_offset,
         )
+        # print(f"{embedding_per_req_chunk.shape=}")
         # remove this item from cache if chunk reaches to the end
         embedding_per_req_length = (
             embedding_per_req.shape[0]
@@ -405,7 +446,7 @@ def _get_chunked_prefill_embedding(
             else embedding_per_req.shape[0] * embedding_per_req.shape[1]
         )
         if end_index == embedding_per_req_length:
-            embedding_cache.free(embedding_items_hash)
+            embedding_cache.free(combined_hash, None)
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None
@@ -455,11 +496,14 @@ def get_embedding_and_mask(
     embedding_items: List[MultimodalDataItem],
     placeholder_tensor: torch.Tensor,
     input_ids: torch.Tensor,
-    items_size: List[int],
+    cu_items_count: List[int],
+    item_token_lens: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    disaggregation_mode: Optional[str] = "null",
+    mm_embedding_allocator=None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
 
@@ -468,7 +512,7 @@ def get_embedding_and_mask(
         embedding_items: List of multimodal items to embed
         placeholder_tensor: Tensor containing token IDs that serve as placeholders for multimodal content
         input_ids: The input token IDs tensor
-        items_size: Cumulative sizes of multimodal items per request
+        cu_items_count: Cumulative sizes of multimodal items per request
         prefix_length: Prefix lengths for each request
         extend_length: Sequence lengths for each request
         items_offset_list: List of offset ranges for multimodal items in each request
@@ -478,19 +522,26 @@ def get_embedding_and_mask(
         - The generated embeddings tensor
         - A boolean mask tensor indicating where these embeddings should be placed
     """
+    # for encoder, get embedding only
+
     # 1. Get embedding
     embedding = _get_precomputed_embedding(embedding_items)
     if embedding is None:
         embedding = _get_chunked_prefill_embedding(
             data_embedding_func,
             embedding_items,
-            items_size,
+            cu_items_count,
+            item_token_lens,
             prefix_length,
             extend_length,
             items_offset_list,
+            disaggregation_mode,
+            mm_embedding_allocator=mm_embedding_allocator,
         )
         if embedding is None:
             return None, None
+    if disaggregation_mode == "encode":
+        return embedding, None
     # 2. Get mask
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
@@ -508,8 +559,10 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
-    placeholder_tokens: dict[Modality, List[int]] = None,
-) -> Optional[torch.Tensor]:
+    disaggregation_mode: Optional[str] = "null",
+    mm_embedding_allocator=None,
+    **kwargs,
+) -> Union[Optional[torch.Tensor], List[torch.Tensor]]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
 
@@ -530,7 +583,7 @@ def embed_mm_inputs(
 
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
-    item_flatten_list = []
+    item_flatten_list: List[MultimodalDataItem] = []
     for mm_inputs in mm_inputs_list:
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
@@ -557,6 +610,8 @@ def embed_mm_inputs(
             )
             # calculate per request items length offset
             items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
+            item_token_lens = [item.token_len for item in items]
+
             items_offsets = []
             for i, mm_inputs in enumerate(mm_inputs_list):
                 mm_items = [
@@ -568,21 +623,26 @@ def embed_mm_inputs(
                 items_offsets.append(
                     flatten_nested_list([item.offsets for item in mm_inputs.mm_items])
                 )
-            items_size = torch.cumsum(items_size, dim=0).tolist()
-
+            cu_items_size = torch.cumsum(items_size, dim=0).tolist()
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
                 placeholder_tensor=placeholder_tensor,
                 input_ids=input_ids,
-                items_size=items_size,
+                cu_items_count=cu_items_size,
+                item_token_lens=item_token_lens,
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                disaggregation_mode=disaggregation_mode,
+                mm_embedding_allocator=mm_embedding_allocator,
             )
+            # print(f"{embedding.shape=}")
             embeddings += [embedding]
             masks += [mask]
 
+    if disaggregation_mode == "encode":
+        return embeddings
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
     # Important: clamp after getting original multimodal regions
@@ -606,11 +666,12 @@ def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
-    multimodal_model: Optional[nn.Module] = None,
-    data_embedding_funcs: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
-    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
+    positions: torch.Tensor,
+    # multimodal_model: Optional[nn.Module] = None,
+    # data_embedding_funcs: Dict[
+    #     Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
+    # ] = None,
+    # placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -628,8 +689,14 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
-    assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
+
+    disaggregation_mode = global_server_args_dict["disaggregation_mode"]
+
+    if disaggregation_mode == "encode":
+        embed_tokens = None
+    else:
+        assert hasattr(language_model, "get_input_embeddings")
+        embed_tokens = language_model.get_input_embeddings()
     if (
         not forward_batch.forward_mode.is_decode()
         and forward_batch.contains_mm_inputs()
@@ -637,25 +704,30 @@ def general_mm_embed_routine(
         mm_inputs_list = [
             mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
         ]
+        # print(f"mm_inputs_list len {len(mm_inputs_list)}")
+        # print(f"mm_inputs_list {mm_inputs_list}")
         extend_prefix_lens = [
             prefix_len
             for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
+        # print(f"extend_prefix_lens {extend_prefix_lens}, len {len(extend_prefix_lens)}")
         extend_seq_lens = [
             seq_len
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
+        # print(f"extend_seq_lens len {len(extend_seq_lens)}")
+        # print(f"extend_seq_lens {extend_seq_lens}, len {len(extend_seq_lens)}")
         inputs_embeds = embed_mm_inputs(
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
             input_embedding=embed_tokens,
-            multimodal_model=multimodal_model,
-            data_embedding_func_mapping=data_embedding_funcs,
-            placeholder_tokens=placeholder_tokens,
+            disaggregation_mode=disaggregation_mode,
+            mm_embedding_allocator=forward_batch.mm_embedding_allocator,
+            **kwargs,
         )
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
@@ -663,11 +735,16 @@ def general_mm_embed_routine(
     else:
         inputs_embeds = embed_tokens(input_ids)
 
+    if disaggregation_mode == "encode":
+        # print(f"return type {type(inputs_embeds)}")
+        return inputs_embeds
+
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=inputs_embeds,
-        **kwargs,
+        positions=positions,
+        # **kwargs,
     )
     return hidden_states
 

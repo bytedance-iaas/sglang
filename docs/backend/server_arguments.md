@@ -290,14 +290,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## PD disaggregation
 
-| Arguments | Description | Defaults |
-|-----------|-------------|----------|
-| `--disaggregation-mode` | PD disaggregation mode: "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only). | null |
-| `--disaggregation-transfer-backend` | The transfer backend for PD disaggregation. | mooncake |
-| `--disaggregation-bootstrap-port` | The bootstrap port for PD disaggregation. | 8998 |
-| `--disaggregation-decode-tp` | The decode TP for PD disaggregation. | None |
-| `--disaggregation-decode-dp` | The decode DP for PD disaggregation. | None |
-| `--disaggregation-prefill-pp` | The prefill PP for PD disaggregation. | 1 |
+| Arguments                                | Description                                                                                              | Defaults |
+|------------------------------------------|----------------------------------------------------------------------------------------------------------|----------|
+| `--disaggregation-mode`                  | PD disaggregation mode: "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only). | null |
+| `--disaggregation-transfer-backend`      | The transfer backend for PD disaggregation.                                                              | mooncake |
+| `--disaggregation-bootstrap-port`        | The bootstrap port for PD disaggregation.                                                                | 8998 |
+| `--disaggregation-bootstrap-port-encode` | The bootstrap port for PD disaggregation for encode instance.                                            | 8998 |
+| `--disaggregation-decode-tp`             | The decode TP for PD disaggregation.                                                                     | None |
+| `--disaggregation-decode-dp`             | The decode DP for PD disaggregation.                                                                     | None |
+| `--disaggregation-prefill-pp`            | The prefill PP for PD disaggregation.                                                                    | 1 |
 
 ## Model weight update
 

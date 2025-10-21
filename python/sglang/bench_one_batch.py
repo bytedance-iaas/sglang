@@ -200,7 +200,7 @@ def prepare_extend_inputs_for_correctness_test(
     for i in range(len(reqs)):
         req = reqs[i]
         req.fill_ids += input_ids[i][bench_args.cut_len :]
-        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
+        req.prefix_indices = model_runner.mm_embedding_pool.req_to_token[
             i, : bench_args.cut_len
         ]
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
@@ -236,7 +236,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
-        req_to_token_pool=model_runner.req_to_token_pool,
+        req_to_token_pool=model_runner.mm_embedding_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
         tree_cache=None,
         model_config=model_runner.model_config,
@@ -351,7 +351,7 @@ def latency_test_run_once(
         return
 
     # Clear the pools.
-    model_runner.req_to_token_pool.clear()
+    model_runner.mm_embedding_pool.clear()
     model_runner.token_to_kv_pool_allocator.clear()
 
     measurement_results = {

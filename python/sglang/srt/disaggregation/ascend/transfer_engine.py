@@ -26,13 +26,13 @@ class AscendTransferEngine(MooncakeTransferEngine):
 
         # Centralized storage address of the AscendTransferEngine
         self.store_url = os.getenv("ASCEND_MF_STORE_URL")
-        if disaggregation_mode == DisaggregationMode.PREFILL:
-            self.role = "Prefill"
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            self.role = "Decode"
-        else:
+        if (
+            disaggregation_mode != DisaggregationMode.PREFILL
+            or disaggregation_mode != DisaggregationMode.DECODE
+        ):
             logger.error(f"Unsupported DisaggregationMode: {disaggregation_mode}")
             raise ValueError(f"Unsupported DisaggregationMode: {disaggregation_mode}")
+        self.role = disaggregation_mode.role_str
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
         self.initialize()
 

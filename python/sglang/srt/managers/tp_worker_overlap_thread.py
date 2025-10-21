@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.multimodal_cache import PagedMultiModalEmbeddingPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
@@ -62,6 +64,7 @@ class TpModelWorkerClient:
         dp_rank: Optional[int],
         nccl_port: int,
     ):
+        self.server_args = server_args
         # Load the model
         self.worker = TpModelWorker(
             server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
@@ -131,8 +134,16 @@ class TpModelWorkerClient:
             self.worker.model_runner.token_to_kv_pool_allocator,
         )
 
+    def get_mm_memory_pool(
+        self,
+    ) -> Tuple[PagedMultiModalEmbeddingPool, BaseTokenToKVPoolAllocator]:
+        return (
+            self.worker.model_runner.mm_embedding_pool,
+            self.worker.model_runner.mm_embedding_allocator,
+        )
+
     def get_kv_cache(self):
-        return self.worker.model_runner.token_to_kv_pool
+        return self.worker.model_runner.mm_embedding_pool
 
     def forward_thread_func(self):
         try:
@@ -171,32 +182,35 @@ class TpModelWorkerClient:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
             # Run forward
+            # print(f"forward_thread_func_ {model_worker_batch=}")
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
                     model_worker_batch, model_worker_batch.launch_done
                 )
             )
+            if not self.server_args.disaggregation_mode == "encode":
+                # Update the future token ids map
+                bs = len(model_worker_batch.seq_lens)
+                self.future_token_ids_map[
+                    future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
+                ] = next_token_ids
 
-            # Update the future token ids map
-            bs = len(model_worker_batch.seq_lens)
-            self.future_token_ids_map[
-                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = next_token_ids
-
-            # Copy results to the CPU
-            if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
-                )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                # Copy results to the CPU
+                if model_worker_batch.return_logprob:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.to("cpu", non_blocking=True)
                     )
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states.to(
-                    "cpu", non_blocking=True
-                )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+                    if logits_output.input_token_logprobs is not None:
+                        logits_output.input_token_logprobs = (
+                            logits_output.input_token_logprobs.to(
+                                "cpu", non_blocking=True
+                            )
+                        )
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states.to(
+                        "cpu", non_blocking=True
+                    )
+                next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
             self.output_queue.put(
@@ -216,7 +230,9 @@ class TpModelWorkerClient:
             launch_done.wait()
         copy_done.synchronize()
 
-        if logits_output.next_token_logprobs is not None:
+        if self.server_args.disaggregation_mode == "encode":
+            pass
+        elif logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (
                 logits_output.next_token_logprobs.tolist()
             )
@@ -224,11 +240,13 @@ class TpModelWorkerClient:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
-        next_token_ids = next_token_ids.tolist()
+            next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids, can_run_cuda_graph
 
     def forward_batch_generation(
-        self, model_worker_batch: ModelWorkerBatch
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        skip_sample: bool = False,
     ) -> Tuple[None, torch.Tensor, bool]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info

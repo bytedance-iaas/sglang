@@ -52,7 +52,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    global_server_args_dict,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -166,6 +170,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -173,6 +178,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -383,7 +389,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
-            device=x.device,
+            device=self.device,
             dtype=torch.int32,
         )
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
@@ -404,21 +410,40 @@ class Qwen2_5_VisionTransformer(nn.Module):
         # compute cu_seqlens
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                torch.tensor([0], device=self.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(self.device),
             ]
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+
+        # pre-compute max seqlens for different attention windows
+        if cu_window_seqlens.numel() >= 2:
+            max_seqlen_window = (
+                (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
+            )
+        else:
+            max_seqlen_window = 0
+        if cu_seqlens.numel() >= 2:
+            max_seqlen_full = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        else:
+            max_seqlen_full = 0
 
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
+                max_seqlen_now = max_seqlen_full
             else:
                 cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = max_seqlen_window
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                max_seqlen=max_seqlen_now,
             )
 
         # adapter
@@ -462,14 +487,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen2_5_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
+        self.is_encoder = global_server_args_dict["disaggregation_mode"] == "encode"
+        self.should_load_vision_model = (
+            self.is_encoder or not global_server_args_dict["encoder_disaggregated"]
         )
+        if self.should_load_vision_model:
+            self.visual = Qwen2_5_VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+            )
 
         self.model = Qwen2Model(
             config,
@@ -551,7 +581,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -560,6 +589,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
+        # if global_server_args_dict["disaggregation_mode"] == "encode":
+        #     print(f"hidden_states type {type(hidden_states)}")
         if not get_embedding:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
@@ -579,6 +610,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            if "visual" in name and not self.should_load_vision_model:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

@@ -102,7 +102,9 @@ class VisionSdpaAttention(nn.Module):
     @staticmethod
     @lru_cache(maxsize=128)
     def _generate_mask_cache(
-        s: int, flatten_batch: bool, cu_seqlens: tuple
+        s: int,
+        flatten_batch: bool,
+        cu_seqlens: Optional[torch.Tensor],
     ) -> torch.BoolTensor:
         """
         Generate a boolean attention mask with caching mechanism.
@@ -114,7 +116,7 @@ class VisionSdpaAttention(nn.Module):
             attention mask tensor of shape [b, 1, s, s] or [1, s, s]
         """
         if flatten_batch:
-            mask = torch.zeros([1, s, s], dtype=torch.bool)
+            mask = torch.zeros([1, s, s], dtype=torch.bool, device=cu_seqlens.device)
             for i in range(1, len(cu_seqlens)):
                 start = cu_seqlens[i - 1]
                 end = cu_seqlens[i]
@@ -151,9 +153,7 @@ class VisionSdpaAttention(nn.Module):
         if cu_seqlens is None:
             return None
 
-        cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
-
-        return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
+        return self._generate_mask_cache(s, flatten_batch, cu_seqlens)
 
     def forward(
         self,
@@ -187,8 +187,6 @@ class VisionSdpaAttention(nn.Module):
         if attention_mask is None:
             if self.softmax_in_single_precision:
                 raise RuntimeError("Empty attention mask")
-        else:
-            attention_mask = attention_mask.to(device=q.device)
 
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
 
@@ -244,6 +242,7 @@ class VisionTritonAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+        max_seqlen: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -256,14 +255,15 @@ class VisionTritonAttention(nn.Module):
         # [b * s, head, head_size]
         output = torch.empty_like(q)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if max_seqlen is None:
+            max_seqlen = kwargs["max_seqlen"]
         context_attention_fwd(
             q,
             k,
             v,
             output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
+            cu_seqlens,
+            seq_lens,
             max_seqlen,
             is_causal=False,
         )
@@ -288,6 +288,7 @@ class VisionFlash3Attention(nn.Module):
         cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
         bsz: int,
         seq_len: int,
+        max_seqlen: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -306,8 +307,9 @@ class VisionFlash3Attention(nn.Module):
             cu_seqlens = cu_seqlens.get_data()
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if max_seqlen is None:
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
         output = flash_attn_varlen_func(
             q,
             k,
@@ -545,6 +547,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            **kwargs,
         )
 
         assert output.dim() == 3, output.shape

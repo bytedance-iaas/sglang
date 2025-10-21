@@ -92,6 +92,7 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.vision_config = getattr(self.hf_config, "vision_config", None)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )

@@ -20,7 +20,6 @@ Page-aligned memory pool.
 """
 
 import abc
-import weakref
 from typing import TYPE_CHECKING
 
 import torch
@@ -152,6 +151,39 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.release_pages = torch.cat((self.release_pages, free_index))
         else:
             self.free_group.append(free_index)
+
+    def get_cpu_copy(self, indices):
+        return self._kvcache.get_cpu_copy(indices)
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+class FakeAllocator(BaseTokenToKVPoolAllocator):
+    """An fake allocator not actually alloc slots, but only calculating the remained size"""
+
+    def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
+        super().__init__(size, 1, dtype, device, kvcache)
+        self.allocated = 0
+        self.clear()
+
+    def clear(self):
+        self.allocated = 0
+
+    def available_size(self):
+        return self.size - self.allocated
+
+    def alloc(self, need_size: int):
+        if need_size + self.allocated > self.size:
+            return
+        self.allocated += need_size
+
+    def free(self, free_size: int):
+        # the semantic of the argument is changed
+        self.release(free_size)
+
+    def release(self, size):
+        self.allocated = max(0, self.allocated - size)
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

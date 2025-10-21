@@ -12,6 +12,10 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
+class EmbeddingArgs:
+    pass
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -34,6 +38,7 @@ class KVArgs:
 class KVPoll:
     Failed = 0
     Bootstrapping = 1
+    # waiting for sender-side to finish computing
     WaitingForInput = 2
     Transferring = 3
     Success = 4
@@ -77,6 +82,12 @@ class BaseKVSender(ABC):
         Send the kv cache at the given kv indices to the decoder server
         """
         ...
+
+    def send_embedding(self, mm_indices: npt.NDArray[np.int32]):
+        """
+        Send the concatenated embeddings with each embedding's start token indices
+        """
+        pass
 
     @abstractmethod
     def poll(self) -> KVPoll:

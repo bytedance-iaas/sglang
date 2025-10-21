@@ -29,7 +29,6 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
-from PIL.Image import Image
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -160,6 +159,8 @@ class Engine(EngineBase):
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_host_encode: Optional[Union[List[str], str]] = None,
+        bootstrap_port_encode: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -194,6 +195,8 @@ class Engine(EngineBase):
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
+            bootstrap_host_encode=bootstrap_host_encode,
+            bootstrap_port_encode=bootstrap_port_encode,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
         )
@@ -256,7 +259,7 @@ class Engine(EngineBase):
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
                 raise ValueError(
-                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size - 1}]"
                 )
 
         logger.info(f"data_parallel_rank: {data_parallel_rank}")

@@ -287,7 +287,7 @@ class TokenizerManager:
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
-        # For pd disaggregtion
+        # For pd disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -295,14 +295,17 @@ class TokenizerManager:
             self.server_args.disaggregation_transfer_backend
         )
         # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            or self.disaggregation_mode == DisaggregationMode.ENCODE
+        ):
             # only start bootstrap server on prefill tm
             kv_bootstrap_server_class = get_kv_class(
                 self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
             )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
+            bootstrap_port = self.server_args.get_bootstrap_sending_port()
+            self.bootstrap_server = kv_bootstrap_server_class(bootstrap_port)
+            print(f"{self.bootstrap_server=}")
             is_create_store = (
                 self.server_args.node_rank == 0
                 and self.server_args.disaggregation_transfer_backend == "ascend"
@@ -529,13 +532,27 @@ class TokenizerManager:
                 obj.image_data = [obj.image_data]
             if not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
-                image_data=obj.image_data,
-                audio_data=obj.audio_data,
-                input_text=input_text or input_ids,
-                request_obj=obj,
-                max_req_input_len=self.max_req_input_len,
-            )
+            start = time.time()
+            if (
+                self.server_args.disaggregation_mode == "text"
+                or self.server_args.disaggregation_mode == "null"
+            ):
+                mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text=input_text or input_ids,
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+            else:
+                mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text=input_text or input_ids,
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+            print(f"preprocess {time.time() - start}")
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
         else:
@@ -626,7 +643,7 @@ class TokenizerManager:
         sampling_params = SamplingParams(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
-
+        # print(f"{obj=}")
         # Build return object
         if isinstance(obj, GenerateReqInput):
             session_params = (

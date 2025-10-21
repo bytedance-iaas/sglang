@@ -56,7 +56,6 @@ class TestPortArgs(unittest.TestCase):
         server_args.dist_init_addr = None
 
         port_args = PortArgs.init_new(server_args)
-        print(f"{port_args=}")
 
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertTrue(
