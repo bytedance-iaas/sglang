@@ -178,39 +178,39 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
 class TestDeepseekV3W4Afp8DeepepLowLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        with (
-            envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True),
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override("256"),
-        ):
-            cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
-            cls.base_url = DEFAULT_URL_FOR_TEST
-            other_args = [
-                "--tp",
-                "8",
-                "--trust-remote-code",
-                "--ep-size",
-                "8",
-                "--cuda-graph-bs",
-                "256",
-                "--disable-radix-cache",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-mode",
-                "low_latency",
-                "--dp",
-                "8",
-                "--enable-dp-attention",
-                "--moe-runner-backend",
-                "cutlass",
-            ]
-            if not is_in_amd_ci():
-                other_args += ["--mem-frac", "0.7"]
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
+        cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp",
+            "8",
+            "--trust-remote-code",
+            "--ep-size",
+            "8",
+            "--cuda-graph-bs",
+            "256",
+            "--disable-radix-cache",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "low_latency",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+            "--moe-runner-backend",
+            "cutlass",
+        ]
+        if not is_in_amd_ci():
+            other_args += ["--mem-frac", "0.7"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            envs={
+                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+            },
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -237,39 +237,39 @@ class TestDeepseekV3W4Afp8DeepepLowLatency(CustomTestCase):
 class TestDeepseekV3W4Afp8DeepepAuto(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        with (
-            envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True),
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override("256"),
-        ):
-            cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
-            cls.base_url = DEFAULT_URL_FOR_TEST
-            other_args = [
-                "--tp",
-                "8",
-                "--trust-remote-code",
-                "--ep-size",
-                "8",
-                "--cuda-graph-bs",
-                "256",
-                "--disable-radix-cache",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-mode",
-                "auto",
-                "--dp",
-                "8",
-                "--enable-dp-attention",
-                "--moe-runner-backend",
-                "cutlass",
-            ]
-            if not is_in_amd_ci():
-                other_args += ["--mem-frac", "0.7"]
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
+        cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp",
+            "8",
+            "--trust-remote-code",
+            "--ep-size",
+            "8",
+            "--cuda-graph-bs",
+            "256",
+            "--disable-radix-cache",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "auto",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+            "--moe-runner-backend",
+            "cutlass",
+        ]
+        if not is_in_amd_ci():
+            other_args += ["--mem-frac", "0.7"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            envs={
+                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+            },
+        )
 
     @classmethod
     def tearDownClass(cls):
