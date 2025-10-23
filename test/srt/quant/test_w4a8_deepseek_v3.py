@@ -234,7 +234,7 @@ class TestDeepseekV3W4Afp8DeepepLowLatency(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.92)
 
 
-class TestDeepseekV3W4Afp8DeepepAuto(CustomTestCase):
+class TestDeepseekV3W4Afp8DeepepAutoMtp(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
@@ -257,6 +257,14 @@ class TestDeepseekV3W4Afp8DeepepAuto(CustomTestCase):
             "--enable-dp-attention",
             "--moe-runner-backend",
             "cutlass",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
