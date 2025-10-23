@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST="/data/models/DeepSeek-R1-W4AFP8"
 
 class TestDeepseekV3W4afp8(CustomTestCase):
     @classmethod
