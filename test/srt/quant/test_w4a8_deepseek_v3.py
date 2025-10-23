@@ -206,7 +206,7 @@ class TestDeepseekV3W4Afp8DeepepLowLatency(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            envs={
+            env={
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
             },
@@ -273,7 +273,7 @@ class TestDeepseekV3W4Afp8DeepepAutoMtp(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            envs={
+            env={
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
             },
