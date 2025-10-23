@@ -178,7 +178,10 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
 class TestDeepseekV3W4Afp8DeepepLowLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        with (envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True),):
+        with (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True),
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override("256"),
+        ):
             cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
             cls.base_url = DEFAULT_URL_FOR_TEST
             other_args = [
@@ -234,7 +237,10 @@ class TestDeepseekV3W4Afp8DeepepLowLatency(CustomTestCase):
 class TestDeepseekV3W4Afp8DeepepAuto(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        with (envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True),):
+        with (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True),
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override("256"),
+        ):
             cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
             cls.base_url = DEFAULT_URL_FOR_TEST
             other_args = [
