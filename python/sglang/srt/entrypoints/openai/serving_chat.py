@@ -45,6 +45,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
+from sglang.srt.observability import accumulate_stream_items, otel_provider
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -512,7 +513,11 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
-
+        is_first_token = True
+        start_time = time.time()
+        time_of_first_token = {}
+        usage = {}
+        complete_response = {"choices": [], "model": "", "usage": None, "error": None}
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -536,6 +541,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+                if is_first_token:
+                    time_of_first_token = time.time()
+                    is_first_token = False
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -557,6 +565,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         choices=[choice_data],
                         model=request.model,
                     )
+                    accumulate_stream_items(chunk, complete_response)
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 stream_buffer = stream_buffers.get(index, "")
@@ -580,6 +589,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+                        accumulate_stream_items(chunk, complete_response)
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
@@ -595,6 +605,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         content,
                         request,
                         has_tool_calls,
+                        complete_response,
                     ):
                         if chunk:
                             yield chunk
@@ -603,10 +614,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
                         remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, index
+                            parser, content, request, index, complete_response,
                         )
                         if remaining_chunk:
                             yield remaining_chunk
+
 
                 else:
                     # Regular content
@@ -624,6 +636,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+                        accumulate_stream_items(chunk, complete_response)
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
@@ -655,6 +668,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     usage=None,
                 )
+                accumulate_stream_items(finish_reason_chunk, complete_response)
                 yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
 
             # Send hidden states if requested
@@ -680,6 +694,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             ],
                             model=request.model,
                         )
+                        accumulate_stream_items(hidden_states_chunk, complete_response)
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
@@ -698,9 +713,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     usage=usage,
                 )
+                accumulate_stream_items(usage_chunk, complete_response)
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+            otel_provider.record(
+                "sglang_chat_completion",
+                raw_request.headers,
+                request,
+                complete_response,
+                usage,
+                start_time,
+                time_of_first_token=time_of_first_token,
+                stream=True,
+            )
         except ValueError as e:
+            otel_provider.recordException(
+                "sglang_chat_completion", raw_request.headers, request, e
+            )
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
@@ -713,11 +742,15 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
+        start_time = time.time()
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ).__anext__()
         except ValueError as e:
+            otel_provider.recordException(
+                "sglang_chat_completion", raw_request.headers, request, e
+            )
             return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
@@ -728,7 +761,15 @@ class OpenAIServingChat(OpenAIServingBase):
             ret,
             int(time.time()),
         )
-
+        otel_provider.record(
+            "sglang_chat_completion",
+            raw_request.headers,
+            request,
+            response,
+            response.usage,
+            start_time,
+            stream=False,
+        )
         return response
 
     def _build_chat_response(
@@ -1065,6 +1106,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        complete_response: Dict[str, Any],
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1101,7 +1143,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+            accumulate_stream_items(chunk, complete_response)
             yield f"data: {chunk.model_dump_json()}\n\n"
+
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -1141,6 +1185,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+            accumulate_stream_items(chunk, complete_response)
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(
@@ -1149,6 +1194,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
+        complete_response: Dict[str, Any] = None,
     ) -> Optional[str]:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -1211,7 +1257,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
-
+            accumulate_stream_items(chunk, complete_response)
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
