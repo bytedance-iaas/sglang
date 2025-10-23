@@ -15,6 +15,8 @@ from sglang.srt.observability_buckets import (
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
 LLM_USAGE_TOKEN_TYPES = ["prompt_tokens", "completion_tokens", "total_tokens"]
+PROMPT_FILTER_KEY = "prompt_filter_results"
+CONTENT_FILTER_KEY = "content_filter_results"
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +416,8 @@ def set_prompts(span, messages):
 
             _set_span_attribute(span, f"{prefix}.role", msg.role)
             _set_span_attribute(span, f"{prefix}.content", content)
+            # TODO: set tool call attributes
+
     except Exception as ex:  # pylint: disable=broad-except
         logger.warning("Failed to set prompts for openai span, error: %s", str(ex))
 
@@ -465,36 +469,58 @@ def set_completions(span, choices):
             span, f"{prefix}.finish_reason", choice.get("finish_reason")
         )
 
+        if choice.get("content_filter_results"):
+            _set_span_attribute(
+                span,
+                f"{prefix}.{CONTENT_FILTER_KEY}",
+                json.dumps(choice.get("content_filter_results")),
+            )
+
+        if choice.get("finish_reason") == "content_filter":
+            _set_span_attribute(span, f"{prefix}.role", "assistant")
+            _set_span_attribute(span, f"{prefix}.content", "FILTERED")
+            return
+
         message = choice.get("message")
         if not message:
             return
 
         _set_span_attribute(span, f"{prefix}.role", message.get("role"))
-        _set_span_attribute(span, f"{prefix}.content", message.get("content"))
+        if message.get("refusal"):
+            _set_span_attribute(span, f"{prefix}.refusal", message.get("refusal"))
+        else:
+            _set_span_attribute(span, f"{prefix}.content", message.get("content"))
 
         function_call = message.get("function_call")
         if function_call:
             _set_span_attribute(
-                span, f"{prefix}.function_call.name", function_call.get("name")
+                span, f"{prefix}.tool_calls.0.name", function_call.get("name")
             )
             _set_span_attribute(
                 span,
-                f"{prefix}.function_call.arguments",
+                f"{prefix}.tool_calls.0.arguments",
                 function_call.get("arguments"),
             )
 
         tool_calls = message.get("tool_calls")
         if tool_calls:
-            _set_span_attribute(
-                span,
-                f"{prefix}.function_call.name",
-                tool_calls[0].get("function").get("name"),
-            )
-            _set_span_attribute(
-                span,
-                f"{prefix}.function_call.arguments",
-                tool_calls[0].get("function").get("arguments"),
-            )
+            for i, tool_call in enumerate(tool_calls):
+                function = tool_call.get("function")
+                _set_span_attribute(
+                    span,
+                    f"{prefix}.tool_calls.{i}.id",
+                    tool_call.get("id"),
+                )
+                _set_span_attribute(
+                    span,
+                    f"{prefix}.tool_calls.{i}.name",
+                    function.get("name"),
+                )
+                _set_span_attribute(
+                    span,
+                    f"{prefix}.tool_calls.{i}.arguments",
+                    function.get("arguments"),
+                )
 
 
 def _set_span_attribute(span, name, value):
@@ -557,7 +583,11 @@ def model_as_dict(model):
 
 
 def accumulate_stream_items(item, complete_response):
+    if complete_response is None:
+        complete_response = {"choices": [], "model": "", "usage": None, "error": None}
     item = model_as_dict(item)
+    if not isinstance(item, dict):
+        return
     complete_response["model"] = item.get("model")
 
     if item.get("error"):
@@ -565,6 +595,10 @@ def accumulate_stream_items(item, complete_response):
 
     if item.get("usage"):
         complete_response["usage"] = item.get("usage")
+
+    # prompt filter results
+    if item.get("prompt_filter_results"):
+        complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
 
     if item.get("choices"):
         for choice in item.get("choices"):
@@ -576,14 +610,44 @@ def accumulate_stream_items(item, complete_response):
             complete_choice = complete_response.get("choices")[index]
             if choice.get("finish_reason"):
                 complete_choice["finish_reason"] = choice.get("finish_reason")
+            if choice.get("content_filter_results"):
+                complete_choice["content_filter_results"] = choice.get(
+                    "content_filter_results"
+                )
 
             delta = choice.get("delta")
 
             if delta.get("content"):
                 complete_choice["message"]["content"] += delta.get("content")
+
             if delta.get("role"):
                 complete_choice["message"]["role"] = delta.get("role")
 
+            if delta and delta.get("tool_calls"):
+                tool_calls = delta.get("tool_calls")
+                if not isinstance(tool_calls, list) or len(tool_calls) == 0:
+                    continue
+
+                if not complete_choice["message"].get("tool_calls"):
+                    complete_choice["message"]["tool_calls"] = []
+
+                for tool_call in tool_calls:
+                    i = int(tool_call["index"])
+                    if len(complete_choice["message"]["tool_calls"]) <= i:
+                        complete_choice["message"]["tool_calls"].append(
+                            {"id": "", "function": {"name": "", "arguments": ""}}
+                        )
+
+                    span_tool_call = complete_choice["message"]["tool_calls"][i]
+                    span_function = span_tool_call["function"]
+                    tool_call_function = tool_call.get("function")
+
+                    if tool_call.get("id"):
+                        span_tool_call["id"] = tool_call.get("id")
+                    if tool_call_function and tool_call_function.get("name"):
+                        span_function["name"] = tool_call_function.get("name")
+                    if tool_call_function and tool_call_function.get("arguments"):
+                        span_function["arguments"] += tool_call_function.get("arguments")
 
 class OpenTelemetryProvider:
     def __init__(self):
