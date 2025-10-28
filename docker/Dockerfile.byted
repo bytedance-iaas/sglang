@@ -10,8 +10,8 @@ ARG eic_sdk_version=
 # ARG absl_version=2.3.0
 ARG branch=
 
-# 编译之前，将源统一设置成内网的，pip源切换成国内源
-RUN pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple/
+# 编译之前，将源统一设置成内网的，pip源切换成火山内网源
+RUN pip config set global.index-url https://bytedpypi.byted.org/simple
 RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
     sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
     sed -i 's/ivolces.com/byted.org/g' /etc/apt/sources.list.d/* && \
@@ -26,7 +26,7 @@ RUN wget -O DeepSeek-R1_decode_ep32_3500_1500.json https://github.com/user-attac
 WORKDIR /sgl-workspace
 RUN git clone --branch support_fp8  https://github.com/bytedance-iaas/FlashMLA.git
 WORKDIR /sgl-workspace/FlashMLA
-RUN pip install . --break-system-packages
+RUN pip install . --break-system-packages --no-build-isolation
 
 # sglang 安装
 RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-build-isolation
