@@ -33,12 +33,13 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs, CudaIpcTensorTransportProxy
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
+
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -1179,18 +1180,21 @@ class DeepseekOCRForCausalLM(nn.Module):
             )
 
         if self.text_config.topk_method == "noaux_tc":
+            print("11")
             self.model = DeepseekV3ForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
         elif not self.text_config.use_mla:
+            print("22")
             self.model = DeepseekForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
         else:
+            print("33")
             self.model = DeepseekV2ForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
@@ -1257,9 +1261,13 @@ class DeepseekOCRForCausalLM(nn.Module):
                 crop_shape = images_spatial_crop[jdx][0]
 
                 if torch.sum(patches).item() != 0:
+                    # print("1")
+                    # print("pathchs {}".format(patches.shape))
                     local_features_1 = self.sam_model(patches)
                     local_features_2 = self.vision_model(patches, local_features_1)
-
+                    
+                    # print("local_fea1_shape {}".format(local_features_1.shape))
+                    # print("local_fea2_shape {}".format(local_features_2.shape))
                     local_features = torch.cat(
                         (
                             local_features_2[:, 1:],
@@ -1267,10 +1275,15 @@ class DeepseekOCRForCausalLM(nn.Module):
                         ),
                         dim=-1,
                     )
+                    # print("local feature shape before pro {}".format(local_features.shape))
                     local_features = self.projector(local_features)
-
+                    # print("local feature shape after pro {}".format(local_features.shape))
+                    
+                    # print("image_ori shape {}".format(image_ori.shape))
                     global_features_1 = self.sam_model(image_ori)
+                    # print("global_features_1 shape {}".format(global_features_1.shape))
                     global_features_2 = self.vision_model(image_ori, global_features_1)
+                    # print("global_features_2 shape {}".format(global_features_2.shape))
                     global_features = torch.cat(
                         (
                             global_features_2[:, 1:],
@@ -1278,7 +1291,10 @@ class DeepseekOCRForCausalLM(nn.Module):
                         ),
                         dim=-1,
                     )
+                    
+                    # print("global_features  shape  before pro {}".format(global_features.shape))
                     global_features = self.projector(global_features)
+                    # print("global_features  shape  after pro {}".format(global_features.shape))
 
                     _, hw, n_dim = global_features.shape
                     h = w = int(hw**0.5)
@@ -1291,7 +1307,8 @@ class DeepseekOCRForCausalLM(nn.Module):
                     )
 
                     global_features = global_features.view(h, w, n_dim)
-
+                    # print("global_features  shape  after view {}".format(global_features.shape))
+                    # print("self.image_newline[None, None, :] shape {}".format(self.image_newline[None, None, :].shape))
                     global_features = torch.cat(
                         [
                             global_features,
@@ -1299,8 +1316,10 @@ class DeepseekOCRForCausalLM(nn.Module):
                         ],
                         dim=1,
                     )
-
+                    
+                    # print("global_features  shape  after cat {}".format(global_features.shape))
                     global_features = global_features.view(-1, n_dim)
+                    # print("global_features  shape  after view to 2dims {}".format(global_features.shape))
 
                     local_features = (
                         local_features.view(
@@ -1326,6 +1345,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                     )
 
                 else:
+                    # print("2")
                     global_features_1 = self.sam_model(image_ori)
                     global_features_2 = self.vision_model(image_ori, global_features_1)
                     global_features = torch.cat(
@@ -1361,6 +1381,10 @@ class DeepseekOCRForCausalLM(nn.Module):
         return images_in_this_batch
 
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
+        for item in mm_items:
+            if isinstance(item.images_crop, CudaIpcTensorTransportProxy):
+                item.images_crop = item.images_crop.reconstruct_on_target_device(torch.cuda.current_device())
+        
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )

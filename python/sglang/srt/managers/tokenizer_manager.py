@@ -421,7 +421,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                s_time = time.time()
                 state = self._send_one_request(obj, tokenized_obj, created_time)
+                e_time = time.time()
+                
+                print("send request cost time {} ms".format((e_time - s_time) * 1000))
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
