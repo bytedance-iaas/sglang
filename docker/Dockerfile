@@ -1,7 +1,13 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
-
+# 使用已缓存好的base镜像
+FROM hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 ARG TARGETARCH
+
+ARG GRACE_BLACKWELL=0
+# 编译之前，将源统一设置成内网的
+RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
+
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
@@ -46,6 +52,9 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  # Fix for `apt-add-repository`
  && cd /usr/lib/python3/dist-packages/ \
  && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+
+# 在安装pip后，设置pip源为国内源
+RUN python3 -m pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple/
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -98,13 +107,13 @@ FROM base AS build-image
 # Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
+# 使用bytedance-iaas代码仓进行sglang安装
+ARG SGLANG_BRANCH
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
-    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 https://github.com/bytedance-iaas/sglang.git -b ${SGLANG_BRANCH} /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
 RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -285,7 +294,10 @@ RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttley
     && chmod +x /usr/local/bin/clang-format
 
 # Install clangd
-RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+# 使用clangd的缓存包加速编译
+RUN wget https://tosv.byted.org/obj/iaas-servingkit/clangd-linux-18.1.3.zip \
+    && mv clangd-linux-18.1.3.zip clangd.zip \
+#RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
     && unzip clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
@@ -295,7 +307,7 @@ RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && wget -q "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && wget "https://tosv.byted.org/obj/iaas-servingkit/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
@@ -332,10 +344,16 @@ RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
 # Configure zsh
 COPY docker/configs/.zshrc /root/.zshrc
 
-RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /usr/local/bin
+# 使用pip安装just，加速编译流程
+#RUN set -euxo ; \
+#    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+RUN pip install rust-just
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
+
+# 将源统一切换成火山源
+RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
+RUN rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list

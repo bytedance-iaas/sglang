@@ -210,6 +210,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         set_global_server_args_for_tokenizer(server_args)
 
         # Initialize tokenizer and processor
+        set_global_server_args_for_tokenizer(server_args)
+
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:

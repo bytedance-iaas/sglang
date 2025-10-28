@@ -93,6 +93,9 @@ docker run --rm \
    echo \"==================================\"
    echo \"Installing CMake\"
    echo \"==================================\"
+   # 使用内网源加速编译
+   pip config set global.index-url https://bytedpypi.byted.org/simple
+   # Install CMake (version >= 3.26) - Robust Installation
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
    # Setting these flags to reduce OOM chance only on ARM
@@ -206,6 +209,8 @@ docker run --rm \
       echo \"Ninja build profiling enabled - will save to /sgl-kernel/build-trace.json\"
    fi
 
+   # 修复ptxas编译失败
+   bash ./replace_ptxas.sh ${CUDA_VERSION} && \
    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
    ./rename_wheels.sh
 

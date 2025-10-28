@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,7 +35,6 @@ _is_npu = is_npu()
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
 
 class TransportProxyTensor(torch.Tensor):
     """
@@ -114,7 +114,7 @@ class TransportProxyTensor(torch.Tensor):
 
         if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
             ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index, s_offset = (
+            handle, shape, dtype, stride, source_device_index, s_offset  = (
                 ipc_extra["handle"],
                 ipc_extra["shape"],
                 ipc_extra["dtype"],
