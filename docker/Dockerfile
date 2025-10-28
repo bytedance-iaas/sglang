@@ -32,8 +32,8 @@ RUN apt update && apt install wget -y && apt install software-properties-common 
  && wget https://bootstrap.pypa.io/get-pip.py \
  && python3 get-pip.py
 
-# 在安装pip后，设置pip源为火山内网源
-RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple
+# 在安装pip后，设置pip源为国内源
+RUN python3 -m pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple/
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -60,9 +60,6 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && ln -sf /usr/bin/python3.12 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
-
-# 设置pip源为内网
-RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
