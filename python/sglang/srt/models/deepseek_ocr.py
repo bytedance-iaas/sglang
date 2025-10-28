@@ -33,12 +33,13 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs, CudaIpcTensorTransportProxy
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
+
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -1361,6 +1362,10 @@ class DeepseekOCRForCausalLM(nn.Module):
         return images_in_this_batch
 
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
+        for item in mm_items:
+            if isinstance(item.images_crop, CudaIpcTensorTransportProxy):
+                item.images_crop = item.images_crop.reconstruct_on_target_device(torch.cuda.current_device())
+        
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )
