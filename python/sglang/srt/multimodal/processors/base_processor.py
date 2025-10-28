@@ -273,12 +273,23 @@ class BaseMultimodalProcessor(ABC):
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if SGL_USE_CUDA_IPC:
-                    pass
+                    if feature_name in result and isinstance(
+                        result[feature_name], torch.Tensor
+                    ) and (not result[feature_name].is_cuda):
+                        result[feature_name] = result[feature_name].to("cuda", non_blocking = True)
+                        
                 else:
                     if feature_name in result and isinstance(
                         result[feature_name], torch.Tensor
                     ):
                         result[feature_name] = result[feature_name].to("cpu")
+            
+            if SGL_USE_CUDA_IPC:
+                image_crops = None
+                if "images_crop" in result:
+                    image_crops = result["images_crop"]
+                if isinstance(image_crops, torch.Tensor) and (not image_crops.is_cuda):
+                    result["images_crop"] = result["images_crop"].to("cuda", non_blocking = True)
 
         return result
 
@@ -695,7 +706,28 @@ class BaseMultimodalProcessor(ABC):
         if SGL_USE_CUDA_IPC:
             # post-process
             for item in all_collected_items:
+                
+                if isinstance(item.model_specific_data["images_crop"], torch.Tensor) and  item.model_specific_data["images_crop"].is_cuda:
+                    sync_flag, available_slice = (
+                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                            item.model_specific_data["images_crop"]
+                        )
+                    )
+                    
+                    if isinstance(available_slice, torch.Tensor):
+                        # print("use ipc to transport")
+                        available_slice.copy_(
+                            item.model_specific_data["images_crop"].view(torch.int8).view(-1), non_blocking=True
+                        )
+                        item.model_specific_data["images_crop"] = CudaIpcTensorTransportProxy(
+                            data=available_slice,
+                            info_data=item.model_specific_data["images_crop"],
+                            sync_buffer_meta=sync_flag,
+                        )
+
+                
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                    # print(item.feature.shape)
                     sync_flag, available_slice = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.feature
