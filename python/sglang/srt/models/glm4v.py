@@ -508,6 +508,7 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         # For multi-image, pixel_values is [num_of_images, L, C] shape
         # assert pixel_values.dim() == 2, pixel_values.dim()
+        print("pixel_values shape {}".format(pixel_values.shape))
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (

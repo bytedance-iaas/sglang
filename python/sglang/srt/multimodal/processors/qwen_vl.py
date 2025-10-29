@@ -272,7 +272,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         request_obj,
         *args,
         **kwargs,
-    ):
+    ):  
+        import time
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -280,12 +281,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
-
+        
+        s_time = time.time()
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
-
+        e_time = time.time()
+        
+        print("resize cost time {} ms".format((e_time - s_time)* 1000))
         video_metadata = None
         if base_output.videos:
             video_results = await asyncio.gather(

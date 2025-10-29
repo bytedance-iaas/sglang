@@ -263,12 +263,20 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
+        import time
+        # torch.cuda.synchronize()
+        # s_time = time.time()
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
+        # torch.cuda.synchronize()
+        # e_time = time.time()
+        
+        # print("processor cost time {} ms".format((e_time - s_time) * 1000))
+        
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -707,7 +715,7 @@ class BaseMultimodalProcessor(ABC):
             # post-process
             for item in all_collected_items:
                 
-                if isinstance(item.model_specific_data["images_crop"], torch.Tensor) and  item.model_specific_data["images_crop"].is_cuda:
+                if  "images_crop" in item.model_specific_data and  isinstance(item.model_specific_data["images_crop"], torch.Tensor) and  item.model_specific_data["images_crop"].is_cuda:
                     sync_flag, available_slice = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.model_specific_data["images_crop"]
@@ -733,6 +741,8 @@ class BaseMultimodalProcessor(ABC):
                             item.feature
                         )
                     )
+                    
+                    # print("available_slice shape {}".format(available_slice.shape))
                     if isinstance(available_slice, torch.Tensor):
                         available_slice.copy_(
                             item.feature.view(torch.int8).view(-1), non_blocking=True
