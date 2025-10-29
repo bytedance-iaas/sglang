@@ -243,11 +243,40 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                         img_pad_token,
                         insert_cached_ids,
                     )
+                    
+            device_id = torch.cuda.current_device()
+            device = torch.device(f"cuda:{device_id}")
 
-            total_bytes = 0
-            for ts in tensor_lists:
-                total_bytes += ts.element_size() * ts.numel()
+            allocated = torch.cuda.memory_allocated(device)
+            reserved = torch.cuda.memory_reserved(device)
+            total = torch.cuda.get_device_properties(device).total_memory
 
+            # [NOTE]actually, torch reserved memory can also be used, here excluding torch reserved memory
+            available_size_mb = (total - allocated - reserved) // (1024 * 1024)
+
+            max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
+            if get_int_env_var("SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+                max_cache_image_size = get_int_env_var(
+                    "SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"
+                )
+            else:
+                logger.info(
+                    "not set SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(
+                        max_cache_image_size
+                    )
+                )
+
+            if max_cache_image_size > available_size_mb:
+                logger.info(
+                    "max_cache_image_size {} mb over available size {} mb, set max cache size as {} mb".format(
+                        max_cache_image_size, available_size_mb, available_size_mb
+                    )
+                )
+                max_cache_image_size = available_size_mb
+
+     
+            hash_keys = set()
+            self.image_cache_table.pop_until(max_cache_image_size, hash_keys)
 
             # [NOTE]actually, torch reserved memory can also be used, here excluding torch reserved memory
             # send_cudaipc_handle
