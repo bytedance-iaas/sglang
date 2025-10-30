@@ -92,6 +92,17 @@ def smart_resize(
         w_bar = ceil_by_factor(width * beta, factor)
     return h_bar, w_bar
 
+import inspect
+
+def check_method_location(method):
+    try:
+        # 获取定义文件路径
+        file_path = inspect.getfile(method)
+        # 获取定义起始行号（元组第二个元素）
+        line_number = inspect.getsourcelines(method)[1]
+        print(f"方法定义在: {file_path}，第 {line_number} 行")
+    except (TypeError, OSError, IOError) as e:
+        print(f"无法获取位置信息: {str(e)}")
 
 def resize_image(
     image,
@@ -109,6 +120,8 @@ def resize_image(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
+    
+    print("resize_h {}, resize_w {}".format(resized_height, resized_width))
     # default interpolation method of cv2 and PIL  both bilinear, but cv2 is much faster than pillow
     if height != resized_height or width != resized_width:
         if use_cv2 and get_int_env_var("SGLANG_CACHE_MM_IMAGE"):
@@ -121,9 +134,9 @@ def resize_image(
             image = image.resize((resized_width, resized_height))
     return image
 
-def get_img_height_from_raw_img(img: Image, patch_pixel_size):
+def get_img_height_from_raw_img(img: Image, patch_pixel_size, image_factor = IMAGE_FACTOR):
     resize_h, resize_w = smart_resize(
-        img.size[0], img.size[1], IMAGE_FACTOR, MIN_PIXELS, MAX_PIXELS
+        img.size[0], img.size[1], image_factor, MIN_PIXELS, MAX_PIXELS
     )
     ret = int((resize_h * resize_w) / patch_pixel_size)
     if ret < 1:
@@ -452,11 +465,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 return_tensors="pt",
                 **kwargs,
             )
+            
+            check_method_location(processor.__call__)
+            # print(processor.__call__)
+            # print("result {}".format(result))
             # move feature tensors to cpu
             torch.cuda.synchronize()
             e_time = time.time()
-            print("processor cost time {} ms".format((e_time - s_time) * 1000))
-
+            # print("processor cost time {} ms".format((e_time - s_time) * 1000))
+        print(result["pixel_values"].shape)
+        print(result["image_grid_thw"])
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -515,10 +533,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 hash_key = image_to_int(images[img_idx])
                 img_hash_keys.append(hash_key)
                 img_height, resize_h, resize_w = get_img_height_from_raw_img(
-                    images[img_idx], self.PATCH_PIXEL_NUMS
+                    images[img_idx], self.PATCH_PIXEL_NUMS, 2 * self.PATCH_SIZE
                 )
                 img_token_num = int(img_height / self.MERGE_PATCH_NUMS)
-
+                
+                print("w{} h{} self.patch_size{}".format(resize_w, resize_h, self.PATCH_SIZE))
                 image_grid_thw_lists.append(
                     [
                         1,
@@ -546,6 +565,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 resize_tasks = [
                     resize_image_async(image) for image in new_processed_imgs
                 ]
+                
+                
                 new_processed_imgs = await asyncio.gather(*resize_tasks)
             
             video_metadata = None
@@ -582,9 +603,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             torch.cuda.synchronize()
             s_time = time.time()
             # Qwen-specific: resize images if they are raw Image objects
-            if base_output.images and isinstance(base_output.images[0], Image.Image):
-                resize_tasks = [resize_image_async(image) for image in base_output.images]
-                base_output.images = await asyncio.gather(*resize_tasks)
+            # if base_output.images and isinstance(base_output.images[0], Image.Image):
+            #     resize_tasks = [resize_image_async(image) for image in base_output.images]
+            #     base_output.images = await asyncio.gather(*resize_tasks)
             torch.cuda.synchronize()
             e_time = time.time()
             print("resize cost time {} ms".format((e_time - s_time) * 1000))

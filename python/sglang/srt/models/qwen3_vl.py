@@ -554,7 +554,8 @@ class Qwen3LLMModel(Qwen3Model):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-
+        
+        print("hidden_states shape {}".format(hidden_states.shape))
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
