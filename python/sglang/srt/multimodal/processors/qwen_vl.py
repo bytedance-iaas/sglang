@@ -29,6 +29,7 @@ from sglang.srt.multimodal.mm_utils import (
     image_to_int,
     insert_input_ids,
     operate_substrings,
+    fast_image_hash
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -37,8 +38,8 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 from sglang.utils import logger
 
-IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
+IMAGE_FACTOR = 32
+MIN_PIXELS = 4 * 32 * 32
 MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
 MAX_RATIO = 200
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
@@ -100,9 +101,10 @@ def check_method_location(method):
         file_path = inspect.getfile(method)
         # 获取定义起始行号（元组第二个元素）
         line_number = inspect.getsourcelines(method)[1]
-        print(f"方法定义在: {file_path}，第 {line_number} 行")
+        # print(f"方法定义在: {file_path}，第 {line_number} 行")
     except (TypeError, OSError, IOError) as e:
-        print(f"无法获取位置信息: {str(e)}")
+        # print(f"无法获取位置信息: {str(e)}")
+        pass
 
 def resize_image(
     image,
@@ -121,10 +123,10 @@ def resize_image(
         max_pixels=max_pixels,
     )
     
-    print("resize_h {}, resize_w {}".format(resized_height, resized_width))
+    # print("resize_h {}, resize_w {}".format(resized_height, resized_width))
     # default interpolation method of cv2 and PIL  both bilinear, but cv2 is much faster than pillow
     if height != resized_height or width != resized_width:
-        if use_cv2 and get_int_env_var("SGLANG_CACHE_MM_IMAGE"):
+        if use_cv2 or get_int_env_var("SGLANG_CACHE_MM_IMAGE"):
             arr = np.array(image)  # convert PIL → NumPy
             resized = cv2.resize(
                 arr, (resized_width, resized_height)
@@ -368,17 +370,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 new_processed_imgs if len(new_processed_imgs) != 0 else None
             )
             
-            torch.cuda.synchronize()
-            s_time = time.time()
+            # torch.cuda.synchronize()
+            # s_time = time.time()
             result = processor.__call__(
                 text=[processed_text],
                 padding=True,
                 return_tensors="pt",
                 **kwargs,
             )
-            torch.cuda.synchronize()
-            e_time = time.time()
-            print("processor cost time {} ms".format((e_time - s_time) * 1000))
+            # torch.cuda.synchronize()
+            # e_time = time.time()
+            # print("processor cost time {} ms".format((e_time - s_time) * 1000))
             
             start_height = 0
             end_height = 0
@@ -455,10 +457,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 torch.int64
             )
             result["pixel_values"] = proxy_pixel_values
+            # torch.cuda.synchronize()
+            # e_time_2 = time.time()
+            # print("after processor cost time {} ms".format((e_time_2 - e_time) * 1000))
 
         else:
-            torch.cuda.synchronize()
-            s_time = time.time()
+            # torch.cuda.synchronize()
+            # s_time = time.time()
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
@@ -466,15 +471,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 **kwargs,
             )
             
-            check_method_location(processor.__call__)
-            # print(processor.__call__)
-            # print("result {}".format(result))
+            # check_method_location(processor.__call__)
+            # # print(processor.__call__)
+            # # print("result {}".format(result))
             # move feature tensors to cpu
-            torch.cuda.synchronize()
-            e_time = time.time()
+            # torch.cuda.synchronize()
+            # e_time = time.time()
             # print("processor cost time {} ms".format((e_time - s_time) * 1000))
-        print(result["pixel_values"].shape)
-        print(result["image_grid_thw"])
+        # print(result["pixel_values"].shape)
+        # print(result["image_grid_thw"])
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -528,16 +533,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             img_token_nums = []
             remove_image_idx = []
             image_grid_thw_lists = []
-
+            t_s_time = time.time()
             for img_idx in range(len(images)):
-                hash_key = image_to_int(images[img_idx])
+                s_time = time.time()
+                hash_key = fast_image_hash(images[img_idx])
+                e_time = time.time()
+                # print("hash time {} ms".format((e_time - s_time) * 1000))
                 img_hash_keys.append(hash_key)
                 img_height, resize_h, resize_w = get_img_height_from_raw_img(
                     images[img_idx], self.PATCH_PIXEL_NUMS, 2 * self.PATCH_SIZE
                 )
                 img_token_num = int(img_height / self.MERGE_PATCH_NUMS)
                 
-                print("w{} h{} self.patch_size{}".format(resize_w, resize_h, self.PATCH_SIZE))
+                # print("w{} h{} self.patch_size{}".format(resize_w, resize_h, self.PATCH_SIZE))
                 image_grid_thw_lists.append(
                     [
                         1,
@@ -557,8 +565,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
                 img_heights.append(img_height)
                 img_token_nums.append(img_token_num)
-
-            # Qwen-specific: resize images if they are raw Image objects
+            t_e_time = time.time()
+            # print("all extra time {} ms".format((t_e_time - t_s_time) * 1000))
+            # # Qwen-specific: resize images if they are raw Image objects
             if len(new_processed_imgs) != 0 and isinstance(
                 new_processed_imgs[0], Image.Image
             ):
@@ -600,15 +609,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 )
 
         else:
-            torch.cuda.synchronize()
-            s_time = time.time()
-            # Qwen-specific: resize images if they are raw Image objects
+            # torch.cuda.synchronize()
+            # s_time = time.time()
+            # # Qwen-specific: resize images if they are raw Image objects
             # if base_output.images and isinstance(base_output.images[0], Image.Image):
             #     resize_tasks = [resize_image_async(image) for image in base_output.images]
             #     base_output.images = await asyncio.gather(*resize_tasks)
-            torch.cuda.synchronize()
-            e_time = time.time()
-            print("resize cost time {} ms".format((e_time - s_time) * 1000))
+            # torch.cuda.synchronize()
+            # e_time = time.time()
+            # # print("resize outside cost time {} ms".format((e_time - s_time) * 1000))
             
             video_metadata = None
             

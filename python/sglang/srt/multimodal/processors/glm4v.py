@@ -211,14 +211,17 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # end_height = 0
             tensor_lists = []
             used_hash_keys = set()
+            
             for img_idx in range(len(images)):
                 # cache Tensor
                 if img_idx in new_processed_img_idxes:
                     idx_in_new_processed = new_processed_img_idxes.index(img_idx)
+
                     per_image_height = result["pixel_values"].shape[0] // len(new_processed_img_idxes)
+   
                     
                     to_cache_tensor = result["pixel_values"][
-                        img_idx * per_image_height : (img_idx + 1) * per_image_height
+                        idx_in_new_processed * per_image_height : (idx_in_new_processed + 1) * per_image_height
                     ].contiguous()
                     self.image_cache_table.add(img_hash_keys[img_idx], to_cache_tensor)
 
@@ -274,18 +277,16 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 )
                 max_cache_image_size = available_size_mb
 
-     
+            proxy_pixel_values = torch.stack(tensor_lists)
             hash_keys = set()
             self.image_cache_table.pop_until(max_cache_image_size, hash_keys)
-
+             
             # [NOTE]actually, torch reserved memory can also be used, here excluding torch reserved memory
             # send_cudaipc_handle
             # 1. generate cuda-ipc infos
             # 2. set cat/stack mark for tensort list
             # 3. add hash_keys(to generate new hash)
             # 4. update cache
-     
-            proxy_pixel_values = torch.cat(tensor_lists)
 
             result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
                 torch.int64
@@ -382,9 +383,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 target_height, target_width = max(height, target_height), max(
                     width, target_width
                 )
-
             for img_idx in range(len(images)):
-                hash_key = str(image_to_int(images[img_idx]))
+                hash_key = str((fast_image_hash(images[img_idx])))
                 target_shape_str = "_" + str(target_height) + "_" + str(target_width)
                 hash_key += target_shape_str
 
@@ -426,6 +426,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 "remove_image_idx": remove_image_idx,
                 "image_grid_thw_lists": image_grid_thw_lists,
             }
+            
         else:
             args_dict = {}
 

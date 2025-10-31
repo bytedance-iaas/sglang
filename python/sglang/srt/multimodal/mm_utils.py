@@ -41,16 +41,21 @@ from PIL import Image
 
 from sglang.srt.utils import flatten_nested_list
 
+import cv2
+
 def fast_image_hash(img: Image.Image, hash_type: str = "int") -> int | str:
-    small_img = img.resize((8, 8), Image.Resampling.BILINEAR).convert("L")
-    pixel_data = small_img.tobytes()
-    hash_obj = hashlib.md5(pixel_data)
+    # Convert PIL → OpenCV gray
+    arr = np.asarray(img.convert("L"))
+    # Resize to 8x8 using fast bilinear interpolation
+    small = cv2.resize(arr, (8, 8), interpolation=cv2.INTER_LINEAR)
+    # Hash raw bytes
+    hash_obj = hashlib.md5(small.tobytes())
 
-    if hash_type == "int":
-        return int.from_bytes(hash_obj.digest(), byteorder="little", signed=False)
-    else:
-        return hash_obj.hexdigest()
-
+    return (
+        int.from_bytes(hash_obj.digest(), "little", signed=False)
+        if hash_type == "int"
+        else hash_obj.hexdigest()
+    )
 
 def image_to_int(img: Image.Image) -> int:
     img_bytes = img.tobytes()
