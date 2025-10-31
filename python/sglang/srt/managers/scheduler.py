@@ -154,6 +154,7 @@ from sglang.srt.mem_cache.eic_hiradix_cache import (
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatchOutput,
     ForwardMode,
@@ -1206,7 +1207,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -2092,7 +2093,9 @@ class Scheduler(
         return batch
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2112,8 +2115,14 @@ class Scheduler(
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
+            kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
+
             forward_batch_output = self.model_worker.forward_batch_generation(
-                batch_or_worker_batch
+                batch_or_worker_batch, **kwargs
             )
 
             if not self.spec_algorithm.is_none():
