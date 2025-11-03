@@ -1228,6 +1228,7 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    async_send: bool = False,
 ):
     """Send data from src to dst in group."""
     from sglang.srt.distributed.parallel_state import P2PWork
