@@ -4,6 +4,13 @@ FROM hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 ARG TARGETARCH
 
 ARG GRACE_BLACKWELL=0
+# 配置 apt 将缓存放到 /root/.cache/apt 目录
+RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
+ && echo 'Dir::Cache "/root/.cache/apt";' > /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::Cache::archives "/root/.cache/apt/archives";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
+
 # 编译之前，将源统一设置成内网的
 RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
     sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
@@ -15,6 +22,8 @@ ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
 ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ARG SGL_KERNEL_VERSION=0.3.16.post4
+ARG CUSTOM_CACHE_TOS_AK=""
+ARG CUSTOM_CACHE_TOS_BUCKET="iaas-servingkit"
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -57,9 +66,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     patchelf \
     nvidia-dkms-550 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
- && ln -sf /usr/bin/python3.12 /usr/bin/python \
- && rm -rf /var/lib/apt/lists/* \
- && apt-get clean
+ && ln -sf /usr/bin/python3.12 /usr/bin/python
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
@@ -79,6 +86,43 @@ FROM base AS build-image
 # Install SGLang
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
+ARG CUSTOM_CACHE_TOS_AK
+ARG CUSTOM_CACHE_TOS_BUCKET
+ARG CUDA_VERSION
+ARG SGLANG_BRANCH
+
+# 设置 ccache 环境变量
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV PATH="/usr/lib/ccache:${PATH}"
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+# 安装 toscli 工具并下载 ccache 缓存
+RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ]; then \
+      curl -s https://luban-source.byted.org/repository/scm/toutiao.tos.toscli_1.0.0.20.tar.gz -o - | tar xz -C . ./toscli \
+      && chmod +x ./toscli \
+      && mv ./toscli /usr/bin/ \
+      && CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH}.tar.gz" \
+      && echo "Downloading cache from TOS: ${CACHE_TAR_NAME}" \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} get -filename /tmp/${CACHE_TAR_NAME} cache/sglang-image/${CACHE_TAR_NAME} || true \
+      && if [ -f "/tmp/${CACHE_TAR_NAME}" ]; then \
+           echo "Cache file downloaded, size: $(du -h /tmp/${CACHE_TAR_NAME} | cut -f1)" \
+           && mkdir -p /root/.cache \
+           && tar -xzf /tmp/${CACHE_TAR_NAME} -C /root \
+           && echo "Cache extracted successfully" \
+           && echo "Cache contents after extraction:" \
+           && du -sh /root/.cache/* 2>/dev/null || echo "  /root/.cache is empty or not accessible" \
+           && rm -f /tmp/${CACHE_TAR_NAME}; \
+         else \
+           echo "No cache found, starting fresh build" \
+           && mkdir -p /root/.cache; \
+         fi \
+    else \
+      echo "CUSTOM_CACHE_TOS_AK not set, skipping cache download" \
+      && mkdir -p /root/.cache; \
+    fi
+
 # 使用bytedance-iaas代码仓进行sglang安装
 ARG SGLANG_BRANCH
 COPY --from=local_src /src /tmp/local_src
@@ -88,7 +132,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 https://github.com/bytedance-iaas/sglang.git -b ${SGLANG_BRANCH} /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
+RUN python3 -m pip install  --upgrade pip setuptools wheel html5lib six \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -97,13 +141,13 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+     python3 -m pip install  https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
    fi \
 && if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-     python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
+     python3 -m pip install  sgl-kernel==${SGL_KERNEL_VERSION} ; \
    fi \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
+ && python3 -m pip install  -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m pip install  nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 
@@ -132,7 +176,12 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
+    cmake -S . -B build/ \
+    -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} \
+    -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
@@ -161,7 +210,7 @@ RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       pip install --no-build-isolation -v . ;
 
 # Python tools
-RUN python3 -m pip install --no-cache-dir \
+RUN python3 -m pip install  \
     datamodel_code_generator \
     mooncake-transfer-engine==0.3.6.post1 \
     pre-commit \
@@ -198,9 +247,14 @@ RUN apt-get update && apt-get install -y \
     bear \
     ccache \
     less \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
+
+# 配置 apt 将缓存放到 /root/.cache/apt 目录
+RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
+ && echo 'Dir::Cache "/root/.cache/apt";' > /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::Cache::archives "/root/.cache/apt/archives";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
@@ -216,7 +270,7 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
+RUN python3 -m pip install  --break-system-packages \
     pytest \
     black \
     isort \
@@ -262,12 +316,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
 
 # Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
+RUN python3 -m pip install  setuptools-rust \
     && cd /sgl-workspace/sglang/sgl-router \
     && cargo build --release \
-    && python3 -m pip install --no-cache-dir . \
-    && rm -rf /root/.cache
-
+    && python3 -m pip install  .
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
@@ -427,6 +479,30 @@ EOF
 #    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 RUN pip install rust-just
 
+# 上传 ccache 缓存到 TOS
+ARG CUSTOM_CACHE_TOS_AK
+ARG CUSTOM_CACHE_TOS_BUCKET
+ARG CUDA_VERSION
+RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ] ; then \
+      CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH}.tar.gz" \
+      && echo "=== Preparing to upload cache to TOS: ${CACHE_TAR_NAME} ===" \
+      && rm -rf /root/.cache/cargo-target /root/.cache/flashinfer \
+      && echo "Cache contents before archiving:" \
+      && du -sh /root/.cache/* 2>/dev/null || echo "  /root/.cache is empty" \
+      && cd /root \
+      && tar -czf /tmp/${CACHE_TAR_NAME} .cache \
+      && echo "Cache archive created, size: $(du -h /tmp/${CACHE_TAR_NAME} | cut -f1)" \
+      && echo "Archive contents:" \
+      && tar -tzf /tmp/${CACHE_TAR_NAME} | head -20 \
+      && echo "..." \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 10m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} del cache/sglang-image/${CACHE_TAR_NAME} || true \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} put -verbose -prefix cache/sglang-image/ -name ${CACHE_TAR_NAME} /tmp/${CACHE_TAR_NAME} \
+      && echo "=== Cache uploaded successfully ===" \
+      && rm -f /tmp/${CACHE_TAR_NAME}; \
+    else \
+      echo "CUSTOM_CACHE_TOS_AK not set, skipping cache upload"; \
+    fi
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -434,4 +510,5 @@ WORKDIR /sgl-workspace/sglang
 RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
 RUN rm -rf /var/lib/apt/lists/* && \
     sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
-    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list && \
+    rm -rf /root/.cache
