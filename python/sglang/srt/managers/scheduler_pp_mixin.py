@@ -683,9 +683,9 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
+                #if self.delayed_weight_sync_fn:
+                    #self.delayed_weight_sync_fn()
+                    #self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
