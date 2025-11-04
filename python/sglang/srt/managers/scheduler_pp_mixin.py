@@ -378,7 +378,7 @@ class SchedulerPPMixin:
                     good_consensus_bootstrapped_rids,
                     bad_consensus_bootstrapped_rids,
                 ) = bootstrapped_rids
-                bootstrapped_rids = [[req.rid for req in good_consensus_bootstrapped_rids], [req.rid for req in bad_consensus_bootstrapped_rids]]
+                bootstrapped_rids = [good_consensus_bootstrapped_rids, [req.rid for req in bad_consensus_bootstrapped_rids]]
                 good_reqs, failed_reqs = (
                     self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                         return_failed_reqs=True,
