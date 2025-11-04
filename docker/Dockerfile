@@ -511,4 +511,5 @@ RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
 RUN rm -rf /var/lib/apt/lists/* && \
     sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
     sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list && \
-    rm -f /etc/apt/apt.conf.d/99custom-cache
+    rm -f /etc/apt/apt.conf.d/99custom-cache && \
+    rm -rf /root/.cache
