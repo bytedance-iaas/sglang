@@ -566,10 +566,36 @@ class SchedulerPPMixin:
                 self.process_input_requests(recv_reqs)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+
+                if self.pp_group.is_first_rank:
+                    # First rank, pop the bootstrap reqs from the bootstrap queue
+                    bootstrapped_reqs, failed_reqs = (
+                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                            return_failed_reqs=True
+                        )
+                    )
+                    bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
+                        req.rid for req in failed_reqs
+                    ]
+                else:
+                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
+                    bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+
+                if self.pp_group.is_first_rank:
+                    transferred_rids = self.get_transferred_rids()
+                # if other ranks,
+                else:
+                    # 1. recv previous stage's transferred reqs info
+                    prev_transferred_rids = self.recv_pyobj_from_prev_stage()
+                    # 2. get the current stage's transferred reqs info
+                    curr_transferred_rids = self.get_transferred_rids()
+                    # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+                    transferred_rids = list(
+                        set(prev_transferred_rids) & set(curr_transferred_rids)
+                    )
+                
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
-
-                transferred_rids = self._pp_pd_get_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
