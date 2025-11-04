@@ -517,181 +517,96 @@ class SchedulerPPMixin:
         - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
 
         """
-        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
-        mbs = [None] * self.pp_loop_size
-        last_mbs = [None] * self.pp_loop_size
+        """An async scheduler loop for pipeline parallelism."""
+        loop_size = self.pp_size + self.server_args.pp_async_batch_depth
+        mbs = [None] * loop_size
+        last_mbs = [None] * loop_size
         self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False)
-            for _ in range(self.pp_loop_size)
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(loop_size)
         ]
-        mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
+        mb_metadata: List[Optional[PPBatchMetadata]] = [None] * loop_size
         pp_outputs: Optional[PPProxyTensors] = None
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
-
-        # PD additional
-        consensus_bootstrapped_rids: Optional[List[str]] = None
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
-        tmbs = [None] * self.pp_loop_size
-        bmbs = [None] * self.pp_loop_size
-
-        send_req_work = []
-        send_bootstrapped_work = []
-        send_consensus_bootstrapped_work = []
-        send_proxy_work = []
-        send_release_work = []
-        send_transfer_work = []
-
         while True:
             server_is_idle = True
-            for mb_id in range(self.pp_loop_size):
+            for mb_id in range(loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
-                next_mb_id = (mb_id + 1) % self.pp_loop_size
-
-                next_pp_outputs = None
-                next_release_rids = None
-                next_consensus_bootstrapped_rids = None
-                d2h_event = None
-                next_batch_result = None
 
                 recv_reqs = self.recv_requests()
-                self._pp_commit_comm_work(send_req_work)
                 self.process_input_requests(recv_reqs)
-
-                if self.pp_group.is_first_rank:
-                    # First rank, pop the bootstrap reqs from the bootstrap queue
-                    bootstrapped_reqs, failed_reqs = (
-                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                            return_failed_reqs=True
-                        )
-                    )
-                    bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
-                        req.rid for req in failed_reqs
-                    ]
-                else:
-                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-                    bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-
-                if self.pp_group.is_first_rank:
-                    transferred_rids = self.get_transferred_rids()
-                # if other ranks,
-                else:
-                    # 1. recv previous stage's transferred reqs info
-                    prev_transferred_rids = self.recv_pyobj_from_prev_stage()
-                    # 2. get the current stage's transferred reqs info
-                    curr_transferred_rids = self.get_transferred_rids()
-                    # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-                    transferred_rids = list(
-                        set(prev_transferred_rids) & set(curr_transferred_rids)
-                    )
-                
-                bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
-                self._pp_commit_comm_work(send_transfer_work)
-                tmbs[mb_id] = transferred_rids
-
-                self.process_prefill_chunk()
-                mbs[mb_id] = self.get_new_batch_prefill()
+                mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                self._pp_commit_comm_work(send_proxy_work)
-                if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event,_ = (
-                        self._pp_send_recv_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                            mbs,
-                            mb_metadata,
-                            last_rank_comm_queue,
-                            pp_outputs,
-                        )
+                    result = self.run_batch(self.cur_batch)
+                    mb_metadata[mb_id] = PPBatchMetadata(
+                        bid=result.bid,
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
-                if self.cur_batch:
-                    result, event = self._pp_launch_batch(
-                        mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
-                    )
-                if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event,_ = (
-                        self._pp_send_recv_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                            mbs,
-                            mb_metadata,
-                            last_rank_comm_queue,
-                            pp_outputs,
-                        )
-                    )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
-                    )
-                )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream())
 
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                    
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self.recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
-                # post-process the coming microbatch
-                if mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        mbs[next_mb_id],
-                        next_batch_result,
-                    )
-                    last_mbs[next_mb_id] = mbs[next_mb_id]
+                with torch.cuda.stream(self.pp_process_stream):
+                    # (last rank) send the outputs to the next step
+                    if self.pp_group.is_last_rank:
+                        if self.cur_batch:
+                            # (last rank) buffer the outputs for async batch depth
+                            last_rank_comm_queue.append(
+                                (
+                                    event,
+                                    PPProxyTensors(
+                                        self._prepare_pp_tensor_dict(
+                                            result, self.cur_batch
+                                        )
+                                    ),
+                                )
+                            )
 
-                if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
-                    send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if self.cur_batch:
-                        torch.cuda.current_stream().wait_event(event)
-                        send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
+                        # send ready PP output to rank 0
+                        next_first_rank_mb_id = (mb_id + self.pp_size) % loop_size
+                        if mbs[next_first_rank_mb_id] is not None:
+                            q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                            torch.cuda.current_stream().wait_event(q_event)
+                            self._pp_send_dict_to_next_stage(pp_outputs_to_send.tensors)
+
+                    # receive outputs to post-process (filter finished reqs) the coming microbatch
+                    next_mb_id = (mb_id + 1) % loop_size
+                    next_pp_outputs = None
+                    if mbs[next_mb_id] is not None:
+                        next_pp_outputs = PPProxyTensors(
+                            self._pp_recv_dict_from_prev_stage()
                         )
 
-                #if self.delayed_weight_sync_fn:
-                    #self.delayed_weight_sync_fn()
-                    #self.delayed_weight_sync_fn = None
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
+                    if not self.pp_group.is_last_rank and pp_outputs:
+                        self._pp_send_dict_to_next_stage(pp_outputs.tensors)
+
+                    # post-process the coming microbatch
+                    if mbs[next_mb_id] is not None:
+                        self._pp_process_batch_result(
+                            mbs[next_mb_id],
+                            mb_metadata[next_mb_id],
+                            next_pp_outputs,
+                        )
+                        last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                    # (not last rank)
+                    if not self.pp_group.is_last_rank:
+                        self._pp_send_reqs_to_next_stage(recv_reqs)
+                        # send out proxy tensors to the next stage
+                        if self.cur_batch:
+                            torch.cuda.current_stream().wait_event(event)
+                            self._pp_send_dict_to_next_stage(
+                                result.pp_hidden_states_proxy_tensors
+                            )
 
                 pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
-                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
-
-                self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+            if server_is_idle:
+                # When the server is idle, do self-check and re-init some states
+                self.self_check_during_idle()
