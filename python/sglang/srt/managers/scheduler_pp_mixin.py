@@ -372,7 +372,7 @@ class SchedulerPPMixin:
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None:
+        if bootstrapped_rids is not None or len(bootstrapped_rids) != 0:
             (
                 good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
