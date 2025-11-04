@@ -565,8 +565,6 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_req_work)
                 self.process_input_requests(recv_reqs)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
-
                 if self.pp_group.is_first_rank:
                     # First rank, pop the bootstrap reqs from the bootstrap queue
                     bootstrapped_reqs, failed_reqs = (
