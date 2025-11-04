@@ -597,7 +597,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk_pp()
+                self.process_prefill_chunk()
                 mbs[mb_id] = self.get_new_batch_prefill()
                 self.running_mbs[mb_id] = self.running_batch
 
