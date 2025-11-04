@@ -479,6 +479,18 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
+    def _pp_send_reqs_to_next_stage(self, reqs: List[Req]):
+        # send out reqs to the next stage
+        dp_offset = self.attn_dp_rank * self.attn_tp_size
+        if self.attn_tp_rank == 0:
+            point_to_point_pyobj(
+                reqs,
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.cpu_group,
+                self.pp_rank * self.tp_size + dp_offset,
+                (self.pp_rank + 1) * self.tp_size + dp_offset,
+            )
+
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
         """
