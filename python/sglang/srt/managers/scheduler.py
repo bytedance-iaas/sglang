@@ -410,6 +410,8 @@ class Scheduler(
         self.default_stream: CudaStream = torch.get_device_module(
             self.device
         ).current_stream()
+        if self.pp_size > 1:
+            self.pp_process_stream = torch.get_device_module(self.device).Stream()
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
