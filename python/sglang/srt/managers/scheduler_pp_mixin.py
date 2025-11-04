@@ -648,7 +648,7 @@ class SchedulerPPMixin:
 
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                    next_consensus_bootstrapped_rids, _ = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
