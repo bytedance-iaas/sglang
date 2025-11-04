@@ -648,12 +648,9 @@ class SchedulerPPMixin:
 
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-                    next_consensus_bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                        return_failed_reqs=True,
-                        rids_to_check=next_consensus_bootstrapped_rids
+                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                        next_consensus_bootstrapped_rids
                     )
-                    self.waiting_queue.extend(next_consensus_bootstrapped_reqs)
-                    next_consensus_bootstrapped_rids = [req.rid for req in next_consensus_bootstrapped_reqs]
                     
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
