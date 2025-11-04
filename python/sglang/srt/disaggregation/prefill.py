@@ -685,7 +685,7 @@ class SchedulerDisaggregationPrefillMixin:
             point_to_point_pyobj(
                 data,
                 self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
+                self.world_group.cpu_group,
                 self.pp_rank * self.tp_size + dp_offset,
                 ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
             )
@@ -696,7 +696,7 @@ class SchedulerDisaggregationPrefillMixin:
             data = point_to_point_pyobj(
                 [],
                 self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
+                self.world_group.cpu_group,
                 ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
                 self.pp_rank * self.tp_size + dp_offset,
             )
