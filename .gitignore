@@ -241,3 +241,6 @@ lmms-eval
 
 **/.claude/
 **/.serena/
+# docker
+docker/eic*
+docker/config

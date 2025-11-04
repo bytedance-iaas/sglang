@@ -122,6 +122,8 @@ class SchedulerStats:
     swa_token_usage: float = 0.0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
+    cache_hit_rate: float = 0.0
+    eic_cache_hit_rate: float = 0.0
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
@@ -220,6 +222,13 @@ class SchedulerMetricsCollector:
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.eic_cache_hit_rate = Gauge(
+            name="sglang:eic_cache_hit_rate",
+            documentation="The EIC cache hit rate.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -544,6 +553,7 @@ class SchedulerMetricsCollector:
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.eic_cache_hit_rate, stats.eic_cache_hit_rate)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
