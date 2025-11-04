@@ -607,7 +607,7 @@ class SchedulerPPMixin:
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 self._pp_commit_comm_work(send_proxy_work)
                 if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    next_pp_outputs, next_batch_result, d2h_event,_ = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -622,7 +622,7 @@ class SchedulerPPMixin:
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
                 if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    next_pp_outputs, next_batch_result, d2h_event,_ = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
