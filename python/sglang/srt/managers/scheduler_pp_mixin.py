@@ -372,20 +372,33 @@ class SchedulerPPMixin:
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None or len(bootstrapped_rids) != 0:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
-            good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids,
-                    bad_rids_to_check=bad_consensus_bootstrapped_rids,
+        if bootstrapped_rids is not None: 
+            if len(bootstrapped_rids) == 2:
+                (
+                    good_consensus_bootstrapped_rids,
+                    bad_consensus_bootstrapped_rids,
+                ) = bootstrapped_rids
+                good_reqs, failed_reqs = (
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                        return_failed_reqs=True,
+                        rids_to_check=good_consensus_bootstrapped_rids,
+                        bad_rids_to_check=bad_consensus_bootstrapped_rids,
+                    )
                 )
-            )
-            self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+                self.waiting_queue.extend(good_reqs)
+                return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            else if len(bootstrapped_rids) == 1:
+                (
+                    good_consensus_bootstrapped_rids
+                ) = bootstrapped_rids
+                good_reqs, failed_reqs = (
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                        return_failed_reqs=True,
+                        rids_to_check=good_consensus_bootstrapped_rids
+                    )
+                ):
+                self.waiting_queue.extend(good_reqs)
+                return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return bootstrapped_rids
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
