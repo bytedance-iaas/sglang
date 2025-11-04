@@ -396,7 +396,7 @@ class SchedulerPPMixin:
                         return_failed_reqs=True,
                         rids_to_check=good_consensus_bootstrapped_rids
                     )
-                ):
+                )
                 self.waiting_queue.extend(good_reqs)
                 return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return bootstrapped_rids
