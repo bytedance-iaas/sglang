@@ -420,7 +420,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
             if obj.is_single:
+                s_time = time.time()
                 tokenized_obj = await self._tokenize_one_request(obj)
+                e_time = time.time()
+                print("tokenize cost time {} ms".format((e_time - s_time) * 1000))
+                
                 s_time = time.time()
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 e_time = time.time()
@@ -612,6 +616,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            s_time = time.time()
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 audio_data=obj.audio_data,
@@ -619,6 +624,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
+            e_time = time.time()
+            print("process_mm_data_async cost time : {} ms".format((e_time - s_time)* 1000))
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
         else:
@@ -872,10 +879,50 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         trace_slice_start("dispatch", obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
+        
+        
+        def describe_socket(socket):
+            info = {}
+            info["type"] = socket.type
+            
+            try:
+                info["endpoint"] = socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+            except:
+                info["endpoint"] = None
+            
+            ep = info["endpoint"]
+            if ep:
+                if ep.startswith("inproc://"):
+                    info["network"] = "same-process"
+                elif ep.startswith("ipc://"):
+                    info["network"] = "local-ipc"
+                elif ep.startswith("tcp://127.") or "localhost" in ep:
+                    info["network"] = "local-loopback"
+                elif ep.startswith("tcp://10.") or ep.startswith("tcp://192.168."):
+                    info["network"] = "LAN"
+                elif ep.startswith("tcp://"):
+                    info["network"] = "WAN/public"
+                else:
+                    info["network"] = "unknown"
+            print(info)
+        # try:
+        print("self.send_to_scheduler {} .....".format(self.send_to_scheduler))
+        # socket_type = self.send_to_scheduler.type
+        # print(socket_type)
+        # print(zmq.socket_type_names[socket_type])
+        # endpoints = self.send_to_scheduler.getsockopt(zmq.LAST_ENDPOINT).decode()
+        # print(endpoints)
+        describe_socket(self.send_to_scheduler)
+                
+        
+        # except:
+        #     print("inffering zmq type finished")
+        
         return state
 
     def _send_batch_request(

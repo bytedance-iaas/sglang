@@ -29,6 +29,8 @@ LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 """
 import ast
 import hashlib
+import xxhash
+import time
 import math
 import re
 from io import BytesIO
@@ -38,6 +40,7 @@ import numpy as np
 import pybase64
 import torch
 from PIL import Image
+import imagehash
 
 from sglang.srt.utils import flatten_nested_list
 
@@ -45,17 +48,37 @@ import cv2
 
 def fast_image_hash(img: Image.Image, hash_type: str = "int") -> int | str:
     # Convert PIL → OpenCV gray
-    arr = np.asarray(img.convert("L"))
-    # Resize to 8x8 using fast bilinear interpolation
-    small = cv2.resize(arr, (8, 8), interpolation=cv2.INTER_LINEAR)
-    # Hash raw bytes
-    hash_obj = hashlib.md5(small.tobytes())
-
+    # s_time = time.time()
+    # # arr = np.array(img)
+    # e_time = time.time()
+    # print("convert cost time {} ms".format((e_time - s_time) * 1000))
+    # # Resize to 8x8 using fast bilinear interpolation
+    # img_2 = Image.new('RGB', img.size)
+    
+    # # self.pil_img = Image.new('RGB', (self.width, self.height), color='blue')
+    # s_time = time.time()
+    # arr = np.random.randint(0, 256, (img.height, img.width, 3), dtype=np.uint8)
+    # img_2 = Image.fromarray(arr)
+    # e_time = time.time()
+    # print("resize_2 cost time {} ms".format((e_time - s_time) * 1000))
+    
+    # s_time = time.time()
+    # small = img.resize((8, 8), resample=Image.NEAREST)
+    # e_time = time.time()
+    # print("resize cost time {} ms".format((e_time - s_time) * 1000))
+    # # Hash raw bytes
+    # # hash_obj = hashlib.md5(small.tobytes())
+    
+    # s_time = time.time()
+    hash_obj = xxhash.xxh32(img.tobytes())
+    # e_time = time.time()
+    # print("hash cost time {} ms".format((e_time - s_time) * 1000))
     return (
         int.from_bytes(hash_obj.digest(), "little", signed=False)
         if hash_type == "int"
         else hash_obj.hexdigest()
     )
+    # return str(imagehash.average_hash(img))
 
 def image_to_int(img: Image.Image) -> int:
     img_bytes = img.tobytes()

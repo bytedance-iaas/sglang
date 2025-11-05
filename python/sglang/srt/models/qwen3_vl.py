@@ -440,6 +440,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        import time
+        torch.cuda.synchronize()
+        start_time = time.time()
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -481,6 +484,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        torch.cuda.synchronize()
+        end_time = time.time()
+        print("vision transformer cost {} ms".format((end_time - start_time) * 1000))
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -543,7 +549,10 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
+        # print("LLM is here")
+        import time
+        torch.cuda.synchronize()
+        s_time = time.time()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -594,6 +603,10 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+        
+        torch.cuda.synchronize()
+        e_time = time.time()
+        print("LLM cost time {} ms".format((e_time - s_time) * 1000))
 
         if len(aux_hidden_states) == 0:
             return hidden_states

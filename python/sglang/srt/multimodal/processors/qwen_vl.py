@@ -329,6 +329,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         """
         process multimodal data with transformers AutoProcessor
         """
+        torch.cuda.synchronize()
+        a_s_time = time.time()
         if images:
             kwargs["images"] = images
         if videos:
@@ -462,8 +464,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             # print("after processor cost time {} ms".format((e_time_2 - e_time) * 1000))
 
         else:
-            # torch.cuda.synchronize()
-            # s_time = time.time()
+            torch.cuda.synchronize()
+            s_time = time.time()
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
@@ -475,11 +477,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             # # print(processor.__call__)
             # # print("result {}".format(result))
             # move feature tensors to cpu
-            # torch.cuda.synchronize()
-            # e_time = time.time()
-            # print("processor cost time {} ms".format((e_time - s_time) * 1000))
+            torch.cuda.synchronize()
+            e_time = time.time()
+            print("processor cost time {} ms".format((e_time - s_time) * 1000))
         # print(result["pixel_values"].shape)
         # print(result["image_grid_thw"])
+        a_ss_time = time.time()
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -501,7 +504,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     image_crops = result["images_crop"]
                 if isinstance(image_crops, torch.Tensor) and (not image_crops.is_cuda):
                     result["images_crop"] = result["images_crop"].to("cuda", non_blocking = True)
-
+        torch.cuda.synchronize()
+        a_e_time = time.time()
+        print("half process_data e2e : {} ms".format((a_e_time - a_ss_time) * 1000))
+        print("all process_data e2e : {} ms".format((a_e_time - a_s_time) * 1000))
         return result
 
     async def process_mm_data_async(
@@ -538,7 +544,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 s_time = time.time()
                 hash_key = fast_image_hash(images[img_idx])
                 e_time = time.time()
-                # print("hash time {} ms".format((e_time - s_time) * 1000))
+                print("hash time {} ms".format((e_time - s_time) * 1000))
                 img_hash_keys.append(hash_key)
                 img_height, resize_h, resize_w = get_img_height_from_raw_img(
                     images[img_idx], self.PATCH_PIXEL_NUMS, 2 * self.PATCH_SIZE
@@ -628,13 +634,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 base_output.videos, video_metadata = map(list, zip(*video_results))
 
             # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+            
             if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+                s_time = time.time()
                 mm_items, input_ids, ret =  self.process_and_combine_mm_data(
                     base_output,
                     self.mm_tokens,
                     video_metadata=video_metadata,
                     do_sample_frames=False,
                 )
+                e_time = time.time()
+                print("all cost time {} ms".format((e_time - s_time)* 1000))
             else:
                 mm_items, input_ids, ret =  self.process_and_combine_mm_data(
                     base_output, self.mm_tokens
@@ -654,7 +664,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         input_ids = input_ids.flatten()
-
+        
+        s_time = time.time()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -676,6 +687,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.hf_config, "position_id_per_seconds", None
             ),
         )
+        e_time = time.time()
+        
+        print("get rope idx cost {} ms".format((e_time - s_time)* 1000))
         mrope_positions = mrope_positions.squeeze(1)
 
         return {

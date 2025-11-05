@@ -576,9 +576,13 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
 class SenderWrapper:
     def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
         self.port_args = port_args
+        print("prot args {}".format(port_args))
+        print("send to socket {}".format(send_to_scheduler))
+        
         self.send_to_scheduler = send_to_scheduler
 
     def send_pyobj(self, obj):
+        print("entering.........................")
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(obj)

@@ -576,12 +576,15 @@ class MultimodalDataItem:
 
     @staticmethod
     def from_dict(obj: dict):
+        s_time = time.time()
         kwargs = dict(obj)
         modality = kwargs.pop("modality")
         if isinstance(modality, str):
             modality = Modality[modality]
         ret = MultimodalDataItem(modality=modality, **kwargs)
         ret.validate()
+        e_time = time.time()
+        print("from dict 1 cost time {} ms".format((e_time - s_time) * 1000))
         return ret
 
     def merge(self, other):
@@ -621,6 +624,7 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        s_time = time.time()
         ret = MultimodalInputs(
             mm_items=obj["mm_items"],
         )
@@ -646,6 +650,9 @@ class MultimodalInputs:
         for arg in optional_args:
             if arg in obj:
                 setattr(ret, arg, obj[arg])
+                
+        e_time = time.time()
+        print("from dict 2 cost time {} ms".format((e_time - s_time) * 1000))
 
         return ret
 

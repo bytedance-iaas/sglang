@@ -264,18 +264,18 @@ class BaseMultimodalProcessor(ABC):
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
         import time
-        # torch.cuda.synchronize()
-        # s_time = time.time()
+        torch.cuda.synchronize()
+        s_time = time.time()
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
-        # torch.cuda.synchronize()
-        # e_time = time.time()
+        torch.cuda.synchronize()
+        e_time = time.time()
         
-        # print("processor cost time {} ms".format((e_time - s_time) * 1000))
+        print("processor cost time {} ms".format((e_time - s_time) * 1000))
         
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
@@ -617,10 +617,13 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (created mm_items, input_ids)
         """
+        import time
+        s_time = time.time()
         ret = self.process_mm_data(
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
-
+        e_time = time.time()
+        print("process mm data cost time {} ms".format((e_time - s_time) * 1000))
         input_ids = ret["input_ids"].flatten()
         collected_items = self.collect_mm_items_from_processor_output(ret)
 
@@ -639,6 +642,7 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (list of mm_items, input_ids)
         """
+        import time
         # Collect all items and categorize them
         all_items = base_output.organize_results()
         # Handle text-only case
@@ -668,6 +672,7 @@ class BaseMultimodalProcessor(ABC):
 
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
+            s_time = time.time()
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
@@ -675,6 +680,8 @@ class BaseMultimodalProcessor(ABC):
                 videos=raw_videos,
                 **kwargs,
             )
+            e_time = time.time()
+            print("sub cost time {} ms".format((e_time - s_time) * 1000))
             all_collected_items = collected_items
         else:
             ret = None
