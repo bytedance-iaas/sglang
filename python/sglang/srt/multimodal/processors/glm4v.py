@@ -185,6 +185,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             img_token_nums = kwargs.pop("img_token_nums")
             remove_image_idx = kwargs.pop("remove_image_idx")
             image_grid_thw_lists = kwargs.pop("image_grid_thw_lists")
+            image_heights = kwargs.pop("image_heights")
 
             processed_text = operate_substrings(
                 input_text, to_replace_str, remove_image_idx, repalce_str
@@ -196,6 +197,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # torch.cuda.synchronize()
             # s_time = time.time()
             
+            # print("new process image idx {} remove_image_idx {}".format(new_processed_img_idxes, remove_image_idx))
             result = processor.__call__(
                 text=[processed_text],
                 padding=True,
@@ -203,28 +205,23 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 **kwargs,
             )
             
-            # torch.cuda.synchronize()
-            # e_time = time.time()
-            # print("processor cost time {} ms".format((e_time - s_time) * 1000))
 
-            # start_height = 0
-            # end_height = 0
+            start_height = 0
+            end_height = 0
             tensor_lists = []
             used_hash_keys = set()
             
             for img_idx in range(len(images)):
                 # cache Tensor
                 if img_idx in new_processed_img_idxes:
-                    idx_in_new_processed = new_processed_img_idxes.index(img_idx)
-
-                    per_image_height = result["pixel_values"].shape[0] // len(new_processed_img_idxes)
-   
+                    start_height = end_height
+                    end_height = start_height + image_heights[img_idx]
                     
                     to_cache_tensor = result["pixel_values"][
-                        idx_in_new_processed * per_image_height : (idx_in_new_processed + 1) * per_image_height
+                        start_height : end_height
                     ].contiguous()
                     self.image_cache_table.add(img_hash_keys[img_idx], to_cache_tensor)
-
+                    
                     tensor_lists.append(to_cache_tensor)
                 # add input ids and insert tensor
                 else:
@@ -277,7 +274,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 )
                 max_cache_image_size = available_size_mb
 
-            proxy_pixel_values = torch.stack(tensor_lists)
+            proxy_pixel_values = torch.cat(tensor_lists)
             hash_keys = set()
             self.image_cache_table.pop_until(max_cache_image_size, hash_keys)
              
@@ -374,24 +371,21 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             img_token_nums = []
             remove_image_idx = []
             image_grid_thw_lists = []
+            image_heights = []
 
-            target_height, target_width = 0, 0
-            for image in images:
-                height, width = smart_resize(
-                    self.TEMP_FACTOR, image.size[0], image.size[1]
-                )
-                target_height, target_width = max(height, target_height), max(
-                    width, target_width
-                )
             for img_idx in range(len(images)):
-                hash_key = str((fast_image_hash(images[img_idx])))
-                target_shape_str = "_" + str(target_height) + "_" + str(target_width)
-                hash_key += target_shape_str
+                
+                hash_key = fast_image_hash(images[img_idx])
+                target_height, target_width = smart_resize(self.TEMP_FACTOR, images[img_idx].size[0], images[img_idx].size[1])
+                # target_shape_str = "_" + str(target_height) + "_" + str(target_width)
+                # hash_key += target_shape_str
 
                 img_hash_keys.append(hash_key)
                 image_height = (target_width // self.PATCH_SIZE) * (
                     target_height // self.PATCH_SIZE
                 )
+                
+                image_heights.append(image_height)
                 # ref: transformers
                 img_token_num = image_height // (self.MERGE_NUM * self.MERGE_NUM)
 
@@ -425,6 +419,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 "img_token_nums": img_token_nums,
                 "remove_image_idx": remove_image_idx,
                 "image_grid_thw_lists": image_grid_thw_lists,
+                "image_heights" : image_heights,
             }
             
         else:
