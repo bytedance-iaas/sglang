@@ -30,7 +30,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
     down_gemm_overlap_args = None,
-    max_block_n: int = None,
+    max_block_n: int = 256,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
