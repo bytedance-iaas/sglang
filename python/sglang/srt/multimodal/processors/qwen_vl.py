@@ -12,12 +12,6 @@ from torchvision.transforms import InterpolationMode
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.environ import envs
-
-use_cv2 = True
-try:
-    pass
-except:
-    use_cv2 = False
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.mm_utils import FIFOTensorCache
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration

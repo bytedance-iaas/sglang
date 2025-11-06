@@ -263,20 +263,13 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
-        import time
 
-        torch.cuda.synchronize()
-        s_time = time.time()
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
-        torch.cuda.synchronize()
-        e_time = time.time()
-
-        print("processor cost time {} ms".format((e_time - s_time) * 1000))
 
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
