@@ -15,6 +15,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
@@ -992,9 +993,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if down_gemm_overlap_args is not None:
+            assert get_moe_runner_backend().is_deep_gemm(), (
+                "DownGemmOverlap is only supported for DeepGemm backend."
+            )
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
@@ -1107,6 +1114,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                down_gemm_overlap_args=down_gemm_overlap_args,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
