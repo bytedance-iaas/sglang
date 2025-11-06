@@ -29,62 +29,34 @@ LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 """
 import ast
 import hashlib
-import xxhash
-import time
 import math
 import re
 from io import BytesIO
-from typing import List
 
 import numpy as np
 import pybase64
 import torch
+import xxhash
 from PIL import Image
-import imagehash
 
 from sglang.srt.utils import flatten_nested_list
 
-import cv2
 
 def fast_image_hash(img: Image.Image, hash_type: str = "int") -> int | str:
-    # Convert PIL → OpenCV gray
-    # s_time = time.time()
-    # # arr = np.array(img)
-    # e_time = time.time()
-    # print("convert cost time {} ms".format((e_time - s_time) * 1000))
-    # # Resize to 8x8 using fast bilinear interpolation
-    # img_2 = Image.new('RGB', img.size)
-    
-    # # self.pil_img = Image.new('RGB', (self.width, self.height), color='blue')
-    # s_time = time.time()
-    # arr = np.random.randint(0, 256, (img.height, img.width, 3), dtype=np.uint8)
-    # img_2 = Image.fromarray(arr)
-    # e_time = time.time()
-    # print("resize_2 cost time {} ms".format((e_time - s_time) * 1000))
-    
-    # s_time = time.time()
-    # small = img.resize((8, 8), resample=Image.NEAREST)
-    # e_time = time.time()
-    # print("resize cost time {} ms".format((e_time - s_time) * 1000))
-    # # Hash raw bytes
-    # # hash_obj = hashlib.md5(small.tobytes())
-    
-    # s_time = time.time()
     hash_obj = xxhash.xxh32(img.tobytes())
-    # e_time = time.time()
-    # print("hash cost time {} ms".format((e_time - s_time) * 1000))
     return (
         int.from_bytes(hash_obj.digest(), "little", signed=False)
         if hash_type == "int"
         else hash_obj.hexdigest()
     )
-    # return str(imagehash.average_hash(img))
+
 
 def image_to_int(img: Image.Image) -> int:
     img_bytes = img.tobytes()
     hash_obj = hashlib.md5(img_bytes)
     hash_bytes = hash_obj.digest()
     return int.from_bytes(hash_bytes, byteorder="big")
+
 
 def operate_substrings(original_str, target_sub, indices, replace_str=""):
 
@@ -123,6 +95,7 @@ def operate_substrings(original_str, target_sub, indices, replace_str=""):
 
     return result
 
+
 def insert_input_ids(input_ids, target_id, forbid_id_before_target, insert_ids):
     # print("check input_ids {}".format(input_ids))
     target_positions = (input_ids[0] == target_id).nonzero().squeeze(dim=1)
@@ -143,6 +116,7 @@ def insert_input_ids(input_ids, target_id, forbid_id_before_target, insert_ids):
             return new_tensor
 
     return input_ids
+
 
 def has_valid_data(data) -> bool:
     if data is None:

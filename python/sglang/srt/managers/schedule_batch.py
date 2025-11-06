@@ -624,7 +624,6 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        s_time = time.time()
         ret = MultimodalInputs(
             mm_items=obj["mm_items"],
         )
@@ -650,9 +649,6 @@ class MultimodalInputs:
         for arg in optional_args:
             if arg in obj:
                 setattr(ret, arg, obj[arg])
-                
-        e_time = time.time()
-        print("from dict 2 cost time {} ms".format((e_time - s_time) * 1000))
 
         return ret
 

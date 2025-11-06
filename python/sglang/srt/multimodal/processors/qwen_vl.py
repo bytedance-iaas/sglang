@@ -2,20 +2,20 @@ import asyncio
 import math
 import os
 import re
-from typing import List, Union
 import time
+from typing import List, Union
 
-import numpy as np
 import torch
 import torchvision
-import transformers
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from transformers import BaseImageProcessorFast
+
 from sglang.srt.environ import envs
+
 use_cv2 = True
 try:
-    import cv2
+    pass
 except:
     use_cv2 = False
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -26,10 +26,9 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneratio
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import (
-    image_to_int,
+    fast_image_hash,
     insert_input_ids,
     operate_substrings,
-    fast_image_hash
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -60,6 +59,7 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 CACHED_IMAGE_MAX_MB_SIZE = 4096
 SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+
 
 def smart_resize(
     height: int,
@@ -93,7 +93,9 @@ def smart_resize(
         w_bar = ceil_by_factor(width * beta, factor)
     return h_bar, w_bar
 
+
 import inspect
+
 
 def check_method_location(method):
     try:
@@ -106,44 +108,22 @@ def check_method_location(method):
         # print(f"无法获取位置信息: {str(e)}")
         pass
 
-def resize_image(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    width, height = image.size
-    min_pixels = min_pixels
-    max_pixels = max_pixels
-    resized_height, resized_width = smart_resize(
-        height,
-        width,
-        factor=size_factor,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-    )
-    
-    # print("resize_h {}, resize_w {}".format(resized_height, resized_width))
-    # default interpolation method of cv2 and PIL  both bilinear, but cv2 is much faster than pillow
-    if height != resized_height or width != resized_width:
-        if use_cv2 or get_int_env_var("SGLANG_CACHE_MM_IMAGE"):
-            arr = np.array(image)  # convert PIL → NumPy
-            resized = cv2.resize(
-                arr, (resized_width, resized_height)
-            )  # , interpolation=cv2.INTER_LINEAR)
-            image = Image.fromarray(resized)
-        else:
-            image = image.resize((resized_width, resized_height))
-    return image
 
-def get_img_height_from_raw_img(img: Image, patch_pixel_size, image_factor = IMAGE_FACTOR):
+def get_img_height_from_raw_img(
+    img: Image,
+    patch_pixel_size,
+    image_factor=IMAGE_FACTOR,
+    min_pixels=MIN_PIXELS,
+    max_pixels=MAX_PIXELS,
+):
     resize_h, resize_w = smart_resize(
-        img.size[0], img.size[1], image_factor, MIN_PIXELS, MAX_PIXELS
+        img.size[0], img.size[1], image_factor, min_pixels, max_pixels
     )
     ret = int((resize_h * resize_w) / patch_pixel_size)
     if ret < 1:
         raise ValueError("invalid image height")
     return ret, resize_h, resize_w
+
 
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
@@ -158,15 +138,6 @@ def ceil_by_factor(number: int, factor: int) -> int:
 def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
-
-
-async def resize_image_async(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
 
 
 def smart_nframes(
@@ -298,17 +269,28 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
         self.NUM_TOKEN_PER_FRAME = 770
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
+
         self.PATCH_SIZE = hf_config.vision_config.patch_size
+        self.MERGE_SIZE = hf_config.vision_config.spatial_merge_size
+        self.IMAGE_FACTOR = self.PATCH_SIZE * self.MERGE_SIZE
+
+        processor = self._processor
+        if hasattr(processor, "image_processor") and isinstance(
+            processor.image_processor, BaseImageProcessorFast
+        ):
+            self.MIN_PIXELS = processor.image_processor.size["shortest_edge"]
+            self.MAX_PIXELS = processor.image_processor.size["longest_edge"]
+        else:
+            self.MIN_PIXELS = 4 * 28 * 28
+            self.MAX_PIXELS = 16384 * 28 * 28
+
+        self.MAX_RATIO = 200
         self.PATCH_PIXEL_NUMS = float(self.PATCH_SIZE) * self.PATCH_SIZE
-        self.MERGE_PATCH_NUMS = (hf_config.vision_config.spatial_merge_size) ** 2
+        self.MERGE_PATCH_NUMS = self.MERGE_SIZE**2
         self.IMG_PAD_TOKEN_ID = hf_config.image_token_id
         self.VISION_START_TOKEN_ID = hf_config.vision_start_token_id
         self.VISION_END_TOKEN_ID = hf_config.vision_end_token_id
-        
+
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
@@ -319,9 +301,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
-        
+
         self.image_cache_table = FIFOTensorCache()
-        
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -371,19 +352,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             kwargs["images"] = (
                 new_processed_imgs if len(new_processed_imgs) != 0 else None
             )
-            
-            # torch.cuda.synchronize()
-            # s_time = time.time()
+
             result = processor.__call__(
                 text=[processed_text],
                 padding=True,
                 return_tensors="pt",
                 **kwargs,
             )
-            # torch.cuda.synchronize()
-            # e_time = time.time()
-            # print("processor cost time {} ms".format((e_time - s_time) * 1000))
-            
+
             start_height = 0
             end_height = 0
             tensor_lists = []
@@ -454,60 +430,47 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             proxy_pixel_values = torch.cat(tensor_lists)
             hash_keys = set()
             self.image_cache_table.pop_until(max_cache_image_size, hash_keys)
-            
+
             result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
                 torch.int64
             )
             result["pixel_values"] = proxy_pixel_values
-            # torch.cuda.synchronize()
-            # e_time_2 = time.time()
-            # print("after processor cost time {} ms".format((e_time_2 - e_time) * 1000))
 
         else:
-            torch.cuda.synchronize()
-            s_time = time.time()
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
                 return_tensors="pt",
                 **kwargs,
             )
-            
-            # check_method_location(processor.__call__)
-            # # print(processor.__call__)
-            # # print("result {}".format(result))
-            # move feature tensors to cpu
-            torch.cuda.synchronize()
-            e_time = time.time()
-            print("processor cost time {} ms".format((e_time - s_time) * 1000))
-        # print(result["pixel_values"].shape)
-        # print(result["image_grid_thw"])
-        a_ss_time = time.time()
+
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if SGL_USE_CUDA_IPC:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ) and (not result[feature_name].is_cuda):
-                        result[feature_name] = result[feature_name].to("cuda", non_blocking = True)
-                        
+                    if (
+                        feature_name in result
+                        and isinstance(result[feature_name], torch.Tensor)
+                        and (not result[feature_name].is_cuda)
+                    ):
+                        result[feature_name] = result[feature_name].to(
+                            "cuda", non_blocking=True
+                        )
+
                 else:
                     if feature_name in result and isinstance(
                         result[feature_name], torch.Tensor
                     ):
                         result[feature_name] = result[feature_name].to("cpu")
-            
+
             if SGL_USE_CUDA_IPC:
                 image_crops = None
                 if "images_crop" in result:
                     image_crops = result["images_crop"]
                 if isinstance(image_crops, torch.Tensor) and (not image_crops.is_cuda):
-                    result["images_crop"] = result["images_crop"].to("cuda", non_blocking = True)
-        torch.cuda.synchronize()
-        a_e_time = time.time()
-        print("half process_data e2e : {} ms".format((a_e_time - a_ss_time) * 1000))
-        print("all process_data e2e : {} ms".format((a_e_time - a_s_time) * 1000))
+                    result["images_crop"] = result["images_crop"].to(
+                        "cuda", non_blocking=True
+                    )
         return result
 
     async def process_mm_data_async(
@@ -517,7 +480,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         request_obj,
         *args,
         **kwargs,
-    ):  
+    ):
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -526,9 +489,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
-        
+
         cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
-        
+
         if cache_mm_image_items:
             images = base_output.images
 
@@ -539,19 +502,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             img_token_nums = []
             remove_image_idx = []
             image_grid_thw_lists = []
-            t_s_time = time.time()
             for img_idx in range(len(images)):
-                s_time = time.time()
                 hash_key = fast_image_hash(images[img_idx])
-                e_time = time.time()
-                print("hash time {} ms".format((e_time - s_time) * 1000))
                 img_hash_keys.append(hash_key)
                 img_height, resize_h, resize_w = get_img_height_from_raw_img(
-                    images[img_idx], self.PATCH_PIXEL_NUMS, 2 * self.PATCH_SIZE
+                    images[img_idx],
+                    self.PATCH_PIXEL_NUMS,
+                    self.IMAGE_FACTOR,
+                    self.MIN_PIXELS,
+                    self.MAX_PIXELS,
                 )
                 img_token_num = int(img_height / self.MERGE_PATCH_NUMS)
-                
-                # print("w{} h{} self.patch_size{}".format(resize_w, resize_h, self.PATCH_SIZE))
+
                 image_grid_thw_lists.append(
                     [
                         1,
@@ -571,19 +533,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
                 img_heights.append(img_height)
                 img_token_nums.append(img_token_num)
-            t_e_time = time.time()
-            # print("all extra time {} ms".format((t_e_time - t_s_time) * 1000))
-            # # Qwen-specific: resize images if they are raw Image objects
-            if len(new_processed_imgs) != 0 and isinstance(
-                new_processed_imgs[0], Image.Image
-            ):
-                resize_tasks = [
-                    resize_image_async(image) for image in new_processed_imgs
-                ]
-                
-                
-                new_processed_imgs = await asyncio.gather(*resize_tasks)
-            
+
             video_metadata = None
             if base_output.videos:
                 video_results = await asyncio.gather(
@@ -600,33 +550,21 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "remove_image_idx": remove_image_idx,
                 "image_grid_thw_lists": image_grid_thw_lists,
             }
-            
+
             if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
                 args_dict["video_metadata"] = video_metadata
                 args_dict["do_sample_frames"] = False
-                mm_items, input_ids, ret =  self.process_and_combine_mm_data(
-                    base_output,
-                    self.mm_tokens,
-                    **args_dict
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, **args_dict
                 )
             else:
-                mm_items, input_ids, ret =  self.process_and_combine_mm_data(
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
                     base_output, self.mm_tokens, **args_dict
                 )
 
         else:
-            # torch.cuda.synchronize()
-            # s_time = time.time()
-            # # Qwen-specific: resize images if they are raw Image objects
-            # if base_output.images and isinstance(base_output.images[0], Image.Image):
-            #     resize_tasks = [resize_image_async(image) for image in base_output.images]
-            #     base_output.images = await asyncio.gather(*resize_tasks)
-            # torch.cuda.synchronize()
-            # e_time = time.time()
-            # # print("resize outside cost time {} ms".format((e_time - s_time) * 1000))
-            
             video_metadata = None
-            
+
             if base_output.videos:
                 video_results = await asyncio.gather(
                     *[preprocess_video(video) for video in base_output.videos]
@@ -634,19 +572,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 base_output.videos, video_metadata = map(list, zip(*video_results))
 
             # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
-            
+
             if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
                 s_time = time.time()
-                mm_items, input_ids, ret =  self.process_and_combine_mm_data(
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
                     base_output,
                     self.mm_tokens,
                     video_metadata=video_metadata,
                     do_sample_frames=False,
                 )
                 e_time = time.time()
-                print("all cost time {} ms".format((e_time - s_time)* 1000))
+                print("all cost time {} ms".format((e_time - s_time) * 1000))
             else:
-                mm_items, input_ids, ret =  self.process_and_combine_mm_data(
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
                     base_output, self.mm_tokens
                 )
 
@@ -664,8 +602,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         input_ids = input_ids.flatten()
-        
-        s_time = time.time()
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -687,9 +624,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.hf_config, "position_id_per_seconds", None
             ),
         )
-        e_time = time.time()
-        
-        print("get rope idx cost {} ms".format((e_time - s_time)* 1000))
+
         mrope_positions = mrope_positions.squeeze(1)
 
         return {

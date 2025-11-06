@@ -264,6 +264,7 @@ class BaseMultimodalProcessor(ABC):
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
         import time
+
         torch.cuda.synchronize()
         s_time = time.time()
         result = processor.__call__(
@@ -274,30 +275,36 @@ class BaseMultimodalProcessor(ABC):
         )
         torch.cuda.synchronize()
         e_time = time.time()
-        
+
         print("processor cost time {} ms".format((e_time - s_time) * 1000))
-        
+
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if SGL_USE_CUDA_IPC:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ) and (not result[feature_name].is_cuda):
-                        result[feature_name] = result[feature_name].to("cuda", non_blocking = True)
-                        
+                    if (
+                        feature_name in result
+                        and isinstance(result[feature_name], torch.Tensor)
+                        and (not result[feature_name].is_cuda)
+                    ):
+                        result[feature_name] = result[feature_name].to(
+                            "cuda", non_blocking=True
+                        )
+
                 else:
                     if feature_name in result and isinstance(
                         result[feature_name], torch.Tensor
                     ):
                         result[feature_name] = result[feature_name].to("cpu")
-            
+
             if SGL_USE_CUDA_IPC:
                 image_crops = None
                 if "images_crop" in result:
                     image_crops = result["images_crop"]
                 if isinstance(image_crops, torch.Tensor) and (not image_crops.is_cuda):
-                    result["images_crop"] = result["images_crop"].to("cuda", non_blocking = True)
+                    result["images_crop"] = result["images_crop"].to(
+                        "cuda", non_blocking=True
+                    )
 
         return result
 
@@ -617,13 +624,9 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (created mm_items, input_ids)
         """
-        import time
-        s_time = time.time()
         ret = self.process_mm_data(
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
-        e_time = time.time()
-        print("process mm data cost time {} ms".format((e_time - s_time) * 1000))
         input_ids = ret["input_ids"].flatten()
         collected_items = self.collect_mm_items_from_processor_output(ret)
 
@@ -642,7 +645,7 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (list of mm_items, input_ids)
         """
-        import time
+
         # Collect all items and categorize them
         all_items = base_output.organize_results()
         # Handle text-only case
@@ -672,7 +675,6 @@ class BaseMultimodalProcessor(ABC):
 
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
-            s_time = time.time()
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
@@ -680,8 +682,6 @@ class BaseMultimodalProcessor(ABC):
                 videos=raw_videos,
                 **kwargs,
             )
-            e_time = time.time()
-            print("sub cost time {} ms".format((e_time - s_time) * 1000))
             all_collected_items = collected_items
         else:
             ret = None
@@ -721,26 +721,36 @@ class BaseMultimodalProcessor(ABC):
         if SGL_USE_CUDA_IPC:
             # post-process
             for item in all_collected_items:
-                
-                if  "images_crop" in item.model_specific_data and  isinstance(item.model_specific_data["images_crop"], torch.Tensor) and  item.model_specific_data["images_crop"].is_cuda:
+
+                if (
+                    "images_crop" in item.model_specific_data
+                    and isinstance(
+                        item.model_specific_data["images_crop"], torch.Tensor
+                    )
+                    and item.model_specific_data["images_crop"].is_cuda
+                ):
                     sync_flag, available_slice = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.model_specific_data["images_crop"]
                         )
                     )
-                    
+
                     if isinstance(available_slice, torch.Tensor):
                         # print("use ipc to transport")
                         available_slice.copy_(
-                            item.model_specific_data["images_crop"].view(torch.int8).view(-1), non_blocking=True
+                            item.model_specific_data["images_crop"]
+                            .view(torch.int8)
+                            .view(-1),
+                            non_blocking=True,
                         )
-                        item.model_specific_data["images_crop"] = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.model_specific_data["images_crop"],
-                            sync_buffer_meta=sync_flag,
+                        item.model_specific_data["images_crop"] = (
+                            CudaIpcTensorTransportProxy(
+                                data=available_slice,
+                                info_data=item.model_specific_data["images_crop"],
+                                sync_buffer_meta=sync_flag,
+                            )
                         )
 
-                
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
                     # print(item.feature.shape)
                     sync_flag, available_slice = (
@@ -748,7 +758,7 @@ class BaseMultimodalProcessor(ABC):
                             item.feature
                         )
                     )
-                    
+
                     # print("available_slice shape {}".format(available_slice.shape))
                     if isinstance(available_slice, torch.Tensor):
                         available_slice.copy_(
