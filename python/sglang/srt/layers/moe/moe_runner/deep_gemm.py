@@ -31,8 +31,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
-
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -100,7 +98,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
-    down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
+    down_gemm_overlap_args = None
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
