@@ -15,7 +15,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
@@ -993,7 +992,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
+        down_gemm_overlap_args = None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
