@@ -78,7 +78,7 @@ def execute_sbo(
 ):
 
     dispatch_output = experts.dispatcher.dispatch(
-        hidden_states=hidden_states, topk_output=topk_output
+        hidden_states=hidden_states, topk_output=topk_output, static_scale=experts.w13_input_scale.float()
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (

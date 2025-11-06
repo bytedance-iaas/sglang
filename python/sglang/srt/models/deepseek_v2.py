@@ -992,6 +992,7 @@ class DeepseekV2MoE(nn.Module):
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
+                static_scale=self.experts.w13_input_scale.float(),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 

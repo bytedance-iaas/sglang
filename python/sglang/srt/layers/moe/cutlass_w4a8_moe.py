@@ -10,6 +10,7 @@ from sgl_kernel import (
     silu_and_mul,
 )
 
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -491,7 +492,10 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-    sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    if get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
+        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    else:
+        gateup_input = a
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
@@ -517,6 +521,8 @@ def cutlass_w4a8_moe_deepep_ll(
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale
     )
+
+    del c1 , gateup_input
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,
