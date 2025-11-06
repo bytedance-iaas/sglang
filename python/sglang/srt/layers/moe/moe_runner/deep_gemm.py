@@ -320,7 +320,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        block_m, threshold = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
@@ -329,7 +329,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             quant_info.down_gemm_overlap_args,
         )
 
-        return down_output
+        return down_output, block_m, threshold
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
