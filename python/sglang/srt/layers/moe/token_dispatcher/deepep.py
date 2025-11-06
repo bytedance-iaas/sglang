@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     load_json_config,
+    is_blackwell,
 )
 
 _is_npu = is_npu()
@@ -652,6 +653,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args.stream.wait_event(overlap_args.wait_event)
             ctx = torch.cuda.stream(overlap_args.stream)
 
+            if is_blackwell():
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    src_signals=overlap_args.signal,
+                    src_signal_expect_value=overlap_args.threshold,
+                )
+            else:
+                overlap_args_dict = dict(
+                    packed_recv_count=self.packed_recv_count,
+                    comp_signal=overlap_args.signal,
+                    block_m=overlap_args.block_m,
+                    threshold=overlap_args.threshold,
+                    num_sms=overlap_args.num_sms,
+                )
+
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
@@ -661,13 +677,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **(
-                    dict(
-                        overlap=overlap_args.overlap,
-                        src_signals=overlap_args.signal,
-                        src_signal_expect_value=overlap_args.threshold,
-                    )
-                    if overlap_args is not None
-                    else {}
+                    overlap_args_dict if overlap_args is not None else {}
                 ),
             )
 
@@ -738,7 +748,13 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
 
     def dispatch(self, *args, **kwargs) -> DispatchOutput:
+        forward_shared_experts = kwargs.pop("forward_shared_experts", None)
+
         self.dispatch_a(*args, **kwargs)
+
+        if forward_shared_experts is not None:
+            forward_shared_experts()
+
         ret = self.dispatch_b()
         return ret
 
