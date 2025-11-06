@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Any
 
 import torch
 
@@ -98,7 +98,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
-    down_gemm_overlap_args = None
+    down_gemm_overlap_args: Optional[Any] = None
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
