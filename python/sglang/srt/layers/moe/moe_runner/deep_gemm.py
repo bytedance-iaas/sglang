@@ -84,6 +84,8 @@ class DeepGemmRunnerInput(RunnerInput):
 @dataclass
 class DeepGemmRunnerOutput(RunnerOutput):
     hidden_states: torch.Tensor
+    block_m: int = None
+    threshold: int = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -117,11 +119,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states = self._run_contiguous_gemm(
                 runner_input, quant_info, running_state
             )
+            return DeepGemmRunnerOutput(hidden_states=hidden_states)
         else:
-            hidden_states = self._run_masked_gemm(
+            hidden_states, block_m, threshold = self._run_masked_gemm(
                 runner_input, quant_info, running_state
             )
-        return DeepGemmRunnerOutput(hidden_states=hidden_states)
+            return DeepGemmRunnerOutput(hidden_states=hidden_states, block_m=block_m, threshold=threshold)
 
     def _run_contiguous_gemm(
         self,
@@ -461,11 +464,18 @@ def post_permute_deep_gemm_to_deepep_ll(
 
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
-    return DeepEPLLCombineInput(
-        hidden_states=runner_output.hidden_states,
-        topk_ids=running_state["topk_ids"],
-        topk_weights=running_state["topk_weights"],
-    )
+    if runner_output.block_m is not None and runner_output.threshold is not None:
+        return DeepEPLLCombineInput(
+            hidden_states=runner_output.hidden_states,
+            topk_ids=running_state["topk_ids"],
+            topk_weights=running_state["topk_weights"],
+        ), runner_output.block_m, runner_output.threshold
+    else:
+        return DeepEPLLCombineInput(
+            hidden_states=runner_output.hidden_states,
+            topk_ids=running_state["topk_ids"],
+            topk_weights=running_state["topk_weights"],
+        )
 
 
 @register_pre_permute("deepep_normal", "deep_gemm")
