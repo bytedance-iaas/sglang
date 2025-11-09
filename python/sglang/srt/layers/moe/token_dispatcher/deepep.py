@@ -26,10 +26,10 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
+    is_blackwell,
     is_hip,
     is_npu,
     load_json_config,
-    is_blackwell,
 )
 
 _is_npu = is_npu()
@@ -677,9 +677,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **(
-                    overlap_args_dict if overlap_args is not None else {}
-                ),
+                **(overlap_args_dict if overlap_args is not None else {}),
             )
 
         self.packed_recv_count = self.handle = None

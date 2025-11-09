@@ -37,14 +37,16 @@ class SboFlags:
         return (
             is_sbo_enabled()
             # currently only cutedsl backend supports it
-            and (get_moe_runner_backend().is_flashinfer_cutedsl()
-                 or (get_moe_runner_backend().is_deep_gemm() and not is_blackwell()))
+            and (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                or (get_moe_runner_backend().is_deep_gemm() and not is_blackwell())
+            )
         )
 
     @classmethod
     def enable_combine_shared_two_stream_overlap(cls):
         return is_sbo_enabled() and not cls.enable_dispatch_shared_one_stream_overlap()
-    
+
     @classmethod
     def enable_dispatch_shared_one_stream_overlap(cls):
         return is_sbo_enabled() and not is_blackwell()
@@ -52,7 +54,10 @@ class SboFlags:
     @classmethod
     def fuse_shared_experts_inside_sbo(cls):
         # TODO after antgroup's PR, should be `... or cls.enable_dispatch_shared_one_stream_overlap()`
-        return cls.enable_combine_shared_two_stream_overlap() or cls.enable_dispatch_shared_one_stream_overlap()
+        return (
+            cls.enable_combine_shared_two_stream_overlap()
+            or cls.enable_dispatch_shared_one_stream_overlap()
+        )
 
 
 @dataclass
@@ -84,8 +89,13 @@ def execute_sbo(
 ):
 
     dispatch_output = experts.dispatcher.dispatch(
-        hidden_states=hidden_states, topk_output=topk_output,
-        forward_shared_experts=forward_shared_experts if not disable_sbo and SboFlags.enable_dispatch_shared_one_stream_overlap() else None,
+        hidden_states=hidden_states,
+        topk_output=topk_output,
+        forward_shared_experts=(
+            forward_shared_experts
+            if not disable_sbo and SboFlags.enable_dispatch_shared_one_stream_overlap()
+            else None
+        ),
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
@@ -158,7 +168,9 @@ def _compute_overlap_args(dispatch_output, alt_stream, disable_sbo):
             )
         else:
             MIN_BLOCK_M = 64
-            combine_signal_size = num_local_experts * ((num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M)
+            combine_signal_size = num_local_experts * (
+                (num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M
+            )
             combine_signal = torch.zeros(
                 combine_signal_size, dtype=torch.int32, device=hidden_states.device
             )

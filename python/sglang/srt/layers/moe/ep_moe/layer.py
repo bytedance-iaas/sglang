@@ -148,7 +148,11 @@ class DeepEPMoE(FusedMoE):
         disable_sbo=False,
     ):
 
-        if self.deprecate_flag and forward_shared_experts is None and alt_stream is None:
+        if (
+            self.deprecate_flag
+            and forward_shared_experts is None
+            and alt_stream is None
+        ):
             # assert forward_shared_experts is None
             # assert alt_stream is None
             return super().forward(

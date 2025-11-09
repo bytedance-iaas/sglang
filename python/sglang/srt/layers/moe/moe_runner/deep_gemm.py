@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Any
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -124,7 +124,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states, block_m, threshold = self._run_masked_gemm(
                 runner_input, quant_info, running_state
             )
-            return DeepGemmRunnerOutput(hidden_states=hidden_states, block_m=block_m, threshold=threshold)
+            return DeepGemmRunnerOutput(
+                hidden_states=hidden_states, block_m=block_m, threshold=threshold
+            )
 
     def _run_contiguous_gemm(
         self,
@@ -465,11 +467,15 @@ def post_permute_deep_gemm_to_deepep_ll(
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
     if runner_output.block_m is not None and runner_output.threshold is not None:
-        return DeepEPLLCombineInput(
-            hidden_states=runner_output.hidden_states,
-            topk_ids=running_state["topk_ids"],
-            topk_weights=running_state["topk_weights"],
-        ), runner_output.block_m, runner_output.threshold
+        return (
+            DeepEPLLCombineInput(
+                hidden_states=runner_output.hidden_states,
+                topk_ids=running_state["topk_ids"],
+                topk_weights=running_state["topk_weights"],
+            ),
+            runner_output.block_m,
+            runner_output.threshold,
+        )
     else:
         return DeepEPLLCombineInput(
             hidden_states=runner_output.hidden_states,

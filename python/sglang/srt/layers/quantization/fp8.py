@@ -992,15 +992,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
-        down_gemm_overlap_args = None,
+        down_gemm_overlap_args=None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         if down_gemm_overlap_args is not None:
-            assert get_moe_runner_backend().is_deep_gemm(), (
-                "DownGemmOverlap is only supported for DeepGemm backend."
-            )
+            assert (
+                get_moe_runner_backend().is_deep_gemm()
+            ), "DownGemmOverlap is only supported for DeepGemm backend."
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
