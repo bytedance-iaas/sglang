@@ -2,6 +2,7 @@
 Multi-modality utils
 """
 
+import asyncio
 import hashlib
 import pickle
 from abc import abstractmethod
@@ -13,15 +14,20 @@ from torch import nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
+    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    get_bool_env_var,
+    is_npu,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -161,13 +167,13 @@ class TransportProxyTensor(torch.Tensor):
 
         if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
             ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index, s_offset  = (
+            handle, shape, dtype, stride, source_device_index, s_offset = (
                 ipc_extra["handle"],
                 ipc_extra["shape"],
                 ipc_extra["dtype"],
                 ipc_extra["stride"],
                 ipc_extra["device_index"],
-                ipc_extra["storage_offset"]
+                ipc_extra["storage_offset"],
             )
 
             try:
@@ -332,6 +338,8 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
+CACHE_SINGLE_IMAGE_EMBEDDING = get_bool_env_var("CACHE_SINGLE_IMAGE_EMBEDDING")
+
 embedding_cache: Optional[MultiModalCache] = None
 
 
@@ -435,7 +443,12 @@ def _get_chunked_prefill_embedding(
             continue
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
+            if CACHE_SINGLE_IMAGE_EMBEDDING:
+                embedding_per_req = _get_single_image_embedding_and_combine(
+                    embedding_items_per_req, data_embedding_func
+                )
+            else:
+                embedding_per_req = data_embedding_func(embedding_items_per_req)
             if not embedding_cache.put(embedding_items_hash, embedding_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. This typically occurs when a single "
@@ -454,6 +467,84 @@ def _get_chunked_prefill_embedding(
     if len(embedding_list) == 0:
         return None
     return torch.concat(embedding_list, dim=0)
+
+
+def _get_single_image_embedding_and_combine(
+    embedding_items_per_req: List[MultimodalDataItem], embedder
+):
+    embedding_list = []
+    for item in embedding_items_per_req:
+        img_grid_thws = item.model_specific_data["image_grid_thw"]
+        img_token_id_offsets = item.offsets
+        assert len(img_token_id_offsets) == img_grid_thws.shape[0]
+        merged_pixel_values = item.feature
+
+        pixel_size = img_grid_thws.prod(dim=1)
+        pixel_size_cum = pixel_size.cumsum(dim=0)
+        pixel_size_cum = torch.cat(
+            [
+                torch.zeros(
+                    1, dtype=pixel_size_cum.dtype, device=pixel_size_cum.device
+                ),
+                pixel_size_cum,
+            ]
+        )
+
+        async def _cal_single_embeddings():
+            tasks = [
+                _cal_single_image_embedding(
+                    merged_pixel_values[pixel_size_cum[j] : pixel_size_cum[j + 1], :],
+                    item.modality,
+                    img_token_id_offsets[j],
+                    img_grid_thws[j].unsqueeze(0),
+                    embedder,
+                )
+                for j in range(len(img_token_id_offsets))
+            ]
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(_cal_single_embeddings())
+        for result in results:
+            single_embedding = result["embedding"]
+            embedding_list.append(single_embedding)
+            if not result["cached"]:
+                if not embedding_cache.put(result["hash"], single_embedding):
+                    print_warning_once(
+                        "Multimodal embedding cache is full. This typically occurs when a single "
+                        "embedding exceeds the cache size limit. Consider increasing the "
+                        "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+                        "embedding size."
+                    )
+
+    embedding = torch.cat(embedding_list)
+    return embedding
+
+
+async def _cal_single_image_embedding(
+    pixel_value, modality, offsets, image_grid_thw, embedder
+):
+    single_hash = hash_feature(pixel_value)
+    embedding = embedding_cache.get(single_hash)
+    if embedding is not None:
+        return {
+            "cached": True,
+            "hash": single_hash,
+            "embedding": embedding,
+        }
+
+    single_item = MultimodalDataItem(
+        modality=modality,
+        hash=single_hash,
+        offsets=offsets,
+        feature=pixel_value,
+        model_specific_data={"image_grid_thw": image_grid_thw},
+    )
+    single_embedding = embedder([single_item])
+    return {
+        "cached": False,
+        "hash": single_hash,
+        "embedding": single_embedding,
+    }
 
 
 def _get_multimodal_mask(
