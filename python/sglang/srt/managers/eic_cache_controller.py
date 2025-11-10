@@ -331,7 +331,7 @@ class EICCacheController(HiCacheController):
         operation.data, mask = self.mem_pool_host.get_page_data(operation.content_hash)
         completed_tokens = 0
         if operation.data is None or not all(mask):
-            logger.warning(f"Failed to load from eic, node: {operation.node_id}")
+            logger.debug(f"Failed to load from eic, node: {operation.node_id}")
             for ret in mask:
                 if ret:
                     completed_tokens += self.page_size
