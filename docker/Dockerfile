@@ -1,10 +1,21 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+# 使用已缓存好的base镜像
+FROM hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
+# 配置 apt 将缓存放到 /root/.cache/apt 目录
+RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
+ && echo 'Dir::Cache "/root/.cache/apt";' > /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::Cache::archives "/root/.cache/apt/archives";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
+
+# 编译之前，将源统一设置成内网的
+RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
 
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
@@ -18,6 +29,8 @@ ARG NVSHMEM_VERSION=3.4.5
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
+ARG CUSTOM_CACHE_TOS_AK=""
+ARG CUSTOM_CACHE_TOS_BUCKET="iaas-servingkit"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -42,6 +55,9 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  && wget https://bootstrap.pypa.io/get-pip.py \
  && python3 get-pip.py
 
+# 在安装pip后，设置pip源为国内源
+RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple/
+
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
@@ -64,9 +80,9 @@ RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select Am
     patchelf \
     nvidia-dkms-550 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
- && ln -sf /usr/bin/python3.12 /usr/bin/python \
- && rm -rf /var/lib/apt/lists/* \
- && apt-get clean
+ && ln -sf /usr/bin/python3.12 /usr/bin/python 
+# && rm -rf /var/lib/apt/lists/* \
+# && apt-get clean
 
 # Replace pip global cache if it is specified
 RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
@@ -93,13 +109,52 @@ FROM base AS build-image
 # Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
+ARG CUSTOM_CACHE_TOS_AK
+ARG CUSTOM_CACHE_TOS_BUCKET
+ARG CUDA_VERSION
+ARG SGLANG_BRANCH
+
+# 设置 ccache 环境变量
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV PATH="/usr/lib/ccache:${PATH}"
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+# 安装 toscli 工具并下载 ccache 缓存
+RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ]; then \
+      curl -s https://luban-source.byted.org/repository/scm/toutiao.tos.toscli_1.0.0.20.tar.gz -o - | tar xz -C . ./toscli \
+      && chmod +x ./toscli \
+      && mv ./toscli /usr/bin/ \
+      && CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGL_VERSION}.tar.gz" \
+      && echo "Downloading cache from TOS: ${CACHE_TAR_NAME}" \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} get -filename /tmp/${CACHE_TAR_NAME} cache/sglang-image/${CACHE_TAR_NAME} || true \
+      && if [ -f "/tmp/${CACHE_TAR_NAME}" ]; then \
+           echo "Cache file downloaded, size: $(du -h /tmp/${CACHE_TAR_NAME} | cut -f1)" \
+           && mkdir -p /root/.cache \
+           && tar -xzf /tmp/${CACHE_TAR_NAME} -C /root \
+           && echo "Cache extracted successfully" \
+           && echo "Cache contents after extraction:" \
+           && du -sh /root/.cache/* 2>/dev/null || echo "  /root/.cache is empty or not accessible" \
+           && rm -f /tmp/${CACHE_TAR_NAME}; \
+         else \
+           echo "No cache found, starting fresh build" \
+           && mkdir -p /root/.cache; \
+         fi \
+    else \
+      echo "CUSTOM_CACHE_TOS_AK not set, skipping cache download" \
+      && mkdir -p /root/.cache; \
+    fi
+
+# 使用bytedance-iaas代码仓进行sglang安装
+ARG SGLANG_BRANCH
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 --branch ${SGLANG_BRANCH} https://github.com/bytedance-iaas/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
 RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -173,7 +228,10 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && \
     cmake --build build --target install -j${BUILD_AND_DOWNLOAD_PARALLEL}
 
 # Install DeepEP
@@ -247,9 +305,16 @@ RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -
     bear \
     ccache \
     less \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
+#    && rm -rf /var/lib/apt/lists/* \
+#    && apt-get clean
+
+# 配置 apt 将缓存放到 /root/.cache/apt 目录
+RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
+    && echo 'Dir::Cache "/root/.cache/apt";' > /etc/apt/apt.conf.d/99custom-cache \
+    && echo 'Dir::Cache::archives "/root/.cache/apt/archives";' >> /etc/apt/apt.conf.d/99custom-cache \
+    && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
+    && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
 
 RUN --mount=type=cache,target=/var/cache/apt apt update -y \
     && apt install -y --no-install-recommends gnupg \
@@ -286,7 +351,10 @@ RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttley
     && chmod +x /usr/local/bin/clang-format
 
 # Install clangd
-RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+# 使用clangd的缓存包加速编译
+RUN wget https://tosv.byted.org/obj/iaas-servingkit/clangd-linux-18.1.3.zip \
+    && mv clangd-linux-18.1.3.zip clangd.zip \
+#RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
     && unzip clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
@@ -296,7 +364,7 @@ RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && wget -q "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && wget "https://tosv.byted.org/obj/iaas-servingkit/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
@@ -332,10 +400,42 @@ RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
 # Configure zsh
 COPY docker/configs/.zshrc /root/.zshrc
 
-RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /usr/local/bin
+# 使用pip安装just，加速编译流程
+#RUN set -euxo ; \
+#    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+RUN pip install rust-just
+
+# 上传 ccache 缓存到 TOS
+ARG CUSTOM_CACHE_TOS_AK
+ARG CUSTOM_CACHE_TOS_BUCKET
+ARG CUDA_VERSION
+RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ] ; then \
+      CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGL_VERSION}.tar.gz" \
+      && echo "=== Preparing to upload cache to TOS: ${CACHE_TAR_NAME} ===" \
+      && rm -rf /root/.cache/cargo-target /root/.cache/flashinfer \
+      && echo "Cache contents before archiving:" \
+      && du -sh /root/.cache/* 2>/dev/null || echo "  /root/.cache is empty" \
+      && cd /root \
+      && tar -czf /tmp/${CACHE_TAR_NAME} .cache \
+      && echo "Cache archive created, size: $(du -h /tmp/${CACHE_TAR_NAME} | cut -f1)" \
+      && echo "Archive contents:" \
+      && tar -tzf /tmp/${CACHE_TAR_NAME} | head -20 \
+      && echo "..." \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 10m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} del cache/sglang-image/${CACHE_TAR_NAME} || true \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} put -verbose -prefix cache/sglang-image/ -name ${CACHE_TAR_NAME} /tmp/${CACHE_TAR_NAME} \
+      && echo "=== Cache uploaded successfully ===" \
+      && rm -f /tmp/${CACHE_TAR_NAME}; \
+    else \
+      echo "CUSTOM_CACHE_TOS_AK not set, skipping cache upload"; \
+    fi
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
+
+# 将源统一切换成火山源
+RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
+RUN rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list && \
+    rm -f /etc/apt/apt.conf.d/99custom-cache && \
+    rm -rf /root/.cache
