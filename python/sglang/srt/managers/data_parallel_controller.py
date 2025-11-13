@@ -500,6 +500,9 @@ class DataParallelController:
             current_id = self.global_balance_id
             self.global_balance_id = (self.global_balance_id + 1) % INT32_MAX
             return current_id
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
 
         req.dp_balance_id = get_next_global_balance_id()
         with self.balance_meta.mutex:
@@ -519,14 +522,6 @@ class DataParallelController:
         # logger.info(f"dp workers {local_tokens=}, {onfly_info=}, {target_worker=}")
         self.workers[target_worker].send_pyobj(req)
 
-        if self.maybe_external_dp_rank_routing(req):
-            return
-
-        logger.warning(
-            "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
-            "Fall back to 'round_robin_scheduler'"
-        )
-        self.round_robin_scheduler(req)
 
     def event_loop(self):
         while True:
