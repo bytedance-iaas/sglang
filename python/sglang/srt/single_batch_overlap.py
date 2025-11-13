@@ -93,7 +93,7 @@ def execute_sbo(
         topk_output=topk_output,
         forward_shared_experts=(
             forward_shared_experts
-            if not disable_sbo and SboFlags.enable_dispatch_shared_one_stream_overlap()
+            if SboFlags.enable_dispatch_shared_one_stream_overlap()
             else None
         ),
     )
@@ -105,7 +105,7 @@ def execute_sbo(
     combine_input = experts.run_moe_core(
         dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
     )
-    if not is_blackwell():
+    if down_gemm_overlap_args is not None and not is_blackwell():
         combine_input, block_m, threshold = combine_input
         if combine_overlap_args is not None:
             combine_overlap_args.block_m = block_m
