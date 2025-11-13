@@ -476,22 +476,13 @@ def post_permute_deep_gemm_to_deepep_ll(
 
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
-    if runner_output.block_m is not None and runner_output.threshold is not None:
-        return (
-            DeepEPLLCombineInput(
-                hidden_states=runner_output.hidden_states,
-                topk_ids=running_state["topk_ids"],
-                topk_weights=running_state["topk_weights"],
-            ),
-            runner_output.block_m,
-            runner_output.threshold,
-        )
-    else:
-        return DeepEPLLCombineInput(
-            hidden_states=runner_output.hidden_states,
-            topk_ids=running_state["topk_ids"],
-            topk_weights=running_state["topk_weights"],
-        )
+    return DeepEPLLCombineInput(
+        hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+        block_m=runner_output.block_m,
+        threshold=runner_output.threshold,
+    )
 
 
 @register_pre_permute("deepep_normal", "deep_gemm")

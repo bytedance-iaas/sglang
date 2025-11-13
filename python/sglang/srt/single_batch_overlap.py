@@ -104,11 +104,6 @@ def execute_sbo(
     combine_input = experts.run_moe_core(
         dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
     )
-    if down_gemm_overlap_args is not None and not is_blackwell():
-        combine_input, block_m, threshold = combine_input
-        if combine_overlap_args is not None:
-            combine_overlap_args.block_m = block_m
-            combine_overlap_args.threshold = threshold
 
     if (e := meta_overlap_args.get("record_event_after_down")) is not None:
         e.record()
