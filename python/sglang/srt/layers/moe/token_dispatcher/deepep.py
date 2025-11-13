@@ -791,10 +791,17 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
         overlap_args: Optional[CombineOverlapArgs] = None,
     ):
-        hidden_states, topk_ids, topk_weights, block_m, threshold = combine_input
+        hidden_states = combine_input.hidden_states
+        topk_ids = combine_input.topk_ids
+        topk_weights = combine_input.topk_weights
+
+        block_m = getattr(combine_input, "block_m", None)
+        threshold = getattr(combine_input, "threshold", None)
+
         if overlap_args is not None and block_m is not None and threshold is not None:
             overlap_args.block_m = block_m
             overlap_args.threshold = threshold
+
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,

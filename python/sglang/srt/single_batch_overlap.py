@@ -137,7 +137,9 @@ def _compute_overlap_args(dispatch_output, alt_stream, disable_sbo):
     total_num_sms = torch.cuda.get_device_properties(
         device="cuda"
     ).multi_processor_count
-    communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
+    communicate_num_sms = get_int_env_var(
+        "SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32 if is_blackwell() else 3
+    )
     compute_num_sms = total_num_sms - communicate_num_sms
 
     assert alt_stream is not None
