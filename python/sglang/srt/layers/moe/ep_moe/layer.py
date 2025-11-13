@@ -153,8 +153,6 @@ class DeepEPMoE(FusedMoE):
             and forward_shared_experts is None
             and alt_stream is None
         ):
-            # assert forward_shared_experts is None
-            # assert alt_stream is None
             return super().forward(
                 hidden_states,
                 topk_output,
