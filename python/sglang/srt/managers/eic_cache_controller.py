@@ -252,6 +252,21 @@ class EICCacheController(HiCacheController):
         ret = result == 0
         self.ack_write_queue.put((operation.node_id, ret))
 
+    def batch_torch_cat(self, data_list: List[torch.Tensor], split_dim: int):
+        """
+        Batch torch.cat to avoid OOM.
+        """
+        batch_size = 1024
+        if len(data_list) <= batch_size:
+            return torch.cat(data_list, dim=split_dim)
+        else:
+            result = torch.cat(data_list[:batch_size], dim=split_dim)
+            for i in range(batch_size, len(data_list), batch_size):
+                batch = data_list[i: i + batch_size]
+                result = torch.cat(
+                    [result, torch.cat(batch, dim=split_dim)], dim=split_dim)
+            return result
+
     def load_operation_exclusive(self, operation: EICCacheOperation):
         """
         Load the KV cache from host memory to device memory.
@@ -283,10 +298,9 @@ class EICCacheController(HiCacheController):
                 f"completed tokens: {completed_tokens}, get data len: {len(operation.data)}"
             )
             completed_device_indices = operation.device_indices[:completed_tokens]
-            flat_data = torch.cat(
-                operation.data[:completed_tokens],
-                dim=self.mem_pool_host.split_dim,
-            )
+
+            flag_data = self.batch_torch_cat(
+                operation.data[:completed_tokens], dim=self.mem_pool_host.split_dim)
             self.mem_pool_device.transfer(completed_device_indices, flat_data)
         self.ack_load_queue.put((operation.node_id, completed_tokens))
 
@@ -355,10 +369,9 @@ class EICCacheController(HiCacheController):
                 f"completed tokens: {completed_tokens}, get data len: {len(operation.data)}"
             )
             completed_device_indices = operation.device_indices[:completed_tokens]
-            flat_data = torch.cat(
-                operation.data[: completed_tokens // self.page_size],
-                dim=self.mem_pool_host.split_dim,
-            )
+
+            self.batch_torch_cat(
+                operation.data[: completed_tokens // self.page_size], dim=self.mem_pool_host.split_dim)
             self.mem_pool_device.transfer(completed_device_indices, flat_data)
         self.ack_load_queue.put((operation.node_id, completed_tokens))
 

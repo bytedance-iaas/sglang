@@ -249,6 +249,8 @@ class EICKVClient:
         G_GDRBounceTensorCount = self.gdr_bounce_buffer_size // (
             kv_cache_numel * kv_cache_dtype.itemsize
         )
+        logger.info(
+            f"eic gdr_bounce_tensor_count: {G_GDRBounceTensorCount}, kvcache_size {kv_cache_numel * kv_cache_dtype.itemsize}")
 
         # other configurations
         self.eic_check_bs = config.get("eic_check_bs", 2048)

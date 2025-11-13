@@ -213,7 +213,7 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         super().reset()
 
-    def cache_finished_req(self, req: Req, is_decode: bool = False):
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -250,11 +250,6 @@ class EICHiRadixCache(RadixCache):
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
             # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
             old_prefix_len -= 1
-
-        # Radix Cache takes one ref in memory pool
-        eic_backup = True
-        if not self.save_decode_cache and is_decode:
-            eic_backup = False
 
         new_prefix_len = self.insert(
             RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
