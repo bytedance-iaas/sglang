@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -29,7 +29,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-    down_gemm_overlap_args=None,
+    overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
     num_groups, _, k = lhs[0].shape
@@ -43,12 +43,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
         expected_m, n, k, num_groups, kernel_type
     ):
         with configure_deep_gemm_num_sms(
-            down_gemm_overlap_args.num_sms
-            if down_gemm_overlap_args is not None
-            else None
+            overlap_args.num_sms if overlap_args is not None else None
         ):
-            if down_gemm_overlap_args is not None:
-                down_gemm_overlap_args.start_event.record()
 
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
                 lhs,
@@ -60,9 +56,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     dict(
                         enable_overlap=True,
                         max_block_n=max_block_n,
-                        signal=down_gemm_overlap_args.signal,
+                        signal=overlap_args.signal,
                     )
-                    if down_gemm_overlap_args is not None
+                    if overlap_args is not None
                     else {}
                 ),
             )

@@ -40,6 +40,7 @@ if not (_is_npu or _is_hip):
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+_DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -323,6 +324,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
+
+        if quant_info.down_gemm_overlap_args is not None:
+            quant_info.down_gemm_overlap_args.start_event.record()
+
+        max_block_n = (
+            160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
+        )
+
         block_m, threshold = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
@@ -330,6 +339,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
             quant_info.down_gemm_overlap_args,
+            max_block_n,
         )
 
         return down_output, block_m, threshold
