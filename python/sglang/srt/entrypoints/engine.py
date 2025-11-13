@@ -838,6 +838,7 @@ def _launch_subprocesses(
                             pp_rank,
                             None,
                             writer,
+                            None,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess():
