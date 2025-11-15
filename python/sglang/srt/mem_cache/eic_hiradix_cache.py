@@ -213,7 +213,9 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         super().reset()
 
-    def cache_finished_req(self, req: Req, is_decode: bool = False):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, is_decode: bool = False
+    ):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -256,12 +258,20 @@ class EICHiRadixCache(RadixCache):
         if not self.save_decode_cache and is_decode:
             eic_backup = False
 
-        new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
-            page_aligned_kv_indices,
-            eic_backup=eic_backup,
-        )
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        if is_insert:
+            new_prefix_len = self.insert(
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                page_aligned_kv_indices,
+                eic_backup=eic_backup,
+            )
+            # Free the duplicates that were already in the tree
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:new_prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:page_aligned_len]
+            )
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)

@@ -172,8 +172,10 @@ class EICChunkCache(ChunkCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices)
 
-    def cache_finished_req(self, req: Req, is_decode: bool = False):
-        save_cache = is_decode and self.save_docode_cache
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, is_decode: bool = False
+    ):
+        save_cache = is_insert and is_decode and self.save_docode_cache
         self.write_backup(req, save_decode_cache=save_cache)
         self.req_to_token_pool.free(req.req_pool_idx)
 
