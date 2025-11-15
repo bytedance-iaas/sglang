@@ -231,6 +231,7 @@ class MetadataBuffers:
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
+    MOONCAKE_ASYNC = "mooncake_async"
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
