@@ -266,6 +266,21 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.MOONCAKE_ASYNC:
+        from sglang.srt.disaggregation.mooncake import (
+            MooncakeAsyncKVManager,
+            MooncakeAsyncKVReceiver,
+            MooncakeAsyncKVSender,
+            MooncakeKVBootstrapServer,
+        )
+
+        class_mapping = {
+            KVClassType.MANAGER: MooncakeAsyncKVManager,
+            KVClassType.SENDER: MooncakeKVSender,
+            KVClassType.RECEIVER: (MooncakeKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
         from sglang.srt.disaggregation.ascend import (
             AscendKVBootstrapServer,
