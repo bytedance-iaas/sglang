@@ -82,6 +82,10 @@ class FlexibleKVCacheMemoryPool:
         self.kvcache_shape = kvcache_shape
         self.kvcache_dtype = kvcache_dtype
 
+        self.kv_cache_numel = 1
+        for i in kvcache_shape:
+            self.kv_cache_numel *= i
+
         if device.startswith("cpu") and G_EnableGPUNicAffinity:
             gpu_id = torch.cuda.current_device()
             self.device = CPUNicAffinity["cuda:" + str(gpu_id)]

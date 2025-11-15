@@ -256,7 +256,9 @@ class EICCacheController(HiCacheController):
         """
         Batch torch.cat to avoid OOM.
         """
-        batch_size = 1024
+        batch_cat_size = 512 * 1024 * 1024
+        tensor_size = data_list[0].element_size() * data_list[0].nelement()
+        batch_size = batch_cat_size // tensor_size
         if len(data_list) <= batch_size:
             return torch.cat(data_list, dim=split_dim)
         else:
@@ -299,8 +301,8 @@ class EICCacheController(HiCacheController):
             )
             completed_device_indices = operation.device_indices[:completed_tokens]
 
-            flag_data = self.batch_torch_cat(
-                operation.data[:completed_tokens], dim=self.mem_pool_host.split_dim)
+            flat_data = self.batch_torch_cat(
+                operation.data[:completed_tokens], split_dim=self.mem_pool_host.split_dim)
             self.mem_pool_device.transfer(completed_device_indices, flat_data)
         self.ack_load_queue.put((operation.node_id, completed_tokens))
 
@@ -370,8 +372,8 @@ class EICCacheController(HiCacheController):
             )
             completed_device_indices = operation.device_indices[:completed_tokens]
 
-            self.batch_torch_cat(
-                operation.data[: completed_tokens // self.page_size], dim=self.mem_pool_host.split_dim)
+            flat_data = self.batch_torch_cat(
+                operation.data[: completed_tokens // self.page_size], split_dim=self.mem_pool_host.split_dim)
             self.mem_pool_device.transfer(completed_device_indices, flat_data)
         self.ack_load_queue.put((operation.node_id, completed_tokens))
 

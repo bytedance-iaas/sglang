@@ -213,7 +213,9 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         super().reset()
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, is_decode: bool = False
+    ):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -251,12 +253,25 @@ class EICHiRadixCache(RadixCache):
             # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
             old_prefix_len -= 1
 
-        new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
-            page_aligned_kv_indices,
-            eic_backup=eic_backup,
-        )
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        # Radix Cache takes one ref in memory pool
+        eic_backup = True
+        if not self.save_decode_cache and is_decode:
+            eic_backup = False
+
+        if is_insert:
+            new_prefix_len = self.insert(
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                page_aligned_kv_indices,
+                eic_backup=eic_backup,
+            )
+            # Free the duplicates that were already in the tree
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:new_prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:page_aligned_len]
+            )
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -367,7 +382,7 @@ class EICHiRadixCache(RadixCache):
             # clear the reference
             del self.ongoing_write_through[ack_id]
         cost_time = time.perf_counter() - write_check_start_time
-        if cost_time > 0.1:
+        if cost_time > 1:
             logger.warning(
                 f"writing check cost {cost_time:.3f} seconds, "
                 f"queue size {queue_size.item()}"
@@ -418,7 +433,7 @@ class EICHiRadixCache(RadixCache):
             # clear the reference
             del self.ongoing_load_back[ack_id]
         cost_time = time.perf_counter() - loading_check_start_time
-        if cost_time > 0.1:
+        if cost_time > 1:
             logger.warning(
                 f"loading check cost {cost_time:.3f} seconds, "
                 f"queue size {queue_size.item()}"
