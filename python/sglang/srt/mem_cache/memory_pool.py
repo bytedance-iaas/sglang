@@ -697,8 +697,9 @@ class MHATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             k_caches.append(self.k_buffer[layer_id][indices])
             v_caches.append(self.v_buffer[layer_id][indices])
-        kv_caches = [torch.cat(k_caches, dim=0), torch.cat(v_caches, dim=0)]
-        return torch.cat(kv_caches, dim=0).to(device="cpu", non_blocking=True)
+        kv_caches = [torch.stack(k_caches, dim=0), torch.stack(v_caches, dim=0)]
+        # todo: why to cpu and why blocking
+        return torch.stack(kv_caches, dim=0).to("cpu")
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.cuda.synchronize()
@@ -1480,7 +1481,7 @@ class MLATokenToKVPool(KVCache):
         kv_caches = []
         for layer_id in range(self.layer_num):
             kv_caches.append(self.kv_buffer[layer_id][indices])
-        return torch.cat(kv_caches, dim=0).to(device="cpu", non_blocking=True)
+        return torch.stack(kv_caches, dim=0).to("cpu")
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.cuda.synchronize()

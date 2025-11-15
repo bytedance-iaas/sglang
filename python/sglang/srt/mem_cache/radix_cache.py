@@ -384,13 +384,14 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len]
             )
+
             # append to session cache
             new_indices, new_last_node, _, _ = self.match_prefix(
                 RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
             )
-            self.write_backup_session(
-                new_indices, new_last_node, req.session_id, req.session_cache_offset
-            )
+
+            print(f"write backup {len(token_ids)} {new_prefix_len} {len(new_indices)}")
+            self.write_backup_session(new_indices, new_last_node, req)
 
         else:
             self.token_to_kv_pool_allocator.free(

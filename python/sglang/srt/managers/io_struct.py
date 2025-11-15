@@ -69,6 +69,11 @@ class SessionParams:
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
+    # The session cache segments.
+    # Each segment is a dict with 'token_start', 'token_length'
+    # and 'uri' keys.
+    old_kv_cache: Optional[List[Dict]] = None
+    new_kv_cache: Optional[List[Dict]] = None
 
 
 # Type definitions for multimodal input data
@@ -854,6 +859,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # session params
+    session_params: List[Optional[SessionParams]]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -932,6 +940,9 @@ class BatchStrOutput(BaseBatchReq):
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # session params
+    session_params: Optional[SessionParams] = None
 
 
 @dataclass

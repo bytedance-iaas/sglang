@@ -424,10 +424,11 @@ class MHATokenToKVPoolHost(HostKVCache):
     def set_from_flat_data(
         self, indices: torch.Tensor, flat_data: torch.Tensor
     ) -> None:
+        # only layer first support now
         self.kv_buffer[:, :, indices, :, :] = flat_data.reshape(
             2,
             self.layer_num,
-            self.len(indices),
+            len(indices),
             self.head_num,
             self.head_dim,
         )

@@ -13,6 +13,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    SessionParams,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sglang.srt.utils.common import ceil_div
@@ -728,6 +729,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
+        session_params = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -827,6 +829,11 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                session_params.append(
+                    SessionParams(id=req.session_id, new_kv_cache=req.new_kv_cache)
+                    if req.session_id is not None
+                    else None
+                )
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -950,6 +957,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    session_params=session_params,
                 )
             )
 

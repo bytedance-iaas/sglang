@@ -769,6 +769,7 @@ class Scheduler(
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_session_cache=server_args.enable_session_cache,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1233,9 +1234,11 @@ class Scheduler(
             session_id = recv_req.session_params.id
             if recv_req.session_params.id not in self.sessions:
                 # resume a previous session
-                self.sessions[session_id] = Session(
-                    recv_req.capacity_of_str_len, session_id
-                )
+                # TODO: capacity_of_str_len
+                # self.sessions[session_id] = Session(
+                #     recv_req.capacity_of_str_len, session_id
+                # )
+                self.sessions[session_id] = Session(1000, session_id)
             session = self.sessions[session_id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1355,8 +1358,9 @@ class Scheduler(
             self.tree_cache.prefetch_from_session_cache(
                 req.session_id,
                 req.last_host_node,
+                new_input_tokens,
                 matched_len,
-                req.session_cache_offset,
+                req.old_kv_cache,
             )
 
         if self.enable_hicache_storage:

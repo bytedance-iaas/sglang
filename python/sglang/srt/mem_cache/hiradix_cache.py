@@ -3,7 +3,7 @@ import json
 import logging
 import threading
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -21,6 +21,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +132,10 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
-        self.ongoing_session_append = {}
-        self.ongoing_session_prefetch = {}
+        if self.enable_session_cache:
+            self.ongoing_session_append = {}
+            self.ongoing_session_prefetch = {}
+
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
@@ -201,6 +206,9 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        if self.enable_session_cache:
+            self.ongoing_session_append.clear()
+            self.ongoing_session_prefetch.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -522,6 +530,14 @@ class HiRadixCache(RadixCache):
         # todo: handle TP synchronization if needed
         to_finalize = []
         for session_id, (node, copy_event) in list(self.ongoing_session_append.items()):
+            print(
+                "check session cache event",
+                session_id,
+                node.key,
+                node.value,
+                node.host_value,
+                copy_event,
+            )
             if not copy_event.query():
                 continue
             to_finalize.append(session_id)
@@ -533,11 +549,18 @@ class HiRadixCache(RadixCache):
         self,
         session_id: str,
         last_host_node: TreeNode,
+        new_input_tokens: List[int],
         starting_offset: int,
-        end_offset: int,
+        old_kv_cache: Optional[List[Dict]] = None,
     ):
         last_host_node.protect_host()
-        prefetch_length = end_offset - starting_offset
+        if old_kv_cache is None:
+            # TODO: get prefetch length from session cache storage if old_kv_cache is None
+            prefetch_length = 0
+        else:
+            prefetch_length = (
+                sum(seg["token_length"] for seg in old_kv_cache) - starting_offset
+            )
         if prefetch_length <= self.prefetch_threshold:
             return
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
@@ -552,8 +575,11 @@ class HiRadixCache(RadixCache):
         operation = self.cache_controller.prefetch_from_session_cache(
             session_id,
             host_indices,
+            new_input_tokens[: len(host_indices)],
             starting_offset,
             prefetch_length,
+            last_host_node.get_last_hash_value(),
+            old_kv_cache,
         )
         self.ongoing_session_prefetch[session_id] = (last_host_node, operation)
 
@@ -561,7 +587,26 @@ class HiRadixCache(RadixCache):
         if session_id not in self.ongoing_session_prefetch:
             return True
         node, operation = self.ongoing_session_prefetch[session_id]
+        from sglang.srt.mem_cache.hicache_storage import get_hash_str
+
+        hash_value = get_hash_str(operation.token_ids, operation.last_hash)
+        host_indices = operation.host_indices
         if operation.done == True:
+            print(
+                "check session prefetch progress",
+                session_id,
+                operation.token_ids,
+                len(operation.token_ids),
+                host_indices,
+                len(host_indices),
+            )
+            matched_length = self._insert_helper_host(
+                node,
+                RadixKey(token_ids=operation.token_ids, extra_key=node.key.extra_key),
+                host_value=host_indices,
+                hash_value=hash_value,
+            )
+            self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
             node.release_host()
             del self.ongoing_session_prefetch[session_id]
             return True
@@ -571,26 +616,45 @@ class HiRadixCache(RadixCache):
         self,
         device_indices: torch.Tensor,
         node: TreeNode,
-        session_id: str,
-        starting_offset: int,
+        req: "Req",
     ):
-        if not self.enable_session_cache:
+        if not self.enable_session_cache or req.session_id is None:
             return
 
+        # todo: read from storage if new_kv_cache is None
+        starting_offset = req.new_kv_cache[0]["token_start"] if req.new_kv_cache else 0
         # todo: replace with a GPU direct copy
         copy_event = torch.cuda.Event()
         flat_data = self.cache_controller.mem_pool_device.get_flat_data(
             device_indices[starting_offset:]
         )
         copy_event.record()
+
+        if req.new_kv_cache is None:
+            # TODO: handle None new_kv_cache case
+            raise ValueError("new_kv_cache should not be None")
+        else:
+            for cache_segment in req.new_kv_cache:
+                # TODO: support more layout
+                start = cache_segment["token_start"] - starting_offset
+                end = start + cache_segment["token_length"]
+                if end > flat_data.shape[2]:
+                    end = flat_data.shape[2]
+                    cache_segment["token_length"] = end - start
+                seg_data = flat_data[:, :, start:end, :, :]
+                length = seg_data.numel() * seg_data.element_size()
+                cache_segment["uri_length"] = length
+
         self.cache_controller.append_session_cache(
-            session_id,
+            req.session_id,
             starting_offset,
             flat_data,
             copy_event,
+            req.new_kv_cache,
         )
+
         self.inc_lock_ref(node)
-        self.ongoing_session_append[session_id] = (node, copy_event)
+        self.ongoing_session_append[req.session_id] = (node, copy_event)
 
     def drain_storage_control_queues(self):
         """

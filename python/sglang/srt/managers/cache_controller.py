@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -214,13 +214,25 @@ class SessionOperation:
         self,
         session_id: str,
         host_indices: torch.Tensor,
+        token_ids: List[int],
         starting_offset: int,
         prefetch_length: int,
+        last_hash: str,
+        old_kv_cache: Optional[List[Dict]] = None,
+        new_kv_cache: Optional[List[Dict]] = None,
     ):
+        assert len(host_indices) == len(token_ids), (
+            f"host_indices and token_ids should have the same length, "
+            f"but got {len(host_indices)} and {len(token_ids)}"
+        )
         self.session_id = session_id
         self.host_indices = host_indices
+        self.token_ids = token_ids
         self.starting_offset = starting_offset
         self.prefetch_length = prefetch_length
+        self.old_kv_cache = old_kv_cache
+        self.new_kv_cache = new_kv_cache
+        self.last_hash = last_hash
         self.done = False
 
 
@@ -390,6 +402,7 @@ class HiCacheController:
 
             self.prefetch_queue = Queue()
             self.backup_queue = Queue()
+            self.host_mem_release_queue = Queue()
 
             self.prefetch_thread.start()
             self.backup_thread.start()
@@ -398,71 +411,129 @@ class HiCacheController:
         self,
         session_id: str,
         host_indices: torch.Tensor,
+        token_ids: List[int],
         starting_offset: int,
         prefetch_length: int,
+        last_hash: str,
+        old_kv_cache: Optional[List[Dict]],
     ):
+        print(
+            f"prefetch_from_session_cache {session_id} {host_indices} {starting_offset} {prefetch_length} {old_kv_cache}"
+        )
         operation = SessionOperation(
-            session_id, host_indices, starting_offset, prefetch_length
+            session_id,
+            host_indices,
+            token_ids,
+            starting_offset,
+            prefetch_length,
+            last_hash,
+            old_kv_cache=old_kv_cache,
         )
         self.prefetch_queue.put(operation)
         return operation
 
     def append_session_cache(
-        self, session_id: str, starting_offset: int, data: torch.Tensor, event
+        self,
+        session_id: str,
+        starting_offset: int,
+        data: torch.Tensor,
+        event,
+        new_kv_cache: Optional[List[Dict]] = None,
     ):
-        self.backup_queue.put((session_id, starting_offset, data, event))
-
-    def naive_slicing(
-        self, session_id: str, starting_offset: int, prefetch_length: int
-    ):
-        file_path = f"/tmp/{session_id}"
-        tensor = torch.load(file_path, map_location="cpu")
-        end_offset = starting_offset + prefetch_length
-        if end_offset > tensor.numel():
-            raise ValueError(
-                f"Requested range [{starting_offset}, {end_offset}) "
-                f"exceeds tensor size {tensor.numel()}"
-            )
-        data_slice = tensor[starting_offset:end_offset]
-        return data_slice
-
-    def naive_appending(
-        self, session_id: str, starting_offset: int, data: torch.Tensor
-    ):
-        file_path = f"/tmp/{session_id}"
-        try:
-            existing_tensor = torch.load(file_path, map_location="cpu")
-            if starting_offset < existing_tensor.numel():
-                data = data[existing_tensor.numel() - starting_offset :]
-            new_tensor = torch.cat((existing_tensor, data), dim=0)
-        except FileNotFoundError:
-            new_tensor = data
-        torch.save(new_tensor, file_path)
+        self.backup_queue.put((session_id, starting_offset, new_kv_cache, data, event))
 
     def prefetch_session_cache_func(self):
+        def _release_prefetch_op(op: SessionOperation):
+            self.append_host_mem_release(op.host_indices)
+            op.done = True
+
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
+            storage = None
             try:
                 op = self.prefetch_queue.get(block=True, timeout=1)
                 # todo: demo purpose only. to be replaced with performant access
-                flat_data = self.naive_slicing(
-                    op.session_id, op.starting_offset, op.prefetch_length
+                storage = create_session_cache_storage(
+                    self.mem_pool_host.dtype, old_kv_cache=op.old_kv_cache
                 )
+                storage.initialize()
+                if op.old_kv_cache is None:
+                    op.old_kv_cache = storage.get_kv_cache_segments()
+
+                if op.old_kv_cache is None:
+                    print(f"op old_kv_cache {op.session_id} None")
+                    _release_prefetch_op(op)
+                    continue
+
+                tensor_list = []
+                for cache_segment in op.old_kv_cache:
+                    seg_data = storage.load(op.session_id, cache_segment)
+                    if seg_data is None:
+                        break
+
+                    if (
+                        cache_segment["token_start"] + cache_segment["token_length"]
+                        <= op.starting_offset
+                    ):
+                        continue
+
+                    if cache_segment["token_start"] < op.starting_offset:
+                        seg_data = seg_data[
+                            :,
+                            :,
+                            op.starting_offset - cache_segment["token_start"] :,
+                            :,
+                            :,
+                        ]
+                    tensor_list.append(seg_data)
+
+                # TODO: support more layout
+                flat_data = torch.cat(tensor_list, dim=2)
+                if flat_data is None:
+                    print("prefetch failed")
+                    _release_prefetch_op(op)
+                    continue
+
+                assert flat_data.shape[2] == len(op.host_indices)
                 self.mem_pool_host.set_from_flat_data(op.host_indices, flat_data)
                 op.done = True
-            except Empty:
+                print(
+                    f"prefetch_session_cache_func {op.session_id} done with {flat_data.shape}"
+                )
+            except Exception as e:
                 continue
+            finally:
+                if storage:
+                    storage.close()
 
     def backup_session_cache_func(self):
         while not self.stop_event.is_set():
+            storage = None
             try:
-                session_id, starting_offset, flat_data, event = self.backup_queue.get(
-                    block=True, timeout=1
+                session_id, starting_offset, new_kv_cache, flat_data, event = (
+                    self.backup_queue.get(block=True, timeout=1)
                 )
                 torch.cuda.current_stream().wait_event(event)
+                storage = create_session_cache_storage(
+                    self.mem_pool_host.dtype, new_kv_cache=new_kv_cache
+                )
+                storage.initialize()
                 # todo: demo purpose only. to be replaced with performant access
-                self.naive_appending(session_id, starting_offset, flat_data)
+                #
+                # starting offset means tokens already cached in the session.
+                # flat_data already trimmed from starting_offset
+                #
+                # cache_segment already updated in append_session_cache, just write directly
+                print(f"backup_session_cache_func {session_id} {new_kv_cache}")
+                for cache_segment in new_kv_cache:
+                    start = cache_segment["token_start"] - starting_offset
+                    end = start + cache_segment["token_length"]
+                    seg_data = flat_data[:, :, start:end, :, :]
+                    storage.save(session_id, seg_data, cache_segment)
             except Empty:
                 continue
+            finally:
+                if storage:
+                    storage.close()
 
     def _generate_storage_config(
         self,
@@ -935,3 +1006,117 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+
+# TODO: move to a single file @wangyu.steph
+class SessionCacheStorage:
+    def __init__(self, dtype: torch.dtype, **kwargs):
+        self.dtype = dtype
+
+    def initialize(self):
+        raise NotImplementedError()
+
+    def save(
+        self,
+        session_id: str,
+        data: torch.Tensor,
+        kv_cache_segment: Optional[Dict] = None,
+    ):
+        raise NotImplementedError()
+
+    def load(
+        self, session_id: str, kv_cache_segment: Optional[Dict] = None
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+
+    # for storage backend that can handle kv_cache_segments itself, old_kv_cache and
+    # new_kv_cache is not necessary
+    def get_kv_cache_segments(self, session_id: str) -> Optional[List[Dict]]:
+        raise NotImplementedError()
+
+    def alloc_new_kv_cache_segments(self, session_id: str) -> Optional[List[Dict]]:
+        raise NotImplementedError()
+
+    def close(self):
+        pass
+
+
+class FileSessionCacheStorage(SessionCacheStorage):
+    def __init__(self, dtype):
+        super().__init__(dtype)
+
+    def initialize(self):
+        pass
+
+    def load(
+        self, session_id: str, kv_cache_segment: Optional[Dict] = None
+    ) -> torch.Tensor:
+        if kv_cache_segment is None:
+            file_path = f"/tmp/session_{session_id}"
+        else:
+            file_path = kv_cache_segment["uri"].removeprefix("file://")
+
+        tensor = torch.load(file_path, map_location="cpu")
+        print(
+            f"load file session segments from {kv_cache_segment['token_start']} \
+                to {kv_cache_segment['token_start'] + kv_cache_segment['token_length']} \
+                load {session_id} {tensor.shape}"
+        )
+
+        return tensor
+
+    def save(
+        self,
+        session_id: str,
+        data: torch.Tensor,
+        kv_cache_segment: Optional[Dict] = None,
+    ):
+        if kv_cache_segment is None:
+            file_path = f"/tmp/session_{session_id}"
+        else:
+            file_path = kv_cache_segment["uri"].removeprefix("file://")
+
+        try:
+            existing_tensor = torch.load(file_path, map_location="cpu")
+            # todo: more layout and more attn support
+            # current layer first mha, [2, layer_num, seq_len, head_num, head_size]
+            # maybe abstract to higher
+            new_tensor = torch.cat((existing_tensor, data), dim=2)
+        except FileNotFoundError:
+            new_tensor = data
+
+        print(
+            f"save file session segments from {kv_cache_segment['token_start']} \
+                to {kv_cache_segment['token_start'] + kv_cache_segment['token_length']} \
+                save {session_id} with new shape {new_tensor.shape}"
+        )
+        torch.save(new_tensor, file_path)
+
+    def get_kv_cache_segments(self, session_id: str) -> Optional[List[Dict]]:
+        return None
+
+    def alloc_new_kv_cache_segments(self, session_id: str) -> Optional[List[Dict]]:
+        return None
+
+
+def create_session_cache_storage(
+    dtype: torch.dtype,
+    old_kv_cache: Optional[List[Dict]] = None,
+    new_kv_cache: Optional[List[Dict]] = None,
+) -> SessionCacheStorage:
+    from sglang.srt.utils import parse_connector_type
+
+    if old_kv_cache is None and new_kv_cache is None:
+        # TODO: support config from env if no old_kv_cache and new_kv_cache
+        raise ValueError(
+            "At least one of old_kv_cache and new_kv_cache must be provided"
+        )
+
+    uri = new_kv_cache[0]["uri"] if new_kv_cache is not None else old_kv_cache[0]["uri"]
+    connector_type = parse_connector_type(uri)
+    if connector_type == "file":
+        return FileSessionCacheStorage(dtype)
+    else:
+        raise ValueError(
+            f"Invalid connector type for session cache storage: {connector_type}"
+        )

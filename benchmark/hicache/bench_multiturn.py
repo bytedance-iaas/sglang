@@ -5,6 +5,7 @@ import queue
 import random
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -140,6 +141,11 @@ def parse_args():
         default="",
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
+    parser.add_argument(
+        "--enable-session-cache",
+        action="store_true",
+        help="If set, enable session cache.",
+    )
     return parser.parse_args()
 
 
@@ -215,7 +221,9 @@ async def async_request_sglang_generate(
     return output
 
 
-def gen_payload(prompt, output_len, lora_path=""):
+def gen_payload(
+    prompt, output_len, lora_path="", session_info: Optional["SessionInfo"] = None
+):
     payload = {
         "text": prompt,
         "sampling_params": {
@@ -229,6 +237,18 @@ def gen_payload(prompt, output_len, lora_path=""):
         "return_logprob": False,
         "logprob_start_len": -1,
     }
+
+    if session_info:
+        payload["session_params"] = {"id": session_info.session_id}
+        if session_info.old_kv_cache:
+            payload["session_params"]["old_kv_cache"] = [
+                {
+                    "token_start": segment.token_start,
+                    "token_length": segment.token_length,
+                    "uri": segment.uri,
+                }
+                for segment in session_info.old_kv_cache
+            ]
     return payload
 
 
@@ -272,6 +292,27 @@ class ReadyQueue:
                 raise ValueError(f"{self.policy} not implemented")
 
 
+@dataclass
+class SessionSegment:
+    def __init__(self, token_start: int, token_length: int, uri: str):
+        self.token_start = token_start
+        self.token_length = token_length
+        self.uri = uri
+
+
+@dataclass
+class SessionInfo:
+    def __init__(
+        self,
+        session_id: str,
+        old_kv_cache: Optional[list[SessionSegment]] = None,
+        new_kv_cache: Optional[list[SessionSegment]] = None,
+    ):
+        self.session_id = session_id
+        self.old_kv_cache = old_kv_cache
+        self.new_kv_cache = new_kv_cache
+
+
 class WorkloadGenerator:
     def __init__(self, args):
         # Construct the base URL for requests
@@ -312,6 +353,8 @@ class WorkloadGenerator:
             random_sample=not args.disable_random_sample,
         )
 
+        self.enable_session_cache = args.enable_session_cache
+        self.session_id = "session123456"
         init_requests = [
             (
                 i,

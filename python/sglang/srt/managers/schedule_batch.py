@@ -41,7 +41,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -119,7 +119,7 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         }
 
 
-class FINISHED_MATCHED_REGEX(BaseFinishReason):
+class FINISH_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
         self.matched = matched
@@ -157,6 +157,22 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+
+
+def finish_reason_stop(finish_reason: BaseFinishReason):
+    return (
+        isinstance(finish_reason, FINISH_MATCHED_STR)
+        or isinstance(finish_reason, FINISH_MATCHED_REGEX)
+        or isinstance(finish_reason, FINISH_MATCHED_TOKEN)
+    )
+
+
+def finish_reason_abort(finish_reason: BaseFinishReason):
+    return isinstance(finish_reason, FINISH_ABORT)
+
+
+def finish_reason_length(finish_reason: BaseFinishReason):
+    return isinstance(finish_reason, FINISH_LENGTH)
 
 
 class Modality(Enum):
@@ -426,7 +442,8 @@ class Req:
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
-        session_cache_offset: Optional[int] = None,
+        old_kv_cache: Optional[List[Dict]] = None,
+        new_kv_cache: Optional[List[Dict]] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
@@ -455,7 +472,8 @@ class Req:
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
-        self.session_cache_offset = session_cache_offset
+        self.old_kv_cache = old_kv_cache
+        self.new_kv_cache = new_kv_cache
         self.input_embeds = input_embeds
 
         # for corss-endoder model
@@ -820,7 +838,7 @@ class Req:
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
                     if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                        self.finished_reason = FINISH_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
                         return True
