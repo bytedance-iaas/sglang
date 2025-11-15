@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
+    StepCounter,
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
@@ -1082,6 +1083,389 @@ class MooncakeKVManager(CommonKVManager):
             f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
         )
 
+
+@dataclasses.dataclass
+class WriteRequest:
+    trans_info: TransferInfo
+    dst_ranks_info: Tuple[str, int, int]
+    prefill_kv_blocks: npt.NDArray[np.int64]
+    dst_kv_blocks: npt.NDArray[np.int64]
+    submit_bids: List[int] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class LayerWiseTask:
+    kv_chunk: TransferKVChunk
+    begin_cache_step: int
+    aux_step: int
+    next_layer_id: int = 0
+    write_requests: List[WriteRequest] = dataclasses.field(default_factory=list)
+    polls: List[bool] = dataclasses.field(default_factory=list)
+
+
+class MooncakeAsyncKVManager(MooncakeKVManager):
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
+    ):
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.layer_num = len(self.kv_args.kv_data_ptrs) if is_mla_backend else len(self.kv_args.kv_data_ptrs) // 2
+        self.submit_interval = server_args.disaggregation_layerwise_interval
+        assert self.submit_interval > 0, "submit_interval must be positive"
+        self.current_transfer_batch: List[Tuple[TransferKVChunk, int]] = []
+
+    def start_transfer_thread(self, transfer_thread_pool_size: int, transfer_queue_size: int):
+        self.transfer_queues: List[FastQueue] = [FastQueue()]
+        for queue in self.transfer_queues:
+            threading.Thread(
+                target=self.async_transfer_worker, args=(queue,), daemon=True
+            ).start()
+
+    def register_step_counter(self, step_counter: StepCounter):
+        self.step_counter = step_counter
+
+    @contextmanager
+    def add_batch(self, is_idle: bool):
+        yield  # add transfer request
+
+        if not is_idle:
+            begin_cache_step, begin_aux_step = self.step_counter.current_step()
+            for kv_chunk, shard_idx in self.current_transfer_batch:
+                self.transfer_queues[shard_idx].put(
+                    LayerWiseTask(
+                        kv_chunk=kv_chunk,
+                        begin_cache_step=begin_cache_step,
+                        aux_step=begin_aux_step if kv_chunk.is_last else None,
+                    )
+                )
+
+            # advance to step of next batch no matter if batch is empty
+            self.step_counter.advance_step(delta_cache_step=self.layer_num, delta_aux_step=1)
+
+        self.current_transfer_batch.clear()
+
+    def add_transfer_request(
+        self,
+        bootstrap_room: int,
+        kv_indices: npt.NDArray[np.int64],
+        index_slice: slice,
+        is_last: bool,
+        aux_index: Optional[int] = None,
+    ):
+        assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        assert not is_last or (is_last and aux_index is not None)
+
+        if (
+            bootstrap_room not in self.request_status
+            or self.check_status(bootstrap_room) == KVPoll.Failed
+        ):
+            logger.debug(
+                "Request with bootstrap_room=%s already failed", bootstrap_room
+            )
+            return
+
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
+        # NOTE(shangming): sharding according to the dst_infos to make sure
+        # requests with the same dst_sessions will be added into the same
+        # queue, which enables early abort with failed sessions.
+        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
+        shard_idx = session_port_sum % len(self.transfer_queues)
+
+        kv_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last=is_last,
+            prefill_aux_index=aux_index,
+        )
+        self.current_transfer_batch.append((kv_chunk, shard_idx))
+
+    def submit_aux(
+        self,
+        mooncake_session_id: str,
+        prefill_aux_index: int,
+        dst_aux_ptrs: list[int],
+        dst_aux_index: int,
+    ):
+        aux_item_len = self.kv_args.aux_item_lens[0]
+        prefill_aux_addr = (
+            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
+        )
+        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
+        return self.engine.transfer_submit_write(
+            mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
+        )
+
+    def submit_layer_cache(
+        self,
+        mooncake_session_id: str,
+        begin_layer_id: int,  # [begin_layer_id, end_layer_id)
+        end_layer_id: int,
+        prefill_kv_blocks: npt.NDArray[np.int64],
+        dst_kv_blocks: npt.NDArray[np.int64],
+    ) -> List[int]:
+        batch_ids = []
+        dst_kv_ptrs = self.decode_kv_args_table[mooncake_session_id].dst_kv_ptrs
+        for layer_id in range(begin_layer_id, end_layer_id):
+            for offset in range(0, self.layer_num * (2 if not self.is_mla_backend else 1), self.layer_num):
+                src_ptr = self.kv_args.kv_data_ptrs[offset + layer_id]
+                dst_ptr = dst_kv_ptrs[offset + layer_id]
+                item_len = self.kv_args.kv_item_lens[offset + layer_id]
+                for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    bid = self.engine.transfer_submit_write(
+                        mooncake_session_id, src_addr, dst_addr, length
+                    )
+                    batch_ids.append(bid)
+
+        return batch_ids
+
+    def async_transfer_worker(self, transfer_queue: FastQueue):
+        def disard_finished_bid_inplace(submit_bids: List[int]):
+            finished_cnt = 0
+            failed = False
+            for bid in submit_bids:
+                status = self.engine.transfer_check_status(bid)
+                if status == 1:
+                    finished_cnt += 1
+                else:
+                    failed = (status != 0)
+                    break
+            submit_bids[:] = submit_bids[finished_cnt:]
+            return not failed
+
+        def discard_tasks(tasks: List[LayerWiseTask], droped: List[LayerWiseTask]) -> List[LayerWiseTask]:
+            droped_rooms = set(id(task) for task in droped)
+            return [task for task in tasks if id(task) not in droped_rooms]
+
+        def query_ready_step(task: LayerWiseTask) -> Tuple[int, int]:
+            if task.next_layer_id < self.layer_num:
+                ready_cache_step = self.step_counter.query_ready_cache_step()
+                if not StepCounter.is_step_ready(ready_cache_step, task.begin_cache_step + task.next_layer_id):
+                    time.sleep(1e-3)
+            elif task.kv_chunk.is_last:
+                ready_aux_step = self.step_counter.query_ready_aux_step()
+                if not StepCounter.is_step_ready(ready_aux_step, task.aux_step):
+                    time.sleep(1e-3)
+
+            ready_cache_step = self.step_counter.query_ready_cache_step()
+            ready_aux_step = self.step_counter.query_ready_aux_step()
+            return ready_cache_step, ready_aux_step
+
+        def get_new_tasks(blocking: bool) -> List[LayerWiseTask]:
+            new_tasks: List[LayerWiseTask] = []
+            if blocking:
+                new_tasks.append(transfer_queue.get())
+            while True:
+                try:
+                    new_tasks.append(transfer_queue.get_nowait())
+                except FastQueue.Empty:
+                    break
+
+            return new_tasks
+
+        def initialize(tasks: List[LayerWiseTask]) -> List[LayerWiseTask]:
+            abort_tasks: List[LayerWiseTask] = []
+
+            for task in tasks:
+                kv_chunk = task.kv_chunk
+                reqs_to_be_processed = (
+                    self.transfer_infos[kv_chunk.room].values()
+                    if kv_chunk.room in self.transfer_infos
+                    else []
+                )
+
+                for req in reqs_to_be_processed:
+                    if req.is_dummy:
+                        task.polls.append(True)
+                        abort_tasks.append(task)
+                        break
+
+                    with self.session_lock:
+                        if req.mooncake_session_id in self.failed_sessions:
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                            )
+                            task.polls.append(False)
+                            abort_tasks.append(task)
+                            break
+
+                    # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                    # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                    chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
+                    if len(chunked_dst_kv_indice) < len(
+                        kv_chunk.prefill_kv_indices
+                    ):
+                        kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+                                                      : len(chunked_dst_kv_indice)
+                                                      ]
+                        logger.warning(
+                            f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                        )
+
+                    # Group by indices
+                    prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+                        kv_chunk.prefill_kv_indices, chunked_dst_kv_indice
+                    )
+                    task.write_requests.append(WriteRequest(
+                        trans_info=req,
+                        dst_ranks_info=(req.endpoint, req.dst_port, req.room),
+                        prefill_kv_blocks=prefill_kv_blocks,
+                        dst_kv_blocks=dst_kv_blocks
+                    ))
+
+            return abort_tasks
+
+        def submit_transfer(
+            tasks: List[LayerWiseTask],
+            ready_cache_step: int,
+            ready_aux_step: int
+        ) -> Tuple[List[LayerWiseTask], List[LayerWiseTask]]:
+            abort_tasks: List[LayerWiseTask] = []
+            complete_tasks: List[LayerWiseTask] = []
+
+            for task in tasks:
+                kv_chunk = task.kv_chunk
+                # submit layer cache
+                if (
+                    task.next_layer_id < self.layer_num
+                    and StepCounter.is_step_ready(ready_cache_step, task.begin_cache_step + task.next_layer_id)
+                ):
+                    for req in task.write_requests:
+                        if (
+                            (task.next_layer_id + 1) % self.submit_interval == 0
+                            or task.next_layer_id == self.layer_num - 1
+                        ):
+                            cache_bids = self.submit_layer_cache(
+                                req.trans_info.mooncake_session_id,
+                                (task.next_layer_id // self.submit_interval) * self.submit_interval,
+                                task.next_layer_id + 1,
+                                req.prefill_kv_blocks,
+                                req.dst_kv_blocks,
+                            )
+                            req.submit_bids.extend(cache_bids)
+
+                            if not disard_finished_bid_inplace(req.submit_bids):
+                                task.polls.append(False)
+                                abort_tasks.append(task)
+                                break
+
+                    task.next_layer_id += 1
+
+                # submit aux data
+                if (
+                    kv_chunk.is_last
+                    and task.aux_step is not None
+                    and StepCounter.is_step_ready(ready_aux_step, task.aux_step)
+                ):
+                    task.aux_step = None  # reset to None to mark aux has been submitted
+                    if kv_chunk.is_last:
+                        for req in task.write_requests:
+                            aux_bid = self.submit_aux(
+                                req.trans_info.mooncake_session_id,
+                                kv_chunk.prefill_aux_index,
+                                self.decode_kv_args_table[req.trans_info.mooncake_session_id].dst_aux_ptrs,
+                                req.trans_info.dst_aux_index
+                            )
+                            req.submit_bids.append(aux_bid)
+
+                if task.next_layer_id == self.layer_num and task.aux_step is None:
+                    complete_tasks.append(task)
+
+            return complete_tasks, abort_tasks
+
+        def pop_transfered(tasks: List[LayerWiseTask]) -> List[LayerWiseTask]:
+            complete_tasks: List[LayerWiseTask] = []
+            for task in tasks:
+                kv_chunk = task.kv_chunk
+                for req in task.write_requests[len(task.polls):]:  # only check the uncompleted requests
+                    success = disard_finished_bid_inplace(req.submit_bids)
+                    if success:
+                        if len(req.submit_bids) == 0:
+                            task.polls.append(True)
+                    else:
+                        task.polls.append(False)
+                        with self.session_lock:
+                            self.session_failures[req.trans_info.mooncake_session_id] += 1
+                            # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                            if self.session_failures[req.trans_info.mooncake_session_id] >= 1:
+                                self.failed_sessions.add(req.trans_info.mooncake_session_id)
+                                logger.error(
+                                    f"Session {req.trans_info.mooncake_session_id} failed."
+                                )
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Failed to send kv chunk of {kv_chunk.room} to {req.trans_info.endpoint}:{req.trans_info.dst_port}",
+                                )
+                                break
+
+                # all finished or any failed
+                if (
+                    len(task.polls) == len(task.write_requests)
+                    or (len(task.polls) > 0 and not all(task.polls))
+                ):
+                    complete_tasks.append(task)
+
+            return complete_tasks
+
+        def finalize(tasks: List[LayerWiseTask]) -> None:
+            for task in tasks:
+                kv_chunk = task.kv_chunk
+                status = KVPoll.Success if all(task.polls) else KVPoll.Failed
+                if (status == KVPoll.Failed or kv_chunk.is_last):  # last chunk or any failed
+                    self.update_status(kv_chunk.room, status)
+                    for packed_req in task.write_requests:
+                        endpoint, dst_port, room = packed_req.dst_ranks_info
+                        self.sync_status_to_decode_endpoint(
+                            endpoint, dst_port, room, status
+                        )
+
+                if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                ):
+                    if kv_chunk.room in self.transfer_infos:
+                        self.transfer_infos.pop(kv_chunk.room)
+
+        pending_tasks: List[LayerWiseTask] = []
+        inflight_tasks: List[LayerWiseTask] = []
+        while True:
+            try:
+                if len(new_tasks := get_new_tasks(blocking=(len(pending_tasks) + len(inflight_tasks) == 0))) > 0:
+                    if len(abort_tasks := initialize(new_tasks)) > 0:
+                        finalize(abort_tasks)
+                        new_tasks = discard_tasks(new_tasks, abort_tasks)
+
+                    pending_tasks.extend(new_tasks)
+
+                if len(pending_tasks) > 0:
+                    ready_cache_step, ready_aux_step = query_ready_step(pending_tasks[0])  # only wait the first task
+                    submited_tasks, abort_tasks = submit_transfer(pending_tasks, ready_cache_step, ready_aux_step)
+                    finalize(abort_tasks)
+                    pending_tasks = discard_tasks(pending_tasks, submited_tasks + abort_tasks)
+                    inflight_tasks.extend(submited_tasks)
+
+                if len(complete_tasks := pop_transfered(inflight_tasks)) > 0:
+                    finalize(complete_tasks)
+                    inflight_tasks = discard_tasks(inflight_tasks, complete_tasks)
+
+            except Exception as e:
+                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                raise RuntimeError(
+                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                )
 
 class MooncakeKVSender(CommonKVSender):
 
