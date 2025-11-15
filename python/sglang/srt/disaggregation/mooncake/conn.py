@@ -1083,27 +1083,32 @@ class MooncakeKVManager(CommonKVManager):
             f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
         )
 
-
 @dataclasses.dataclass
 class WriteRequest:
-    trans_info: TransferInfo
-    dst_ranks_info: Tuple[str, int, int]
-    prefill_kv_blocks: npt.NDArray[np.int64]
-    dst_kv_blocks: npt.NDArray[np.int64]
-    submit_bids: List[int] = dataclasses.field(default_factory=list)
+    """写入请求的数据结构，包含传输所需的元信息和数据块"""
+    trans_info: TransferInfo  # 传输信息（目标地址、会话ID等）
+    dst_ranks_info: Tuple[str, int, int]  # 目标节点信息（地址、端口、房间号）
+    prefill_kv_blocks: npt.NDArray[np.int64]  # 源KV缓存数据块索引
+    dst_kv_blocks: npt.NDArray[np.int64]  # 目标KV缓存数据块索引
+    submit_bids: List[int] = dataclasses.field(default_factory=list)  # 已提交的传输批次ID列表
 
 
 @dataclasses.dataclass
 class LayerWiseTask:
-    kv_chunk: TransferKVChunk
-    begin_cache_step: int
-    aux_step: int
-    next_layer_id: int = 0
-    write_requests: List[WriteRequest] = dataclasses.field(default_factory=list)
-    polls: List[bool] = dataclasses.field(default_factory=list)
+    """分层传输任务的数据结构，跟踪每批传输的进度"""
+    kv_chunk: TransferKVChunk  # KV缓存数据块
+    begin_cache_step: int  # 起始缓存步骤（用于与模型计算对齐）
+    aux_step: int  # 辅助数据传输步骤
+    next_layer_id: int = 0  # 下一个待传输的层ID
+    write_requests: List[WriteRequest] = dataclasses.field(default_factory=list)  # 写入请求列表
+    polls: List[bool] = dataclasses.field(default_factory=list)  # 传输结果列表（True为成功）
 
 
 class MooncakeAsyncKVManager(MooncakeKVManager):
+    """
+    异步KV缓存传输管理器，继承自基础KV管理器
+    支持分层传输，与模型计算步骤协同，实现计算与传输的并行化
+    """
     def __init__(
         self,
         args: KVArgs,
@@ -1111,28 +1116,60 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # 调用父类初始化方法
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        
+        # 计算模型总层数（MLA架构与非MLA架构的层数计算方式不同）
         self.layer_num = len(self.kv_args.kv_data_ptrs) if is_mla_backend else len(self.kv_args.kv_data_ptrs) // 2
+        
+        # 传输提交间隔（每处理多少层提交一次传输）
         self.submit_interval = server_args.disaggregation_layerwise_interval
-        assert self.submit_interval > 0, "submit_interval must be positive"
+        assert self.submit_interval > 0, "传输提交间隔必须为正数"
+        
+        # 当前待提交的传输批次（存储数据块与分片索引的对应关系）
         self.current_transfer_batch: List[Tuple[TransferKVChunk, int]] = []
 
     def start_transfer_thread(self, transfer_thread_pool_size: int, transfer_queue_size: int):
+        """
+        启动异步传输线程
+        参数:
+            transfer_thread_pool_size: 传输线程池大小
+            transfer_queue_size: 传输队列数量
+        """
+        # 创建传输队列（此处简化为单队列，可根据需要扩展）
         self.transfer_queues: List[FastQueue] = [FastQueue()]
+        
+        # 为每个队列启动一个传输工作线程
         for queue in self.transfer_queues:
             threading.Thread(
-                target=self.async_transfer_worker, args=(queue,), daemon=True
+                target=self.async_transfer_worker,  # 工作线程函数
+                args=(queue,), 
+                daemon=True  # 守护线程，主程序退出时自动结束
             ).start()
 
     def register_step_counter(self, step_counter: StepCounter):
+        """
+        注册步骤计数器，用于协调模型计算步骤与传输步骤
+        参数:
+            step_counter: 步骤计数器实例
+        """
         self.step_counter = step_counter
 
     @contextmanager
     def add_batch(self, is_idle: bool):
-        yield  # add transfer request
+        """
+        上下文管理器，用于批量处理传输请求
+        参数:
+            is_idle: 是否处于空闲状态（无计算任务）
+        """
+        yield  # 在此处添加传输请求（上下文管理器的核心逻辑）
 
+        # 如果非空闲状态（有计算任务），则提交批次并推进步骤
         if not is_idle:
+            # 获取当前步骤（用于后续传输与计算的对齐）
             begin_cache_step, begin_aux_step = self.step_counter.current_step()
+            
+            # 将当前批次的所有任务封装为LayerWiseTask并放入传输队列
             for kv_chunk, shard_idx in self.current_transfer_batch:
                 self.transfer_queues[shard_idx].put(
                     LayerWiseTask(
@@ -1142,9 +1179,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     )
                 )
 
-            # advance to step of next batch no matter if batch is empty
+            # 推进步骤计数器（无论批次是否为空，均更新步骤）
+            # 缓存步骤增量为总层数，辅助数据步骤增量为1
             self.step_counter.advance_step(delta_cache_step=self.layer_num, delta_aux_step=1)
 
+        # 清空当前批次
         self.current_transfer_batch.clear()
 
     def add_transfer_request(
@@ -1155,31 +1194,40 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
     ):
+        """
+        添加KV缓存传输请求到当前批次
+        参数:
+            bootstrap_room: 引导房间号（用于标识请求）
+            kv_indices: KV缓存索引数组
+            index_slice: 索引切片（用于拆分大型请求）
+            is_last: 是否为最后一个数据块
+            aux_index: 辅助数据索引（仅最后一个块需要）
+        """
+        # 仅处理预填充模式
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        # 最后一个块必须包含辅助数据索引
         assert not is_last or (is_last and aux_index is not None)
 
+        # 如果请求已失败，则直接返回
         if (
             bootstrap_room not in self.request_status
             or self.check_status(bootstrap_room) == KVPoll.Failed
         ):
-            logger.debug(
-                "Request with bootstrap_room=%s already failed", bootstrap_room
-            )
+            logger.debug(f"房间号为{bootstrap_room}的请求已失败，不再添加传输任务")
             return
 
+        # 如果当前_rank是该请求的哑节点（无需实际传输），则直接返回
         if bootstrap_room not in self.transfer_infos:
-            # This means that the current rank is a dummy rank for this request,
-            # and it has already been marked as success, so there is no need to
-            # add further chunks into the transfer queue.
+            logger.debug(f"当前节点是房间号{bootstrap_room}的哑节点，无需添加传输任务")
             return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
+        # 根据目标节点信息计算分片索引（确保相同目标的任务进入同一队列）
         dst_infos = self.transfer_infos[bootstrap_room].keys()
+        # 通过目标会话的端口号求和取模确定分片索引
         session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
+        # 创建KV数据块并添加到当前批次
         kv_chunk = TransferKVChunk(
             room=bootstrap_room,
             prefill_kv_indices=kv_indices,
@@ -1196,90 +1244,179 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
+        """
+        提交辅助数据传输请求
+        参数:
+            mooncake_session_id: 传输会话ID
+            prefill_aux_index: 源辅助数据索引
+            dst_aux_ptrs: 目标辅助数据指针列表
+            dst_aux_index: 目标辅助数据索引
+        返回:
+            传输批次ID
+        """
+        # 计算辅助数据长度和地址
         aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
-        )
+        prefill_aux_addr = self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
         decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
+        
+        # 提交异步传输并返回批次ID
         return self.engine.transfer_submit_write(
-            mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
+            mooncake_session_id, 
+            prefill_aux_addr,  # 源地址
+            decode_aux_addr,   # 目标地址
+            aux_item_len       # 数据长度
         )
 
     def submit_layer_cache(
         self,
         mooncake_session_id: str,
-        begin_layer_id: int,  # [begin_layer_id, end_layer_id)
-        end_layer_id: int,
+        begin_layer_id: int,  # 起始层ID（包含）
+        end_layer_id: int,    # 结束层ID（不包含）
         prefill_kv_blocks: npt.NDArray[np.int64],
         dst_kv_blocks: npt.NDArray[np.int64],
     ) -> List[int]:
+        """
+        提交指定范围内的层缓存传输请求
+        参数:
+            mooncake_session_id: 传输会话ID
+            begin_layer_id: 起始层ID
+            end_layer_id: 结束层ID
+            prefill_kv_blocks: 源KV数据块
+            dst_kv_blocks: 目标KV数据块
+        返回:
+            传输批次ID列表
+        """
         batch_ids = []
+        # 获取目标KV指针
         dst_kv_ptrs = self.decode_kv_args_table[mooncake_session_id].dst_kv_ptrs
+        
+        # 遍历每层提交传输
         for layer_id in range(begin_layer_id, end_layer_id):
-            for offset in range(0, self.layer_num * (2 if not self.is_mla_backend else 1), self.layer_num):
-                src_ptr = self.kv_args.kv_data_ptrs[offset + layer_id]
-                dst_ptr = dst_kv_ptrs[offset + layer_id]
-                item_len = self.kv_args.kv_item_lens[offset + layer_id]
+            # 根据架构类型（MLA/MHA）处理KV指针偏移
+            offset_step = 1 if self.is_mla_backend else 2
+            for offset in range(0, self.layer_num * offset_step, self.layer_num):
+                src_ptr = self.kv_args.kv_data_ptrs[offset + layer_id]  # 源指针
+                dst_ptr = dst_kv_ptrs[offset + layer_id]                # 目标指针
+                item_len = self.kv_args.kv_item_lens[offset + layer_id] # 数据项长度
+                
+                # 遍历每个数据块提交传输
                 for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                    src_addr = src_ptr + int(prefill_index[0]) * item_len
-                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                    length = item_len * len(prefill_index)
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len  # 源地址
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len   # 目标地址
+                    length = item_len * len(prefill_index)                 # 数据长度
+                    
+                    # 提交异步传输并记录批次ID
                     bid = self.engine.transfer_submit_write(
-                        mooncake_session_id, src_addr, dst_addr, length
+                        mooncake_session_id, 
+                        src_addr, 
+                        dst_addr, 
+                        length
                     )
                     batch_ids.append(bid)
 
         return batch_ids
 
     def async_transfer_worker(self, transfer_queue: FastQueue):
+        """
+        异步传输工作线程，处理队列中的传输任务
+        参数:
+            transfer_queue: 传输任务队列
+        """
         def disard_finished_bid_inplace(submit_bids: List[int]):
+            """
+            原地移除已完成的传输批次ID，并检查是否有失败
+            参数:
+                submit_bids: 传输批次ID列表
+            返回:
+                是否所有已检查的批次都成功
+            """
             finished_cnt = 0
             failed = False
             for bid in submit_bids:
+                # 检查传输状态（1: 成功, 0: 进行中, -1: 失败）
                 status = self.engine.transfer_check_status(bid)
                 if status == 1:
-                    finished_cnt += 1
+                    finished_cnt += 1  # 累计成功数量
                 else:
-                    failed = (status != 0)
+                    failed = (status != 0)  # 标记失败
                     break
+            # 保留未完成的批次ID
             submit_bids[:] = submit_bids[finished_cnt:]
             return not failed
 
         def discard_tasks(tasks: List[LayerWiseTask], droped: List[LayerWiseTask]) -> List[LayerWiseTask]:
+            """
+            从任务列表中移除已丢弃的任务
+            参数:
+                tasks: 原始任务列表
+                droped: 需丢弃的任务列表
+            返回:
+                过滤后的任务列表
+            """
             droped_rooms = set(id(task) for task in droped)
             return [task for task in tasks if id(task) not in droped_rooms]
 
         def query_ready_step(task: LayerWiseTask) -> Tuple[int, int]:
+            """
+            查询当前就绪的步骤，等待任务可执行
+            参数:
+                task: 传输任务
+            返回:
+                当前就绪的缓存步骤和辅助数据步骤
+            """
+            # 如果还有未传输的层，等待对应计算步骤完成
             if task.next_layer_id < self.layer_num:
                 ready_cache_step = self.step_counter.query_ready_cache_step()
                 if not StepCounter.is_step_ready(ready_cache_step, task.begin_cache_step + task.next_layer_id):
-                    time.sleep(1e-3)
+                    time.sleep(1e-3)  # 短暂休眠等待
+            
+            # 如果是最后一个块且辅助数据未传输，等待辅助数据步骤完成
             elif task.kv_chunk.is_last:
                 ready_aux_step = self.step_counter.query_ready_aux_step()
                 if not StepCounter.is_step_ready(ready_aux_step, task.aux_step):
-                    time.sleep(1e-3)
+                    time.sleep(1e-3)  # 短暂休眠等待
 
-            ready_cache_step = self.step_counter.query_ready_cache_step()
-            ready_aux_step = self.step_counter.query_ready_aux_step()
-            return ready_cache_step, ready_aux_step
+            # 返回当前就绪的步骤
+            return (
+                self.step_counter.query_ready_cache_step(),
+                self.step_counter.query_ready_aux_step()
+            )
 
         def get_new_tasks(blocking: bool) -> List[LayerWiseTask]:
+            """
+            从队列获取新任务
+            参数:
+                blocking: 是否阻塞等待（队列为空时）
+            返回:
+                新任务列表
+            """
             new_tasks: List[LayerWiseTask] = []
             if blocking:
+                # 阻塞获取一个任务
                 new_tasks.append(transfer_queue.get())
+            
+            # 非阻塞获取剩余所有任务
             while True:
                 try:
                     new_tasks.append(transfer_queue.get_nowait())
                 except FastQueue.Empty:
-                    break
+                    break  # 队列为空时退出
 
             return new_tasks
 
         def initialize(tasks: List[LayerWiseTask]) -> List[LayerWiseTask]:
+            """
+            初始化任务（检查会话状态、准备数据块）
+            参数:
+                tasks: 待初始化的任务列表
+            返回:
+                需终止的任务列表
+            """
             abort_tasks: List[LayerWiseTask] = []
 
             for task in tasks:
                 kv_chunk = task.kv_chunk
+                # 获取该任务对应的传输信息
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -1287,38 +1424,37 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 )
 
                 for req in reqs_to_be_processed:
+                    # 处理哑请求（无需实际传输）
                     if req.is_dummy:
-                        task.polls.append(True)
-                        abort_tasks.append(task)
+                        task.polls.append(True)  # 标记为成功
+                        abort_tasks.append(task)  # 加入终止列表
                         break
 
+                    # 检查会话是否已失败
                     with self.session_lock:
                         if req.mooncake_session_id in self.failed_sessions:
                             self.record_failure(
                                 kv_chunk.room,
-                                f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                f"解码实例可能已失效，远程会话 {req.mooncake_session_id} 不可用"
                             )
-                            task.polls.append(False)
-                            abort_tasks.append(task)
+                            task.polls.append(False)  # 标记为失败
+                            abort_tasks.append(task)   # 加入终止列表
                             break
 
-                    # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                    # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                    # 处理KV索引长度不匹配的情况（临时兼容处理）
                     chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-                    if len(chunked_dst_kv_indice) < len(
-                        kv_chunk.prefill_kv_indices
-                    ):
-                        kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                                      : len(chunked_dst_kv_indice)
-                                                      ]
+                    if len(chunked_dst_kv_indice) < len(kv_chunk.prefill_kv_indices):
+                        # 截断源索引以匹配目标索引长度
+                        kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[: len(chunked_dst_kv_indice)]
                         logger.warning(
-                            f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                            f"目标KV索引长度({len(chunked_dst_kv_indice)})小于源索引长度({len(kv_chunk.prefill_kv_indices)})，已截断"
                         )
 
-                    # Group by indices
+                    # 按连续块分组（优化传输效率）
                     prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
                         kv_chunk.prefill_kv_indices, chunked_dst_kv_indice
                     )
+                    # 创建写入请求并添加到任务
                     task.write_requests.append(WriteRequest(
                         trans_info=req,
                         dst_ranks_info=(req.endpoint, req.dst_port, req.room),
@@ -1333,21 +1469,32 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             ready_cache_step: int,
             ready_aux_step: int
         ) -> Tuple[List[LayerWiseTask], List[LayerWiseTask]]:
+            """
+            提交传输任务（按层分批提交）
+            参数:
+                tasks: 待处理的任务列表
+                ready_cache_step: 当前就绪的缓存步骤
+                ready_aux_step: 当前就绪的辅助数据步骤
+            返回:
+                已提交的任务列表和需终止的任务列表
+            """
             abort_tasks: List[LayerWiseTask] = []
             complete_tasks: List[LayerWiseTask] = []
 
             for task in tasks:
                 kv_chunk = task.kv_chunk
-                # submit layer cache
+                # 提交层缓存传输（如果当前层已计算完成）
                 if (
                     task.next_layer_id < self.layer_num
                     and StepCounter.is_step_ready(ready_cache_step, task.begin_cache_step + task.next_layer_id)
                 ):
                     for req in task.write_requests:
+                        # 按间隔提交或最后一层时提交
                         if (
                             (task.next_layer_id + 1) % self.submit_interval == 0
                             or task.next_layer_id == self.layer_num - 1
                         ):
+                            # 提交当前区间的层传输
                             cache_bids = self.submit_layer_cache(
                                 req.trans_info.mooncake_session_id,
                                 (task.next_layer_id // self.submit_interval) * self.submit_interval,
@@ -1355,116 +1502,148 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 req.prefill_kv_blocks,
                                 req.dst_kv_blocks,
                             )
-                            req.submit_bids.extend(cache_bids)
+                            req.submit_bids.extend(cache_bids)  # 记录批次ID
 
+                            # 检查已提交的传输是否失败
                             if not disard_finished_bid_inplace(req.submit_bids):
-                                task.polls.append(False)
-                                abort_tasks.append(task)
+                                task.polls.append(False)  # 标记为失败
+                                abort_tasks.append(task)   # 加入终止列表
                                 break
 
+                    # 推进到下一层
                     task.next_layer_id += 1
 
-                # submit aux data
+                # 提交辅助数据传输（如果是最后一块且辅助步骤已就绪）
                 if (
                     kv_chunk.is_last
                     and task.aux_step is not None
                     and StepCounter.is_step_ready(ready_aux_step, task.aux_step)
                 ):
-                    task.aux_step = None  # reset to None to mark aux has been submitted
+                    task.aux_step = None  # 重置为None标记已提交
                     if kv_chunk.is_last:
                         for req in task.write_requests:
+                            # 提交辅助数据传输
                             aux_bid = self.submit_aux(
                                 req.trans_info.mooncake_session_id,
                                 kv_chunk.prefill_aux_index,
                                 self.decode_kv_args_table[req.trans_info.mooncake_session_id].dst_aux_ptrs,
                                 req.trans_info.dst_aux_index
                             )
-                            req.submit_bids.append(aux_bid)
+                            req.submit_bids.append(aux_bid)  # 记录批次ID
 
+                # 检查是否所有层和辅助数据都已提交
                 if task.next_layer_id == self.layer_num and task.aux_step is None:
-                    complete_tasks.append(task)
+                    complete_tasks.append(task)  # 加入已完成列表
 
             return complete_tasks, abort_tasks
 
         def pop_transfered(tasks: List[LayerWiseTask]) -> List[LayerWiseTask]:
+            """
+            处理已完成传输的任务
+            参数:
+                tasks: 进行中的任务列表
+            返回:
+                已完成的任务列表
+            """
             complete_tasks: List[LayerWiseTask] = []
             for task in tasks:
                 kv_chunk = task.kv_chunk
-                for req in task.write_requests[len(task.polls):]:  # only check the uncompleted requests
+                # 仅检查未完成的请求
+                for req in task.write_requests[len(task.polls):]:
+                    # 检查传输状态并移除已完成的批次
                     success = disard_finished_bid_inplace(req.submit_bids)
                     if success:
+                        # 所有批次都已完成
                         if len(req.submit_bids) == 0:
-                            task.polls.append(True)
+                            task.polls.append(True)  # 标记为成功
                     else:
-                        task.polls.append(False)
+                        # 传输失败
+                        task.polls.append(False)  # 标记为失败
                         with self.session_lock:
                             self.session_failures[req.trans_info.mooncake_session_id] += 1
-                            # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                            # 一次失败即标记会话为失败
                             if self.session_failures[req.trans_info.mooncake_session_id] >= 1:
                                 self.failed_sessions.add(req.trans_info.mooncake_session_id)
-                                logger.error(
-                                    f"Session {req.trans_info.mooncake_session_id} failed."
-                                )
+                                logger.error(f"会话 {req.trans_info.mooncake_session_id} 传输失败")
                                 self.record_failure(
                                     kv_chunk.room,
-                                    f"Failed to send kv chunk of {kv_chunk.room} to {req.trans_info.endpoint}:{req.trans_info.dst_port}",
+                                    f"房间号{kv_chunk.room}的KV块传输到{req.trans_info.endpoint}:{req.trans_info.dst_port}失败"
                                 )
                                 break
 
-                # all finished or any failed
+                # 所有请求都已处理或出现失败
                 if (
                     len(task.polls) == len(task.write_requests)
                     or (len(task.polls) > 0 and not all(task.polls))
                 ):
-                    complete_tasks.append(task)
+                    complete_tasks.append(task)  # 加入已完成列表
 
             return complete_tasks
 
         def finalize(tasks: List[LayerWiseTask]) -> None:
+            """
+            完成任务的最终处理（更新状态、同步结果）
+            参数:
+                tasks: 已完成的任务列表
+            """
             for task in tasks:
                 kv_chunk = task.kv_chunk
+                # 确定最终状态（全部成功则成功，否则失败）
                 status = KVPoll.Success if all(task.polls) else KVPoll.Failed
-                if (status == KVPoll.Failed or kv_chunk.is_last):  # last chunk or any failed
+                
+                # 最后一个块或失败时更新状态
+                if (status == KVPoll.Failed or kv_chunk.is_last):
                     self.update_status(kv_chunk.room, status)
+                    # 同步状态到所有目标解码端
                     for packed_req in task.write_requests:
                         endpoint, dst_port, room = packed_req.dst_ranks_info
                         self.sync_status_to_decode_endpoint(
                             endpoint, dst_port, room, status
                         )
 
+                # 清理资源（如果任务成功或已失败）
                 if (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
                 ):
                     if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
+                        self.transfer_infos.pop(kv_chunk.room)  # 移除传输信息
 
-        pending_tasks: List[LayerWiseTask] = []
-        inflight_tasks: List[LayerWiseTask] = []
+        # 工作线程主循环
+        pending_tasks: List[LayerWiseTask] = []    # 待处理任务
+        inflight_tasks: List[LayerWiseTask] = []   # 进行中任务
         while True:
             try:
+                # 1. 获取新任务（队列为空时阻塞等待）
                 if len(new_tasks := get_new_tasks(blocking=(len(pending_tasks) + len(inflight_tasks) == 0))) > 0:
+                    # 初始化新任务并处理需终止的任务
                     if len(abort_tasks := initialize(new_tasks)) > 0:
-                        finalize(abort_tasks)
-                        new_tasks = discard_tasks(new_tasks, abort_tasks)
+                        finalize(abort_tasks)  # 最终处理终止的任务
+                        new_tasks = discard_tasks(new_tasks, abort_tasks)  # 过滤已终止任务
 
-                    pending_tasks.extend(new_tasks)
+                    pending_tasks.extend(new_tasks)  # 将有效任务加入待处理列表
 
+                # 2. 处理待处理任务（检查步骤就绪并提交传输）
                 if len(pending_tasks) > 0:
-                    ready_cache_step, ready_aux_step = query_ready_step(pending_tasks[0])  # only wait the first task
+                    # 等待第一个任务就绪（确保按顺序处理）
+                    ready_cache_step, ready_aux_step = query_ready_step(pending_tasks[0])
+                    # 提交传输并获取已提交和需终止的任务
                     submited_tasks, abort_tasks = submit_transfer(pending_tasks, ready_cache_step, ready_aux_step)
-                    finalize(abort_tasks)
+                    finalize(abort_tasks)  # 最终处理终止的任务
+                    # 过滤已处理的任务，剩余的继续等待
                     pending_tasks = discard_tasks(pending_tasks, submited_tasks + abort_tasks)
-                    inflight_tasks.extend(submited_tasks)
+                    inflight_tasks.extend(submited_tasks)  # 将已提交任务加入进行中列表
 
+                # 3. 处理进行中任务（检查传输完成情况）
                 if len(complete_tasks := pop_transfered(inflight_tasks)) > 0:
-                    finalize(complete_tasks)
+                    finalize(complete_tasks)  # 最终处理已完成的任务
+                    # 过滤已完成的任务
                     inflight_tasks = discard_tasks(inflight_tasks, complete_tasks)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                # 传输线程异常退出（便于调试）
                 raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                    f"传输线程失败: {e}。预填充实例的引导端口为{self.bootstrap_port}"
                 )
 
 class MooncakeKVSender(CommonKVSender):
