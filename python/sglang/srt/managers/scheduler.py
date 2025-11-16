@@ -506,6 +506,7 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+        self.kv_manager = None
 
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
@@ -956,6 +957,7 @@ class Scheduler(
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+            self.kv_manager = self.disagg_decode_prealloc_queue.kv_manager
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -994,6 +996,7 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            self.kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
 
     def init_overlap(self):
         if not self.enable_overlap and self.pp_size == 1:
