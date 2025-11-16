@@ -24,7 +24,8 @@ import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
-
+import numpy as np
+import numpy.typing as npt
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -307,7 +308,10 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
-
+        self.kv_manager: BaseKVManager
+        if self.kv_manager.is_support_asnyc:
+            model = self.tp_worker.worker.model_runner.model
+            self.kv_manager.insert_layer_callbacks(model)
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -322,6 +326,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                if self.kv_manager.is_support_asnyc:
+                    self.kv_manager.prepare_batch(self, batch)
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
@@ -339,7 +345,10 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
-
+        self.kv_manager: BaseKVManager
+        if self.kv_manager.is_support_asnyc:
+            model = self.tp_worker.worker.model_runner.model
+            self.kv_manager.insert_layer_callbacks(model)
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -355,6 +364,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             batch_result = None
             if batch:
+                if self.kv_manager.is_support_asnyc:
+                    self.kv_manager.prepare_batch(self, batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
