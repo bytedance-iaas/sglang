@@ -137,7 +137,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             src_addr = src_ptr + int(prefill_index) * item_len
             dst_addr = dst_ptr + int(decode_index) * item_len
             length = item_len * block_length
-            batch_id = self.engine.transfer_submit_write(
+            batch_id = self.engine.transfer_sync(
                 session_id, src_addr, dst_addr, length
             )
             bids.append(batch_id)
