@@ -6,6 +6,4 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.mooncake.conn_async import (
     MooncakeAsyncKVManager,
-    MooncakeAsyncKVReceiver,
-    MooncakeAsyncKVSender,
 )
