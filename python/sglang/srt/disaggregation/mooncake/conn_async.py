@@ -350,9 +350,3 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
-
-class MooncakeAsyncKVSender(MooncakeKVSender):
-    pass
-
-class MooncakeAsyncKVReceiver(MooncakeKVReceiver):
-    pass
