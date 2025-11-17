@@ -143,12 +143,20 @@ class SchedulerMetricsMixin:
         if self.enable_hierarchical_cache and self.enable_eic_cache:
             num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
             num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+
+            if num_write_queue_size:
+                f += (f"#write-queue: {num_write_queue_size}, ")
+            if num_load_queue_size:
+                f += (f"#load-queue: {num_load_queue_size}, ")
+
+            total_hit_rate = adder.log_hit_tokens / \
+                (adder.log_input_tokens + adder.log_hit_tokens)
+            gpu_hit_rate = total_hit_rate - adder.log_hit_eic_tokens / \
+                (adder.log_input_tokens + adder.log_hit_tokens)
+            eic_hit_rate = adder.log_hit_eic_tokens / \
+                (adder.log_input_tokens + adder.log_hit_tokens)
             f += (
-                f"#write-queue: {num_write_queue_size}, "
-                f"#load-queue: {num_load_queue_size}, "
-                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
-                f"#gpu_hit_rate: {adder.log_hit_gpu_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
-                f"#eic_hit_rate: {adder.log_hit_eic_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#hit_rate(total/gpu/eic): {total_hit_rate:.2f}/{gpu_hit_rate:.2f}/{eic_hit_rate:.2f}, "
             )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
