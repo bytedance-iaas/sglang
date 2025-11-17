@@ -48,8 +48,8 @@ from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+# from xformers import ops as xops
+# from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 from sglang.srt.utils import  get_bool_env_var
 
 ROTARY_EMBED_CLASSES = {
@@ -700,12 +700,12 @@ class VisionAttention(nn.Module):
         if get_bool_env_var("SGLANG_VIT_XFORMER_BE"):
             # assert isinstance(cu_seqlens, list), "xformer backend seq must be a list"
             cu_seqlens_now =  (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-            attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=cu_seqlens_now,
-                                                        kv_seqlen=None,
-                                                        device=q.device)
+            # attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=cu_seqlens_now,
+            #                                             kv_seqlen=None,
+            #                                             device=q.device)
 
-            output = xops.memory_efficient_attention_forward(
-                    q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attn_bias=attn_bias, p=0, scale=None).squeeze(0)
+            # output = xops.memory_efficient_attention_forward(
+            #         q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attn_bias=attn_bias, p=0, scale=None).squeeze(0)
             
             
         else:
