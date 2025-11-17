@@ -17,9 +17,11 @@ from sglang.srt.mem_cache.memory_pool_host import synchronized
 
 logger = logging.getLogger(__name__)
 
-TensorPoolSize = 1024
-
 REMOTE_EIC_YAML_ENV_VAR = "REMOTE_EIC_YAML"
+
+# GDR Bounce Buffer
+G_GDRBounceBufferSize = 1 * 1024 * 1024 * 1024
+G_GDRBounceTensorCount = 128 # caclulated by G_GDRBounceBufferSize / kvcache_size
 
 # gpu direct rdma for kv set
 G_EnableKVSetGPUDirect = False
@@ -32,7 +34,6 @@ G_EnableGPUNicAffinity = False
 
 # async kv set
 G_EnableAsyncKVSet = False
-
 G_KVSetTTLOption = -1
 
 # default H20 gpu nic affinity
@@ -59,7 +60,6 @@ CPUNicAffinity = {
     "cuda:7": "cpu",
 }
 
-
 def get_eic_config_file_path():
     if os.environ.get(REMOTE_EIC_YAML_ENV_VAR) is not None:
         logger.info(f"eic init with env var {REMOTE_EIC_YAML_ENV_VAR}")
@@ -69,7 +69,6 @@ def get_eic_config_file_path():
         logger.info(f"eic init with default config, config_file {config_file}")
     return config_file
 
-
 class MemoryStateInt(IntEnum):
     IDLE = 0
     RESERVED = 1
@@ -77,26 +76,24 @@ class MemoryStateInt(IntEnum):
     SYNCED = 3
     BACKUP = 4
 
-
 class FlexibleKVCacheMemoryPool:
     def __init__(self, conn, kvcache_shape, kvcache_dtype, device):
         self.connection = conn
-
-        if device.startswith("cpu") and G_EnableGPUNicAffinity:
-            gpu_id = torch.cuda.current_device()
-            self.device = CPUNicAffinity["cuda:" + str(gpu_id)]
-            # current memory pool size is 5 times of CPU TensorPoolSize
-            mempool_size = TensorPoolSize * 5
-        else:
-            self.device = device
-            mempool_size = TensorPoolSize
-
         self.kvcache_shape = kvcache_shape
         self.kvcache_dtype = kvcache_dtype
 
         self.kv_cache_numel = 1
-        for i in self.kvcache_shape:
+        for i in kvcache_shape:
             self.kv_cache_numel *= i
+
+        if device.startswith("cpu") and G_EnableGPUNicAffinity:
+            gpu_id = torch.cuda.current_device()
+            self.device = CPUNicAffinity["cuda:" + str(gpu_id)]
+            # current memory pool size is 5 times of CPU buffer size
+            mempool_size = G_GDRBounceTensorCount * 5
+        else:
+            self.device = device
+            mempool_size = G_GDRBounceTensorCount
 
         self.free_data_addr = set()
         self.data_ptr_to_index = dict()
@@ -164,15 +161,14 @@ class FlexibleKVCacheMemoryPool:
     def left_count(self):
         return len(self.free_data_addr)
 
-
 class EICKVClient:
     """
     The remote url should start with "eic://" and only have one host-port pair
     """
-
     def __init__(self, kv_cache_dtype, kv_cache_shape, device="cpu"):
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect, G_EnableAsyncKVSet
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
+        global G_GDRBounceBufferSize, G_GDRBounceTensorCount
 
         config_file = get_eic_config_file_path()
         if os.path.exists(config_file) is False:
@@ -246,6 +242,19 @@ class EICKVClient:
         eic_namespace = config.get("eic_namespace", "")
         logger.info(f"eic namespace: {eic_namespace}")
         self.eic_namespace = eic_namespace
+
+        self.gdr_bounce_buffer_size = config.get("gdr_bounce_buffer_size", G_GDRBounceBufferSize)
+        G_GDRBounceBufferSize = self.gdr_bounce_buffer_size
+        logger.info(f"eic gdr_bounce_buffer_size: {self.gdr_bounce_buffer_size}")
+
+        kv_cache_numel = 1
+        for i in kv_cache_shape:
+            kv_cache_numel *= i
+        G_GDRBounceTensorCount = self.gdr_bounce_buffer_size // (
+            kv_cache_numel * kv_cache_dtype.itemsize
+        )
+        logger.info(
+            f"eic gdr_bounce_tensor_count: {G_GDRBounceTensorCount}, kvcache_size {kv_cache_numel * kv_cache_dtype.itemsize}")
 
         # other configurations
         self.eic_check_bs = config.get("eic_check_bs", 2048)
@@ -653,7 +662,7 @@ class EICBaseTokenToKVPoolHost:
     def get_flat_data(self, indices) -> Tuple[Optional[torch.Tensor], List[bool]]:
         logger.debug(f"get_flat_data indices {indices}")
         keys = self._encode_key_exclusive(indices)
-        bs = TensorPoolSize // 2
+        bs = G_GDRBounceTensorCount // 2
         ret = []
         masks = []
 
@@ -688,7 +697,7 @@ class EICBaseTokenToKVPoolHost:
         else:
             values = torch.split(flat_data, 1, dim=self.split_dim)
 
-        bs = TensorPoolSize
+        bs = G_GDRBounceTensorCount
         split_time = time.perf_counter()
 
         for i in range(0, len(keys), bs):
@@ -747,7 +756,7 @@ class EICBaseTokenToKVPoolHost:
     def get_page_data(self, content_hashs):
         logger.debug(f"get_page_data content_hashs {content_hashs}")
         keys = self._encode_key_shared(content_hashs)
-        bs = TensorPoolSize // 2
+        bs = G_GDRBounceTensorCount // 2
         ret = []
         masks = []
 
@@ -779,7 +788,7 @@ class EICBaseTokenToKVPoolHost:
         flat_data = flat_data.contiguous()
         values = torch.split(flat_data, self.page_size, dim=self.split_dim)
 
-        bs = TensorPoolSize
+        bs = G_GDRBounceTensorCount
         split_time = time.perf_counter()
 
         for i in range(0, len(keys), bs):
