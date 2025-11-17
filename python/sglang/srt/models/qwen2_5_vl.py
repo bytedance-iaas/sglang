@@ -62,6 +62,9 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import permute_inv
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils import get_bool_env_var
+from sglang.srt.server_args import get_global_server_args
+# from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,17 @@ class Qwen2_5_VLMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
+        
+
+        self.shape_hidden = self.gate_up_proj._parameters["weight"].shape[0] // 2
+        self.shape_mid= self.gate_up_proj._parameters["weight"].shape[1]
+        self.up_gate_proj_weight = self.gate_up_proj._parameters["weight"]
+        self.up_gate_proj_bias = self.gate_up_proj._parameters["bias"]
+        self.up_proj = None
+        self.gate_proj = None
+        self.up_bias = None
+        self.gate_bias = None
+        
         self.down_proj = RowParallelLinear(
             hidden_features,
             in_features,
@@ -94,8 +108,28 @@ class Qwen2_5_VLMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
+        kernel_selection = get_bool_env_var("SGLANG_VIT_KERNEL_SELECTION")
+        if self.up_proj is None and kernel_selection:
+            print("---init params---")
+            self.up_proj = nn.Parameter(self.up_gate_proj_weight[self.shape_hidden:].clone()).to(self.up_gate_proj_weight.device).contiguous()
+            self.gate_proj = nn.Parameter(self.up_gate_proj_weight[:self.shape_hidden].clone()).to(self.up_gate_proj_weight.device).contiguous()
+            if self.up_gate_proj_bias is not None:
+               self.up_bias = nn.Parameter(self.up_gate_proj_bias[self.shape_hidden:].clone()).to(self.up_gate_proj_bias.device).contiguous()
+               self.gate_bias = nn.Parameter(self.up_gate_proj_bias[:self.shape_hidden].clone()).to(self.up_gate_proj_bias.device).contiguous()
+            # del self.gate_up_proj
+        
+        # gate_up, _ = self.gate_up_proj(x)
+        # gate, up = gate_up.chunk(2, dim=-1)
+        
+        # print("gate_up shape : {}".format(gate_up.shape))
+        if x.shape[0] > 1024 and kernel_selection :
+            gate = F.linear(x, self.gate_proj, self.gate_bias) 
+            up = F.linear(x, self.up_proj, self.up_bias)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            gate, up = gate_up.chunk(2, dim=-1)
+          
+        # print("gate shape : {}".format(gaate))
         x = self.act(gate) * up
         x_down, _ = self.down_proj(x)
         return x_down
@@ -170,7 +204,9 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        output_ws = None,
     ) -> torch.Tensor:
+        ws = output_ws
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
         x2d = x.reshape(-1, H)
@@ -182,6 +218,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            output_ws = ws
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -298,6 +335,19 @@ class Qwen2_5_VisionTransformer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
         )
+        
+        # resource prepared for vit cuda graph
+        self.block_input = {}
+        self.block_output = {}
+        self.block_ws = {}
+        self.block_graphs = {}
+        
+        self.cu_len = {}
+        self.cu_window_len = {}
+        self.cu_len_kk = {}
+        self.cu_window_len_kk = {}
+        
+        self.sin_cos_ws = None
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
@@ -389,6 +439,10 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if get_bool_env_var("SGLANG_VIT_GRAPH"):
+            if get_bool_env_var("SGLANG_VIT_XFORMER_BE"):
+                raise RuntimeError("not suppprt xformer be when enable vit graph")
+            return self.forward_cudagraph(x, grid_thw)
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -455,6 +509,137 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x = self.merger(x)
         x = x[reverse_indices, :]
 
+        return x
+    
+    def forward_cudagraph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        # compute position embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=x.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        # Move window_index to the same device as x before using it to index x
+        window_index = window_index.to(device=x.device)
+        reverse_indices = permute_inv(window_index)
+
+        # Ensure rotary_pos_emb is on the same device/dtype as x
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+
+        seq_len, _ = x.size()
+
+        x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        x = x[window_index, :, :]
+        x = x.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        # After building position_embeddings, make sure both cos and sin are on the same device/dtype as the attention input
+        position_embeddings = (
+            position_embeddings[0].to(x.device, x.dtype),
+            position_embeddings[1].to(x.device, x.dtype),
+        )
+        
+        workspace_shape = x.shape[0]
+        
+        if self.sin_cos_ws is None:
+            max_shape = 16384 # todo : replace with model's max_context_len
+            head_dim = position_embeddings[0].shape[1]
+            cos_ws = torch.empty(max_shape, head_dim, dtype=x.dtype, device= x.device)
+            sin_ws = torch.empty(max_shape, head_dim, dtype=x.dtype, device= x.device)
+            self.sin_cos_ws = (cos_ws, sin_ws)
+        
+        used_cos_ws = self.sin_cos_ws[0][:workspace_shape, :]
+        used_sin_ws = self.sin_cos_ws[1][:workspace_shape, :]
+        used_cos_ws.copy_(position_embeddings[0])
+        used_sin_ws.copy_(position_embeddings[1])
+        temp_cos_sin = (used_cos_ws, used_sin_ws)
+
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        cu_seqlens = torch.cat(
+            [
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(device=x.device, dtype=torch.int32),
+            ]
+        )
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+
+        # transformers
+        x = x.unsqueeze(1)
+        #[TODO] replace  create new tensosr with a slice of max shape workspace
+        if workspace_shape not in self.block_output:
+            self.block_output[workspace_shape] = torch.empty_like(x, device= x.device).contiguous()
+            self.block_input[workspace_shape] = torch.empty_like(x, device= x.device).contiguous()
+            # todo replace 16 80 with get from config
+            self.block_ws[workspace_shape] = torch.empty(workspace_shape, 16, 80, device= x.device, dtype= x.dtype)
+        if workspace_shape not in self.cu_window_len:
+            self.cu_window_len[workspace_shape] = cu_window_seqlens
+            self.cu_len[workspace_shape] = cu_seqlens
+            
+            self.cu_window_len_kk[workspace_shape] = cu_window_seqlens[1:] - cu_window_seqlens[:-1]
+            self.cu_len_kk[workspace_shape] = cu_seqlens[1:] - cu_seqlens[:-1]
+        
+        override_backend = get_global_server_args().mm_attention_backend
+        max_len_1 = self.cu_window_len_kk[workspace_shape].max().item()
+        max_len_2 = self.cu_len_kk[workspace_shape].max().item()
+        
+        if get_bool_env_var("SGLANG_VIT_GRAPH"):
+            
+            if workspace_shape not in self.block_graphs:
+                self.block_graphs[workspace_shape] = torch.cuda.CUDAGraph()
+            
+                with torch.cuda.graph(self.block_graphs[workspace_shape]):
+                    for layer_num, blk in enumerate(self.blocks):
+                        if layer_num in self.fullatt_block_indexes:
+                            cu_seqlens_now = self.cu_len[workspace_shape]
+                            max_len = max_len_2
+                            cu_seqlens_kk_now = self.cu_len_kk[workspace_shape]
+                        else:
+                            cu_seqlens_now = self.cu_window_len[workspace_shape]
+                            max_len = max_len_1
+                            cu_seqlens_kk_now = self.cu_window_len_kk[workspace_shape]                    
+                        
+                        if override_backend == "triton_attn":
+                            cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len] 
+                        elif override_backend == "fa3":
+                            cu_seq_len_ws = [cu_seqlens_now, max_len]
+                        else:
+                            raise RuntimeError("not support vit atten be")
+                        
+                        
+                        if layer_num == 0:
+                            y = blk(
+                                self.block_input[workspace_shape], cu_seqlens= cu_seq_len_ws, position_embeddings=temp_cos_sin, output_ws = self.block_ws[workspace_shape]
+                            )
+                        else :
+                            y = blk(
+                                y , cu_seqlens= cu_seq_len_ws, position_embeddings=temp_cos_sin, output_ws = self.block_ws[workspace_shape]
+                            )
+                            
+                    self.block_output[workspace_shape] = self.merger(y)    
+            
+            self.block_input[workspace_shape].copy_(x)
+            self.block_graphs[workspace_shape].replay()
+            x = self.block_output[workspace_shape][reverse_indices, :]
+        
         return x
 
 
