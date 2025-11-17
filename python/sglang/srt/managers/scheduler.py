@@ -147,11 +147,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import (
-    DPBalanceMeta,
-    GenerationBatchResult,
-    validate_input_length,
-)
+from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -967,7 +963,7 @@ class Scheduler(
     def init_overlap(self):
         self.future_map = None
 
-        if not self.enable_overlap:
+        if not self.enable_overlap and self.pp_size == 1:
             return
 
         self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
@@ -978,6 +974,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
             self.device
         ).stream(self.copy_stream)
+
+        if not self.enable_overlap:
+            return
 
         self.future_map = FutureMap(
             self.max_running_requests, self.device, self.spec_algorithm
@@ -1103,7 +1102,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -2101,7 +2100,9 @@ class Scheduler(
         pass
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2149,6 +2150,7 @@ class Scheduler(
                     self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
+                        # here pp is not compatible with overlap
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2184,8 +2186,13 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
+                    batch_or_worker_batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
