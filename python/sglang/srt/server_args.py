@@ -2234,6 +2234,12 @@ class ServerArgs:
             help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth of pipeline parallelism.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
