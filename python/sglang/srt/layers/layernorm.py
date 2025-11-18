@@ -22,7 +22,7 @@ from packaging.version import Version
 
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
-    rms_norm_batch_invariant,
+    # rms_norm_batch_invariant,
 )
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.server_args import get_global_server_args
