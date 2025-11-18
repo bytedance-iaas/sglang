@@ -38,6 +38,7 @@ import pybase64
 import torch
 import xxhash
 from PIL import Image
+# import cv2
 
 from sglang.srt.utils import flatten_nested_list
 
