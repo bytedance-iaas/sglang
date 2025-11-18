@@ -2,28 +2,37 @@ import asyncio
 import math
 import os
 import re
+import time
 from typing import List, Union
 
 import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessorFast
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import FIFOTensorCache
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.multimodal.mm_utils import (
+    fast_image_hash,
+    insert_input_ids,
+    operate_substrings,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 from sglang.utils import logger
 
-IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
+IMAGE_FACTOR = 32
+MIN_PIXELS = 4 * 32 * 32
 MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
 MAX_RATIO = 200
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
@@ -42,6 +51,8 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+CACHED_IMAGE_MAX_MB_SIZE = 4096
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 
 def smart_resize(
@@ -77,24 +88,35 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def resize_image(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    width, height = image.size
-    min_pixels = min_pixels
-    max_pixels = max_pixels
-    resized_height, resized_width = smart_resize(
-        height,
-        width,
-        factor=size_factor,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
+import inspect
+
+
+def check_method_location(method):
+    try:
+        # 获取定义文件路径
+        file_path = inspect.getfile(method)
+        # 获取定义起始行号（元组第二个元素）
+        line_number = inspect.getsourcelines(method)[1]
+        # print(f"方法定义在: {file_path}，第 {line_number} 行")
+    except (TypeError, OSError, IOError) as e:
+        # print(f"无法获取位置信息: {str(e)}")
+        pass
+
+
+def get_img_height_from_raw_img(
+    img: Image,
+    patch_pixel_size,
+    image_factor=IMAGE_FACTOR,
+    min_pixels=MIN_PIXELS,
+    max_pixels=MAX_PIXELS,
+):
+    resize_h, resize_w = smart_resize(
+        img.size[0], img.size[1], image_factor, min_pixels, max_pixels
     )
-    image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
-    return image
+    ret = int((resize_h * resize_w) / patch_pixel_size)
+    if ret < 1:
+        raise ValueError("invalid image height")
+    return ret, resize_h, resize_w
 
 
 def round_by_factor(number: int, factor: int) -> int:
@@ -111,14 +133,6 @@ def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
 
-
-async def resize_image_async(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
 
 
 def smart_nframes(
@@ -250,10 +264,28 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
         self.NUM_TOKEN_PER_FRAME = 770
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
+
+        self.PATCH_SIZE = hf_config.vision_config.patch_size
+        self.MERGE_SIZE = hf_config.vision_config.spatial_merge_size
+        self.IMAGE_FACTOR = self.PATCH_SIZE * self.MERGE_SIZE
+
+        processor = self._processor
+        if hasattr(processor, "image_processor") and isinstance(
+            processor.image_processor, BaseImageProcessorFast
+        ):
+            self.MIN_PIXELS = processor.image_processor.size["shortest_edge"]
+            self.MAX_PIXELS = processor.image_processor.size["longest_edge"]
+        else:
+            self.MIN_PIXELS = 4 * 28 * 28
+            self.MAX_PIXELS = 16384 * 28 * 28
+
         self.MAX_RATIO = 200
+        self.PATCH_PIXEL_NUMS = float(self.PATCH_SIZE) * self.PATCH_SIZE
+        self.MERGE_PATCH_NUMS = self.MERGE_SIZE**2
+        self.IMG_PAD_TOKEN_ID = hf_config.image_token_id
+        self.VISION_START_TOKEN_ID = hf_config.vision_start_token_id
+        self.VISION_END_TOKEN_ID = hf_config.vision_end_token_id
+
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
@@ -264,6 +296,150 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+        self.image_cache_table = FIFOTensorCache()
+
+    def process_mm_data(
+        self, input_text, images=None, videos=None, audios=None, **kwargs
+    ) -> dict:
+        """
+        process multimodal data with transformers AutoProcessor
+        """
+        torch.cuda.synchronize()
+        a_s_time = time.time()
+        if images:
+            kwargs["images"] = images
+        if videos:
+            kwargs["videos"] = videos
+
+        processor = self._processor
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and not self.server_args.disable_fast_image_processor
+        ):
+            kwargs["device"] = "cuda"
+
+        cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
+
+        if cache_mm_image_items:
+
+            to_replace_str = "<|vision_start|><|image_pad|><|vision_end|>"
+            repalce_str = "<|vision_end|>"
+            v_start_token, img_pad_token, v_end_token = (
+                self.VISION_START_TOKEN_ID,
+                self.IMG_PAD_TOKEN_ID,
+                self.VISION_END_TOKEN_ID,
+            )
+
+            img_hash_keys = kwargs.pop("img_hash_keys")
+            img_heights = kwargs.pop("img_heights")
+            new_processed_imgs = kwargs.pop("new_processed_imgs")
+            new_processed_img_idxes = kwargs.pop("new_processed_img_idxes")
+            img_token_nums = kwargs.pop("img_token_nums")
+            remove_image_idx = kwargs.pop("remove_image_idx")
+            image_grid_thw_lists = kwargs.pop("image_grid_thw_lists")
+            processed_img_heights = []
+
+            processed_text = operate_substrings(
+                input_text, to_replace_str, remove_image_idx, repalce_str
+            )
+            kwargs["images"] = (
+                new_processed_imgs if len(new_processed_imgs) != 0 else None
+            )
+
+            result = processor.__call__(
+                text=[processed_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+
+            start_height = 0
+            end_height = 0
+            tensor_lists = []
+            used_hash_keys = set()
+            for img_idx in range(len(images)):
+                # cache Tensor
+                if img_idx in new_processed_img_idxes:
+                    img_height = img_heights[img_idx]
+                    processed_img_heights.append(img_height)
+
+                    start_height = end_height
+                    end_height = start_height + img_height
+                    to_cache_tensor = result["pixel_values"][start_height:end_height]
+                    self.image_cache_table.add(img_hash_keys[img_idx], to_cache_tensor)
+
+                    tensor_lists.append(to_cache_tensor)
+                # add input ids and insert tensor
+                else:
+                    cached_tensor = self.image_cache_table.get(img_hash_keys[img_idx])
+                    used_hash_keys.add(img_hash_keys[img_idx])
+                    assert isinstance(
+                        cached_tensor, torch.Tensor
+                    ), "invalid cached_tensor"
+                    tensor_lists.append(cached_tensor)
+                    insert_cached_ids = (
+                        [v_start_token]
+                        + img_token_nums[img_idx] * [img_pad_token]
+                        + [v_end_token]
+                    )
+
+                    result["input_ids"] = insert_input_ids(
+                        result["input_ids"],
+                        v_end_token,
+                        img_pad_token,
+                        insert_cached_ids,
+                    )
+
+            device_id = torch.cuda.current_device()
+            device = torch.device(f"cuda:{device_id}")
+
+            allocated = torch.cuda.memory_allocated(device)
+            reserved = torch.cuda.memory_reserved(device)
+            total = torch.cuda.get_device_properties(device).total_memory
+
+            # [NOTE]actually, torch reserved memory can also be used, here excluding torch reserved memory
+            available_size_mb = (total - allocated - reserved) // (1024 * 1024)
+
+            max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
+            if get_int_env_var("SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+                max_cache_image_size = get_int_env_var(
+                    "SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"
+                )
+            else:
+                logger.info(
+                    "not set SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(
+                        max_cache_image_size
+                    )
+                )
+
+            if max_cache_image_size > available_size_mb:
+                logger.info(
+                    "max_cache_image_size {} mb over available size {} mb, set max cache size as {} mb".format(
+                        max_cache_image_size, available_size_mb, available_size_mb
+                    )
+                )
+                max_cache_image_size = available_size_mb
+
+            proxy_pixel_values = torch.cat(tensor_lists)
+            hash_keys = set()
+            self.image_cache_table.pop_until(max_cache_image_size, hash_keys)
+
+            result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
+                torch.int64
+            )
+            result["pixel_values"] = proxy_pixel_values
+
+        else:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+
+        return result
 
     async def process_mm_data_async(
         self,
@@ -281,30 +457,100 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        # Qwen-specific: resize images if they are raw Image objects
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
+        cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
 
-        video_metadata = None
-        if base_output.videos:
-            video_results = await asyncio.gather(
-                *[preprocess_video(video) for video in base_output.videos]
-            )
-            base_output.videos, video_metadata = map(list, zip(*video_results))
+        if cache_mm_image_items:
+            images = base_output.images
 
-        # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
-        if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output,
-                self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
-            )
+            img_hash_keys = []
+            img_heights = []
+            new_processed_imgs = []
+            new_processed_img_idxes = []
+            img_token_nums = []
+            remove_image_idx = []
+            image_grid_thw_lists = []
+            for img_idx in range(len(images)):
+                hash_key = fast_image_hash(images[img_idx])
+                img_hash_keys.append(hash_key)
+                img_height, resize_h, resize_w = get_img_height_from_raw_img(
+                    images[img_idx],
+                    self.PATCH_PIXEL_NUMS,
+                    self.IMAGE_FACTOR,
+                    self.MIN_PIXELS,
+                    self.MAX_PIXELS,
+                )
+                img_token_num = int(img_height / self.MERGE_PATCH_NUMS)
+
+                image_grid_thw_lists.append(
+                    [
+                        1,
+                        int(resize_w // self.PATCH_SIZE),
+                        int(resize_h // self.PATCH_SIZE),
+                    ]
+                )
+
+                if img_token_num < 1:
+                    raise ValueError("invalid img token num")
+
+                if self.image_cache_table.get(hash_key) is None:
+                    new_processed_img_idxes.append(img_idx)
+                    new_processed_imgs.append(images[img_idx])
+                else:
+                    remove_image_idx.append(img_idx)
+
+                img_heights.append(img_height)
+                img_token_nums.append(img_token_num)
+
+            video_metadata = None
+            if base_output.videos:
+                video_results = await asyncio.gather(
+                    *[preprocess_video(video) for video in base_output.videos]
+                )
+                base_output.videos, video_metadata = map(list, zip(*video_results))
+
+            args_dict = {
+                "img_hash_keys": img_hash_keys,
+                "img_heights": img_heights,
+                "new_processed_imgs": new_processed_imgs,
+                "new_processed_img_idxes": new_processed_img_idxes,
+                "img_token_nums": img_token_nums,
+                "remove_image_idx": remove_image_idx,
+                "image_grid_thw_lists": image_grid_thw_lists,
+            }
+
+            if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+                args_dict["video_metadata"] = video_metadata
+                args_dict["do_sample_frames"] = False
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, **args_dict
+                )
+            else:
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, **args_dict
+                )
+
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
-            )
+            video_metadata = None
+
+            if base_output.videos:
+                video_results = await asyncio.gather(
+                    *[preprocess_video(video) for video in base_output.videos]
+                )
+                base_output.videos, video_metadata = map(list, zip(*video_results))
+
+            # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+
+            if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output,
+                    self.mm_tokens,
+                    video_metadata=video_metadata,
+                    do_sample_frames=False,
+                )
+            else:
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens
+                )
 
         audio_feature_lengths = None
 
@@ -342,6 +588,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.hf_config, "position_id_per_seconds", None
             ),
         )
+
         mrope_positions = mrope_positions.squeeze(1)
 
         return {
