@@ -55,8 +55,8 @@ FetchContent_Populate(repo-cutlass)
 # DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        f4adba8a6695e635b0106ce3dae3202016ad0ee5
+    GIT_REPOSITORY https://github.com/HanHan009527/DeepGEMM.git
+    GIT_TAG        88dbabd1be291d61409c1363a059beeb508ed192
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
