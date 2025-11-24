@@ -5,9 +5,8 @@ ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
-
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
-ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG DEEPEP_REPO=https://github.com/deepseek-ai/DeepEP.git
+ARG DEEPEP_BRANCH=antgroup-opt
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.3.17
@@ -140,8 +139,7 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
     fi \
  && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-# Download NVSHMEM source files
-# We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
+# Download NVSHMEM source files and DeepEP (antgroup-opt branch)
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       wget -q https://${GITHUB_ARTIFACTORY}/NVIDIA/nvshmem/releases/download/v${NVSHMEM_VERSION}-0/nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz; \
@@ -150,18 +148,10 @@ RUN set -eux; \
       wget -q https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz; \
       NVSHMEM_TARBALL="nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
     fi && \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      git clone https://github.com/fzyzcjy/DeepEP.git && \
-      cd DeepEP && \
-      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      cd .. ; \
-    else \
-      wget -q https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
-      unzip ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      cd .. ; \
-    fi && \
+    git clone --depth=1 --branch ${DEEPEP_BRANCH} ${DEEPEP_REPO} DeepEP && \
+    cd DeepEP && \
+    sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+    cd .. && \
     tar -xf "${NVSHMEM_TARBALL}" && \
     mv nvshmem_src nvshmem && \
     rm -f "/sgl-workspace/${NVSHMEM_TARBALL}"
