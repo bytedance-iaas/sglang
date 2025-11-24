@@ -51,10 +51,33 @@ echo "ccache directory: ${CCACHE_DIR}"
 echo "ccache enabled: ${USE_CCACHE:-1}"
 echo ""
 
+# Calculate and export half of host resources to constrain the build
+TOTAL_CPUS=$(nproc)
+HALF_CPUS=$(( TOTAL_CPUS / 2 ))
+if [ "${HALF_CPUS}" -lt 1 ]; then
+   HALF_CPUS=1
+fi
+
+# MemTotal is in kB; convert to MB and take half
+TOTAL_MEM_KB=$(grep -E '^MemTotal:' /proc/meminfo | awk '{print $2}')
+HALF_MEM_MB=$(( TOTAL_MEM_KB / 2 / 1024 ))
+# Ensure a reasonable minimum so the container has enough memory to operate
+if [ "${HALF_MEM_MB}" -lt 512 ]; then
+   HALF_MEM_MB=512
+fi
+
+# Allow overrides via environment, default to computed halves
+CPU_LIMIT=${CPU_LIMIT:-${HALF_CPUS}}
+MEMORY_LIMIT_MB=${MEMORY_LIMIT_MB:-${HALF_MEM_MB}}
+echo "CPU limit (half of host): ${CPU_LIMIT}"
+echo "Memory limit (half of host): ${MEMORY_LIMIT_MB} MB"
+
 docker run --rm \
    -v $(pwd):/sgl-kernel \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
    -v ${CCACHE_DIR}:/ccache \
+   --cpus="${CPU_LIMIT}" \
+   --memory="${MEMORY_LIMIT_MB}m" \
    -e http_proxy="http://sys-proxy-rd-relay.byted.org:8118/" \
    -e https_proxy="http://sys-proxy-rd-relay.byted.org:8118/" \
    -e HTTP_PROXY="http://sys-proxy-rd-relay.byted.org:8118/" \
