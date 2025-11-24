@@ -50,7 +50,7 @@ echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
 echo "ccache directory: ${CCACHE_DIR}"
 echo "ccache enabled: ${USE_CCACHE:-1}"
 echo ""
-
+USE_CCACHE=1
 # Calculate and export half of host resources to constrain the build
 TOTAL_CPUS=$(nproc)
 HALF_CPUS=$(( TOTAL_CPUS / 2 ))
@@ -87,7 +87,7 @@ docker run --rm \
    -e USE_CCACHE="${USE_CCACHE:-1}" \
    ${DOCKER_IMAGE} \
    bash -c "
-   set -e
+   set -ex
    # Configure HTTP/HTTPS proxy inside build container
    export http_proxy=\"http://sys-proxy-rd-relay.byted.org:8118/\"
    export https_proxy=\"http://sys-proxy-rd-relay.byted.org:8118/\"
