@@ -78,21 +78,17 @@ docker run --rm \
    -v ${CCACHE_DIR}:/ccache \
    --cpus="${CPU_LIMIT}" \
    --memory="${MEMORY_LIMIT_MB}m" \
-   -e http_proxy="http://sys-proxy-rd-relay.byted.org:8118/" \
-   -e https_proxy="http://sys-proxy-rd-relay.byted.org:8118/" \
-   -e HTTP_PROXY="http://sys-proxy-rd-relay.byted.org:8118/" \
-   -e HTTPS_PROXY="http://sys-proxy-rd-relay.byted.org:8118/" \
+   -e http_proxy="${PROXY_URL:-http://sys-proxy-rd-relay.byted.org:8118/}" \
+   -e https_proxy="${PROXY_URL:-http://sys-proxy-rd-relay.byted.org:8118/}" \
+   -e HTTP_PROXY="${PROXY_URL:-http://sys-proxy-rd-relay.byted.org:8118/}" \
+   -e HTTPS_PROXY="${PROXY_URL:-http://sys-proxy-rd-relay.byted.org:8118/}" \
    -e ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE:-}" \
    -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
    -e USE_CCACHE="${USE_CCACHE:-1}" \
    ${DOCKER_IMAGE} \
    bash -c "
    set -ex
-   # Configure HTTP/HTTPS proxy inside build container
-   export http_proxy=\"http://sys-proxy-rd-relay.byted.org:8118/\"
-   export https_proxy=\"http://sys-proxy-rd-relay.byted.org:8118/\"
-   export HTTP_PROXY=\"${HTTP_PROXY:-$http_proxy}\"
-   export HTTPS_PROXY=\"${HTTPS_PROXY:-$https_proxy}\"
+   # HTTP/HTTPS proxy is configured by docker environment variables.
    # Install CMake (version >= 3.26) - Robust Installation with caching
    echo \"==================================\"
    echo \"Installing CMake\"
