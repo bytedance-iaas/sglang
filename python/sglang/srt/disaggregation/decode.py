@@ -174,6 +174,13 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
 
 
+@dataclass
+class EmbeddingRequest:
+    req: Req
+    embedding_receiver: BaseKVReceiver
+    waiting_for_input: bool = False
+
+
 class DecodePreallocQueue:
     """
     Store the requests that are preallocating.
@@ -316,6 +323,7 @@ class DecodePreallocQueue:
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 prefill_dp_rank=req.data_parallel_rank,
+                disaggregation_mode=DisaggregationMode.DECODE,
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)

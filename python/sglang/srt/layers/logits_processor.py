@@ -414,7 +414,12 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
-            pruned_states = hidden_states[last_index]
+            # pruned_states = hidden_states[last_index]
+            # 检查hidden_states是否为列表，如果是则先获取第一个元素再进行索引
+            if isinstance(hidden_states, list):
+                pruned_states = hidden_states[0][last_index]
+            else:
+                pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None

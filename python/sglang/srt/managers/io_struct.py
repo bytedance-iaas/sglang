@@ -194,6 +194,8 @@ class GenerateReqInput(BaseReq):
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_host_encode: Optional[Union[List[str], str]] = None
+    bootstrap_port_encode: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
 
@@ -607,6 +609,16 @@ class GenerateReqInput(BaseReq):
             ),
             bootstrap_port=(
                 self.bootstrap_port[i] if self.bootstrap_port is not None else None
+            ),
+            bootstrap_host_encode=(
+                self.bootstrap_host_encode[i]
+                if self.bootstrap_host_encode is not None
+                else None
+            ),
+            bootstrap_port_encode=(
+                self.bootstrap_port_encode[i]
+                if self.bootstrap_port_encode is not None
+                else None
             ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None

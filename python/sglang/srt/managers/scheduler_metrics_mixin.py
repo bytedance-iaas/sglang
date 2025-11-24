@@ -40,6 +40,7 @@ class SchedulerMetricsMixin:
     ):
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
+        self.last_encode_stats_tic = time.perf_counter()
 
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0

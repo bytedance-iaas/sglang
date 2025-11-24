@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import logging
+import sys
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -39,6 +41,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.multimodal_cache import PagedMultiModalEmbeddingPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -96,6 +99,12 @@ class BaseTpWorker(ABC):
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
+        )
+
+    def get_mm_memory_pool(self):
+        return (
+            self.model_runner.mm_embedding_pool,
+            self.model_runner.mm_embedding_allocator,
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
@@ -211,6 +220,8 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        mm_item_to_token_pool: Optional[PagedMultiModalEmbeddingPool] = None,
+        mm_embedding_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -233,6 +244,8 @@ class TpModelWorker(BaseTpWorker):
             ),
             is_draft_model=is_draft_worker,
         )
+        # print(f"TPModelWorker {req_to_token_pool=}")
+        # print(f"TPModelWorker {mm_item_to_token_pool=}")
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -250,6 +263,8 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            mm_embedding_pool=mm_item_to_token_pool,
+            mm_embedding_allocator=mm_embedding_allocator,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -276,30 +291,39 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Profile number of tokens
-        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
-            ),
-            self.model_runner.req_to_token_pool.size,
-        )
-        assert self.max_running_requests > 0, "max_running_request is zero"
-        self.max_queued_requests = server_args.max_queued_requests
-        assert (
-            self.max_queued_requests is None or self.max_queued_requests >= 1
-        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
-        )
-        self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        if server_args.disaggregation_mode == "encode":
+            # TODO: fix hard-code variables
+            self.max_total_num_tokens = sys.maxsize
+            self.max_prefill_tokens = server_args.max_prefill_tokens
+            self.max_running_requests = 3
+            self.max_queued_requests = server_args.max_queued_requests
+            self.max_req_len = sys.maxsize
+            self.max_req_input_len = sys.maxsize
+        else:
+            self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+            self.max_prefill_tokens = server_args.max_prefill_tokens
+            self.max_running_requests = min(
+                (
+                    self.max_total_num_tokens // 2
+                    if server_args.max_running_requests is None
+                    else server_args.max_running_requests
+                    // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                ),
+                self.model_runner.req_to_token_pool.size,
+            )
+            assert self.max_running_requests > 0, "max_running_request is zero"
+            self.max_queued_requests = server_args.max_queued_requests
+            assert (
+                self.max_queued_requests is None or self.max_queued_requests >= 1
+            ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+            self.max_req_len = min(
+                self.model_config.context_len - 1,
+                self.max_total_num_tokens - 1,
+            )
+            self.max_req_input_len = self.max_req_len - 5
+            assert (
+                self.max_req_len > 0 and self.max_req_input_len > 0
+            ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
@@ -314,6 +338,8 @@ class TpModelWorker(BaseTpWorker):
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
+        self.server_args = server_args
+
     @property
     def model_runner(self) -> ModelRunner:
         return self._model_runner
@@ -326,6 +352,23 @@ class TpModelWorker(BaseTpWorker):
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def get_worker_info(self):
+        if self.server_args.disaggregation_mode == "encode":
+            return (
+                self.max_total_num_tokens,
+                self.max_prefill_tokens,
+                self.max_running_requests,
+                self.max_queued_requests,
+                self.max_req_len,
+                self.max_req_input_len,
+                self.random_seed,
+                self.device,
+                None,
+                None,
+                None,
+                # self.model_runner.mm_embedding_pool.available_size(),
+                # self.model_runner.mm_embedding_pool.used_size,
+            )
+        
         return (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
@@ -358,6 +401,8 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+        # FIXME(yyh): Temporary solution, needs proper design
+        forward_batch.mm_embedding_allocator = model_worker_batch.mm_embedding_allocator
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -413,6 +458,8 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
+            if self.server_args.disaggregation_mode == "encode":
+                batch_result.next_token_ids = None
             else:
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch

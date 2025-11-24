@@ -54,7 +54,7 @@ class CommonKVManager(BaseKVManager):
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.bootstrap_port = server_args.disaggregation_bootstrap_port_encode if disaggregation_mode == DisaggregationMode.ENCODE else server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -75,12 +75,12 @@ class CommonKVManager(BaseKVManager):
             self.server_socket.setsockopt(zmq.IPV6, 1)
         self.request_status: Dict[int, KVPoll] = {}
 
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if (self.disaggregation_mode == DisaggregationMode.PREFILL or self.disaggregation_mode == DisaggregationMode.ENCODE):
             self._register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif (self.disaggregation_mode == DisaggregationMode.DECODE or self.disaggregation_mode == DisaggregationMode.TEXT):
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
@@ -113,8 +113,10 @@ class CommonKVManager(BaseKVManager):
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
+        role_str = self.disaggregation_mode.role_str
+        # print(f"_register_to_bootstrap, {url=}, {role_str=}")
         payload = {
-            "role": "Prefill",
+            "role": role_str,
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
             "attn_dp_size": self.attn_dp_size,
@@ -130,14 +132,14 @@ class CommonKVManager(BaseKVManager):
         try:
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
-                logger.debug("Prefill successfully registered to bootstrap server.")
+                logger.debug(f"{role_str} successfully registered to bootstrap server.")
             else:
                 logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
+                    f"{role_str} instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
                 )
         except Exception as e:
             logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
+                f"{role_str} instance failed to register to bootstrap server: {e}"
             )
 
     @cache
@@ -222,12 +224,14 @@ class CommonKVReceiver(BaseKVReceiver):
         self,
         mgr: BaseKVManager,
         bootstrap_addr: str,
+        disaggregation_mode: Optional[DisaggregationMode] = None,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
+        self.disaggregation_mode = disaggregation_mode
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
@@ -518,7 +522,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.pp_size is None:
             self.pp_size = pp_size
 
-        if role == "Prefill":
+        if (role == DisaggregationMode.PREFILL.role_str or role == DisaggregationMode.ENCODE.role_str):
             if system_dp_size == 1:
                 dp_group = attn_dp_rank
             else:
@@ -536,7 +540,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register {role} bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
@@ -559,6 +563,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
             }
+            print(f"prefill_parallel_info={prefill_parallel_info}")
             return web.json_response(prefill_parallel_info, status=200)
 
         # Find corresponding prefill info

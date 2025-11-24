@@ -182,6 +182,8 @@ class Engine(EngineBase):
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_host_encode: Optional[Union[List[str], str]] = None,
+        bootstrap_port_encode: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -216,6 +218,8 @@ class Engine(EngineBase):
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
+            bootstrap_host_encode=bootstrap_host_encode,
+            bootstrap_port_encode=bootstrap_port_encode,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
         )

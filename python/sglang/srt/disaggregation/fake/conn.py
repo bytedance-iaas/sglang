@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -10,6 +10,8 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVPoll,
 )
+
+from sglang.srt.disaggregation.utils import DisaggregationMode
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,7 @@ class FakeKVReceiver(BaseKVReceiver):
         self,
         mgr: BaseKVManager,
         bootstrap_addr: str,
+        disaggregation_mode: Optional[DisaggregationMode] = None,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
     ):

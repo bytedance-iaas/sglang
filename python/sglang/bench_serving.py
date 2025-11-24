@@ -401,6 +401,7 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
+                                        output.text_chunks.append(content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
@@ -772,6 +773,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_format=args.image_format,
             image_resolution=args.image_resolution,
             backend=args.backend,
+            random_image_count=args.random_image_count,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -994,7 +996,10 @@ async def get_mooncake_request_over_time(
             # Form the full prompt from history
             try:
                 full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history, tokenize=False, add_generation_prompt=True
+                    chat_history,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    return_dict=False,
                 )
             except Exception:
                 full_prompt_text = "\n".join(
@@ -1160,6 +1165,7 @@ def sample_sharegpt_requests(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=False,
+                return_dict=False,
             )
             if tokenizer.bos_token:
                 prompt = prompt.replace(tokenizer.bos_token, "")
@@ -1382,6 +1388,7 @@ def create_mm_data_row(
     vision_prompt_len = prompt_len - text_prompt_len
 
     use_raw_prompt = backend in [
+        "sglang",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",
@@ -1410,10 +1417,12 @@ def sample_image_requests(
     image_format: str,
     image_resolution: str,
     backend: str,
+    random_image_count: bool = False,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
-    - Each request includes ``image_count`` images.
+    - If ``random_image_count`` is True, each request includes a random number of images between 1 and ``image_count``.
+    - If ``random_image_count`` is False, each request includes exactly ``image_count`` images.
     - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
       or custom 'heightxwidth' (e.g., 1080x1920).
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
@@ -1423,10 +1432,20 @@ def sample_image_requests(
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_image_resolution(image_resolution)
 
+    # Determine image counts for each request
+    if random_image_count:
+        # Random number of images per request
+        image_counts = np.random.randint(1, image_count + 1, size=num_requests)
+        total_images = np.sum(image_counts)
+    else:
+        # Fixed number of images per request
+        image_counts = np.full(num_requests, image_count)
+        total_images = image_count * num_requests
+
     # Check for potentially problematic combinations and warn user
-    if width * height >= 1920 * 1080 and image_count * num_requests >= 100:
+    if width * height >= 1920 * 1080 and total_images >= 100:
         warnings.warn(
-            f"High resolution ({width}x{height}) with {image_count * num_requests} total images "
+            f"High resolution ({width}x{height}) with {total_images} total images "
             f"may take a long time. Consider reducing resolution or image count.",
             UserWarning,
             stacklevel=2,
@@ -1460,12 +1479,19 @@ def sample_image_requests(
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
     for i in range(num_requests):
+        # Get the number of images for this request
+        request_image_count = int(image_counts[i])
+
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_mm_prompt(
+            processor.tokenizer,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            int(input_lens[i]),
+        )
 
         # Generate image list
         images, images_base64, images_bytes = zip(
-            *[_gen_random_image_data_uri() for _ in range(image_count)]
+            *[_gen_random_image_data_uri() for _ in range(request_image_count)]
         )
         total_image_bytes += sum(list(images_bytes))
 
@@ -1477,11 +1503,20 @@ def sample_image_requests(
             processor,
             backend,
         )
-
         dataset.append(data_row)
 
+    # Print statistics
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
+    print(f"#Total images: {total_images}")
+
+    if random_image_count:
+        print(
+            f"#Images per request: min={np.min(image_counts)}, max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}"
+        )
+    else:
+        print(f"#Images per request: {image_count} (fixed)")
+
     print(
         f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
@@ -1497,6 +1532,15 @@ def get_available_tokens(tokenizer):
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -2052,6 +2096,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print(
+        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
+    )
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -2092,6 +2142,7 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
@@ -2497,6 +2548,11 @@ if __name__ == "__main__":
             "Resolution of images for image dataset. "
             "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
         ),
+    )
+    parser.add_argument(
+        "--random-image-count",
+        action="store_true",
+        help="Enable Random Image Count",
     )
     parser.add_argument(
         "--image-format",

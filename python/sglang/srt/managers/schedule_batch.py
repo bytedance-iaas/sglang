@@ -202,6 +202,9 @@ class MultimodalDataItem:
     modality: Modality
     hash: int = None
     pad_value: int = None
+    # the token len of this item in final embedding
+    token_len: int = None
+    image_sizes: Tuple[int, int] = None
     offsets: Optional[list] = None
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
@@ -253,6 +256,9 @@ class MultimodalDataItem:
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
+    
+    def set_token_len(self):
+        self.token_len = sum(e - s + 1 for s, e in self.offsets)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -328,6 +334,7 @@ class MultimodalInputs:
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
         for item in ret.mm_items:
             item.set_pad_value()
+            item.set_token_len()
 
         optional_args = [
             "mrope_positions",
@@ -542,6 +549,7 @@ class Req:
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        self.mm_embedding_indices: Optional[np.ndarray] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -653,6 +661,8 @@ class Req:
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.bootstrap_host_encode: str = bootstrap_host
+        self.bootstrap_port_encode: Optional[int] = bootstrap_port
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # For data parallel rank routing
@@ -673,6 +683,11 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+        # for encoder-disaggregation
+        self.mm_embedding_lens = []
+        # self.mm_embedding_token_sum = []
+        self.mm_hashes = []
 
     @property
     def seqlen(self):
@@ -703,11 +718,18 @@ class Req:
         )
         self.last_tic = now
 
-    def extend_image_inputs(self, image_inputs):
+    def extend_mm_inputs(self, mm_inputs: MultimodalInputs):
         if self.multimodal_inputs is None:
-            self.multimodal_inputs = image_inputs
+            self.multimodal_inputs = mm_inputs
         else:
-            self.multimodal_inputs.merge(image_inputs)
+            self.multimodal_inputs.merge(mm_inputs)
+
+        self.mm_hashes = [mm_item.hash for mm_item in self.multimodal_inputs.mm_items]
+        self.mm_embedding_lens = [
+            mm_item.token_len for mm_item in self.multimodal_inputs.mm_items
+        ]
+        # print(f"{self.mm_embedding_lens=}")
+        self.cu_mm_embedding_len = sum(self.mm_embedding_lens)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -954,6 +976,12 @@ class Req:
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+    
+    def contains_mm_input(self) -> bool:
+        return (
+            self.multimodal_inputs is not None
+            and self.multimodal_inputs.contains_mm_input()
+        )
 
     def __repr__(self):
         return (
@@ -1088,6 +1116,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        device=None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1111,11 +1140,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
-            device=req_to_token_pool.device,
+            device=device or req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            # to work with decode node with VLM
+            # it's going to be set in `prepare_for_extend` later and then be pickled anyway, so this won't introduce overhead
+            multimodal_inputs=[req.multimodal_inputs for req in reqs],
         )
 
     def batch_size(self):
@@ -1198,7 +1230,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, should_set_req_pool_indices=True):
         self.forward_mode = ForwardMode.EXTEND
 
         # Init tensors
@@ -1248,9 +1280,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        if should_set_req_pool_indices:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+                self
+            )
 
         # Set fields
         input_embeds = []
@@ -1258,8 +1291,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            if should_set_req_pool_indices:
+                req.req_pool_idx = req_pool_indices[i]
+                assert seq_len - pre_len == req.extend_input_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1351,9 +1385,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids = None
 
         self.input_ids = input_ids_tensor
-        self.req_pool_indices = req_pool_indices_tensor
+        if should_set_req_pool_indices:
+            self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
-        self.out_cache_loc = out_cache_loc
+        if should_set_req_pool_indices:
+            self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -1766,6 +1802,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
+        if get_global_server_args().disaggregation_mode == "encode":
+            seq_lens_cpu = None
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -1836,6 +1874,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            multimodal_inputs=self.multimodal_inputs,
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
@@ -1851,6 +1890,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
+            f" req_ids={[r.rid for r in self.reqs]}"
+            # f" input_ids={self.input_ids}, shape={self.input_ids.shape}"
+            f" seq_lens={self.seq_lens}"
+            f" output_ids={self.output_ids}"
+            f" prefix_lens={self.prefix_lens}"
+            f" extend_lens={self.extend_lens}"
+            f" extend_num_tokens={self.extend_num_tokens}"
+            f" return_logprob={self.return_logprob}"
         )
 
 

@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+from enum import IntEnum, auto
 import ipaddress
 import logging
 import random
@@ -48,6 +49,12 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
+class ServerRole(IntEnum):
+    ENCODE = auto()
+    PREFILL = auto()
+    DECODE = auto()
+    TEXT = auto()
+
 class MiniLoadBalancer:
     def __init__(
         self,
@@ -58,9 +65,12 @@ class MiniLoadBalancer:
         self.host = router_args.host
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
+        self.encode_urls = [url[0] for url in router_args.encode_urls]
+        self.encode_bootstrap_ports = [url[1] for url in router_args.encode_urls]
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
+        self.text_urls = router_args.text_urls
         self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
         self.enable_trace = router_args.enable_trace
         if self.enable_trace and not trace_package_imported:
@@ -96,86 +106,209 @@ class MiniLoadBalancer:
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
-        assert len(self.prefill_urls) > 0, "No prefill servers available"
-        assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
+        if not self.text_urls or not self.encode_urls:
+            assert len(self.prefill_urls) > 0, "No prefill servers available"
+            assert len(self.decode_urls) > 0, "No decode servers available"
+        if self.prefill_urls:
+            pidx = random.randint(0, len(self.prefill_urls) - 1)
+        else:
+            pidx = None
+        if self.decode_urls:
+            didx = random.randint(0, len(self.decode_urls) - 1)
+        else:
+            didx = None
+        if self.encode_urls:
+            eidx = random.randint(0, len(self.encode_urls) - 1)
+        else:
+            eidx = None
+        if self.text_urls:
+            tidx = random.randint(0, len(self.text_urls) - 1)
+        else:
+            tidx = None
         return (
-            self.prefill_urls[pidx],
-            self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
+            self.prefill_urls[pidx] if pidx is not None else None,
+            self.prefill_bootstrap_ports[pidx] if pidx is not None else None,
+            self.decode_urls[didx] if didx is not None else None,
+            self.encode_urls[eidx] if eidx is not None else None,
+            self.encode_bootstrap_ports[eidx] if eidx is not None else None,
+            self.text_urls[tidx] if tidx is not None else None,
         )
 
-    async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
-    ) -> ORJSONResponse:
-        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
-
+    async def get_responses(
+        self,
+        prefill_server,
+        decode_server,
+        encode_server,
+        text_server,
+        endpoint,
+        modified_request,
+        modified_request_for_prefill,
+    ):
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
-            headers = {}
-            bootstrap_room_list = []
-            if self.enable_trace:
-                bootstrap_room_list = (
-                    modified_request["bootstrap_room"]
-                    if isinstance(modified_request["bootstrap_room"], list)
-                    else [modified_request["bootstrap_room"]]
-                )
-                trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
-                headers = {"trace_context": trace_context}
-
-            tasks = [
-                session.post(
-                    f"{prefill_server}/{endpoint}",
-                    json=modified_request,
-                    headers=headers,
-                ),
-                session.post(
-                    f"{decode_server}/{endpoint}",
-                    json=modified_request,
-                    headers=headers,
-                ),
-            ]
-
-            for bootstrap_room in bootstrap_room_list:
-                trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
-
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
-
-            if "return_logprob" in modified_request:
-
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
-
-                # merge `meta_info.input_token_logprobs` from prefill to decode
-                if "meta_info" in ret_json:
-                    if "input_token_logprobs" in ret_json["meta_info"]:
-                        ret_json["meta_info"]["input_token_logprobs"] = (
-                            prefill_json["meta_info"]["input_token_logprobs"]
-                            + ret_json["meta_info"]["input_token_logprobs"]
-                        )
-            else:
-                ret_json = await decode_response.json()
-
-            for bootstrap_room in bootstrap_room_list:
-                trace_slice_end(
-                    "wait_PD_finish",
-                    bootstrap_room,
-                    thread_finish_flag=True,
-                )
-                trace_req_finish(bootstrap_room)
-
-            return ORJSONResponse(
-                content=ret_json,
-                status_code=decode_response.status,
+            return await self._get_responses_from_session(
+                session,
+                prefill_server,
+                decode_server,
+                encode_server,
+                text_server,
+                endpoint,
+                modified_request,
+                modified_request_for_prefill,
             )
 
+    async def _get_responses_from_session(
+        self,
+        session,
+        prefill_server,
+        decode_server,
+        encode_server,
+        text_server,
+        endpoint,
+        modified_request,
+        modified_request_for_prefill,
+    ):
+        tasks_mapping = dict()
+        for server_role, server in [
+            (ServerRole.PREFILL, prefill_server),
+            (ServerRole.DECODE, decode_server),
+            (ServerRole.ENCODE, encode_server),
+            (ServerRole.TEXT, text_server),
+        ]:
+            if server:
+                if server_role == ServerRole.PREFILL or server_role == ServerRole.TEXT:
+                    req = modified_request_for_prefill
+                else:
+                    req = modified_request
+                # print(f"req for {server_role}: {req=}")
+                tasks_mapping[server_role] = session.post(
+                    f"{server}/{endpoint}", json=req
+                )
+
+        # print(f"requests {tasks_mapping.values()=}")
+
+        # Wait for all responses to complete. Prefill should end first.
+        responses = await asyncio.gather(*tasks_mapping.values())
+
+        # Extract responses based on server roles
+        response_mapping = {}
+        response_idx = 0
+        for server_role, _ in [
+            (ServerRole.PREFILL, prefill_server),
+            (ServerRole.DECODE, decode_server),
+            (ServerRole.ENCODE, encode_server),
+            (ServerRole.TEXT, text_server),
+        ]:
+            if server_role in tasks_mapping:
+                response_mapping[server_role] = responses[response_idx]
+                response_idx += 1
+
+        prefill_response = response_mapping.get(ServerRole.PREFILL)
+        decode_response = response_mapping.get(ServerRole.DECODE)
+        encode_response = response_mapping.get(ServerRole.ENCODE)
+        text_response = response_mapping.get(ServerRole.TEXT)
+        return prefill_response, decode_response, encode_response, text_response
+
+    async def generate(
+        self, modified_request, prefill_server, decode_server, endpoint, encode_server=None,
+        text_server=None,
+        modified_request_for_prefill=None,
+    ) -> ORJSONResponse:
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+        prefill_response, decode_response, encode_response, text_response = (
+            await self.get_responses(
+                prefill_server,
+                decode_server,
+                encode_server,
+                text_server,
+                endpoint,
+                modified_request,
+                modified_request_for_prefill,
+            )
+        )
+
+        # async with aiohttp.ClientSession(
+        #     timeout=aiohttp.ClientTimeout(
+        #         total=self.timeout
+        #     )  # Add timeout for request reliability
+        # ) as session:
+        #     headers = {}
+        #     bootstrap_room_list = []
+        #     if self.enable_trace:
+        #         bootstrap_room_list = (
+        #             modified_request["bootstrap_room"]
+        #             if isinstance(modified_request["bootstrap_room"], list)
+        #             else [modified_request["bootstrap_room"]]
+        #         )
+        #         trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
+        #         headers = {"trace_context": trace_context}
+
+        #     tasks = [
+        #         session.post(
+        #             f"{prefill_server}/{endpoint}",
+        #             json=modified_request,
+        #             headers=headers,
+        #         ),
+        #         session.post(
+        #             f"{decode_server}/{endpoint}",
+        #             json=modified_request,
+        #             headers=headers,
+        #         ),
+        #     ]
+
+        #     for bootstrap_room in bootstrap_room_list:
+        #         trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
+
+        #     # Wait for both responses to complete. Prefill should end first.
+        #     prefill_response, decode_response = await asyncio.gather(*tasks)
+
+        if "return_logprob" in modified_request:
+            final_response = decode_response
+            if prefill_response and decode_response:
+                prefill_json, ret_json = await asyncio.gather(
+                    prefill_response.json(), decode_response.json()
+                )
+
+            # merge `meta_info.input_token_logprobs` from prefill to decode
+            if "meta_info" in ret_json and "meta_info" in prefill_json:
+                if "input_token_logprobs" in ret_json["meta_info"]:
+                    ret_json["meta_info"]["input_token_logprobs"] = (
+                        prefill_json["meta_info"]["input_token_logprobs"]
+                        + ret_json["meta_info"]["input_token_logprobs"]
+                    )
+            else:
+                # Fallback to decode response only if prefill is not available
+                ret_json = await decode_response.json() if decode_response else {}
+        else:
+            if decode_server:
+                final_response = decode_response
+            else:
+                assert text_server
+                print(f"using text response as decode_response")
+                final_response = text_response
+            ret_json = await decode_response.json() if final_response else {}
+
+        for bootstrap_room in bootstrap_room_list:
+            trace_slice_end(
+                "wait_PD_finish",
+                bootstrap_room,
+                thread_finish_flag=True,
+            )
+            trace_req_finish(bootstrap_room)
+
+        return ORJSONResponse(
+            content=ret_json,
+            status_code=final_response.status if final_response else 200,
+        )
+
     async def generate_stream(
-        self, modified_request, prefill_server, decode_server, endpoint="generate"
+        self, modified_request, prefill_server, decode_server, encode_server=None,
+        text_server=None,
+        modified_request_for_prefill=None,
+        endpoint="generate"
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -186,71 +319,106 @@ class MiniLoadBalancer:
                 )  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
-                headers = {}
-                bootstrap_room_list = []
-                if self.enable_trace:
-                    bootstrap_room_list = (
-                        modified_request["bootstrap_room"]
-                        if isinstance(modified_request["bootstrap_room"], list)
-                        else [modified_request["bootstrap_room"]]
-                    )
-                    trace_context = trace_get_remote_propagate_context(
-                        bootstrap_room_list
-                    )
-                    headers = {"trace_context": trace_context}
+                # headers = {}
+                # bootstrap_room_list = []
+                # if self.enable_trace:
+                #     bootstrap_room_list = (
+                #         modified_request["bootstrap_room"]
+                #         if isinstance(modified_request["bootstrap_room"], list)
+                #         else [modified_request["bootstrap_room"]]
+                #     )
+                #     trace_context = trace_get_remote_propagate_context(
+                #         bootstrap_room_list
+                #     )
+                #     headers = {"trace_context": trace_context}
 
-                tasks = [
-                    session.post(
-                        f"{prefill_server}/{endpoint}",
-                        json=modified_request,
-                        headers=headers,
-                    ),
-                    session.post(
-                        f"{decode_server}/{endpoint}",
-                        json=modified_request,
-                        headers=headers,
-                    ),
-                ]
+                # tasks = [
+                #     session.post(
+                #         f"{prefill_server}/{endpoint}",
+                #         json=modified_request,
+                #         headers=headers,
+                #     ),
+                #     session.post(
+                #         f"{decode_server}/{endpoint}",
+                #         json=modified_request,
+                #         headers=headers,
+                #     ),
+                # ]
 
-                for bootstrap_room in bootstrap_room_list:
-                    trace_slice_end(
-                        "mini_lb_launch", bootstrap_room, auto_next_anon=True
-                    )
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                # for bootstrap_room in bootstrap_room_list:
+                #     trace_slice_end(
+                #         "mini_lb_launch", bootstrap_room, auto_next_anon=True
+                #     )
+                # # Wait for both responses to complete. Since this is streaming, they return immediately.
+                # prefill_response, decode_response = await asyncio.gather(*tasks)
+
+                (
+                    prefill_response,
+                    decode_response,
+                    encode_response,
+                    text_response,
+                ) = await self._get_responses_from_session(
+                    session,
+                    prefill_server,
+                    decode_server,
+                    encode_server,
+                    text_server,
+                    endpoint,
+                    modified_request,
+                    modified_request_for_prefill,
+                )
+
+                if decode_server:
+                    final_response = decode_response
+                else:
+                    assert text_server
+                    # print(f"using text response as decode_response")
+                    final_response = text_response
 
                 if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                    # Optimized logprob handling for streaming
+                    # 1. Read the entire prefill response first.
+                    prefill_body = await prefill_response.read()
+                    prefill_response.release()  # Release connection early
 
+                    # 2. Extract the first chunk of prefill to get initial logprobs
                     first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                        prefill_body.split(b"\n\n")[0].decode("utf-8")[5:].strip()
                     )
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+                    initial_logprobs = first_prefill_chunk_json["meta_info"].get(
+                        "input_token_logprobs", []
+                    )
 
-                    async for chunk in decode_response.content:
-                        # Note: This is inefficient
-                        # merge prefill input_token_logprobs, output_token_logprobs to decode
-                        decoded_chunk = chunk.decode("utf-8")
-                        if (
-                            decoded_chunk
-                            and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
-                        ):
-                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
-                                + ret_json["meta_info"]["input_token_logprobs"]
-                            )
+                    # 3. Process the decode stream
+                    first_chunk = True
+                    async for chunk in final_response.content:
+                        if first_chunk:
+                            # For the first chunk, merge the logprobs
+                            decoded_chunk = chunk.decode("utf-8")
+                            if (
+                                decoded_chunk
+                                and decoded_chunk.startswith("data:")
+                                and "[DONE]" not in decoded_chunk
+                            ):
+                                ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                                if "meta_info" in ret_json:
+                                    ret_json["meta_info"]["input_token_logprobs"] = (
+                                        initial_logprobs
+                                        + ret_json["meta_info"].get(
+                                            "input_token_logprobs", []
+                                        )
+                                    )
 
-                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                                yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                            else:
+                                yield chunk
+                            first_chunk = False
                         else:
+                            # For all subsequent chunks, forward them directly
                             yield chunk
                 else:
-                    async for chunk in decode_response.content.iter_chunked(
+                    async for chunk in final_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
@@ -275,6 +443,19 @@ lb: Optional[MiniLoadBalancer] = None
 
 @app.get("/health")
 async def health_check():
+    # encode_servers, prefill_servers, decode_servers = (
+    #     load_balancer.encode_servers,
+    #     load_balancer.prefill_servers,
+    #     load_balancer.decode_servers,
+    # )
+    # async with aiohttp.ClientSession() as session:
+    #     # Create the tasks
+    #     tasks = []
+    #     for server in chain(encode_servers, prefill_servers, decode_servers):
+    #         tasks.append(session.post(f"{server}/health_generate"))
+    #     for i, response in enumerate(asyncio.as_completed(tasks)):
+    #         await response
+    # return Response(status_code=200)
     return Response(status_code=200)
 
 
@@ -290,12 +471,48 @@ async def health_generate():
     return Response(status_code=200)
 
 
+# @app.post("/start_profile")
+# async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+#     encode_servers, prefill_servers, decode_servers, text_servers = (
+#         load_balancer.encode_servers,
+#         load_balancer.prefill_servers,
+#         load_balancer.decode_servers,
+#         load_balancer.text_addrs,
+#     )
+#     async with aiohttp.ClientSession() as session:
+#         # Create the tasks
+#         tasks = []
+#         for server in chain(encode_servers, prefill_servers, decode_servers, text_servers):
+#             tasks.append(session.post(f"{server}/start_profile"))
+#         for i, response in enumerate(asyncio.as_completed(tasks)):
+#             await response
+#     return Response(status_code=200)
+
+
+# @app.post("/stop_profile")
+# async def start_profile_async():
+#     encode_servers, prefill_servers, decode_servers, text_servers = (
+#         load_balancer.encode_servers,
+#         load_balancer.prefill_servers,
+#         load_balancer.decode_servers,
+#         load_balancer.text_addrs,
+#     )
+#     async with aiohttp.ClientSession() as session:
+#         # Create the tasks
+#         tasks = []
+#         for server in chain(encode_servers, prefill_servers, decode_servers, text_servers):
+#             tasks.append(session.post(f"{server}/stop_profile"))
+#         for i, response in enumerate(asyncio.as_completed(tasks)):
+#             await response
+#     return Response(status_code=200)
+
+
 @app.post("/flush_cache")
 async def flush_cache():
     async with aiohttp.ClientSession() as session:
         # Create the tasks
         tasks = []
-        for server in chain(lb.prefill_urls, lb.decode_urls):
+        for server in chain(lb.prefill_urls, lb.decode_urls, lb.encode_urls, lb.text_urls):
             tasks.append(session.post(f"{server}/flush_cache"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
@@ -306,6 +523,8 @@ async def flush_cache():
 async def get_server_info():
     prefill_infos = []
     decode_infos = []
+    encode_infos = []
+    text_infos = []
     all_internal_states = []
 
     async with aiohttp.ClientSession() as session:
@@ -319,13 +538,20 @@ async def get_server_info():
             # Extract internal_states from decode servers
             if "internal_states" in info_json:
                 all_internal_states.extend(info_json["internal_states"])
-
+        for server in lb.encode_urls:
+            server_info = await session.get(f"{server}/get_server_info")
+            encode_infos.append(await server_info.json())
+        for server in lb.text_urls:
+            server_info = await session.get(f"{server}/get_server_info")
+            text_infos.append(await server_info.json())
     # Return format expected by bench_one_batch_server.py
     if all_internal_states:
         return {
             "internal_states": all_internal_states,
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "encode": encode_infos,
+            "text": text_infos,
         }
     else:
         # Fallback with dummy data if no internal states found
@@ -338,6 +564,8 @@ async def get_server_info():
             ],
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "encode": encode_infos,
+            "text": text_infos,
         }
 
 
@@ -375,13 +603,22 @@ async def get_model_info():
             )
 
 
-@app.post("/generate")
-async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
+def parse_url_as_host(server_addr) -> str:
+    """
+    Parse and transform prefill_server for bootstrap data
+    """
+    parsed_url = urllib.parse.urlparse(server_addr)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+    return hostname
+
+
+def modify_bootstrap_info_in_request(
+    request_data, bootstrap_server: str, bootstrap_port
+):
+    """
+    In EPD, we have 2 bootstrap servers on encode & prefill
+    """
+    hostname = parse_url_as_host(bootstrap_server)
     modified_request = request_data.copy()
 
     batch_size = _get_request_batch_size(modified_request)
@@ -390,27 +627,54 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
             }
         )
+
     else:
         modified_request.update(
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
             }
         )
+    if "bootstrap_room" not in modified_request:
+        modified_request.update(
+            {
+                "bootstrap_room": (
+                    [_generate_bootstrap_room() for _ in range(batch_size)]
+                    if batch_size is not None
+                    else _generate_bootstrap_room()
+                )
+            }
+        )
+    return modified_request
+
+
+@app.post("/generate")
+async def handle_generate_request(request_data: dict):
+    prefill_server, bootstrap_port, decode_server, encode_server, encode_bootstrap_port, text_server = lb.select_pair()
+
+    modified_request = modify_bootstrap_info_in_request(
+        request_data, prefill_server, bootstrap_port
+    )
+    if encode_server:
+        modified_request_for_prefill = modify_bootstrap_info_in_request(
+            modified_request, encode_server, encode_bootstrap_port
+        )
+    else:
+        modified_request_for_prefill = modified_request
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
+            modified_request, prefill_server, decode_server, encode_server=encode_server,
+            text_server=text_server,
+            modified_request_for_prefill=modified_request_for_prefill,
         )
     else:
         return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
+            modified_request, prefill_server, decode_server, encode_server=encode_server,
+            text_server=text_server,
+            modified_request_for_prefill=modified_request_for_prefill,
         )
 
 

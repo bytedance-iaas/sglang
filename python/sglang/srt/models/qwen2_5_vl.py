@@ -60,6 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import permute_inv
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -170,6 +171,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -182,6 +184,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -440,15 +443,32 @@ class Qwen2_5_VisionTransformer(nn.Module):
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
+        # pre-compute max seqlens for different attention windows
+        if cu_window_seqlens.numel() >= 2:
+            max_seqlen_window = (
+                (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
+            )
+        else:
+            max_seqlen_window = 0
+        if cu_seqlens.numel() >= 2:
+            max_seqlen_full = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        else:
+            max_seqlen_full = 0
+
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
+                max_seqlen_now = max_seqlen_full
             else:
                 cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = max_seqlen_window
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                max_seqlen=max_seqlen_now,
             )
 
         # adapter
@@ -489,14 +509,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen2_5_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
+        self.is_encoder = get_global_server_args().disaggregation_mode == "encode"
+        self.should_load_vision_model = (
+            self.is_encoder or not get_global_server_args().encoder_disaggregated
         )
+        if self.should_load_vision_model:
+            self.visual = Qwen2_5_VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+            )
 
         self.model = Qwen2Model(
             config,
@@ -615,7 +640,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-
+            
+            if "visual" in name and not self.should_load_vision_model:
+                continue
+            
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

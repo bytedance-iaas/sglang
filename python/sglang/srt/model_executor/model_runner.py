@@ -48,6 +48,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -108,6 +109,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.mem_cache.multimodal_cache import PagedMultiModalEmbeddingPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -254,6 +256,8 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        mm_embedding_pool: Optional[PagedMultiModalEmbeddingPool] = None,
+        mm_embedding_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -279,8 +283,15 @@ class ModelRunner:
             server_args.speculative_algorithm
         )
         self.page_size = server_args.page_size
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        if self.server_args.disaggregation_mode == "encode":
+            self.req_to_token_pool = None
+            self.token_to_kv_pool_allocator = None
+        else:
+            self.req_to_token_pool = req_to_token_pool
+            self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.mm_embedding_pool = mm_embedding_pool
+        self.mm_embedding_allocator = mm_embedding_allocator
+
         self.is_hybrid = model_config.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
@@ -468,22 +479,53 @@ class ModelRunner:
             enable_batch_invariant_mode()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
+        # assume seq_len = 1k, average image token num ~= 200, 1 image per-req, average layer num = 60
+        # kv_size/embedding_size = 1k * 60 / 200 = 300
+        # fraction = 1 / (300 + 1) = 0.0033
+        MM_MEM_POOL_FRACTION = float(
+            os.environ.get("SGLANG_MM_MEM_POOL_FRACTION", "0.0033")
         )
-        if self.device == "cuda":
-            self.init_cublas()
-            self.init_attention_backend()
-            self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
-            self.init_attention_backend()
-            self.init_device_graphs()
+        if self.server_args.disaggregation_mode != "encode":
+            self.init_memory_pool(
+                min_per_gpu_memory  * (1 - MM_MEM_POOL_FRACTION),
+                server_args.max_running_requests,
+                server_args.max_total_tokens,
+            )
         else:
+            self.token_to_kv_pool = None
+            self.req_to_token_pool = None
+
+        # Init memory pool for mm embedding (only allocated in PDE-disaggregation)
+        if (
+            (
+                self.server_args.disaggregation_mode == "prefill"
+                and self.server_args.encoder_disaggregated
+            )
+            or self.server_args.disaggregation_mode == "text"
+            or self.server_args.disaggregation_mode == "encode"
+        ):
+            self.init_mm_memory_pool(
+                min_per_gpu_memory * MM_MEM_POOL_FRACTION,
+                server_args.max_running_requests,
+                # server_args.max_total_tokens,
+            )
+        
+        if self.server_args.disaggregation_mode == "encode":
+            self.attn_backend = None
             self.graph_runner = None
             self.graph_mem_usage = 0
-            self.init_attention_backend()
+        else:
+            if self.device == "cuda":
+                self.init_cublas()
+                self.init_attention_backend()
+                self.init_device_graphs()
+            elif self.device in ["npu", "cpu"]:
+                self.init_attention_backend()
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -507,6 +549,10 @@ class ModelRunner:
                 eagle_aux_hidden_state_layer_ids = None
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+
+    def is_encoder_disaggregated(self) -> bool:
+        # FIXME
+        return True
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1499,6 +1545,132 @@ class ModelRunner:
             return False
         return True
 
+    def init_mm_memory_pool(
+        self,
+        mm_available_memory: int,
+        max_num_reqs: Optional[int] = None,
+        max_total_tokens: Optional[int] = None,
+    ):
+        """Initialize multimodal memory pool for storing multimodal embeddings.
+
+        This method initializes the multimodal embedding pool and allocator,
+        similar to init_memory_pool but specifically for multimodal embeddings.
+        Each mm_embedding corresponds to a hash and will be stored in the pool,
+        and released after the request completes inference.
+        """
+        # Set multimodal embedding dtype - use the same dtype as model
+        mm_embedding_dtype = self.dtype
+
+        # Calculate maximum number of multimodal tokens based on available memory
+        # Each multimodal embedding has hidden_size dimensions
+        hidden_size = self.model_config.hidden_size
+        if "qwen3_vl" in self.model_config.hf_config.model_type:
+            hidden_size = hidden_size * (1 + len(self.model_config.vision_config.deepstack_visual_indexes))
+
+        # Calculate memory per multimodal token
+        mm_token_size = hidden_size * torch._utils._element_size(mm_embedding_dtype)
+
+        # Calculate maximum number of multimodal tokens
+        max_mm_total_num_tokens = int(mm_available_memory * (1 << 30) // mm_token_size)
+
+        # Apply CI test constraints if needed
+        if SGLANG_CI_SMALL_KV_SIZE:
+            max_mm_total_num_tokens = min(max_mm_total_num_tokens, 1000)
+
+        # Apply user-specified constraints
+        if max_total_tokens is not None:
+            if (
+                max_total_tokens > max_mm_total_num_tokens
+                and self.server_args.disaggregation_mode != DisaggregationMode.ENCODE
+            ):
+                logging.warning(
+                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                    f"{max_mm_total_num_tokens} for multimodal cache. "
+                    f"Use the profiled value instead."
+                )
+            max_mm_total_num_tokens = min(max_mm_total_num_tokens, max_total_tokens)
+
+        # Ensure the size is page-aligned
+        mm_page_size = 1  # Multimodal embeddings typically use page size of 1
+        max_mm_total_num_tokens = max_mm_total_num_tokens // mm_page_size * mm_page_size
+
+        # Validate the calculated size
+        if max_mm_total_num_tokens <= 0:
+            logger.warning(
+                "Not enough memory for multimodal cache. "
+                "Multimodal features may not be available."
+            )
+            max_mm_total_num_tokens = 100  # Minimum fallback size
+
+        # Initialize multimodal embedding pool
+        if self.mm_embedding_pool is None:
+            self.mm_embedding_pool = PagedMultiModalEmbeddingPool(
+                size=max_mm_total_num_tokens,
+                hidden_size=hidden_size,
+                page_size=mm_page_size,
+                dtype=mm_embedding_dtype,
+                device=self.device,
+            )
+        else:
+            # Draft worker shares mm_embedding_pool with the target worker
+            assert self.is_draft_worker
+
+        # Initialize multimodal embedding allocator
+        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+        if self.mm_embedding_allocator is None:
+            assert mm_page_size == 1
+            self.mm_embedding_allocator = TokenToKVPoolAllocator(
+                max_mm_total_num_tokens,
+                dtype=mm_embedding_dtype,
+                device=self.device,
+                kvcache=self.mm_embedding_pool,
+                need_sort=need_sort,
+            )
+            # if mm_page_size == 1:
+            # Use simple allocator for page size 1
+            # if self.server_args.disaggregation_mode == "encode":
+            #     self.mm_embedding_allocator = FakeAllocator(
+            #         max_mm_total_num_tokens,
+            #         dtype=mm_embedding_dtype,
+            #         device=self.device,
+            #         kvcache=None,
+            #     )
+            # else:
+            #     self.mm_embedding_allocator = TokenToKVPoolAllocator(
+            #         max_mm_total_num_tokens,
+            #         dtype=mm_embedding_dtype,
+            #         device=self.device,
+            #         kvcache=self.mm_embedding_pool,
+            #     )
+            #     logger.info(
+            #         f"Multimodal memory pool initialized. "
+            #         f"max_mm_tokens={max_mm_total_num_tokens}, "
+            #         f"hidden_size={hidden_size}, "
+            #         f"dtype={mm_embedding_dtype}, "
+            #         f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            #     )
+            # else:
+            #     # Use paged allocator for larger page sizes
+            #     if _is_npu:
+            #         self.mm_embedding_allocator = AscendPagedTokenToKVPoolAllocator(
+            #             max_mm_total_num_tokens,
+            #             page_size=mm_page_size,
+            #             dtype=mm_embedding_dtype,
+            #             device=self.device,
+            #             kvcache=self.mm_embedding_pool,
+            #         )
+            #     else:
+            #         self.mm_embedding_allocator = PagedTokenToKVPoolAllocator(
+            #             max_mm_total_num_tokens,
+            #             page_size=mm_page_size,
+            #             dtype=mm_embedding_dtype,
+            #             device=self.device,
+            #             kvcache=self.mm_embedding_pool,
+            #         )
+        else:
+            # Draft worker shares mm_embedding_allocator with the target worker
+            assert self.is_draft_worker
+
     def init_memory_pool(
         self,
         total_gpu_memory: int,
@@ -2074,7 +2246,7 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
+        if not skip_attn_backend_init and self.attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
 
         kwargs = {}

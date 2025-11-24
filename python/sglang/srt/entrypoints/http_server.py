@@ -1489,7 +1489,7 @@ def _execute_server_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        if server_args.disaggregation_mode == "null":
+        if (server_args.disaggregation_mode == "null" or server_args.disaggregation_mode == "text"):
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -1498,7 +1498,9 @@ def _execute_server_warmup(
             )
             assert res.status_code == 200, f"{res}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
-
+        elif server_args.disaggregation_mode == "encode":
+            # TODO
+            pass
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
             json_data = {

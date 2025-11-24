@@ -17,10 +17,14 @@ class RouterArgs:
     # PD-specific configuration
     mini_lb: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    encode_urls: List[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    text_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
     policy: str = "cache_aware"
@@ -198,11 +202,26 @@ class RouterArgs:
             "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
+            f"--{prefix}encode",
+            nargs="+",
+            action="append",
+            help="Encode server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --encode URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
+        )
+        parser.add_argument(
             f"--{prefix}decode",
             nargs=1,
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        parser.add_argument(
+            f"--{prefix}text",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Text server URL. Can be specified multiple times.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -649,8 +668,14 @@ class RouterArgs:
         args_dict["prefill_urls"] = cls._parse_prefill_urls(
             cli_args_dict.get(f"{prefix}prefill", None)
         )
+        args_dict["encode_urls"] = cls._parse_encode_urls(
+            cli_args_dict.get(f"{prefix}encode", None)
+        )
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
+        )
+        args_dict["text_urls"] = cls._parse_text_urls(
+            cli_args_dict.get(f"{prefix}text", None)
         )
         args_dict["selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}selector", None)
@@ -746,6 +771,45 @@ class RouterArgs:
         return prefill_urls
 
     @staticmethod
+    def _parse_encode_urls(encode_list):
+        """Parse encode URLs from --encode arguments.
+
+        Format: --encode URL [BOOTSTRAP_PORT]
+        Example:
+            --encode http://encode1:8080 9000  # With bootstrap port
+            --encode http://encode2:8080 none  # Explicitly no bootstrap port
+            --encode http://encode3:8080       # Defaults to no bootstrap port
+        """
+        if not encode_list:
+            return []
+
+        encode_urls = []
+        for encode_args in encode_list:
+
+            url = encode_args[0]
+
+            # Handle optional bootstrap port
+            if len(encode_args) >= 2:
+                bootstrap_port_str = encode_args[1]
+                # Handle 'none' as None
+                if bootstrap_port_str.lower() == "none":
+                    bootstrap_port = None
+                else:
+                    try:
+                        bootstrap_port = int(bootstrap_port_str)
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                        )
+            else:
+                # No bootstrap port specified, default to None
+                bootstrap_port = None
+
+            encode_urls.append((url, bootstrap_port))
+
+        return encode_urls
+
+    @staticmethod
     def _parse_decode_urls(decode_list):
         """Parse decode URLs from --decode arguments.
 
@@ -757,3 +821,16 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+    
+    @staticmethod
+    def _parse_text_urls(text_list):
+        """Parse text URLs from --text arguments.
+
+        Format: --text URL
+        Example: --text http://decode1:8081 --text http://decode2:8081
+        """
+        if not text_list:
+            return []
+
+        # decode_list is a list of single-element lists due to nargs=1
+        return [url[0] for url in text_list]

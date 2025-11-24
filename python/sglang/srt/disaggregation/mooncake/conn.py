@@ -61,6 +61,12 @@ class TransferKVChunk:
     state_indices: Optional[List[int]]
 
 
+@dataclasses.dataclass
+class TransferEmbeddingChunk:
+    room: int
+    mm_indices: npt.NDArray[np.int32]
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -165,8 +171,11 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.start_prefill_thread()
+        if (self.disaggregation_mode == DisaggregationMode.PREFILL or self.disaggregation_mode == DisaggregationMode.ENCODE):
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.start_prefill_thread()
+            else:
+                self.start_encode_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -190,10 +199,18 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for _ in range(transfer_queue_size)
             ]
-            for queue, executor in zip(self.transfer_queues, self.executors):
-                threading.Thread(
-                    target=self.transfer_worker, args=(queue, executor), daemon=True
-                ).start()
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                for queue, executor in zip(self.transfer_queues, self.executors):
+                    threading.Thread(
+                        target=self.transfer_worker, args=(queue, executor), daemon=True
+                    ).start()
+            else:
+                for queue, executor in zip(self.transfer_queues, self.executors):
+                    threading.Thread(
+                        target=self.transfer_embedding_worker,
+                        args=(queue, executor),
+                        daemon=True,
+                    ).start()
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -204,7 +221,7 @@ class MooncakeKVManager(CommonKVManager):
             self.enable_custom_mem_pool = get_bool_env_var(
                 "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
             )
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        elif (self.disaggregation_mode == DisaggregationMode.DECODE or self.disaggregation_mode == DisaggregationMode.TEXT):
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
@@ -564,6 +581,34 @@ class MooncakeKVManager(CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def send_embedding(
+        self,
+        session_id: str,
+        mm_indices: npt.NDArray[np.int32],
+        dst_mm_ptrs: List[int],
+        dst_mm_indices: npt.NDArray[np.int32],
+    ):
+        encode_mm_blocks, dst_mm_blocks = group_concurrent_contiguous(
+            mm_indices, dst_mm_indices
+        )
+        item_len = self.kv_args.kv_item_lens[0]
+
+        for encode_index, dst_index in zip(encode_mm_blocks, dst_mm_blocks):
+            src_addr = self.kv_args.kv_data_ptrs[0] + int(encode_index[0]) * item_len
+            dst_addr = dst_mm_ptrs[0] + int(dst_index[0]) * item_len
+            length = item_len * len(encode_index)
+            logger.debug(
+                f"{len(dst_mm_ptrs)=} {len(dst_mm_indices)=} {len(mm_indices)=}, {item_len=}"
+            )
+            status = self.engine.transfer_sync(session_id, src_addr, dst_addr, length)
+            if status != 0:
+                logger.error(
+                    f"Embedding transfer failed: session_id={session_id}, status={status}"
+                )
+                break
+
+        return status
+
     def send_aux_tcp(
         self,
         req: TransferInfo,
@@ -850,6 +895,90 @@ class MooncakeKVManager(CommonKVManager):
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
 
+    def transfer_embedding_worker(
+        self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
+    ):
+        while True:
+            try:
+                embedding_chunk: TransferEmbeddingChunk = queue.get()
+                reqs_to_be_processed = (
+                    self.transfer_infos[embedding_chunk.room].values()
+                    if embedding_chunk.room in self.transfer_infos
+                    else []
+                )
+                polls = []
+                dst_ranks_infos = []
+                local_rank = self.kv_args.engine_rank
+                for req in reqs_to_be_processed:
+                    with self.session_lock:
+                        if req.mooncake_session_id in self.failed_sessions:
+                            self.record_failure(
+                                embedding_chunk.room,
+                                f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                            )
+                            self.update_status(embedding_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                local_rank,
+                            )
+                            break
+
+                    dst_kv_indice = req.dst_kv_indices
+
+                    target_rank_registration_info: KVArgsRegisterInfo = (
+                        self.decode_kv_args_table[req.mooncake_session_id]
+                    )
+                    # print(target_rank_registration_info)
+
+                    ret = self.send_embedding(
+                        session_id=req.mooncake_session_id,
+                        mm_indices=embedding_chunk.mm_indices,
+                        dst_mm_ptrs=target_rank_registration_info.dst_kv_ptrs,
+                        dst_mm_indices=dst_kv_indice,
+                    )
+                    if ret != 0:
+                        with self.session_lock:
+                            self.session_failures[req.mooncake_session_id] += 1
+                            # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                            if self.session_failures[req.mooncake_session_id] >= 1:
+                                self.failed_sessions.add(req.mooncake_session_id)
+                                logger.error(
+                                    f"Session {req.mooncake_session_id} failed."
+                                )
+                        self.record_failure(
+                            embedding_chunk.room,
+                            f"Failed to send kv chunk of {embedding_chunk.room} to {req.endpoint}:{req.dst_port}",
+                        )
+                        self.update_status(embedding_chunk.room, KVPoll.Failed)
+                        self.sync_status_to_decode_endpoint(
+                            req.endpoint,
+                            req.dst_port,
+                            req.room,
+                            KVPoll.Failed,
+                            local_rank,
+                        )
+                        break
+                    polls.append(True if ret == 0 else False)
+                    dst_ranks_infos.append((req.endpoint, req.dst_port, req.room))
+
+                    # Only sync status when all the dst ranks have received the kvcache
+                    if len(polls) == req.required_dst_info_num:
+                        status = KVPoll.Success if all(polls) else KVPoll.Failed
+                        self.update_status(req.room, status)
+                        for endpoint, dst_port, room in dst_ranks_infos:
+                            self.sync_status_to_decode_endpoint(
+                                endpoint, dst_port, room, status, local_rank
+                            )
+
+            except Exception as e:
+                # NOTE(yizhang2077): Remove this when we make sure the transfer thread is bug-free
+                raise RuntimeError(
+                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                )
+
     def start_prefill_thread(self):
         self._bind_server_socket()
 
@@ -888,6 +1017,52 @@ class MooncakeKVManager(CommonKVManager):
 
         threading.Thread(target=bootstrap_thread).start()
 
+    def start_encode_thread(self):
+        self._bind_server_socket()
+
+        def bootstrap_thread():
+            """This thread recvs pre-alloc notification from the prefill/text engine"""
+            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+            while True:
+                waiting_req_bytes = self.server_socket.recv_multipart()
+                room = waiting_req_bytes[0].decode("ascii")
+                logger.debug(f"encode thread received waiting_req_bytes {room=}")
+                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                if room == "None":
+                    self.decode_kv_args_table[mooncake_session_id] = (
+                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    )
+                    logger.debug(
+                        f"825 {mooncake_session_id=} {KVArgsRegisterInfo.from_zmq(waiting_req_bytes)=}"
+                    )
+                    with self.session_lock:
+                        if mooncake_session_id in self.failed_sessions:
+                            self.failed_sessions.remove(mooncake_session_id)
+                        if mooncake_session_id in self.session_failures:
+                            del self.session_failures[mooncake_session_id]
+                    logger.debug(
+                        f"Register KVArgs from {mooncake_session_id} successfully"
+                    )
+                    continue
+                else:
+                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
+                    room = int(room)
+                    if room not in self.transfer_infos:
+                        self.transfer_infos[room] = {}
+
+                    self.transfer_infos[room][mooncake_session_id] = (
+                        TransferInfo.from_zmq(waiting_req_bytes)
+                    )
+                    logger.debug(f"waiting_req_bytes {len(waiting_req_bytes[4])=}")
+                    # print(
+                    #     f"transfer_infos {room=} {mooncake_session_id=} {self.transfer_infos[room][mooncake_session_id]=}"
+                    # )
+                    # NOTE: after bootstrapping we can mark the req as waiting for input
+                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.update_status(room, KVPoll.WaitingForInput)
+
+        threading.Thread(target=bootstrap_thread).start()
+
     def start_decode_thread(self):
         self._bind_server_socket()
 
@@ -902,6 +1077,7 @@ class MooncakeKVManager(CommonKVManager):
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
+                # print(f"decode_thread {status=}, {bootstrap_room=}, {prefill_rank=}")
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
@@ -1023,6 +1199,41 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
+    def add_transfer_embedding_request(
+        self,
+        bootstrap_room: int,
+        mm_indices: npt.NDArray[np.int32],
+    ):
+        assert self.disaggregation_mode == DisaggregationMode.ENCODE
+        if (
+            bootstrap_room not in self.request_status
+            or self.check_status(bootstrap_room) == KVPoll.Failed
+        ):
+            logger.debug(
+                "Request with bootstrap_room=%s already failed", bootstrap_room
+            )
+            return
+
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
+        # NOTE(shangming): sharding according to the dst_infos to make sure
+        # requests with the same dst_sessions will be added into the same
+        # queue, which enables early abort with failed sessions.
+        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+        shard_idx = session_port_sum % len(self.transfer_queues)
+
+        self.transfer_queues[shard_idx].put(
+            TransferEmbeddingChunk(
+                room=bootstrap_room,
+                mm_indices=mm_indices,
+            )
+        )
+
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
 
@@ -1123,6 +1334,15 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
             )
 
+    def send_embedding(self, mm_indices: npt.NDArray[np.int32]):
+        """
+        Send the embedding tensor to the remote server using MooncakeKVManager.
+        """
+        self.kv_mgr.add_transfer_embedding_request(
+            self.bootstrap_room,
+            mm_indices,
+        )
+    
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -1185,13 +1405,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self,
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
+        disaggregation_mode: Optional[DisaggregationMode] = None,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
     ):
         self.session_id = mgr.get_session_id()
         self.conclude_state = None
         self.init_time = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
+        super().__init__(mgr, bootstrap_addr, disaggregation_mode, bootstrap_room, prefill_dp_rank)
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -1216,25 +1437,57 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return None
 
     def _register_kv_args(self):
+        tp_rank = self.kv_mgr.kv_args.engine_rank
+        dst_tp_rank = str(tp_rank).encode("ascii")
+        dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         for bootstrap_info in self.bootstrap_infos:
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-            packed_state_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
-            )
-            # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
-            tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-            dst_tp_rank = str(tp_rank).encode("ascii")
-            dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
-            dst_kv_item_len = str(kv_item_len).encode("ascii")
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+                )
+                packed_aux_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+                )
+                packed_state_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
+                )
+                # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
+                # tp_rank = self.kv_mgr.kv_args.engine_rank
+                kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+                # dst_tp_rank = str(tp_rank).encode("ascii")
+                # dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
+                dst_kv_item_len = str(kv_item_len).encode("ascii")
 
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_kv_item_len,
+                        ]
+                    )
+            elif (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                or self.disaggregation_mode == DisaggregationMode.TEXT
+            ):
+                packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+                )
+                # packed_aux_data_ptrs = b"".join(
+                #     struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+                # )
+                kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+                # print(f"{self.kv_mgr.kv_args.kv_data_ptrs=}, {kv_item_len=}")
+                dst_kv_item_len = str(kv_item_len).encode("ascii")
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 sock.send_multipart(
                     [
                         "None".encode("ascii"),
@@ -1242,8 +1495,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
+                        b"",
+                        b"",
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,

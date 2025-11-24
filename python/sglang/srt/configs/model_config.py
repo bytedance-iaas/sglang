@@ -123,6 +123,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+        self.vision_config = getattr(self.hf_config, "vision_config", None)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,

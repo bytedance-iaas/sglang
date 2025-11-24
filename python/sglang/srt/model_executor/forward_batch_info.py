@@ -53,7 +53,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
+    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.multimodal_cache import PagedMultiModalEmbeddingPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -276,6 +278,10 @@ class ForwardBatch:
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    # encoder disaggregation, prefill node
+    mm_embedding_pool: PagedMultiModalEmbeddingPool = None
+    mm_embedding_allocator: TokenToKVPoolAllocator = None
+
     # For DP attention
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
@@ -352,6 +358,7 @@ class ForwardBatch:
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
+            mm_embedding_pool=model_runner.mm_embedding_pool,
             attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,

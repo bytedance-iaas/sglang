@@ -20,14 +20,16 @@ def start_disagg_service(
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
+    if (disagg_mode == DisaggregationMode.PREFILL or disagg_mode == DisaggregationMode.ENCODE):
         # only start bootstrap server on prefill tm
         kv_bootstrap_server_class: Type[BaseKVBootstrapServer] = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
+        bootstrap_port = server_args.disaggregation_bootstrap_port_encode if disagg_mode == DisaggregationMode.ENCODE else server_args.disaggregation_bootstrap_port
+        print(f"disagg_mode = {disagg_mode}, init bootstrap server, host is {server_args.host}, port is {bootstrap_port}")
         bootstrap_server: BaseKVBootstrapServer = kv_bootstrap_server_class(
             host=server_args.host,
-            port=server_args.disaggregation_bootstrap_port,
+            port=bootstrap_port,
         )
         is_create_store = (
             server_args.node_rank == 0 and transfer_backend == TransferBackend.ASCEND

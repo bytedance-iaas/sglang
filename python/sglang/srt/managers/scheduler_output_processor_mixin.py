@@ -31,6 +31,8 @@ if TYPE_CHECKING:
         Scheduler,
     )
 
+from sglang.srt.mem_cache.multimodal_cache import MultimodalCache
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
@@ -109,6 +111,17 @@ class SchedulerOutputProcessorMixin:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
+
+                    if (
+                        self.mm_embedding_pool is not None
+                        and req.multimodal_inputs is not None
+                    ):
+                        mm_hash = MultimodalCache.combine_hashes(
+                            [item.hash for item in req.multimodal_inputs.mm_items]
+                        )
+                        _loc = self.mm_embedding_pool.free(
+                            mm_hash, self.mm_embedding_allocator
+                        )
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
