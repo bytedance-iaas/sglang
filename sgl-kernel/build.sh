@@ -54,11 +54,20 @@ docker run --rm \
    -v $(pwd):/sgl-kernel \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
    -v ${CCACHE_DIR}:/ccache \
+   -e http_proxy="http://sys-proxy-rd-relay.byted.org:8118/" \
+   -e https_proxy="http://sys-proxy-rd-relay.byted.org:8118/" \
+   -e HTTP_PROXY="http://sys-proxy-rd-relay.byted.org:8118/" \
+   -e HTTPS_PROXY="http://sys-proxy-rd-relay.byted.org:8118/" \
    -e ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE:-}" \
    -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
    ${DOCKER_IMAGE} \
    bash -c "
    set -e
+   # Configure HTTP/HTTPS proxy inside build container
+   export http_proxy=\"http://sys-proxy-rd-relay.byted.org:8118/\"
+   export https_proxy=\"http://sys-proxy-rd-relay.byted.org:8118/\"
+   export HTTP_PROXY=\"${HTTP_PROXY:-$http_proxy}\"
+   export HTTPS_PROXY=\"${HTTPS_PROXY:-$https_proxy}\"
    # Install CMake (version >= 3.26) - Robust Installation with caching
    echo \"==================================\"
    echo \"Installing CMake\"
