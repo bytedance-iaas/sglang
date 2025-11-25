@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # 在安装pip后，设置pip源为国内源
-RUN python3 -m pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple/
+RUN python3 -m pip config set global.index-url https://pypi.org/simple
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
