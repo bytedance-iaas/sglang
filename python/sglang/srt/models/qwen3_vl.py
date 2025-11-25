@@ -33,10 +33,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -615,9 +612,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.is_encoder = get_global_server_args().disaggregation_mode == "encode"
+        self.mm_only = get_global_server_args().disaggregation_mode == "encode"
         self.should_load_vision_model = (
-            self.is_encoder or not get_global_server_args().encoder_disaggregated
+            self.mm_only or not get_global_server_args().encoder_disaggregated
         )
         self.language_only = (
             get_global_server_args().disaggregation_mode == "text"
@@ -640,16 +637,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             self.config = config.text_config  # for qwen3-omni
 
-        if self.is_encoder:
+        if self.mm_only:
             self.model = nn.Module()
-            model_prefix = add_prefix("model", prefix)
-            self.model.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("embed_tokens", model_prefix),
-            )
-            setattr(self.model, "get_input_embeddings", lambda: self.model.embed_tokens)
         else:
             self.model = language_model_cls(
                 config=self.config,
@@ -764,7 +753,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             positions=positions,
             use_deepstack=self.use_deepstack,
         )
-
         if not get_embedding:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
@@ -793,7 +781,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     continue
                 if "visual" in name:
                     continue
-                if self.is_encoder:
+                if self.mm_only:
                     continue
 
                 name = name.replace(weight_name, param_name)
@@ -806,14 +794,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading mm/language parameters
-                if (self.is_encoder or self.language_only) and name not in params_dict:
-                    continue
-
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                     name = name.replace(r"model.visual.", r"visual.")
+
+                # Skip loading mm/language parameters
+                if (self.mm_only or self.language_only) and name not in params_dict:
+                    continue
 
                 try:
                     # Skip loading extra bias for GPTQ models.

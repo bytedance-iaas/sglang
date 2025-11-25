@@ -232,7 +232,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 if "visual" in name:
                     continue
-                if self.is_encoder:
+                if self.mm_only:
                     continue
 
                 # We have mlp.experts[0].gate_proj in the checkpoint.
@@ -268,7 +268,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         continue
                     if "visual" in name:
                         continue
-                    if self.is_encoder:
+                    if self.mm_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -326,16 +326,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
-                    # Skip loading mm/language parameters
-                    if (
-                        self.is_encoder or self.language_only
-                    ) and name not in params_dict:
-                        continue
-
                     if "visual" in name:
                         # adapt to VisionAttention
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                         name = name.replace(r"model.visual.", r"visual.")
+
+                    # Skip loading mm/language parameters
+                    if (self.mm_only or self.language_only) and name not in params_dict:
+                        continue
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
