@@ -33,7 +33,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -46,6 +49,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -611,14 +615,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
+        self.is_encoder = get_global_server_args().disaggregation_mode == "encode"
+        self.should_load_vision_model = (
+            self.is_encoder or not get_global_server_args().encoder_disaggregated
         )
+        self.language_only = (
+            get_global_server_args().disaggregation_mode == "text"
+            or get_global_server_args().encoder_disaggregated
+        )
+
+        if self.should_load_vision_model:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("visual", prefix),
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -626,11 +640,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             self.config = config.text_config  # for qwen3-omni
 
-        self.model = language_model_cls(
-            config=self.config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
+        if self.is_encoder:
+            self.model = nn.Module()
+            model_prefix = add_prefix("model", prefix)
+            self.model.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", model_prefix),
+            )
+            setattr(self.model, "get_input_embeddings", lambda: self.model.embed_tokens)
+        else:
+            self.model = language_model_cls(
+                config=self.config,
+                quant_config=quant_config,
+                prefix=add_prefix("model", prefix),
+            )
 
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
@@ -649,7 +674,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
@@ -768,6 +793,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     continue
                 if "visual" in name:
                     continue
+                if self.is_encoder:
+                    continue
+
                 name = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
@@ -778,6 +806,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Skip loading mm/language parameters
+                if (self.is_encoder or self.language_only) and name not in params_dict:
+                    continue
+
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
