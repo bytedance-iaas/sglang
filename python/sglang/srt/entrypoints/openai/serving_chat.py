@@ -778,7 +778,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
-                tool_calls_reasoning, _, _ = self._process_tool_calls(
+                tool_calls_reasoning, reasoning_text, _ = self._process_tool_calls(
                     reasoning_text,
                     request.tools,
                     finish_reason,
