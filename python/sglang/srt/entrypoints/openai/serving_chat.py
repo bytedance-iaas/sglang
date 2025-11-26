@@ -750,7 +750,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         stream_reasoning=False,
                         force_reasoning=is_force_reasoning,
                     )
+                    logging.info(f"reasoning-pre-text: {text}")
                     reasoning_text, text = parser.parse_non_stream(text)
+                    logging.info(f"reasoning-after-text: {text}")
+                    logging.info(f"reasoning-after-reasoning_text: {reasoning_text}")
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -767,6 +770,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 and self.tool_call_parser
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                logging.info(f"tool_calls-pre-text: {text}")
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
                     request.tools,
@@ -774,6 +778,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
+                logging.info(f"tool_calls-after-text: {text}")
+                logging.info(f"tool_calls-after-tool_calls: {tool_calls}")
+                logging.info(f"tool_calls-after-finish_reason: {finish_reason}")
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
