@@ -735,6 +735,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
+            tool_code_text = text
 
             # Handle reasoning content
             reasoning_text = None
@@ -770,9 +771,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 and self.tool_call_parser
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                logging.info(f"tool_calls-pre-text: {text}")
+                logging.info(f"tool_calls-pre-text: {tool_code_text}")
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
+                    tool_code_text,
                     request.tools,
                     finish_reason,
                     request.tool_choice,
