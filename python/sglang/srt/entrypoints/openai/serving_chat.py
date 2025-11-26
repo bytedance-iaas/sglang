@@ -785,7 +785,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
-                tool_calls.extend(tool_calls_reasoning)
+                if tool_calls is None:
+                    tool_calls = tool_calls_reasoning
+                else:
+                    tool_calls.extend(tool_calls_reasoning)
 
                 logging.info(f"tool_calls-after-text: {text}")
                 logging.info(f"tool_calls-after-tool_calls: {tool_calls}")
