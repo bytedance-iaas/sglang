@@ -532,7 +532,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser, stream_reasoning=False
             )
+            logging.info(f"final_output: {final_output}")
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            logging.info(f"reasoning_content: {reasoning_content}")
+            logging.info(f"content: {content}")
         else:
             reasoning_content = None
             content = final_output

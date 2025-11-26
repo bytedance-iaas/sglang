@@ -231,9 +231,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                logging.info(f"request.tools: {request.tools}")
+                logging.info(f"self.tool_call_parser: {self.tool_call_parser}")
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice
                 )
+                logging.info(f"tool_call_constraint: {tool_call_constraint}")
             # Handle JSON schema constraint directly for required or named tool choice
             if request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
