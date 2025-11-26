@@ -253,6 +253,8 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
+        logging.info(f"result.tool_call_constraint: {result.tool_call_constraint}")
+
         return result
 
     def _apply_jinja_template(
@@ -889,6 +891,11 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int = 0,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
+        logging.info(f"_process_tool_calls-text: {text}")
+        logging.info(f"_process_tool_calls-tools: {tools}")
+        logging.info(f"_process_tool_calls-finish_reason: {finish_reason}")
+        logging.info(f"_process_tool_calls-tool_choice: {tool_choice}")
+        logging.info(f"_process_tool_calls-history_tool_calls_cnt: {history_tool_calls_cnt}")
 
         # Handle required or named tool choice
         if tool_choice == "required" or (
