@@ -64,7 +64,11 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.quantization.unquant import triton_matmul
 # from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+
+L20_DEVICE_NAME = 'NVIDIA L20'
+H20_DEVICE_NAME = 'NVIDIA H20'
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +101,7 @@ class Qwen2_5_VLMLP(nn.Module):
         self.gate_proj = None
         self.up_bias = None
         self.gate_bias = None
+        self.device_name = torch.cuda.get_device_name()
         
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -111,20 +116,39 @@ class Qwen2_5_VLMLP(nn.Module):
         kernel_selection = get_bool_env_var("SGLANG_VIT_KERNEL_SELECTION")
         if self.up_proj is None and kernel_selection:
             print("---init params---")
-            self.up_proj = nn.Parameter(self.up_gate_proj_weight[self.shape_hidden:].clone()).to(self.up_gate_proj_weight.device).contiguous()
-            self.gate_proj = nn.Parameter(self.up_gate_proj_weight[:self.shape_hidden].clone()).to(self.up_gate_proj_weight.device).contiguous()
+            self.up_proj = nn.Parameter(self.up_gate_proj_weight[self.shape_hidden:].clone()).to(self.up_gate_proj_weight.device).data.contiguous()
+            self.gate_proj = nn.Parameter(self.up_gate_proj_weight[:self.shape_hidden].clone()).to(self.up_gate_proj_weight.device).data.contiguous()
             if self.up_gate_proj_bias is not None:
-               self.up_bias = nn.Parameter(self.up_gate_proj_bias[self.shape_hidden:].clone()).to(self.up_gate_proj_bias.device).contiguous()
-               self.gate_bias = nn.Parameter(self.up_gate_proj_bias[:self.shape_hidden].clone()).to(self.up_gate_proj_bias.device).contiguous()
+               self.up_bias = nn.Parameter(self.up_gate_proj_bias[self.shape_hidden:].clone()).to(self.up_gate_proj_bias.device).data.contiguous()
+               self.gate_bias = nn.Parameter(self.up_gate_proj_bias[:self.shape_hidden].clone()).to(self.up_gate_proj_bias.device).data.contiguous()
             # del self.gate_up_proj
         
         # gate_up, _ = self.gate_up_proj(x)
         # gate, up = gate_up.chunk(2, dim=-1)
-        
+        is_h20 = self.device_name == H20_DEVICE_NAME
+        is_l20 = self.device_name == L20_DEVICE_NAME
         # print("gate_up shape : {}".format(gate_up.shape))
         if x.shape[0] > 1024 and kernel_selection :
-            gate = F.linear(x, self.gate_proj, self.gate_bias) 
-            up = F.linear(x, self.up_proj, self.up_bias)
+            if is_h20 and (x.shape[0]>=4524 * 0.9 and x.shape[0] <= 4524 * 1.1):
+                gate = triton_matmul(x, self.gate_proj, self.gate_bias, [64, 64, 32, 8, 4, 3, 1]) 
+                up = triton_matmul(x, self.up_proj, self.up_bias, [64, 64, 32, 8, 4, 3, 1])
+            elif is_h20 and (x.shape[0]>=6526 * 0.9 and x.shape[0] <= 6526 * 1.1):
+                launch_config = [64, 128, 32, 16, 4, 3, 2]
+                gate = triton_matmul(x, self.gate_proj, self.gate_bias, launch_config) 
+                up = triton_matmul(x, self.up_proj, self.up_bias, launch_config)
+            
+            elif is_l20 and (x.shape[0]>=4524 * 0.9 and x.shape[0] <= 4524 * 1.1):
+                launch_config =  [64, 128, 32, 4, 4, 3, 1]
+                gate = triton_matmul(x, self.gate_proj, self.gate_bias, launch_config) 
+                up = triton_matmul(x, self.up_proj, self.up_bias, launch_config)
+
+            elif is_l20 and (x.shape[0]>=6526 * 0.9 and x.shape[0] <= 6526 * 1.1):
+                launch_config = [128, 64, 32, 4, 4, 3, 1]
+                gate = triton_matmul(x, self.gate_proj, self.gate_bias, launch_config) 
+                up = triton_matmul(x, self.up_proj, self.up_bias, launch_config)
+            else:
+                gate = F.linear(x, self.gate_proj, self.gate_bias)
+                up = F.linear(x, self.up_proj, self.up_bias)     
         else:
             gate_up, _ = self.gate_up_proj(x)
             gate, up = gate_up.chunk(2, dim=-1)
@@ -508,9 +532,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
         # adapter
         x = self.merger(x)
         x = x[reverse_indices, :]
-        
-        return x
 
+        return x
+    
     def forward_cudagraph(
         self,
         x: torch.Tensor,
