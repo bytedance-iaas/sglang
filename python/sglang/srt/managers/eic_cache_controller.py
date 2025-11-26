@@ -233,11 +233,9 @@ class EICCacheController(HiCacheController):
         """
         Write the KV cache to host memory.
         """
-        if operation.data is None:
-            operation.data = self.mem_pool_device.get_flat_data(
-                operation.device_indices
-            )
-        ret = self.mem_pool_host.transfer(operation.host_indices, operation.data)
+        ret = self.mem_pool_host.assign_flat_data(
+            operation.host_indices, operation.data, operation.device_indices
+        )
         if not ret:
             logger.error(f"Failed to write to host memory {operation.node_id}")
         result = 0 if ret else 1
@@ -272,9 +270,11 @@ class EICCacheController(HiCacheController):
         """
         Load the KV cache from host memory to device memory.
         """
-        operation.data, mask = self.mem_pool_host.get_flat_data(operation.host_indices)
+        mask = self.mem_pool_host.get_flat_data(
+            operation.host_indices, operation.device_indices
+        )
         completed_tokens = 0
-        if operation.data is None or not all(mask):
+        if not all(mask):
             logger.warning(f"Failed to load from eic, node: {operation.node_id}")
             for ret in mask:
                 if ret:
@@ -295,16 +295,14 @@ class EICCacheController(HiCacheController):
             )
             completed_tokens = temp_tensor.item()
         if completed_tokens > 0:
-            logger.debug(
-                f"completed tokens: {completed_tokens}, get data len: {len(operation.data)}"
-            )
-            completed_device_indices = operation.device_indices[:completed_tokens]
+            logger.debug(f"completed tokens: {completed_tokens}")
+            # completed_device_indices = operation.device_indices[:completed_tokens]
 
-            flat_data = self.batch_torch_cat(
-                operation.data[:completed_tokens],
-                split_dim=self.mem_pool_host.split_dim,
-            )
-            self.mem_pool_device.transfer(completed_device_indices, flat_data)
+            # flat_data = self.batch_torch_cat(
+            #     operation.data[:completed_tokens],
+            #     split_dim=self.mem_pool_host.split_dim,
+            # )
+            # self.mem_pool_device.transfer(completed_device_indices, flat_data)
         self.ack_load_queue.put((operation.node_id, completed_tokens))
 
     def write_operation_shared(self, operation: EICCacheOperation):
@@ -317,12 +315,8 @@ class EICCacheController(HiCacheController):
         while self.write_wait_event.is_set():
             time.sleep(0.01)
         logger.debug(f"write device indices: {operation.device_indices}")
-        if operation.data is None:
-            operation.data = self.mem_pool_device.get_flat_data(
-                operation.device_indices
-            )
         ret = self.mem_pool_host.assign_page_data(
-            operation.content_hash, operation.data
+            operation.content_hash, operation.data, operation.device_indices
         )
         if not ret:
             logger.error(f"Failed to write to host memory {operation.node_id}")
@@ -345,9 +339,11 @@ class EICCacheController(HiCacheController):
         assert len(operation.host_indices) == self.page_size * len(
             operation.content_hash
         )
-        operation.data, mask = self.mem_pool_host.get_page_data(operation.content_hash)
+        mask = self.mem_pool_host.get_page_data(
+            operation.content_hash, operation.device_indices
+        )
         completed_tokens = 0
-        if operation.data is None or not all(mask):
+        if not all(mask):
             logger.debug(f"Failed to load from eic, node: {operation.node_id}")
             for ret in mask:
                 if ret:
@@ -368,16 +364,14 @@ class EICCacheController(HiCacheController):
             )
             completed_tokens = temp_tensor.item()
         if completed_tokens > 0:
-            logger.debug(
-                f"completed tokens: {completed_tokens}, get data len: {len(operation.data)}"
-            )
-            completed_device_indices = operation.device_indices[:completed_tokens]
+            logger.debug(f"completed tokens: {completed_tokens}")
+            # completed_device_indices = operation.device_indices[:completed_tokens]
 
-            flat_data = self.batch_torch_cat(
-                operation.data[: completed_tokens // self.page_size],
-                split_dim=self.mem_pool_host.split_dim,
-            )
-            self.mem_pool_device.transfer(completed_device_indices, flat_data)
+            # flat_data = self.batch_torch_cat(
+            #     operation.data[: completed_tokens // self.page_size],
+            #     split_dim=self.mem_pool_host.split_dim,
+            # )
+            # self.mem_pool_device.transfer(completed_device_indices, flat_data)
         self.ack_load_queue.put((operation.node_id, completed_tokens))
 
     def write_to_eic(self, operation: EICCacheOperation):
