@@ -23,8 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, DeepEPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
-        DeepEPLLOutput,
-        DeepEPNormalOutput,
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
         StandardDispatchOutput,
@@ -334,7 +332,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def apply_deepep_normal(
         self,
         layer: DeepEPMoE,
-        dispatch_output: DeepEPNormalOutput,
+        dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.cutlass_w4a8_moe import (
             cutlass_w4a8_moe_deepep_normal,
@@ -375,15 +373,15 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def apply_deepep_ll(
         self,
         layer: DeepEPMoE,
-        dispatch_output: DeepEPLLOutput,
+        dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
 
-        hidden_states, topk_idx, _, masked_m, _ = dispatch_output
+        hidden_states, _, topk_idx, _, masked_m, _ = dispatch_output
 
         output = cutlass_w4a8_moe_deepep_ll(
-            hidden_states[0],
+            hidden_states,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,
