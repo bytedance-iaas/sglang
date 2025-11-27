@@ -1,0 +1,226 @@
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+[2025-11-27 12:59:51] WARNING server_args.py:1141: FlashMLA only supports a page_size of 64, change page_size to 64.
+[2025-11-27 12:59:51] WARNING server_args.py:1305: DP attention is enabled. The chunked prefill size is adjusted to 1024 to avoid MoE kernel issues. 
+[2025-11-27 12:59:51] WARNING server_args.py:1349: DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[8].
+[2025-11-27 12:59:51] WARNING server_args.py:1467: Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding.
+[2025-11-27 12:59:51] WARNING server_args.py:1603: KV cache is forced as chunk cache for decode server
+[2025-11-27 12:59:51] INFO trace.py:48: opentelemetry package is not installed, tracing disabled
+[2025-11-27 12:59:52] server_args=ServerArgs(model_path='/data00/DeepSeek-R1-W4AFP8', tokenizer_path='/data00/DeepSeek-R1-W4AFP8', tokenizer_mode='auto', tokenizer_worker_num=1, skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=None, is_embedding=False, enable_multimodal=None, revision=None, model_impl='auto', host='0.0.0.0', port=30300, grpc_mode=False, skip_server_warmup=False, warmups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, dtype='auto', quantization=None, quantization_param_path=None, kv_cache_dtype='fp8_e4m3', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpoint_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, mem_fraction_static=0.8, max_running_requests=256, max_queued_requests=None, max_total_tokens=None, chunked_prefill_size=1024, max_prefill_tokens=16384, schedule_policy='fcfs', enable_priority_scheduling=False, abort_on_priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, schedule_conservativeness=0.3, page_size=64, hybrid_kvcache_ratio=None, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_policy='lru', device='cuda', tp_size=8, pp_size=1, pp_max_micro_batch_size=None, pp_async_batch_depth=0, stream_interval=1, stream_output=False, random_seed=133937349, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=1000000.0, dist_timeout=None, download_dir=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, log_level='info', log_level_http=None, log_requests=False, log_requests_level=2, crash_dump_folder=None, show_time_cost=True, enable_metrics=False, enable_metrics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_custom_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, collect_tokens_histogram=False, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_trace=False, oltp_traces_endpoint='localhost:4317', api_key=None, served_model_name='/data00/DeepSeek-R1-W4AFP8', weight_version='default', chat_template=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, tool_server=None, sampling_defaults='model', dp_size=8, load_balance_method='round_robin', load_watch_interval=0.1, prefill_round_robin_balance=True, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, enable_lora=None, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend='triton', max_lora_chunk_size=16, attention_backend='flashmla', decode_attention_backend=None, prefill_attention_backend=None, sampling_backend='flashinfer', grammar_backend='xgrammar', mm_attention_backend=None, nsa_prefill_backend='flashmla_sparse', nsa_decode_backend='fa3', speculative_algorithm='EAGLE', speculative_draft_model_path='/data00/DeepSeek-R1-W4AFP8', speculative_draft_model_revision=None, speculative_draft_load_format=None, speculative_num_steps=1, speculative_eagle_topk=1, speculative_num_draft_tokens=2, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_token_map=None, speculative_attention_mode='prefill', speculative_ngram_min_match_window_size=1, speculative_ngram_max_match_window_size=12, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_type='BFS', speculative_ngram_branch_length=18, speculative_ngram_capacity=10000000, speculative_moe_runner_backend='auto', ep_size=8, moe_a2a_backend='deepep', moe_runner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, deepep_mode='low_latency', ep_num_redundant_experts=0, ep_dispatch_algorithm='static', init_expert_location='trivial', enable_eplb=False, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalancing_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, enable_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=1, elastic_ep_backend=None, mooncake_ib_device=None, max_mamba_cache_size=None, mamba_ssm_dtype='float32', mamba_full_memory_ratio=0.9, enable_hierarchical_cache=False, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through_selective', hicache_io_backend='', hicache_mem_layout='layer_first', hicache_storage_backend=None, hicache_storage_prefetch_policy='best_effort', hicache_storage_backend_extra_config=None, enable_lmcache=False, kt_amx_weight_path=None, kt_amx_method='AMXINT4', kt_cpuinfer=None, kt_threadpool_count=2, kt_num_gpu_experts=None, enable_double_sparsity=False, ds_channel_config_path=None, ds_heavy_channel_num=32, ds_heavy_token_num=256, ds_heavy_channel_type='qk', ds_sparse_decode_threshold=4096, cpu_offload_gb=0, offload_group_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', multi_item_scoring_delimiter=None, disable_radix_cache=True, cuda_graph_max_bs=32, cuda_graph_bs=[1, 2, 4, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32], disable_cuda_graph=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, enable_nccl_nvls=False, enable_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_tokenizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, enable_torch_symm_mem=False, disable_overlap_schedule=True, enable_mixed_chunk=False, enable_dp_attention=True, enable_dp_lm_head=True, enable_two_batch_overlap=False, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, enable_piecewise_cuda_graph=False, torch_compile_max_bs=32, piecewise_cuda_graph_max_tokens=4096, piecewise_cuda_graph_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048, 2176, 2304, 2432, 2560, 2688, 2816, 2944, 3072, 3200, 3328, 3456, 3584, 3712, 3840, 3968, 4096], piecewise_cuda_graph_compiler='eager', torchao_config='', enable_nan_detection=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, delete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, allow_auto_truncate=False, enable_custom_logit_processor=False, enable_eic_cache=False, disable_eic_shared=False, flashinfer_mla_disable_ragged=False, disable_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_image_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, scheduler_recv_interval=1, numa_node=None, enable_deterministic_inference=False, rl_on_policy_target=None, enable_dynamic_batch_tokenizer=False, dynamic_batch_tokenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='decode', disaggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=8998, disaggregation_decode_tp=None, disaggregation_decode_dp=None, disaggregation_prefill_pp=1, disaggregation_ib_device='mlx5_1,mlx5_2,mlx5_3,mlx5_4', disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_tokens=512, disaggregation_decode_polling_interval=1, custom_weight_loader=[], weight_loader_disable_mmap=False, remote_instance_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_weight_loader_send_weights_group_ports=None, enable_pdmux=False, pdmux_config_path=None, sm_group_num=8)
+[2025-11-27 12:59:52] Using default HuggingFace chat template with detected content format: string
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+[2025-11-27 12:59:58] INFO trace.py:48: opentelemetry package is not installed, tracing disabled
+[2025-11-27 12:59:58] INFO trace.py:48: opentelemetry package is not installed, tracing disabled
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK is deprecated, please use SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK
+  warnings.warn(
+/sgl-workspace/sglang-bytedance/python/sglang/srt/environ.py:272: UserWarning: Environment variable SGL_ENABLE_JIT_DEEPGEMM is deprecated, please use SGLANG_ENABLE_JIT_DEEPGEMM
+  warnings.warn(
+[2025-11-27 13:00:04] INFO trace.py:48: opentelemetry package is not installed, tracing disabled
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 122, in spawn_main
+  File "<string>", line 1, in <module>
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 122, in spawn_main
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 122, in spawn_main
+Process Process-2:
+    exitcode = _main(fd, parent_sentinel)
+    exitcode = _main(fd, parent_sentinel)
+    exitcode = _main(fd, parent_sentinel)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 132, in _main
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 132, in _main
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/spawn.py", line 132, in _main
+    self = reduction.pickle.load(from_parent)
+    self = reduction.pickle.load(from_parent)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/scheduler.py", line 66, in <module>
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    self = reduction.pickle.load(from_parent)
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/scheduler.py", line 66, in <module>
+    from sglang.srt.managers.io_struct import (
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/io_struct.py", line 1104, in <module>
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/scheduler.py", line 66, in <module>
+    from sglang.srt.managers.io_struct import (
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/io_struct.py", line 1438, in <module>
+    from sglang.srt.managers.io_struct import (
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/io_struct.py", line 1178, in <module>
+    @dataclass
+     ^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1275, in dataclass
+    @dataclass
+     ^^^^^^^^^
+    @dataclass
+  File "/usr/lib/python3.12/dataclasses.py", line 1275, in dataclass
+     ^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1275, in dataclass
+    return wrap(cls)
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1265, in wrap
+    return _process_class(cls, init, repr, eq, order, unsafe_hash,
+    return wrap(cls)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1092, in _process_class
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1265, in wrap
+    return wrap(cls)
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1265, in wrap
+Traceback (most recent call last):
+    _cmp_fn('__eq__', '==',
+  File "/usr/lib/python3.12/dataclasses.py", line 667, in _cmp_fn
+    return _process_class(cls, init, repr, eq, order, unsafe_hash,
+    return _create_fn(name,
+           ^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 473, in _create_fn
+  File "/usr/lib/python3.12/dataclasses.py", line 1083, in _process_class
+    return _process_class(cls, init, repr, eq, order, unsafe_hash,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 1063, in _process_class
+    exec(txt, globals, ns)
+  File "<string>", line 0, in <module>
+KeyboardInterrupt
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/detokenizer_manager.py", line 325, in run_detokenizer_process
+    manager.event_loop()
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/detokenizer_manager.py", line 116, in event_loop
+    recv_obj = self.recv_from_scheduler.recv_pyobj()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/zmq/sugar/socket.py", line 989, in recv_pyobj
+    msg = self.recv(flags)
+          ^^^^^^^^^^^^^^^^
+  File "zmq/backend/cython/_zmq.py", line 1218, in zmq.backend.cython._zmq.Socket.recv
+    def recv(self, flags=0, copy: bint = True, track: bint = False):
+    ^^^^^^^^^^^
+  File "zmq/backend/cython/_zmq.py", line 1253, in zmq.backend.cython._zmq.Socket.recv
+    return _recv_copy(self.handle, flags)
+    ^^^^^^^^^^^
+  File "zmq/backend/cython/_zmq.py", line 1408, in zmq.backend.cython._zmq._recv_copy
+    _check_rc(rc)
+    ^^^^^^^^^^^
+  File "zmq/backend/cython/_zmq.py", line 179, in zmq.backend.cython._zmq._check_rc
+    PyErr_CheckSignals()
+    ^^^^^^^^^^^
+KeyboardInterrupt
+    _set_new_attribute(cls, '__repr__', _repr_fn(flds, globals))
+                                        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 628, in _repr_fn
+    _init_fn(all_init_fields,
+  File "/usr/lib/python3.12/dataclasses.py", line 596, in _init_fn
+    fn = _create_fn('__repr__',
+         ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 473, in _create_fn
+    line = _field_init(f, frozen, locals, self_name, slots)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/dataclasses.py", line 489, in _field_init
+    exec(txt, globals, ns)
+  File "<string>", line 0, in <module>
+KeyboardInterrupt
+    def _field_init(f, frozen, globals, self_name, slots):
+    
+KeyboardInterrupt
+Process Process-1:3:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/scheduler.py", line 2887, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/scheduler.py", line 301, in __init__
+    self.init_tokenizer()
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/managers/scheduler.py", line 720, in init_tokenizer
+    self.tokenizer = get_tokenizer(
+                     ^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/utils/hf_transformers_utils.py", line 379, in get_tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/models/auto/tokenization_auto.py", line 1140, in from_pretrained
+    return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/tokenization_utils_base.py", line 2097, in from_pretrained
+    return cls._from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/tokenization_utils_base.py", line 2324, in _from_pretrained
+    tokenizer_file_handle = json.load(tokenizer_file_handle)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 338, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 354, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/sgl-workspace/sglang-bytedance/python/sglang/launch_server.py", line 23, in <module>
+    launch_server(server_args)
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/entrypoints/http_server.py", line 1359, in launch_server
+    _launch_subprocesses(server_args=server_args)
+  File "/sgl-workspace/sglang-bytedance/python/sglang/srt/entrypoints/engine.py", line 883, in _launch_subprocesses
+    data = scheduler_pipe_readers[i].recv()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 395, in _recv
+    chunk = read(handle, remaining)
+            ^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

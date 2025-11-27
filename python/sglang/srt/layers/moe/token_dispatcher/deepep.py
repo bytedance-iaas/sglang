@@ -18,7 +18,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -90,23 +89,8 @@ class DeepEPLLDispatchOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-class AscendDeepEPLLOutput(NamedTuple):
-    """AscendDeepEP low latency dispatch output."""
-
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
-    topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    seg_indptr: torch.Tensor
-    expected_m: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.ASCENT_LL
-
-
-assert isinstance(DeepEPNormalOutput, DispatchOutput)
-assert isinstance(DeepEPLLOutput, DispatchOutput)
+assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
@@ -374,11 +358,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
         static_scale: torch.Tensor = None,
     ):
-        topk_idx = topk_idx.to(torch.int64)
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass_w4afp8()
@@ -563,7 +547,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             topk_ids,
             static_scale=static_scale,
-            # use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
         )
         return (
             hidden_states,
@@ -609,10 +592,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         use_fp8: bool = False,
         static_scale: torch.Tensor = None,
     ):
+        use_nvfp4 = use_fp8 = False
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            use_nvfp4 = True
+        elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
+            use_fp8 = True
+
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
@@ -623,6 +613,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_fp8=use_fp8,
                 use_per_tensor_quantization=get_moe_runner_backend().is_cutlass_w4afp8(),
                 static_scale=static_scale,
+                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
+                **(
+                    dict(x_global_scale=input_global_scale)
+                    if input_global_scale is not None
+                    else dict()
+                ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -766,16 +762,14 @@ class DeepEPDispatcher(BaseDispatcher):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
+        topk_output: TopKOutput,
         static_scale: torch.Tensor = None,
     ):
+        assert static_scale is not None
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_output=topk_output,
             static_scale=static_scale,
         )
         self._dispatch_intermediate_state = inner_state
