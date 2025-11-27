@@ -61,7 +61,7 @@ RUN http_proxy='' pip install boto3 --extra-index-url https://bytedpypi.byted.or
 RUN http_proxy='' pip install absl-py==${absl_version} --extra-index-url https://bytedpypi.byted.org/simple
 
 # group_gemm 安装
-RUN pip install --verbose git+https://github.com/bytedance-iaas/grouped_gemm@dev
+RUN pip install --verbose git+https://github.com/bytedance-iaas/grouped_gemm@dev --no-build-isolation
 
 # examples 覆盖
 RUN cd /tmp && git clone https://github.com/bytedance-iaas/sglang.git -b ${branch} && \
