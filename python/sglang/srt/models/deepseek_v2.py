@@ -991,7 +991,10 @@ class DeepseekV2MoE(nn.Module):
         if self.ep_size > 1:
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
-                topk_output=state.pop("topk_output"),
+                topk_idx=state.pop("topk_idx_local"),
+                topk_weights=state.pop("topk_weights_local"),
+                forward_batch=state.forward_batch,
+                static_scale=self.experts.w13_input_scale.float(),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 

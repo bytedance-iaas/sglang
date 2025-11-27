@@ -35,6 +35,7 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    get_bool_env_var,
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
@@ -130,7 +131,6 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv"]
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
-
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 NSA_CHOICES = ["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "aiter"]
@@ -139,16 +139,15 @@ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "deep_gemm",
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
-    "cutlass",
+    "cutlass_fp8",
+    "cutlass_w4afp8",
 ]
-
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -181,6 +180,10 @@ def add_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+
+
+def add_moe_runner_backend_choices(choices):
+    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -363,6 +366,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_moe_runner_backend: str = "auto"
 
     # Expert parallelism
     ep_size: int = 1
@@ -1325,6 +1329,16 @@ class ServerArgs:
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
+        if get_bool_env_var("SGLANG_CUTLASS_MOE"):
+            logger.warning(
+                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 and/or --speculative-moe-runner-backend=cutlass_fp8 instead"
+            )
+            self.moe_runner_backend = "cutlass_fp8"
+            self.speculative_moe_runner_backend = "cutlass_fp8"
+        if self.moe_runner_backend == "cutlass_fp8":
+            assert (
+                self.ep_size == 1
+            ), "cutlass_fp8 MoE is only supported with ep_size == 1"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
@@ -2666,6 +2680,13 @@ class ServerArgs:
             choices=["prefill", "decode"],
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
+        )
+        parser.add_argument(
+            "--speculative-moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_runner_backend,
+            help="Choose the runner backend for MoE in speculative decoding.",
         )
         # Ngram speculative decoding
         parser.add_argument(

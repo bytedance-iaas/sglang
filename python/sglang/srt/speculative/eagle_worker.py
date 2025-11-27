@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -117,7 +118,7 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context():
+        with empty_context(), speculative_moe_backend_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -195,6 +196,181 @@ class EAGLEWorker(TpModelWorker):
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
+    def _create_backend(
+        self, backend_name: str, backend_map: dict, error_template: str
+    ):
+        backend_type = getattr(self.server_args, backend_name)
+        if backend_type is None:
+            backend_type = self.server_args.attention_backend
+
+        if backend_type not in backend_map:
+            raise ValueError(error_template.format(backend_type=backend_type))
+
+        return backend_map[backend_type]()
+
+    def _create_decode_backend(self):
+        backend_map = {
+            "flashinfer": self._create_flashinfer_decode_backend,
+            "triton": self._create_triton_decode_backend,
+            "aiter": self._create_aiter_decode_backend,
+            "fa3": self._create_fa3_decode_backend,
+            "flashmla": self._create_flashmla_decode_backend,
+            "trtllm_mha": self._create_trtllm_mha_decode_backend,
+            "trtllm_mla": self._create_trtllm_mla_decode_backend,
+        }
+
+        return self._create_backend(
+            "decode_attention_backend",
+            backend_map,
+            "EAGLE is not supported in decode attention backend {backend_type}",
+        )
+
+    def _create_draft_extend_backend(self):
+        backend_map = {
+            "flashinfer": self._create_flashinfer_prefill_backend,
+            "triton": self._create_triton_prefill_backend,
+            "aiter": self._create_aiter_prefill_backend,
+            "fa3": self._create_fa3_prefill_backend,
+            "trtllm_mha": self._create_trtllm_mha_prefill_backend,
+            "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+            "flashmla": self._create_flashmla_decode_backend,
+        }
+        backend_name = (
+            "decode_attention_backend"
+            if self.server_args.speculative_attention_mode == "decode"
+            else "prefill_attention_backend"
+        )
+        return self._create_backend(
+            backend_name,
+            backend_map,
+            "EAGLE is not supported in attention backend {backend_type}",
+        )
+
+    def _create_flashinfer_decode_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferMultiStepDraftBackend,
+            )
+
+            self.has_prefill_wrapper_verify = True
+            return FlashInferMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+        else:
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAMultiStepDraftBackend,
+            )
+
+            self.has_prefill_wrapper_verify = True
+            return FlashInferMLAMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
+    def _create_triton_decode_backend(self):
+        from sglang.srt.layers.attention.triton_backend import (
+            TritonMultiStepDraftBackend,
+        )
+
+        return TritonMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_aiter_decode_backend(self):
+        from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
+
+        return AiterMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_fa3_decode_backend(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMultiStepBackend,
+        )
+
+        return FlashAttentionMultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_flashmla_decode_backend(self):
+        from sglang.srt.layers.attention.flashmla_backend import (
+            FlashMLAMultiStepDraftBackend,
+        )
+
+        return FlashMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_trtllm_mha_decode_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnMultiStepDraftBackend,
+        )
+
+        self.has_prefill_wrapper_verify = True
+        return TRTLLMHAAttnMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_trtllm_mla_decode_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            raise ValueError(
+                "trtllm_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            TRTLLMMLAMultiStepDraftBackend,
+        )
+
+        self.has_prefill_wrapper_verify = True
+        return TRTLLMMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_flashinfer_prefill_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferAttnBackend,
+            )
+
+            return FlashInferAttnBackend(self.draft_model_runner, skip_prefill=False)
+        else:
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAAttnBackend,
+            )
+
+            return FlashInferMLAAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_triton_prefill_backend(self):
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_aiter_prefill_backend(self):
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        return AiterAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_fa3_prefill_backend(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_trtllm_mha_prefill_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_trtllm_mla_prefill_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            raise ValueError(
+                "trtllm_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+        return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
@@ -223,9 +399,10 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
+            with speculative_moe_backend_context():
+                self.cuda_graph_runner_for_draft_extend = (
+                    EAGLEDraftExtendCudaGraphRunner(self)
+                )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
@@ -595,11 +772,11 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            )
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
+            with speculative_moe_backend_context():
+                logits_output, _ = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                )
+            self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
@@ -821,9 +998,11 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        with speculative_moe_backend_context():
+            logits_output, _ = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            )
+        self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
@@ -913,9 +1092,10 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
-            logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            with speculative_moe_backend_context():
+                logits_output, _ = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                )
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         if self.enable_nan_detection:
