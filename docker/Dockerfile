@@ -150,7 +150,7 @@ RUN cd /sgl-workspace/DeepEP && \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
         ;; \
     esac && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
@@ -158,7 +158,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
       git submodule update --init --recursive && \
-      pip install -v . ; \
+      pip install --no-build-isolation -v . ; \
     fi
 
 # Install fast-hadamard-transform
