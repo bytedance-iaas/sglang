@@ -485,7 +485,6 @@ def cutlass_w4a8_moe_deepep_ll(
     topk = topk_ids_.size(1)
 
     device = a.device
-    # expected_m_per_group = 8
     expected_m_per_group = int(m / num_experts)
 
     problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(

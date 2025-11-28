@@ -80,6 +80,21 @@ void dispatch_w4a8_moe_mm_sm90(
           d_strides,
           s_strides,
           chunk_size);
+    } else if (m <= 8) {
+      using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME(64, 16, 512, 1, 1, 1)::Cutlass3xW4A8Gemm;
+      cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
     } else if (m <= 16) {
       using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME_CO(128, 16, 512, 2, 1, 1)::Cutlass3xW4A8Gemm;
       cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
@@ -173,7 +188,22 @@ void dispatch_w4a8_moe_mm_sm90(
     }
   } else if (n == 7168 && k == 2048) {
     // group gemm 2
-    if (m <= 8) {
+    if (m <= 4) {
+      using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME(64, 32, 512, 2, 1, 1)::Cutlass3xW4A8Gemm;
+      cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 8) {
       using Cutlass3xW4A8GemmSelected = typename JOIN_STRUCT_NAME(64, 16, 512, 1, 1, 1)::Cutlass3xW4A8Gemm;
       cutlass_w4a8_group_gemm_caller<Cutlass3xW4A8GemmSelected>(
           d_tensors,
