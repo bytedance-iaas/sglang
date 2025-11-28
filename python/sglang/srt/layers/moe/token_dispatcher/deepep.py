@@ -603,18 +603,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
             use_fp8 = True
 
-        if static_scale is not None:
-            if use_fp8:
-                static_scale = static_scale.to(torch.float32)
-                if static_scale.numel() != 1:
-                    static_scale = static_scale.max().to(torch.float32)
-            else:
-                expected = hidden_states.shape[1] // 128
-                if static_scale.numel() != expected:
-                    static_scale = None
-                else:
-                    static_scale = static_scale.to(torch.float32).contiguous()
-
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(

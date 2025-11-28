@@ -522,6 +522,8 @@ def cutlass_w4a8_moe_deepep_ll(
         c1, intermediate_q, masked_m, a2_scale
     )
 
+    print(f"[INFO]: c1 type: {c1.dtype}")
+
     del c1 , gateup_input
     cutlass_w4a8_moe_mm(
         c2,
@@ -538,5 +540,7 @@ def cutlass_w4a8_moe_deepep_ll(
         128,
         topk,
     )
+    
+    print(f"[INFO]: c2 type: {c2.dtype}")
 
     return c2
