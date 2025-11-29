@@ -444,7 +444,8 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk);
+    int64_t topk,
+    int64_t expected_m_per_group);
 
 torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& a,
