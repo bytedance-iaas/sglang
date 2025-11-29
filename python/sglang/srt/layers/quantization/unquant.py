@@ -433,7 +433,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     
             if len(launch_config) != 0:
             
-                return triton_matmul(x, layer.weight.data, bias.data, launch_config)
+                return triton_matmul(x, layer.weight, bias, launch_config)
         
         ret =  F.linear(x, layer.weight, bias)
         # print("ret shape {}".format(ret.shape))
