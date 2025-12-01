@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import random
+import threading
+import warnings
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
+import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import  is_npu
+
+def get_ip() -> Optional[str]:
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+    return None
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -85,7 +95,7 @@ class MetadataBuffers:
         self,
         size: int,
         hidden_size: int,
-        hidden_states_dtype: torch.dtype,
+        dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
@@ -107,9 +117,7 @@ class MetadataBuffers:
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
-            self.cached_tokens = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
-            )
+
             self.output_token_logprobs_val = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
             )
@@ -122,49 +130,33 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
-            # For PD + spec decode
-            self.output_topk_p = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
-            )
-            self.output_topk_index = torch.zeros(
-                (size, 16), dtype=torch.int64, device=device
-            )
             self.output_hidden_states = torch.zeros(
-                (size, hidden_size), dtype=hidden_states_dtype, device=device
+                (size, hidden_size), dtype=dtype, device=device
             )
 
     def get_buf_infos(self):
         ptrs = [
             self.output_ids.data_ptr(),
-            self.cached_tokens.data_ptr(),
             self.output_token_logprobs_val.data_ptr(),
             self.output_token_logprobs_idx.data_ptr(),
             self.output_top_logprobs_val.data_ptr(),
             self.output_top_logprobs_idx.data_ptr(),
-            self.output_topk_p.data_ptr(),
-            self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
-            self.cached_tokens.nbytes,
             self.output_token_logprobs_val.nbytes,
             self.output_token_logprobs_idx.nbytes,
             self.output_top_logprobs_val.nbytes,
             self.output_top_logprobs_idx.nbytes,
-            self.output_topk_p.nbytes,
-            self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
-            self.cached_tokens[0].nbytes,
             self.output_token_logprobs_val[0].nbytes,
             self.output_token_logprobs_idx[0].nbytes,
             self.output_top_logprobs_val[0].nbytes,
             self.output_top_logprobs_idx[0].nbytes,
-            self.output_topk_p[0].nbytes,
-            self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
@@ -172,20 +164,16 @@ class MetadataBuffers:
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx],
-            self.cached_tokens[idx],
             self.output_token_logprobs_val[idx],
             self.output_token_logprobs_idx[idx],
             self.output_top_logprobs_val[idx],
             self.output_top_logprobs_idx[idx],
-            self.output_topk_p[idx],
-            self.output_topk_index[idx],
             self.output_hidden_states[idx],
         )
 
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
-        self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -208,17 +196,8 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
-        # For PD + spec decode
+        # for PD + spec decode
         if req.hidden_states_tensor is not None:
-            # speculative_eagle_topk should not be greater than 16 currently
-            topk = req.output_topk_p.size(0)
-
-            self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_p
-            )
-            self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_index
-            )
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
@@ -332,6 +311,48 @@ def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     # ceil(num_kv_indices / page_size)
     return (num_kv_indices + page_size - 1) // page_size
+
+#########################
+# PDLB Registry
+#########################
+
+
+@dataclasses.dataclass
+class PDRegistryRequest:
+    """A request to register a machine itself to the LB."""
+
+    mode: str
+    registry_url: str
+    bootstrap_port: Optional[int] = None
+
+    def __post_init__(self):
+        if self.mode == "prefill" and self.bootstrap_port is None:
+            raise ValueError("Bootstrap port must be set in PREFILL mode.")
+        elif self.mode == "decode" and self.bootstrap_port is not None:
+            raise ValueError("Bootstrap port must not be set in DECODE mode.")
+        elif self.mode not in ["prefill", "decode"]:
+            raise ValueError(
+                f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
+            )
+
+
+def register_disaggregation_server(
+    mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
+):
+    boostrap_port = bootstrap_port if mode == "prefill" else None
+    registry_request = PDRegistryRequest(
+        mode=mode,
+        registry_url=f"http://{get_ip()}:{server_port}",
+        bootstrap_port=boostrap_port,
+    )
+    res = requests.post(
+        f"{pdlb_url}/register",
+        json=dataclasses.asdict(registry_request),
+    )
+    if res.status_code != 200:
+        warnings.warn(
+            f"Failed to register disaggregation server: {res.status_code} {res.text}"
+        )
 
 
 #########################
