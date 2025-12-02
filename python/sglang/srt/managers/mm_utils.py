@@ -11,7 +11,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from python.sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -26,7 +25,12 @@ from sglang.srt.mem_cache.multimodal_cache import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once, print_info_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    is_npu,
+    print_info_once,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -797,7 +801,7 @@ def general_mm_embed_routine(
         forward_batch.mm_inputs = None
     else:
         inputs_embeds = embed_tokens(input_ids)
-    
+
     if disaggregation_mode == "encode":
         # print(f"return type {type(inputs_embeds)}")
         return inputs_embeds
