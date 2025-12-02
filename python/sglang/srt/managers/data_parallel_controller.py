@@ -550,7 +550,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     try:
-        controller = data_parallel_controller_class(
+        controller = DataParallelController(
             server_args, port_args, dp_balance_meta=balance_meta
         )
         pipe_writer.send(
