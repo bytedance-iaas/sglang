@@ -695,6 +695,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -752,6 +754,9 @@ class EmbeddingReqInput(BaseReq):
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+
+    # For dp balance
+    dp_balance_id: int = -1
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
