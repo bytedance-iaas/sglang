@@ -583,71 +583,73 @@ def model_as_dict(model):
 
 
 def accumulate_stream_items(item, complete_response):
-    if complete_response is None:
-        complete_response = {"choices": [], "model": "", "usage": None, "error": None}
-    item = model_as_dict(item)
-    if not isinstance(item, dict):
-        return
-    complete_response["model"] = item.get("model")
+    if is_otel_available():
 
-    if item.get("error"):
-        complete_response["error"] = item.get("error")
+        if complete_response is None:
+            complete_response = {"choices": [], "model": "", "usage": None, "error": None}
+        item = model_as_dict(item)
+        if not isinstance(item, dict):
+            return
+        complete_response["model"] = item.get("model")
 
-    if item.get("usage"):
-        complete_response["usage"] = item.get("usage")
+        if item.get("error"):
+            complete_response["error"] = item.get("error")
 
-    # prompt filter results
-    if item.get("prompt_filter_results"):
-        complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
+        if item.get("usage"):
+            complete_response["usage"] = item.get("usage")
 
-    if item.get("choices"):
-        for choice in item.get("choices"):
-            index = choice.get("index")
-            if len(complete_response.get("choices")) <= index:
-                complete_response["choices"].append(
-                    {"index": index, "message": {"content": "", "role": ""}}
-                )
-            complete_choice = complete_response.get("choices")[index]
-            if choice.get("finish_reason"):
-                complete_choice["finish_reason"] = choice.get("finish_reason")
-            if choice.get("content_filter_results"):
-                complete_choice["content_filter_results"] = choice.get(
-                    "content_filter_results"
-                )
+        # prompt filter results
+        if item.get("prompt_filter_results"):
+            complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
 
-            delta = choice.get("delta")
+        if item.get("choices"):
+            for choice in item.get("choices"):
+                index = choice.get("index")
+                if len(complete_response.get("choices")) <= index:
+                    complete_response["choices"].append(
+                        {"index": index, "message": {"content": "", "role": ""}}
+                    )
+                complete_choice = complete_response.get("choices")[index]
+                if choice.get("finish_reason"):
+                    complete_choice["finish_reason"] = choice.get("finish_reason")
+                if choice.get("content_filter_results"):
+                    complete_choice["content_filter_results"] = choice.get(
+                        "content_filter_results"
+                    )
 
-            if delta.get("content"):
-                complete_choice["message"]["content"] += delta.get("content")
+                delta = choice.get("delta")
 
-            if delta.get("role"):
-                complete_choice["message"]["role"] = delta.get("role")
+                if delta.get("content"):
+                    complete_choice["message"]["content"] += delta.get("content")
 
-            if delta and delta.get("tool_calls"):
-                tool_calls = delta.get("tool_calls")
-                if not isinstance(tool_calls, list) or len(tool_calls) == 0:
-                    continue
+                if delta.get("role"):
+                    complete_choice["message"]["role"] = delta.get("role")
 
-                if not complete_choice["message"].get("tool_calls"):
-                    complete_choice["message"]["tool_calls"] = []
+                if delta and delta.get("tool_calls"):
+                    tool_calls = delta.get("tool_calls")
+                    if not isinstance(tool_calls, list) or len(tool_calls) == 0:
+                        continue
 
-                for tool_call in tool_calls:
-                    i = int(tool_call["index"])
-                    if len(complete_choice["message"]["tool_calls"]) <= i:
-                        complete_choice["message"]["tool_calls"].append(
-                            {"id": "", "function": {"name": "", "arguments": ""}}
-                        )
+                    if not complete_choice["message"].get("tool_calls"):
+                        complete_choice["message"]["tool_calls"] = []
 
-                    span_tool_call = complete_choice["message"]["tool_calls"][i]
-                    span_function = span_tool_call["function"]
-                    tool_call_function = tool_call.get("function")
+                    for tool_call in tool_calls:
+                        i = int(tool_call["index"])
+                        if len(complete_choice["message"]["tool_calls"]) <= i:
+                            complete_choice["message"]["tool_calls"].append(
+                                {"id": "", "function": {"name": "", "arguments": ""}}
+                            )
 
-                    if tool_call.get("id"):
-                        span_tool_call["id"] = tool_call.get("id")
-                    if tool_call_function and tool_call_function.get("name"):
-                        span_function["name"] = tool_call_function.get("name")
-                    if tool_call_function and tool_call_function.get("arguments"):
-                        span_function["arguments"] += tool_call_function.get("arguments")
+                        span_tool_call = complete_choice["message"]["tool_calls"][i]
+                        span_function = span_tool_call["function"]
+                        tool_call_function = tool_call.get("function")
+
+                        if tool_call.get("id"):
+                            span_tool_call["id"] = tool_call.get("id")
+                        if tool_call_function and tool_call_function.get("name"):
+                            span_function["name"] = tool_call_function.get("name")
+                        if tool_call_function and tool_call_function.get("arguments"):
+                            span_function["arguments"] += tool_call_function.get("arguments")
 
 class OpenTelemetryProvider:
     def __init__(self):
