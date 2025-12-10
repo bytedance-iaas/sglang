@@ -365,9 +365,9 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache, is_decode=True)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(req, self.tree_cache, is_decode=True)
 
                 req.time_stats.completion_time = time.perf_counter()
 
