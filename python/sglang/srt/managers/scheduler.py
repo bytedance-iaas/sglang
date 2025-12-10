@@ -153,16 +153,22 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    DPBalanceMeta,
+    GenerationBatchResult,
+    validate_input_length,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.eic_hiradix_cache import (
     EICHiRadixCache,
     EICHiRadixCacheBuilder,
     EICPagedHiRadixCache,
+    MambaRadixCache,
 )
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -239,6 +245,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        dp_balance_meta: Optional[DPBalanceMeta] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -598,6 +605,14 @@ class Scheduler(
                 (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
         )
+        self.balance_meta = dp_balance_meta
+        if (
+            server_args.enable_dp_attention
+            and server_args.load_balance_method == "minimum_tokens"
+        ):
+            assert dp_balance_meta is not None
+
+        self.recv_dp_balance_id_this_term = []
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -966,7 +981,7 @@ class Scheduler(
     def init_overlap(self):
         self.future_map = None
 
-        if not self.enable_overlap:
+        if not self.enable_overlap and self.pp_size == 1:
             return
 
         self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
@@ -977,6 +992,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
             self.device
         ).stream(self.copy_stream)
+
+        if not self.enable_overlap:
+            return
 
         self.future_map = FutureMap(
             self.max_running_requests,
@@ -1133,7 +1151,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -1311,6 +1329,11 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if (
+            self.server_args.enable_dp_attention
+            and self.server_args.load_balance_method == "minimum_tokens"
+        ):
+            self.recv_dp_balance_id_this_term.append(recv_req.dp_balance_id)
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1668,6 +1691,145 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def _get_token_info(self):
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.tree_cache.evictable_size()
+        num_used = self.max_total_num_tokens - (available_size + evictable_size)
+        token_usage = num_used / self.max_total_num_tokens
+        return num_used, token_usage, available_size, evictable_size
+
+    def _get_mamba_token_info(self):
+        is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
+        full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_evictable_size = (
+            self.tree_cache.full_evictable_size() if is_radix_tree else 0
+        )
+        mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
+        mamba_evictable_size = (
+            self.tree_cache.mamba_evictable_size() if is_radix_tree else 0
+        )
+        full_num_used = self.token_to_kv_pool_allocator.size - (
+            full_available_size + full_evictable_size
+        )
+        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
+            mamba_available_size + mamba_evictable_size
+        )
+        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
+        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
+        return (
+            full_num_used,
+            mamba_num_used,
+            full_token_usage,
+            mamba_usage,
+            full_available_size,
+            full_evictable_size,
+            mamba_available_size,
+            mamba_evictable_size,
+        )
+
+    def _get_swa_token_info(self):
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        full_evictable_size = self.tree_cache.full_evictable_size()
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_num_used = self.full_tokens_per_layer - (
+            full_available_size + full_evictable_size
+        )
+        swa_num_used = self.swa_tokens_per_layer - (
+            swa_available_size + swa_evictable_size
+        )
+        full_token_usage = full_num_used / self.full_tokens_per_layer
+        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+        return (
+            full_num_used,
+            swa_num_used,
+            full_token_usage,
+            swa_token_usage,
+            full_available_size,
+            full_evictable_size,
+            swa_available_size,
+            swa_evictable_size,
+        )
+
+    def handle_dp_balance_data(self, local_batch: ScheduleBatch):
+        def gather_dp_balance_info(holding_tokens_list) -> Union[None, List[List[int]]]:
+            """gather recv_dp_balance_id_this_term and holding tokens per worker for dp balance"""
+            recv_list = self.recv_dp_balance_id_this_term
+            assert len(recv_list) <= 511, (
+                "The number of requests received this round is too large. "
+                "Please increase gather_tensor_size and onfly_info_size."
+            )
+            # The maximum size of the tensor used for gathering data from all workers.
+            gather_tensor_size = 512
+            # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
+            recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
+            recv_tensor[0] = holding_tokens_list
+            recv_tensor[1] = len(
+                recv_list
+            )  # The first element is the length of the list.
+            recv_tensor[2 : len(recv_list) + 2] = torch.tensor(
+                recv_list, dtype=torch.int32
+            )
+
+            if self.tp_rank == 0:
+                gathered_list = [
+                    torch.zeros(gather_tensor_size, dtype=torch.int32)
+                    for _ in range(self.balance_meta.num_workers)
+                ]
+            else:
+                gathered_list = None
+
+            torch.distributed.gather(
+                recv_tensor, gathered_list, group=self.tp_cpu_group
+            )
+
+            gathered_id_list_per_worker = None
+            if self.tp_rank == 0:
+                gathered_id_list_per_worker = []
+                holding_tokens_list = []
+                for tensor in gathered_list:
+                    holding_tokens_list.append(tensor[0].item())
+                    list_length = tensor[1].item()
+                    gathered_id_list_per_worker.append(
+                        tensor[2 : list_length + 2].tolist()
+                    )
+
+            return gathered_id_list_per_worker, holding_tokens_list
+
+        def write_shared_dp_balance_info(new_recv_rid_lists, local_tokens):
+            meta = self.balance_meta
+
+            with meta.mutex:
+                onfly_list: List[Dict[int, int]] = meta.get_shared_onfly()
+                assert len(new_recv_rid_lists) == len(
+                    onfly_list
+                ), "num_worker not equal"
+                # 1.Check if the rid received by each worker this round is present in onfly.
+                #   If it is, remove the corresponding onfly item.
+                worker_id = 0
+                for new_recv_rids, on_fly_reqs in zip(new_recv_rid_lists, onfly_list):
+                    for new_recv_rid in new_recv_rids:
+                        assert (
+                            new_recv_rid in on_fly_reqs
+                        ), f"{new_recv_rid=} not in {worker_id=} {on_fly_reqs=}, data consistency is wrong"
+                        del on_fly_reqs[new_recv_rid]
+                    worker_id += 1
+                # 2. Atomically write local_tokens and onfly into shm under the mutex
+                meta.set_shared_onfly_info(onfly_list)
+                meta.set_shared_local_tokens(local_tokens)
+
+        holding_tokens = self.get_load()
+
+        new_recv_dp_balance_id_list, holding_token_list = gather_dp_balance_info(
+            holding_tokens
+        )
+
+        self.recv_dp_balance_id_this_term.clear()
+        if self.tp_rank == 0:  # only first worker write info
+            write_shared_dp_balance_info(
+                new_recv_dp_balance_id_list, holding_token_list
+            )
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.dllm_config is not None:
             if self.chunked_req is not None and self.chunked_req.finished():
@@ -1734,6 +1896,11 @@ class Scheduler(
 
         # Handle DP attention
         if need_mlp_sync:
+            if (
+                self.server_args.load_balance_method == "minimum_tokens"
+                and self.forward_ct % 40 == 0
+            ):
+                self.handle_dp_balance_data(ret)
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
@@ -1993,7 +2160,9 @@ class Scheduler(
         pass
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2041,6 +2210,7 @@ class Scheduler(
                     self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
+                        # here pp is not compatible with overlap
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2074,8 +2244,13 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
+                    batch_or_worker_batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -2710,6 +2885,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    balance_meta: Optional[DPBalanceMeta] = None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2765,6 +2941,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            dp_balance_meta=balance_meta,
         )
         pipe_writer.send(
             {
