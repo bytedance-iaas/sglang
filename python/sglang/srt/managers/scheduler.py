@@ -166,6 +166,7 @@ from sglang.srt.mem_cache.eic_hiradix_cache import (
     EICPagedHiRadixCache,
     MambaRadixCache,
 )
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
