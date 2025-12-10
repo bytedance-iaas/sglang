@@ -29,6 +29,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DisableEICReqInput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -215,6 +217,9 @@ class TokenizerCommunicatorMixin:
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
+        self.eic_switch_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -300,6 +305,14 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
+                ),
+                (
+                    EnableEICReqInput,
+                    self.eic_switch_communicator.handle_recv,
+                ),
+                (
+                    DisableEICReqInput,
+                    self.eic_switch_communicator.handle_recv,
                 ),
             ]
         )
