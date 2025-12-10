@@ -164,6 +164,7 @@ from sglang.srt.mem_cache.eic_hiradix_cache import (
     EICHiRadixCache,
     EICHiRadixCacheBuilder,
     EICPagedHiRadixCache,
+    MambaRadixCache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
