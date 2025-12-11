@@ -153,7 +153,7 @@ def cutlass_w4a8_moe(
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
-    expected_m_per_group = int(m / num_experts)
+    expected_m_per_group = int(m / num_local_experts)
     cutlass_w4a8_moe_mm(
         c1,
         gateup_input,
