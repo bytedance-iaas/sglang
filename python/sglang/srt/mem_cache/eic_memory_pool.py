@@ -7,13 +7,17 @@ import time
 from enum import IntEnum
 from typing import List, Optional, Tuple
 
-import eic
 import torch
 import yaml
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import synchronized
+
+try:
+    import eic
+except ImportError:
+    eic = None
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +175,8 @@ class EICKVClient:
     """
 
     def __init__(self, kv_cache_dtype, kv_cache_shape, device="cpu"):
+        if eic is None:
+            raise ImportError("eic module is not found, please install eic package")
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect, G_EnableAsyncKVSet
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
         global G_GDRBounceBufferSize, G_GDRBounceTensorCount
