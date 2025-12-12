@@ -1119,7 +1119,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if get_moe_runner_backend().is_cutlass_w4afp8() or get_moe_runner_backend().is_cutlass_fp8():
+        if get_moe_runner_backend().is_cutlass_w4afp8() or get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
