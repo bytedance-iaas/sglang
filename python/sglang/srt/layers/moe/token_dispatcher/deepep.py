@@ -796,6 +796,7 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
         static_scale: torch.Tensor = None,
     ):
+        assert static_scale is not None
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
