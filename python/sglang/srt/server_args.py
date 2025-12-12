@@ -1124,6 +1124,9 @@ class ServerArgs:
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
+            if self.moe_runner_backend == "auto":
+                if self.quantization == "w4afp8":
+                    self.moe_runner_backend = "cutlass_w4afp8"
 
             if self.moe_runner_backend == "triton_kernel":
                 assert (
