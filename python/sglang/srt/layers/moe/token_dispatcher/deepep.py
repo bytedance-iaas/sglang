@@ -783,8 +783,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: torch.Tensor = None,
     ) -> DispatchOutput:
-        self.dispatch_a(hidden_states, topk_output)
+        self.dispatch_a(hidden_states, topk_output, static_scale)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()

@@ -161,7 +161,8 @@ class DeepEPMoE(FusedMoE):
 
         # TODO: can we call super().forward here?
         dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+            hidden_states=hidden_states, topk_output=topk_output,
+            static_scale=self.w13_input_scale.float() if self.use_w4afp8 else None,
         )
         combine_input = self.run_moe_core(dispatch_output)
         hidden_states = self.dispatcher.combine(
