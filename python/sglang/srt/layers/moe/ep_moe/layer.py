@@ -10,6 +10,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_moe_quantization
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -113,6 +114,9 @@ class DeepEPMoE(FusedMoE):
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
             self.use_w4afp8 = False
+
+        if get_moe_quantization() == "w4afp8":
+            self.use_w4afp8 = True
 
         self.deepep_mode = get_deepep_mode()
 

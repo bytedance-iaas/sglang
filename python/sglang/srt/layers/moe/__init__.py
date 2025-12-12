@@ -7,6 +7,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_moe_quantization,
     get_tbo_token_distribution_threshold,
     initialize_moe_config,
     is_tbo_enabled,
