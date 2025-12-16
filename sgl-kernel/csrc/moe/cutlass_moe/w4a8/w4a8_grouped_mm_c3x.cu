@@ -82,8 +82,8 @@ void dispatch_w4a8_moe_mm_sm90(
     int64_t topk,
     int64_t expected_m_per_group) {
   uint32_t const m = expected_m_per_group;
-  uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+  uint32_t const n = d_tensors.size(2);
+  uint32_t const k = a_tensors.size(2);
 
    if (n == 4096 && k == 7168) {
     // group gemm 1
