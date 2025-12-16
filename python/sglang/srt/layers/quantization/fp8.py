@@ -496,7 +496,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
             )
-
+        print(" will return here")
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
