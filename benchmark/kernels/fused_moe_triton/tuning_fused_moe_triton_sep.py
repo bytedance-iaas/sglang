@@ -53,6 +53,7 @@ def benchmark_config(
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
+    torch.cuda.empty_cache()
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
@@ -134,7 +135,7 @@ def benchmark_config(
 
     def prepare(i: int):
         input_gating = gating_output[i]
-        topk_ids = torch.load(f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt")
+        topk_ids = torch.load(f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt", map_location=hidden_states.device)
         new_topk_output = select_experts(hidden_states, input_gating, topk_config)
         topk_output.topk_weights.copy_(new_topk_output.topk_weights)
         tokens, _topk = topk_output.topk_ids.shape
@@ -144,132 +145,166 @@ def benchmark_config(
     moe_use_tma = False
 
     def run():
-        moe_runner_config = MoeRunnerConfig(
-            inplace=True,
-        )
-        topk_weights, topk_ids, _ = topk_output
+        try:
+            moe_runner_config = MoeRunnerConfig(
+                inplace=True,
+            )
+            topk_weights, topk_ids, _ = topk_output
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], num_experts
-        )
-        M = hidden_states.shape[0]
-        E, N, _ = w1.shape
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, config["BLOCK_SIZE_M"], num_experts
+            )
+            M = hidden_states.shape[0]
+            E, N, _ = w1.shape
 
-        topk = topk_ids.shape[1]
-        padded_tokens = (
-            min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1) if moe_use_tma else 0
-        )
-        total_tokens = M * topk + padded_tokens
-        cache = torch.empty(
-            total_tokens * max(N, w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        intermediate_cache1 = cache[: total_tokens * N].view(
-            (total_tokens, N),
-        )
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
-            (M, topk, w2.shape[1]),
-        )
+            topk = topk_ids.shape[1]
+            padded_tokens = (
+                min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1) if moe_use_tma else 0
+            )
+            total_tokens = M * topk + padded_tokens
+            cache = torch.empty(
+                total_tokens * max(N, w2.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            intermediate_cache1 = cache[: total_tokens * N].view(
+                (total_tokens, N),
+            )
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
+                (M, topk, w2.shape[1]),
+            )
 
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
-        apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
+            compute_type = (
+                tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+            )
+            apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
 
-        with override_config(config):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(10 if not ncu_enable else 1):
-                invoke_fused_moe_kernel(
-                    hidden_states,
-                    w1,
-                    None,
-                    intermediate_cache1,
-                    None,
-                    w1_scale,
-                    None,
-                    topk_weights,
-                    topk_ids,
-                    sorted_token_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    apply_router_weight_on_input,
-                    topk_ids.shape[1],
-                    config,
-                    compute_type=compute_type,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_int8_w8a8=False,
-                    use_int8_w8a16=False,
-                    use_int4_w4a16=False,
-                    per_channel_quant=False,
-                    block_shape=block_shape,
-                    b_use_tma=moe_use_tma,
-                    c_sorted=moe_use_tma,
-                    filter_expert=False,
+            with override_config(config):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                torch.cuda.synchronize()
+                start_event.record()
+                for _ in range(10 if not ncu_enable else 1):
+                    invoke_fused_moe_kernel(
+                        hidden_states,
+                        w1,
+                        None,
+                        intermediate_cache1,
+                        None,
+                        w1_scale,
+                        None,
+                        topk_weights,
+                        topk_ids,
+                        sorted_token_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        apply_router_weight_on_input,
+                        topk_ids.shape[1],
+                        config,
+                        compute_type=compute_type,
+                        use_fp8_w8a8=use_fp8_w8a8,
+                        use_int8_w8a8=use_int8_w8a8,
+                        use_int8_w8a16=False,
+                        use_int4_w4a16=False,
+                        per_channel_quant=True,
+                        block_shape=block_shape,
+                        b_use_tma=moe_use_tma,
+                        c_sorted=moe_use_tma,
+                        filter_expert=False,
+                    )
+                end_event.record()
+                end_event.synchronize()
+                time_cost0 = start_event.elapsed_time(end_event)
+
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                torch.cuda.synchronize()
+                start_event.record()
+
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                for _ in range(10 if not ncu_enable else 1):
+                    invoke_fused_moe_kernel(
+                        intermediate_cache2,
+                        w2,
+                        None,
+                        intermediate_cache3,
+                        a2_scale,
+                        w2_scale,
+                        None,
+                        topk_weights,
+                        topk_ids,
+                        sorted_token_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        not apply_router_weight_on_input,
+                        1,
+                        config,
+                        compute_type=compute_type,
+                        use_fp8_w8a8=use_fp8_w8a8,
+                        use_int8_w8a8=True,
+                        use_int8_w8a16=False,
+                        use_int4_w4a16=False,
+                        per_channel_quant=True,
+                        block_shape=block_shape,
+                        a_use_tma=moe_use_tma,
+                        b_use_tma=moe_use_tma,
+                        filter_expert=False,
+                    )
+                end_event.record()
+                end_event.synchronize()
+                time_cost1 = start_event.elapsed_time(end_event)
+        except RuntimeError as e:
+            print(f"Error in run  {e}", flush=True)
+            print(
+                        hidden_states,
+                        w1,
+                        None,
+                        intermediate_cache1,
+                        None,
+                        w1_scale,
+                        None,
+                        topk_weights,
+                        topk_ids,
+                        sorted_token_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        apply_router_weight_on_input,
+                        topk_ids.shape[1],
+                        config,
+                        compute_type=compute_type,
+                        use_fp8_w8a8=use_fp8_w8a8,
+                        use_int8_w8a8=use_int8_w8a8,
+                        use_int8_w8a16=False,
+                        use_int4_w4a16=False,
+                        per_channel_quant=True,
+                        block_shape=block_shape,
+                        b_use_tma=moe_use_tma,
+                        c_sorted=moe_use_tma,
+                        filter_expert=False,
                 )
-            end_event.record()
-            end_event.synchronize()
-            time_cost0 = start_event.elapsed_time(end_event)
-
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-
-            silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            for _ in range(10 if not ncu_enable else 1):
-                invoke_fused_moe_kernel(
-                    intermediate_cache2,
-                    w2,
-                    None,
-                    intermediate_cache3,
-                    a2_scale,
-                    w2_scale,
-                    None,
-                    topk_weights,
-                    topk_ids,
-                    sorted_token_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    not apply_router_weight_on_input,
-                    1,
-                    config,
-                    compute_type=compute_type,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_int8_w8a8=False,
-                    use_int8_w8a16=False,
-                    use_int4_w4a16=False,
-                    per_channel_quant=False,
-                    block_shape=block_shape,
-                    a_use_tma=moe_use_tma,
-                    b_use_tma=moe_use_tma,
-                    filter_expert=False,
-                )
-            end_event.record()
-            end_event.synchronize()
-            time_cost1 = start_event.elapsed_time(end_event)
+            time_cost0, time_cost1 = float("inf"), float("inf")
         return time_cost0, time_cost1
 
     # JIT compilation & warmup
+    is_hopper = torch.cuda.get_device_capability()[0] >= 9
     if not ncu_enable:
         moe_use_tma = False
         run()
-        moe_use_tma = True
-        run()
+        if is_hopper:
+            moe_use_tma = True
+            run()
     latencies: List[float] = []
     latencies1: List[float] = []
     latencies_tma: List[float] = []
     latencies1_tma: List[float] = []
 
     for i in range(num_iters):
+        torch.cuda.empty_cache()
         prepare(i)
         torch.cuda.synchronize()
         moe_use_tma = False
@@ -278,17 +313,25 @@ def benchmark_config(
         latencies.append(t0)
         latencies1.append(t1)
 
-        moe_use_tma = True
-        t0, t1 = run()
-        torch.cuda.synchronize()
-        latencies_tma.append(t0)
-        latencies1_tma.append(t1)
+        if is_hopper:
+            moe_use_tma = True
+            t0, t1 = run()
+            torch.cuda.synchronize()
+            latencies_tma.append(t0)
+            latencies1_tma.append(t1)
+        else:
+            latencies_tma.append(float("inf"))
+            latencies1_tma.append(float("inf"))
 
     avg = sum(latencies) / (num_iters * 10) * 1000  # us
-    avg_tma = sum(latencies_tma) / (num_iters * 10) * 1000  # us
     avg1 = sum(latencies1) / (num_iters * 10) * 1000  # us
-    avg1_tma = sum(latencies1_tma) / (num_iters * 10) * 1000  # us
-
+    if is_hopper:
+        avg_tma = sum(latencies_tma) / (num_iters * 10) * 1000  # us
+        avg1_tma = sum(latencies1_tma) / (num_iters * 10) * 1000  # us
+    else:
+        avg_tma = float("inf")
+        avg1_tma = float("inf")
+    del w1, w2
     return avg, avg_tma, avg1, avg1_tma
 
 
@@ -410,8 +453,12 @@ class BenchmarkWorker:
                         block_shape,
                         num_iters=10,
                     )
-                except triton.runtime.autotuner.OutOfResources:
+                except RuntimeError as e:
                     # Some configurations may be invalid and fail to compile.
+                    print(f"RuntimeError: {e}")
+                    continue
+                except triton.runtime.errors.OutOfResources as e:
+                    print(f"Triton OutOfResources: {e}")
                     continue
                 kt0 = kt0_no_tma
                 kt1 = min(kt1_no_tma, kt1_tma)
