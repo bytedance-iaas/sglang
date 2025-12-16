@@ -603,6 +603,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
+        per_tensor_quantization = use_fp8
+        if static_scale is None:
+            per_tensor_quantization = False
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -610,7 +613,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                use_per_tensor_quantization=use_fp8,
+                use_per_tensor_quantization=per_tensor_quantization,
                 static_scale=static_scale,
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
