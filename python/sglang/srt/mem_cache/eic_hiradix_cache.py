@@ -317,6 +317,7 @@ class EICHiRadixCache(RadixCache):
                     self.evictable_size_ -= len(end_node.value)
                     failed_token_num -= len(end_node.value)
                     end_node.value = None
+                    end_node.host_value = None
                 elif failed_token_num > 0:
                     # node load back partial fail, split node
                     split_len = len(end_node.value) - failed_token_num
@@ -325,6 +326,7 @@ class EICHiRadixCache(RadixCache):
                     self.cache_controller.mem_pool_device_allocator.free(end_node.value)
                     failed_token_num -= len(end_node.value)
                     end_node.value = None
+                    end_node.host_value = None
                     assert failed_token_num == 0, "failed_token_num should be zero"
                 end_node = end_node.parent
             # clear the reference
