@@ -626,7 +626,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                use_per_tensor_quantization=use_fp8,
+                use_per_tensor_quantization=use_fp8 if static_scale is not None else False,
                 static_scale=static_scale,
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
