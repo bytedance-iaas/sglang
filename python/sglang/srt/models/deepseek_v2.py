@@ -750,11 +750,18 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-        ]
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            return [
+                 x.data
+                 for name, x in self.experts.named_parameters()
+                 if name not in ["correction_bias"]
+             ][:-2]
+        else:
+             return [
+                 x.data
+                 for name, x in self.experts.named_parameters()
+                if name not in ["correction_bias"]
+             ]
 
     def forward(
         self,
@@ -1160,6 +1167,7 @@ class DeepseekV2MoE(nn.Module):
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
+                **(dict(static_scale=self.experts.w13_input_scale.float()) if self.experts.w13_input_scale is not None else dict()),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -1727,13 +1735,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
             )
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)
-            kv = self.kv_b_proj(kv_a)[0]
 
         # kv_a = self.kv_a_layernorm(kv_a)
 
@@ -1757,7 +1761,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q.dtype,
                     forward_batch,
                 )
-        kv = self.kv_b_proj(kv_a)[0]
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            kv = self.kv_b_proj(
+                kv_a_quanted,
+            )[0]
+        else:
+            kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
