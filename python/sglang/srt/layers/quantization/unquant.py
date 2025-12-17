@@ -497,16 +497,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
             shape_collect = x.shape
         
         do_kernel_selection = get_int_env_var("SGLANG_GEMM_KERNEL_SELC")
+        M, N, K = shape_collect[0], layer.weight.shape[0], shape_collect[1]
+        call_in_graph = torch.cuda.is_current_stream_capturing()
+        
+        if not hasattr(self, "device_name"):
+            setattr(self, "device_name", torch.cuda.get_device_name())
+            
+        # only collect valid shape
+        if len(shape_collect) == 2 and get_bool_env_var("SGLANG_RECORD_TUNE"):
+            device_parts = self.device_name.split(" ")         
+            device_name = device_parts[1] if (len(device_parts) == 2 and device_parts[0]== "NVIDIA") else "unknown"
+            save_path = os.getenv("gemm_tune_record_path")
+            file_name = "{}_GEMM_graph_{}_BF16.txt".format(device_name, call_in_graph) 
+            file_name = os.path.join(save_path, file_name)
+            to_save_mnk ="{}_{}_{}".format(M, N, K)
+            append_string_if_not_exists(file_name, to_save_mnk)
         
         if len(shape_collect) == 2  and do_kernel_selection:
-            # print("try to opt")
-            if not hasattr(self, "device_name"):
-                setattr(self, "device_name", torch.cuda.get_device_name())
-                
             kernel_selector = get_kernel_selector()
-            
-            is_h20 = self.device_name == H20_DEVICE_NAME
-            is_l20 = self.device_name == L20_DEVICE_NAME
+
             if not hasattr(self, "is_hopper"):
                 is_hopper = torch.cuda.get_device_capability()[0] == 9
                 setattr(self, "is_hopper", is_hopper)
@@ -531,19 +540,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 hash_dtype = "BF16"
             elif x.dtype == torch.float16:
                 hash_dtype = "FP16"
-            
-            M, N, K = shape_collect[0], layer.weight.shape[0], shape_collect[1]    
-            
-            call_in_graph = torch.cuda.is_current_stream_capturing()
-
-            if get_bool_env_var("SGLANG_RECORD_TUNE"):
-                save_path = os.getenv("gemm_tune_record_path")
-                file_name = "GEMM_graph_{}_BF16.txt".format(call_in_graph) 
-                file_name = os.path.join(save_path, file_name)
-                
-                to_save_mnk ="{}_{}_{}".format(M, N, K)
-                append_string_if_not_exists(file_name, to_save_mnk)
-                
             
             # ori_len = len(self.shape_table)
             # self.shape_table.add((M,N,K))
@@ -576,7 +572,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     return triton_matmul_persistent_tma(self.is_hopper, self.sum_num, x, layer.weight, bias, kernel_config)
         # else:
             # print("check this case x.shape {} shape_collect {}".format(x.shape, shape_collect))                
-        print("F")
         ret =  F.linear(x, layer.weight, bias)
         # print("ret shape {}".format(ret.shape))
         return ret
