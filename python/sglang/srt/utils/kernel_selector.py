@@ -2,7 +2,40 @@ import os
 import importlib
 import warnings
 import pkgutil
+import fcntl
 from typing import List, Optional
+
+
+def generate_level1_key(device_type, op_type, graph_mode, data_type):
+    return f"{device_type}_{data_type}_{op_type}_graphmode_{graph_mode}"
+
+def append_string_if_not_exists(filename, target_str):
+    if os.name == 'posix':
+        import fcntl
+    elif os.name == 'nt':
+        import msvcrt
+
+    with open(filename, 'a+', encoding='utf-8') as f:
+        if os.name == 'posix':
+            fcntl.flock(f, fcntl.LOCK_EX)
+        elif os.name == 'nt':
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        
+        f.seek(0)
+        exists = False
+        for line in f:
+            if line.rstrip('\n') == target_str:
+                exists = True
+                break
+        
+        if not exists:
+            # print("target_str {}".format(target_str))
+            f.write(target_str + '\n')
+
+        if os.name == 'posix':
+            fcntl.flock(f, fcntl.LOCK_UN)
+        elif os.name == 'nt':
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def append_string_if_not_exists(filename, target_str):
@@ -25,7 +58,7 @@ def append_string_if_not_exists(filename, target_str):
                 break
         
         if not exists:
-            print("target_str {}".format(target_str))
+            # print("target_str {}".format(target_str))
             f.write(target_str + '\n')
 
         if os.name == 'posix':
@@ -37,65 +70,140 @@ def append_string_if_not_exists(filename, target_str):
 class KernelSelector:
     def __init__(self):
         self.all_kernel_data = {}
+        self.file_map = {}  # NEW: Maps level1_key -> file_path
+        self.package_dir = None # NEW: Stores the directory of the package
         self.import_success = False
         
-        # 1. Load environment variable
-        # data_path = os.getenv("kernel_select_data_path")
-        
-        # 2. Try to import the module
+        # 1. Try to import the main module
         try:
-            # We assume the module 'kernel_select_data' is in the python path
-            # (e.g., the directory containing it is in sys.path)
             module = importlib.import_module("kernel_select_data")
             self.import_success = True
             
-            # 3. Iterate over submodules in the package
-            # pkgutil.iter_modules looks at the __path__ of the imported module
+            # Save the package directory (used for creating NEW files later)
+            if hasattr(module, "__path__"):
+                self.package_dir = list(module.__path__)[0]
+
+            # 2. Iterate over submodules
             if hasattr(module, "__path__"):
                 for loader, module_name, is_pkg in pkgutil.iter_modules(module.__path__):
-                    # We only care about .py files (not sub-packages)
                     if not is_pkg:
                         full_module_name = f"kernel_select_data.{module_name}"
                         submod = importlib.import_module(full_module_name)
                         
-                        # Get the 'kernel_data' dict from the submodule
                         if hasattr(submod, "kernel_data"):
                             self.all_kernel_data[module_name] = getattr(submod, "kernel_data")
+                            
+                            # NEW: Store the file path for this module
+                            if hasattr(submod, "__file__") and submod.__file__:
+                                # Ensure we point to .py, not .pyc
+                                file_path = submod.__file__
+                                if file_path.endswith('.pyc'):
+                                    file_path = file_path[:-1]
+                                self.file_map[module_name] = file_path
             
-            print("collect all data is {}".format(self.all_kernel_data))
+            print("import kernel_data @ {}".format(self.package_dir))
+            print("file_map : {}".format(self.file_map))
+            # Debug print
+            # print(f"Collected data: {self.all_kernel_data}")
+            # print(f"File mapping: {self.file_map}")
+
         except (ImportError, ModuleNotFoundError) as e:
             warnings.warn(f"Failed to import 'kernel_select_data': {e}. Kernel selection will use defaults.")
             self.import_success = False
 
     def query_kernel_data(self, device_type: str, shape: List[int], data_type: str, op_type: str, run_in_graph: bool, **kwargs) -> str:
-        """
-        Queries the loaded kernel data based on device, shape, and operation type.
-        """
         if not self.import_success:
             return "default"
         
-        # Create shape string: "128_128_128"
         shape_str = "_".join(map(str, shape))
-        
-        # Create first-level key: "A100_FP32_MATMUL"
-        # Join: device_type, data_type, op_type
-        level1_key = f"{device_type}_{data_type}_{op_type}_graphmode_{run_in_graph}"
-        
-        # Search in loaded data
-        # Each 'module_name' in all_kernel_data acts as the level1_key 
-        # based on the file-naming convention.
-        if level1_key not in self.all_kernel_data:
-            print("can not find lv1 key {}".format(level1_key))
+        level1_key = generate_level1_key(device_type, op_type, run_in_graph, data_type)
         
         if level1_key in self.all_kernel_data:
             specific_dict = self.all_kernel_data[level1_key]
-            # return specific_dict.get(shape_str, "default")
-            if not (shape_str in specific_dict):
-                print("can not find shape {}".format(shape_str))
-            else:
-                return specific_dict[shape_str]
+            return specific_dict.get(shape_str, "default")
         
         return "default"
+
+    def refresh_kernel_data(self, level1_key: str):
+            """
+            Updates kernel data with Process Safety:
+            1. Acquires an exclusive file lock.
+            2. Refreshes in-memory data by reading the latest file content from disk.
+            3. Merges the new updates.
+            4. Writes back to disk and releases lock.
+            """
+            if not self.import_success or not self.package_dir:
+                print("Cannot update: kernel_select_data module was not loaded successfully.")
+                return
+
+            # 1. Determine File Path
+            if level1_key in self.file_map:
+                file_path = self.file_map[level1_key]
+            else:
+                file_path = os.path.join(self.package_dir, f"{level1_key}.py")
+                self.file_map[level1_key] = file_path
+
+            # 2. Enter Critical Section (File Locking)
+            # We open with 'a+' to create the file if it doesn't exist, but allow reading.
+            # However, to read efficiently from start, 'r+' is better if file exists.
+            mode = 'r+' if os.path.exists(file_path) else 'w+'
+            
+            with open(file_path, mode) as f:
+                # [LOCK] Block here until other processes are done with this file
+                fcntl.flock(f, fcntl.LOCK_EX)
+                
+                try:
+                    # 3. REFRESH: Read the LATEST content from disk (ignore import cache)
+                    # We cannot rely on 'self.all_kernel_data' or 'importlib' here because 
+                    # another process might have just updated the file 1ms ago.
+                    f.seek(0)
+                    content = f.read()
+                    
+                    disk_data = {}
+                    if content.strip():
+                        try:
+                            # We use exec() to parse the file content as a dictionary 
+                            # without triggering Python's import caching mechanism.
+                            local_scope = {}
+                            exec(content, {}, local_scope)
+                            if "kernel_data" in local_scope:
+                                disk_data = local_scope["kernel_data"]
+                        except Exception as e:
+                            print(f"Warning: Failed to parse existing file {file_path}: {e}")
+                            # If parse fails, we proceed with empty disk_data (overwrite risk, but safer than crashing)
+
+                    # 4. MERGE: Disk Data + Current Memory + New Updates
+                    if level1_key not in self.all_kernel_data:
+                        self.all_kernel_data[level1_key] = {}
+                    
+                    # Step A: Update our memory with what was actually on disk 
+                    # (Syncs us with other processes)
+                    self.all_kernel_data[level1_key].update(disk_data)
+                    
+                    # 5. WRITE BACK
+                    # Clear the file content
+                    f.seek(0)
+                    f.truncate()
+                    
+                    f.write("# Auto-generated kernel data\n")
+                    f.write(f"# Level 1 Key: {level1_key}\n")
+                    f.write("kernel_data = {\n")
+                    
+                    # Write the merged result
+                    data_to_save = self.all_kernel_data[level1_key]
+                    for shape_key in sorted(data_to_save.keys()):
+                        value = data_to_save[shape_key]
+                        f.write(f'    "{shape_key}": {repr(value)},\n')
+                        
+                    f.write("}\n")
+                    
+                    # Force write to disk immediately
+                    f.flush()
+                    os.fsync(f.fileno())
+                    
+                finally:
+                    # [UNLOCK] Release the lock
+                    fcntl.flock(f, fcntl.LOCK_UN)
 
 # Example Usage:
 # if __name__ == "__main__":

@@ -58,6 +58,7 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+set_allocator = False
 
 
 def deep_gemm_matmul(a, b):
@@ -298,9 +299,8 @@ def matmul_kernel_descriptor_persistent(
         block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2],
     )
 
-    tl.assume(num_pid_m >= 0)
-    tl.assume(num_pid_n >= 0)
-
+    # tl.assume(num_pid_m >= 0)
+    # tl.assume(num_pid_n >= 0)
 
     # tile_id_c is used in the epilogue to break the dependency between
     # the prologue and the epilogue
@@ -319,15 +319,13 @@ def matmul_kernel_descriptor_persistent(
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
         
-
-            
         tile_id_c += NUM_SMS
         #GLOBAL
         pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
         
-        offs_bn_bias = (pid_n * BLOCK_SIZE_N + tl.range(0, BLOCK_SIZE_N)) % N
+        offs_bn_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         if ACTIVATION == "add_bias":
             bias_ptrs = bias_ptr + offs_bn_bias
             bias = tl.load(bias_ptrs)
@@ -350,7 +348,16 @@ def triton_matmul_persistent_tma(is_hopper, sm_num, a, b, bias = None, launch_co
     if len(launch_configs)!= 9:
         Logger.info("invalid luanch config , use default config")
         launch_configs =  [64,64,64,8, False, True, 4, 4, 1]
+
+    global set_allocator
     
+    if not set_allocator:
+        def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+          return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        triton.set_allocator(alloc_fn)
+        
+        set_allocator = True
     
     activation = ""
     if not (bias is None):
@@ -372,7 +379,7 @@ def triton_matmul_persistent_tma(is_hopper, sm_num, a, b, bias = None, launch_co
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16).contiguous()
     # print("c.shape {}".format(c.shape))
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    grid = lambda META: (min(sm_num, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
     #BLOCK_SIZE_M: 512, BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32, GROUP_SIZE_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4
     
     warp_specialize = launch_configs[5]
@@ -435,6 +442,16 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+def align_to_closest(x, align):
+    if not isinstance(align, int) or align <= 0:
+        raise ValueError("align must be a positive integer")
+    floor = (x // align) * align
+    ceil = ((x + align - 1) // align) * align
+    if floor == ceil:
+        return x
+    diff_f, diff_c = abs(x - floor), abs(x - ceil)
+    return ceil if diff_c <= diff_f else floor
+
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
@@ -485,6 +502,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
         bias_shape = "none" if  bias is None else bias.shape
+        # print(bias_shape)
         # print("check_shape weight {} input {} bias {} ".format(layer.weight.shape, x.shape,  bias_shape))
         
         shape_collect = []
@@ -499,6 +517,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         do_kernel_selection = get_int_env_var("SGLANG_GEMM_KERNEL_SELC")
         M, N, K = shape_collect[0], layer.weight.shape[0], shape_collect[1]
         call_in_graph = torch.cuda.is_current_stream_capturing()
+        
+        if M <=256:
+            M = M
+        elif M>=256 and M <512:
+            M = align_to_closest(M, 8)
+        elif M>=512 and M <1024:
+            M = align_to_closest(M, 16)
+        elif M >=1024:
+            M = align_to_closest(M, 32)
+            
         
         if not hasattr(self, "device_name"):
             setattr(self, "device_name", torch.cuda.get_device_name())
@@ -548,6 +576,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             # if ori_len !=after_len:
             #     print("all shape {}".format(self.shape_table))
             selection_rets = kernel_selector.query_kernel_data(hash_device_name, (M,N,K), hash_dtype, "GEMM", call_in_graph)
+            
             # all case use default
             if not isinstance(selection_rets, list) or len(selection_rets) == 0:
                 pass
@@ -569,7 +598,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     print("p")
                     return triton_matmul(x, layer.weight, bias, kernel_config)
                 elif kernel_type == "triton_tma":
-                    return triton_matmul_persistent_tma(self.is_hopper, self.sum_num, x, layer.weight, bias, kernel_config)
+                    return triton_matmul_persistent_tma(self.is_hopper, self.sm_num, x, layer.weight, bias, kernel_config)
         # else:
             # print("check this case x.shape {} shape_collect {}".format(x.shape, shape_collect))                
         ret =  F.linear(x, layer.weight, bias)
