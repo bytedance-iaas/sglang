@@ -17,7 +17,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -336,7 +335,6 @@ class _DeepEPDispatcherImplBase:
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        static_scale: torch.Tensor = None,
     ):
         raise NotImplementedError
 
@@ -383,7 +381,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        static_scale: torch.Tensor = None,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
@@ -550,7 +547,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        static_scale: torch.Tensor = None,
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -562,7 +558,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            static_scale=static_scale,
         )
         return (
             hidden_states,
@@ -609,7 +604,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        static_scale: torch.Tensor = None,
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
@@ -626,8 +620,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                use_per_tensor_quantization=use_fp8 if static_scale is not None else False,
-                static_scale=static_scale,
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
@@ -783,9 +775,8 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        static_scale: torch.Tensor = None,
     ) -> DispatchOutput:
-        self.dispatch_a(hidden_states, topk_output, static_scale)
+        self.dispatch_a(hidden_states, topk_output)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
@@ -795,13 +786,11 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        static_scale: torch.Tensor = None,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
-            static_scale=static_scale,
         )
         self._dispatch_intermediate_state = inner_state
 
