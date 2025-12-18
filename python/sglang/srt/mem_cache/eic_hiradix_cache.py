@@ -840,6 +840,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         return load_node
 
     def _match_for_remote_fetch(self, node: TreeNode, key: RadixKey):
+        key, _ = self.maybe_bigram_convert(key)
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         local_prefix_len = 0
