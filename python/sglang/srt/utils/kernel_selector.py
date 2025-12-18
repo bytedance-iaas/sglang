@@ -68,11 +68,32 @@ def append_string_if_not_exists(filename, target_str):
 
 
 class KernelSelector:
+    def __del__(self):
+        print("========summary kernel selector status========")
+        for op_type in self.launch_times:
+            print("---> summary op {} status".format(op_type))
+            print("\t\t launch_times {}".format(self.launch_times[op_type]))
+            print("\t\t hit times {}".format(self.hit_times[op_type]))
+            print("\t\t unhit_shape")
+            for s in self.unhit_shape[op_type]:
+                print("\t\t\t {}".format(s))
+            print("\t\t kernel_launch_times{}")
+            for kernel in self.launch_data[op_type]:
+                print("\t\t\t {} : {} ".format(kernel, self.launch_data[op_type][kernel]))
+                
+        print("======summary end======")
+           
     def __init__(self):
         self.all_kernel_data = {}
         self.file_map = {}  # NEW: Maps level1_key -> file_path
         self.package_dir = None # NEW: Stores the directory of the package
         self.import_success = False
+        
+        self.launch_data = {}
+        self.hit_times = {}
+        self.launch_times = {}
+        self.unhit_shape = {}
+
         
         # 1. Try to import the main module
         try:
@@ -110,19 +131,39 @@ class KernelSelector:
         except (ImportError, ModuleNotFoundError) as e:
             warnings.warn(f"Failed to import 'kernel_select_data': {e}. Kernel selection will use defaults.")
             self.import_success = False
-
+    
+    def update_kernel_data(self, key, op_type):
+        if op_type not in self.launch_data:
+            self.launch_data[op_type] = {}
+        
+        if key not in self.launch_data[op_type]:
+            self.launch_data[op_type][key] = 1
+        else:
+            self.launch_data[op_type][key]+=1
+    
     def query_kernel_data(self, device_type: str, shape: List[int], data_type: str, op_type: str, run_in_graph: bool, **kwargs) -> str:
+        if op_type not in self.launch_data:
+            self.launch_data[op_type] = {}
+        self.launch_times[op_type]+=1
         if not self.import_success:
             return "default"
+        if op_type not in self.hit_times:
+            self.hit_times[op_type] = 0
+        
+        if op_type not in self.unhit_shape:
+            self.unhit_shape[op_type] = set()
         
         shape_str = "_".join(map(str, shape))
         level1_key = generate_level1_key(device_type, op_type, run_in_graph, data_type)
         
         if level1_key in self.all_kernel_data:
             specific_dict = self.all_kernel_data[level1_key]
-            return specific_dict.get(shape_str, "default")
-        
-        return "default"
+            if shape_str in specific_dict:
+                self.hit_times[op_type]+=1
+                return specific_dict[shape_str]
+            else :
+                self.unhit_shape[op_type].add(shape_str)
+                return "default"
 
     def refresh_kernel_data(self, level1_key: str):
             """

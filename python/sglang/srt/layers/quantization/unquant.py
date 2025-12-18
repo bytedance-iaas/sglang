@@ -455,6 +455,17 @@ def align_to_closest(x, align):
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
+    def __init__(self):
+        super().__init__()
+        
+        if not hasattr(self, "is_hopper"):
+            self.is_hopper = torch.cuda.get_device_capability()[0] == 9
+     
+        if not hasattr(self, "sm_num"):
+            self.sm_num = torch.cuda.get_device_properties("cuda").multi_processor_count
+            
+        if not hasattr(self, "device_name"):
+            self.device_name =  torch.cuda.get_device_name()
 
     def create_weights(
         self,
@@ -527,10 +538,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif M >=1024:
             M = align_to_closest(M, 32)
             
-        
-        if not hasattr(self, "device_name"):
-            setattr(self, "device_name", torch.cuda.get_device_name())
-            
         # only collect valid shape
         if len(shape_collect) == 2 and get_bool_env_var("SGLANG_RECORD_TUNE"):
             device_parts = self.device_name.split(" ")         
@@ -543,15 +550,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         
         if len(shape_collect) == 2  and do_kernel_selection:
             kernel_selector = get_kernel_selector()
-
-            if not hasattr(self, "is_hopper"):
-                is_hopper = torch.cuda.get_device_capability()[0] == 9
-                setattr(self, "is_hopper", is_hopper)
-            
-            if not hasattr(self, "sm_num"):
-                sm_num = torch.cuda.get_device_properties("cuda").multi_processor_count
-                setattr(self, "sm_num", sm_num)
-                
             # if not hasattr(self, "shape_table"):
             #     shape_table = set()
             #     setattr(self, "shape_table", shape_table)
@@ -569,12 +567,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             elif x.dtype == torch.float16:
                 hash_dtype = "FP16"
             
-            # ori_len = len(self.shape_table)
-            # self.shape_table.add((M,N,K))
-            # after_len = len(self.shape_table)
-            
-            # if ori_len !=after_len:
-            #     print("all shape {}".format(self.shape_table))
             selection_rets = kernel_selector.query_kernel_data(hash_device_name, (M,N,K), hash_dtype, "GEMM", call_in_graph)
             
             # all case use default
@@ -586,21 +578,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 kernel_config = selection_ret["kernel_config"]
                 
                 if kernel_type == "deep_gemm":
+                    # deepgemm currently not support gemm with bias
                     if (bias is None) and DEEP_GEMM_AVAILABLE:
+                        kernel_selector.update_kernel_data("deep_gemm")
                         return deep_gemm_matmul(x, layer.weight)
                     else:
                         if len(selection_rets)!=0:
                             selection_ret = selection_rets[-2]
                             kernel_type = selection_ret["kernel_type"]
                             kernel_config = selection_ret["kernel_config"]
+                            kernel_selector.update_kernel_data(kernel_type)
                 
                 if kernel_type == "triton":
-                    print("p")
                     return triton_matmul(x, layer.weight, bias, kernel_config)
                 elif kernel_type == "triton_tma":
                     return triton_matmul_persistent_tma(self.is_hopper, self.sm_num, x, layer.weight, bias, kernel_config)
         # else:
             # print("check this case x.shape {} shape_collect {}".format(x.shape, shape_collect))                
+        
         ret =  F.linear(x, layer.weight, bias)
         # print("ret shape {}".format(ret.shape))
         return ret
