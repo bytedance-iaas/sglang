@@ -4,6 +4,7 @@ import warnings
 import pkgutil
 import fcntl
 from typing import List, Optional
+from sglang.srt.utils import get_bool_env_var
 
 
 def generate_level1_key(device_type, op_type, graph_mode, data_type):
@@ -68,20 +69,6 @@ def append_string_if_not_exists(filename, target_str):
 
 
 class KernelSelector:
-    def __del__(self):
-        print("========summary kernel selector status========")
-        for op_type in self.launch_times:
-            print("---> summary op {} status".format(op_type))
-            print("\t\t launch_times {}".format(self.launch_times[op_type]))
-            print("\t\t hit times {}".format(self.hit_times[op_type]))
-            print("\t\t unhit_shape")
-            for s in self.unhit_shape[op_type]:
-                print("\t\t\t {}".format(s))
-            print("\t\t kernel_launch_times{}")
-            for kernel in self.launch_data[op_type]:
-                print("\t\t\t {} : {} ".format(kernel, self.launch_data[op_type][kernel]))
-                
-        print("======summary end======")
            
     def __init__(self):
         self.all_kernel_data = {}
@@ -131,10 +118,25 @@ class KernelSelector:
         except (ImportError, ModuleNotFoundError) as e:
             warnings.warn(f"Failed to import 'kernel_select_data': {e}. Kernel selection will use defaults.")
             self.import_success = False
-    
+
+    def summary_status(self):
+        print("========summary kernel selector status========")
+        for op_type in self.launch_times:
+            print("---> summary op {} status".format(op_type))
+            print("\t\t launch_times {}".format(self.launch_times[op_type]))
+            print("\t\t hit times {}".format(self.hit_times[op_type]))
+            print("\t\t unhit_shape")
+            for s in self.unhit_shape[op_type]:
+                print("\t\t\t {}".format(s))
+            print("\t\t kernel_launch_times")
+            for kernel in self.launch_data[op_type]:
+                print("\t\t\t {} : {} ".format(kernel, self.launch_data[op_type][kernel]))
+                
+        print("======summary end======")
+
     def update_kernel_data(self, key, op_type):
-        if op_type not in self.launch_data:
-            self.launch_data[op_type] = {}
+        if not self.import_success:
+            return
         
         if key not in self.launch_data[op_type]:
             self.launch_data[op_type][key] = 1
@@ -142,11 +144,20 @@ class KernelSelector:
             self.launch_data[op_type][key]+=1
     
     def query_kernel_data(self, device_type: str, shape: List[int], data_type: str, op_type: str, run_in_graph: bool, **kwargs) -> str:
-        if op_type not in self.launch_data:
-            self.launch_data[op_type] = {}
-        self.launch_times[op_type]+=1
         if not self.import_success:
             return "default"
+        if op_type not in self.launch_times:
+            self.launch_times[op_type] = 0
+        self.launch_times[op_type]+=1
+        
+        if op_type not in self.launch_data:
+            self.launch_data[op_type] = {}
+        
+        if get_bool_env_var("SHOW_SELECTOR_STATUS"):
+            if self.launch_times[op_type] % 1000 == 0 and self.launch_times[op_type] > 0:
+                self.summary_status()
+        
+       
         if op_type not in self.hit_times:
             self.hit_times[op_type] = 0
         

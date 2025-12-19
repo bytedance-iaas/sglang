@@ -570,7 +570,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             selection_rets = kernel_selector.query_kernel_data(hash_device_name, (M,N,K), hash_dtype, "GEMM", call_in_graph)
             
             # all case use default
-            if not isinstance(selection_rets, list) or len(selection_rets) == 0:
+            if not isinstance(selection_rets, list) or len(selection_rets) == 0 :#or True:
+                kernel_selector.update_kernel_data("cublas", "GEMM")
                 pass
             else:
                 selection_ret = selection_rets[-1]
@@ -580,14 +581,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 if kernel_type == "deep_gemm":
                     # deepgemm currently not support gemm with bias
                     if (bias is None) and DEEP_GEMM_AVAILABLE:
-                        kernel_selector.update_kernel_data("deep_gemm")
+                        kernel_selector.update_kernel_data("deep_gemm", "GEMM")
                         return deep_gemm_matmul(x, layer.weight)
                     else:
                         if len(selection_rets)!=0:
                             selection_ret = selection_rets[-2]
                             kernel_type = selection_ret["kernel_type"]
                             kernel_config = selection_ret["kernel_config"]
-                            kernel_selector.update_kernel_data(kernel_type)
+                
+                kernel_selector.update_kernel_data(kernel_type, "GEMM")
                 
                 if kernel_type == "triton":
                     return triton_matmul(x, layer.weight, bias, kernel_config)
