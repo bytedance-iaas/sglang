@@ -528,15 +528,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         do_kernel_selection = get_int_env_var("SGLANG_GEMM_KERNEL_SELC")
         M, N, K = shape_collect[0], layer.weight.shape[0], shape_collect[1]
         call_in_graph = torch.cuda.is_current_stream_capturing()
-        
-        if M <=256:
-            M = M
-        elif M>=256 and M <512:
-            M = align_to_closest(M, 8)
-        elif M>=512 and M <1024:
-            M = align_to_closest(M, 16)
-        elif M >=1024:
-            M = align_to_closest(M, 32)
+
+        #[NOTE] remove M align for best performance         
+        # if M <=256:
+        #     M = M
+        # elif M>=256 and M <512:
+        #     M = align_to_closest(M, 8)
+        # elif M>=512 and M <1024:
+        #     M = align_to_closest(M, 16)
+        # elif M >=1024:
+        #     M = align_to_closest(M, 32)
             
         # only collect valid shape
         if len(shape_collect) == 2 and get_bool_env_var("SGLANG_RECORD_TUNE"):
@@ -571,7 +572,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             
             # all case use default
             if not isinstance(selection_rets, list) or len(selection_rets) == 0 :#or True:
-                kernel_selector.update_kernel_data("cublas", "GEMM")
+                kernel_selector.update_kernel_data("default", "GEMM")
                 pass
             else:
                 selection_ret = selection_rets[-1]
