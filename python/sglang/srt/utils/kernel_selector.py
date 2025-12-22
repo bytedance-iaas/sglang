@@ -6,7 +6,10 @@ import fcntl
 from typing import List, Optional
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
-import torch
+import time
+import hashlib
+import threading
+import copy
 
 def generate_level1_key(device_type, op_type, graph_mode, data_type):
     return f"{device_type}_{data_type}_{op_type}_graphmode_{graph_mode}"
@@ -70,7 +73,11 @@ def append_string_if_not_exists(filename, target_str):
 
 
 class KernelSelector:
-           
+    
+    def __del__(self):
+        if self.update_thread is None:
+            return
+        self.update_thread.join()
     def __init__(self):
         self.all_kernel_data = {}
         self.file_map = {}  # NEW: Maps level1_key -> file_path
@@ -83,9 +90,11 @@ class KernelSelector:
         self.unhit_shape = {}
         
         self.acc_map = {}
-        self.report_step_num = 1000
+        self.report_step_num =  1000
+        self.monitor_interval = 30.0
+        self.files_last_hash = {}   
+        self.lock = threading.Lock()
 
-        
         # 1. Try to import the main module
         try:
             module = importlib.import_module("kernel_select_data")
@@ -112,6 +121,7 @@ class KernelSelector:
                                 if file_path.endswith('.pyc'):
                                     file_path = file_path[:-1]
                                 self.file_map[module_name] = file_path
+                                self.files_last_hash[module_name] = self._get_file_hash(file_path)
             
             print("import kernel_data @ {}".format(self.package_dir))
             print("file_map : {}".format(self.file_map))
@@ -122,7 +132,39 @@ class KernelSelector:
         except (ImportError, ModuleNotFoundError) as e:
             warnings.warn(f"Failed to import 'kernel_select_data': {e}. Kernel selection will use defaults.")
             self.import_success = False
-
+        
+        self.update_thread = None
+        if get_bool_env_var("KERNEL_SELECTION_UPDATE_ONLINE"):        
+            self.update_thread = threading.Thread(target=self._file_monitor_loop, daemon=True)
+            self.update_thread.start()
+    
+    def _file_monitor_loop(self):
+        while True:
+            time.sleep(self.monitor_interval)
+            for file_name in self.file_map:
+                current_hash = self._get_file_hash(self.file_map[file_name])
+                if current_hash != self.files_last_hash[file_name]:
+                    print("refresh")
+                    self.refresh_kernel_data(file_name)
+                else:
+                    print("not update")
+                self.files_last_hash[file_name] = current_hash
+    
+    def _get_file_hash(self, file_path):
+        try:
+            with open(file_path, 'rb') as f:
+                hash_obj = hashlib.md5()
+                while chunk := f.read(4096):
+                    hash_obj.update(chunk)
+                return hash_obj.hexdigest()
+        except FileNotFoundError:
+            print(f"[{time.ctime()}]  {file_path} not existed")
+            return None
+        except Exception as e:
+            print(f"[{time.ctime()}] load file failed{e}")
+            return None
+    
+    
     def summary_status(self):
         print("========summary kernel selector status========")
         for op_type in self.launch_times:
@@ -190,37 +232,50 @@ class KernelSelector:
         
         shape_str = "_".join(map(str, shape))
         level1_key = generate_level1_key(device_type, op_type, run_in_graph, data_type)
-        
-        if level1_key in self.all_kernel_data:
-            specific_dict = self.all_kernel_data[level1_key]
+        # add lock for all_kernel_data load
+        ret = None
+        if get_bool_env_var("KERNEL_SELECTION_UPDATE_ONLINE"):
+            with self.lock:
+            # if True:
+                if level1_key in self.all_kernel_data:
+                    specific_dict = self.all_kernel_data[level1_key]
+                if shape_str in specific_dict:
+                    self.hit_times[op_type]+=1
+                    ret = copy.deepcopy(specific_dict[shape_str])
+        else:
+            if level1_key in self.all_kernel_data:
+                specific_dict = self.all_kernel_data[level1_key]
             if shape_str in specific_dict:
                 self.hit_times[op_type]+=1
-                ret =  specific_dict[shape_str]
-                kernel_type = ret[-1]["kernel_type"]
-                if get_int_env_var("SHOW_SELECTOR_STATUS") == 1 and kernel_type !="default":
-                    if shape_str not in self.acc_map:
-                        self.acc_map[shape_str] = {}                                            
-                        default_letency = 0
-                        for data_dic in ret:
-                            if data_dic["kernel_type"] == "default":
-                                default_letency = data_dic["latency"]
-                                break
-                        
-                        selected_latency = ret[-1]["latency"]
-                        abs_accerlate = default_letency - selected_latency
-                        relative_accerlate = abs_accerlate / default_letency
-                        self.acc_map[shape_str]["abs_acc"] =  abs_accerlate
-                        self.acc_map[shape_str]["rel_acc"] = relative_accerlate
-                        self.acc_map[shape_str]["hit_times"]= 1
-                    else:
-                        self.acc_map[shape_str]["hit_times"]+=1
-                return ret
-            else :
-                if run_in_graph:
-                    shape_str+="_graph"
-                self.unhit_shape[op_type].add(shape_str)
-                
-                return "default"
+                ret = specific_dict[shape_str]
+            
+                # ret = specific_dict[shape_str] 
+        if isinstance(ret, List):                
+            kernel_type = ret[-1]["kernel_type"]
+            if get_int_env_var("SHOW_SELECTOR_STATUS") == 1 and kernel_type !="default":
+                if shape_str not in self.acc_map:
+                    self.acc_map[shape_str] = {}                                            
+                    default_letency = 0
+                    for data_dic in ret:
+                        if data_dic["kernel_type"] == "default":
+                            default_letency = data_dic["latency"]
+                            break
+                    
+                    selected_latency = ret[-1]["latency"]
+                    abs_accerlate = default_letency - selected_latency
+                    relative_accerlate = abs_accerlate / default_letency
+                    self.acc_map[shape_str]["abs_acc"] =  abs_accerlate
+                    self.acc_map[shape_str]["rel_acc"] = relative_accerlate
+                    self.acc_map[shape_str]["hit_times"]= 1
+                else:
+                    self.acc_map[shape_str]["hit_times"]+=1
+            return ret
+        else :
+            if run_in_graph:
+                shape_str+="_graph"
+            self.unhit_shape[op_type].add(shape_str)
+            
+            return "default"
 
     def refresh_kernel_data(self, level1_key: str):
             """
@@ -271,20 +326,16 @@ class KernelSelector:
                             # If parse fails, we proceed with empty disk_data (overwrite risk, but safer than crashing)
 
                     # 4. MERGE: Disk Data + Current Memory + New Updates
-                    if level1_key not in self.all_kernel_data:
-                        self.all_kernel_data[level1_key] = {}
-                    
-                    # Step A: Update our memory with what was actually on disk 
-                    # (Syncs us with other processes)
-                    self.all_kernel_data[level1_key].update(disk_data)
+                    # add lock for all_kernel_data update
+                    with self.lock:                        
+                        # Step A: Update our memory with what was actually on disk 
+                        # (Syncs us with other processes)
+                        self.all_kernel_data[level1_key].update(disk_data)
                     
                 finally:
                     # [UNLOCK] Release the lock
                     fcntl.flock(f, fcntl.LOCK_UN)
     # should update background
-    def update_all_kernel_datas(self):
-        for level_1_key in self.all_kernel_data:
-            self.refresh_kernel_data(level_1_key)
 # Example Usage:
 # if __name__ == "__main__":
 #     selector = get_kernel_selector()
