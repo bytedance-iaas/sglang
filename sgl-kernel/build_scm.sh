@@ -122,7 +122,7 @@ else
     # 上传制品到 tos
     for wheel_file in $(find $OUTPUT_PATH -name "*.whl"); do
         echo "uploading $wheel_file to tos..."
-        tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) -re cn-beijing -e tos-cn-beijing.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+        tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) -re cn-beijing -e dualstack.cn-beijing.tos.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
     done
 fi
 
