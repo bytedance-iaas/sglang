@@ -109,7 +109,7 @@ source build.sh $PYTHON_VERSION $CUDA_VERSION
 # 产物放到 output 目录下
 cp -r $ROOT_PATH/sgl-kernel/dist/* $OUTPUT_PATH/
 
-TOS_UTIL_URL=https://tos-tools.tos-cn-beijing.volces.com/linux/amd64/tosutil
+TOS_UTIL_URL=https://tos-tools.dualstack.cn-beijing.tos.volces.com/linux/amd64/tosutil
 if [ ! -z "$CUSTOM_TOS_UTIL_URL" ]; then
     TOS_UTIL_URL=$CUSTOM_TOS_UTIL_URL
 fi
