@@ -109,7 +109,7 @@ source build.sh $PYTHON_VERSION $CUDA_VERSION
 # 产物放到 output 目录下
 cp -r $ROOT_PATH/sgl-kernel/dist/* $OUTPUT_PATH/
 
-TOS_UTIL_URL=https://tos-tools.tos-cn-beijing.volces.com/linux/amd64/tosutil
+TOS_UTIL_URL=https://tos-tools.dualstack.cn-beijing.tos.volces.com/linux/amd64/tosutil
 if [ ! -z "$CUSTOM_TOS_UTIL_URL" ]; then
     TOS_UTIL_URL=$CUSTOM_TOS_UTIL_URL
 fi
@@ -122,7 +122,7 @@ else
     # 上传制品到 tos
     for wheel_file in $(find $OUTPUT_PATH -name "*.whl"); do
         echo "uploading $wheel_file to tos..."
-        tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) -re cn-beijing -e tos-cn-beijing.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+        tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) -re cn-beijing -e dualstack.cn-beijing.tos.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
     done
 fi
 

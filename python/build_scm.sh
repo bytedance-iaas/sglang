@@ -9,18 +9,6 @@ BUILD_TIME=$(date +%Y%m%d%H%M)
 BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
 echo "BRANCH_NAME: $BRANCH_NAME"
 
-# 测试域名连通性
-DOMAINS=("tos-cn-beijing.volces.com" "tos-cn-beijing.ivolces.com" "dualstack.cn-beijing.tos.volces.com" "tos-cn-beijing-inner.ivolces.com")
-
-for DOMAIN in "${DOMAINS[@]}"; do
-    echo "Pinging $DOMAIN..."
-    if ping -c 1 -W 2 "$DOMAIN" > /dev/null 2>&1; then
-        echo "$DOMAIN is reachable"
-    else
-        echo "$DOMAIN is NOT reachable"
-    fi
-done
-
 # 如果分支是以 release_ 或 release/ 开头，则将 release_ 或 release/ 替换为空
 if [[ $BRANCH_NAME =~ ^release[\/_] ]]; then
     BRANCH_NAME=${BRANCH_NAME#release}
@@ -40,7 +28,7 @@ fi
 
 echo "VERSION_SUFFIX: $VERSION_SUFFIX"
 
-TOS_UTIL_URL=https://tos-tools.tos-cn-beijing.volces.com/linux/amd64/tosutil
+TOS_UTIL_URL=https://tos-tools.dualstack.cn-beijing.tos.volces.com/linux/amd64/tosutil
 if [ ! -z "$CUSTOM_TOS_UTIL_URL" ]; then
     TOS_UTIL_URL=$CUSTOM_TOS_UTIL_URL
 fi
@@ -69,6 +57,6 @@ else
     wget $TOS_UTIL_URL -O tosutil && chmod +x tosutil
     for wheel_file in $(find $OUTPUT_PATH -name "*.whl"); do
         echo "uploading $wheel_file to tos..."
-        ./tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sglang/$(basename $wheel_file) -re cn-beijing -e tos-cn-beijing.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+        ./tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sglang/$(basename $wheel_file) -re cn-beijing -e dualstack.cn-beijing.tos.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
     done
 fi
