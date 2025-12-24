@@ -161,6 +161,8 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.failure_records: Dict[int, str] = {}
+        self.failure_lock = threading.Lock()
         self.init_engine()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -224,8 +226,12 @@ class MooncakeKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
             )
 
-        self.failure_records: Dict[int, str] = {}
-        self.failure_lock = threading.Lock()
+
+    def _ensure_failure_tracking(self):
+        if not hasattr(self, "failure_lock"):
+            self.failure_lock = threading.Lock()
+        if not hasattr(self, "failure_records"):
+            self.failure_records = {}
 
     def init_engine(self):
         self.engine = MooncakeTransferEngine(
@@ -1031,6 +1037,7 @@ class MooncakeKVManager(CommonKVManager):
                 )
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
+        self._ensure_failure_tracking()
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
