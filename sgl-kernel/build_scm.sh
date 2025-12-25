@@ -104,7 +104,7 @@ if [[ "${SCM_BUILD}" == "True" ]]; then
     source /root/start_dockerd.sh
 fi
 
-source build.sh $PYTHON_VERSION $CUDA_VERSION
+USE_CCACHE=1 source build.sh $PYTHON_VERSION $CUDA_VERSION
 
 # 产物放到 output 目录下
 cp -r $ROOT_PATH/sgl-kernel/dist/* $OUTPUT_PATH/
