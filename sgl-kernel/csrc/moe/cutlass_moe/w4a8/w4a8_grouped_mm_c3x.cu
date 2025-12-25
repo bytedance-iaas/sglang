@@ -107,47 +107,14 @@ void dispatch_w4a8_moe_mm_sm90(
    if (n == 4096 && k == 7168) {
     // group gemm 1
     if (m <= 4) {
-      invoke_gemm<SM90_PP<64, 32, 512, 2, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
+    } else if (m <= 32) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
     } else if (m <= 64) {
-      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else if (m <= 512) {
-      invoke_gemm<SM90_CO<128, 64, 512, 1, 2, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+    } else if (m <= 256) {
+      // update tune
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     } else if (m <= 1024) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else if (m <= 4096) {
@@ -160,49 +127,12 @@ void dispatch_w4a8_moe_mm_sm90(
   } else if (n == 7168 && k == 2048) {
     // group gemm 2
     if (m <= 8) {
-      invoke_gemm<SM90_PP<64, 16, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 512, 1, 1, 1>));
     } else if (m <= 64) {
-      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else if (m <= 256) {
-      invoke_gemm<SM90_CO<128, 64, 512, 1, 2, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else if (m <= 512) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+    } else if (m <= 512) {
+      // update tune
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     } else if (m <= 4096) {
       // Optimized for prefill: larger cluster for better throughput
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
