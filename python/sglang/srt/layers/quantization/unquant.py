@@ -571,7 +571,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             selection_rets = kernel_selector.query_kernel_data(hash_device_name, (M,N,K), hash_dtype, "GEMM", call_in_graph)
             
             # all case use default
-            if not isinstance(selection_rets, list) or len(selection_rets) == 0 or True:
+            if not isinstance(selection_rets, list) or len(selection_rets) == 0 :
                 kernel_selector.update_kernel_data("default", "GEMM")
                 pass
             else:

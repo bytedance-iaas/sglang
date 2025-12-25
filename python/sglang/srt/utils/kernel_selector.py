@@ -90,7 +90,7 @@ class KernelSelector:
         self.unhit_shape = {}
         
         self.acc_map = {}
-        self.report_step_num =  1000
+        self.report_step_num =  5000
         self.monitor_interval = 30.0
         self.files_last_hash = {}   
         self.lock = threading.Lock()
@@ -193,9 +193,9 @@ class KernelSelector:
             for kernel in self.launch_data[op_type]:
                 print("\t\t\t {} : {} ".format(kernel, self.launch_data[op_type][kernel]))
         
-        # for shape_str in self.acc_map:
-        #     print("\n=====check shape {} speedup======".format(shape_str))
-        #     print("\tabs {} rel {} hit_times {}".format(self.acc_map[shape_str]["abs_acc"], self.acc_map[shape_str]["rel_acc"], self.acc_map[shape_str]["hit_times"]))
+        for shape_str in self.acc_map:
+            print("\n=====check shape {} speedup======".format(shape_str))
+            print("\tabs {} rel {} hit_times {}".format(self.acc_map[shape_str]["abs_acc"], self.acc_map[shape_str]["rel_acc"], self.acc_map[shape_str]["hit_times"]))
                 
         print("======summary end======")
 
