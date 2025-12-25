@@ -108,10 +108,13 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 1
     if (m <= 4) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
+    } else if (m <= 32) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
     } else if (m <= 64) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 2, 1>));
+      // update tune
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     } else if (m <= 1024) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else if (m <= 4096) {
@@ -128,7 +131,8 @@ void dispatch_w4a8_moe_mm_sm90(
     } else if (m <= 64) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 512) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 2, 1>));
+      // update tune
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     } else if (m <= 4096) {
       // Optimized for prefill: larger cluster for better throughput
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
