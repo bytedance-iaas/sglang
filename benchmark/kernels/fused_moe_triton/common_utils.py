@@ -161,12 +161,12 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     if is_hip():
         configs = get_rocm_configs_compute_bound()
     else:
-        for num_stages in [2, 3, 4, 5]:
-            for block_m in [16, 32, 64, 128, 256]:
-                for block_k in [64, 128, 256]:
-                    for block_n in [32, 64, 128, 256]:
-                        for num_warps in [4, 8]:
-                            for group_size in [1, 16, 32, 64]:
+        for num_stages in [2, 3, 4]:
+            for block_m in [256, 128, 64, 32, 16]:
+                for block_k in [256, 128, 64]:
+                    for block_n in [256, 128, 64, 32]:
+                        for num_warps in [8, 4]:
+                            for group_size in [32, 16, 1]:
                                 configs.append(
                                     {
                                         "BLOCK_SIZE_M": block_m,
@@ -239,22 +239,24 @@ def get_config_filename(
 
 def get_default_batch_sizes() -> List[int]:
     return [
-        1,
-        2,
-        4,
-        8,
-        16,
-        24,
-        32,
-        48,
-        64,
-        96,
-        128,
-        256,
-        512,
-        1024,
-        1536,
-        2048,
-        3072,
+        16384,
+        8192,
         4096,
+        3072,
+        2048,
+        1536,
+        1024,
+        512,
+        256,
+        128,
+        96,
+        64,
+        48,
+        32,
+        24,
+        16,
+        8,
+        4,
+        2,
+        1,
     ]
