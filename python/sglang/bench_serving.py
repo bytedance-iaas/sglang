@@ -2154,7 +2154,6 @@ async def benchmark(
     )
     print(
         "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
             "Total token throughput (tok/s):",
             (
                 metrics.total_throughput_retokenized
