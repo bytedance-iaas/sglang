@@ -292,6 +292,8 @@ class Scheduler(
         self.enable_eic_cache = (
             server_args.enable_eic_cache if self.enable_hierarchical_cache else False
         )
+        self.think_start_token_id = None
+        self.think_end_token_id = None
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -321,6 +323,14 @@ class Scheduler(
 
         # Init moe config
         self.init_moe_config()
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.tokenizer.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -360,7 +370,25 @@ class Scheduler(
         # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
+            self.relaxed_thinking = get_global_server_args().speculative_relaxed_thinking
+            if self.server_args.speculative_reasoning_parser and self.tokenizer:
+                spec_reasoning_parser = ReasoningParser(
+                    model_type=self.server_args.speculative_reasoning_parser,
+                    stream_reasoning=False,
+                )
+                self.think_start_token_id = self.tokenizer.encode(
+                    spec_reasoning_parser.detector.think_start_token,
+                    add_special_tokens=False,
+                )[0]
+                self.think_end_token_id = self.tokenizer.encode(
+                    spec_reasoning_parser.detector.think_end_token,
+                    add_special_tokens=False,
+                )[0]
+            
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
+        draft_worker_kwargs["think_start_token_id"] = self.think_start_token_id
+        draft_worker_kwargs["think_end_token_id"] = self.think_end_token_id
+
         self.draft_worker = self.spec_algorithm.create_draft_worker(
             **draft_worker_kwargs
         )
@@ -1375,6 +1403,9 @@ class Scheduler(
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                think_start_token_id=self.think_start_token_id,
+                think_end_token_id=self.think_end_token_id,
+                relaxed_thinking=self.server_args.speculative_relaxed_thinking,
             )
             req.tokenizer = self.tokenizer
 

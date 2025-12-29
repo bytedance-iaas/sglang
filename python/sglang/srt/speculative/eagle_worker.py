@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -82,6 +82,8 @@ class EAGLEWorker(TpModelWorker):
         moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        think_start_token_id: Optional[int] = None,
+        think_end_token_id: Optional[int] = None,
     ):
         # Parse arguments
         self.server_args = server_args
@@ -190,6 +192,11 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        self.relaxed_thinking = get_global_server_args().speculative_relaxed_thinking
+        if self.relaxed_thinking:
+            self.think_start_token_id = think_start_token_id
+            self.think_end_token_id = think_end_token_id
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -351,6 +358,16 @@ class EAGLEWorker(TpModelWorker):
             batch_result.logits_output,
             batch_result.next_token_ids,
         )
+
+        if self.relaxed_thinking:
+            thinking_states = batch.thinking_states()
+            for i, tok in enumerate(next_token_ids):
+                if tok == self.think_start_token_id:
+                    thinking_states[i] = True
+                elif tok == self.think_end_token_id:
+                    thinking_states[i] = False
+            batch.update_thinking_states(thinking_states)
+
         return (
             logits_output,
             next_token_ids,
@@ -723,6 +740,9 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+        
+        if self.relaxed_thinking:
+            batch.update_thinking_states(res.thinking_states)
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)

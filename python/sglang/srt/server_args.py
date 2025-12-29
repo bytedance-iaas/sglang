@@ -392,6 +392,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_relaxed_thinking: bool = False
+    speculative_reasoning_parser: Optional[str] = None
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
@@ -1766,6 +1768,11 @@ class ServerArgs:
                 raise ValueError(
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
+                
+            if self.speculative_relaxed_thinking:
+                assert (
+                    self.speculative_reasoning_parser
+                ), "Must set speculative reasoning parser when using relaxed thinking."
 
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
@@ -2993,6 +3000,19 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-relaxed-thinking",
+            action="store_true",
+            default=ServerArgs.speculative_relaxed_thinking,
+            help="Relaxed acceptance for thinking tokens.",
+        )
+        parser.add_argument(
+            "--speculative-reasoning-parser",
+            type=str,
+            choices=list(ReasoningParser.DetectorMap.keys()),
+            default=ServerArgs.speculative_reasoning_parser,
+            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
         parser.add_argument(
             "--speculative-token-map",
