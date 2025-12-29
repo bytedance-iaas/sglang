@@ -339,17 +339,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 (bs,), dtype=torch.float32, device=batch.device
             )
             
-            threshold_singles = torch.ones_like(
-                coins_for_final_sampling, dtype=torch.float32, device="cuda"
+            threshold_singles = torch.ones(
+                (bs,), dtype=torch.float32, device=batch.device
             )
-            threshold_accs = torch.ones_like(
-                coins_for_final_sampling, dtype=torch.float32, device="cuda"
+            threshold_accs = torch.ones(
+                (bs,), dtype=torch.float32, device=batch.device
             )
             if relaxed_thinking:
                 thinking_states = batch.thinking_states()
-                thinking_states_ts = torch.tensor(thinking_states, device="cuda")
+                thinking_states_ts = batch.thinking_states_tensor(batch.device)
             else:
-                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device="cuda")
+                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device=batch.device)
                 
             threshold_singles[thinking_states_ts] = get_global_server_args().speculative_accept_threshold_single
             threshold_accs[thinking_states_ts] = get_global_server_args().speculative_accept_threshold_acc

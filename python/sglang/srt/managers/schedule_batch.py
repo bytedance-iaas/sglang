@@ -1563,6 +1563,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert len(thinking_states) == len(self.reqs)
         for req, s in zip(self.reqs, thinking_states):
             req.is_thinking = s
+        if hasattr(self, "_thinking_states_cache"):
+            self._thinking_states_cache.clear()
+
+    def thinking_states_tensor(self, device: str, dtype: torch.dtype = torch.bool):
+        if not getattr(self, "relaxed_thinking", False):
+            return torch.ones(len(self.reqs), dtype=dtype, device=device)
+        if not hasattr(self, "_thinking_states_cache"):
+            self._thinking_states_cache = {}
+        key = (device, dtype, len(self.reqs))
+        t = self._thinking_states_cache.get(key)
+        if t is None or t.device.type != device or t.dtype != dtype or t.numel() != len(self.reqs):
+            t = torch.tensor([req.is_thinking for req in self.reqs], dtype=dtype, device=device)
+            self._thinking_states_cache[key] = t
+        return t
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
