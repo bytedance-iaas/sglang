@@ -257,7 +257,8 @@ class NativeSparseAttnBackend(AttentionBackend):
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
-        self.mha_nsa_index_topk = get_int_env_var("SGLANG_MHA_NSA_INDEX_TOPK", self.nsa_index_topk*3)
+        mha_nsa_index_topk_value = self.nsa_index_topk*6 if self.nsa_kv_cache_store_fp8 else self.nsa_index_topk*3
+        self.mha_nsa_index_topk = get_int_env_var("SGLANG_MHA_NSA_INDEX_TOPK", mha_nsa_index_topk_value)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
