@@ -339,20 +339,30 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 (bs,), dtype=torch.float32, device=batch.device
             )
             
-            threshold_singles = torch.ones(
-                (bs,), dtype=torch.float32, device=batch.device
+            # threshold_singles and threshold_accs are the thresholds for single token and accumulated tokens respectively.
+            args_single_threshold = get_global_server_args().speculative_accept_threshold_single
+            args_acc_threshold = get_global_server_args().speculative_accept_threshold_acc
+            threshold_singles = torch.full(
+                (bs,),  # 形状
+                fill_value=args_single_threshold,  # 填充值
+                dtype=torch.float32,
+                device=batch.device
             )
-            threshold_accs = torch.ones(
-                (bs,), dtype=torch.float32, device=batch.device
+
+            threshold_accs = torch.full(
+                (bs,),
+                fill_value=args_acc_threshold,
+                dtype=torch.float32,
+                device=batch.device
             )
             if relaxed_thinking:
                 thinking_states = batch.thinking_states()
                 thinking_states_ts = batch.thinking_states_tensor(batch.device)
             else:
                 thinking_states_ts = torch.ones(bs, dtype=torch.bool, device=batch.device)
-                
-            threshold_singles[thinking_states_ts] = get_global_server_args().speculative_accept_threshold_single
-            threshold_accs[thinking_states_ts] = get_global_server_args().speculative_accept_threshold_acc
+            # For relaxed thinking mode, we reduce the thresholds for single token and accumulated tokens respectively.
+            threshold_singles[thinking_states_ts] = args_single_threshold / 10.0
+            threshold_accs[thinking_states_ts] = args_acc_threshold / 10.0
             
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
