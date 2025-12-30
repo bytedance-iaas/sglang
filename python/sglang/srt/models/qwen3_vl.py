@@ -46,6 +46,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -611,6 +613,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.enable_batch_compute_mm_embeddings = (
+            get_global_server_args().enable_batch_compute_mm_embeddings
+        )
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -685,12 +691,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        # if self.use_data_parallel:
-        #     return run_dp_sharded_mrope_vision_model(
-        #         self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
-        #     )
-        # else:
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if self.use_data_parallel and (not self.enable_batch_compute_mm_embeddings):
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
