@@ -226,7 +226,7 @@ pub struct HealthConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: 5,
+            timeout_secs: 30,
             check_interval_secs: 30,
             endpoint: "/health".to_string(),
             failure_threshold: 3,
