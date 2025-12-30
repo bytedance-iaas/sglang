@@ -196,7 +196,7 @@ impl Router {
 
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(worker_startup_timeout_secs))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
