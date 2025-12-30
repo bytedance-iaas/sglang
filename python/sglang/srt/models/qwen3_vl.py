@@ -1076,7 +1076,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
-
+        self.enable_batch_compute_mm_embeddings = (
+            get_global_server_args().enable_batch_compute_mm_embeddings
+        )
+        
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -1180,7 +1183,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
-        if self.use_data_parallel:
+        if self.use_data_parallel and (not self.enable_batch_compute_mm_embeddings):
             return run_dp_sharded_mrope_vision_model(
                 self.visual,
                 pixel_values,
