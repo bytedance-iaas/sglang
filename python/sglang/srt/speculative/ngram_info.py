@@ -352,6 +352,19 @@ class NgramVerifyInput(SpecInput):
         coins_for_final_sampling = torch.rand(
             (bs,), dtype=torch.float32, device=self.device
         )
+        threshold_singles = torch.full(
+            (bs,),
+            get_global_server_args().speculative_accept_threshold_single,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        threshold_accs = torch.full(
+            (bs,),
+            get_global_server_args().speculative_accept_threshold_acc,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
         tree_speculative_sampling_target_only(
             predicts=self.predict,  # mutable
             accept_index=self.accept_index,  # mutable
@@ -364,8 +377,8 @@ class NgramVerifyInput(SpecInput):
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=get_global_server_args().speculative_accept_threshold_single,
-            threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+            threshold_singles=threshold_singles,
+            threshold_accs=threshold_accs,
             deterministic=True,
         )
 

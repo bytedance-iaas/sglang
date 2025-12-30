@@ -224,6 +224,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     dtype=torch.int32,
                     device=batch.device,
                 ),
+                # Tracking the contents if they are in thinking mode.
+                thinking_states=None,
             )
 
         bs = self.retrive_index.shape[0]
@@ -273,6 +275,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
+            
+        relaxed_thinking = get_global_server_args().speculative_relaxed_thinking
+        thinking_states = None
 
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
@@ -333,6 +338,32 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
+            
+            # threshold_singles and threshold_accs are the thresholds for single token and accumulated tokens respectively.
+            args_single_threshold = get_global_server_args().speculative_accept_threshold_single
+            args_acc_threshold = get_global_server_args().speculative_accept_threshold_acc
+            threshold_singles = torch.full(
+                (bs,),  # 形状
+                fill_value=args_single_threshold,  # 填充值
+                dtype=torch.float32,
+                device=batch.device
+            )
+
+            threshold_accs = torch.full(
+                (bs,),
+                fill_value=args_acc_threshold,
+                dtype=torch.float32,
+                device=batch.device
+            )
+            if relaxed_thinking:
+                thinking_states = batch.thinking_states()
+                thinking_states_ts = batch.thinking_states_tensor(batch.device)
+            else:
+                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device=batch.device)
+            # For relaxed thinking mode, we reduce the thresholds for single token and accumulated tokens respectively.
+            threshold_singles[thinking_states_ts] = args_single_threshold / 10.0
+            threshold_accs[thinking_states_ts] = args_acc_threshold / 10.0
+            
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -345,8 +376,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                threshold_singles=threshold_singles,
+                threshold_accs=threshold_accs,
                 deterministic=True,
             )
 
@@ -374,6 +405,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     break
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                if relaxed_thinking and thinking_states:
+                    if id == req.think_start_token_id:
+                        thinking_states[i] = True
+                    elif id == req.think_end_token_id:
+                        thinking_states[i] = False
                 req.check_finished()
                 if req.finished():
                     has_finished = True
@@ -512,6 +548,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 verified_id=verified_id,
                 accept_length_per_req_cpu=draft_input.accept_length_cpu,
                 accepted_indices=accept_index,
+                # Tracking the contents if they are in thinking mode.
+                thinking_states=thinking_states,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -585,6 +623,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_list,
                 accepted_indices=accept_index,
+                # Tracking the contents if they are in thinking mode.
+                thinking_states=thinking_states,
             )
 
 
@@ -794,3 +834,5 @@ class EagleVerifyOutput:
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+    # Tracking the contents if they are in thinking mode.
+    thinking_states: Optional[List[bool]]

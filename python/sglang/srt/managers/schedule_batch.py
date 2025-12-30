@@ -776,6 +776,9 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        think_start_token_id: Optional[int] = None,
+        think_end_token_id: Optional[int] = None,
+        relaxed_thinking: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -785,6 +788,19 @@ class Req:
             if origin_input_ids_unpadded
             else origin_input_ids  # Before image padding
         )
+        self.relaxed_thinking = relaxed_thinking
+        if self.relaxed_thinking:
+            assert think_start_token_id is not None
+            self.is_thinking = False
+            self.think_start_token_id = think_start_token_id
+            self.think_end_token_id = think_end_token_id
+            for i in range(len(self.origin_input_ids_unpadded) - 1, -1, -1):
+                if self.origin_input_ids_unpadded[i] == think_start_token_id:
+                    self.is_thinking = True
+                    break
+                if self.origin_input_ids_unpadded[i] == think_end_token_id:
+                    break
+
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = []
@@ -1000,6 +1016,7 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.is_thinking = False
 
     @property
     def seqlen(self) -> int:
@@ -1393,6 +1410,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
+    next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
@@ -1536,6 +1554,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_dllm(self):
         return self.dllm_config is not None
+    def thinking_states(self):
+        return [req.is_thinking for req in self.reqs]
+
+    def update_thinking_states(self, thinking_states: Optional[list[bool]]):
+        if thinking_states is None:
+            return
+        assert len(thinking_states) == len(self.reqs)
+        for req, s in zip(self.reqs, thinking_states):
+            req.is_thinking = s
+        if hasattr(self, "_thinking_states_cache"):
+            self._thinking_states_cache.clear()
+
+    def thinking_states_tensor(self, device: str, dtype: torch.dtype = torch.bool):
+        if not getattr(self, "relaxed_thinking", False):
+            return torch.ones(len(self.reqs), dtype=dtype, device=device)
+        if not hasattr(self, "_thinking_states_cache"):
+            self._thinking_states_cache = {}
+        key = (device, dtype, len(self.reqs))
+        t = self._thinking_states_cache.get(key)
+        if t is None or t.device.type != device or t.dtype != dtype or t.numel() != len(self.reqs):
+            t = torch.tensor([req.is_thinking for req in self.reqs], dtype=dtype, device=device)
+            self._thinking_states_cache[key] = t
+        return t
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []

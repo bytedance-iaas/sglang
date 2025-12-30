@@ -140,7 +140,7 @@ async def async_request_trt_llm(
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
-            "temperature": 0.000001,
+            "temperature": args.temperature if args.temperature else 0.000001,
             "top_p": 1.0,
             "max_tokens": request_func_input.output_len,
             "stream": True,
@@ -213,7 +213,7 @@ async def async_request_openai_completions(
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
+            "temperature": args.temperature if args.temperature else 0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
@@ -342,8 +342,8 @@ async def async_request_openai_chat_completions(
         payload = {
             "model": request_func_input.model,
             "messages": messages,
-            "temperature": 0.0,
-            "max_completion_tokens": request_func_input.output_len,
+            "temperature": args.temperature if args.temperature else 0.0,
+            "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
@@ -353,6 +353,8 @@ async def async_request_openai_chat_completions(
         if request_func_input.lora_name:
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
+        if args.chat_completions_unset_output_len:
+            payload.pop("max_tokens")
 
         headers = get_auth_headers()
 
@@ -452,7 +454,7 @@ async def async_request_truss(
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
+            "temperature": args.temperature if args.temperature else 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
@@ -529,7 +531,7 @@ async def async_request_sglang_generate(
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
             "sampling_params": {
-                "temperature": 0.0,
+                "temperature": args.temperature if args.temperature else 0.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": not args.disable_ignore_eos,
             },
@@ -2132,7 +2134,12 @@ async def benchmark(
     )
     print(
         "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
+            "Output token throughput (tok/s):",
+            (
+                metrics.output_throughput_retokenized
+                if args.chat_completions_unset_output_len
+                else metrics.output_throughput
+            ),
         )
     )
     print(
@@ -2147,7 +2154,12 @@ async def benchmark(
     )
     print(
         "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
+            "Total token throughput (tok/s):",
+            (
+                metrics.total_throughput_retokenized
+                if args.chat_completions_unset_output_len
+                else metrics.total_throughput
+            ),
         )
     )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
@@ -2862,6 +2874,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
+    )
+    group.add_argument(
+        "--temperature", type=float, default=None, help="Temperature used in sampling"
+    )
+    group.add_argument(
+        "--chat-completions-unset-output-len",
+        action="store_true",
+        help="Unset max output length when using chat completions backend.",
     )
     args = parser.parse_args()
     run_benchmark(args)

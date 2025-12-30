@@ -338,6 +338,19 @@ class EagleVerifyInputV2Mixin:
                 (bs,), dtype=torch.float32, device=device
             )
 
+            threshold_singles = torch.full(
+                (bs,),
+                get_global_server_args().speculative_accept_threshold_single,
+                dtype=torch.float32,
+                device=device,
+            )
+            threshold_accs = torch.full(
+                (bs,),
+                get_global_server_args().speculative_accept_threshold_acc,
+                dtype=torch.float32,
+                device=device,
+            )
+
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -350,8 +363,8 @@ class EagleVerifyInputV2Mixin:
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                threshold_singles=threshold_singles,
+                threshold_accs=threshold_accs,
                 deterministic=True,
             )
 
