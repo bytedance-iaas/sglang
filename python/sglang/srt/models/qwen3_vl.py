@@ -1161,11 +1161,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def get_mm_dp_metadata(self):
+        return self.visual.spatial_merge_unit, "rope_3d"
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        if pixel_values.shape[0] == 0:
+            if self.use_data_parallel:
+                return torch.empty(
+                    (0, self.visual.out_hidden_size),
+                    device=pixel_values.device,
+                    dtype=pixel_values.dtype,
+                )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
@@ -1179,6 +1189,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             )
         else:
             return self.visual(pixel_values, grid_thw=image_grid_thw)
+
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
