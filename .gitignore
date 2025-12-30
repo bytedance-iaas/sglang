@@ -258,3 +258,6 @@ outputs/
 *.nsys-rep
 *.ncu-rep
 *.nvcudmp
+# docker
+docker/eic*
+docker/config
