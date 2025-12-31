@@ -14,6 +14,10 @@ import numpy as np
 import torch
 from torch import nn
 
+<<<<<<< HEAD
+=======
+from sglang.srt.distributed.parallel_state import get_tp_group
+>>>>>>> 34969ea3c7 (code clean)
 from sglang.srt.environ import envs
 from python.sglang.srt.managers.scheduler_multimodal import (
     MMDPSchedulePolicy,
@@ -27,7 +31,16 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+<<<<<<< HEAD
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+=======
+from sglang.srt.managers.scheduler_multimodal import (
+    MMDPSchedulePolicy,
+    MMDPScheduler,
+    MMPackPolicy,
+)
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+>>>>>>> 34969ea3c7 (code clean)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
@@ -775,18 +788,6 @@ def _get_chunked_prefill_embedding_batch(
                 model_specific_data={"image_grid_thw": grid_thw},
             )
         ]
-
-    # if max_iterations > 1:
-    #     batch_compute_embedding = _get_chunked_prefill_embedding_batch(
-    #         data_embedding_func,
-    #         get_mm_dp_metadata_func,
-    #         embedding_items,
-    #         items_size,
-    #         prefix_length,
-    #         extend_length,
-    #         items_offset_list,
-    #     )
-    #     return batch_compute_embedding
 
     # step2: calculate embeddings
     use_encoder_dp = get_global_server_args().mm_enable_dp_encoder
