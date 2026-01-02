@@ -613,6 +613,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or enable_nextn_moe_sparse_fully_dp(is_nextn)
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
             self.shared_experts = DeepseekV2MLP(
