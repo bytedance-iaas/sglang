@@ -570,7 +570,8 @@ def _get_chunked_prefill_embedding_batch(
         ]
 
     # step2: calculate embeddings
-    use_encoder_dp = get_global_server_args().mm_enable_dp_encoder
+    # use_encoder_dp = get_global_server_args().mm_enable_dp_encoder
+    use_encoder_dp = False
     for req_idx, embedding_items in cache_miss_items.items():
         # step2.1: get mm items to be computed on current rank according to MMDPSchedulePolicy and MMPackPolicy
 
@@ -666,7 +667,7 @@ def _get_chunked_prefill_embedding_batch(
                 embeddings_per_req = cache_miss_items[i]
         assert embeddings_per_req is not None
 
-        if not embedding_cache.set(req_items_hash_map[i], embeddings_per_req):
+        if not embedding_cache.put(req_items_hash_map[i], embeddings_per_req):
             print_warning_once(
                 "Multimodal embedding cache is full. This typically occurs when a single "
                 "embedding exceeds the cache size limit. Consider increasing the "
