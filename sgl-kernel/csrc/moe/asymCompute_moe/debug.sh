@@ -1,0 +1,1 @@
+compute-sanitizer ./out/matmul > debug.log 2>&1

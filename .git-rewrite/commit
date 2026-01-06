@@ -1,0 +1,24 @@
+tree 3dd483c47368a613965b8f76e4aaf296bac35894
+parent b45f753cba189cd95e536a5415e3520c5e1bfe31
+author Chang Su <chang.s.su@oracle.com> 1755647051 -0700
+committer GitHub <noreply@github.com> 1755647051 -0700
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wsFcBAABCAAQBQJopQxLCRC1aQ7uu5UhlAAAJagQAGVs9x8QDUfZ5Vauz11jcx8x
+ EP7D2Ime6lGF0an1/wuAOGWXKNuxj/ZlmeJq54G7p443iBUGzKLW2rj89bLCRkQG
+ +FVKb50Ymq34ghkBhe1EjjsVL476Y6SF/aXNMDiwOeQoxKf1MxvEAFIn+LUtrcN8
+ BYOrlDmV6Mrrin1nZzHYnyLYtHOMg4JbtWJ6TI62GyTVdDY9h6WWrtVYeZ8vPtVO
+ MtDp3wXhJbKi0rIOzpoUWVmU9sr8tU97ttOlswoc+DppoDzAbKgpTPhvWxdFMzAJ
+ b8+FB4Twl2srBk4vIQnJmGmiUxG8Qu3L5iyZ2NTQaH8MpT69tuZuc+1f8xt2mutk
+ ylqhsgwAoFnFbwe7eZHBzLdlKHdTWvEVVNLnkhCtPmmTuz9te/+5yqIFIyoAP3Oi
+ llUKmcrL0BiwborbXn7aygW2b4DYUGQeQw9YB5LEjEROZSWcE4Ee4Gx13BvMA6w3
+ fFfxyl/ViA5szHkN4rYjO++Kp7bcktSou1+8wEWj+dgy38oeh28dujISEQEOIqKL
+ EeEYvNkCniUS+jH0dqCTHDrF2v4Krg19y5JZEYVGQn52HjZKr7s4TbhgfW7tJT5L
+ 1hoTi1WOYqGWtggcvBDt5Q0sT8kovnr6kDLDF/CVuXAte9Nfr5gir+EV3OQ/8dUO
+ 3pliHbcbWBTrbtMTn50b
+ =aYi3
+ -----END PGP SIGNATURE-----
+ 
+
+[router] Implement gRPC SGLangSchedulerClient (#9364)
+
