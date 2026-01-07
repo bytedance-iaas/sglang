@@ -607,7 +607,7 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
-    speculative_moe_tp_ep_size: Optional[int] = None
+    speculative_moe_tp_size: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -5917,9 +5917,9 @@ class ServerArgs:
             help="The quantization method for speculative model.",
         )
         parser.add_argument(
-            "--speculative-moe-tp-ep-size",
+            "--speculative-moe-tp-size",
             type=int,
-            default=ServerArgs.speculative_moe_tp_ep_size,
+            default=ServerArgs.speculative_moe_tp_size,
             help="TP/EP-MOE size for EAGLE speculative decoding MoE layers only. Default is None, which means use the same size as the normal MoE layers.",
         )
 
@@ -7295,10 +7295,10 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
-        assert self.speculative_moe_tp_ep_size in {
+        assert self.speculative_moe_tp_size in {
             1,
             None,
-        }, "speculative_moe_tp_ep_size only support 1 and None currently"
+        }, "speculative_moe_tp_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         if not is_runai_obj_uri(self.served_model_name):

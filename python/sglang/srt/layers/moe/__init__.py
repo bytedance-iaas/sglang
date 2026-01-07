@@ -31,4 +31,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "enable_nextn_moe_sparse_fully_dp",
 ]

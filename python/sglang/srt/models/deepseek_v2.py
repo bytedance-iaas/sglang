@@ -69,7 +69,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
-    enable_nextn_moe_sparse_fully_dp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
@@ -90,6 +89,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
@@ -444,7 +444,7 @@ class DeepseekV2MoE(nn.Module):
         is_deepseek_v4: bool = False,
     ):
         super().__init__()
-        if enable_nextn_moe_sparse_fully_dp(is_nextn):
+        if enable_nextn_moe_sparse_fully_dp():
             self.tp_size = 1
             self.moe_ep_size = 1
         else:
@@ -527,7 +527,7 @@ class DeepseekV2MoE(nn.Module):
             num_experts=num_experts_for_moe
             + (
                 0
-                if enable_nextn_moe_sparse_fully_dp(is_nextn)
+                if enable_nextn_moe_sparse_fully_dp()
                 else get_global_server_args().ep_num_redundant_experts
             ),
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -542,7 +542,6 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
-            is_nextn=is_nextn,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
@@ -613,7 +612,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                or enable_nextn_moe_sparse_fully_dp(is_nextn)
+                or enable_nextn_moe_sparse_fully_dp()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
             self.shared_experts = DeepseekV2MLP(
@@ -1853,7 +1852,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
-            is_nextn=is_nextn,
         )
 
         if self.is_layer_sparse:
@@ -1909,7 +1907,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
-                is_nextn=is_nextn,
             )
 
     def _detect_gfx95_quant_format(self) -> str:
