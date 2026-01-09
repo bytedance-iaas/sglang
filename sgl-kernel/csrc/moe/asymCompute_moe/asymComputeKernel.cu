@@ -378,4 +378,4 @@ void launch_MoECompute(cutlass::half_t* A, cutlass::half_t* B, cutlass::half_t* 
     // std::cout << "cup-aware symCompute: " << measure_time(start, stop) << " ms" << std::endl;
 }
 
-void launch_MoECompute(cutlass::half_t* A, cutlass::half_t* B, cutlass::half_t* C, int M, int N, int K, cudaStream_t stream);
+// void launch_MoECompute(cutlass::half_t* A, cutlass::half_t* B, cutlass::half_t* C, int M, int N, int K, cudaStream_t stream);

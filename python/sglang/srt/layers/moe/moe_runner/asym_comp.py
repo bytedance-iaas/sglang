@@ -1,70 +1,82 @@
 from __future__ import annotations
 
-import functools
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-import triton.language as tl
 
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    register_fused_func,
     register_post_permute,
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils.offloader import get_offloader
+import AsymCompute
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
 
-
 _is_hip = is_hip()
-_is_cuda = is_cuda()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_use_aiter = bool(int(os.getenv("SGLANG_MOE_USE_AITER", "0")))
-_MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+_is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if not (_is_npu or _is_hip):
+    from sgl_kernel import silu_and_mul
 
 
-if _is_cuda:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
-
-    if _use_aiter:
-        try:
-            from aiter import moe_sum
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+_MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+_DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
-if _is_cuda or _is_hip:
-    from sgl_kernel import (  # noqa: F401
-        moe_align_block_size as sgl_moe_align_block_size,
+# TODO(kaixih@nvidia): ideally we should merge this logic into
+# `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
+@torch.compile
+def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
+    temp = x.to(torch.float32).view(torch.int32)
+    exp = torch.bitwise_right_shift(temp, 23)
+    mant = torch.bitwise_and(temp, 0x7FFFFF)
+    is_ru = torch.logical_and(
+        torch.logical_and((mant > 0), (exp != 0xFE)),
+        ~torch.logical_and((exp == 0), (mant <= 0x400000)),
     )
+    exp = torch.where(is_ru, exp + 1, exp)
+    new_x = exp.to(torch.uint8).view(torch.int)
+    return new_x.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def copy_list_to_gpu_no_ce(arr: List[int]):
+    from sgl_kernel.elementwise import copy_to_gpu_no_ce
+
+    tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
+    tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
+    copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
+    return tensor_gpu
 
 
 @dataclass
 class AsymCompRunnerInput(RunnerInput):
-
     hidden_states: torch.Tensor
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    sorted_token_ids: torch.Tensor
-    expert_ids: torch.Tensor
-    num_tokens_post_padded: torch.Tensor
+    hidden_states_scale: torch.Tensor
+    use_masked_gemm: bool
+    masked_m: Optional[torch.Tensor] = None
+    expected_m: Optional[int] = None
+    m_indices: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -73,40 +85,27 @@ class AsymCompRunnerInput(RunnerInput):
 
 @dataclass
 class AsymCompRunnerOutput(RunnerOutput):
-
     hidden_states: torch.Tensor
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.AsymComp
+        return MoeRunnerBackend.ASYM_COMP
 
 
 @dataclass
 class AsymCompMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
-    b13: Optional[torch.Tensor] = None
-    b2: Optional[torch.Tensor] = None
-    use_fp8_w8a8: bool = False
-    use_int8_w8a8: bool = False
-    use_int8_w8a16: bool = False
-    use_int4_w4a16: bool = False
-    per_channel_quant: bool = False
+    use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
-    w13_zp: Optional[torch.Tensor] = None
-    w2_zp: Optional[torch.Tensor] = None
-    a13_scale: Optional[torch.Tensor] = None
-    a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
 
-AsymCompQuantInfoMoe = AsymCompMoeQuantInfo
-
 class AsymCompRunnerCore(MoeRunnerCore):
-
     def __init__(self, config: MoeRunnerConfig):
-        print("__init__ AsymCompRunnerCore")
         super().__init__(config)
+        assert self.config.activation == "silu"
+        assert self.config.is_gated
 
     def run(
         self,
@@ -114,255 +113,244 @@ class AsymCompRunnerCore(MoeRunnerCore):
         quant_info: AsymCompMoeQuantInfo,
         running_state: dict,
     ) -> AsymCompRunnerOutput:
-        print("within AsymCompRunnerCore")
-        # TODO: move these functions to the AsymComp runner
-        from sglang.srt.layers.moe.fused_moe_asymCompute.fused_moe import (
-            invoke_fused_moe_kernel,
-            moe_sum_reduce_torch_compile,
-            moe_sum_reduce_asymCompute,
-            swiglu_with_alpha_and_limit,
+        print("Within AsymCompRunnerCore")
+        print("unner_input.use_masked_gemm: ", runner_input.use_masked_gemm)
+        if not runner_input.use_masked_gemm:
+            hidden_states = self._run_contiguous_gemm(
+                runner_input, quant_info, running_state
+            )
+        else:
+            hidden_states = self._run_masked_gemm(
+                runner_input, quant_info, running_state
+            )
+        return AsymCompRunnerOutput(hidden_states=hidden_states)
+
+    def _run_contiguous_gemm(
+        self,
+        runner_input: AsymCompRunnerInput,
+        quant_info: AsymCompMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
         )
 
         hidden_states = runner_input.hidden_states
-        topk_weights = runner_input.topk_weights
-        topk_ids = runner_input.topk_ids
-        sorted_token_ids = runner_input.sorted_token_ids
-        expert_ids = runner_input.expert_ids
-        num_tokens_post_padded = runner_input.num_tokens_post_padded
+        hidden_states_scale = runner_input.hidden_states_scale
+        all_tokens = running_state["all_tokens"]
+        hidden_states_device = running_state["hidden_states_device"]
+        hidden_states_dtype = running_state["hidden_states_dtype"]
+        hidden_states_shape = running_state["hidden_states_shape"]
+        m_indices = runner_input.m_indices
 
-        w13 = quant_info.w13_weight
-        w2 = quant_info.w2_weight
-        b13 = quant_info.b13
-        b2 = quant_info.b2
-        a13_scale = quant_info.a13_scale
-        a2_scale = quant_info.a2_scale
+        N = quant_info.w13_weight.size(1)
+        K = hidden_states_shape[1]
+        scale_block_size = 128
+
+        w13_weight_fp8 = (
+            quant_info.w13_weight,
+            quant_info.w13_scale,
+        )
+        w2_weight_fp8 = (quant_info.w2_weight, quant_info.w2_scale)
+
+        gateup_output = torch.empty(
+            (all_tokens, N),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            hidden_states_scale = tma_align_input_scale(hidden_states_scale)
+        AsymCompute.grouped_gemm_nt_f8f8bf16_contig(
+            (hidden_states, hidden_states_scale),
+            w13_weight_fp8,
+            gateup_output,
+            m_indices,
+        )
+
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
+        del gateup_output
+
+        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+            down_input,
+            scale_block_size,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+        del down_input
+
+        down_output = torch.empty(
+            (all_tokens, K),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = tma_align_input_scale(down_input_scale)
+
+        AsymCompute.grouped_gemm_nt_f8f8bf16_contig(
+            (down_input_fp8, down_input_scale),
+            w2_weight_fp8,
+            down_output,
+            m_indices,
+        )
+
+        return down_output
+
+    def _run_masked_gemm(
+        self,
+        runner_input: AsymCompRunnerInput,
+        quant_info: AsymCompMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_post_quant_fwd,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_8bit,
+        )
+
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        masked_m = runner_input.masked_m
+        expected_m = runner_input.expected_m
+
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
-        w13_zp = quant_info.w13_zp
-        w2_zp = quant_info.w2_zp
-        block_shape = quant_info.block_shape
-        per_channel_quant = quant_info.per_channel_quant
-        use_fp8_w8a8 = quant_info.use_fp8_w8a8
-        use_int8_w8a8 = quant_info.use_int8_w8a8
-        use_int8_w8a16 = quant_info.use_int8_w8a16
-        use_int4_w4a16 = quant_info.use_int4_w4a16
 
-        activation = self.config.activation
-        no_combine = self.config.no_combine
-        inplace = self.config.inplace
-        gemm1_alpha = self.config.gemm1_alpha
-        gemm1_limit = self.config.gemm1_clamp_limit
-        routed_scaling_factor = self.config.routed_scaling_factor
-        apply_router_weight_on_input = self.config.apply_router_weight_on_input
+        hidden_states_device = running_state["hidden_states_device"]
 
-        assert self.config.is_gated, "Only gated MoEs are supported for AsymComp runner"
-
-        M = hidden_states.shape[0]
-        E, N, _ = w13.shape
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
-
-        intermediate_cache1 = torch.empty(
-            (M, topk_ids.shape[1], N),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        # TODO: replace this kernel using asymmetric compute
-        print("Within AsymCompRunnerCore running function. TODO: replace this kernel using asymmetric compute")
-        invoke_fused_moe_kernel(
-            hidden_states,
-            w13,
-            b13,
-            intermediate_cache1,
-            a13_scale,
-            w13_scale,
-            w13_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
-            running_state["config"],
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
-
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        if activation == "silu":
-            if gemm1_alpha is not None:
-                assert gemm1_limit is not None
-                intermediate_cache2 = swiglu_with_alpha_and_limit(
-                    intermediate_cache1.view(-1, N),
-                    gemm1_alpha,
-                    gemm1_limit,
-                )
-            elif _is_cuda:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        elif activation == "gelu":
-            assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
-            assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+        # GroupGemm-0
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if hidden_states_scale.dtype != torch.int:
+                b, s_mn, s_k = hidden_states_scale.shape
+                assert (
+                    s_mn % 4 == 0 and s_k % 4 == 0
+                ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                hidden_states_scale = _cast_to_e8m0_with_rounding_up(
+                    hidden_states_scale
                 )
         else:
-            raise ValueError(f"Unsupported activation: {activation=}")
-
-        intermediate_cache3 = torch.empty(
-            (M, topk_ids.shape[1], w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        if no_combine:
-            assert not inplace
-            out_hidden_states = torch.empty(
-                (M, topk_ids.shape[1], w2.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-        elif inplace:
-            out_hidden_states = hidden_states
-        else:
-            out_hidden_states = torch.empty_like(hidden_states)
-
-        print("Within invoke_fused_moe_kernel")
-        invoke_fused_moe_kernel(
-            intermediate_cache2,
-            w2,
-            b2,
-            (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states.unsqueeze(0)
-            ),
-            a2_scale,
-            w2_scale,
-            w2_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            running_state["config"],
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
-
-        if routed_scaling_factor is None:
-            routed_scaling_factor = 1.0
-
-        if no_combine:
-            pass
-        elif _is_cuda:
-            if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
-                pass  # we write directly into out_hidden_states
-            elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
-                torch.add(
-                    intermediate_cache3[:, 0],
-                    intermediate_cache3[:, 1],
-                    out=out_hidden_states,
-                ).squeeze(dim=1)
-            else:
-                # According to micro benchmark results, torch.compile can get better performance for small token.
-                if M <= 32:
-                    moe_sum_reduce_torch_compile(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states,
-                        routed_scaling_factor,
-                    )
-                else:
-                    moe_sum_reduce_asymCompute(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states,
-                        routed_scaling_factor,
-                    )
-        elif _is_hip:
-            if _use_aiter:
-                moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                )
-            else:
-                vllm_ops.moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                )
-        else:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
+            hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                hidden_states_scale
             )
 
-        return AsymCompRunnerOutput(
-            hidden_states=out_hidden_states,
+        num_groups, m, k = hidden_states.shape
+        n = w13_weight.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (hidden_states, hidden_states_scale),
+            (w13_weight, w13_scale),
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        # Act
+        scale_block_size = 128
+        if _MASKED_GEMM_FAST_ACT:
+            down_input, down_input_scale = sglang_per_token_group_quant_8bit(
+                x=gateup_output,
+                dst_dtype=torch.float8_e4m3fn,
+                group_size=scale_block_size,
+                masked_m=masked_m,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                fuse_silu_and_mul=True,
+                enable_v2=True,
+            )
+        else:
+            down_input = torch.empty(
+                (
+                    gateup_output.shape[0],
+                    gateup_output.shape[1],
+                    gateup_output.shape[2] // 2,
+                ),
+                device=hidden_states_device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = torch.empty(
+                (
+                    gateup_output.shape[0],
+                    gateup_output.shape[1],
+                    gateup_output.shape[2] // 2 // scale_block_size,
+                ),
+                device=hidden_states_device,
+                dtype=torch.float32,
+            )
+            silu_and_mul_masked_post_quant_fwd(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                scale_block_size,
+                masked_m,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        del gateup_output
+
+        # GroupGemm-1
+        n = w2_weight.shape[1]
+
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                down_input_scale
+            )
+
+        down_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        )
+
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if down_gemm_overlap_args is None:
+            gemm_overlap_args_dict = {}
+        else:
+            down_gemm_overlap_args.start_event.record()
+            max_block_n = (
+                160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
+            )
+            gemm_overlap_args_dict = {
+                "overlap_args": down_gemm_overlap_args,
+                "max_block_n": max_block_n,
+            }
+
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (down_input, down_input_scale),
+            (w2_weight, w2_scale),
+            down_output,
+            masked_m,
+            expected_m,
+            **gemm_overlap_args_dict,
+        )
+        meta_overlap_args = running_state.get("meta_overlap_args", None)
+        if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = threshold
+
+        return down_output
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.ASYM_COMP
-
-
-@register_fused_func("none", "asym_comp")
-def fused_experts_none_to_asymComp(
-    dispatch_output: StandardDispatchOutput,
-    quant_info: AsymCompMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> StandardCombineInput:
-    from sglang.srt.layers.moe.fused_moe_asymCompute.fused_moe import fused_experts
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-
-    output = fused_experts(
-        hidden_states=dispatch_output.hidden_states,
-        w1=quant_info.w13_weight,
-        w2=quant_info.w2_weight,
-        topk_output=dispatch_output.topk_output,
-        moe_runner_config=runner_config,
-        b1=quant_info.b13,
-        b2=quant_info.b2,
-        use_fp8_w8a8=quant_info.use_fp8_w8a8,
-        use_int8_w8a8=quant_info.use_int8_w8a8,
-        use_int8_w8a16=quant_info.use_int8_w8a16,
-        use_int4_w4a16=quant_info.use_int4_w4a16,
-        per_channel_quant=quant_info.per_channel_quant,
-        w1_scale=quant_info.w13_scale,
-        w2_scale=quant_info.w2_scale,
-        w1_zp=quant_info.w13_zp,
-        w2_zp=quant_info.w2_zp,
-        a1_scale=quant_info.a13_scale,
-        a2_scale=quant_info.a2_scale,
-        block_shape=quant_info.block_shape,
-    )
-
-    return StandardCombineInput(
-        hidden_states=output,
-    )
+        return MoeRunnerBackend.DEEP_GEMM
 
 
 @register_pre_permute("standard", "asym_comp")
@@ -372,73 +360,48 @@ def pre_permute_standard_to_asymComp(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AsymCompRunnerInput:
-
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
-
-    from sglang.srt.layers.moe.fused_moe_asymCompute.fused_moe import (
-        get_config_dtype_str,
-        moe_align_block_size,
-        try_get_optimal_moe_config,
-    )
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
 
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
     )
 
-    assert TopKOutputChecker.format_is_standard(topk_output)
+    topk_weights, topk_ids, _ = topk_output
 
-    num_tokens = hidden_states.shape[0]
-    num_local_experts = runner_config.num_local_experts
+    hidden_states_shape = hidden_states.shape
+    hidden_states_dtype = hidden_states.dtype
+    hidden_states_device = hidden_states.device
+    hidden_states_ref = hidden_states
 
-    if (
-        not (quant_info.use_fp8_w8a8 or quant_info.use_int8_w8a8)
-        or quant_info.block_shape is not None
-        or _use_aiter
-    ):
-        padding_size = 0
-    else:
-        padding_size = _MOE_PADDING_SIZE
+    topk_weights, topk_ids = topk_weights, topk_ids
 
-    config_dtype = get_config_dtype_str(
-        use_fp8_w8a8=quant_info.use_fp8_w8a8,
-        use_int8_w8a8=quant_info.use_int8_w8a8,
-        use_int8_w8a16=quant_info.use_int8_w8a16,
-        use_int4_w4a16=quant_info.use_int4_w4a16,
-        dtype=hidden_states.dtype,
+    # PreReorder
+    masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
+        moe_ep_deepgemm_preprocess(
+            topk_ids,
+            runner_config.num_local_experts,
+            hidden_states,
+            runner_config.top_k,
+            quant_info.block_shape,
+        )
     )
 
-    get_config_func = functools.partial(
-        try_get_optimal_moe_config,
-        quant_info.w13_weight.shape,
-        (
-            num_local_experts,
-            quant_info.w2_weight.shape[1],
-            quant_info.w2_weight.shape[2] - padding_size,
-        ),
-        topk_output.topk_ids.shape[1],
-        config_dtype,
-        block_shape=quant_info.block_shape,
-        per_channel_quant=quant_info.per_channel_quant,
-    )
+    dispose_tensor(hidden_states_ref)
 
-    config = get_config_func(num_tokens)
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_output.topk_ids, config["BLOCK_SIZE_M"], num_local_experts
-    )
-
-    running_state["config"] = config
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["src2dst"] = src2dst
 
     return AsymCompRunnerInput(
         hidden_states=hidden_states,
-        topk_weights=topk_output.topk_weights,
-        topk_ids=topk_output.topk_ids,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
+        hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
     )
 
 
@@ -449,12 +412,198 @@ def post_permute_asymComp_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
-
+    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
+    hidden_states_shape = running_state["hidden_states_shape"]
+    hidden_states_dtype = running_state["hidden_states_dtype"]
+    hidden_states_device = running_state["hidden_states_device"]
+    src2dst = running_state["src2dst"]
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+
+    output = torch.empty(
+        hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+    )
+    post_reorder_triton_kernel[(hidden_states_shape[0],)](
+        runner_output.hidden_states,
+        output,
+        src2dst,
+        topk_ids,
+        topk_weights,
+        runner_config.top_k,
+        hidden_states_shape[1],
+        BLOCK_SIZE=512,
+    )
+
+    dispose_tensor(runner_output.hidden_states)
+
+    if runner_config.routed_scaling_factor is not None:
+        output *= runner_config.routed_scaling_factor
+
     return StandardCombineInput(
+        hidden_states=output,
+    )
+
+
+@register_pre_permute("deepep_ll", "asym_comp")
+def pre_permute_deepep_ll_to_asym_comp(
+    dispatch_output: DeepEPLLDispatchOutput,
+    quant_info: AsymCompMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AsymCompRunnerInput:
+    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
+        dispatch_output
+    )
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["hidden_states_device"] = hidden_states.device
+
+    return AsymCompRunnerInput(
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
+    )
+
+
+@register_post_permute("asym_comp", "deepep_ll")
+def post_permute_deep_gemm_to_asym_comp(
+    runner_output: AsymCompRunnerOutput,
+    quant_info: AsymCompMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
+
+
+@register_pre_permute("deepep_normal", "asym_comp")
+def pre_permute_deepep_normal_to_asym_comp(
+    dispatch_output: DeepEPNormalDispatchOutput,
+    quant_info: AsymCompMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AsymCompRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        num_recv_tokens_per_expert,
+    ) = dispatch_output
+    assert runner_config.activation == "silu"
+
+    all_tokens = sum(num_recv_tokens_per_expert)
+    running_state["all_tokens"] = all_tokens
+
+    K = hidden_states.shape[1]
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_device = hidden_states.device
+    hidden_states_dtype = hidden_states.dtype
+
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    input_tensor = torch.empty(
+        (all_tokens, K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        # TODO check whether need `zeros`
+        input_tensor_scale = torch.zeros(
+            (ceil_div(K // 128, 4), all_tokens),
+            device=hidden_states.device,
+            dtype=torch.int,
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.empty(
+            (all_tokens, K // 128),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+
+    if get_offloader().forbid_copy_engine_usage:
+        num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+            num_recv_tokens_per_expert
+        )
+    else:
+        num_recv_tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            pin_memory=True,
+            device="cpu",
+        ).cuda(non_blocking=True)
+    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+    ep_scatter(
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    dispose_tensor(hidden_states)
+    dispose_tensor(hidden_states_scale)
+
+    running_state["output_index"] = output_index
+
+    return AsymCompRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("asym_comp", "deepep_normal")
+def post_permute_deep_gemm_to_asym_comp(
+    runner_output: AsymCompRunnerOutput,
+    quant_info: AsymCompMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepEPNormalCombineInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+
+    hidden_states = runner_output.hidden_states
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+    output_index = running_state["output_index"]
+
+    gather_out = torch.empty(
+        running_state["hidden_states_shape"],
+        device=running_state["hidden_states_device"],
+        dtype=torch.bfloat16,
+    )
+    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+
+    return DeepEPNormalCombineInput(
+        hidden_states=gather_out,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
     )

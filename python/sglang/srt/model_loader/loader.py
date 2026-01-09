@@ -160,9 +160,6 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device,
                 device_data = original_info["device_data"]
                 original_data = original_info["original_data"]
                 original_device: torch.device = original_info["device"]
-                
-                import ipdb
-                ipdb.set_trace()
 
                 if (
                     (device_data.device == p.data.device)
@@ -698,8 +695,6 @@ class LayeredModelLoader(DefaultModelLoader):
 
             # Get all weights from disk
             weights = self._get_all_weights(model_config, model)
-            import ipdb
-            ipdb.set_trace()
             # Helper function to recursively fill the weights of a module
             def fill_module(module, fqn: List[str], weights):
                 """
@@ -713,8 +708,6 @@ class LayeredModelLoader(DefaultModelLoader):
                 module.to_empty(device=target_device, recurse=False)
                 fqn_path = ".".join(fqn)
                 # Fill weights
-                import ipdb
-                ipdb.set_trace()
                 model.load_weights_to_module(
                     fqn_path,
                     weights,
@@ -1815,8 +1808,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, pre_quant, load_8bit
         )
 
-        import ipdb
-        ipdb.set_trace()
         model.load_weights(qweight_iterator)
 
         torch.cuda.empty_cache()
@@ -1906,8 +1897,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-                import ipdb
-                ipdb.set_trace()
                 self._load_weights(model_config, model)
 
         return model.eval()

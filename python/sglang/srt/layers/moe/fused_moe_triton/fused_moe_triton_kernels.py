@@ -666,6 +666,8 @@ def invoke_fused_moe_kernel(
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
+    # import ipdb
+    # ipdb.set_trace()
     K = B.shape[2] - padded_size
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True

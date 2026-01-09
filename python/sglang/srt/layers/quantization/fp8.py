@@ -612,7 +612,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     hidden_size // 8,
-                    dtype=params_dtype
+                    dtype=params_dtype, device="cpu", pin_memory=True
                 ),
                 requires_grad=False,
             )
@@ -621,7 +621,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // 8,
-                    dtype=params_dtype
+                    dtype=params_dtype, device="cpu", pin_memory=True
                 ),
                 requires_grad=False,
             )
@@ -1266,23 +1266,41 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_asym_comp():
             print("runner.runner_backend.is_asym_comp")
+
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+            if self.block_quant:
+                block_shape = self.quant_config.weight_block_size
+                w13_scale = layer.w13_weight_scale_inv
+                w2_scale = layer.w2_weight_scale_inv
+            else:
+                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+                scale_block_size = 128
+                block_shape = [scale_block_size, scale_block_size]
+                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                w13_scale = (
+                    layer.w13_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w13_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w13_scale_k, dim=2)
+                )
+                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+                w2_scale = (
+                    layer.w2_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w2_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w2_scale_k, dim=2)
+                )
             quant_info = AsymCompMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                w13_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.quant_config.weight_block_size,
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=True,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=block_shape,
             )
         else:
             raise NotImplementedError(
