@@ -43,11 +43,14 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+
+
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -185,6 +188,7 @@ class Qwen3_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -192,6 +196,7 @@ class Qwen3_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            output_ws=output_ws,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -314,6 +319,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
         )
+        
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -442,6 +449,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if get_bool_env_var("SGLANG_VIT_GRAPH"):
+            return self.forward_with_cuda_graph(x, grid_thw)
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -484,6 +493,48 @@ class Qwen3VLMoeVisionModel(nn.Module):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+    def forward_with_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        x += pos_embeds
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        seq_len, _ = x.size()
+        rotary_pos_emb = rotary_pos_emb.to(x.device)
+
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        # compute cu_seqlens
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0)
+        cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int32),
+            ]
+        )
+        
+        cu_seqlens = cu_seqlens.to("cuda")
+        # print(cu_seqlens.device)
+        # blocks + merger + deepstack(optional) via CUDA Graph Runner
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings= position_embeddings,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=None,
+            output_indices=None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
