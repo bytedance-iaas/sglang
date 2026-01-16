@@ -38,7 +38,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import EmbeddingPortPool, MMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -180,6 +180,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        embedding_port_pool: Optional[EmbeddingPortPool],
     ):
         # Parse args
         self.server_args = server_args
@@ -188,6 +189,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
         set_global_server_args_for_tokenizer(server_args)
+        self.embedding_port_pool = embedding_port_pool
 
         # Init model config
         self.init_model_config()
@@ -407,9 +409,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Encoder Disaggregation
         if self.server_args.language_only:
+            if self.embedding_port_pool is not None:
+                self.embedding_port_pool.init()
             self.mm_receiver = MMReceiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                embedding_port_pool=self.embedding_port_pool,
             )
 
     def init_metric_collector_watchdog(self):
@@ -925,6 +930,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 extra_key=obj.extra_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
+                embedding_ports=obj.embedding_ports,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

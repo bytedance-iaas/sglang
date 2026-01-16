@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import multiprocessing
 import pickle
 import random
 import threading
@@ -12,15 +13,72 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
+from python.sglang.srt.utils.common import get_zmq_socket
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils import get_free_port, get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+EPD_EMBEDDING_PORT_POOL_SIZE = envs.SGLANG_EPD_EMBEDDING_PORT_POOL_SIZE.get()
+
+
+class EmbeddingPortPool:
+    def __init__(self):
+        # self.pool = multiprocessing.Array('i', [0] * EPD_EMBEDDING_PORT_POOL_SIZE)
+        # self.free_ports = multiprocessing.Array('b', [1] * EPD_EMBEDDING_PORT_POOL_SIZE)
+        # self.free_ports_num = multiprocessing.Value('i', 0)
+        # self.port_index_map = multiprocessing.Manager().dict()
+        self.pool = multiprocessing.Queue()
+        self.lock = multiprocessing.Lock()
+
+    def init(self):
+        port_set = set()
+        for i in range(EPD_EMBEDDING_PORT_POOL_SIZE):
+            port = get_free_port()
+            # while port in self.port_index_map.keys():
+            #     port = get_free_port()
+            #     print(f"reduplicated port")
+            # self.pool[i] = port
+            # self.port_index_map[port] = i
+            while port in port_set:
+                port = get_free_port()
+            self.pool.put(port)
+            port_set.add(port)
+        # self.free_ports_num.value = EPD_EMBEDDING_PORT_POOL_SIZE
+
+    def allocate_ports(self, num=1):
+        with self.lock:
+            if num > self.pool.qsize():
+                return None
+            allocated_ports = []
+            # allocated_num = 0
+            # for i in range(EPD_EMBEDDING_PORT_POOL_SIZE):
+            #     if self.free_ports[i]:
+            #         self.free_ports[i] = 0
+            #         allocated_port = self.pool[i]
+            #         allocated_ports.append(allocated_port)
+            #         allocated_num += 1
+            #         if allocated_num == num:
+            #             break
+            # self.free_ports_num.value -= num
+            for _ in range(num):
+                allocated_port = self.pool.get()
+                allocated_ports.append(allocated_port)
+            return allocated_ports
+
+    def recycle_port(self, port: int):
+        with self.lock:
+            # idx = self.port_index_map[port]
+            # self.free_ports[idx] = 1
+            # self.free_ports_num.value += 1
+            self.pool.put(port)
+            print(f"{self.pool.qsize()=}")
 
 
 class EmbeddingData:
@@ -91,6 +149,7 @@ class WaitingImageRequest:
         encoder_urls,
         host_name,
         receive_count,
+        embedding_port=None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -102,9 +161,17 @@ class WaitingImageRequest:
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
-        self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL
-        )
+        self.embedding_port_preallocated = False
+        if embedding_port is not None:
+            self.embedding_port = embedding_port
+            self.recv_socket = get_zmq_socket(
+                zmq.Context(), zmq.PULL, f"tcp://*:{self.embedding_port}", True
+            )
+            self.embedding_port_preallocated = True
+        else:
+            self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
+                zmq.Context(), zmq.PULL
+            )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
         self.ready = False
@@ -215,6 +282,7 @@ class MMReceiver:
         pp_rank: Optional[int] = None,
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
+        embedding_port_pool: Optional[EmbeddingPortPool] = None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
@@ -233,10 +301,12 @@ class MMReceiver:
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
             self.tp_size = server_args.tp_size
+            self.world_size = server_args.pp_size * server_args.tp_size
             self.tp_group = tp_group
             self.nnodes = server_args.nnodes
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
+            self.embedding_port_pool = embedding_port_pool
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -276,6 +346,11 @@ class MMReceiver:
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_image is True
             ):
+                embedding_port = None
+                if recv_req.embedding_ports is not None:
+                    embedding_port = recv_req.embedding_ports[
+                        self.tp_size * self.pp_rank + self.tp_rank
+                    ]
                 waiting_req = WaitingImageRequest(
                     rid=recv_req.rid,
                     recv_req=recv_req,
@@ -283,8 +358,10 @@ class MMReceiver:
                     encoder_urls=self.encode_urls,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
+                    embedding_port=embedding_port,
                 )
-                waiting_req.send_encode_request()
+                if embedding_port is None:
+                    waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
             else:
                 new_recv_reqs.append(recv_req)
@@ -309,6 +386,8 @@ class MMReceiver:
         for i, waiting_req in enumerate(self.waiting_list):
             if local_status[i].item():
                 new_recv_reqs.append(waiting_req.recv_req)
+                if waiting_req.embedding_port_preallocated:
+                    self.embedding_port_pool.recycle_port(waiting_req.embedding_port)
             else:
                 new_waiting.append(waiting_req)
 
@@ -463,6 +542,11 @@ class MMReceiver:
             obj.num_items_assigned = [
                 (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
             ]
+            obj.embedding_ports = None
+            if self.nnodes == 1:
+                obj.embedding_ports = self.embedding_port_pool.allocate_ports(
+                    self.world_size
+                )
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
@@ -470,7 +554,7 @@ class MMReceiver:
                     image_urls,
                     "encode",
                     obj.num_items_assigned,
-                    None,
+                    obj.embedding_ports,
                 ),
                 daemon=True,
             )

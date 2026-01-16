@@ -383,6 +383,9 @@ class Envs:
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
+    # VLM EPD
+    SGLANG_EPD_EMBEDDING_PORT_POOL_SIZE = EnvInt(50)
+
     # MM splitting behavior control
     SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 

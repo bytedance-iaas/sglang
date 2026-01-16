@@ -257,6 +257,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        embedding_port_pool,
     ):
         # Parse args
         self.server_args = server_args
@@ -302,6 +303,7 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.embedding_port_pool = embedding_port_pool
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -986,6 +988,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
                 tp_group=self.tp_group,
+                embedding_port_pool=self.embedding_port_pool,
             )
 
     def init_overlap(self):
@@ -2886,6 +2889,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    embedding_port_pool,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2941,6 +2945,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            embedding_port_pool,
         )
         result_dict = {
             "status": "ready",
