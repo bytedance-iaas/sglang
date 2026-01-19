@@ -449,7 +449,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if get_bool_env_var("SGLANG_VIT_GRAPH"):
+        graph_nums = len(self.cuda_graph_runner.block_graphs)
+        if get_bool_env_var("SGLANG_VIT_GRAPH") and graph_nums <=20:
+            print("graph num {}".format(graph_nums))
             return self.forward_with_cuda_graph(x, grid_thw)
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)

@@ -334,9 +334,9 @@ class VisionFlash3Attention(nn.Module):
              [b * s, h, head_size]
         """
         
-        if get_bool_env_var("SGLANG_VIT_GRAPH"):
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seq_lens should be a list")
+        if get_bool_env_var("SGLANG_VIT_GRAPH") and isinstance(cu_seqlens, list):
+            # if not isinstance(cu_seqlens, list):
+            #     raise RuntimeError("cuda-graph mode cu_seq_lens should be a list")
             max_seqlen = cu_seqlens[1]
             output = flash_attn_varlen_func(
                 q,
