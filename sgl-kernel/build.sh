@@ -1,40 +1,53 @@
 #!/bin/bash
 set -ex
 
-if [ $# -lt 2 ]; then
-  echo "Usage: $0 <PYTHON_VERSION> <CUDA_VERSION> [ARCH]"
-  exit 1
+PYTHON_VERSION=$1
+CUDA_VERSION=$2
+PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
+
+if [ -z "$3" ]; then
+   ARCH=$(uname -i)
+else
+   ARCH=$3
 fi
 
-PYTHON_VERSION="$1"          # e.g. 3.10
-CUDA_VERSION="$2"            # e.g. 12.9
-ARCH="${3:-$(uname -i)}"     # optional override
-
-if [ "${ARCH}" = "aarch64" ]; then
-  BASE_IMG="pytorch/manylinuxaarch64-builder"
+echo "ARCH:  $ARCH"
+if [ ${ARCH} = "aarch64" ]; then
+   LIBCUDA_ARCH="sbsa"
+   BUILDER_NAME="pytorch/manylinuxaarch64-builder"
 else
-  BASE_IMG="pytorch/manylinux2_28-builder"
+   LIBCUDA_ARCH=${ARCH}
+   BUILDER_NAME="pytorch/manylinux2_28-builder"
+fi
+
+if [ ${CUDA_VERSION} = "13.0" ]; then
+   DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130"
+elif [ ${CUDA_VERSION} = "12.9" || ${CUDA_VERSION} = "12.8" ]; then
+   DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128"
+else
+   DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126"
 fi
 
 # Create cache directories for persistent build artifacts in home directory
 # Using home directory to persist across workspace cleanups/checkouts
 CACHE_DIR="${HOME}/.cache/sgl-kernel"
-BUILDX_CACHE_DIR="${CACHE_DIR}/buildx"
-mkdir -p "${BUILDX_CACHE_DIR}"
+CMAKE_DOWNLOAD_CACHE="${CACHE_DIR}/cmake-downloads"
+CCACHE_DIR="${CACHE_DIR}/ccache"
 
-# Ensure a buildx builder with docker-container driver (required for cache export)
-BUILDER_NAME="sgl-kernel-builder"
-if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap
-else
-  docker buildx use "${BUILDER_NAME}"
-fi
+mkdir -p "${CMAKE_DOWNLOAD_CACHE}"
+mkdir -p "${CCACHE_DIR}"
 
-PY_TAG="cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}"
+echo "==================================="
+echo "Cache Configuration"
+echo "==================================="
+echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
+echo "ccache directory: ${CCACHE_DIR}"
+echo "ccache enabled: ${USE_CCACHE:-1}"
+echo ""
 
-# Output directory for wheels
-DIST_DIR="dist"
-mkdir -p "${DIST_DIR}"
 docker run --rm \
    -v $(pwd):/sgl-kernel \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
@@ -64,39 +77,24 @@ docker run --rm \
       echo \"ARM detected: Using extra conservative settings (2 parallel jobs)\"
    fi
 
-echo "----------------------------------------"
-echo "Build configuration"
-echo "PYTHON_VERSION: ${PYTHON_VERSION}"
-echo "CUDA_VERSION:   ${CUDA_VERSION}"
-echo "ARCH:           ${ARCH}"
-echo "BASE_IMG:       ${BASE_IMG}"
-echo "PYTHON_TAG:     ${PY_TAG}"
-echo "Output:         ${DIST_DIR}/"
-echo "Buildx cache:   ${BUILDX_CACHE_DIR}"
-echo "Builder:        ${BUILDER_NAME}"
-echo "----------------------------------------"
+   CMAKE_TARBALL=\"cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
 
-# Optional profiling build-args (empty string disables)
-BUILD_ARGS=()
-[ -n "${ENABLE_CMAKE_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE}")
-[ -n "${ENABLE_BUILD_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE}")
+   # Check if CMake is already cached
+   if [ -f \"/cmake-downloads/\${CMAKE_TARBALL}\" ]; then
+      echo \"Using cached CMake from /cmake-downloads/\${CMAKE_TARBALL}\"
+      cp /cmake-downloads/\${CMAKE_TARBALL} .
+   else
+      echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/\${CMAKE_TARBALL}\"
+      wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/\${CMAKE_TARBALL}
+      # Cache the downloaded file
+      cp \${CMAKE_TARBALL} /cmake-downloads/
+   fi
 
-docker buildx build \
-  --builder "${BUILDER_NAME}" \
-  -f Dockerfile . \
-  --build-arg BASE_IMG="${BASE_IMG}" \
-  --build-arg CUDA_VERSION="${CUDA_VERSION}" \
-  --build-arg ARCH="${ARCH}" \
-  --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
-  --build-arg PYTHON_TAG="${PY_TAG}" \
-  "${BUILD_ARGS[@]}" \
-  --cache-from type=local,src=${BUILDX_CACHE_DIR} \
-  --cache-to type=local,dest=${BUILDX_CACHE_DIR},mode=max \
-  --target artifact \
-  --output "type=local,dest=${DIST_DIR}" \
-  --network=host
+   tar -xzf \${CMAKE_TARBALL}
+   mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH} /opt/cmake
+   export PATH=/opt/cmake/bin:\$PATH
+   export LD_LIBRARY_PATH=/lib64:\$LD_LIBRARY_PATH
 
-echo "Done. Wheels are in ${DIST_DIR}/"
    # Debugging CMake
    echo \"PATH: \$PATH\"
    which cmake
