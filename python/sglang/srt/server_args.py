@@ -746,6 +746,7 @@ class ServerArgs:
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     enable_mm_global_cache: bool = False
+    # temporary variable, will be obsoleted after MM batch scheduling enabled by default.
     enable_batch_compute_mm_embeddings: bool = False
 
     # For checkpoint decryption

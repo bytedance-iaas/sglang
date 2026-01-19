@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Callable
 
@@ -15,15 +16,86 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.managers.mm_utils import MultimodalDataItem
 
 logger = logging.getLogger(__name__)
 
 
-class MMPackPolicy(Enum):
-    """Strategies for packing multiple images/videos in a single encoder instance."""
+class MMPackPolicy(ABC):
+    """Abstract base class for strategies for packing multiple images/videos in a single encoder instance."""
 
-    ALL_PACK = "all_pack"  # Pack all images/videos together
-    PROFILE_PACK = "profile_pack"  # Use offline profile data for optimal packing
+    @classmethod
+    @abstractmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        """Get the packing result for multimodal data."""
+        pass
+
+
+class AllPackPolicy(MMPackPolicy):
+    """Pack all images/videos into a single group."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+
+        return [
+            [
+                MultimodalDataItem(
+                    modality=modality,
+                    feature=pixel_values,
+                    model_specific_data={"image_grid_thw": torch.tensor(grid_thw_list)},
+                )
+            ]
+        ]
+
+
+class ProfilePackPolicy(MMPackPolicy):
+    """Use offline profile data for optimal packing."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        """Pack images/videos based on offline profile data."""
+
+        logger.warning("ProfilePackPolicy is not fully implemented yet")
+        return None
+
+
+class DefaultPackPolicy(MMPackPolicy):
+    """Don't apply pack by default."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
+        cum_patches = [0] + list(itertools.accumulate(patches_per_image))
+
+        embedding_items_list = []
+
+        for i in range(len(grid_thw_list)):
+            start_patch = cum_patches[i]
+            end_patch = cum_patches[i + 1]
+            single_pixel_values = pixel_values[start_patch:end_patch]
+            single_grid_thw = [grid_thw_list[i]]
+
+            embedding_items_list.append(
+                [
+                    MultimodalDataItem(
+                        modality=modality,
+                        feature=single_pixel_values,
+                        model_specific_data={
+                            "image_grid_thw": torch.tensor(single_grid_thw)
+                        },
+                    )
+                ]
+            )
+
+        return embedding_items_list
+
+
+# Map mm pack policy names to policy classes
+MM_PACK_POLICY_MAP = {
+    "all": AllPackPolicy,
+    "profile": ProfilePackPolicy,
+    "default": DefaultPackPolicy,
+}
 
 
 class MMDPSchedulePolicy(Enum):
@@ -32,12 +104,10 @@ class MMDPSchedulePolicy(Enum):
     LOAD_BALANCE = "load_balance"
 
 
-class MMDPScheduler:
+class MMScheduler:
     """
-    Multi-modal Data Parallel Scheduler.
-
-    This policy decides how to distribute multiple requests with multiple images/videos
-    across different encoder instances (data parallelism).
+    Multi-modal Scheduler, use MMDPSchedulePolicy to distribute multiple images/videos to different encoder instances and
+    MMPackPolicy to pack multiple images/videos in a single encoder instance.
     """
 
     def get_dp_encoder_lb_assignment(
@@ -115,17 +185,16 @@ class MMDPScheduler:
         schedule_policy: MMDPSchedulePolicy = MMDPSchedulePolicy.LOAD_BALANCE,
     ):
         """
+        Assign images/videos to different dp rank according to MMDPSchedulePolicy, and calculate some metadata info for later use
+
         Args:
-        vision_model (torch.nn.Module): Vision model.
-        pixel_values (torch.Tensor): Image/Video input tensor.
         grid_thw_list: List of grid dimensions for each image
-        rope_type: Type of rope used in the vision model.
-                   Different rope types have different dimension to do ViT.
-                   "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
-                   "rope_2d" for 2D rope (e.g., Kimi-VL)
+        schedule_policy: MMDPSchedulePolicy
         Returns:
-            shuffle_indices:
-                Indices to reorder data for balanced loading
+            patches_per_image:
+                Patch num for each image
+            image_to_tp_rank:
+                Image indices reordered according to its assigned DP rank, needs to be used in conjunction with gpu_sample_counts
             gpu_sample_counts:
                 Number of samples assigned to each GPU
             grouped_sizes_per_gpu:
@@ -133,11 +202,7 @@ class MMDPScheduler:
 
         Example:
             ```
-            vision_model.out_hidden_size = 64
-            vision_model.spatial_merge_size = 2
-            pixel_values.shape = (1350, channel)
             grid_thw_list = [[1, 10, 100], [1, 10, 10], [1, 10, 20], [1, 50]]
-            tp_size = 2
             ```
         """
         tp_size = get_tensor_model_parallel_world_size()
@@ -177,6 +242,26 @@ class MMDPScheduler:
         image_to_tp_rank: list[int],
         gpu_sample_counts: list[int],
     ):
+        """
+        Split mm data to different DP rank according to assignment result
+
+        Args:
+            pixel_values: Image/Video input tensor.
+            grid_thw_list: List of grid dimensions for each image
+            patches_per_image: Patch num for each image
+            image_to_tp_rank: Image indices reordered according to its assigned DP rank, needs to be used in conjunction with gpu_sample_counts
+            gpu_sample_counts: Number of samples assigned to each GPU
+        Returns:
+            pixel_values_local: Image/Video input tensor for local DP rank
+            local_grid_thw_list: List of grid dimensions for each image on local DP rank
+
+        Example:
+            ```
+            pixel_values.shape = (1350, channel)
+            image_to_tp_rank = [0, 2, 1, 3]
+            gpu_sample_counts = [1, 3]
+            ```
+        """
         # GPU_0 tp_rank_local = 0
         # GPU_1 tp_rank_local = 1
         tp_rank_local = get_tensor_model_parallel_rank()
@@ -212,21 +297,6 @@ class MMDPScheduler:
                 dtype=pixel_values.dtype,
             )
 
-        # # embed_dim_reduction_factor = 2 * 2
-        # if rope_type == "rope_2d":
-        #     embed_dim_reduction_factor = (
-        #         vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
-        #     )
-        # else:
-        #     embed_dim_reduction_factor = (
-        #         vision_model.spatial_merge_size * vision_model.spatial_merge_size
-        #     )
-
-        # # Find the max length across all ranks
-        # # The output embedding of every DP rank has to be
-        # # padded to this length for tensor_model_parallel_all_gather
-        # # to work
-        # max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
         local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
         return pixel_values_local, local_grid_thw_list
@@ -237,34 +307,40 @@ class MMDPScheduler:
         pixel_values: torch.Tensor,
         grid_thw_list: list,
         modality,
-        schedule_policy: MMPackPolicy = MMPackPolicy.ALL_PACK,
+        schedule_policy: str = "default",
     ):
-        from sglang.srt.managers.mm_utils import MultimodalDataItem
+        """
+        Pack images/videos in a single encoder instance to multiple computing groups according to MMPackPolicy
 
-        if schedule_policy == MMPackPolicy.ALL_PACK:
-            return [
-                [
-                    MultimodalDataItem(
-                        modality=modality,
-                        feature=pixel_values,
-                        model_specific_data={
-                            "image_grid_thw": torch.tensor(grid_thw_list)
-                        },
-                    )
-                ]
-            ]
-        elif schedule_policy == MMPackPolicy.PROFILE_PACK:
-            # TODO
-            logger.warning("MMDPScheduler only supports MMPackPolicy.ALL_PACK now")
-        return [
-            [
-                MultimodalDataItem(
-                    modality=modality,
-                    feature=pixel_values,
-                    model_specific_data={"image_grid_thw": torch.tensor(grid_thw_list)},
-                )
-            ]
-        ]
+        Args:
+            pixel_values: Image/Video input tensor for local DP rank
+            grid_thw_list: List of grid dimensions for each image on local DP rank
+            modality: Modality of the input data
+            schedule_policy: Name of the packing policy to use
+        Returns:
+            embedding_items_list_local_rank:
+                List of MultimodalDataItem to be computed for local DP rank, each item represents a computing group
+
+        Example:
+            ```
+            pixel_values.shape = (350, channel)
+            grid_thw_list = [[1, 10, 10], [1, 10, 20], [1, 50]]
+            ```
+        """
+        # Create policy instance based on schedule_policy using class variable
+        policy_class = MM_PACK_POLICY_MAP.get(schedule_policy, None)
+        if policy_class is None:
+            logger.warning(
+                f"Unknown packing policy: {schedule_policy}, using DefaultPackPolicy(no pack)"
+            )
+            policy_class = DefaultPackPolicy
+        if policy_class == ProfilePackPolicy:
+            logger.warning(
+                "ProfilePackPolicy is not fully implemented yet, using DefaultPackPolicy(no pack)"
+            )
+            policy_class = DefaultPackPolicy
+
+        return policy_class.get_mm_pack_result(pixel_values, grid_thw_list, modality)
 
     @classmethod
     def gather_dp_result(
@@ -277,6 +353,29 @@ class MMDPScheduler:
         image_embeds_local: torch.Tensor,
         get_mm_dp_metadata_func: Callable,
     ):
+        """
+        Gather mm embeddings from different dp rank to local dp rank
+
+        Args:
+            patches_per_image: Patch num for each image
+            image_to_tp_rank: Image indices reordered according to its assigned DP rank, needs to be used in conjunction with gpu_sample_counts
+            gpu_sample_counts: Number of samples assigned to each GPU
+            grouped_pixel_values_len: Total size assigned to each GPU
+            grid_thw_list: List of grid dimensions for all image
+            image_embeds_local: Image/Video embeddings for local DP rank
+            get_mm_dp_metadata_func: Function to get mm dp metadata, can be used to get rope_type and embed_dim_reduction_factor of different model
+        Returns:
+            embeddings_all_rank: Embeddings for all input images/videos in original order
+
+        Example:
+            ```
+            patches_per_image = [1000, 100, 200, 50]
+            image_to_tp_rank = [0, 2, 1, 3]
+            gpu_sample_counts = [1, 3]
+            grouped_pixel_values_len = [1000, 350]
+            grid_thw_list = [[1, 10, 100], [1, 10, 10], [1, 10, 20], [1, 50]]
+            ```
+        """
         embed_dim_reduction_factor, rope_type = get_mm_dp_metadata_func()
 
         # Pad the output based on max_len_per_rank
@@ -321,7 +420,7 @@ class MMDPScheduler:
             )
             rank_embeddings.append(gathered_embeds[start_idx:end_idx])
 
-        patches_per_output_image = [
+        embedding_len_per_output_image = [
             (patch_size // embed_dim_reduction_factor)
             for patch_size in patches_per_image
         ]
@@ -341,11 +440,11 @@ class MMDPScheduler:
                 # Split rank embeddings back to individual images
                 embed_start = 0
                 for img_idx in rank_images:
-                    img_patches = patches_per_output_image[img_idx]
+                    img_embedding_len = embedding_len_per_output_image[img_idx]
                     original_order_embeddings[img_idx] = rank_embed[
-                        embed_start : embed_start + img_patches
+                        embed_start : embed_start + img_embedding_len
                     ]
-                    embed_start += img_patches
+                    embed_start += img_embedding_len
                 current_idx += count
         out_embeddings = torch.cat(original_order_embeddings, dim=0)
         return out_embeddings
