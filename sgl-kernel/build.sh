@@ -25,7 +25,10 @@ mkdir -p "${BUILDX_CACHE_DIR}"
 # Ensure a buildx builder with docker-container driver (required for cache export)
 BUILDER_NAME="sgl-kernel-builder"
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap
+  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap   --driver-opt network=host \
+  --driver-opt env.http_proxy=http://sys-proxy-rd-relay.byted.org:8118 \
+  --driver-opt env.https_proxy=http://sys-proxy-rd-relay.byted.org:8118 \
+  --driver-opt env.no_proxy=localhost,127.0.0.1,::1
 else
   docker buildx use "${BUILDER_NAME}"
 fi
