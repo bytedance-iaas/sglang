@@ -95,7 +95,7 @@ if [ "$CUSTOM_CACHE_PIP" == "true" ]; then
     sed -i 's|--no-cache-dir||g' build.sh  # 删除 pip 缓存参数
 fi
 
-sed -i "s|docker run --rm|docker run --rm --network=host $proxy_args $cache_args|" build.sh
+sed -i "s|--network=host|--network=host $proxy_args $cache_args|" build.sh
 sed -i "s|pytorch/manylinux|hub.byted.org/iaas/manylinux|g" build.sh
 sed -i 's|ARCH=$(uname -i)|ARCH=x86_64|g' build.sh  # DinD 可能不支持 ARCH=$(uname -i)
 

@@ -1,4 +1,4 @@
-ARG BASE_IMG=hub.byted.org/iaas/pytorch_manylinux2_28-builder
+ARG BASE_IMG=pytorch/manylinux2_28-builder
 ARG CUDA_VERSION=12.9
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
