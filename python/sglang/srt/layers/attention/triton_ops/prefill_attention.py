@@ -31,6 +31,8 @@ _is_hip = is_hip()
 if _is_cuda or _is_hip:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
+global_container = {}
+
 
 @triton.jit
 def _fwd_kernel(
@@ -169,60 +171,72 @@ def _fwd_kernel(
 
 
 def benchmark_attention(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
-    configs = [
-        {'BLOCK': 64, 'num_warps': 4, 'num_stages': 1},
-        {'BLOCK': 128, 'num_warps': 4, 'num_stages': 1},
-        {'BLOCK': 64, 'num_warps': 8, 'num_stages': 1},
-        {'BLOCK': 128, 'num_warps': 8, 'num_stages': 1},
-        {'BLOCK': 256, 'num_warps': 8, 'num_stages': 1},
-        {'BLOCK': 64, 'num_warps': 4, 'num_stages': 2},
-        {'BLOCK': 128, 'num_warps': 4, 'num_stages': 2},
-        {'BLOCK': 64, 'num_warps': 8, 'num_stages': 2},
-        {'BLOCK': 128, 'num_warps': 8, 'num_stages': 2},
-    ]
-
+    
+    block_ms =   [64, 128, 256]
+    block_ns =   [64, 128, 256]
+    num_warps =  [4, 8]
+    num_stages = [1,2, 4]
+    num_ctas = [1]
+    
+    configs = []
+    for block_m in block_ms:
+        for block_n in block_ns:
+            for num_warp  in num_warps:
+                for num_stage  in num_stages:
+                    for num_cta in num_ctas:
+                        configs.append({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'num_warps': num_warp, 'num_stages': num_stage, "num_ctas": num_cta})
+    
+    # configs = [{"BLOCK_M":64, "BLOCK_N":64, "num_warps":8, "num_stages": 2},
+    #            {"BLOCK_M":128, "BLOCK_N":64, "num_warps":8, "num_stages": 1}]
+    
     best = (float('inf'), None)
     for cfg in configs:
-        grid = (b_seq_len.shape[0], q.shape[1], triton.cdiv(max_input_len, cfg['BLOCK']))
+        try:
+            grid = (b_seq_len.shape[0], q.shape[1], triton.cdiv(max_input_len, cfg['BLOCK_M']))
 
-        # Warmup
-        for _ in range(5):
-            _fwd_kernel[grid](
-                q, k, v, 1.0 / (q.shape[-1] ** 0.5),
-                b_start_loc, b_seq_len, o,
-                q.stride(0), q.stride(1),
-                k.stride(0), k.stride(1),
-                v.stride(0), v.stride(1),
-                o.stride(0), o.stride(1),
-                kv_group_num=q.shape[1] // k.shape[1],
-                BLOCK_M=cfg['BLOCK'], BLOCK_DMODEL=triton.next_power_of_2(q.shape[-1]),
-                BLOCK_N=cfg['BLOCK'], IS_CAUSAL=True,
-                num_warps=cfg['num_warps'], num_stages=cfg['num_stages'],
-                Lk=q.shape[-1],
-            )
-        torch.cuda.synchronize()
+            # Warmup
+            for _ in range(5):
+                _fwd_kernel[grid](
+                    q, k, v, 1.0 / (q.shape[-1] ** 0.5),
+                    b_start_loc, b_seq_len, o,
+                    q.stride(0), q.stride(1),
+                    k.stride(0), k.stride(1),
+                    v.stride(0), v.stride(1),
+                    o.stride(0), o.stride(1),
+                    kv_group_num=q.shape[1] // k.shape[1],
+                    BLOCK_M=cfg['BLOCK_M'], BLOCK_DMODEL=triton.next_power_of_2(q.shape[-1]),
+                    BLOCK_N=cfg['BLOCK_N'], IS_CAUSAL=True,
+                    num_warps=cfg['num_warps'], num_stages=cfg['num_stages'],
+                    num_ctas = cfg["num_ctas"],
+                    Lk=q.shape[-1],
+                )
+            torch.cuda.synchronize()
 
-        t0 = time.time()
-        for _ in range(10):
-            _fwd_kernel[grid](
-                q, k, v, 1.0 / (q.shape[-1] ** 0.5),
-                b_start_loc, b_seq_len, o,
-                q.stride(0), q.stride(1),
-                k.stride(0), k.stride(1),
-                v.stride(0), v.stride(1),
-                o.stride(0), o.stride(1),
-                kv_group_num=q.shape[1] // k.shape[1],
-                BLOCK_M=cfg['BLOCK'], BLOCK_DMODEL=triton.next_power_of_2(q.shape[-1]),
-                BLOCK_N=cfg['BLOCK'], IS_CAUSAL=True,
-                num_warps=cfg['num_warps'], num_stages=cfg['num_stages'],
-                Lk=q.shape[-1],
-            )
-        torch.cuda.synchronize()
-        t = (time.time() - t0) * 1000 / 50
-        print(f"{cfg} -> {t:.3f} ms")
-        if t < best[0]:
-            best = (t, cfg)
+            t0 = time.time()
+            for _ in range(20):
+                _fwd_kernel[grid](
+                    q, k, v, 1.0 / (q.shape[-1] ** 0.5),
+                    b_start_loc, b_seq_len, o,
+                    q.stride(0), q.stride(1),
+                    k.stride(0), k.stride(1),
+                    v.stride(0), v.stride(1),
+                    o.stride(0), o.stride(1),
+                    kv_group_num=q.shape[1] // k.shape[1],
+                    BLOCK_M=cfg['BLOCK_M'], BLOCK_DMODEL=triton.next_power_of_2(q.shape[-1]),
+                    BLOCK_N=cfg['BLOCK_N'], IS_CAUSAL=True,
+                    num_warps=cfg['num_warps'], num_stages=cfg['num_stages'],
+                    num_ctas = cfg["num_ctas"],
+                    Lk=q.shape[-1],
+                )
+            torch.cuda.synchronize()
+            t = (time.time() - t0) * 1000 / 20
+            print(f"{cfg} -> {t:.3f} ms")
+            if t < best[0]:
+                best = (t, cfg)
+        except:
+            print("test and update failed")
     print("Best config:", best)
+    return best
 
 
 def context_attention_fwd(
@@ -235,61 +249,87 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     """
     
-    if not get_bool_env_var("SGLANG_VIT_TRITON_TUNE"):
-        if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
-            BLOCK = 128
-        else:
-            BLOCK = 64
+    # if not get_bool_env_var("SGLANG_VIT_TRITON_TUNE"):
+    #     if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+    #         BLOCK = 128
+    #     else:
+    #         BLOCK = 64
 
-        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    #     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
 
-        sm_scale = 1.0 / (Lq**0.5)
-        batch, head = b_seq_len.shape[0], q.shape[1]
-        kv_group_num = q.shape[1] // k.shape[1]
+    #     sm_scale = 1.0 / (Lq**0.5)
+    #     batch, head = b_seq_len.shape[0], q.shape[1]
+    #     kv_group_num = q.shape[1] // k.shape[1]
 
-        grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-        num_warps = 4 if Lk <= 64 else 8
+    #     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
+    #     num_warps = 4 if Lk <= 64 else 8
 
-        _fwd_kernel[grid](
-            q,
-            k,
-            v,
-            sm_scale,
-            b_start_loc,
-            b_seq_len,
-            o,
-            q.stride(0),
-            q.stride(1),
-            k.stride(0),
-            k.stride(1),
-            v.stride(0),
-            v.stride(1),
-            o.stride(0),
-            o.stride(1),
-            kv_group_num=kv_group_num,
-            BLOCK_M=BLOCK,
-            BLOCK_DMODEL=triton.next_power_of_2(Lk),
-            BLOCK_N=BLOCK,
-            IS_CAUSAL=is_causal,
-            num_warps=num_warps,
-            num_stages=1,
-            Lk=Lk,
-        )
+    #     _fwd_kernel[grid](
+    #         q,
+    #         k,
+    #         v,
+    #         sm_scale,
+    #         b_start_loc,
+    #         b_seq_len,
+    #         o,
+    #         q.stride(0),
+    #         q.stride(1),
+    #         k.stride(0),
+    #         k.stride(1),
+    #         v.stride(0),
+    #         v.stride(1),
+    #         o.stride(0),
+    #         o.stride(1),
+    #         kv_group_num=kv_group_num,
+    #         BLOCK_M=BLOCK,
+    #         BLOCK_DMODEL=triton.next_power_of_2(Lk),
+    #         BLOCK_N=BLOCK,
+    #         IS_CAUSAL=is_causal,
+    #         num_warps=num_warps,
+    #         num_stages=1,
+    #         Lk=Lk,
+    #     )
     # todo do auto tune during infer:
     # here is a tuned results
-    # benchmark_attention(q, k, v, o, b_start_loc, b_seq_len, max_input_len)
+
+    
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
 
     sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
     
-    BLOCK = 64
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-    num_warps = 4 if Lk <= 64 else 8
-    num_warps = 4
-    num_stages = 2
+    
+    if get_bool_env_var("SGLANG_VIT_TRITON_TUNE"):
 
+        # global global_container
+        hash_key =  "{}_{}_{}_{}".format(q.shape[0], b_start_loc, b_seq_len, max_input_len)
+        
+        
+        if hash_key not in global_container:
+            print("profiling new case")
+            kernel_configs = benchmark_attention(q, k, v, o, b_start_loc, b_seq_len, max_input_len)[1]
+            global_container[hash_key] = kernel_configs
+        else:
+            kernel_configs = global_container[hash_key]
+        # BLOCK_M = kernel_configs["BLOCK_M"]
+        # BLOCK_N = kernel_configs["BLOCK_N"]
+        # num_warps =  kernel_configs["num_warps"]
+        # num_stages = kernel_configs["num_stages"]
+        
+        BLOCK_M = 128
+        BLOCK_N = 64
+        num_warps = 8
+        num_stages = 1
+    
+    
+    else:
+        BLOCK_M = 64
+        BLOCK_N = 64
+        num_warps = 4 if Lk <= 64 else 8
+        num_stages = 2
+
+    grid = (batch, head, triton.cdiv(max_input_len, BLOCK_M))
     _fwd_kernel[grid](
         q,
         k,
@@ -307,9 +347,9 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
-        BLOCK_M=BLOCK,
+        BLOCK_M=BLOCK_M,
         BLOCK_DMODEL=triton.next_power_of_2(Lk),
-        BLOCK_N=BLOCK,
+        BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
         num_warps=num_warps,
         num_stages= num_stages,
