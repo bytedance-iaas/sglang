@@ -560,6 +560,12 @@ class EICHiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
+            while not last_node.backuped:
+                last_node = last_node.parent
+                last_host_node = last_node
+                host_hit_length = 0
+            if not last_node.evicted:
+                break
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
@@ -1011,6 +1017,12 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
+            while not last_node.backuped:
+                last_node = last_node.parent
+                last_host_node = last_node
+                host_hit_length = 0
+            if not last_node.evicted:
+                break
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
