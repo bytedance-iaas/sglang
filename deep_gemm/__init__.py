@@ -37,6 +37,7 @@ if version.parse(cuda_version) >= version.parse('12.1'):
         fp8_gemm_tn, fp8_gemm_tt,
         fp8_gemm_nt_skip_head_mid,
         m_grouped_fp8_gemm_nt_contiguous,
+        m_grouped_fp8_asym_gemm_nt_contiguous,
         m_grouped_fp8_gemm_nn_contiguous,
         m_grouped_fp8_gemm_nt_masked,
         k_grouped_fp8_gemm_nt_contiguous,

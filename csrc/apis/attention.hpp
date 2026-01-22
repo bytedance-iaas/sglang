@@ -6,6 +6,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm100_fp8_asym_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/smxx_fp8_mqa_logits.hpp"
 #include "../jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"

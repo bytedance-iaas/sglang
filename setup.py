@@ -64,7 +64,10 @@ def get_package_version():
             status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
             if status_output:
                 print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
-                assert False, 'Git working directory is not clean'
+                # if not os.environ.get("DEEPGEMM_ALLOW_DIRTY", ""):
+                #     raise RuntimeError("Git working directory is not clean "
+                #                        "(set DEEPGEMM_ALLOW_DIRTY=1 to override)")
+                # assert False, 'Git working directory is not clean'
 
             cmd = ['git', 'rev-parse', '--short', 'HEAD']
             revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()

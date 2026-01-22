@@ -1,0 +1,33 @@
+Library path:
+ > ['/usr/local/lib/python3.12/dist-packages/deep_gemm']
+
+Testing m-grouped contiguous GEMM:
+> [32m/sgl-workspace/sglang/DeepGEMM/tests/test_fp8.py[39m([92m88[39m)[36mtest_m_grouped_gemm_contiguous[39m[34m()[39m
+[32m     87[39m         ipdb.set_trace()
+[32m---> 88[39m         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
+[32m     89[39m         deep_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
+
+ipdb> Traceback (most recent call last):
+  File "/sgl-workspace/sglang/DeepGEMM/tests/test_fp8.py", line 177, in <module>
+    test_m_grouped_gemm_contiguous()
+  File "/sgl-workspace/sglang/DeepGEMM/tests/test_fp8.py", line 88, in test_m_grouped_gemm_contiguous
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
+    ^^^^^^^^^
+  File "/usr/lib/python3.12/bdb.py", line 90, in trace_dispatch
+    return self.dispatch_line(frame)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/bdb.py", line 115, in dispatch_line
+    if self.quitting: raise BdbQuit
+                      ^^^^^^^^^^^^^
+bdb.BdbQuit
+
+If you suspect this is an IPython 9.9.0 bug, please report it at:
+    https://github.com/ipython/ipython/issues
+or send an email to the mailing list at ipython-dev@python.org
+
+You can print a more detailed traceback right now with "%tb", or use "%debug"
+to interactively debug it.
+
+Extra-detailed tracebacks for bug-reporting purposes can be enabled via:
+    %config Application.verbose_crash=True
+

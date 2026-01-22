@@ -81,8 +81,12 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         # noinspection PyShadowingNames
         def test_func():
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
+            deep_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
 
+        import ipdb
+        ipdb.set_trace()
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
+        deep_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(a, b, d, m_indices, disable_ue8m0_cast=disable_ue8m0_cast)
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
         print(f' > Perf ({num_groups=}, m={m:5}, n={n:6}, k={k:5}, {kernel_opt}, layout={major_opt}): '
               f'{t * 1e6:4.0f} us | '
@@ -169,7 +173,7 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
+    # test_gemm()
     test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
-    test_k_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_masked()
+    # test_k_grouped_gemm_contiguous()

@@ -1,0 +1,42 @@
+/usr/local/lib/python3.12/dist-packages/torch/include/fmt/base.h(473): warning #128-D: loop is not reachable
+    for (; n != 0; ++s1, ++s2, --n) {
+    ^
+          detected during:
+            instantiation of "auto fmt::v11::detail::compare(const Char *, const Char *, std::size_t)->int [with Char=char]" at line 591
+            instantiation of "auto fmt::v11::basic_string_view<Char>::compare(fmt::v11::basic_string_view<Char>) const->int [with Char=char]" at line 598
+            instantiation of class "fmt::v11::basic_string_view<Char> [with Char=char]" at line 2642
+            instantiation of "auto fmt::v11::basic_format_args<Context>::get_id(fmt::v11::basic_string_view<Char>) const->int [with Context=fmt::v11::context, Char=char]" at line 2685
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/usr/local/lib/python3.12/dist-packages/torch/include/fmt/format.h(2597): warning #2417-D: constexpr constructor calls non-constexpr function "fmt::v11::basic_memory_buffer<T, SIZE, Allocator>::basic_memory_buffer(const Allocator &) [with T=fmt::v11::detail::bigint::bigit, SIZE=32UL, Allocator=fmt::v11::detail::allocator<fmt::v11::detail::bigint::bigit>]"
+    constexpr bigint() : exp_(0) {}
+                                 ^
+
+csrc/apis/../jit_kernels/impls/../heuristics/../../utils/layout.hpp(39): warning #3288-D: explicit lambda template parameters are a C++20 feature
+      return [&t] <size_t... Is> (std::index_sequence<Is...>) {
+                  ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/fmt/base.h(473): warning #128-D: loop is not reachable
+    for (; n != 0; ++s1, ++s2, --n) {
+    ^
+          detected during:
+            instantiation of "auto fmt::v11::detail::compare(const Char *, const Char *, std::size_t)->int [with Char=char]" at line 591
+            instantiation of "auto fmt::v11::basic_string_view<Char>::compare(fmt::v11::basic_string_view<Char>) const->int [with Char=char]" at line 598
+            instantiation of class "fmt::v11::basic_string_view<Char> [with Char=char]" at line 2642
+            instantiation of "auto fmt::v11::basic_format_args<Context>::get_id(fmt::v11::basic_string_view<Char>) const->int [with Context=fmt::v11::context, Char=char]" at line 2685
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/usr/local/lib/python3.12/dist-packages/torch/include/fmt/format.h(2597): warning #2417-D: constexpr constructor calls non-constexpr function "fmt::v11::basic_memory_buffer<T, SIZE, Allocator>::basic_memory_buffer(const Allocator &) [with T=fmt::v11::detail::bigint::bigit, SIZE=32UL, Allocator=fmt::v11::detail::allocator<fmt::v11::detail::bigint::bigit>]"
+    constexpr bigint() : exp_(0) {}
+                                 ^
+
+csrc/apis/../jit_kernels/impls/../heuristics/../../utils/layout.hpp(39): warning #3288-D: explicit lambda template parameters are a C++20 feature
+      return [&t] <size_t... Is> (std::index_sequence<Is...>) {
+                  ^
+
+asymCompKernelMain.cu(19): warning #177-D: function "ceil_div_i64" was declared but never referenced
+  static inline int64_t ceil_div_i64(int64_t a, int64_t b) {
+                        ^
+
