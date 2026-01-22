@@ -1679,8 +1679,23 @@ class LazyDumpTensorsReqInput(BaseReq):
 
 
 @dataclass
+class EnableEICReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class DisableEICReqInput(BaseReq):
+    pass
+
+
+@dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+class EICSwitchOutput(BaseReq):
+    success: bool
+    message: str
 
 
 def _check_all_req_types():

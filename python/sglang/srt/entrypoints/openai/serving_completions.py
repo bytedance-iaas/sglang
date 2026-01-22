@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    StreamOptions,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -62,6 +63,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
+        request.stream_options = StreamOptions(include_usage=True)
         # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
             logger.warning(
