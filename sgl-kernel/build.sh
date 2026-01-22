@@ -8,7 +8,10 @@ fi
 
 PYTHON_VERSION="$1"          # e.g. 3.10
 CUDA_VERSION="$2"            # e.g. 12.9
-ARCH="${3:-$(uname -i)}"     # optional override
+ARCH="${3:-$(uname -m)}"     # optional override
+if [ "${ARCH}" = "unknown" ]; then
+  ARCH="x86_64"
+fi
 
 if [ "${ARCH}" = "aarch64" ]; then
   BASE_IMG="pytorch/manylinuxaarch64-builder"
