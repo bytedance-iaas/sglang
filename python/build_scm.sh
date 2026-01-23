@@ -36,19 +36,29 @@ fi
 cd ./python
 
 VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)
-echo "Building sglang-python version $VERSION$VERSION_SUFFIX"
-
-pyproject_bk=pyproject.toml.bk
-cp pyproject.toml $pyproject_bk
-
-sed -i "s/^version = .*$/version = \"$VERSION$VERSION_SUFFIX\"/" pyproject.toml
 $PIP install build
-$PYTHON -m build
+
+if [ -z "$VERSION" ]; then
+    BASE_VERSION=${CUSTOM_SGLANG_VERSION}
+    if [ -z "$BASE_VERSION" ]; then
+        echo "CUSTOM_SGLANG_VERSION is not set"
+        exit 1
+    fi
+    PRETEND_VERSION="${BASE_VERSION}${VERSION_SUFFIX}"
+    echo "Building sglang-python version ${PRETEND_VERSION}"
+    SETUPTOOLS_SCM_PRETEND_VERSION="${PRETEND_VERSION}" $PYTHON -m build
+else
+    echo "Building sglang-python version $VERSION$VERSION_SUFFIX"
+    pyproject_bk=pyproject.toml.bk
+    cp pyproject.toml $pyproject_bk
+    sed -i "s/^version = .*$/version = \"$VERSION$VERSION_SUFFIX\"/" pyproject.toml
+    $PYTHON -m build
+    mv $pyproject_bk pyproject.toml
+fi
 
 OUTPUT_PATH=$ROOT_DIR/output
 mkdir -p $OUTPUT_PATH
 mv dist/* $OUTPUT_PATH/
-mv $pyproject_bk pyproject.toml
 
 if [ -z "$CUSTOM_TOS_AK" ] && [ -z "$CUSTOM_TOS_SK" ]; then
     echo "CUSTOM_TOS_AK and CUSTOM_TOS_SK are not set, skip uploading to tos"
