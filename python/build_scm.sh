@@ -39,10 +39,15 @@ VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)
 $PIP install build
 
 if [ -z "$VERSION" ]; then
-    BASE_VERSION=${CUSTOM_SGLANG_VERSION}
-    if [ -z "$BASE_VERSION" ]; then
-        echo "CUSTOM_SGLANG_VERSION is not set"
-        exit 1
+    BASE_TAG=$(git -C .. tag --list --sort=-version:refname "v*.*.*" | head -1)
+    if [ -z "$BASE_TAG" ]; then
+        BASE_VERSION=${CUSTOM_SGLANG_VERSION}
+        if [ -z "$BASE_VERSION" ]; then
+            echo "No git tag found and CUSTOM_SGLANG_VERSION is not set"
+            exit 1
+        fi
+    else
+        BASE_VERSION=${BASE_TAG#v}
     fi
     PRETEND_VERSION="${BASE_VERSION}${VERSION_SUFFIX}"
     echo "Building sglang-python version ${PRETEND_VERSION}"
