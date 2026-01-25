@@ -8,7 +8,10 @@ fi
 
 PYTHON_VERSION="$1"          # e.g. 3.10
 CUDA_VERSION="$2"            # e.g. 12.9
-ARCH="${3:-$(uname -i)}"     # optional override
+ARCH="${3:-$(uname -m)}"     # optional override
+if [ "${ARCH}" = "unknown" ]; then
+  ARCH="x86_64"
+fi
 
 if [ "${ARCH}" = "aarch64" ]; then
   BASE_IMG="pytorch/manylinuxaarch64-builder"
@@ -22,10 +25,16 @@ CACHE_DIR="${HOME}/.cache/sgl-kernel"
 BUILDX_CACHE_DIR="${CACHE_DIR}/buildx"
 mkdir -p "${BUILDX_CACHE_DIR}"
 
+# Proxy settings
+PROXY_URL="http://sys-proxy-rd-relay.byted.org:8118"
+NO_PROXY_LIST="localhost,127.0.0.1,::1"
+
 # Ensure a buildx builder with docker-container driver (required for cache export)
 BUILDER_NAME="sgl-kernel-builder"
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap
+  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap   --driver-opt network=host \
+  --driver-opt env.http_proxy="${PROXY_URL}" \
+  --driver-opt env.https_proxy="${PROXY_URL}" 
 else
   docker buildx use "${BUILDER_NAME}"
 fi
@@ -63,6 +72,9 @@ docker buildx build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  --build-arg http_proxy="${PROXY_URL}" \
+  --build-arg https_proxy="${PROXY_URL}" \
+  --build-arg no_proxy="${NO_PROXY_LIST}" \
   "${BUILD_ARGS[@]}" \
   --cache-from type=local,src=${BUILDX_CACHE_DIR} \
   --cache-to type=local,dest=${BUILDX_CACHE_DIR},mode=max \

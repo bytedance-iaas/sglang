@@ -1,17 +1,32 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
-
+# 使用已缓存好的base镜像
+FROM hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 as base
 ARG TARGETARCH
+
+ARG GRACE_BLACKWELL=0
+# 配置 apt 将缓存放到 /root/.cache/apt 目录
+RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
+ && echo 'Dir::Cache "/root/.cache/apt";' > /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::Cache::archives "/root/.cache/apt/archives";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
+# 编译之前，将源统一设置成内网的
+RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
+
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
 
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
+ARG HOPPER_SBO=1
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.3.21
+ARG CUSTOM_CACHE_TOS_AK=""
+ARG CUSTOM_CACHE_TOS_BUCKET="iaas-servingkit"
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -53,12 +68,13 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && cd /usr/lib/python3/dist-packages/ \
     && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
-# Install system dependencies (organized by category for better caching)
-RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
-    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    # Core system utilities
+# 在安装pip后，设置pip源为火山内网源
+RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple
+
+# Set timezone and install all packages
+RUN --mount=type=cache,target=/var/cache/apt,id=base-apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+ && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
+ && apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     ca-certificates \
     software-properties-common \
@@ -176,17 +192,51 @@ ARG TRITON_LANG_COMMIT
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
+ARG CUSTOM_CACHE_TOS_AK
+ARG CUSTOM_CACHE_TOS_BUCKET
+ARG CUDA_VERSION
+ARG SGLANG_BRANCH
 
-# Install SGLang
+# 设置 ccache 环境变量
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV PATH="/usr/lib/ccache:${PATH}"
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+# 安装 toscli 工具并下载 ccache 缓存
+RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ]; then \
+      curl -s https://luban-source.byted.org/repository/scm/toutiao.tos.toscli_1.0.0.20.tar.gz -o - | tar xz -C . ./toscli \
+      && chmod +x ./toscli \
+      && mv ./toscli /usr/bin/ \
+      && CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH}.tar.gz" \
+      && echo "Downloading cache from TOS: ${CACHE_TAR_NAME}" \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} get -filename /tmp/${CACHE_TAR_NAME} cache/sglang-image/${CACHE_TAR_NAME} || true \
+      && if [ -f "/tmp/${CACHE_TAR_NAME}" ]; then \
+           echo "Cache file downloaded, size: $(du -h /tmp/${CACHE_TAR_NAME} | cut -f1)" \
+           && mkdir -p /root/.cache \
+           && tar -xzf /tmp/${CACHE_TAR_NAME} -C /root \
+           && echo "Cache extracted successfully" \
+           && echo "Cache contents after extraction:" \
+           && du -sh /root/.cache/* 2>/dev/null || echo "  /root/.cache is empty or not accessible" \
+           && rm -f /tmp/${CACHE_TAR_NAME}; \
+         else \
+           echo "No cache found, starting fresh build" \
+           && mkdir -p /root/.cache; \
+         fi \
+    else \
+      echo "CUSTOM_CACHE_TOS_AK not set, skipping cache download" \
+      && mkdir -p /root/.cache; \
+    fi
+
+
+# 使用bytedance-iaas代码仓进行sglang安装
+ARG SGLANG_BRANCH
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
-    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    elif [ -z "$SGL_VERSION" ]; then \
-        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
     else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 https://github.com/bytedance-iaas/sglang.git -b ${SGLANG_BRANCH} /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
 
@@ -343,9 +393,14 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install NVIDIA development tools
-RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
-    apt update -y \
+# 配置 apt 将缓存放到 /root/.cache/apt 目录
+RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
+ && echo 'Dir::Cache "/root/.cache/apt";' > /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::Cache::archives "/root/.cache/apt/archives";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
+ && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
+
+RUN --mount=type=cache,target=/var/cache/apt apt update -y \
     && apt install -y --no-install-recommends gnupg \
     && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
     && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
@@ -378,10 +433,12 @@ RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/clang-format \
         https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /usr/local/bin/clang-format
 
-# clangd
-RUN curl --retry 3 --retry-delay 2 -fsSL -o clangd.zip \
-        https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
-    && unzip -q clangd.zip \
+# Install clangd
+# 使用clangd的缓存包加速编译
+RUN wget https://tosv.byted.org/obj/iaas-servingkit/clangd-linux-18.1.3.zip \
+    && mv clangd-linux-18.1.3.zip clangd.zip \
+#RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+    && unzip clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
     && rm -rf clangd_18.1.3 clangd.zip
@@ -390,8 +447,7 @@ RUN curl --retry 3 --retry-delay 2 -fsSL -o clangd.zip \
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
-        "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && wget "https://tosv.byted.org/obj/iaas-servingkit/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
@@ -418,10 +474,33 @@ COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
 
-# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+# 使用pip安装just，加速编译流程
+#RUN set -euxo ; \
+#    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+RUN pip install rust-just
+
+# 上传 ccache 缓存到 TOS
+ARG CUSTOM_CACHE_TOS_AK
+ARG CUSTOM_CACHE_TOS_BUCKET
+ARG CUDA_VERSION
+RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ] ; then \
+      CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH}.tar.gz" \
+      && echo "=== Preparing to upload cache to TOS: ${CACHE_TAR_NAME} ===" \
+      && rm -rf /root/.cache/cargo-target /root/.cache/flashinfer \
+      && echo "Cache contents before archiving:" \
+      && du -sh /root/.cache/* 2>/dev/null || echo "  /root/.cache is empty" \
+      && cd /root \
+      && tar -czf /tmp/${CACHE_TAR_NAME} .cache \
+      && echo "Cache archive created, size: $(du -h /tmp/${CACHE_TAR_NAME} | cut -f1)" \
+      && echo "Archive contents:" \
+      && tar -tzf /tmp/${CACHE_TAR_NAME} | head -20 \
+      && echo "..." \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 10m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} del cache/sglang-image/${CACHE_TAR_NAME} || true \
+      && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} put -verbose -prefix cache/sglang-image/ -name ${CACHE_TAR_NAME} /tmp/${CACHE_TAR_NAME} \
+      && echo "=== Cache uploaded successfully ===" \
+      && rm -f /tmp/${CACHE_TAR_NAME}; \
+    else \
+      echo "CUSTOM_CACHE_TOS_AK not set, skipping cache upload"; \
     fi
 
 RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
@@ -429,127 +508,8 @@ RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
-########################################################
-########## Runtime Image ##############################
-########################################################
-#
-# PURPOSE: Production runtime environment with JIT support
-#
-# This stage creates a production-ready image containing:
-# - Pre-compiled SGLang and DeepEP components
-# - Full CUDA toolchain for JIT compilation (DeepGEMM, Triton, FlashInfer)
-# - Optimized for inference workloads and deployment
-# - Smaller than framework (no dev tools like vim, tmux, nsight, etc.)
-#
-# Use this stage when you need:
-# - Production deployment of SGLang
-# - JIT compilation support for FP8/microscaling kernels
-# - Ready-to-run inference server environment
-#
-# Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
-
-ARG CUDA_VERSION
-ARG TARGETARCH
-ARG GDRCOPY_VERSION=2.5.1
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
-
-# Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
-ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
-    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-
-# Install runtime dependencies (devel base provides gcc/g++/build tools)
-RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
-    # Python runtime
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
-    python3.12-full \
-    python3.12-dev \
-    wget \
-    # Core system utilities
-    tzdata \
-    ca-certificates \
-    netcat-openbsd \
-    curl \
-    git \
-    # Runtime libraries
-    libopenmpi3 \
-    libnuma1 \
-    libibverbs1 \
-    libibumad3 \
-    librdmacm1 \
-    libnl-3-200 \
-    libnl-route-3-200 \
-    ibverbs-providers \
-    libgoogle-glog0v6t64 \
-    libunwind8 \
-    libboost-system1.83.0 \
-    libboost-thread1.83.0 \
-    libboost-filesystem1.83.0 \
-    libgrpc++1.51t64 \
-    libprotobuf32t64 \
-    libhiredis1.1.0 \
-    libcurl4 \
-    libczmq4 \
-    libfabric1 \
-    libssl3 \
-    # RDMA runtime
-    rdma-core \
-    infiniband-diags \
-    perftest \
-    # Build tools for JIT compilation
-    ninja-build \
-    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
-    libnccl2 \
-    libnccl-dev \
-    # GPG key verification
-    gnupg2 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
-    && update-alternatives --set python3 /usr/bin/python3.12 \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# Set up locale
-RUN apt-get update && apt-get install -y --no-install-recommends locales \
-    && locale-gen en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV LANG=en_US.UTF-8 \
-    LANGUAGE=en_US:en \
-    LC_ALL=en_US.UTF-8
-
-# Copy Python site-packages from framework (contains all built packages)
-COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-
-# Copy SGLang workspace
-COPY --from=framework /sgl-workspace /sgl-workspace
-
-# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
-    fi
-
-# Copy GDRCopy runtime libraries (but not the build artifacts)
-COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
-COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
-COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
-
-# Fix DeepEP IBGDA symlink in runtime
-RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
-
-WORKDIR /sgl-workspace/sglang
-
-# Default command
-CMD ["/bin/bash"]
+# 将源统一切换成火山源
+RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
+RUN rm -rf /var/lib/apt/lists/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list
