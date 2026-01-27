@@ -56,7 +56,10 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DisableEICReqInput,
+    EICSwitchOutput,
     EmbeddingReqInput,
+    EnableEICReqInput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -477,6 +480,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (EICSwitchOutput, lambda x: None),
             ]
         )
         self.init_communicators(self.server_args)
@@ -1475,6 +1479,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
             self.soft_watchdog.feed()
+
+    async def enable_eic_cache(self) -> EICSwitchOutput:
+        return (await self.eic_switch_communicator(EnableEICReqInput()))[0]
+
+    async def disable_eic_cache(self) -> EICSwitchOutput:
+        return (await self.eic_switch_communicator(DisableEICReqInput()))[0]
 
     def _handle_batch_output(
         self,
