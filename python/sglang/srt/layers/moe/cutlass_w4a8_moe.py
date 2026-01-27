@@ -13,11 +13,13 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
+    get_cutlass_w4a8_moe_mm_data_triton_kernel,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
+from sglang.srt.utils import get_bool_env_var
 
 
 def cutlass_w4a8_moe(
@@ -135,23 +137,37 @@ def cutlass_w4a8_moe(
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_local_experts,
-        n,
-        k,
-    )
+    if not get_bool_env_var("SGLANG_USE_TRITON_PREP_NORMAL"):
+        a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+        )
+    else:
+        # use triton kernel to get problem sizes and expert offsets
+        problem_sizes1, problem_sizes2, expert_offsets = (
+            get_cutlass_w4a8_moe_mm_data_triton_kernel(
+                topk_ids,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                num_local_experts,
+                n,
+                k,
+            )
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
-
+    expected_m_per_group = int(m / num_local_experts * topk)
     cutlass_w4a8_moe_mm(
         c1,
         gateup_input,
@@ -166,6 +182,7 @@ def cutlass_w4a8_moe(
         s_strides13,
         128,
         topk,
+        expected_m_per_group,
     )
 
     intermediate_q = torch.empty(
@@ -189,6 +206,7 @@ def cutlass_w4a8_moe(
         s_strides2,
         128,
         topk,
+        expected_m_per_group,
     )
 
     output = torch.empty_like(a)
@@ -323,6 +341,7 @@ def cutlass_w4a8_moe_deepep_normal(
     local_topk_ids = (
         torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
     ).contiguous()
+    expected_m_per_group = int(m / num_experts)
 
     a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
@@ -354,6 +373,7 @@ def cutlass_w4a8_moe_deepep_normal(
         s_strides13,
         128,
         topk,
+        expected_m_per_group,
     )
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
     silu_and_mul(c1, intermediate)
@@ -377,6 +397,7 @@ def cutlass_w4a8_moe_deepep_normal(
         s_strides2,
         128,
         topk,
+        expected_m_per_group,
     )
     num_tokens = src2dst.shape[0] // topk
     output = torch.empty(
@@ -478,6 +499,7 @@ def cutlass_w4a8_moe_deepep_ll(
     topk = topk_ids_.size(1)
 
     device = a.device
+    expected_m_per_group = int(m / num_experts)
 
     problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
         masked_m,
@@ -489,7 +511,10 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-    per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    if get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
+        per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    else:
+        gateup_input = a
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
@@ -507,6 +532,7 @@ def cutlass_w4a8_moe_deepep_ll(
         s_strides13,
         128,
         topk,
+        expected_m_per_group,
     )
 
     intermediate_q = torch.empty(
@@ -515,6 +541,7 @@ def cutlass_w4a8_moe_deepep_ll(
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale
     )
+    del c1, gateup_input
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,
@@ -529,6 +556,7 @@ def cutlass_w4a8_moe_deepep_ll(
         s_strides2,
         128,
         topk,
+        expected_m_per_group,
     )
 
     return c2
