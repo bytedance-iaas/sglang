@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
 import torch
-import bisect
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -653,8 +653,12 @@ class ModelRunnerKVCacheMixin:
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
-                    start_layer=bisect.bisect_left(config.full_attention_layer_ids, self.start_layer),
-                    end_layer=bisect.bisect_left(config.full_attention_layer_ids, self.end_layer),
+                    start_layer=bisect.bisect_left(
+                        config.full_attention_layer_ids, self.start_layer
+                    ),
+                    end_layer=bisect.bisect_left(
+                        config.full_attention_layer_ids, self.end_layer
+                    ),
                     **extra_args,
                 )
             else:

@@ -822,7 +822,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
-    
+
     def _mamba_verify_update(
         self,
         batch: ModelWorkerBatch,

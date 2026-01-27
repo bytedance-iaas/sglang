@@ -129,6 +129,9 @@ class DeepEPMoE(FusedMoE):
         if get_moe_quantization() == "w4afp8":
             self.use_w4afp8 = True
 
+        if get_moe_quantization() == "w4afp8":
+            self.use_w4afp8 = True
+
         self.deepep_mode = get_deepep_mode()
 
         if (

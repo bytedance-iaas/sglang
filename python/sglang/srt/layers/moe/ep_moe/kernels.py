@@ -1298,6 +1298,7 @@ def get_cutlass_w4a8_moe_mm_data_triton_kernel(
         expert_offsets.to(torch.int32),
     )
 
+
 def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     masked_m,
     problem_sizes1,

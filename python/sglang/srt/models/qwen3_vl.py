@@ -844,7 +844,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds
-    
+
     @property
     def start_layer(self) -> int:
         return getattr(getattr(self, "model", None), "start_layer", 0)

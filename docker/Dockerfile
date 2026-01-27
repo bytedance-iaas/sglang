@@ -297,6 +297,11 @@ RUN set -eux; \
       cd DeepEP && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
       cd .. ; \
+    elif [ "$W4A8_PER_TENSOR_TRANSFER" = "1" ]; then \
+      git clone https://github.com/bytedance-iaas/DeepEP.git -b support_per_tensor_transfer && \
+      cd DeepEP && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
     else \
         curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \

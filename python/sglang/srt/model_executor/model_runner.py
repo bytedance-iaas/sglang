@@ -1756,7 +1756,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
-            
+
             self.init_new_workspace = init_new_workspace
             attn_backend = HybridAttnBackend(
                 self,

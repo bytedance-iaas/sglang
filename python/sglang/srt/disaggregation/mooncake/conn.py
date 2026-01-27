@@ -276,7 +276,7 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         src_data_ptrs: list[int],
         dst_data_ptrs: list[int],
-        dst_non_draft_kv_data_lens : int, 
+        dst_non_draft_kv_data_lens: int,
         item_lens: list[int],
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
@@ -308,7 +308,9 @@ class MooncakeKVManager(CommonKVManager):
             ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, dst_non_draft_kv_data_lens)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs, dst_data_ptrs, dst_non_draft_kv_data_lens
+                )
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
@@ -385,7 +387,7 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_non_draft_kv_data_lens : int, 
+        dst_non_draft_kv_data_lens: int,
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
@@ -405,7 +407,7 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_non_draft_kv_data_lens : int, 
+        dst_non_draft_kv_data_lens: int,
         dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
@@ -449,7 +451,9 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs, dst_non_draft_kv_data_lens)
+            self.get_mha_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs, dst_kv_ptrs, dst_non_draft_kv_data_lens
+            )
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -612,7 +616,7 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_state_indices: list[int],
         dst_state_data_ptrs: list[int],
-        dst_non_draft_kv_data_lens: int, 
+        dst_non_draft_kv_data_lens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
@@ -644,6 +648,7 @@ class MooncakeKVManager(CommonKVManager):
                     for base in range(0, total_layers * num_tensors, total_layers)
                     for idx in layer_indices
                 ]
+
                 def slice_list(values):
                     if not values:
                         return []
@@ -1357,7 +1362,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            non_draft_kv_data_lens = str(self.kv_mgr.kv_args.non_draft_kv_data_lens).encode("ascii")
+            non_draft_kv_data_lens = str(
+                self.kv_mgr.kv_args.non_draft_kv_data_lens
+            ).encode("ascii")
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(

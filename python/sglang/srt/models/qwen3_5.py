@@ -62,6 +62,9 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+
+# Utils
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -74,9 +77,6 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 # Models
 from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-
-# Utils
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -843,7 +843,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
-        
+
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
@@ -1061,10 +1061,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 }
             )
         return loaded_params
-    
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
@@ -1119,7 +1120,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
-                and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
             ):
                 continue
             if "embed_tokens" in name and not self.pp_group.is_first_rank:
@@ -1273,7 +1277,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
-                and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
             ):
                 continue
             if "embed_tokens" in name and not self.pp_group.is_first_rank:
@@ -1408,7 +1415,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 }
             )
         return loaded_params
-    
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
