@@ -11,10 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -23,8 +21,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     print_info_once,
-    timer_start,
     timer_end,
+    timer_start,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -58,13 +56,18 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding import (
+    apply_rotary_pos_emb,
+    connect_qkv_and_attn_compile,
+    connect_qkv_and_attn_no_compile,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
+TORCH_COMPILE_SHAPE = 3400
 
 
 @dataclasses.dataclass
@@ -754,111 +757,32 @@ class VisionAttention(nn.Module):
         kv_head = self.num_attention_kv_heads_per_partition
 
         attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
-        if self.use_qkv_parallel:
-            # [b, s, embed_dim] --> [b, s, embed_dim]
-            timer_start("qkv_project")
-            qkv, _ = self.qkv_proj(x)
-            timer_end("qkv_project")
-            timer_start("qkv_split")
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            timer_end("qkv_split")
-            # [b, s, embed_dim] --> [b * s, head, head_size]
-            timer_start("reshape")
-            q = q.reshape(bsz * s, head, -1).contiguous()
-            k = k.reshape(bsz * s, kv_head, -1).contiguous()
-            v = v.reshape(bsz * s, kv_head, -1).contiguous()
-            timer_end("reshape")
-        else:
-            # [b, s, embed_dim] --> [s, b, embed_dim]
-            x = rearrange(x, "b s ... -> s b ...")
-            # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
-            qkv, _ = self.qkv_proj(x)
 
-            # [s, b, head, head_dim_sum]
-            new_x_shape = qkv.size()[:-1] + (
-                head,
-                self.q_size + 2 * self.kv_size,
+        # [b, s, embed_dim] --> [b, s, embed_dim]
+        timer_start("qkv_project")
+        qkv, _ = self.qkv_proj(x)
+        timer_end("qkv_project")
+        cos = rotary_pos_emb_cos
+        sin = rotary_pos_emb_sin
+
+        # print("qkv shape {}".format(qkv.shape[1]))
+        # 3400
+        # timer_start("connect_with_compile", True)
+
+        if qkv.shape[1] >= TORCH_COMPILE_SHAPE:
+            q, k, v = connect_qkv_and_attn_compile(
+                qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin
             )
-            qkv = qkv.view(*new_x_shape)
+        else:
+            q, k, v = connect_qkv_and_attn_no_compile(
+                qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin
+            )
+        # timer_end("connect_with_compile", True)
 
-            # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # timer_start("connect_without_compile", True)
+        # q, k, v = connect_qkv_and_attn_no_compile(qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin)
+        # timer_end("connect_without_compile", True)
 
-            # [s, b, head, head_size] --> [b, s, head, head_size]
-            q, k, v = [
-                rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
-            ]
-
-        cos = None
-        sin = None
-        
-        timer_start("pos_embedding")
-        if position_embeddings is not None:
-            # print("check")
-            if self.customized_position_embedding_applier is not None:
-                q, k = self.customized_position_embedding_applier(
-                    q, k, position_embeddings, x_shape
-                )
-            else:
-                cos, sin = position_embeddings
-        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            cos = rotary_pos_emb_cos
-            sin = rotary_pos_emb_sin
-        timer_end("pos_embedding")
-
-        if cos is not None and sin is not None:
-            original_shape = q.shape
-
-            # [total_tokens, head, head_size]
-            q = q.view(-1, head, self.head_size)
-            k = k.view(-1, head, self.head_size)
-            
-            timer_start("concatenate") 
-            if cos.size(-1) * 2 == self.head_size:
-                cos = torch.cat([cos, cos], dim=-1)
-                sin = torch.cat([sin, sin], dim=-1)
-            timer_end("concatenate") 
-            # print("check {} {} {} {}".format(q.shape, k.shape, cos.shape, sin.shape))
-            # print(sin[10], sin[20], sin[30])
-            # print(cos[10], cos[20], cos[30])
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            q = q.view(original_shape)
-            k = k.view(original_shape)
-        timer_start("rearrange_1")
-        if q.dim() == 4:
-            # [b, s, head, head_size] --> [b * s, head, head_size]
-            q = rearrange(q, "b s ... -> (b s) ...")
-        if k.dim() == 4:
-            # [b, s, head, head_size] --> [b * s, head, head_size]
-            k = rearrange(k, "b s ... -> (b s) ...")
-        if v.dim() == 4:
-            # [b, s, head, head_size] --> [b * s, head, head_size]
-            v = rearrange(v, "b s ... -> (b s) ...")
-        timer_end("rearrange_1")
-        
-        assert q.dim() == 3, q.dim()
-        assert k.dim() == 3, k.dim()
-        assert v.dim() == 3, v.dim()
-
-        # internvl
-        if self.qk_normalization:
-            # jit kernel
-            if can_use_jit_qk_norm(self.head_size, q.dtype):
-
-                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
-                head_dim_for_norm = head * self.head_size
-
-                q, k = apply_qk_norm(
-                    q=q,
-                    k=k,
-                    q_norm=self.q_norm,
-                    k_norm=self.k_norm,
-                    head_dim=head_dim_for_norm,
-                    alt_stream=self.aux_stream,
-                )
-
-            else:
-                q, k = self._apply_qk_norm(q, k)
         timer_start("self_attn")
         output = self.qkv_backend.forward(
             q=q,

@@ -18,7 +18,6 @@ import math
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
-import time
 
 import torch
 import torch.nn as nn
@@ -64,7 +63,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, timer_start, timer_end
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, timer_end, timer_start
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -373,7 +372,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
-        
+
         self.compiled = False
 
     @property
@@ -443,7 +442,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             return self.raw_forward(x, grid_thw)
 
-   
     def raw_forward(self, x, grid_thw):
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -460,7 +458,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
         # rotary_pos_emb_cos = rotary_pos_emb_cos.to(torch.bfloat16)
         # rotary_pos_emb_sin = rotary_pos_emb_sin.to(torch.bfloat16)
-
+        rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
+        rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
@@ -491,7 +490,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
-        
+
         timer_end("vision_model")
         return hidden_states
 
@@ -947,7 +946,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             use_deepstack=self.use_deepstack,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
