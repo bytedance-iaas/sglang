@@ -43,7 +43,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import EmbeddingPortPool, MMReceiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -270,6 +270,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        embedding_port_pool: Optional[EmbeddingPortPool] = None,
     ):
         self.is_initializing = True
         self.init_soft_watchdog(server_args)
@@ -319,6 +320,7 @@ class Scheduler(
         self.enable_eic_cache = (
             server_args.enable_eic_cache if self.enable_hierarchical_cache else False
         )
+        self.embedding_port_pool = embedding_port_pool
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -997,6 +999,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
                 scheduler=self,
+                embedding_port_pool=self.embedding_port_pool,
             )
 
     def init_overlap(self):
@@ -2992,6 +2995,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    embedding_port_pool: Optional[EmbeddingPortPool] = None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -3047,6 +3051,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            embedding_port_pool,
         )
         result_dict = {
             "status": "ready",

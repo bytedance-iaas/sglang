@@ -36,6 +36,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.disaggregation.encode_receiver import EmbeddingPortPool
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -96,10 +97,13 @@ def init_tokenizer_manager(
     server_args: ServerArgs,
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
+    embedding_port_pool: Optional[EmbeddingPortPool] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
     # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
-    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
+    tokenizer_manager = TokenizerManagerClass(
+        server_args, port_args, embedding_port_pool
+    )
 
     # Initialize templates
     template_manager = TemplateManager()
@@ -865,6 +869,7 @@ def _launch_scheduler_processes(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
+    embedding_port_pool: Optional[EmbeddingPortPool] = None,
 ):
     scheduler_procs = []
 
@@ -911,6 +916,7 @@ def _launch_scheduler_processes(
                             pp_rank,
                             None,
                             writer,
+                            embedding_port_pool,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
@@ -931,6 +937,7 @@ def _launch_scheduler_processes(
                 port_args=port_args,
                 pipe_writer=writer,
                 run_scheduler_process_func=run_scheduler_process_func,
+                embedding_port_pool=embedding_port_pool,
             ),
         )
         proc.start()
@@ -959,11 +966,20 @@ def _launch_subprocesses(
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
+    # Init embedding port pool
+    embedding_port_pool = None
+    if (
+        server_args.language_only
+        and server_args.encoder_transfer_backend == "zmq_to_scheduler"
+    ):
+        embedding_port_pool = EmbeddingPortPool()
+
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
+        embedding_port_pool=embedding_port_pool,
     )
 
     if server_args.node_rank >= 1:
@@ -1002,7 +1018,7 @@ def _launch_subprocesses(
     # Init tokenizer manager first, as the bootstrap server is initialized here
     if server_args.tokenizer_worker_num == 1:
         tokenizer_manager, template_manager = init_tokenizer_manager_func(
-            server_args, port_args
+            server_args, port_args, embedding_port_pool=embedding_port_pool
         )
     else:
         # Launch multi-tokenizer router
