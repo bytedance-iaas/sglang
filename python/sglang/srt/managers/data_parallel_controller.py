@@ -26,6 +26,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.encode_receiver import EmbeddingPortPool
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -121,6 +122,7 @@ class DataParallelController:
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        embedding_port_pool: Optional[EmbeddingPortPool],
     ) -> None:
         # Parse args
         self.server_args = server_args
@@ -162,10 +164,12 @@ class DataParallelController:
         self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
-            self.launch_dp_attention_schedulers(server_args, port_args)
+            self.launch_dp_attention_schedulers(
+                server_args, port_args, embedding_port_pool
+            )
             self.control_message_step = server_args.tp_size
         else:
-            self.launch_dp_schedulers(server_args, port_args)
+            self.launch_dp_schedulers(server_args, port_args, embedding_port_pool)
             self.control_message_step = 1
 
         self.init_dispatcher()
@@ -219,7 +223,7 @@ class DataParallelController:
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
 
-    def launch_dp_schedulers(self, server_args, port_args):
+    def launch_dp_schedulers(self, server_args, port_args, embedding_port_pool):
         base_gpu_id = 0
 
         threads = []
@@ -240,7 +244,14 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+                args=(
+                    server_args,
+                    tmp_port_args,
+                    base_gpu_id,
+                    dp_rank,
+                    ready_event,
+                    embedding_port_pool,
+                ),
             )
             threads.append(thread)
             base_gpu_id += (
@@ -272,8 +283,15 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
+        embedding_port_pool: Optional[EmbeddingPortPool],
     ):
-        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
+        self.launch_tensor_parallel_group(
+            server_args,
+            port_args,
+            base_gpu_id,
+            dp_rank,
+            embedding_port_pool=embedding_port_pool,
+        )
         ready_event.set()
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
@@ -369,7 +387,10 @@ class DataParallelController:
             req_socket.close()
 
     def launch_dp_attention_schedulers(
-        self, server_args: ServerArgs, port_args: PortArgs
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        embedding_port_pool: Optional[EmbeddingPortPool],
     ):
         # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
@@ -384,7 +405,7 @@ class DataParallelController:
             server_args, worker_ports if worker_ports else None
         )
         self.launch_tensor_parallel_group(
-            server_args, port_args, 0, None, broadcasted_ports
+            server_args, port_args, 0, None, broadcasted_ports, embedding_port_pool
         )
 
     def launch_tensor_parallel_group(
@@ -394,6 +415,7 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
+        embedding_port_pool: Optional[EmbeddingPortPool] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -458,6 +480,7 @@ class DataParallelController:
                             pp_rank,
                             dp_rank,
                             writer,
+                            embedding_port_pool,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
@@ -547,6 +570,7 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
     run_scheduler_process_func: Callable = run_scheduler_process,
+    embedding_port_pool: Optional[EmbeddingPortPool] = None,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
@@ -565,7 +589,7 @@ def run_data_parallel_controller_process(
 
     try:
         controller = DataParallelController(
-            server_args, port_args, run_scheduler_process_func
+            server_args, port_args, run_scheduler_process_func, embedding_port_pool
         )
         pipe_writer.send(
             {

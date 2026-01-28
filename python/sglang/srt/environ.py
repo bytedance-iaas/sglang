@@ -401,6 +401,9 @@ class Envs:
     SGLANG_MM_PACK_POLICY = EnvStr("default")
     SGLANG_MM_SCHEDULE_PACK_NUM = EnvInt(5)
 
+    # VLM EPD
+    SGLANG_EPD_EMBEDDING_PORT_POOL_SIZE = EnvInt(50)
+
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)

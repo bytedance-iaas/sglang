@@ -266,6 +266,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -764,6 +765,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
 
 @dataclass
