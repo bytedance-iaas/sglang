@@ -497,7 +497,7 @@ def generate_qkv(
     "rotary_fraction",
     (
         [0.0, 0.5, 1.0]
-        if (not DISABLE_APPENDKV) and (apply_rotary_emb is not None)
+        if (not DISABLE_APPENDKV) and ( is not None)
         else [0.0]
     ),
 )

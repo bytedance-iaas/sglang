@@ -144,6 +144,7 @@ class CUDAPiecewiseBackend:
             return entry.runnable(*args)
 
         if entry.cudagraph is None:
+            return self.entry.runnable(*args)
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)

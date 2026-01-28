@@ -22,6 +22,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
+    timer_start,
+    timer_end,
 )
 
 _is_cuda = is_cuda()
@@ -1382,7 +1384,7 @@ def triton_mrope_fused(
     pad_n_qh = triton.next_power_of_2(n_qh)
     pad_n_kh = triton.next_power_of_2(n_kh)
     pad_hd = triton.next_power_of_2(head_size)
-
+    # print("check dtype {} {} {}".format(q.dtype, k.dtype, cos_sin_cache.dtype))
     _triton_mrope_forward_fused[(num_tokens,)](
         q,
         k,
@@ -1547,7 +1549,9 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         # Use Triton kernel for multimodal (2D positions) with mrope
         if positions.ndim == 2 and self.mrope_section:
+            # print("1")
             return self.forward_triton(positions, query, key)
+        print("2")
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_triton(
@@ -2748,8 +2752,9 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+import time
+from flash_attn.layers.rotary import apply_rotary_emb
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2757,18 +2762,60 @@ def apply_rotary_pos_emb_native(
     sin: torch.Tensor,
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # timer_start("rope", False)
+    q_r, k_r = apply_rotary_pos_emb_native_(q, k, cos, sin)
+    # timer_end("rope", False)
+    return q_r, k_r
+    # seq_lens = q.shape[0]
+    # positions = torch.arange(0, seq_lens, dtype=torch.int64, device='cuda')
+    # dummy_sin_cos = torch.concat((cos, sin), dim=0)
+    # timer_start("rope", True)
+    # apply_rotary_pos_emb_fused_(q, k, dummy_sin_cos, positions)
+    # timer_end("rope", True)
+    # q = q.unsqueeze_(0)
+    # k = k.unsqueeze_(0)
+    # q_ret = apply_rotary_emb(q, cos, sin)
+    # k_ret = apply_rotary_emb(k, cos, sin)
+    # return q_ret, k_ret
+    
+
+from sgl_kernel import rotary_embedding
+def apply_rotary_pos_emb_fused_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin: torch.Tensor,
+    postions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    head_size = cos_sin.shape[1]
+ 
+    
+    
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def apply_rotary_pos_emb_native_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # print("q cos dtype {} {}".format(q.dtype, cos.dtype))
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()
 
     # embedding is performed in float
-    cos = cos.unsqueeze(unsqueeze_dim).float()
-    sin = sin.unsqueeze(unsqueeze_dim).float()
+    cos = cos.unsqueeze(unsqueeze_dim)#.float()
+    sin = sin.unsqueeze(unsqueeze_dim)#.float()
+    
+    timer_start("rope_float_compute")
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-
+    timer_end("rope_float_compute")
+    
     q_embed = q_embed.to(orig_q_dtype)
     k_embed = k_embed.to(orig_k_dtype)
+    # torch.cuda.synchronize()
 
     return q_embed, k_embed
 

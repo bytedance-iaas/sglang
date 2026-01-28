@@ -18,6 +18,7 @@ import math
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
+import time
 
 import torch
 import torch.nn as nn
@@ -63,7 +64,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, timer_start, timer_end
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -195,8 +196,10 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        timer_start("vision other_1")
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+        timer_end("vision other_1")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -204,9 +207,11 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             output_ws=output_ws,
         )
+        timer_start("vision other_2")
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
         norm2 = self.norm2(x)
+        timer_end("vision other_2")
         mlp = self.mlp(norm2)
         x += mlp
         return x
@@ -368,6 +373,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        
+        self.compiled = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -427,9 +434,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        timer_start("vision_model")
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if not self.compiled:
+                self.raw_forward(x, grid_thw)
+                self.compiled = True
             return self.forward_with_cuda_graph(x, grid_thw)
+        else:
+            return self.raw_forward(x, grid_thw)
 
+   
+    def raw_forward(self, x, grid_thw):
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -443,6 +458,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        # rotary_pos_emb_cos = rotary_pos_emb_cos.to(torch.bfloat16)
+        # rotary_pos_emb_sin = rotary_pos_emb_sin.to(torch.bfloat16)
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
@@ -474,6 +491,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        
+        timer_end("vision_model")
         return hidden_states
 
     def forward_with_cuda_graph(
@@ -588,7 +607,7 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
+        timer_start("LLM")
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -646,7 +665,7 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states, _ = self.norm(
                         hidden_states, residual, post_residual_addition=last_deepstack
                     )
-
+        timer_end("LLM")
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -905,6 +924,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
+        timer_start("routine")
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
@@ -927,9 +947,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             use_deepstack=self.use_deepstack,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                timer_end("routine")
+
                 return self.logits_processor(
                     input_ids,
                     hidden_states,

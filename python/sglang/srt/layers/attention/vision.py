@@ -23,6 +23,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     print_info_once,
+    timer_start,
+    timer_end,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -370,7 +372,7 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
             output = flash_attn_varlen_func(
                 q,
@@ -724,6 +726,7 @@ class VisionAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        timer_start("vit_attn")
         r"""
         Args:
             x: [b, s, embed_dim]
@@ -742,7 +745,9 @@ class VisionAttention(nn.Module):
                 "expected position_embeddings to be a tuple of two tensors,\n"
                 f"but got {type(position_embeddings)}, change if needed"
             )
+            timer_start("position_embedd")
             position_embeddings = tuple(p.to(x.dtype) for p in position_embeddings)
+            timer_end("position_embedd")
         x_shape = x.shape
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
@@ -751,13 +756,18 @@ class VisionAttention(nn.Module):
         attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
+            timer_start("qkv_project")
             qkv, _ = self.qkv_proj(x)
+            timer_end("qkv_project")
+            timer_start("qkv_split")
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
+            timer_end("qkv_split")
             # [b, s, embed_dim] --> [b * s, head, head_size]
+            timer_start("reshape")
             q = q.reshape(bsz * s, head, -1).contiguous()
             k = k.reshape(bsz * s, kv_head, -1).contiguous()
             v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            timer_end("reshape")
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -781,8 +791,10 @@ class VisionAttention(nn.Module):
 
         cos = None
         sin = None
-
+        
+        timer_start("pos_embedding")
         if position_embeddings is not None:
+            # print("check")
             if self.customized_position_embedding_applier is not None:
                 q, k = self.customized_position_embedding_applier(
                     q, k, position_embeddings, x_shape
@@ -792,6 +804,7 @@ class VisionAttention(nn.Module):
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             cos = rotary_pos_emb_cos
             sin = rotary_pos_emb_sin
+        timer_end("pos_embedding")
 
         if cos is not None and sin is not None:
             original_shape = q.shape
@@ -799,15 +812,19 @@ class VisionAttention(nn.Module):
             # [total_tokens, head, head_size]
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
-
+            
+            timer_start("concatenate") 
             if cos.size(-1) * 2 == self.head_size:
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
-
+            timer_end("concatenate") 
+            # print("check {} {} {} {}".format(q.shape, k.shape, cos.shape, sin.shape))
+            # print(sin[10], sin[20], sin[30])
+            # print(cos[10], cos[20], cos[30])
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             q = q.view(original_shape)
             k = k.view(original_shape)
-
+        timer_start("rearrange_1")
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
             q = rearrange(q, "b s ... -> (b s) ...")
@@ -817,7 +834,8 @@ class VisionAttention(nn.Module):
         if v.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
             v = rearrange(v, "b s ... -> (b s) ...")
-
+        timer_end("rearrange_1")
+        
         assert q.dim() == 3, q.dim()
         assert k.dim() == 3, k.dim()
         assert v.dim() == 3, v.dim()
@@ -841,7 +859,7 @@ class VisionAttention(nn.Module):
 
             else:
                 q, k = self._apply_qk_norm(q, k)
-
+        timer_start("self_attn")
         output = self.qkv_backend.forward(
             q=q,
             k=k,
@@ -852,15 +870,19 @@ class VisionAttention(nn.Module):
             attention_mask=attention_mask,
             output_ws=attn_output_ws,
         )
+        timer_end("self_attn")
 
         assert output.dim() == 3, output.shape
 
         if self.use_qkv_parallel:
             # [b * s, h, head_size] --> [b, s, h * head_size]
+            timer_start("rearrange_2")
             output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)
-
+            timer_end("rearrange_2")
             # [b, s, h * head_size] --> [b, s, h * head_size]
+            timer_start("o_proj")
             output, _ = self.proj(output)
+            timer_end("o_proj")
         else:
             # [b * s, h, head_size] --> [s, b, h * head_size]
             context_layer = rearrange(
@@ -872,5 +894,5 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)
-
+        timer_end("vit_attn")
         return output
