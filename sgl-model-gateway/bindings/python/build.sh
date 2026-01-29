@@ -7,19 +7,9 @@ PATH="/root/.cargo/bin:$VIRTUAL_ENV/bin:/root/.local/bin:$PATH"
 
 # install dependencies
 apt update -y \
-    && apt install -y git build-essential libssl-dev pkg-config curl protobuf-compiler libprotobuf-dev\
+    && apt install -y git build-essential libssl-dev pkg-config curl zip\
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
-
-
-
-
-
-# install rustup from rustup.rs
-export RUSTUP_DIST_SERVER="https://rsproxy.cn"
-export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
-curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y \
-    && rustc --version && cargo --version
 
 VER=25.3
 cd /tmp
@@ -29,6 +19,13 @@ chmod +x /usr/local/bin/protoc
 /usr/local/bin/protoc --version
 export PROTOC=/usr/local/bin/protoc
 export PATH=/usr/local/bin:$PATH
+
+# install rustup from rustup.rs
+export RUSTUP_DIST_SERVER="https://rsproxy.cn"
+export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y \
+    && rustc --version && cargo --version
+
 
 pip install maturin
 maturin build --release --out dist --features vendored-openssl
