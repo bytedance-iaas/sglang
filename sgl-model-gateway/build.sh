@@ -11,11 +11,6 @@ apt update -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
-#curl -LsSf https://astral.sh/uv/install.sh | sh
-pip install uv
-
-# install python
-uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
 
 
 # install rustup from rustup.rs
