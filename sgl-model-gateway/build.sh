@@ -24,6 +24,6 @@ export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
 curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y \
     && rustc --version && cargo --version
 
-cargo build --release \
-    && uv build \
-    && rm -rf /root/.cache
+pip install maturin
+cd bindings/python
+maturin build --release --out dist --features vendored-openssl
