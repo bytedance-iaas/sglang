@@ -13,11 +13,22 @@ apt update -y \
 
 
 
+
+
 # install rustup from rustup.rs
 export RUSTUP_DIST_SERVER="https://rsproxy.cn"
 export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
 curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y \
     && rustc --version && cargo --version
+
+VER=25.3
+cd /tmp
+curl -L -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${VER}/protoc-${VER}-linux-x86_64.zip"
+unzip -o protoc.zip -d /usr/local
+chmod +x /usr/local/bin/protoc
+/usr/local/bin/protoc --version
+export PROTOC=/usr/local/bin/protoc
+export PATH=/usr/local/bin:$PATH
 
 pip install maturin
 maturin build --release --out dist --features vendored-openssl
