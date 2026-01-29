@@ -561,7 +561,7 @@ class EICHiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped:
+            while not last_node.backuped and last_node.parent is not None:
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
@@ -870,7 +870,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         temp_node = node
         local_evict_len = 0
         while temp_node.evicted:
-            while not temp_node.backuped:
+            while not temp_node.backuped and temp_node.parent is not None:
                 temp_node = temp_node.parent
                 local_evict_len = 0
             if not temp_node.evicted:
@@ -1023,7 +1023,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped:
+            while not last_node.backuped and last_node.parent is not None:
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
