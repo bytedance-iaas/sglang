@@ -18,7 +18,6 @@ import math
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
-import time
 
 import torch
 import torch.nn as nn
@@ -64,7 +63,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, timer_start, timer_end
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, timer_end, timer_start
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -373,7 +372,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
-        
+
         self.compiled = False
 
     @property
@@ -443,7 +442,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             return self.raw_forward(x, grid_thw)
 
-   
     def raw_forward(self, x, grid_thw):
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -491,7 +489,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
-        
+
         timer_end("vision_model")
         return hidden_states
 
@@ -586,6 +584,10 @@ class Qwen3LLMModel(Qwen3Model):
             len(config.vision_config.deepstack_visual_indexes)
         )
 
+        self.fixed_input_buffers = {}
+        self.fixed_residual_buffers = {}
+        self.cuda_graphs = {}
+
     def get_deepstack_embeds(
         self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
@@ -620,54 +622,157 @@ class Qwen3LLMModel(Qwen3Model):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        for layer_idx, layer in enumerate(
-            self.layers[self.start_layer : self.end_layer]
+        timer_start("LLM_block_for_loop")
+
+        # do graph capture for this part (estimate max benefit)
+        if (
+            get_int_env_var("SGLANG_PREFILL_CUDAGRAPH")
+            and hidden_states.shape[0] >= 128
         ):
-            layer_idx = layer_idx + self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+            hash_key = ""
+            for s in hidden_states.shape:
+                hash_key += "_"
+                hash_key += str(s)
+
+            input_buffer = None
+            residual_buffer = None
+            if hash_key in self.fixed_input_buffers:
+                input_buffer = self.fixed_input_buffers[hash_key]
+                cuda_graph = self.cuda_graphs[hash_key]
+                residual_buffer = self.fixed_residual_buffers[hash_key]
+            else:
+                input_buffer = torch.empty_like(
+                    hidden_states,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                residual_buffer = torch.empty_like(
+                    hidden_states,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
                 )
 
-            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
-            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
-            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
-            # The order matters because addition with different tensors is not associative in practice.
-            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
-            deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
-            )
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                post_residual_addition=deepstack_embeds,
+                self.fixed_input_buffers[hash_key] = input_buffer
+                self.fixed_residual_buffers[hash_key] = residual_buffer
+
+                cuda_graph = torch.cuda.CUDAGraph()
+                self.cuda_graphs[hash_key] = cuda_graph
+
+                with torch.cuda.graph(cuda_graph):
+                    for layer_idx, layer in enumerate(
+                        self.layers[self.start_layer : self.end_layer]
+                    ):
+                        if layer_idx == self.start_layer:
+                            # residual = input_buffer
+                            # print(residual)
+                            hidden_states = input_buffer
+                        if layer_idx == self.end_layer:
+                            hidden_states, residual = input_buffer, residual_buffer
+
+                        layer_idx = layer_idx + self.start_layer
+
+                        # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+                        # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+                        # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+                        # The order matters because addition with different tensors is not associative in practice.
+                        # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+                        deepstack_embeds = self.get_deepstack_embeds(
+                            layer_idx - 1, input_deepstack_embeds
+                        )
+                        hidden_states, residual = layer(
+                            positions,
+                            hidden_states,
+                            forward_batch,
+                            residual,
+                            post_residual_addition=deepstack_embeds,
+                        )
+
+                # with torch.cuda.graph(cuda_graph):
+
+                # self.cuda_graphs[hash_key] = cuda_graph
+            input_buffer.copy_(hidden_states)
+            cuda_graph.replay()
+
+            timer_end("LLM_block_for_loop")
+            # Handle deepstack for the last processed layer if it exists.
+            last_deepstack = self.get_deepstack_embeds(
+                self.end_layer - 1, input_deepstack_embeds
             )
 
-        # Handle deepstack for the last processed layer if it exists.
-        last_deepstack = self.get_deepstack_embeds(
-            self.end_layer - 1, input_deepstack_embeds
-        )
-
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": input_buffer,
+                        "residual": residual_buffer,
+                    }
+                )
+            else:
+                if input_buffer.shape[0] != 0:
+                    if residual_buffer is None:
+                        input_buffer = self.norm(input_buffer)
+                    else:
+                        input_buffer, _ = self.norm(
+                            input_buffer,
+                            input_buffer,
+                            post_residual_addition=last_deepstack,
+                        )
+            timer_end("LLM")
+            if len(aux_hidden_states) == 0:
+                # print("do not have aux_hidden_states")
+                return input_buffer
         else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(
-                        hidden_states, residual, post_residual_addition=last_deepstack
+            for layer_idx, layer in enumerate(
+                self.layers[self.start_layer : self.end_layer]
+            ):
+                layer_idx = layer_idx + self.start_layer
+                if layer_idx in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
                     )
-        timer_end("LLM")
-        if len(aux_hidden_states) == 0:
-            return hidden_states
+
+                # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+                # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+                # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+                # The order matters because addition with different tensors is not associative in practice.
+                # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+                deepstack_embeds = self.get_deepstack_embeds(
+                    layer_idx - 1, input_deepstack_embeds
+                )
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    post_residual_addition=deepstack_embeds,
+                )
+
+            # Handle deepstack for the last processed layer if it exists.
+            last_deepstack = self.get_deepstack_embeds(
+                self.end_layer - 1, input_deepstack_embeds
+            )
+
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
+                )
+            else:
+                if hidden_states.shape[0] != 0:
+                    if residual is None:
+                        hidden_states = self.norm(hidden_states)
+                    else:
+                        hidden_states, _ = self.norm(
+                            hidden_states,
+                            residual,
+                            post_residual_addition=last_deepstack,
+                        )
+
+            if len(aux_hidden_states) == 0:
+                return hidden_states
 
         return hidden_states, aux_hidden_states
 
@@ -947,7 +1052,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             use_deepstack=self.use_deepstack,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        
 
         if self.pp_group.is_last_rank:
             if not get_embedding:

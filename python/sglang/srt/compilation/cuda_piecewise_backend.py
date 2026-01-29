@@ -144,7 +144,8 @@ class CUDAPiecewiseBackend:
             return entry.runnable(*args)
 
         if entry.cudagraph is None:
-            return self.entry.runnable(*args)
+            # print("create new cudagraph")
+            return entry.runnable(*args)
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
@@ -168,6 +169,8 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
                 stream = get_pcg_capture_stream()
+                if stream is None:
+                    stream = torch.cuda.current_stream()
                 assert (
                     stream is not None
                 ), "PCG capture stream is not set, please check if runtime recompilation happened"

@@ -30,7 +30,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, timer_start, timer_end
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, timer_end, timer_start
 
 Qwen3Config = None
 
@@ -128,9 +128,9 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        
+
         print(self.rotary_emb)
-        
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -152,7 +152,7 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
-        
+
         # print("self.rorary_emb {}".format(self.rotary_emb))
         # print(positions.shape)
         # print(q.shape)
@@ -208,11 +208,11 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
         timer_start("llm_attn")
-        attn_output = self.attn(q, k, v, forward_batch)
+        # attn_output = self.attn(q, k, v, forward_batch)
         timer_end("llm_attn")
-        
+
         timer_start("llm_o_proj")
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(q)
         timer_end("llm_o_proj")
         return output
 
@@ -295,7 +295,7 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         timer_start("LLM_decode")
-        
+
         timer_start("prepare_attn")
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -304,41 +304,41 @@ class Qwen3DecoderLayer(nn.Module):
             post_residual_addition=post_residual_addition,
         )
         timer_end("prepare_attn")
-        
-        if hidden_states.shape[0] != 0:
-            timer_start("self_attn")
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-            timer_end("self_attn")
+
+        # if hidden_states.shape[0] != 0:
+        #     timer_start("self_attn")
+        #     hidden_states = self.self_attn(
+        #         positions=positions,
+        #         hidden_states=hidden_states,
+        #         forward_batch=forward_batch,
+        #     )
+        #     timer_end("self_attn")
 
         # Fully Connected
         timer_start("prepare_mlp")
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
-                else None
-            ),
-        )
+        # hidden_states, residual = self.layer_communicator.prepare_mlp(
+        #     hidden_states,
+        #     residual,
+        #     forward_batch,
+        #     cache=(
+        #         [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+        #         if _is_npu
+        #         else None
+        #     ),
+        # )
         timer_end("prepare_mlp")
-        
+
         timer_start("llm_mlp")
         hidden_states = self.mlp(hidden_states)
         timer_end("llm_mlp")
-        
+
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
-        
+
         timer_start("LLM_post_process")
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        # hidden_states, residual = self.layer_communicator.postprocess_layer(
+        #     hidden_states, residual, forward_batch
+        # )
         timer_end("LLM_post_process")
         timer_end("LLM_decode")
         return hidden_states, residual
