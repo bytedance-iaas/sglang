@@ -17,6 +17,8 @@ curl -L -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/down
 unzip -o protoc.zip -d /usr/local
 chmod +x /usr/local/bin/protoc
 /usr/local/bin/protoc --version
+cd -
+
 export PROTOC=/usr/local/bin/protoc
 export PATH=/usr/local/bin:$PATH
 
