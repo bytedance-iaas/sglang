@@ -20,5 +20,4 @@ curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -
     && rustc --version && cargo --version
 
 pip install maturin
-cd bindings/python
 maturin build --release --out dist --features vendored-openssl
