@@ -262,6 +262,7 @@ class EICHiRadixCache(RadixCache):
         for ack_id, success in zip(ack_list, flags):
             if (
                 not success
+                and not isinstance(self, EICPagedHiRadixCache)
                 and self.ongoing_write_through[ack_id].host_value is not None
             ):
                 if (
@@ -869,6 +870,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         temp_node = node
         local_evict_len = 0
         while temp_node.evicted:
+            while not temp_node.backuped:
+                temp_node = temp_node.parent
+                local_evict_len = 0
+            if not temp_node.evicted:
+                break
             local_evict_len += len(temp_node.host_value)
             temp_node = temp_node.parent
         return local_prefix_len, local_evict_len, node
