@@ -57,12 +57,14 @@ echo "Building sgl-router version $BASE_VERSION$VERSION_SUFFIX"
 sed -i "s/^version = .*$/version = \"$BASE_VERSION$VERSION_SUFFIX\"/" pyproject.toml
 
 
-proxy_args=""
 if [ ! -z "$http_proxy" ]; then
-    proxy_args="$proxy_args -e http_proxy=$http_proxy"
+    export http_proxy=$http_proxy
 fi
 if [ ! -z "$https_proxy" ]; then
-    proxy_args="$proxy_args -e https_proxy=$https_proxy"
+    export https_proxy=$https_proxy
+fi
+if [ ! -z "$no_proxy" ]; then
+    export no_proxy=$no_proxy
 fi
 
 
