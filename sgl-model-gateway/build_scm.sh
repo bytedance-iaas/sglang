@@ -14,10 +14,12 @@ if [ -z "$PYTHON_VERSION" ]; then
     PYTHON_VERSION="3.10"
 fi
 
-cd sgl-model-gateway/bindings/python
+
 ROOT_PATH=$(pwd)
 OUTPUT_PATH=$ROOT_PATH/output
 mkdir -p $OUTPUT_PATH
+cd sgl-model-gateway/bindings/python
+PYTHON_BINDING_PATH=$(pwd)
 
 
 # 获取当前分支名，并将特殊字符转换为下划线
@@ -72,7 +74,7 @@ source build.sh $PYTHON_VERSION
 
 
 # 产物放到 output 目录下
-cp -r $ROOT_PATH/dist/* $OUTPUT_PATH/
+cp -r $PYTHON_BINDING_PATH/dist/* $OUTPUT_PATH/
 
 
 TOS_UTIL_URL=https://tos-tools.tos-cn-beijing.volces.com/linux/amd64/tosutil
