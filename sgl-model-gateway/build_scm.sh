@@ -18,7 +18,7 @@ fi
 ROOT_PATH=$(pwd)
 OUTPUT_PATH=$ROOT_PATH/output
 mkdir -p $OUTPUT_PATH
-cd sgl-model-gateway
+cd sgl-model-gateway/bindings/python
 
 
 # 获取当前分支名，并将特殊字符转换为下划线
