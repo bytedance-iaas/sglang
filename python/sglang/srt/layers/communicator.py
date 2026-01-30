@@ -463,6 +463,7 @@ class LayerCommunicator:
                         )
 
                     else:
+                        # print("first layer here")
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
 
@@ -494,18 +495,21 @@ class LayerCommunicator:
                             output_unquantized_inp1=False,
                         )
                     else:
+                        # print("other layers here")
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
                             residual,
                             post_residual_addition,
                         )
-
+        # print("other layers here")
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             context=self._context,
         )
+        # print("_communicate_simple_fn")
         if self.qkv_latent_func is not None:
+            # print("????")
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
             )

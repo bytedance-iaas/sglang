@@ -587,6 +587,8 @@ class Qwen3LLMModel(Qwen3Model):
         self.fixed_input_buffers = {}
         self.fixed_residual_buffers = {}
         self.cuda_graphs = {}
+        self.fixed_output_buffers = {}
+        self.position_buffers = None
 
     def get_deepstack_embeds(
         self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
@@ -610,6 +612,7 @@ class Qwen3LLMModel(Qwen3Model):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         timer_start("LLM")
+        # print("positions shape {} contents{}".format(positions.shape, positions))
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -621,14 +624,13 @@ class Qwen3LLMModel(Qwen3Model):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        ori_hidden_states = hidden_states
         aux_hidden_states = []
         timer_start("LLM_block_for_loop")
 
+        is_not_capture = not torch.cuda.is_current_stream_capturing()
         # do graph capture for this part (estimate max benefit)
-        if (
-            get_int_env_var("SGLANG_PREFILL_CUDAGRAPH")
-            and hidden_states.shape[0] >= 128
-        ):
+        if get_int_env_var("SGLANG_PREFILL_CUDAGRAPH") and is_not_capture:
             hash_key = ""
             for s in hidden_states.shape:
                 hash_key += "_"
@@ -640,24 +642,44 @@ class Qwen3LLMModel(Qwen3Model):
                 input_buffer = self.fixed_input_buffers[hash_key]
                 cuda_graph = self.cuda_graphs[hash_key]
                 residual_buffer = self.fixed_residual_buffers[hash_key]
+                output_buffer = self.fixed_output_buffers[hash_key]
+                positions_buffers = self.position_buffers[:, : positions.shape[1]]
+                positions_buffers.copy_(positions)
+
             else:
                 input_buffer = torch.empty_like(
                     hidden_states,
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
+
                 residual_buffer = torch.empty_like(
                     hidden_states,
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
 
+                output_buffer = torch.empty_like(
+                    hidden_states,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
+                self.position_buffers = torch.empty(
+                    (positions.shape[0], 16384),
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
+                positions_buffers = self.position_buffers[:, : positions.shape[1]]
+                positions_buffers.copy_(positions)
+
                 self.fixed_input_buffers[hash_key] = input_buffer
                 self.fixed_residual_buffers[hash_key] = residual_buffer
+                self.fixed_output_buffers[hash_key] = output_buffer
 
                 cuda_graph = torch.cuda.CUDAGraph()
                 self.cuda_graphs[hash_key] = cuda_graph
-
+                print("capture new graph")
                 with torch.cuda.graph(cuda_graph):
                     for layer_idx, layer in enumerate(
                         self.layers[self.start_layer : self.end_layer]
@@ -667,7 +689,7 @@ class Qwen3LLMModel(Qwen3Model):
                             # print(residual)
                             hidden_states = input_buffer
                         if layer_idx == self.end_layer:
-                            hidden_states, residual = input_buffer, residual_buffer
+                            hidden_states, residual = output_buffer, residual_buffer
 
                         layer_idx = layer_idx + self.start_layer
 
@@ -679,18 +701,20 @@ class Qwen3LLMModel(Qwen3Model):
                         deepstack_embeds = self.get_deepstack_embeds(
                             layer_idx - 1, input_deepstack_embeds
                         )
+                        # if not (deepstack_embeds is None):
+                        #     print("check_shape and ptr {} {}".format(deepstack_embeds.shape, deepstack_embeds.data_ptr()))
                         hidden_states, residual = layer(
-                            positions,
+                            positions_buffers,
                             hidden_states,
                             forward_batch,
                             residual,
-                            post_residual_addition=deepstack_embeds,
+                            # post_residual_addition=deepstack_embeds,
                         )
 
                 # with torch.cuda.graph(cuda_graph):
 
                 # self.cuda_graphs[hash_key] = cuda_graph
-            input_buffer.copy_(hidden_states)
+            input_buffer.copy_(ori_hidden_states)
             cuda_graph.replay()
 
             timer_end("LLM_block_for_loop")
@@ -702,24 +726,24 @@ class Qwen3LLMModel(Qwen3Model):
             if not self.pp_group.is_last_rank:
                 return PPProxyTensors(
                     {
-                        "hidden_states": input_buffer,
+                        "hidden_states": output_buffer,
                         "residual": residual_buffer,
                     }
                 )
             else:
                 if input_buffer.shape[0] != 0:
                     if residual_buffer is None:
-                        input_buffer = self.norm(input_buffer)
+                        input_buffer = self.norm(output_buffer)
                     else:
                         input_buffer, _ = self.norm(
-                            input_buffer,
-                            input_buffer,
+                            output_buffer,
+                            residual_buffer,
                             post_residual_addition=last_deepstack,
                         )
             timer_end("LLM")
             if len(aux_hidden_states) == 0:
                 # print("do not have aux_hidden_states")
-                return input_buffer
+                return output_buffer
         else:
             for layer_idx, layer in enumerate(
                 self.layers[self.start_layer : self.end_layer]
