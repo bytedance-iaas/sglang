@@ -31,7 +31,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import TORCH_COMPILE_SHAPE, VisionAttention
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -429,7 +429,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if not self.rope_compiled:
+            if not self.rope_compiled and x.shape[0] >= TORCH_COMPILE_SHAPE:
                 self.raw_forward(x, grid_thw)
                 self.rope_compiled = True
             return self.forward_with_cuda_graph(x, grid_thw)
@@ -455,7 +455,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
-
+        if envs.SGLANG_VIT_FRAG_OPT.get():
+            rotary_pos_emb_cos = torch.concat(
+                [rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1
+            )
+            rotary_pos_emb_sin = torch.concat(
+                [rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1
+            )
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
@@ -508,6 +514,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # rotary embedding -> (cos, sin)
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        if envs.SGLANG_VIT_FRAG_OPT.get():
+            rotary_pos_emb_cos = torch.concat(
+                [rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1
+            )
+            rotary_pos_emb_sin = torch.concat(
+                [rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1
+            )
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
