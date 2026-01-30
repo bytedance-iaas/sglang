@@ -68,7 +68,7 @@ ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
 
-TORCH_COMPILE_SHAPE = 3400
+TORCH_COMPILE_SHAPE = 128
 
 
 @dataclasses.dataclass
