@@ -22,6 +22,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
+    timer_end,
+    timer_start,
 )
 
 _is_cuda = is_cuda()
@@ -2747,6 +2749,71 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def connect_qkv_and_attn_compile(qkv, q_size, kv_size, bsz, s, head, kv_head, cos, sin):
+
+    timer_start("qkv_split")
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    timer_end("qkv_split")
+    # [b, s, embed_dim] --> [b * s, head, head_size]
+    timer_start("reshape")
+    q = q.reshape(bsz * s, head, -1).contiguous()
+    k = k.reshape(bsz * s, kv_head, -1).contiguous()
+    v = v.reshape(bsz * s, kv_head, -1).contiguous()
+    timer_end("reshape")
+    # cos = torch.cat([cos, cos], dim=-1)
+    # sin = torch.cat([sin, sin], dim=-1)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+
+    # embedding is performed in float
+    cos = cos.unsqueeze(1)  # .float()
+    sin = sin.unsqueeze(1)  # .float()
+
+    timer_start("rope_float_compute")
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    timer_end("rope_float_compute")
+
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed, v
+
+
+def connect_qkv_and_attn_no_compile(
+    qkv, q_size, kv_size, bsz, s, head, kv_head, cos, sin
+):
+
+    timer_start("qkv_split")
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    timer_end("qkv_split")
+    # [b, s, embed_dim] --> [b * s, head, head_size]
+    timer_start("reshape")
+    q = q.reshape(bsz * s, head, -1).contiguous()
+    k = k.reshape(bsz * s, kv_head, -1).contiguous()
+    v = v.reshape(bsz * s, kv_head, -1).contiguous()
+    timer_end("reshape")
+    # cos = torch.cat([cos, cos], dim=-1)
+    # sin = torch.cat([sin, sin], dim=-1)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+
+    # embedding is performed in float
+    cos = cos.unsqueeze(1)  # .float()
+    sin = sin.unsqueeze(1)  # .float()
+
+    timer_start("rope_float_compute")
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    timer_end("rope_float_compute")
+
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed, v
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

@@ -56,13 +56,19 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding import (
+    apply_rotary_pos_emb,
+    connect_qkv_and_attn_compile,
+    connect_qkv_and_attn_no_compile,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
+
+TORCH_COMPILE_SHAPE = 3400
 
 
 @dataclasses.dataclass
@@ -749,98 +755,112 @@ class VisionAttention(nn.Module):
         kv_head = self.num_attention_kv_heads_per_partition
 
         attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
-        if self.use_qkv_parallel:
-            # [b, s, embed_dim] --> [b, s, embed_dim]
+
+        if envs.SGLANG_VIT_FRAG_OPT.get():
             qkv, _ = self.qkv_proj(x)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-            # [b, s, embed_dim] --> [b * s, head, head_size]
-            q = q.reshape(bsz * s, head, -1).contiguous()
-            k = k.reshape(bsz * s, kv_head, -1).contiguous()
-            v = v.reshape(bsz * s, kv_head, -1).contiguous()
-        else:
-            # [b, s, embed_dim] --> [s, b, embed_dim]
-            x = rearrange(x, "b s ... -> s b ...")
-            # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
-            qkv, _ = self.qkv_proj(x)
-
-            # [s, b, head, head_dim_sum]
-            new_x_shape = qkv.size()[:-1] + (
-                head,
-                self.q_size + 2 * self.kv_size,
-            )
-            qkv = qkv.view(*new_x_shape)
-
-            # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-            # [s, b, head, head_size] --> [b, s, head, head_size]
-            q, k, v = [
-                rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
-            ]
-
-        cos = None
-        sin = None
-
-        if position_embeddings is not None:
-            if self.customized_position_embedding_applier is not None:
-                q, k = self.customized_position_embedding_applier(
-                    q, k, position_embeddings, x_shape
-                )
-            else:
-                cos, sin = position_embeddings
-        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             cos = rotary_pos_emb_cos
             sin = rotary_pos_emb_sin
-
-        if cos is not None and sin is not None:
-            original_shape = q.shape
-
-            # [total_tokens, head, head_size]
-            q = q.view(-1, head, self.head_size)
-            k = k.view(-1, head, self.head_size)
-
-            if cos.size(-1) * 2 == self.head_size:
-                cos = torch.cat([cos, cos], dim=-1)
-                sin = torch.cat([sin, sin], dim=-1)
-
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            q = q.view(original_shape)
-            k = k.view(original_shape)
-
-        if q.dim() == 4:
-            # [b, s, head, head_size] --> [b * s, head, head_size]
-            q = rearrange(q, "b s ... -> (b s) ...")
-        if k.dim() == 4:
-            # [b, s, head, head_size] --> [b * s, head, head_size]
-            k = rearrange(k, "b s ... -> (b s) ...")
-        if v.dim() == 4:
-            # [b, s, head, head_size] --> [b * s, head, head_size]
-            v = rearrange(v, "b s ... -> (b s) ...")
-
-        assert q.dim() == 3, q.dim()
-        assert k.dim() == 3, k.dim()
-        assert v.dim() == 3, v.dim()
-
-        # internvl
-        if self.qk_normalization:
-            # jit kernel
-            if can_use_jit_qk_norm(self.head_size, q.dtype):
-
-                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
-                head_dim_for_norm = head * self.head_size
-
-                q, k = apply_qk_norm(
-                    q=q,
-                    k=k,
-                    q_norm=self.q_norm,
-                    k_norm=self.k_norm,
-                    head_dim=head_dim_for_norm,
-                    alt_stream=self.aux_stream,
+            if qkv.shape[1] >= TORCH_COMPILE_SHAPE:
+                q, k, v = connect_qkv_and_attn_compile(
+                    qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin
                 )
-
             else:
-                q, k = self._apply_qk_norm(q, k)
+                q, k, v = connect_qkv_and_attn_no_compile(
+                    qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin
+                )
+        else:
+            if self.use_qkv_parallel:
+                # [b, s, embed_dim] --> [b, s, embed_dim]
+                qkv, _ = self.qkv_proj(x)
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+                # [b, s, embed_dim] --> [b * s, head, head_size]
+                q = q.reshape(bsz * s, head, -1).contiguous()
+                k = k.reshape(bsz * s, kv_head, -1).contiguous()
+                v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            else:
+                # [b, s, embed_dim] --> [s, b, embed_dim]
+                x = rearrange(x, "b s ... -> s b ...")
+                # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
+                qkv, _ = self.qkv_proj(x)
+
+                # [s, b, head, head_dim_sum]
+                new_x_shape = qkv.size()[:-1] + (
+                    head,
+                    self.q_size + 2 * self.kv_size,
+                )
+                qkv = qkv.view(*new_x_shape)
+
+                # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+                # [s, b, head, head_size] --> [b, s, head, head_size]
+                q, k, v = [
+                    rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
+                ]
+
+            cos = None
+            sin = None
+
+            if position_embeddings is not None:
+                if self.customized_position_embedding_applier is not None:
+                    q, k = self.customized_position_embedding_applier(
+                        q, k, position_embeddings, x_shape
+                    )
+                else:
+                    cos, sin = position_embeddings
+            elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+                cos = rotary_pos_emb_cos
+                sin = rotary_pos_emb_sin
+
+            if cos is not None and sin is not None:
+                original_shape = q.shape
+
+                # [total_tokens, head, head_size]
+                q = q.view(-1, head, self.head_size)
+                k = k.view(-1, head, self.head_size)
+
+                if cos.size(-1) * 2 == self.head_size:
+                    cos = torch.cat([cos, cos], dim=-1)
+                    sin = torch.cat([sin, sin], dim=-1)
+
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                q = q.view(original_shape)
+                k = k.view(original_shape)
+
+            if q.dim() == 4:
+                # [b, s, head, head_size] --> [b * s, head, head_size]
+                q = rearrange(q, "b s ... -> (b s) ...")
+            if k.dim() == 4:
+                # [b, s, head, head_size] --> [b * s, head, head_size]
+                k = rearrange(k, "b s ... -> (b s) ...")
+            if v.dim() == 4:
+                # [b, s, head, head_size] --> [b * s, head, head_size]
+                v = rearrange(v, "b s ... -> (b s) ...")
+
+            assert q.dim() == 3, q.dim()
+            assert k.dim() == 3, k.dim()
+            assert v.dim() == 3, v.dim()
+
+            # internvl
+            if self.qk_normalization:
+                # jit kernel
+                if can_use_jit_qk_norm(self.head_size, q.dtype):
+
+                    # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
+                    head_dim_for_norm = head * self.head_size
+
+                    q, k = apply_qk_norm(
+                        q=q,
+                        k=k,
+                        q_norm=self.q_norm,
+                        k_norm=self.k_norm,
+                        head_dim=head_dim_for_norm,
+                        alt_stream=self.aux_stream,
+                    )
+
+                else:
+                    q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,

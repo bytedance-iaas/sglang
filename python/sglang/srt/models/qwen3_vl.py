@@ -455,7 +455,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
-
+        if envs.SGLANG_VIT_FRAG_OPT.get():
+            rotary_pos_emb_cos = torch.concat(
+                [rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1
+            )
+            rotary_pos_emb_sin = torch.concat(
+                [rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1
+            )
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
