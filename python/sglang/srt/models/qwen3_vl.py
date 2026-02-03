@@ -63,7 +63,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, timer_end, timer_start
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -195,8 +195,10 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        timer_start("vision other_1")
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+        timer_end("vision other_1")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -204,9 +206,11 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             output_ws=output_ws,
         )
+        timer_start("vision other_2")
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
         norm2 = self.norm2(x)
+        timer_end("vision other_2")
         mlp = self.mlp(norm2)
         x += mlp
         return x
@@ -592,6 +596,21 @@ class Qwen3LLMModel(Qwen3Model):
             len(config.vision_config.deepstack_visual_indexes)
         )
 
+        self.fixed_input_buffers = None
+        self.fixed_residual_buffers = None
+        self.cuda_graphs = {}
+        self.fixed_output_buffers = {}
+        self.position_buffers = None
+        self.q_buffers = None
+        self.k_buffers = None
+        self.v_buffers = None
+        self.deepstack_buffers = None
+
+        self.pcg_buffers_inited = False
+        self.graph_buffer_saver = {}
+
+        # self.first_pcg = False
+
     def get_deepstack_embeds(
         self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
@@ -604,7 +623,7 @@ class Qwen3LLMModel(Qwen3Model):
         sep = self.hidden_size * layer_idx
         return input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
-    def forward(
+    def pcg_forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -614,6 +633,8 @@ class Qwen3LLMModel(Qwen3Model):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
+        timer_start("LLM")
+        # print("positions shape {} contents{}".format(positions.shape, positions))
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -626,6 +647,10 @@ class Qwen3LLMModel(Qwen3Model):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        timer_start("LLM_block_for_loop")
+        first_pcg = True
+
+        ret = None
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
@@ -643,13 +668,190 @@ class Qwen3LLMModel(Qwen3Model):
             deepstack_embeds = self.get_deepstack_embeds(
                 layer_idx - 1, input_deepstack_embeds
             )
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                post_residual_addition=deepstack_embeds,
-            )
+
+            if deepstack_embeds is None:
+                deep_stack_buffer = None
+            else:
+                if self.deepstack_buffers is None:
+                    self.deepstack_buffers = torch.empty(
+                        (16384, deepstack_embeds.shape[1]),
+                        dtype=deepstack_embeds.dtype,
+                        device=deepstack_embeds.device,
+                    )
+
+                assert deepstack_embeds.shape[0] <= 16384
+                # print("deepstack shape {} ".format(deepstack_embeds.shape))
+                deep_stack_buffer = self.deepstack_buffers[
+                    : deepstack_embeds.shape[0], :
+                ]
+
+            if True:
+                if layer_idx == self.start_layer:
+                    # print("s")
+                    q, k, v, residual = layer.forward_before_attn_break(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        deepstack_embeds,
+                    )
+                    attn_res = layer.forward_outof_capture(
+                        q, k, v, positions, forward_batch
+                    )
+
+                    if not self.pcg_buffers_inited:
+                        # self.q_buffers = torch.empty_like(
+                        #     (16384, q.shape[1], q.shape[2]), dtype=q.dtype, device=q.device
+                        # ).contiguous()
+
+                        # self.k_buffers = torch.empty_like(
+                        #     (16384, k.shape[1], k.shape[2]), dtype=q.dtype, device=q.device
+                        # ).contiguous()
+
+                        # self.v_buffers = torch.empty_like(
+                        #     (16384, v.shape[1], v.shape[2]), dtype=q.dtype, device=q.device
+                        # ).contiguous()
+                        # print("check shape attn_res {} residual {}".format(attn_res.shape, residual.shape))
+
+                        self.fixed_input_buffers = torch.empty(
+                            (16384, attn_res.shape[1]), dtype=q.dtype, device=q.device
+                        ).contiguous()
+
+                        self.fixed_residual_buffers = torch.empty(
+                            (16384, residual.shape[1]), dtype=q.dtype, device=q.device
+                        ).contiguous()
+
+                        self.position_buffers = torch.empty(
+                            (positions.shape[0], 16384),
+                            dtype=positions.dtype,
+                            device=positions.device,
+                        ).contiguous()
+
+                        self.pcg_buffers_inited = True
+
+                    shape_key = q.shape[0]
+                    if shape_key not in self.graph_buffer_saver:
+                        self.graph_buffer_saver[shape_key] = []
+
+                    positions_buffers = self.position_buffers[:, : positions.shape[1]]
+
+                elif layer_idx == self.end_layer - 1:
+
+                    res_buffer = self.graph_buffer_saver[shape_key][-1][-1]
+                    hidden_states, residual = self.layers[
+                        layer_idx - 1
+                    ].forward_after_attn_break(ret, forward_batch, res_buffer)
+                    q, k, v, residual = layer.forward_before_attn_break(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        deepstack_embeds,
+                    )
+                    attn_res = layer.forward_outof_capture(
+                        q, k, v, positions, forward_batch
+                    )
+                    # print("layer_idx {} attn_res {}".format(layer_idx, attn_res))
+                    hidden_states, residual = layer.forward_after_attn_break(
+                        attn_res, forward_batch, residual
+                    )
+                else:
+
+                    if first_pcg:
+                        first_pcg = False
+                        self.fixed_input_buffers[:shape_key, :].copy_(
+                            attn_res, non_blocking=True
+                        )
+                        self.fixed_residual_buffers[:shape_key, :].copy_(
+                            residual, non_blocking=True
+                        )
+
+                        positions_buffers.copy_(positions, non_blocking=True)
+                        if deepstack_embeds is None:
+                            pass
+                        else:
+                            deep_stack_buffer.copy_(deepstack_embeds, non_blocking=True)
+                        if shape_key not in self.cuda_graphs:
+                            cuda_graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(cuda_graph):
+                                hidden_states, residual = self.layers[
+                                    layer_idx - 1
+                                ].forward_after_attn_break(
+                                    self.fixed_input_buffers[:shape_key, :],
+                                    forward_batch,
+                                    self.fixed_residual_buffers[:shape_key, :],
+                                )
+                                q, k, v, res_buffer = layer.forward_before_attn_break(
+                                    positions_buffers,
+                                    hidden_states,
+                                    forward_batch,
+                                    residual,
+                                    deep_stack_buffer,
+                                )
+                                self.graph_buffer_saver[shape_key].append(
+                                    (q, k, v, res_buffer)
+                                )
+
+                            self.cuda_graphs[shape_key] = cuda_graph
+
+                        else:
+                            cuda_graph = self.cuda_graphs[shape_key]
+
+                    else:
+                        key = str(layer_idx) + "_" + str(shape_key)
+                        self.fixed_input_buffers[:shape_key, :].copy_(
+                            ret, non_blocking=True
+                        )
+
+                        if deepstack_embeds is None:
+                            pass
+                        else:
+                            deep_stack_buffer.copy_(deepstack_embeds, non_blocking=True)
+
+                        if key not in self.cuda_graphs:
+                            cuda_graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(cuda_graph):
+                                # print("layer_idx{}".format(layer_idx))
+                                res_buffer = self.graph_buffer_saver[shape_key][-1][-1]
+                                hidden_states, residual = self.layers[
+                                    layer_idx - 1
+                                ].forward_after_attn_break(
+                                    self.fixed_input_buffers[:shape_key, :],
+                                    forward_batch,
+                                    res_buffer,
+                                )
+                                q, k, v, res_buffer = layer.forward_before_attn_break(
+                                    positions_buffers,
+                                    hidden_states,
+                                    forward_batch,
+                                    residual,
+                                    deep_stack_buffer,
+                                )
+                                self.graph_buffer_saver[shape_key].append(
+                                    (q, k, v, res_buffer)
+                                )
+                            self.cuda_graphs[key] = cuda_graph
+                        else:
+                            cuda_graph = self.cuda_graphs[key]
+
+                    cuda_graph.replay()
+                    graph_buffer_idx = layer_idx - self.start_layer - 1
+                    # print("idx {}".format(graph_buffer_idx))
+                    buffers = self.graph_buffer_saver[shape_key][graph_buffer_idx]
+                    ret = layer.forward_outof_capture(
+                        buffers[0], buffers[1], buffers[2], positions, forward_batch
+                    )
+            else:
+                q, k, v, residual = layer.forward_before_attn_break(
+                    positions, hidden_states, forward_batch, residual, deepstack_embeds
+                )
+                attn_res = layer.forward_outof_capture(
+                    q, k, v, positions, forward_batch
+                )
+                print("layer_idx {} attn_res {}".format(layer_idx, attn_res))
+                hidden_states, residual = layer.forward_after_attn_break(
+                    attn_res, forward_batch, residual
+                )
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(
@@ -669,11 +871,230 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(
-                        hidden_states, residual, post_residual_addition=last_deepstack
+                        hidden_states,
+                        residual,
+                        post_residual_addition=last_deepstack,
                     )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
+
+        return hidden_states, aux_hidden_states
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        # is_capture = torch.cuda.is_current_stream_capturing()
+        # cuda_graph_nums = len(self.cuda_graphs)
+        # print("cuda_graph_nums {} input_embeds shape {}".format(cuda_graph_nums, input_embeds.shape[0]))
+        if envs.SGLANG_PCG_OPEN.get():
+            free_GB = (
+                torch.cuda.mem_get_info()[0] / 1024**3
+                if torch.cuda.is_available()
+                else 0
+            )
+            built_shape = input_embeds.shape[0] in self.cuda_graphs
+            if input_embeds.shape[0] > 128 and (free_GB >= 5 or built_shape):
+                return self.pcg_forward(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    input_embeds,
+                    pp_proxy_tensors,
+                    input_deepstack_embeds,
+                )
+        timer_start("LLM")
+        # print("positions shape {} contents{}".format(positions.shape, positions))
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        ori_hidden_states = hidden_states
+        aux_hidden_states = []
+        timer_start("LLM_block_for_loop")
+
+        # is_not_capture = not torch.cuda.is_current_stream_capturing()
+        # do graph capture for this part (estimate max benefit)
+        if get_int_env_var("SGLANG_PREFILL_CUDAGRAPH"):
+            hash_key = ""
+            for s in hidden_states.shape:
+                hash_key += "_"
+                hash_key += str(s)
+
+            input_buffer = None
+            residual_buffer = None
+            if hash_key in self.fixed_input_buffers:
+                input_buffer = self.fixed_input_buffers[hash_key]
+                cuda_graph = self.cuda_graphs[hash_key]
+                residual_buffer = self.fixed_residual_buffers[hash_key]
+                output_buffer = self.fixed_output_buffers[hash_key]
+                positions_buffers = self.position_buffers[:, : positions.shape[1]]
+                positions_buffers.copy_(positions)
+
+            else:
+                input_buffer = torch.empty_like(
+                    hidden_states,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
+                residual_buffer = torch.empty_like(
+                    hidden_states,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
+                output_buffer = torch.empty_like(
+                    hidden_states,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
+                self.position_buffers = torch.empty(
+                    (positions.shape[0], 16384),
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
+                positions_buffers = self.position_buffers[:, : positions.shape[1]]
+                positions_buffers.copy_(positions)
+
+                self.fixed_input_buffers[hash_key] = input_buffer
+                self.fixed_residual_buffers[hash_key] = residual_buffer
+                self.fixed_output_buffers[hash_key] = output_buffer
+
+                cuda_graph = torch.cuda.CUDAGraph()
+                self.cuda_graphs[hash_key] = cuda_graph
+                print("capture new graph")
+                with torch.cuda.graph(cuda_graph):
+                    for layer_idx, layer in enumerate(
+                        self.layers[self.start_layer : self.end_layer]
+                    ):
+                        if layer_idx == self.start_layer:
+                            # residual = input_buffer
+                            # print(residual)
+                            hidden_states = input_buffer
+                        if layer_idx == self.end_layer:
+                            hidden_states, residual = output_buffer, residual_buffer
+
+                        layer_idx = layer_idx + self.start_layer
+
+                        # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+                        # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+                        # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+                        # The order matters because addition with different tensors is not associative in practice.
+                        # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+                        deepstack_embeds = self.get_deepstack_embeds(
+                            layer_idx - 1, input_deepstack_embeds
+                        )
+                        # if not (deepstack_embeds is None):
+                        #     print("check_shape and ptr {} {}".format(deepstack_embeds.shape, deepstack_embeds.data_ptr()))
+                        hidden_states, residual = layer(
+                            positions_buffers,
+                            hidden_states,
+                            forward_batch,
+                            residual,
+                            # post_residual_addition=deepstack_embeds,
+                        )
+
+                # with torch.cuda.graph(cuda_graph):
+
+                # self.cuda_graphs[hash_key] = cuda_graph
+            input_buffer.copy_(ori_hidden_states)
+            cuda_graph.replay()
+
+            timer_end("LLM_block_for_loop")
+            # Handle deepstack for the last processed layer if it exists.
+            last_deepstack = self.get_deepstack_embeds(
+                self.end_layer - 1, input_deepstack_embeds
+            )
+
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": output_buffer,
+                        "residual": residual_buffer,
+                    }
+                )
+            else:
+                if input_buffer.shape[0] != 0:
+                    if residual_buffer is None:
+                        input_buffer = self.norm(output_buffer)
+                    else:
+                        input_buffer, _ = self.norm(
+                            output_buffer,
+                            residual_buffer,
+                            post_residual_addition=last_deepstack,
+                        )
+            timer_end("LLM")
+            if len(aux_hidden_states) == 0:
+                # print("do not have aux_hidden_states")
+                return output_buffer
+        else:
+            for layer_idx, layer in enumerate(
+                self.layers[self.start_layer : self.end_layer]
+            ):
+                layer_idx = layer_idx + self.start_layer
+                if layer_idx in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
+
+                # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+                # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+                # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+                # The order matters because addition with different tensors is not associative in practice.
+                # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+                deepstack_embeds = self.get_deepstack_embeds(
+                    layer_idx - 1, input_deepstack_embeds
+                )
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    post_residual_addition=deepstack_embeds,
+                )
+
+            # Handle deepstack for the last processed layer if it exists.
+            last_deepstack = self.get_deepstack_embeds(
+                self.end_layer - 1, input_deepstack_embeds
+            )
+
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
+                )
+            else:
+                if hidden_states.shape[0] != 0:
+                    if residual is None:
+                        hidden_states = self.norm(hidden_states)
+                    else:
+                        hidden_states, _ = self.norm(
+                            hidden_states,
+                            residual,
+                            post_residual_addition=last_deepstack,
+                        )
+
+            if len(aux_hidden_states) == 0:
+                return hidden_states
 
         return hidden_states, aux_hidden_states
 
@@ -943,6 +1364,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
+        timer_start("routine")
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
@@ -968,6 +1390,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                timer_end("routine")
+
                 return self.logits_processor(
                     input_ids,
                     hidden_states,
