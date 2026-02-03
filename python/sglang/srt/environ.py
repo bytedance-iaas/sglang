@@ -398,6 +398,7 @@ class Envs:
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_VIT_FRAG_OPT = EnvBool(False)
+    SGLANG_PCG_OPEN = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     SGLANG_MM_PACK_POLICY = EnvStr("default")
     SGLANG_MM_SCHEDULE_PACK_NUM = EnvInt(5)
