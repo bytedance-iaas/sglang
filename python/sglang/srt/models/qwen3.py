@@ -158,7 +158,30 @@ class Qwen3Attention(nn.Module):
         # print(q.shape)
         # print(k.shape)
         # print("========")
-        # q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v
+
+    def forward_outof_capture(self, q, k, v, positions, forward_batch):
+        q, k = self.rotary_emb(positions, q, k)
+        if get_global_server_args().rl_on_policy_target is not None:
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+        timer_start("llm_attn")
+        output_ws = self.attn(q, k, v, forward_batch)
+        timer_end("llm_attn")
+        return output_ws
+
+    def forward_prepare_native_exclude(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
+        )
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -208,11 +231,11 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
         timer_start("llm_attn")
-        # attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch)
         timer_end("llm_attn")
 
         timer_start("llm_o_proj")
-        output, _ = self.o_proj(hidden_states)
+        output, _ = self.o_proj(attn_output)
         timer_end("llm_o_proj")
         return output
 
@@ -284,6 +307,71 @@ class Qwen3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
         )
+
+    def forward_outof_capture(self, q, k, v, positions, forward_batch):
+        return self.self_attn.forward_outof_capture(q, k, v, positions, forward_batch)
+
+    def forward_before_attn_break(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
+
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states,
+            residual,
+            forward_batch,
+            post_residual_addition=post_residual_addition,
+        )
+
+        q, k, v = self.self_attn.forward_prepare_native_exclude(
+            positions, hidden_states
+        )
+        return q, k, v, residual
+
+    def forward_after_attn_break(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, _ = self.self_attn.o_proj(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+            cache=(
+                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                if _is_npu
+                else None
+            ),
+        )
+        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
+
+    def inter_block_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.forward_after_attn_break(
+            hidden_states, forward_batch, residual
+        )
+        q, k, v, residual = self.forward_before_attn_break(
+            positions, hidden_states, forward_batch, residual, post_residual_addition
+        )
+        return q, k, v, residual
 
     def forward(
         self,
