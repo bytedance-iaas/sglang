@@ -584,16 +584,17 @@ class Qwen3LLMModel(Qwen3Model):
             len(config.vision_config.deepstack_visual_indexes)
         )
 
-        self.fixed_input_buffers = {}
-        self.fixed_residual_buffers = {}
+        self.fixed_input_buffers = None
+        self.fixed_residual_buffers = None
         self.cuda_graphs = {}
         self.fixed_output_buffers = {}
         self.position_buffers = None
-        self.q_buffers = {}
-        self.k_buffers = {}
-        self.v_buffers = {}
-        self.deepstack_buffers = {}
+        self.q_buffers = None
+        self.k_buffers = None
+        self.v_buffers = None
+        self.deepstack_buffers = None
 
+        self.pcg_buffers_inited = False
         self.graph_buffer_saver = {}
 
         # self.first_pcg = False
@@ -619,9 +620,6 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
-        print("cuda_graph nums {}".format(len(self.cuda_graphs)))
-        # print(len(self.))
 
         timer_start("LLM")
         # print("positions shape {} contents{}".format(positions.shape, positions))
@@ -662,16 +660,18 @@ class Qwen3LLMModel(Qwen3Model):
             if deepstack_embeds is None:
                 deep_stack_buffer = None
             else:
-                ds_key = deepstack_embeds.shape[0]
-                if ds_key not in self.deepstack_buffers:
-                    deep_stack_buffer = torch.empty_like(
-                        deepstack_embeds,
+                if self.deepstack_buffers is None:
+                    self.deepstack_buffers = torch.empty(
+                        (16384, deepstack_embeds.shape[1]),
                         dtype=deepstack_embeds.dtype,
                         device=deepstack_embeds.device,
-                    ).contiguous()
-                    self.deepstack_buffers[ds_key] = deep_stack_buffer
-                else:
-                    deep_stack_buffer = self.deepstack_buffers[ds_key]
+                    )
+
+                assert deepstack_embeds.shape[0] <= 16384
+                # print("deepstack shape {} ".format(deepstack_embeds.shape))
+                deep_stack_buffer = self.deepstack_buffers[
+                    : deepstack_embeds.shape[0], :
+                ]
 
             if True:
                 if layer_idx == self.start_layer:
@@ -687,36 +687,39 @@ class Qwen3LLMModel(Qwen3Model):
                         q, k, v, positions, forward_batch
                     )
 
-                    shape_key = q.shape[0]
-                    if shape_key not in self.q_buffers:
-                        self.graph_buffer_saver[shape_key] = []
-                        q_buffer = torch.empty_like(
-                            q, dtype=q.dtype, device=q.device
-                        ).contiguous()
-                        k_buffer = torch.empty_like(
-                            k, dtype=k.dtype, device=k.device
-                        ).contiguous()
-                        v_buffer = torch.empty_like(
-                            v, dtype=v.dtype, device=v.device
-                        ).contiguous()
-                        attn_buffer = torch.empty_like(
-                            attn_res, dtype=attn_res.dtype, device=attn_res.device
-                        ).contiguous()
-                        res_buffer = torch.empty_like(
-                            residual, dtype=residual.dtype, device=residual.device
+                    if not self.pcg_buffers_inited:
+                        # self.q_buffers = torch.empty_like(
+                        #     (16384, q.shape[1], q.shape[2]), dtype=q.dtype, device=q.device
+                        # ).contiguous()
+
+                        # self.k_buffers = torch.empty_like(
+                        #     (16384, k.shape[1], k.shape[2]), dtype=q.dtype, device=q.device
+                        # ).contiguous()
+
+                        # self.v_buffers = torch.empty_like(
+                        #     (16384, v.shape[1], v.shape[2]), dtype=q.dtype, device=q.device
+                        # ).contiguous()
+                        # print("check shape attn_res {} residual {}".format(attn_res.shape, residual.shape))
+
+                        self.fixed_input_buffers = torch.empty(
+                            (16384, attn_res.shape[1]), dtype=q.dtype, device=q.device
                         ).contiguous()
 
-                        self.q_buffers[shape_key] = q_buffer
-                        self.k_buffers[shape_key] = k_buffer
-                        self.v_buffers[shape_key] = v_buffer
-                        self.fixed_input_buffers[shape_key] = attn_buffer
-                        self.fixed_residual_buffers[shape_key] = res_buffer
-                        if self.position_buffers is None:
-                            self.position_buffers = torch.empty(
-                                (positions.shape[0], 16384),
-                                dtype=positions.dtype,
-                                device=positions.device,
-                            )
+                        self.fixed_residual_buffers = torch.empty(
+                            (16384, residual.shape[1]), dtype=q.dtype, device=q.device
+                        ).contiguous()
+
+                        self.position_buffers = torch.empty(
+                            (positions.shape[0], 16384),
+                            dtype=positions.dtype,
+                            device=positions.device,
+                        ).contiguous()
+
+                        self.pcg_buffers_inited = True
+
+                    shape_key = q.shape[0]
+                    if shape_key not in self.graph_buffer_saver:
+                        self.graph_buffer_saver[shape_key] = []
 
                     positions_buffers = self.position_buffers[:, : positions.shape[1]]
 
@@ -744,12 +747,13 @@ class Qwen3LLMModel(Qwen3Model):
 
                     if first_pcg:
                         first_pcg = False
-                        self.fixed_input_buffers[shape_key].copy_(
+                        self.fixed_input_buffers[:shape_key, :].copy_(
                             attn_res, non_blocking=True
                         )
-                        self.fixed_residual_buffers[shape_key].copy_(
+                        self.fixed_residual_buffers[:shape_key, :].copy_(
                             residual, non_blocking=True
                         )
+
                         positions_buffers.copy_(positions, non_blocking=True)
                         if deepstack_embeds is None:
                             pass
@@ -761,9 +765,9 @@ class Qwen3LLMModel(Qwen3Model):
                                 hidden_states, residual = self.layers[
                                     layer_idx - 1
                                 ].forward_after_attn_break(
-                                    self.fixed_input_buffers[shape_key],
+                                    self.fixed_input_buffers[:shape_key, :],
                                     forward_batch,
-                                    self.fixed_residual_buffers[shape_key],
+                                    self.fixed_residual_buffers[:shape_key, :],
                                 )
                                 q, k, v, res_buffer = layer.forward_before_attn_break(
                                     positions_buffers,
@@ -783,7 +787,7 @@ class Qwen3LLMModel(Qwen3Model):
 
                     else:
                         key = str(layer_idx) + "_" + str(shape_key)
-                        self.fixed_input_buffers[shape_key].copy_(
+                        self.fixed_input_buffers[:shape_key, :].copy_(
                             ret, non_blocking=True
                         )
 
@@ -800,7 +804,7 @@ class Qwen3LLMModel(Qwen3Model):
                                 hidden_states, residual = self.layers[
                                     layer_idx - 1
                                 ].forward_after_attn_break(
-                                    self.fixed_input_buffers[shape_key],
+                                    self.fixed_input_buffers[:shape_key, :],
                                     forward_batch,
                                     res_buffer,
                                 )
@@ -825,13 +829,6 @@ class Qwen3LLMModel(Qwen3Model):
                     ret = layer.forward_outof_capture(
                         buffers[0], buffers[1], buffers[2], positions, forward_batch
                     )
-                # print("layer_idx {} attn_res {}".format(layer_idx, attn_res))
-            # if layer_idx == self.start_layer:
-            #     print("s")
-            # elif layer_idx == self.end_layer-1:
-            #     print("e")
-            # else:
-            #     print("m")
             else:
                 q, k, v, residual = layer.forward_before_attn_break(
                     positions, hidden_states, forward_batch, residual, deepstack_embeds
@@ -881,17 +878,25 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        is_capture = torch.cuda.is_current_stream_capturing()
-
-        if not is_capture:
-            return self.pcg_forward(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors,
-                input_deepstack_embeds,
+        # is_capture = torch.cuda.is_current_stream_capturing()
+        # cuda_graph_nums = len(self.cuda_graphs)
+        # print("cuda_graph_nums {} input_embeds shape {}".format(cuda_graph_nums, input_embeds.shape[0]))
+        if envs.SGLANG_PCG_OPEN.get():
+            free_GB = (
+                torch.cuda.mem_get_info()[0] / 1024**3
+                if torch.cuda.is_available()
+                else 0
             )
+            built_shape = input_embeds.shape[0] in self.cuda_graphs
+            if input_embeds.shape[0] > 128 and (free_GB >= 5 or built_shape):
+                return self.pcg_forward(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    input_embeds,
+                    pp_proxy_tensors,
+                    input_deepstack_embeds,
+                )
         timer_start("LLM")
         # print("positions shape {} contents{}".format(positions.shape, positions))
         if self.pp_group.is_first_rank:
