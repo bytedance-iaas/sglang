@@ -30,7 +30,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, timer_end, timer_start
 
 Qwen3Config = None
 
@@ -128,6 +128,7 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -150,6 +151,29 @@ class Qwen3Attention(nn.Module):
             alt_stream=self.alt_stream,
         )
         q, k = self.rotary_emb(positions, q, k)
+        return q, k, v
+
+    def forward_outof_capture(self, q, k, v, positions, forward_batch):
+        q, k = self.rotary_emb(positions, q, k)
+        if get_global_server_args().rl_on_policy_target is not None:
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+        timer_start("llm_attn")
+        output_ws = self.attn(q, k, v, forward_batch)
+        timer_end("llm_attn")
+        return output_ws
+
+    def forward_prepare_native_exclude(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
+        )
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -270,7 +294,10 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
-    def forward(
+    def forward_outof_capture(self, q, k, v, positions, forward_batch):
+        return self.self_attn.forward_outof_capture(q, k, v, positions, forward_batch)
+
+    def forward_before_attn_break(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -279,20 +306,26 @@ class Qwen3DecoderLayer(nn.Module):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             post_residual_addition=post_residual_addition,
         )
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
 
-        # Fully Connected
+        q, k, v = self.self_attn.forward_prepare_native_exclude(
+            positions, hidden_states
+        )
+        return q, k, v, residual
+
+    def forward_after_attn_break(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, _ = self.self_attn.o_proj(hidden_states)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
             residual,
@@ -304,11 +337,102 @@ class Qwen3DecoderLayer(nn.Module):
             ),
         )
         hidden_states = self.mlp(hidden_states)
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+
+        return hidden_states, residual
+
+    def inter_block_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.forward_after_attn_break(
+            hidden_states, forward_batch, residual
+        )
+        q, k, v, residual = self.forward_before_attn_break(
+            positions, hidden_states, forward_batch, residual, post_residual_addition
+        )
+        return q, k, v, residual
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
+
+        def show_shape(inputs, des):
+            return
+            for i in inputs:
+                if isinstance(i, torch.Tensor):
+                    print(i.shape)
+            print("=========={}============".format(des))
+
+        timer_start("LLM_decode")
+
+        timer_start("prepare_attn")
+
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states,
+            residual,
+            forward_batch,
+            post_residual_addition=post_residual_addition,
+        )
+
+        show_shape([hidden_states, residual], "prepare_attn")
+        # return hidden_states, residual
+        timer_end("prepare_attn")
+
+        if hidden_states.shape[0] != 0:
+            timer_start("self_attn")
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            timer_end("self_attn")
+
+        show_shape([hidden_states, residual], "attn")
+        # Fully Connected
+        timer_start("prepare_mlp")
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+            cache=(
+                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                if _is_npu
+                else None
+            ),
+        )
+        timer_end("prepare_mlp")
+
+        show_shape([hidden_states, residual], "pre_mlp")
+
+        timer_start("llm_mlp")
+        hidden_states = self.mlp(hidden_states)
+        timer_end("llm_mlp")
+
+        show_shape([hidden_states, residual], "mlp")
+        if _is_npu and get_cmo_stream():
+            wait_cmo_stream()
+
+        timer_start("LLM_post_process")
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        show_shape([hidden_states, residual], "after_mlp")
+        timer_end("LLM_post_process")
+        timer_end("LLM_decode")
         return hidden_states, residual
 
 
