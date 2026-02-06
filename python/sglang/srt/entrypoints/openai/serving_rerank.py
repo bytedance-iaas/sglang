@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -558,6 +559,18 @@ class OpenAIServingRerank(OpenAIServingBase):
         self, ret: Union[List[Dict[str, Any]], List[float]], request: V1RerankReqInput
     ) -> List[RerankResponse]:
         """Build the rerank response from generation results"""
+        if envs.SGLANG_RERANKER_CUSTOM_OUTPUT_FORMAT.get():
+            responses = {}
+            responses["results"] = []
+            for idx, score in enumerate(ret):
+                new_item = {}
+                new_item["relevance_score"] = score
+                new_item["document"] = request.documents[idx] if request.return_documents else None
+                responses["results"].append(new_item)
+            
+            responses["results"] = sorted(responses["results"], key = lambda x :x["relevance_score"], reverse= True)
+            return responses
+            
         responses = []
         for idx, item in enumerate(ret):
             if isinstance(item, dict):
