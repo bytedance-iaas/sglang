@@ -262,6 +262,7 @@ class EICHiRadixCache(RadixCache):
         for ack_id, success in zip(ack_list, flags):
             if (
                 not success
+                and not isinstance(self, EICPagedHiRadixCache)
                 and self.ongoing_write_through[ack_id].host_value is not None
             ):
                 if (
@@ -560,7 +561,7 @@ class EICHiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped:
+            while not last_node.backuped and last_node.parent is not None:
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
@@ -869,6 +870,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         temp_node = node
         local_evict_len = 0
         while temp_node.evicted:
+            while not temp_node.backuped and temp_node.parent is not None:
+                temp_node = temp_node.parent
+                local_evict_len = 0
+            if not temp_node.evicted:
+                break
             local_evict_len += len(temp_node.host_value)
             temp_node = temp_node.parent
         return local_prefix_len, local_evict_len, node
@@ -1017,7 +1023,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped:
+            while not last_node.backuped and last_node.parent is not None:
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
