@@ -1,0 +1,1 @@
+python3 -m sglang.launch_server --model-path /data/models/Qwen3-VL-8B-Instruct/ --disable-cuda-graph
