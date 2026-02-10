@@ -77,10 +77,11 @@ source build.sh $PYTHON_VERSION
 cp -r $PYTHON_BINDING_PATH/dist/* $OUTPUT_PATH/
 
 
-TOS_UTIL_URL=https://tos-tools.tos-cn-beijing.volces.com/linux/amd64/tosutil
+TOS_UTIL_URL=https://tos-tools.dualstack.cn-beijing.tos.volces.com/linux/amd64/tosutil
 if [ ! -z "$CUSTOM_TOS_UTIL_URL" ]; then
     TOS_UTIL_URL=$CUSTOM_TOS_UTIL_URL
 fi
+
 
 
 if [ -z "$CUSTOM_TOS_AK" ] && [ -z "$CUSTOM_TOS_SK" ]; then
@@ -90,6 +91,6 @@ else
     wget $TOS_UTIL_URL -O tosutil && chmod +x tosutil
     for wheel_file in $(find $OUTPUT_PATH -name "*.whl"); do
         echo "uploading $wheel_file to tos..."
-        ./tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sglang-router/$(basename $wheel_file) -re cn-beijing -e tos-cn-beijing.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+        ./tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sglang-router/$(basename $wheel_file) -re cn-beijing -e dualstack.cn-beijing.tos.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
     done
 fi
