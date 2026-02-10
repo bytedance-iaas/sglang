@@ -321,6 +321,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
         )
         
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        
+        self.compiled = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -444,15 +446,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
-        graph_nums = len(self.cuda_graph_runner.block_graphs)
-        if get_bool_env_var("SGLANG_VIT_GRAPH") and graph_nums <=20:
-            print("graph num {}".format(graph_nums))
-            return self.forward_with_cuda_graph(x, grid_thw)
+
+    def raw_forward(self, x, grid_thw):
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -495,6 +490,23 @@ class Qwen3VLMoeVisionModel(nn.Module):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        graph_nums = len(self.cuda_graph_runner.block_graphs)
+        if get_bool_env_var("SGLANG_VIT_GRAPH") and graph_nums <=20:
+            print("graph num {}".format(graph_nums))
+            if not self.compiled:
+                self.raw_forward(x, grid_thw)
+                self.compiled = True
+            return self.forward_with_cuda_graph(x, grid_thw)
+        else:
+            return self.raw_forward(x, grid_thw)
+  
 
     def forward_with_cuda_graph(
         self,

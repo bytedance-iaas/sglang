@@ -2655,7 +2655,7 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
