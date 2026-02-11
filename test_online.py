@@ -60,6 +60,12 @@ def _encode_rgb_tensor_to_png_base64(image: torch.Tensor, save_path: str | None 
 first_image = frames[0]
 image_b64 = _encode_rgb_tensor_to_png_base64(first_image, save_path="last_frame.png")
 
+# Extract trajectory history
+history_traj = {
+    "ego_history_xyz": data["ego_history_xyz"].tolist(),
+    "ego_history_rot": data["ego_history_rot"].tolist(),
+}
+
 client = OpenAI(
 	base_url="http://127.0.0.1:30000/v1",
 	api_key="EMPTY",
@@ -79,7 +85,9 @@ resp = client.chat.completions.create(
 			],
 		}
 	],
-	max_tokens=256,
+	max_tokens=512,
+    extra_body={"history_traj": history_traj},
 )
+
 
 print(resp.choices[0].message.content)
