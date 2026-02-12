@@ -67,7 +67,7 @@ history_traj = {
 }
 
 client = OpenAI(
-	base_url="http://127.0.0.1:30000/v1",
+	base_url="http://127.0.0.1:3838/v1",
 	api_key="EMPTY",
 )
 

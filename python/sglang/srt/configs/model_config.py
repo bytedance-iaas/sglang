@@ -138,6 +138,8 @@ class ModelConfig:
             **kwargs,
         )
 
+        import pdb;pdb.set_trace()
+        
         # Set enable_multimodal
         if enable_multimodal is None:
             mm_disabled_models = [

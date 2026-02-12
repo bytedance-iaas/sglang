@@ -14,27 +14,42 @@
 # ==============================================================================
 """Inference-only AlpamayoR1 model (Dummy Implementation)."""
 
+import json
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
+from sglang.srt.configs.qwen3_vl import Qwen3VLConfig
 
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.utils import logger
 
+
+# FIXME:
 class AlpamayoR1Config(PretrainedConfig):
+    """Minimal config for AlpamayoR1 that wraps Qwen3-VL."""
     model_type = "alpamayo_r1"
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        pass
+        # Store the vlm_name_or_path if provided
+        self.vlm_name_or_path = "Qwen/Qwen3-VL-8B-Instruct"
+        self.vlm_backend = "qwenvl3"
+
+        logger.info(f"AlpamayoR1Config initialized")
+        # self.vocab_size = kwargs.get("vocab_size", 155697)  # Default vocab size for AlpamayoR1
 
 class AlpamayoR1(nn.Module):
     """
     Dummy implementation of AlpamayoR1 for SGLang.
-    AlpamayoR1 wraps Qwen3VLForConditionalGeneration as its language model.
+    AlpamayoR1 wraps Qwen3VLForConditionalGeneration as its language model (vlm).
+    
+    This implementation bypasses the standard HF config loading since Alpamayo
+    uses a custom config.json format with training-specific fields.
     """
     def __init__(
         self,
@@ -43,13 +58,30 @@ class AlpamayoR1(nn.Module):
         cache_config = None,
     ):
         super().__init__()
-        # Initialize internal Qwen3-VL model
-        self.language_model = Qwen3VLForConditionalGeneration(
-            config, 
+        
+        logger.info(f"AlpamayoR1 initialized")
+
+        # Store config for later use
+        self.config = config
+        qwen_config = Qwen3VLConfig()
+        qwen_config.vocab_size = config.vocab_size
+        qwen_config.text_config.vocab_size = config.vocab_size
+
+        # Initialize internal Qwen3-VL model as 'vlm' (matching alpamayo naming)
+        self.vlm = Qwen3VLForConditionalGeneration(
+            qwen_config, 
             quant_config=quant_config, 
-            cache_config=cache_config
+            prefix = "vlm"
         )
 
+        logger.info(f"AlpamayoR1: Successfully initialized Qwen3-VL as self.vlm")
+
+
+        self.expert = None
+        self.action_space = None
+        self.action_in_proj = None
+        self.action_out_proj = None
+        # convert action-related parameters
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -57,12 +89,25 @@ class AlpamayoR1(nn.Module):
         forward_batch: "ForwardBatch",
         **kwargs,
     ):
-        # Delegate forward to the language model
-        return self.language_model(input_ids, positions, forward_batch, **kwargs)
+        # Delegate forward to the VLM
+        return self.vlm(input_ids, positions, forward_batch, **kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Delegate loading to the inner model
-        return self.language_model.load_weights(weights)
+        """Load weights into the model.
+        
+        The weights from Alpamayo checkpoint may have keys prefixed with 'vlm.'
+        We need to strip this prefix and load into self.vlm.
+        """
+        # Convert weights iterator to list so we can modify keys
+        # weights_list = []
+        # for name, tensor in weights:
+        #     # Strip 'vlm.' prefix if present
+        #     if name.startswith("vlm."):
+        #         name = name[4:]  # Remove "vlm."
+        #     weights_list.append((name, tensor))
+        
+        # Delegate to internal VLM's load_weights
+        return self.vlm.load_weights(weights)
 
 # Entry point for SGLang model registry
 EntryClass = AlpamayoR1
