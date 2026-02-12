@@ -1,2 +1,3 @@
-# python3 -m sglang.launch_server --model-path /data/models/Qwen3-VL-8B-Instruct/ --disable-cuda-graph
-python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B --disable-cuda-graph --port 3838
+python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B  --port 3838 --tp 1 --disable-cuda-graph
+
+

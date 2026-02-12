@@ -137,8 +137,6 @@ class ModelConfig:
             revision=revision,
             **kwargs,
         )
-
-        import pdb;pdb.set_trace()
         
         # Set enable_multimodal
         if enable_multimodal is None:

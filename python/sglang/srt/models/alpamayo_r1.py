@@ -1,5 +1,5 @@
 
-# Copyright 2025 SGLang Team
+# Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Inference-only AlpamayoR1 model (Dummy Implementation)."""
-
 import json
 import os
 from typing import Iterable, Optional, Tuple
@@ -29,19 +27,16 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.utils import logger
 
 
-# FIXME:
-class AlpamayoR1Config(PretrainedConfig):
-    """Minimal config for AlpamayoR1 that wraps Qwen3-VL."""
-    model_type = "alpamayo_r1"
+# class AlpamayoR1Config(PretrainedConfig):
+#     """Minimal config for AlpamayoR1 that wraps Qwen3-VL."""
+#     model_type = "alpamayo_r1"
     
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Store the vlm_name_or_path if provided
-        self.vlm_name_or_path = "Qwen/Qwen3-VL-8B-Instruct"
-        self.vlm_backend = "qwenvl3"
-
-        logger.info(f"AlpamayoR1Config initialized")
-        # self.vocab_size = kwargs.get("vocab_size", 155697)  # Default vocab size for AlpamayoR1
+#     def __init__(self, **kwargs):
+#         super().__init__(**kwargs)
+#         Store the vlm_name_or_path if provided
+#         self.vlm_name_or_path = "Qwen/Qwen3-VL-8B-Instruct"
+#         self.vlm_backend = "qwenvl3"
+#         self.vocab_size = kwargs.get("vocab_size", 155697)  # Default vocab size for AlpamayoR1
 
 class AlpamayoR1(nn.Module):
     """
@@ -55,7 +50,6 @@ class AlpamayoR1(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
     ):
         super().__init__()
         
@@ -63,15 +57,16 @@ class AlpamayoR1(nn.Module):
 
         # Store config for later use
         self.config = config
-        qwen_config = Qwen3VLConfig()
-        qwen_config.vocab_size = config.vocab_size
+
+        qwen_config = config
+
+        # we increaset vocab size to match Alpamayo's tokenizer, which may have additional special tokens compared to the base Qwen3-VL config
         qwen_config.text_config.vocab_size = config.vocab_size
 
         # Initialize internal Qwen3-VL model as 'vlm' (matching alpamayo naming)
         self.vlm = Qwen3VLForConditionalGeneration(
             qwen_config, 
             quant_config=quant_config, 
-            prefix = "vlm"
         )
 
         logger.info(f"AlpamayoR1: Successfully initialized Qwen3-VL as self.vlm")
@@ -96,18 +91,24 @@ class AlpamayoR1(nn.Module):
         """Load weights into the model.
         
         The weights from Alpamayo checkpoint may have keys prefixed with 'vlm.'
-        We need to strip this prefix and load into self.vlm.
+        We strip this prefix and load into self.vlm.
+        We skip expert.*, action_space.*, and other non-VLM weights since
+        they are not implemented in this inference-only version.
         """
-        # Convert weights iterator to list so we can modify keys
-        # weights_list = []
-        # for name, tensor in weights:
-        #     # Strip 'vlm.' prefix if present
-        #     if name.startswith("vlm."):
-        #         name = name[4:]  # Remove "vlm."
-        #     weights_list.append((name, tensor))
+        weights_list = []
+        for name, tensor in weights:
+            # Skip weights for unimplemented components
+            if name.startswith(("expert.", "action_space.", "action_in_proj.", "action_out_proj.", "diffusion.")):
+                logger.debug(f"Skipping weight: {name} (not implemented in inference-only mode)")
+                continue
+            
+            # Strip 'vlm.' prefix if present
+            if name.startswith("vlm."):
+                name = name[4:]  # Remove "vlm."
+            weights_list.append((name, tensor))
         
         # Delegate to internal VLM's load_weights
-        return self.vlm.load_weights(weights)
+        return self.vlm.load_weights(iter(weights_list))
 
 # Entry point for SGLang model registry
 EntryClass = AlpamayoR1
