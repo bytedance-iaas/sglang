@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
@@ -67,6 +67,7 @@ class DeepEPPDispatchHooks(DispatcherBaseHooks):
             hook_fun(dispatcher)
 
 
+
 class DeepEPNormalDispatchOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
@@ -79,6 +80,14 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     @property
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.DEEPEP_NORMAL
+
+    @property
+    def topk_output(self) -> TopKOutput:
+        return StandardTopKOutput(
+            topk_weights=self.topk_weights,
+            topk_ids=self.topk_ids,
+            router_logits=None,
+        )
 
 
 class DeepEPLLDispatchOutput(NamedTuple):
@@ -94,6 +103,14 @@ class DeepEPLLDispatchOutput(NamedTuple):
     @property
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.DEEPEP_LL
+
+    @property
+    def topk_output(self) -> TopKOutput:
+        return StandardTopKOutput(
+            topk_weights=self.topk_weights,
+            topk_ids=self.topk_ids,
+            router_logits=None,
+        )
 
 
 assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)

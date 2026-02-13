@@ -114,13 +114,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         super().__init__(config)
         assert self.config.activation == "silu"
         assert self.config.is_gated
+        # Internal BF16 runner core for dtype-based dispatch
+        from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+            DeepGemmBf16RunnerCore,
+        )
+
+        self._bf16_core = DeepGemmBf16RunnerCore(config)
 
     def run(
         self,
-        runner_input: DeepGemmRunnerInput,
-        quant_info: DeepGemmMoeQuantInfo,
+        runner_input,
+        quant_info,
         running_state: dict,
-    ) -> DeepGemmRunnerOutput:
+    ):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+            DeepGemmBf16MoeQuantInfo,
+        )
+
+        # Dtype-based dispatch: route to BF16 runner core if quant_info is BF16
+        if isinstance(quant_info, DeepGemmBf16MoeQuantInfo):
+            return self._bf16_core.run(runner_input, quant_info, running_state)
+
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(
                 runner_input, quant_info, running_state
@@ -362,6 +376,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 @register_pre_permute("standard", "deep_gemm")
 def pre_permute_standard_to_deep_gemm(
     dispatch_output: StandardDispatchOutput,
+    quant_info,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+        DeepGemmBf16MoeQuantInfo,
+    )
+
+    # Dtype-based dispatch
+    if isinstance(quant_info, DeepGemmBf16MoeQuantInfo):
+        return _pre_permute_standard_to_deep_gemm_bf16(
+            dispatch_output, quant_info, runner_config, running_state
+        )
+
+    return _pre_permute_standard_to_deep_gemm_fp8(
+        dispatch_output, quant_info, runner_config, running_state
+    )
+
+
+def _pre_permute_standard_to_deep_gemm_fp8(
+    dispatch_output: StandardDispatchOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -404,6 +439,99 @@ def pre_permute_standard_to_deep_gemm(
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
+    )
+
+
+def _pre_permute_standard_to_deep_gemm_bf16(
+    dispatch_output: StandardDispatchOutput,
+    quant_info,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        compute_masked_m_triton_kernel,
+        compute_seg_indptr_triton_kernel,
+        deepgemm_compute_src2dst_triton_kernel,
+    )
+    from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+        DeepGemmBf16RunnerInput,
+        fill_gateup_input_bf16,
+    )
+
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
+    topk_weights, topk_ids, _ = topk_output
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_dtype = hidden_states.dtype
+    hidden_states_device = hidden_states.device
+    hidden_states_ref = hidden_states
+
+    num_local_experts = runner_config.num_local_experts
+    top_k = runner_config.top_k
+
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.zeros(
+        num_local_experts + 1, device=topk_ids.device, dtype=torch.int64
+    )
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+    masked_m = torch.empty(
+        num_local_experts, device=topk_ids.device, dtype=torch.int32
+    )
+
+    compute_seg_indptr_triton_kernel[(num_local_experts + 1,)](
+        reorder_topk_ids, seg_indptr, topk_ids.numel()
+    )
+    compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
+
+    m_max = (hidden_states.size(0) // 256 + 1) * 256
+    expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
+
+    gateup_input = torch.empty(
+        (num_local_experts, m_max, hidden_states.size(1)),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+
+    import triton
+
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),
+    )
+    deepgemm_compute_src2dst_triton_kernel[grid](
+        topk_ids,
+        reorder_ids,
+        seg_indptr,
+        src2dst,
+        m_max,
+        topk_ids.numel(),
+        BLOCK_SIZE=256,
+    )
+
+    fill_gateup_input_bf16(
+        hidden_states,
+        gateup_input,
+        src2dst,
+        topk_ids,
+        top_k,
+    )
+
+    dispose_tensor(hidden_states_ref)
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["src2dst"] = src2dst
+
+    return DeepGemmBf16RunnerInput(
+        hidden_states=gateup_input,
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
@@ -454,10 +582,15 @@ def post_permute_deep_gemm_to_standard(
 @register_pre_permute("deepep_ll", "deep_gemm")
 def pre_permute_deepep_ll_to_deep_gemm(
     dispatch_output: DeepEPLLDispatchOutput,
-    quant_info: DeepGemmMoeQuantInfo,
+    quant_info,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> DeepGemmRunnerInput:
+):
+    from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+        DeepGemmBf16MoeQuantInfo,
+        DeepGemmBf16RunnerInput,
+    )
+
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
@@ -467,6 +600,15 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
+
+    # Dtype-based dispatch
+    if isinstance(quant_info, DeepGemmBf16MoeQuantInfo):
+        return DeepGemmBf16RunnerInput(
+            hidden_states=hidden_states,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
@@ -495,6 +637,28 @@ def post_permute_deep_gemm_to_deepep_ll(
 
 @register_pre_permute("deepep_normal", "deep_gemm")
 def pre_permute_deepep_normal_to_deep_gemm(
+    dispatch_output: DeepEPNormalDispatchOutput,
+    quant_info,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+        DeepGemmBf16MoeQuantInfo,
+        DeepGemmBf16RunnerInput,
+    )
+
+    # Dtype-based dispatch
+    if isinstance(quant_info, DeepGemmBf16MoeQuantInfo):
+        return _pre_permute_deepep_normal_to_deep_gemm_bf16(
+            dispatch_output, quant_info, runner_config, running_state
+        )
+
+    return _pre_permute_deepep_normal_to_deep_gemm_fp8(
+        dispatch_output, quant_info, runner_config, running_state
+    )
+
+
+def _pre_permute_deepep_normal_to_deep_gemm_fp8(
     dispatch_output: DeepEPNormalDispatchOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -580,6 +744,91 @@ def pre_permute_deepep_normal_to_deep_gemm(
     return DeepGemmRunnerInput(
         hidden_states=input_tensor,
         hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+def _pre_permute_deepep_normal_to_deep_gemm_bf16(
+    dispatch_output: DeepEPNormalDispatchOutput,
+    quant_info,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+    from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+        DeepGemmBf16RunnerInput,
+    )
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        num_recv_tokens_per_expert,
+    ) = dispatch_output
+    assert runner_config.activation == "silu"
+
+    all_tokens = sum(num_recv_tokens_per_expert)
+    running_state["all_tokens"] = all_tokens
+
+    K = hidden_states.shape[1]
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_device = hidden_states.device
+    hidden_states_dtype = hidden_states.dtype
+
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    input_tensor = torch.empty(
+        (all_tokens, K),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    # Dummy scale for ep_scatter API compatibility
+    dummy_scale = torch.empty(
+        (all_tokens, K // 128),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+
+    if get_offloader().forbid_copy_engine_usage:
+        num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+            num_recv_tokens_per_expert
+        )
+    else:
+        num_recv_tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            pin_memory=True,
+            device="cpu",
+        ).cuda(non_blocking=True)
+    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+    ep_scatter(
+        hidden_states,
+        hidden_states_scale if hidden_states_scale is not None else dummy_scale[:hidden_states.shape[0]],
+        topk_ids,
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        input_tensor,
+        dummy_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=False,
+    )
+    dispose_tensor(hidden_states)
+
+    running_state["output_index"] = output_index
+
+    return DeepGemmBf16RunnerInput(
+        hidden_states=input_tensor,
         use_masked_gemm=False,
         m_indices=m_indices,
     )

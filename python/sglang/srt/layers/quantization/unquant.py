@@ -357,7 +357,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         moe_runner_config = self.moe_runner_config
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
+        if backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+                DeepGemmBf16MoeQuantInfo,
+            )
+
+            quant_info = DeepGemmBf16MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )
