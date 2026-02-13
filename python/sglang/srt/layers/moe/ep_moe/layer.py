@@ -105,6 +105,17 @@ class DeepEPMoE(FusedMoE):
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
+        elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and quant_config is None
+        ):
+            from sglang.srt.layers.quantization.unquant import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            self.deprecate_flag = (
+                UnquantizedFusedMoEMethod._is_deepgemm_bf16_enabled()
+            )
         else:
             self.deprecate_flag = False
 

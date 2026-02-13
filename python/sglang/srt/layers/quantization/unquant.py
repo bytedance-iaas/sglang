@@ -322,12 +322,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        if self.use_triton_kernels:
+            backend = MoeRunnerBackend.TRITON_KERNELS
+        elif self._is_deepgemm_bf16_enabled():
+            backend = MoeRunnerBackend.DEEP_GEMM
+        else:
+            backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
+
+    @staticmethod
+    def _is_deepgemm_bf16_enabled():
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
+        backend = get_moe_runner_backend()
+        if backend.is_deep_gemm():
+            return True
+        if backend.is_auto():
+            return ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+            )
+        return False
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -357,7 +376,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         moe_runner_config = self.moe_runner_config
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
+        if backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm_bf16 import (
+                DeepGemmBf16MoeQuantInfo,
+            )
+
+            quant_info = DeepGemmBf16MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )
