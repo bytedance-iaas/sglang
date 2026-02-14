@@ -85,7 +85,7 @@ class DeepGemmBf16RunnerCore(MoeRunnerCore):
         quant_info: DeepGemmBf16MoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        hidden_states = runner_input.hidden_states
+        hidden_states = runner_input.hidden_states.to(torch.bfloat16)
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
@@ -139,7 +139,7 @@ class DeepGemmBf16RunnerCore(MoeRunnerCore):
         quant_info: DeepGemmBf16MoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        hidden_states = runner_input.hidden_states
+        hidden_states = runner_input.hidden_states.to(torch.bfloat16)
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
 
@@ -164,22 +164,24 @@ class DeepGemmBf16RunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
 
         # Activation: SiLU-and-Mul (BF16 -> BF16)
+        # Apply over entire flattened buffer to avoid masked_m[i].item() which
+        # triggers GPU-to-CPU sync and breaks CUDA graph capture.
+        # Padding rows are ignored by the downstream masked GEMM.
         down_input = torch.empty(
             (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
+                gateup_output.shape[0] * gateup_output.shape[1],
                 gateup_output.shape[2] // 2,
             ),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        for i in range(num_groups):
-            cur_m = masked_m[i].item() if masked_m[i].item() > 0 else 0
-            if cur_m > 0:
-                silu_and_mul(
-                    gateup_output[i, :cur_m].contiguous(),
-                    down_input[i, :cur_m],
-                )
+        silu_and_mul(
+            gateup_output.view(-1, gateup_output.shape[2]),
+            down_input,
+        )
+        down_input = down_input.view(
+            gateup_output.shape[0], gateup_output.shape[1], gateup_output.shape[2] // 2
+        )
         del gateup_output
 
         # GroupGemm-1: BF16 x BF16 -> BF16
