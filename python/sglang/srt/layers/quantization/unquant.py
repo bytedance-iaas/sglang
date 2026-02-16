@@ -374,6 +374,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -383,7 +384,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         elif self.use_deep_gemm:
             backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_triton_kernels:
-            backend = MoeRunnerBackend.TRITON_KERNELS
+            backend = MoeRunnerBackend.TRITON_KERNEL
+        elif moe_runner_backend.is_asym_gemm():
+            backend = MoeRunnerBackend.ASYM_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
