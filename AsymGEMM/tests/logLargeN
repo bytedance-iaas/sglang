@@ -1,0 +1,2029 @@
+B_bp16_cpu first 4 values=[-0.335938, 1.375, 0.431641, 0.914062]
+offsets_h=[0, 2176, 4352, 6784, 9344]
+experts_h=[0, 1, 2, 3, -1]
+m=9344, n=4096, k=7168, num_groups=4,list_size=5
+Calling asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous...
+A=[9344, 7168] BFloat16
+B_bp16_cpu=[4, 4096, 7168] BFloat16
+D=[9344, 4096] BFloat16
+A_bp16 bytes=133955584 (127.75 MiB)
+B_bp16 bytes=234881024 (224 MiB)
+B_bp16_cpu bytes=234881024 (224 MiB)
+D bytes=76546048 (73 MiB)
+GEMM type: 1, kernel type: 2, M: 9344, N: 4096, K: 7168, groups: 1, A major: 0, B major: 0, AB dtype: BFloat16, CD dtype: BFloat16, accumulation: 0, SM limit: 152 -> block M: 128, block N: 256, block K: 64, stages: 4, last stages: 0, SMs: 146, multicast: 1, multicast on A: 0, shared memory: 229516 bytes, swizzle A: 128, swizzle B: 128, swizzle CD: 128, SMs: 146, threads: 256, TC util: 100%
+Making TMA desc: global memory: 7168 9344, shared memory: 64 128, outer stride: 7168, swizzle: 128 (base: 0), elem size: 2
+Making TMA desc: global memory: 7168 16384, shared memory: 64 256, outer stride: 7168, swizzle: 128 (base: 0), elem size: 2
+Making TMA desc: global memory: 4096 9344, shared memory: 64 128, outer stride: 4096, swizzle: 128 (base: 0), elem size: 2
+Generated kernel code: 
+#include <asym_gemm/impls/sm100_bf16_gemm.cuh>
+
+using namespace asym_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sm100_bf16_gemm_impl<
+        cute::UMMA::Major::K, cute::UMMA::Major::K,
+        9344, 4096, 7168,
+        128, 256, 64,
+        4,
+        128, 128, 128,
+        4,
+        128, 128,
+        1, false,
+        146,
+        GemmType::MGroupedContiguous, false, cutlass::bfloat16_t,
+        100
+    >);
+};
+
+Loading CUBIN: /tmp/deepgemm_jit/cache/kernel.sm100_bf16_m_grouped_gemm_contiguous.b8267496c7669ded03145423c7389452/kernel.cubin
+Symbol names: _ZN9asym_gemm20sm100_bf16_gemm_implILN4cute4UMMA5MajorE0ELS3_0ELj9344ELj4096ELj7168ELj128ELj256ELj64ELj4ELj128ELj128ELj128ELj4ELj128ELj128ELj1ELb0ELj146ELNS_8GemmTypeE1ELb0EN7cutlass10bfloat16_tELm100EEEvPijjj14CUtensorMap_stS8_S8_, 
+Launch kernel with {146, 1} x 256, shared memory: 229516 bytes, cluster: 1, stream: 0
+Epilogue warp, n_block_idx: 0, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, n_block_idx: 0, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, n_block_idx: 0, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 128, m_idx: 0 
+Epilogue warp, n_block_idx: 0, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 192, m_idx: 0 
+Epilogue warp, n_block_idx: 9, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 2304, m_idx: 256 
+Epilogue warp, n_block_idx: 9, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 2368, m_idx: 256 
+Epilogue warp, n_block_idx: 9, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 2432, m_idx: 256 
+Epilogue warp, n_block_idx: 9, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 2496, m_idx: 256 
+Epilogue warp, n_block_idx: 2, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 512, m_idx: 2560 
+Epilogue warp, n_block_idx: 2, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 576, m_idx: 2560 
+Epilogue warp, n_block_idx: 2, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 640, m_idx: 2560 
+Epilogue warp, n_block_idx: 2, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 704, m_idx: 2560 
+Epilogue warp, n_block_idx: 11, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 2816, m_idx: 2816 
+Epilogue warp, n_block_idx: 11, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 2880, m_idx: 2816 
+Epilogue warp, n_block_idx: 11, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 2944, m_idx: 2816 
+Epilogue warp, n_block_idx: 11, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 3008, m_idx: 2816 
+Epilogue warp, n_block_idx: 4, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 1024, m_idx: 5120 
+Epilogue warp, n_block_idx: 4, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 1088, m_idx: 5120 
+Epilogue warp, n_block_idx: 4, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 1152, m_idx: 5120 
+Epilogue warp, n_block_idx: 4, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 1216, m_idx: 5120 
+Epilogue warp, n_block_idx: 13, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 3328, m_idx: 5376 
+Epilogue warp, n_block_idx: 13, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 3392, m_idx: 5376 
+Epilogue warp, n_block_idx: 13, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 3456, m_idx: 5376 
+Epilogue warp, n_block_idx: 13, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 3520, m_idx: 5376 
+Epilogue warp, n_block_idx: 6, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 1536, m_idx: 7680 
+Epilogue warp, n_block_idx: 6, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 1600, m_idx: 7680 
+Epilogue warp, n_block_idx: 6, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 1664, m_idx: 7680 
+Epilogue warp, n_block_idx: 6, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 1728, m_idx: 7680 
+Epilogue warp, n_block_idx: 15, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 3840, m_idx: 7936 
+Epilogue warp, n_block_idx: 15, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 3904, m_idx: 7936 
+Epilogue warp, n_block_idx: 15, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 3968, m_idx: 7936 
+Epilogue warp, n_block_idx: 15, kNumStores: 4, BLOCK_N: 256, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 4032, m_idx: 7936 
+Making TMA desc: global memory: 7168 9344, shared memory: 64 128, outer stride: 7168, swizzle: 128 (base: 0), elem size: 2
+Making TMA desc: global memory: 7168 16384, shared memory: 64 128, outer stride: 7168, swizzle: 128 (base: 0), elem size: 2
+Making TMA desc: global memory: 4096 9344, shared memory: 64 128, outer stride: 4096, swizzle: 128 (base: 0), elem size: 2
+Generated kernel code: 
+#include <asym_gemm/impls/sm100_bf16_asym_gemm.cuh>
+
+using namespace asym_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sm100_bf16_asym_gemm_impl<
+        cute::UMMA::Major::K, cute::UMMA::Major::K,
+        9344, 4096, 7168,
+        128, 128, 256,
+        0,
+        128, 128, 128,
+        2,
+        128, 128,
+        1, false,
+        146,
+        GemmType::MGroupedContiguous, false, cutlass::bfloat16_t,
+        100
+    >);
+};
+
+Create directory: /tmp/deepgemm_jit/cache/kernel.sm100_bf16_m_grouped_asym_gemm_contiguous.5757eae0ff213139bbbf23e921b2bf7d
+Running NVCC command: /usr/local/cuda-12.9/bin/nvcc /tmp/deepgemm_jit/cache/kernel.sm100_bf16_m_grouped_asym_gemm_contiguous.5757eae0ff213139bbbf23e921b2bf7d/kernel.cu -o /tmp/deepgemm_jit/tmp/862162-399071e1-79760e74-b8be03dc -std=c++20 --diag-suppress=39,161,174,177,186,940 --ptxas-options=--register-usage-level=10 --ptxas-options=--verbose,--warn-on-local-memory-usage -Xcompiler -rdynamic -lineinfo -I/sgl-workspace/sglang/DeepGEMM/asym_gemm/include --gpu-architecture=sm_100f --compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi -cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda
+ptxas warning : Local memory used for function '_ZN9asym_gemm25sm100_bf16_asym_gemm_implILN4cute4UMMA5MajorE0ELS3_0ELj9344ELj4096ELj7168ELj128ELj128ELj256ELj0ELj128ELj128ELj128ELj2ELj128ELj128ELj1ELb0ELj146ELNS_8GemmTypeE1ELb0EN7cutlass10bfloat16_tELm100EEEvPjS7_jjj14CUtensorMap_stS8_S8_', size of stack frame: 24 bytes
+ptxas info    : 322 bytes gmem
+ptxas info    : Compiling entry function '_ZN9asym_gemm25sm100_bf16_asym_gemm_implILN4cute4UMMA5MajorE0ELS3_0ELj9344ELj4096ELj7168ELj128ELj128ELj256ELj0ELj128ELj128ELj128ELj2ELj128ELj128ELj1ELb0ELj146ELNS_8GemmTypeE1ELb0EN7cutlass10bfloat16_tELm100EEEvPjS7_jjj14CUtensorMap_stS8_S8_' for 'sm_100f'
+ptxas info    : Function properties for _ZN9asym_gemm25sm100_bf16_asym_gemm_implILN4cute4UMMA5MajorE0ELS3_0ELj9344ELj4096ELj7168ELj128ELj128ELj256ELj0ELj128ELj128ELj128ELj2ELj128ELj128ELj1ELb0ELj146ELNS_8GemmTypeE1ELb0EN7cutlass10bfloat16_tELm100EEEvPjS7_jjj14CUtensorMap_stS8_S8_
+    24 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 72 registers, used 9 barriers, 24 bytes cumulative stack size
+ptxas info    : Compile time = 45.195 ms
+Loading CUBIN: /tmp/deepgemm_jit/cache/kernel.sm100_bf16_m_grouped_asym_gemm_contiguous.5757eae0ff213139bbbf23e921b2bf7d/kernel.cubin
+Symbol names: _ZN9asym_gemm25sm100_bf16_asym_gemm_implILN4cute4UMMA5MajorE0ELS3_0ELj9344ELj4096ELj7168ELj128ELj128ELj256ELj0ELj128ELj128ELj128ELj2ELj128ELj128ELj1ELb0ELj146ELNS_8GemmTypeE1ELb0EN7cutlass10bfloat16_tELm100EEEvPjS7_jjj14CUtensorMap_stS8_S8_, 
+Launch kernel with {32, 4} x 256, shared memory: 229484 bytes, cluster: 1, stream: 0
+information about tensor memory, kNumStages: 2, kNumEpilogueStages: 2, kNumTMAStoreStages: 2, kNumAccumTmemCols: 256, kNumTmemCols: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 0 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 128 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 256 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 384 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 512 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 640 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 768 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 896 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1024 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1152 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1280 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1408 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1536 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1664 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1792 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 1920 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 0, n_idx: 0, m_idx: 2048 
+Epilogue warp, scheduler.n_idx: 0, kNumStores: 2, BLOCK_N: 128, STORE_BLOCK_N: 64 
+Epilogue warp within store, threadIdx.x: 128, tma_stage_idx: 1, n_idx: 64, m_idx: 2048 
+D vs AsymD abs diff: max=nan, mean=nan
+AsymD unchanged elements (NaN-aware): 29360128 / 38273024
+AsymD still NaN after kernel: 29360128 / 38273024
+D block rows [0,3], cols [0,7]
+  [-28.625, -107.5, 96.5, -48, 44.5, 70.5, -20.625, 67.5]
+  [151, -143, 89.5, -30.125, 70.5, 9.9375, -97, -154]
+  [-9.4375, 39, -92.5, 210, -58.5, -29.5, -79.5, -104]
+  [5.65625, 21, -153, 101, -6.6875, 105, -47.25, -158]
+AsymD block rows [0,3], cols [0,7]
+  [-200, 175, -52, 157, -306, -250, 119.5, 36.5]
+  [368, -130, 130, -170, 212, -560, -294, 81.5]
+  [-62, 274, 41.25, 44, -64.5, 226, -324, -470]
+  [76, 46, 38, 86, -90, -1, 268, -186]
+abs(D-AsymD) block rows [0,3], cols [0,7]
+  [171, 282, 148, 205, 350, 320, 140, 31]
+  [217, 13, 40.5, 140, 142, 568, 197, 236]
+  [52.5, 235, 134, 166, 6, 256, 244, 366]
+  [70.5, 25, 191, 15, 83.5, 106, 316, 28]
