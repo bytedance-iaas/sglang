@@ -78,6 +78,8 @@ class ViTCudaGraphRunner:
 
         self._attn: Optional[VisionAttention] = getattr(first_blk, "attn", None)
         self._attn_backend = getattr(self._attn, "qkv_backend", None)
+        
+        self.fixed_buffer = None
 
     @property
     def device(self) -> torch.device:
@@ -108,6 +110,17 @@ class ViTCudaGraphRunner:
                     max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
                 )
                 self.sin_cos_ws = (cos_ws, sin_ws)
+                
+    
+    def _ensure_graph_buffer(self, x):
+
+        if self.fixed_buffer is None:
+            buffer_shape = list(x.shape)
+            #[TODO] remove hardcode here
+            buffer_shape[0] = 32768
+            self.fixed_buffer = torch.empty(buffer_shape, dtype = x.dtype, device = x.device).contiguous()
+        
+                
 
     def _get_graph_key(self, x_3d: torch.Tensor) -> int:
         # x_3d: [S, B, H], B=1, S as graph_key
@@ -245,22 +258,18 @@ class ViTCudaGraphRunner:
         attn_module: VisionAttention = vit.blocks[0].attn
         num_heads = attn_module.num_attention_heads_per_partition
         attn_head_dim = attn_module.head_size
-
+        self._ensure_graph_buffer(x_3d)
+        
         if graph_key not in self.block_output:
-            self.block_output[graph_key] = torch.empty_like(
-                x_3d, device=self.device
-            ).contiguous()
-            self.block_input[graph_key] = torch.empty_like(
-                x_3d, device=self.device
-            ).contiguous()
-            self.block_ws[graph_key] = torch.empty(
-                graph_key,
-                num_heads,
-                attn_head_dim,
-                device=self.device,
-                dtype=self.dtype,
-            )
-
+            if x_3d.shape[0] > 32768:
+                raise RuntimeError("input shape exceed prepared buffer's max size,  try run vision encoder without cudagraph")
+            
+            self.block_input[graph_key] = self.fixed_buffer[:x_3d.shape[0], :, :]
+            
+            # currently, block_ws is not necessary
+            self.block_ws[graph_key] = None
+            # currently, output use graph kept buffer (no new  buffer is necessary)
+            self.block_output[graph_key] = None
         # Qwen2.5-VL
         if self._fullatt_block_indexes:
             if graph_key not in self.cu_window_len:
