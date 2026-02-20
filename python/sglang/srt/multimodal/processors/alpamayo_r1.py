@@ -17,7 +17,9 @@ import torch
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+# from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.alpamayo_r1 import AlpamayoR1
+
 from sglang.utils import logger
 
 # Constants from alpamayo_r1/models/base_model.py
@@ -165,7 +167,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
     # Reuse Qwen3VLForConditionalGeneration temporarily, should be AlpamayoR1
     # But user said "reference alpamayo_r1.py", I can register AlpamayoR1 class here if needed?
     # Or just use the processor with any model that matches config.
-    models = [Qwen3VLForConditionalGeneration] 
+    models = [AlpamayoR1] 
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # IMPORTANT: Add trajectory tokens to the tokenizer BEFORE calling super().__init__
@@ -175,19 +177,9 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         
         # Initialize trajectory tokenizer configs
-        delta_cfg = getattr(hf_config, "delta_tokenizer_cfg", {})
-        # If delta_cfg is a dict config object (e.g. Munch or similar), convert to dict
-        if hasattr(delta_cfg, "to_dict"):
-             delta_cfg = delta_cfg.to_dict()
-        elif hasattr(delta_cfg, "__dict__"):
-             delta_cfg = delta_cfg.__dict__
-             
-        self.hist_traj_tokenizer = DeltaTrajectoryTokenizer(**delta_cfg)
-        self.hist_token_start_idx = getattr(hf_config, "traj_token_start_idx", 0)
-        self.traj_token_ids = getattr(hf_config, "traj_token_ids", {})
+        self.hist_traj_tokenizer = DeltaTrajectoryTokenizer()
         
-    @staticmethod
-    def _add_trajectory_tokens_to_processor(processor, hf_config):
+    def _add_trajectory_tokens_to_processor(self, processor, hf_config):
         """Add trajectory tokens to the tokenizer before it's used.
         
         This mirrors alpamayo_r1/models/base_model.py::_build_processor logic.
@@ -195,20 +187,20 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         tokenizer = processor.tokenizer
         
         # Add discrete trajectory tokens <i0> to <i999>
-        traj_vocab_size = getattr(hf_config, "traj_vocab_size", None)
-        if traj_vocab_size is not None:
-            discrete_tokens = [f"<i{v}>" for v in range(traj_vocab_size)]
-            num_new_tokens = tokenizer.add_tokens(discrete_tokens)
-            logger.info(f"Added {num_new_tokens} discrete trajectory tokens to tokenizer")
-            
-            # Store indices for later use
-            tokenizer.traj_token_start_idx = tokenizer.convert_tokens_to_ids("<i0>")
-            tokenizer.traj_token_end_idx = tokenizer.convert_tokens_to_ids(
-                f"<i{traj_vocab_size - 1}>"
-            )
+        traj_vocab_size = getattr(hf_config, "traj_vocab_size", 4000)
+        
+        discrete_tokens = [f"<i{v}>" for v in range(traj_vocab_size)]
+        num_new_tokens = tokenizer.add_tokens(discrete_tokens)
+        logger.info(f"Added {num_new_tokens} discrete trajectory tokens to tokenizer")
+        
+        # Store indices for later use
+        self.traj_token_start_idx = tokenizer.convert_tokens_to_ids("<i0>")
+        self.traj_token_end_idx = tokenizer.convert_tokens_to_ids(
+            f"<i{traj_vocab_size - 1}>"
+        )
         
         # Check if we should add all special tokens or just traj tokens
-        add_special_tokens = getattr(hf_config, "add_special_tokens", False)
+        add_special_tokens = getattr(hf_config, "add_special_tokens", True)
         
         if add_special_tokens:
             # Add all special tokens defined in alpamayo
@@ -221,14 +213,9 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             logger.info(f"Added {len(TRAJ_TOKEN)} trajectory special tokens to tokenizer")
         
         # Store traj_token_ids mapping
-        tokenizer.traj_token_ids = {
+        self.traj_token_ids = {
             k: tokenizer.convert_tokens_to_ids(v) for k, v in TRAJ_TOKEN.items()
         }
-        
-        # Update config with tokenizer info
-        if hasattr(tokenizer, "traj_token_start_idx"):
-            hf_config.traj_token_start_idx = tokenizer.traj_token_start_idx
-        hf_config.traj_token_ids = tokenizer.traj_token_ids
 
     async def process_mm_data_async(
         self,
@@ -238,6 +225,10 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         *args,
         **kwargs,
     ):
+
+        logger.info("AlpamayoR1Processor: Starting to process multimodal data with trajectory fusion.")
+
+        
         # 1. Reuse Qwen3-VL processor logic
         result = await super().process_mm_data_async(image_data, input_text, request_obj, *args, **kwargs)
         
@@ -266,7 +257,6 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
                      # So it is 1D.
                      
                      # But fuse_traj_tokens expects [B, L]. So we unsqueeze(0).
-                     pass
                      traj_data[k] = t
                 elif isinstance(v, torch.Tensor):
                     traj_data[k] = v
@@ -299,6 +289,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             
             # Update result
             result["input_ids"] = fused_ids.squeeze(0).tolist()
+        
             
         return result
 
@@ -315,7 +306,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
 
         # Reuse tokenize_history_trajectory helper
         hist_idx = tokenize_history_trajectory(
-            self.hist_traj_tokenizer, traj_data, self.hist_token_start_idx
+            self.hist_traj_tokenizer, traj_data, self.traj_token_start_idx
         )
         
         # We need the history placeholder token ID.

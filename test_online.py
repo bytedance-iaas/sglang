@@ -51,14 +51,20 @@ def _encode_rgb_tensor_to_png_base64(image: torch.Tensor, save_path: str | None 
 		) from e
 
 	img = Image.fromarray(array_hwc, mode="RGB")
+	target_h = 336
+	if img.height != target_h:
+		target_w = max(1, round(img.width * target_h / img.height))
+		img = img.resize((target_w, target_h), resample=Image.Resampling.BILINEAR)
 	buf = io.BytesIO()
 	img.save(buf, format="PNG")
 	if save_path is not None:
 		img.save(save_path, format="PNG")
 	return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-first_image = frames[0]
-image_b64 = _encode_rgb_tensor_to_png_base64(first_image, save_path="last_frame.png")
+images = [
+	_encode_rgb_tensor_to_png_base64(frame, save_path="last_frame.png" if i == 0 else None)
+	for i, frame in enumerate(frames)
+]
 
 # Extract trajectory history
 history_traj = {
@@ -66,8 +72,9 @@ history_traj = {
     "ego_history_rot": data["ego_history_rot"].tolist(),
 }
 
+import pdb; pdb.set_trace()
 client = OpenAI(
-	base_url="http://127.0.0.1:3838/v1",
+	base_url="http://127.0.0.1:29003/v1",
 	api_key="EMPTY",
 )
 
@@ -77,10 +84,13 @@ resp = client.chat.completions.create(
 		{
 			"role": "user",
 			"content": [
-				{
-					"type": "image_url",
-					"image_url": {"url": f"data:image/png;base64,{image_b64}"},
-				},
+				*[
+					{
+						"type": "image_url",
+						"image_url": {"url": f"data:image/png;base64,{image_b64}"},
+					}
+					for image_b64 in images
+				],
 				{"type": "text", "text": "describe this image"},
 			],
 		}
@@ -88,6 +98,5 @@ resp = client.chat.completions.create(
 	max_tokens=512,
     extra_body={"history_traj": history_traj},
 )
-
 
 print(resp.choices[0].message.content)

@@ -283,11 +283,20 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        extra_body = request.extra_body if isinstance(request.extra_body, dict) else {}
+        extra_json = request.extra_json if isinstance(request.extra_json, dict) else {}
+        history_traj = (
+            request.history_traj
+            or extra_body.get("history_traj")
+            or extra_json.get("history_traj")
+        )
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
+            history_traj=history_traj,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,

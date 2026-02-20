@@ -14,7 +14,7 @@
 # ==============================================================================
 import json
 import os
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,9 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.utils import logger
+from sglang.srt.managers.schedule_batch import (
+    MultimodalInputs,
+)
 
 
 # class AlpamayoR1Config(PretrainedConfig):
@@ -86,6 +89,12 @@ class AlpamayoR1(nn.Module):
     ):
         # Delegate forward to the VLM
         return self.vlm(input_ids, positions, forward_batch, **kwargs)
+
+    
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        ret = self.vlm.pad_input_ids(input_ids, mm_inputs)
+        pass
+        return ret
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights into the model.
