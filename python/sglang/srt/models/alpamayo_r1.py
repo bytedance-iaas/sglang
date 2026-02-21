@@ -92,9 +92,20 @@ class AlpamayoR1(nn.Module):
 
     
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        ret = self.vlm.pad_input_ids(input_ids, mm_inputs)
-        pass
-        return ret
+        # Qwen3-VL default path may collapse all same-modality tokens to one pad value
+        # when MM splitting is disabled. For Alpamayo-R1 we always use per-item offsets.
+        # if not input_ids or mm_inputs is None or not mm_inputs.mm_items:
+        #     return input_ids
+
+        # input_ids_tensor = torch.as_tensor(input_ids)
+        # for item in mm_inputs.mm_items:
+        #     if item is None or item.offsets is None:
+        #         continue
+        #     for start, end in item.offsets:
+        #         input_ids_tensor[start : end + 1] = item.pad_value
+
+        # return input_ids_tensor.tolist()
+        return self.vlm.pad_input_ids(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights into the model.

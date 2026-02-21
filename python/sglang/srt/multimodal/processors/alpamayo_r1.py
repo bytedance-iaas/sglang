@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Union
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 # from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.alpamayo_r1 import AlpamayoR1
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
 from sglang.utils import logger
 
@@ -290,7 +291,11 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             # Update result
             result["input_ids"] = fused_ids.squeeze(0).tolist()
         
-            
+        # Expand bundled multimodal items (e.g. multiple images in one item)
+        # so each image gets an independent pad_value and offset mapping.
+        # if "mm_items" in result and result["mm_items"]:
+        #     result["mm_items"] = get_new_expanded_mm_items(result["mm_items"])
+
         return result
 
     def fuse_traj_tokens(

@@ -530,6 +530,24 @@ class ModelConfig:
         )
         self.vocab_size = self.hf_text_config.vocab_size
 
+        # Alpamayo-R1 extends the tokenizer vocab beyond the base Qwen text vocab.
+        # Scheduler vocab boundary checks use ModelConfig.vocab_size, so keep it
+        # aligned with the model-level vocab_size when architectures indicate Alpamayo.
+        if "AlpamayoR1" in self.hf_config.architectures:
+            model_vocab_size = getattr(self.hf_config, "vocab_size", None)
+            if (
+                isinstance(model_vocab_size, int)
+                and model_vocab_size > 0
+                and model_vocab_size != self.vocab_size
+            ):
+                logger.warning(
+                    "Adjusting vocab_size for AlpamayoR1: text_config.vocab_size=%d, model.vocab_size=%d",
+                    self.vocab_size,
+                    model_vocab_size,
+                )
+                self.vocab_size = model_vocab_size
+                self.hf_text_config.vocab_size = model_vocab_size
+
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
 
