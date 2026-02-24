@@ -692,7 +692,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 alt_stream=alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer= make_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             get_layer,
             pp_rank=self.pp_group.rank_in_group,
