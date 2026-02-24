@@ -76,7 +76,14 @@ from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    is_cuda,
+    is_npu,
+    make_layers,
+    set_weight_attrs,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
