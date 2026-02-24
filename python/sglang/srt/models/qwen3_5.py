@@ -730,7 +730,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Pass through decoder layers
-        for layer_idx in range(len(self.layers)):
+        for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
