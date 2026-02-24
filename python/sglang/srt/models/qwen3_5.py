@@ -76,15 +76,7 @@ from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    is_cuda,
-    is_npu,
-    make_layers,
-    set_weight_attrs,
-)
-
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -774,18 +766,6 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return hidden_states
 
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        text_config = getattr(config, "text_config", config)
-        num_logical_experts = getattr(text_config, "num_experts", None)
-        if num_logical_experts is None:
-            return None
-        return ModelConfigForExpertLocation(
-            num_layers=text_config.num_hidden_layers,
-            num_logical_experts=num_logical_experts,
-            num_groups=None,
-        )
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1036,29 +1016,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-        if not hasattr(self, "_routed_experts_weights_of_layer"):
-            self._routed_experts_weights_of_layer = LazyValue(
-                lambda: {
-                    layer_id: self.layers[layer_id].mlp.get_moe_weights()
-                    for layer_id in range(len(self.layers))
-                    if isinstance(self.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
-                }
-            )
 
         return loaded_params
-
-    @property
-    def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
-    
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        text_config = getattr(config, "text_config", config)
-        return ModelConfigForExpertLocation(
-            num_layers=text_config.num_hidden_layers,
-            num_logical_experts=text_config.num_experts,
-            num_groups=None,
-        )
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -1150,18 +1109,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        text_config = getattr(config, "text_config", config)
-        num_logical_experts = getattr(text_config, "num_experts", None)
-        if num_logical_experts is None:
-            return None
-        return ModelConfigForExpertLocation(
-            num_layers=text_config.num_hidden_layers,
-            num_logical_experts=num_logical_experts,
-            num_groups=None,
-        )
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -1382,22 +1329,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-        if not hasattr(self, "_routed_experts_weights_of_layer"):
-            self._routed_experts_weights_of_layer = LazyValue(
-                lambda: {
-                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                    for layer_id in range(len(self.model.layers))
-                    if isinstance(
-                        self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock
-                    )
-                }
-            )
 
         return loaded_params
-    
-    @property
-    def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1409,9 +1342,4 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [
-    Qwen3_5MoeForCausalLM,
-    Qwen3_5ForCausalLM,
-    Qwen3_5MoeForConditionalGeneration,
-    Qwen3_5ForConditionalGeneration,
-]
+EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
