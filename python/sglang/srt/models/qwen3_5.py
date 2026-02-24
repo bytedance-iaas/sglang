@@ -703,6 +703,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
