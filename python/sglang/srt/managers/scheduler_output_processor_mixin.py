@@ -483,6 +483,7 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
+                logger.info("[decode-step] rid=%s token_id=%s", req.rid, next_token_id)
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
@@ -550,6 +551,8 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+
+
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

@@ -21,6 +21,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig
 
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -40,6 +41,29 @@ from sglang.srt.managers.schedule_batch import (
 #         self.vlm_name_or_path = "Qwen/Qwen3-VL-8B-Instruct"
 #         self.vlm_backend = "qwenvl3"
 #         self.vocab_size = kwargs.get("vocab_size", 155697)  # Default vocab size for AlpamayoR1
+
+
+class AlpamayoR1LogitsProcessor(LogitsProcessor):
+    """Masks out Alpamayo trajectory token logits."""
+
+    def __init__(self, config, traj_token_start_idx, traj_vocab_size):
+        super().__init__(config)
+        self.traj_mask_start = traj_token_start_idx
+        self.traj_mask_end = traj_token_start_idx + traj_vocab_size
+            
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head,
+        logits_metadata,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        logits = super()._get_logits(
+            hidden_states, lm_head, logits_metadata, embedding_bias
+        )
+        logits[:, self.traj_mask_start : self.traj_mask_end] = float("-inf")
+        return logits
+    
 
 class AlpamayoR1(nn.Module):
     """
@@ -71,6 +95,11 @@ class AlpamayoR1(nn.Module):
             qwen_config, 
             quant_config=quant_config, 
         )
+    
+        # override the logits processor to mask out trajectory tokens during generation
+        self.vlm.logits_processor = AlpamayoR1LogitsProcessor(self.config, 
+                                                                traj_token_start_idx=config.traj_token_start_idx, 
+                                                                traj_vocab_size=config.traj_vocab_size)
 
         logger.info(f"AlpamayoR1: Successfully initialized Qwen3-VL as self.vlm")
 
