@@ -345,6 +345,12 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
 
+    # AsymGemm
+    SGLANG_ENABLE_JIT_ASYMGEMM = EnvBool(True)
+    SGLANG_JIT_ASYMGEMM_PRECOMPILE = EnvBool(True)
+    SGLANG_JIT_ASYMGEMM_FAST_WARMUP = EnvBool(False)
+    SGLANG_IN_ASYMGEMM_PRECOMPILE_STAGE = EnvBool(False)
+
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 

@@ -326,6 +326,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_deep_gemm():
             backend = MoeRunnerBackend.DEEP_GEMM
+        elif moe_runner_backend.is_asym_gemm():
+            backend = MoeRunnerBackend.ASYM_GEMM
         else:
             backend = (
                 MoeRunnerBackend.TRITON_KERNELS
@@ -368,6 +370,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
 
             quant_info = DeepGemmBf16MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif backend.is_asym_gemm():
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
+                AsymGemmBf16MoeQuantInfo,
+            )
+
+            quant_info = AsymGemmBf16MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
             )

@@ -66,6 +66,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    ASYM_GEMM = "asym_gemm"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -96,6 +97,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_asym_gemm(self):
+        return self == MoeRunnerBackend.ASYM_GEMM
 
 
 class DeepEPMode(Enum):

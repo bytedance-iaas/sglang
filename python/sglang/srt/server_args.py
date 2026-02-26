@@ -176,6 +176,7 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
+    "asym_gemm",
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
