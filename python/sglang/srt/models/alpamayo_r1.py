@@ -14,7 +14,7 @@
 # ==============================================================================
 import json
 import os
-from typing import Iterable, Optional, Tuple, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,9 +26,7 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.utils import logger
-from sglang.srt.managers.schedule_batch import (
-    MultimodalInputs,
-)
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 
 
 # class AlpamayoR1Config(PretrainedConfig):
@@ -108,7 +106,10 @@ class AlpamayoR1(nn.Module):
         self.action_space = None
         self.action_in_proj = None
         self.action_out_proj = None
+        self.traj_future_start_token_id = 155681 # <|traj_future_start|>
+        self.traj_force_stop_token_id = 151645 #<|im_end|>
         # convert action-related parameters
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -116,24 +117,21 @@ class AlpamayoR1(nn.Module):
         forward_batch: "ForwardBatch",
         **kwargs,
     ):
-        # Delegate forward to the VLM
-        return self.vlm(input_ids, positions, forward_batch, **kwargs)
+        ret = self.vlm(input_ids, positions, forward_batch, **kwargs)
+
+        if forward_batch.forward_mode.is_decode():
+            bstar = int(input_ids.shape[0]) # number of batch items
+            for i in range(bstar):
+                if input_ids[i] == self.traj_future_start_token_id:
+                    # stop generation immediately
+                    ret.next_token_logits[i, :] = float("-inf")
+                    ret.next_token_logits[i, self.traj_force_stop_token_id] = 0.0
+                    # self._run_flow_matching()
+
+        return ret
 
     
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Qwen3-VL default path may collapse all same-modality tokens to one pad value
-        # when MM splitting is disabled. For Alpamayo-R1 we always use per-item offsets.
-        # if not input_ids or mm_inputs is None or not mm_inputs.mm_items:
-        #     return input_ids
-
-        # input_ids_tensor = torch.as_tensor(input_ids)
-        # for item in mm_inputs.mm_items:
-        #     if item is None or item.offsets is None:
-        #         continue
-        #     for start, end in item.offsets:
-        #         input_ids_tensor[start : end + 1] = item.pad_value
-
-        # return input_ids_tensor.tolist()
         return self.vlm.pad_input_ids(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
