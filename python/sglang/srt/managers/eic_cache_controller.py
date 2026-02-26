@@ -474,12 +474,12 @@ class EICCacheController(HiCacheController):
             return []
         exist_result = self.mem_pool_host.batch_exist_page(content_hashes)
         for i in range(len(prompts)):
-            eic_prefix_len.append(
-                exist_result[prompt_key_offset[i] : prompt_key_offset[i + 1]].count(
-                    True
-                )
-                * self.page_size
-            )
+            count = 0
+            for res in exist_result[prompt_key_offset[i] : prompt_key_offset[i + 1]]:
+                if not res:
+                    break
+                count += 1
+            eic_prefix_len.append(count * self.page_size)
 
         return eic_prefix_len
 
@@ -489,7 +489,6 @@ class EICCacheController(HiCacheController):
         priority: Optional[int] = None,
         node_id: int = 0,
         content_hash: List[int] = None,
-        data_copy: bool = False,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
@@ -498,8 +497,6 @@ class EICCacheController(HiCacheController):
         cache_operation = EICCacheOperation(
             host_indices, device_indices, node_id, content_hash, priority
         )
-        if data_copy:
-            cache_operation.data = self.mem_pool_device.get_flat_data(device_indices)
         self.write_queue.put(cache_operation)
         return host_indices
 
