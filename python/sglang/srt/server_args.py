@@ -199,6 +199,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "asym_gemm",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
