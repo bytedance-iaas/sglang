@@ -311,7 +311,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not is_dp_attention_enabled(),
+                enable_tp=not (is_dp_attention_enabled() or get_global_server_args().mm_enable_dp_encoder),
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
@@ -1201,6 +1201,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
+        #[TODO]kousaka: replace cat with fixed_buffer copy to avoid buffer copy in vit-cudagraph
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
