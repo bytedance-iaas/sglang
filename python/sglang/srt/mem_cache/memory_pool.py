@@ -1241,8 +1241,8 @@ class HybridLinearKVPool(KVCache):
         self.total_mamba_layer_ids = total_mamba_layer_ids
         self.mamba_layer_ids = mamba_layer_ids
         self.page_size = page_size
-        # TODO support pp?
-        self.start_layer = 0
+        self.start_layer = start_layer
+        self.end_layer = end_layer
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
