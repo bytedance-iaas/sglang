@@ -645,7 +645,7 @@ class ModelRunnerKVCacheMixin:
                         else [
                             i
                             for i, layer_id in enumerate(total_mamba_layer_ids)
-                            if self.start_layer <= i < self.end_layer
+                            if self.start_layer <= layer_id < self.end_layer
                         ]
                     ),
                     enable_kvcache_transpose=False,
