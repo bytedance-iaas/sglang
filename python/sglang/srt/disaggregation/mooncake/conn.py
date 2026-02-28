@@ -882,6 +882,7 @@ class MooncakeKVManager(CommonKVManager):
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
+                                target_rank_registration_info.dst_non_draft_kv_data_lens,
                                 chunked_dst_kv_indice,
                                 executor,
                             )
@@ -890,6 +891,7 @@ class MooncakeKVManager(CommonKVManager):
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
+                                target_rank_registration_info.dst_non_draft_kv_data_lens,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
                                 target_rank_registration_info.dst_attn_tp_size,
