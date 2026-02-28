@@ -1233,6 +1233,8 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        start_layer: int = None,
+        end_layer: int = None,
     ):
         self.size = size
         self.dtype = dtype
