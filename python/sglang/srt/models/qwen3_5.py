@@ -712,7 +712,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
-            self.norm = PPMissingLayer()
+            self.norm = PPMissingLayer(return_tuple=True)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -810,6 +810,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -938,6 +942,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1105,6 +1113,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
             ):
                 continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1254,6 +1266,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and hasattr(self.model, "start_layer")
                 and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
             ):
+                continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
