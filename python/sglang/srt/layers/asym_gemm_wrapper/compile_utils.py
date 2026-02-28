@@ -280,13 +280,28 @@ class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
         self.rhs = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        # Pre-allocate buffers for offsets/experts conversion
+        self.offsets = torch.empty((max_m + 1,), device="cuda", dtype=torch.int32)
+        self.experts = torch.empty((max_m + 1,), device="cuda", dtype=torch.int32)
+
+    def _convert_m_indices(self, m: int):
+        """Convert m_indices to offsets/experts format matching C++ build_offsets_experts_from_indices."""
+        # Use simple conversion: each token with different expert ID starts a new segment
+        # For warmup, we use a simple pattern where all tokens belong to expert 0
+        self.m_indices[:m].fill_(0)
+        self.offsets[:2].copy_(torch.tensor([0, m], device="cuda", dtype=torch.int32))
+        self.experts[:2].copy_(torch.tensor([0, -1], device="cuda", dtype=torch.int32))
+        return 2  # list_size
 
     def execute(self, m):
+        list_size = self._convert_m_indices(m)
         asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
             self.lhs[:m],
             self.rhs,
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.offsets[:list_size],
+            self.experts[:list_size],
+            list_size,
         )
 
 
