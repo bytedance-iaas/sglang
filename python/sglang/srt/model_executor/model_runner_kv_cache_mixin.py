@@ -618,6 +618,7 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                total_mamba_layer_ids = list(config.mamba2_cache_params.layers)
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -633,6 +634,16 @@ class ModelRunnerKVCacheMixin:
                         else [
                             i
                             for i in config.full_attention_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ]
+                    ),
+                    total_mamba_layer_ids=total_mamba_layer_ids,
+                    mamba_layer_ids=(
+                        []
+                        if self.is_draft_worker
+                        else [
+                            i
+                            for i, layer_id in enumerate(total_mamba_layer_ids)
                             if self.start_layer <= i < self.end_layer
                         ]
                     ),
