@@ -744,6 +744,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                 )
+            if (
+                forward_batch.layer_ready_callback is not None
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not forward_batch.can_run_tbo
+            ):
+                forward_batch.layer_ready_callback(layer_idx)
 
             # Process deepstack embeddings if provided
             if (
