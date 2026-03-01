@@ -54,6 +54,9 @@ from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
+from sglang.srt.disaggregation.mooncake.async_kv_manager import (
+    get_layer_ready_callback,
+)
 from sglang.srt.distributed import (
     get_default_distributed_backend,
     get_pp_group,
@@ -2093,6 +2096,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+        forward_batch.layer_ready_callback = get_layer_ready_callback()
 
         if lora_ids is not None:
             self.lora_manager.prepare_lora_batch(forward_batch)
