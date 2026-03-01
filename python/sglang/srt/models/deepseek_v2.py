@@ -1966,6 +1966,12 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+                if (
+                    forward_batch.layer_ready_callback is not None
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                    and not forward_batch.can_run_tbo
+                ):
+                    forward_batch.layer_ready_callback(i - self.start_layer)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
