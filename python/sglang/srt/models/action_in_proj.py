@@ -163,4 +163,5 @@ class PerWaypointActionInProjV2(torch.nn.Module):
         timestep_feats = self.timestep_fourier_encoder(timesteps[..., -1])
         timestep_feats = timestep_feats.repeat(1, T, 1)
         x = torch.cat((action_feats, timestep_feats), dim=-1)
+        x = x.to(dtype=next(self.encoder.parameters()).dtype)
         return self.norm(self.encoder(x.flatten(0, 1)).reshape(B, T, -1))

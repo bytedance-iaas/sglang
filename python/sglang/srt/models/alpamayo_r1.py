@@ -135,6 +135,7 @@ class AlpamayoR1(nn.Module):
             num_fourier_feats=action_in_proj_cfg["num_fourier_feats"],
         )
         self.action_out_proj = torch.nn.Linear(expert_config.hidden_size, action_dim)
+
         self.traj_future_start_token_id = 155681 # <|traj_future_start|>
         self.traj_force_stop_token_id = 151645 #<|im_end|>
 
@@ -180,6 +181,7 @@ class AlpamayoR1(nn.Module):
                 logger.info(
                     f"Flow matching completed for {len(active_indices)} requests, "
                     f"sampled_actions shape: {sampled_actions.shape}"
+                    f"data: {sampled_actions[0,:5]}"
                 )
 
         return ret
@@ -310,9 +312,10 @@ class AlpamayoR1(nn.Module):
         forward_batch.attn_backend.init_forward_metadata(expert_batch)
 
         # --- 3. Euler integration loop ---
-        expert_dtype = next(self.expert.parameters()).dtype
+        # Match reference FlowMatching._euler: x is fp32 (default dtype)
+        # so Euler accumulation x = x + dt * v stays in fp32 throughout.
         x = torch.randn(
-            bstar, *self.action_dims, device=device, dtype=expert_dtype
+            bstar, *self.action_dims, device=device
         )
         time_steps = torch.linspace(
             0.0, 1.0, self.num_inference_steps + 1, device=device

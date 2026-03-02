@@ -1,2 +1,3 @@
+SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0 \
 CUDA_VISIBLE_DEVICES=7 \
 python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B --port 29003 --tp 1 --disable-cuda-graph --disable-overlap-schedule --enable-deterministic-inference --attention-backend flashinfer
