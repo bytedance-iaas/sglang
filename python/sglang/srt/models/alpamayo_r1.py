@@ -15,18 +15,20 @@
 import copy
 from typing import Iterable, List, Optional, Tuple
 
+import einops
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.utils import logger
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from .action_in_proj import PerWaypointActionInProjV2
 
@@ -135,7 +137,20 @@ class AlpamayoR1(nn.Module):
         self.action_out_proj = torch.nn.Linear(expert_config.hidden_size, action_dim)
         self.traj_future_start_token_id = 155681 # <|traj_future_start|>
         self.traj_force_stop_token_id = 151645 #<|im_end|>
-        # convert action-related parameters
+
+        # Set expert attention layers to ENCODER_ONLY:
+        #   - Bidirectional (non-causal) attention among action tokens
+        #   - Reads VLM's KV cache via shared layer_ids (both 0..N-1)
+        #   - Does NOT write to KV cache (FlashInfer auto-skips set_kv_buffer for ENCODER_ONLY)
+        for layer in self.expert.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
+                layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
+
+        # Flow matching parameters
+        self.n_diffusion_tokens = n_waypoints
+        self.action_dims = [n_waypoints, action_dim]
+        diffusion_cfg = getattr(config, "diffusion_cfg", {}) or {}
+        self.num_inference_steps = diffusion_cfg.get("num_inference_steps", 10)
 
     def forward(
         self,
@@ -147,17 +162,207 @@ class AlpamayoR1(nn.Module):
         ret = self.vlm(input_ids, positions, forward_batch, **kwargs)
 
         if forward_batch.forward_mode.is_decode():
-            bstar = int(input_ids.shape[0]) # batch size
+            bstar = int(input_ids.shape[0])
+            active_indices = []
             for i in range(bstar):
                 if input_ids[i] == self.traj_future_start_token_id:
-                    # stop generation immediately
+                    # Force generation to stop immediately
                     ret.next_token_logits[i, :] = float("-inf")
                     ret.next_token_logits[i, self.traj_force_stop_token_id] = 0.0
-                    # self._run_flow_matching()
-                    delta  = forward_batch.mm_inputs[i].mrope_positions
-                    # postions
+                    active_indices.append(i)
+
+            if active_indices:
+                sampled_actions = self._run_flow_matching(
+                    active_indices, forward_batch
+                )
+                # TODO: convert sampled_actions to trajectories via action_space
+                # and attach to the response (e.g., via forward_batch or a side channel)
+                logger.info(
+                    f"Flow matching completed for {len(active_indices)} requests, "
+                    f"sampled_actions shape: {sampled_actions.shape}"
+                )
 
         return ret
+
+    def _build_expert_forward_batch(
+        self,
+        active_indices: List[int],
+        forward_batch: ForwardBatch,
+        mrope_positions: torch.Tensor,
+    ) -> ForwardBatch:
+        """Build an EXTEND-mode ForwardBatch for the expert model.
+
+        The expert reads the VLM's KV cache (shared layer_ids) and processes
+        n_diffusion_tokens new action embeddings per request, using bidirectional
+        attention (ENCODER_ONLY) without writing to KV cache.
+
+        Args:
+            active_indices: Indices of requests that need flow matching.
+            forward_batch: The original decode-mode ForwardBatch from VLM.
+            mrope_positions: Multimodal RoPE positions for action tokens,
+                shape (3, bstar * n_diff).
+
+        Returns:
+            A ForwardBatch configured for EXTEND mode with the expert.
+        """
+        device = forward_batch.seq_lens.device
+        bstar = len(active_indices)
+        n_diff = self.n_diffusion_tokens
+        idx_tensor = torch.tensor(active_indices, device=device, dtype=torch.long)
+
+        # VLM's current seq_lens for active requests (tokens already in KV cache)
+        vlm_seq_lens = forward_batch.seq_lens[idx_tensor]
+
+        # Expert sees: prefix (VLM cached) + new action tokens
+        expert_seq_lens = vlm_seq_lens + n_diff
+        extend_seq_lens = torch.full((bstar,), n_diff, dtype=torch.int32, device=device)
+        extend_prefix_lens = vlm_seq_lens.to(torch.int32)
+
+        # Cumulative start locations for the new tokens (each request contributes n_diff)
+        extend_start_loc = torch.arange(
+            0, bstar * n_diff, n_diff, dtype=torch.int32, device=device
+        )
+
+        # Dummy out_cache_loc — ENCODER_ONLY skips KV cache writes,
+        # but the tensor must exist with the correct shape.
+        out_cache_loc = torch.zeros(
+            bstar * n_diff, dtype=torch.int32, device=device
+        )
+
+        expert_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=bstar,
+            input_ids=torch.zeros(bstar * n_diff, dtype=torch.long, device=device),
+            req_pool_indices=forward_batch.req_pool_indices[idx_tensor],
+            seq_lens=expert_seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(expert_seq_lens.sum()),
+            extend_num_tokens=bstar * n_diff,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_seq_lens_cpu=extend_seq_lens.cpu().tolist(),
+            extend_prefix_lens_cpu=extend_prefix_lens.cpu().tolist(),
+            seq_lens_cpu=expert_seq_lens.cpu(),
+            # Share the VLM's KV cache pool and attention backend
+            req_to_token_pool=forward_batch.req_to_token_pool,
+            token_to_kv_pool=forward_batch.token_to_kv_pool,
+            attn_backend=forward_batch.attn_backend,
+            # Multimodal RoPE positions for the action tokens
+            mrope_positions=mrope_positions,
+        )
+        return expert_batch
+
+    @torch.no_grad()
+    def _run_flow_matching(
+        self,
+        active_indices: List[int],
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run flow matching (Euler integration) for requests that generated
+        <traj_future_start>.
+
+        This implements the same logic as the original alpamayo step_fn:
+        1. Sample Gaussian noise x ~ N(0, I) in action space
+        2. For each Euler step t_i -> t_{i+1}:
+            a. action_in_proj(x, t) -> token embeddings [bstar, n_diff, hidden]
+            b. expert forward (bidirectional, reads VLM KV cache) -> hidden states
+            c. action_out_proj -> predicted velocity field v
+            d. x = x + dt * v
+        3. Return final x as the sampled action
+
+        Args:
+            active_indices: Indices of requests needing flow matching.
+            forward_batch: The decode-mode ForwardBatch.
+
+        Returns:
+            Sampled actions of shape (bstar, n_waypoints, action_dim).
+        """
+        device = forward_batch.seq_lens.device
+        bstar = len(active_indices)
+        n_diff = self.n_diffusion_tokens
+
+        # --- 1. Compute mRoPE positions for the action tokens ---
+        # During decode, mrope_positions has shape (3, total_batch_size)
+        # For each active request, action tokens get positions starting after
+        # the current decode position (which is <traj_future_start>).
+        positions_list = []
+        for idx in active_indices:
+            # Current mrope position of the <traj_future_start> token: shape (3,)
+            current_mrope = forward_batch.mrope_positions[:, idx]  # (3,)
+            # Action tokens: pos+1, pos+2, ..., pos+n_diff
+            action_pos = (
+                current_mrope.unsqueeze(1)
+                + 1
+                + torch.arange(n_diff, device=device).unsqueeze(0)
+            )  # (3, n_diff)
+            positions_list.append(action_pos)
+        mrope_positions = torch.cat(positions_list, dim=1)  # (3, bstar * n_diff)
+
+        # --- 2. Build the expert ForwardBatch (EXTEND mode) ---
+        expert_batch = self._build_expert_forward_batch(
+            active_indices, forward_batch, mrope_positions
+        )
+
+        # Initialize attention metadata (FlashInfer wrapper plans / Triton metadata)
+        # This is safe because the VLM's decode is already finished;
+        # the runtime will re-init metadata for the next batch.
+        forward_batch.attn_backend.init_forward_metadata(expert_batch)
+
+        # --- 3. Euler integration loop ---
+        expert_dtype = next(self.expert.parameters()).dtype
+        x = torch.randn(
+            bstar, *self.action_dims, device=device, dtype=expert_dtype
+        )
+        time_steps = torch.linspace(
+            0.0, 1.0, self.num_inference_steps + 1, device=device
+        )
+
+        for step_i in range(self.num_inference_steps):
+            dt = time_steps[step_i + 1] - time_steps[step_i]
+            t = time_steps[step_i].view(1, 1, 1).expand(bstar, 1, 1)
+
+            # --- step_fn start ---
+            # a. Project noisy action + timestep -> expert token embeddings
+            #    x: (bstar, n_waypoints, action_dim)
+            #    t: (bstar, 1, 1)
+            #    output: (bstar, n_diff, hidden_size)
+            future_token_embeds = self.action_in_proj(x, t)
+            if future_token_embeds.dim() == 2:
+                future_token_embeds = future_token_embeds.view(
+                    bstar, n_diff, -1
+                )
+
+            # b. Flatten for sglang's model forward: (bstar * n_diff, hidden_size)
+            input_embeds_flat = future_token_embeds.reshape(
+                bstar * n_diff, -1
+            )
+
+            # c. Run expert: bidirectional attention over action tokens,
+            #    attending to VLM's cached prefix KV via shared layer_ids.
+            #    ENCODER_ONLY ensures:
+            #      - Ragged attn: action tokens attend bidirectionally to each other
+            #      - Paged attn:  action tokens attend to VLM's cached KV
+            #      - No KV is written to the cache pool
+            expert_hidden = self.expert(
+                input_ids=None,
+                positions=mrope_positions,
+                forward_batch=expert_batch,
+                input_embeds=input_embeds_flat,
+            )  # (bstar * n_diff, hidden_size)
+
+            # d. Project to action space
+            expert_hidden = expert_hidden.view(
+                bstar, n_diff, -1
+            )  # (bstar, n_diff, hidden_size)
+            pred = self.action_out_proj(expert_hidden)  # (bstar, n_diff, action_dim)
+            pred = pred.view(bstar, *self.action_dims)
+            # --- step_fn end ---
+
+            # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
+            x = x + dt * pred
+
+        return x  # (bstar, n_waypoints, action_dim)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.vlm.pad_input_ids(input_ids, mm_inputs)
