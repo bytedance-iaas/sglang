@@ -14,7 +14,7 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-from python.sglang.srt.utils.common import get_zmq_socket
+from sglang.srt.utils.common import get_zmq_socket
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
