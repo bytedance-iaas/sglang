@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 clip_ids = pd.read_parquet("clip_ids.parquet")["clip_id"].tolist()
 clip_id = clip_ids[1]
 # 774 clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
+# 5 clip_id = "74d763f1-9c47-416e-a840-a3e4bd8cc6a7"
 pkl_filename = f"{clip_id}_data.pkl"
 if not os.path.exists(pkl_filename):
 	from load_physical_aiavdataset import load_physical_aiavdataset

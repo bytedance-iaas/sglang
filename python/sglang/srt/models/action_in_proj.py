@@ -164,5 +164,7 @@ class PerWaypointActionInProjV2(torch.nn.Module):
         timestep_feats = timestep_feats.repeat(1, T, 1)
         x = torch.cat((action_feats, timestep_feats), dim=-1)
         
-        x = x.to(dtype=torch.bfloat16)
+        # Cast to match encoder weight dtype (e.g. bfloat16) —
+        # the original code relies on torch.autocast for this.
+        x = x.to(dtype=self.encoder.trunk[0].weight.dtype)
         return self.norm(self.encoder(x.flatten(0, 1)).reshape(B, T, -1))

@@ -264,13 +264,13 @@ class AlpamayoR1(nn.Module):
 
                 if should_trigger_flow_matching:
                     # Avoid recomputing if already attached once for this request.
-                    if (
-                        reqs is not None
-                        and i < len(reqs)
-                        and getattr(reqs[i], "customized_info", None) is not None
-                        and "traj_xyz" in reqs[i].customized_info
-                    ):
-                        continue
+                    # if (
+                    #     reqs is not None
+                    #     and i < len(reqs)
+                    #     and getattr(reqs[i], "customized_info", None) is not None
+                    #     and "traj_xyz" in reqs[i].customized_info
+                    # ):
+                    #     continue
 
                     # Force generation to stop immediately
                     ret.next_token_logits[i, :] = float("-inf")
@@ -322,16 +322,17 @@ class AlpamayoR1(nn.Module):
                 )
                 continue
 
-            # Convert to tensor if needed and move to GPU
+            # Convert to tensor if needed and move to GPU.
+            # Use float32 to match action_space precision (not bfloat16).
             if not isinstance(hist_xyz_raw, torch.Tensor):
-                hist_xyz = torch.tensor(hist_xyz_raw, dtype=sampled_actions.dtype, device=device)
+                hist_xyz = torch.tensor(hist_xyz_raw, dtype=torch.float32, device=device)
             else:
-                hist_xyz = hist_xyz_raw.to(dtype=sampled_actions.dtype, device=device)
+                hist_xyz = hist_xyz_raw.to(dtype=torch.float32, device=device)
 
             if not isinstance(hist_rot_raw, torch.Tensor):
-                hist_rot = torch.tensor(hist_rot_raw, dtype=sampled_actions.dtype, device=device)
+                hist_rot = torch.tensor(hist_rot_raw, dtype=torch.float32, device=device)
             else:
-                hist_rot = hist_rot_raw.to(dtype=sampled_actions.dtype, device=device)
+                hist_rot = hist_rot_raw.to(dtype=torch.float32, device=device)
 
             # Ensure shape: (T, 3) and (T, 3, 3) – add batch dim for action_to_traj
             if hist_xyz.dim() == 2:     # (T, 3)
@@ -340,7 +341,7 @@ class AlpamayoR1(nn.Module):
                 hist_rot = hist_rot.unsqueeze(0)   # (1, T, 3, 3)
 
             # sampled_actions[j]: (n_waypoints, action_dim) → unsqueeze batch
-            action_j = sampled_actions[j].unsqueeze(0).to(dtype=sampled_actions.dtype)  # (1, n_waypoints, 2)
+            action_j = sampled_actions[j].unsqueeze(0).float()  # (1, n_waypoints, 2)
 
             with torch.no_grad():
                 pred_xyz, pred_rot = self.action_space.action_to_traj(
@@ -617,6 +618,28 @@ class AlpamayoR1(nn.Module):
             if self._fm_should_log_step(step_i):
                 self._fm_tensor_fingerprint(f"step{step_i}.x_out", x)
 
+        # ---- Diagnostic: raw sampled actions (ALWAYS logged) ----
+        with torch.no_grad():
+            accel_ch = x[..., 0]  # (bstar, n_waypoints)
+            kappa_ch = x[..., 1]  # (bstar, n_waypoints)
+            logger.info(
+                "FM_DIAG sampled_action: accel  mean=%.6f std=%.6f min=%.6f max=%.6f",
+                accel_ch.mean().item(), accel_ch.std().item(),
+                accel_ch.min().item(), accel_ch.max().item(),
+            )
+            logger.info(
+                "FM_DIAG sampled_action: kappa  mean=%.6f std=%.6f min=%.6f max=%.6f",
+                kappa_ch.mean().item(), kappa_ch.std().item(),
+                kappa_ch.min().item(), kappa_ch.max().item(),
+            )
+            logger.info(
+                "FM_DIAG action_space buffers: accel_mean=%.8f accel_std=%.8f "
+                "curvature_mean=%.8f curvature_std=%.8f",
+                self.action_space.accel_mean.item(),
+                self.action_space.accel_std.item(),
+                self.action_space.curvature_mean.item(),
+                self.action_space.curvature_std.item(),
+            )
         return x  # (bstar, n_waypoints, action_dim)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -830,6 +853,11 @@ class AlpamayoR1(nn.Module):
         )
 
         # 3) Load action space buffers (accel_mean, accel_std, etc.).
+        # IMPORTANT: convert action_space to float32 BEFORE loading weights,
+        # so that the float32 checkpoint values are not truncated to bfloat16.
+        # The original alpamayo code keeps action_space in float32 (keep_same_dtype
+        # only applies to diffusion, action_in_proj, action_out_proj).
+        self.action_space = self.action_space.float()
         if action_space_weights:
             self._load_plain_module_weights(
                 self.action_space,
