@@ -14,7 +14,12 @@ from sglang.srt.managers.eic_cache_controller import (
     get_content_hash,
 )
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.eic_memory_pool import (
     EICMHATokenToKVPoolHost,
@@ -413,8 +418,9 @@ class EICHiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int, evict_callback=None, retry_times: int = 3):
+    def evict(self, params: EvictParams, retry_times: int = 3) -> EvictResult:
         start_time = time.perf_counter()
+        num_tokens = params.num_tokens
         while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
             self.writing_check()
             self.loading_check()
@@ -423,8 +429,11 @@ class EICHiRadixCache(RadixCache):
         num_evicted = 0
         while retry_times > 0:
             retry_times -= 1
-            leaves = self._collect_leaves_device()
-            heapq.heapify(leaves)
+            leaves = list(self.evictable_leaves)
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node) for node in leaves
+            ]
+            heapq.heapify(eviction_heap)
 
             write_back_nodes = []
             idx = 0
@@ -432,9 +441,11 @@ class EICHiRadixCache(RadixCache):
             logger.debug(
                 f"evict {num_tokens} tokens, current evictable size {self.evictable_size_}, protect_size {self.protected_size_}, leaves {len(leaves)}"
             )
-            while num_evicted < num_tokens and len(leaves):
-                x = heapq.heappop(leaves)
-                logger.debug(f"evicting {idx} node {x.id}, access {x.last_access_time}")
+            while num_evicted < num_tokens and len(eviction_heap):
+                _priority, x = heapq.heappop(eviction_heap)
+                logger.debug(
+                    f"evicting {idx} node {x.id}, access {x.last_access_time}, value {x.value} {x.host_value}"
+                )
                 idx += 1
 
                 if x.lock_ref > 0:
@@ -458,7 +469,8 @@ class EICHiRadixCache(RadixCache):
                         break
                 else:
                     # all children are evicted or no children
-                    heapq.heappush(leaves, x.parent)
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             if self.cache_controller.write_policy == "write_back":
                 # blocking till all write back complete
@@ -473,8 +485,7 @@ class EICHiRadixCache(RadixCache):
                 logger.info(
                     f"only evicted {num_evicted} tokens, less than requested {num_tokens}"
                 )
-            else:
-                return
+            return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
         if node.host_value is None:
@@ -548,7 +559,7 @@ class EICHiRadixCache(RadixCache):
             host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
-            self.evict(len(host_indices))
+            self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
@@ -718,10 +729,12 @@ class EICHiRadixCache(RadixCache):
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len]
+                    node.value = value[:prefix_len].clone()
                     if not isinstance(self, EICPagedHiRadixCache):
                         self.token_to_kv_pool_host.free(node.host_value)
                     self.evictable_size_ += len(node.value)
+                    self._update_leaf_status(node)
+                    self._update_leaf_status(node.parent)
                     self.inc_hit_count(node)
                 else:
                     self.inc_hit_count(node)
@@ -731,10 +744,12 @@ class EICHiRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
-                    new_node.value = value[:prefix_len]
+                    new_node.value = value[:prefix_len].clone()
                     if not isinstance(self, EICPagedHiRadixCache):
                         self.token_to_kv_pool_host.free(new_node.host_value)
                     self.evictable_size_ += len(new_node.value)
+                    self._update_leaf_status(new_node)
+                    self._update_leaf_status(new_node.parent)
                     self.inc_hit_count(new_node)
                 else:
                     self.inc_hit_count(new_node)
@@ -751,9 +766,11 @@ class EICHiRadixCache(RadixCache):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
-            new_node.value = value
+            new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
 
             if self.cache_controller.write_policy != "write_back":
                 self.inc_hit_count(new_node)
@@ -1191,7 +1208,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             content_hash=host_content_hash,
         )
         if device_indices is None:
-            self.evict(len(host_indices))
+            self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load_page(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
