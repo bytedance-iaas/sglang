@@ -483,7 +483,7 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                logger.info("[decode-step] rid=%s token_id=%s", req.rid, next_token_id)
+                # logger.info("[decode-step] rid=%s token_id=%s", req.rid, next_token_id)
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.

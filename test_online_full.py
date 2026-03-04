@@ -138,8 +138,8 @@ resp = client.chat.completions.create(
 	messages=messages,
 	max_tokens=32,
     extra_body={"history_traj": history_traj, "continue_final_message": True},
-	temperature=0.6,
-	top_p=0.98,
+	temperature=0,
+	top_p=1,
 )
 
 print(resp.choices[0].message.content)

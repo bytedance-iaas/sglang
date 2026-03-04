@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 import copy
+import os
+from collections import defaultdict
 from typing import Iterable, List, Optional, Tuple
 
 import einops
@@ -153,6 +155,69 @@ class AlpamayoR1(nn.Module):
         diffusion_cfg = getattr(config, "diffusion_cfg", {}) or {}
         self.num_inference_steps = diffusion_cfg.get("num_inference_steps", 10)
 
+        # Flow matching debug switches.
+        # Can be enabled by config.flow_matching_debug=True or env var:
+        #   SGLANG_ALPAMAYO_FM_DEBUG=1
+        self.flow_matching_debug = bool(
+            getattr(config, "flow_matching_debug", False)
+            or os.getenv("SGLANG_ALPAMAYO_FM_DEBUG", "0") == "1"
+        )
+        # Max number of Euler steps to log in detail (+ always logs the last step).
+        self.flow_matching_debug_max_steps = int(
+            os.getenv("SGLANG_ALPAMAYO_FM_DEBUG_MAX_STEPS", "3")
+        )
+        # Debug option: do not read VLM KV cache in expert flow-matching branch.
+        # This is useful to isolate whether run-to-run drift comes from VLM KV states.
+        self.flow_matching_disable_vlm_kv = (
+            os.getenv("SGLANG_ALPAMAYO_FM_DISABLE_VLM_KV", "0") == "1"
+        )
+
+    def _fm_should_log_step(self, step_i: int) -> bool:
+        if not self.flow_matching_debug:
+            return False
+        return (
+            step_i < self.flow_matching_debug_max_steps
+            or step_i == self.num_inference_steps - 1
+        )
+
+    def _fm_tensor_fingerprint(self, tag: str, tensor: torch.Tensor, sample_size: int = 4096):
+        """Print compact numeric fingerprint for drift debugging."""
+        if not self.flow_matching_debug:
+            return
+
+        with torch.no_grad():
+            x = tensor.detach().float().reshape(-1)
+            if x.numel() == 0:
+                logger.info(
+                    f"FM_DEBUG {tag}: empty shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                )
+                return
+
+            n = min(sample_size, x.numel())
+            s = x[:n]
+            idx = torch.arange(1, n + 1, device=s.device, dtype=s.dtype)
+
+            mean = s.mean().item()
+            std = s.std(unbiased=False).item()
+            min_v = s.min().item()
+            max_v = s.max().item()
+            l2 = torch.linalg.vector_norm(s).item()
+            checksum = (s * idx).sum().item()
+
+        logger.info(
+            "FM_DEBUG %s: shape=%s dtype=%s n=%d mean=%.8f std=%.8f min=%.8f max=%.8f l2=%.8f checksum=%.8f",
+            tag,
+            tuple(tensor.shape),
+            tensor.dtype,
+            n,
+            mean,
+            std,
+            min_v,
+            max_v,
+            l2,
+            checksum,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -165,6 +230,15 @@ class AlpamayoR1(nn.Module):
         if forward_batch.forward_mode.is_decode():
             bstar = int(input_ids.shape[0])
             active_indices = []
+            if self.flow_matching_debug:
+                # Log every decoded token ID to detect VLM non-determinism across runs.
+                # If the same request produces different token IDs between runs,
+                # that is the root cause of expert_hidden_flat divergence.
+                logger.info(
+                    "FM_DEBUG decode_token: input_ids=%s seq_lens=%s",
+                    input_ids.tolist(),
+                    forward_batch.seq_lens.tolist(),
+                )
             for i in range(bstar):
                 if input_ids[i] == self.traj_future_start_token_id:
                     # Force generation to stop immediately
@@ -180,8 +254,7 @@ class AlpamayoR1(nn.Module):
                 # and attach to the response (e.g., via forward_batch or a side channel)
                 logger.info(
                     f"Flow matching completed for {len(active_indices)} requests, "
-                    f"sampled_actions shape: {sampled_actions.shape}"
-                    f"data: {sampled_actions[0,:5]}"
+                    f"data: \n{sampled_actions[0,:5]}"
                 )
 
         return ret
@@ -216,9 +289,14 @@ class AlpamayoR1(nn.Module):
         vlm_seq_lens = forward_batch.seq_lens[idx_tensor]
 
         # Expert sees: prefix (VLM cached) + new action tokens
-        expert_seq_lens = vlm_seq_lens + n_diff
+        # In debug mode, we can disable VLM KV reading for reproducibility checks.
+        if self.flow_matching_disable_vlm_kv:
+            expert_seq_lens = torch.full_like(vlm_seq_lens, n_diff)
+            extend_prefix_lens = torch.zeros_like(vlm_seq_lens, dtype=torch.int32)
+        else:
+            expert_seq_lens = vlm_seq_lens + n_diff
+            extend_prefix_lens = vlm_seq_lens.to(torch.int32)
         extend_seq_lens = torch.full((bstar,), n_diff, dtype=torch.int32, device=device)
-        extend_prefix_lens = vlm_seq_lens.to(torch.int32)
 
         # Cumulative start locations for the new tokens (each request contributes n_diff)
         extend_start_loc = torch.arange(
@@ -306,17 +384,75 @@ class AlpamayoR1(nn.Module):
             active_indices, forward_batch, mrope_positions
         )
 
+        if self.flow_matching_debug:
+            logger.info(
+                "FM_DEBUG meta: bstar=%d n_diff=%d action_dims=%s num_steps=%d disable_vlm_kv=%s",
+                bstar,
+                n_diff,
+                self.action_dims,
+                self.num_inference_steps,
+                self.flow_matching_disable_vlm_kv,
+            )
+            self._fm_tensor_fingerprint("mrope_positions", mrope_positions)
+            self._fm_tensor_fingerprint("forward_batch.seq_lens", forward_batch.seq_lens)
+            self._fm_tensor_fingerprint("expert_batch.seq_lens", expert_batch.seq_lens)
+
         # Initialize attention metadata (FlashInfer wrapper plans / Triton metadata)
         # This is safe because the VLM's decode is already finished;
         # the runtime will re-init metadata for the next batch.
-        forward_batch.attn_backend.init_forward_metadata(expert_batch)
+        #
+        # BUG FIX: The expert uses ENCODER_ONLY attention (bidirectional self-attention
+        # among action tokens + cross-attention to VLM prefix KV).  FlashInfer's EXTEND
+        # mode has two code paths:
+        #
+        #   use_ragged=True  (correct for ENCODER_ONLY):
+        #     - Ragged wrapper:  Q(64) × local K,V(64) computed in-memory, non-causal
+        #     - Paged wrapper:   Q(64) × VLM prefix KV(3190), non-causal
+        #     - Merge with log-sum-exp
+        #     - ENCODER_ONLY suppresses KV cache write and forces causal=False
+        #     - paged_kernel_lens = prefix_lens = 3190  (no garbage)
+        #
+        #   use_ragged=False (buggy for ENCODER_ONLY, forced by is_multimodal + enable_deterministic):
+        #     - Paged wrapper only, causal=True (wrong!), save_kv_cache=True (wrong!)
+        #     - out_cache_loc=zeros → writes all 64 action-token KVs to physical slot 0,
+        #       corrupting VLM token 0's KV stored there
+        #     - paged_kernel_lens = seq_lens = 3254 → req_to_token[3190..3253] are
+        #       uninitialized, all pointing to slot 0 which holds corrupted KV
+        #     - Between runs, VLM tokens land on different physical slots, so the
+        #       corruption propagates differently → non-deterministic output
+        #
+        # Fix: temporarily clear is_multimodal and enable_deterministic so
+        # init_forward_metadata chooses use_ragged=True for this expert batch.
+        # The expert's paged attention (3190 prefix tokens < tile_size 4096) has no
+        # split-K and processes the same KV values in the same logical order each run
+        # → fully deterministic.
+
+        backend = forward_batch.attn_backend
+        logger.info(f"attention_backend={backend}")
+        backend.init_forward_metadata(expert_batch)
+
+        # _orig_is_multimodal = getattr(backend, "is_multimodal", False)
+        # _orig_enable_deterministic = getattr(backend, "enable_deterministic", False)
+        # backend.is_multimodal = False
+        # backend.enable_deterministic = False
+        # try:
+        #     backend.init_forward_metadata(expert_batch)
+        # finally:
+        #     backend.is_multimodal = _orig_is_multimodal
+        #     backend.enable_deterministic = _orig_enable_deterministic
 
         # --- 3. Euler integration loop ---
         # Match reference FlowMatching._euler: x is fp32 (default dtype)
         # so Euler accumulation x = x + dt * v stays in fp32 throughout.
+
+        torch.cuda.manual_seed_all(42)  # for reproducibility in testing
         x = torch.randn(
-            bstar, *self.action_dims, device=device
+            bstar, *self.action_dims, device=device,
         )
+
+        logger.info(f"start flowmatching {x[0,:2]}")
+        self._fm_tensor_fingerprint("x_init", x)
+                    
         time_steps = torch.linspace(
             0.0, 1.0, self.num_inference_steps + 1, device=device
         )
@@ -341,6 +477,15 @@ class AlpamayoR1(nn.Module):
                 bstar * n_diff, -1
             )
 
+            if self._fm_should_log_step(step_i):
+                self._fm_tensor_fingerprint(f"step{step_i}.x_in", x)
+                self._fm_tensor_fingerprint(
+                    f"step{step_i}.future_token_embeds", future_token_embeds
+                )
+                self._fm_tensor_fingerprint(
+                    f"step{step_i}.input_embeds_flat", input_embeds_flat
+                )
+
             # c. Run expert: bidirectional attention over action tokens,
             #    attending to VLM's cached prefix KV via shared layer_ids.
             #    ENCODER_ONLY ensures:
@@ -354,24 +499,44 @@ class AlpamayoR1(nn.Module):
                 input_embeds=input_embeds_flat,
             )  # (bstar * n_diff, hidden_size)
 
+            if self._fm_should_log_step(step_i):
+                self._fm_tensor_fingerprint(
+                    f"step{step_i}.expert_hidden_flat", expert_hidden
+                )
+
             # d. Project to action space
             expert_hidden = expert_hidden.view(
                 bstar, n_diff, -1
             )  # (bstar, n_diff, hidden_size)
             pred = self.action_out_proj(expert_hidden)  # (bstar, n_diff, action_dim)
             pred = pred.view(bstar, *self.action_dims)
+
+            if self._fm_should_log_step(step_i):
+                self._fm_tensor_fingerprint(f"step{step_i}.pred", pred)
             # --- step_fn end ---
 
             # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
             x = x + dt * pred
+            if self._fm_should_log_step(step_i):
+                self._fm_tensor_fingerprint(f"step{step_i}.x_out", x)
 
         return x  # (bstar, n_waypoints, action_dim)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.vlm.pad_input_ids(input_ids, mm_inputs)
 
-    def _load_expert_weights(self, expert_weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load expert (Qwen3 text backbone) weights."""
+
+    
+    def _load_expert_weights(
+        self,
+        expert_weights: Iterable[Tuple[str, torch.Tensor]],
+        strict: bool = True,
+    ):
+        """Load expert (Qwen3 text backbone) weights.
+
+        Returns:
+            A tuple ``(loaded_cnt, missing_params, unexpected_ckpt_keys)``.
+        """
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -382,9 +547,15 @@ class AlpamayoR1(nn.Module):
         ]
 
         params_dict = dict(self.expert.named_parameters())
+        expected_param_names = set(params_dict.keys())
+        loaded_full_params = set()
+        loaded_stacked_shards = defaultdict(set)
+        unexpected_ckpt_keys = []
         loaded_cnt = 0
+        seen_any_expert_weight = False
 
         for name, loaded_weight in expert_weights:
+            seen_any_expert_weight = True
             # Keep compatibility with checkpoints that include an extra "model." prefix.
             if name.startswith("model."):
                 name = name[len("model.") :]
@@ -417,11 +588,13 @@ class AlpamayoR1(nn.Module):
                     continue
                 if name not in params_dict:
                     logger.warning(f"Expert parameter {name} not found; skipping")
+                    unexpected_ckpt_keys.append(name)
                     break
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_stacked_shards[name].add(shard_id)
                 loaded_cnt += 1
                 break
             else:
@@ -429,27 +602,61 @@ class AlpamayoR1(nn.Module):
                     continue
                 if name not in params_dict:
                     logger.warning(f"Expert parameter {name} not found; skipping")
+                    unexpected_ckpt_keys.append(name)
                     continue
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_full_params.add(name)
                 loaded_cnt += 1
 
+        missing_params = []
+        for pname in expected_param_names:
+            if "qkv_proj" in pname:
+                if loaded_stacked_shards.get(pname, set()) != {"q", "k", "v"}:
+                    missing_params.append(pname)
+                continue
+            if "gate_up_proj" in pname:
+                if loaded_stacked_shards.get(pname, set()) != {0, 1}:
+                    missing_params.append(pname)
+                continue
+            if pname not in loaded_full_params:
+                missing_params.append(pname)
+
         logger.info(f"AlpamayoR1: loaded {loaded_cnt} expert tensors")
+        if strict:
+            if not seen_any_expert_weight:
+                raise RuntimeError(
+                    "AlpamayoR1 strict load failed: no checkpoint weights were routed "
+                    "to expert."
+                )
+            if missing_params or unexpected_ckpt_keys:
+                raise RuntimeError(
+                    "AlpamayoR1 strict expert load failed: "
+                    f"missing={len(missing_params)}, "
+                    f"unexpected={len(unexpected_ckpt_keys)}. "
+                    f"Sample missing={missing_params[:8]}, "
+                    f"sample unexpected={unexpected_ckpt_keys[:8]}"
+                )
+        return loaded_cnt, missing_params, unexpected_ckpt_keys
 
     def _load_plain_module_weights(
         self,
         module: nn.Module,
         module_name: str,
         module_weights: Iterable[Tuple[str, torch.Tensor]],
+        strict: bool = True,
     ):
         state_dict = {name: tensor for name, tensor in module_weights}
         if not state_dict:
-            logger.info(f"AlpamayoR1: no weights found for {module_name}")
+            msg = f"AlpamayoR1: no weights found for {module_name}"
+            if strict:
+                raise RuntimeError(f"AlpamayoR1 strict load failed: {msg}")
+            logger.info(msg)
             return
 
-        incompatible = module.load_state_dict(state_dict, strict=False)
+        incompatible = module.load_state_dict(state_dict, strict=strict)
         if incompatible.missing_keys:
             logger.warning(
                 f"AlpamayoR1: {module_name} missing keys: {incompatible.missing_keys}"
@@ -460,7 +667,11 @@ class AlpamayoR1(nn.Module):
             )
         logger.info(f"AlpamayoR1: loaded {len(state_dict)} tensors into {module_name}")
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        strict: bool = True,
+    ):
         """Load weights into the model.
         
         The weights from Alpamayo checkpoint may have keys prefixed with 'vlm.'
@@ -475,6 +686,7 @@ class AlpamayoR1(nn.Module):
         expert_weights = []
         action_in_proj_weights = []
         action_out_proj_weights = []
+        skipped_weights = []
 
         for name, tensor in weights:
             if name.startswith("vlm."):
@@ -497,26 +709,52 @@ class AlpamayoR1(nn.Module):
                 )
                 continue
 
-            if name.startswith(("action_space.", "diffusion.")):
+            if name.startswith(("action_space.")):
                 logger.debug(f"Skipping weight: {name} (module not implemented)")
+                skipped_weights.append(name)
                 continue
 
             # Keep compatibility for checkpoints without explicit "vlm." prefix.
             vlm_weights.append((name, tensor))
 
         # 1) Load VLM weights.
+        if strict and not vlm_weights:
+            raise RuntimeError(
+                "AlpamayoR1 strict load failed: no checkpoint weights were routed to vlm."
+            )
         self.vlm.load_weights(iter(vlm_weights))
         logger.info(f"AlpamayoR1: loaded {len(vlm_weights)} vlm tensors")
 
         # 2) Load expert weights.
-        self._load_expert_weights(expert_weights)
+        expert_loaded_cnt, expert_missing, expert_unexpected = self._load_expert_weights(
+            expert_weights, strict=strict
+        )
 
         # 3) Load action projection modules.
         self._load_plain_module_weights(
-            self.action_in_proj, "action_in_proj", action_in_proj_weights
+            self.action_in_proj,
+            "action_in_proj",
+            action_in_proj_weights,
+            strict=strict,
         )
         self._load_plain_module_weights(
-            self.action_out_proj, "action_out_proj", action_out_proj_weights
+            self.action_out_proj,
+            "action_out_proj",
+            action_out_proj_weights,
+            strict=strict,
+        )
+
+        logger.info(
+            "AlpamayoR1 load summary: "
+            f"strict={strict}, "
+            f"vlm_ckpt_tensors={len(vlm_weights)}, "
+            f"expert_ckpt_tensors={len(expert_weights)}, "
+            f"expert_loaded_tensors={expert_loaded_cnt}, "
+            f"expert_missing_params={len(expert_missing)}, "
+            f"expert_unexpected_ckpt_keys={len(expert_unexpected)}, "
+            f"action_in_proj_ckpt_tensors={len(action_in_proj_weights)}, "
+            f"action_out_proj_ckpt_tensors={len(action_out_proj_weights)}, "
+            f"skipped_tensors={len(skipped_weights)}"
         )
 
 # Entry point for SGLang model registry
