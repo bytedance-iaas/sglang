@@ -394,6 +394,8 @@ class EICHiRadixCache(RadixCache):
                     failed_token_num -= len(end_node.value)
                     end_node.value = None
                     end_node.host_value = None
+                    self._update_leaf_status(end_node)
+                    self._update_leaf_status(end_node.parent)
                 elif failed_token_num > 0:
                     # node load back partial fail, split node
                     split_len = len(end_node.value) - failed_token_num
@@ -403,6 +405,8 @@ class EICHiRadixCache(RadixCache):
                     failed_token_num -= len(end_node.value)
                     end_node.value = None
                     end_node.host_value = None
+                    self._update_leaf_status(end_node)
+                    self._update_leaf_status(end_node.parent)
                     assert failed_token_num == 0, "failed_token_num should be zero"
                 end_node = end_node.parent
             # clear the reference
@@ -495,6 +499,8 @@ class EICHiRadixCache(RadixCache):
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
+        self._update_leaf_status(node)
+        self._update_leaf_status(node.parent)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):

@@ -1080,6 +1080,8 @@ class EICBaseTokenToKVPoolHost:
 
     def assign_page_data(self, content_hashes, flat_data, device_indices=None):
         logger.debug(f"assign_page_data hashes {content_hashes}")
+        if len(content_hashes) == 0:
+            return True
         keys = self._encode_key_shared(content_hashes)
         if self.eic_client.eic_direct_backup and flat_data is None:
             return self.assign_page_data_direct(keys, device_indices)
