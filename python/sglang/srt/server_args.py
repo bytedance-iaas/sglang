@@ -632,7 +632,7 @@ class ServerArgs:
     disable_eic_shared: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
+    hicache_write_policy: str = "write_through"
     hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
