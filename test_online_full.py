@@ -8,6 +8,9 @@ import torch
 from openai import OpenAI
 import pickle
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 
 clip_ids = pd.read_parquet("clip_ids.parquet")["clip_id"].tolist()
@@ -143,3 +146,63 @@ resp = client.chat.completions.create(
 )
 
 print(resp.choices[0].message.content)
+sglext = getattr(resp, "sglext", None)
+if sglext is None:
+	sglext = getattr(resp, "model_extra", {}).get("sglext")
+
+traj_xyz=np.asarray(sglext['traj_xyz'])
+
+
+print(f"first 5 pred_xy:\n{traj_xyz[0][:5][...,:-1]}")
+
+
+
+gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].numpy()
+gt_xy = gt_xy
+print(f"first 5 gt_xy:\n{gt_xy[:5, :]}")
+
+
+def rotate_90cc(xy: np.ndarray) -> np.ndarray:
+    return np.stack([-xy[:, 1], xy[:, 0]], axis=1)
+
+
+if traj_xyz.size == 0:
+	raise ValueError("`sglext.traj_xyz` is empty in response")
+
+if traj_xyz.ndim >= 5:
+	pred_xy_all = traj_xyz[0, 0, :, :, :2]
+elif traj_xyz.ndim == 3:
+	pred_xy_all = traj_xyz[:, :, :2]
+elif traj_xyz.ndim == 2:
+	pred_xy_all = traj_xyz[None, :, :2]
+else:
+	raise ValueError(f"Unexpected `sglext.traj_xyz` shape: {traj_xyz.shape}")
+
+pred_steps = pred_xy_all.shape[1]
+gt_steps = gt_xy.shape[0]
+min_steps = min(pred_steps, gt_steps)
+pred_xy_all = pred_xy_all[:, :min_steps, :]
+gt_xy = gt_xy[:min_steps, :]
+
+ade_each = np.linalg.norm(pred_xy_all - gt_xy[None, ...], axis=-1).mean(axis=-1)
+best_idx = int(np.argmin(ade_each))
+pred_xy = pred_xy_all[best_idx]
+
+print(f"Best trajectory index: {best_idx}")
+print(f"ADE: {ade_each[best_idx]} meters")
+
+pred_xy_rot = rotate_90cc(pred_xy)
+gt_xy_rot = rotate_90cc(gt_xy)
+
+plt.figure(figsize=(8, 8))
+plt.plot(pred_xy_rot[:, 0], pred_xy_rot[:, 1], "o-", label="Predicted Trajectory")
+plt.plot(gt_xy_rot[:, 0], gt_xy_rot[:, 1], "r-", label="Ground Truth Trajectory")
+plt.ylabel("y coordinate (meters)")
+plt.xlabel("x coordinate (meters)")
+plt.legend(loc="best")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig("output.png", dpi=200)
+plt.close()
+print("Saved trajectory plot to output.png")
+

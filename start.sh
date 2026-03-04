@@ -8,7 +8,7 @@ python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B \
  --tp 1 \
  --disable-cuda-graph \
  --disable-overlap-schedule \
- --attention-backend  trtllm_mha \
+ --attention-backend trtllm_mha \
  --skip-server-warmup 
  # flashinfer has bug
  # triton

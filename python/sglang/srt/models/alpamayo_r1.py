@@ -239,6 +239,7 @@ class AlpamayoR1(nn.Module):
         if forward_batch.forward_mode.is_decode():
             bstar = int(input_ids.shape[0])
             active_indices = []
+            reqs = getattr(forward_batch, "reqs", None)
             if self.flow_matching_debug:
                 # Log every decoded token ID to detect VLM non-determinism across runs.
                 # If the same request produces different token IDs between runs,
@@ -249,7 +250,28 @@ class AlpamayoR1(nn.Module):
                     forward_batch.seq_lens.tolist(),
                 )
             for i in range(bstar):
-                if input_ids[i] == self.traj_future_start_token_id:
+                has_history_traj = False
+                if reqs is not None and i < len(reqs):
+                    has_history_traj = getattr(reqs[i], "history_traj", None) is not None
+
+                should_trigger_flow_matching = (
+                    input_ids[i] == self.traj_future_start_token_id
+                    or (
+                        has_history_traj
+                        and input_ids[i] == self.traj_force_stop_token_id
+                    )
+                )
+
+                if should_trigger_flow_matching:
+                    # Avoid recomputing if already attached once for this request.
+                    if (
+                        reqs is not None
+                        and i < len(reqs)
+                        and getattr(reqs[i], "customized_info", None) is not None
+                        and "traj_xyz" in reqs[i].customized_info
+                    ):
+                        continue
+
                     # Force generation to stop immediately
                     ret.next_token_logits[i, :] = float("-inf")
                     ret.next_token_logits[i, self.traj_force_stop_token_id] = 0.0
