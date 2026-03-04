@@ -33,6 +33,7 @@ from sglang.utils import logger
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from .action_in_proj import PerWaypointActionInProjV2
+from .unicycle_accel_curvature import UnicycleAccelCurvatureActionSpace
 
 
 # class AlpamayoR1Config(PretrainedConfig):
@@ -118,15 +119,23 @@ class AlpamayoR1(nn.Module):
         if hasattr(self.expert, "embed_tokens"):
             del self.expert.embed_tokens
 
-        self.action_space = None
 
         # Build action projection modules from Alpamayo config to match checkpoint shapes.
         action_in_proj_cfg = config.action_in_proj_cfg
-        action_space_cfg = config.action_space_cfg
         traj_tokenizer_cfg = config.traj_tokenizer_cfg
-
+        action_space_cfg = config.traj_tokenizer_cfg["action_space_cfg"]
         n_waypoints = action_space_cfg["n_waypoints"]
         action_dim = len(traj_tokenizer_cfg["dims_max"])
+
+
+        # Instantiate action space (UnicycleAccelCurvatureActionSpace)
+        action_space_kwargs = {
+            k: v for k, v in action_space_cfg.items()
+            if k not in ("_target_", "_recursive_", "n_waypoints")
+        }
+        self.action_space = UnicycleAccelCurvatureActionSpace(
+            **action_space_kwargs,
+        )
 
         self.action_in_proj = PerWaypointActionInProjV2(
             in_dims=[n_waypoints, action_dim],
@@ -250,14 +259,80 @@ class AlpamayoR1(nn.Module):
                 sampled_actions = self._run_flow_matching(
                     active_indices, forward_batch
                 )
-                # TODO: convert sampled_actions to trajectories via action_space
-                # and attach to the response (e.g., via forward_batch or a side channel)
-                logger.info(
-                    f"Flow matching completed for {len(active_indices)} requests, "
-                    f"data: \n{sampled_actions[0,:5]}"
+                # Convert sampled actions → trajectories and write to req.customized_info
+                self._attach_traj_to_reqs(
+                    sampled_actions, active_indices, forward_batch
                 )
 
         return ret
+
+    def _attach_traj_to_reqs(
+        self,
+        sampled_actions: torch.Tensor,
+        active_indices: List[int],
+        forward_batch: "ForwardBatch",
+    ) -> None:
+        """Convert sampled actions to trajectories and write to req.customized_info.
+
+        Args:
+            sampled_actions: (bstar, n_waypoints, action_dim) on GPU.
+            active_indices: batch-slot indices of active requests.
+            forward_batch: ForwardBatch carrying per-req objects.
+        """
+        reqs = getattr(forward_batch, "reqs", None)
+        if reqs is None:
+            logger.warning("_attach_traj_to_reqs: forward_batch.reqs is None; skipping action_to_traj")
+            return
+
+        device = sampled_actions.device
+
+        for j, slot_i in enumerate(active_indices):
+            req = reqs[slot_i]
+            history_traj = getattr(req, "history_traj", None) or {}
+
+            hist_xyz_raw = history_traj.get("ego_history_xyz")
+            hist_rot_raw = history_traj.get("ego_history_rot")
+
+            if hist_xyz_raw is None or hist_rot_raw is None:
+                logger.warning(
+                    f"_attach_traj_to_reqs: req {req.rid} missing history_traj; "
+                    "skipping action_to_traj for this request"
+                )
+                continue
+
+            # Convert to tensor if needed and move to GPU
+            if not isinstance(hist_xyz_raw, torch.Tensor):
+                hist_xyz = torch.tensor(hist_xyz_raw, dtype=sampled_actions.dtype, device=device)
+            else:
+                hist_xyz = hist_xyz_raw.to(dtype=sampled_actions.dtype, device=device)
+
+            if not isinstance(hist_rot_raw, torch.Tensor):
+                hist_rot = torch.tensor(hist_rot_raw, dtype=sampled_actions.dtype, device=device)
+            else:
+                hist_rot = hist_rot_raw.to(dtype=sampled_actions.dtype, device=device)
+
+            # Ensure shape: (T, 3) and (T, 3, 3) – add batch dim for action_to_traj
+            if hist_xyz.dim() == 2:     # (T, 3)
+                hist_xyz = hist_xyz.unsqueeze(0)   # (1, T, 3)
+            if hist_rot.dim() == 3:     # (T, 3, 3)
+                hist_rot = hist_rot.unsqueeze(0)   # (1, T, 3, 3)
+
+            # sampled_actions[j]: (n_waypoints, action_dim) → unsqueeze batch
+            action_j = sampled_actions[j].unsqueeze(0).to(dtype=sampled_actions.dtype)  # (1, n_waypoints, 2)
+
+            with torch.no_grad():
+                pred_xyz, pred_rot = self.action_space.action_to_traj(
+                    action_j, hist_xyz, hist_rot
+                )  # (1, n_waypoints, 3), (1, n_waypoints, 3, 3)
+
+            if req.customized_info is None:
+                req.customized_info = {}
+            req.customized_info["traj_xyz"] = pred_xyz[0].cpu().tolist()
+            req.customized_info["traj_rot"] = pred_rot[0].cpu().tolist()
+
+        logger.info(
+            f"_attach_traj_to_reqs: converted {len(active_indices)} sampled_actions to trajectories"
+        )
 
     def _build_expert_forward_batch(
         self,
@@ -686,6 +761,7 @@ class AlpamayoR1(nn.Module):
         expert_weights = []
         action_in_proj_weights = []
         action_out_proj_weights = []
+        action_space_weights = []
         skipped_weights = []
 
         for name, tensor in weights:
@@ -709,9 +785,10 @@ class AlpamayoR1(nn.Module):
                 )
                 continue
 
-            if name.startswith(("action_space.")):
-                logger.debug(f"Skipping weight: {name} (module not implemented)")
-                skipped_weights.append(name)
+            if name.startswith("action_space."):
+                action_space_weights.append(
+                    (name[len("action_space."):], tensor)
+                )
                 continue
 
             # Keep compatibility for checkpoints without explicit "vlm." prefix.
@@ -730,7 +807,16 @@ class AlpamayoR1(nn.Module):
             expert_weights, strict=strict
         )
 
-        # 3) Load action projection modules.
+        # 3) Load action space buffers (accel_mean, accel_std, etc.).
+        if action_space_weights:
+            self._load_plain_module_weights(
+                self.action_space,
+                "action_space",
+                action_space_weights,
+                strict=False,  # scalar hyperparams are not in state_dict
+            )
+
+        # 4) Load action projection modules.
         self._load_plain_module_weights(
             self.action_in_proj,
             "action_in_proj",
@@ -754,6 +840,7 @@ class AlpamayoR1(nn.Module):
             f"expert_unexpected_ckpt_keys={len(expert_unexpected)}, "
             f"action_in_proj_ckpt_tensors={len(action_in_proj_weights)}, "
             f"action_out_proj_ckpt_tensors={len(action_out_proj_weights)}, "
+            f"action_space_ckpt_tensors={len(action_space_weights)}, "
             f"skipped_tensors={len(skipped_weights)}"
         )
 

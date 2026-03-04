@@ -740,6 +740,9 @@ class Req:
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
+        # Alpamayo: history trajectory for action_to_traj conversion
+        self.history_traj: Optional[Dict[str, Any]] = None
+
         # Embedding (return values)
         self.embedding = None
 

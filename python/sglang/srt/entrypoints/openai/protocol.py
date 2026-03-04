@@ -317,6 +317,8 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    traj_xyz: Optional[Any] = None
+    traj_rot: Optional[Any] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
