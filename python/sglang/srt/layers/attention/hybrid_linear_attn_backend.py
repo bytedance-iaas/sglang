@@ -974,12 +974,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                     mamba_layer_idx = mamba_map.get(layer_id)
                     if mamba_layer_idx is not None and self._mamba_state_tensors_per_layer > 0:
                         state_offset = kv_ntensors
-                        first = int(state_offset + 0 * self._mamba_num_layers + mamba_layer_idx)
-                        last = int(
-                            state_offset
-                            + (self._mamba_state_tensors_per_layer - 1) * self._mamba_num_layers
-                            + mamba_layer_idx
-                        )
                         for t in range(self._mamba_state_tensors_per_layer):
                             callback(int(state_offset + t * self._mamba_num_layers + mamba_layer_idx))
                     else:
