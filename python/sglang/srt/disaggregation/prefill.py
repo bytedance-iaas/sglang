@@ -48,6 +48,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -195,6 +196,13 @@ class PrefillBootstrapQueue:
             kv_args.state_type = "none"
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        if (
+            envs.SGLANG_MOONCAKE_ASYNC_KV.get()
+        ):
+            from sglang.srt.disaggregation.mooncake.async_kv_manager import (
+                MooncakeAsyncKVManager,
+            )
+            kv_manager_class = MooncakeAsyncKVManager
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
