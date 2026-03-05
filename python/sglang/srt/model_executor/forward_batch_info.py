@@ -377,6 +377,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids: Optional[List[str]] = None
 
     layer_ready_callback: Optional[Callable[[int], None]] = None
+    async_kv_batch_started: bool = False
 
     @classmethod
     def init_new(
