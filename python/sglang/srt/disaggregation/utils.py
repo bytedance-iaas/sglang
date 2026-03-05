@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import logging
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -13,6 +14,8 @@ import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs
