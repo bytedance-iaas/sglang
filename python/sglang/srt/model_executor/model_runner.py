@@ -536,6 +536,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+        logger.error(
+            "model layers: model_num_layers=%s start_layer=%s end_layer=%s num_effective_layers=%s tp_size=%s pp_size=%s",
+            model_num_layers,
+            self.start_layer,
+            self.end_layer,
+            self.num_effective_layers,
+            self.tp_size,
+            self.pp_size,
+        )
 
         # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
         loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
@@ -2414,6 +2423,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        forward_batch.layer_ready_callback = get_layer_ready_callback()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
