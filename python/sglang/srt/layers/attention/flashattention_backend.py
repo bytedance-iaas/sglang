@@ -745,6 +745,10 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
+        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            save_kv_cache = False
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1085,6 +1089,10 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
+        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            save_kv_cache = False
+
         if k is not None:
             assert v is not None
             if save_kv_cache:

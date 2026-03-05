@@ -208,6 +208,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             cache_loc = forward_batch.out_cache_loc
 
+        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
+        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            save_kv_cache = False
+
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
@@ -258,6 +262,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
             cache_loc = forward_batch.out_cache_loc
+
+        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
+        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            save_kv_cache = False
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)

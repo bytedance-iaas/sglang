@@ -177,6 +177,23 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         
+        # Apply min_pixels / max_pixels from model config to the HF image processor.
+        # Alpamayo's config.json specifies min_pixels=163840, max_pixels=196608 at the
+        # root level, but these are NOT in preprocessor_config.json so AutoProcessor
+        # doesn't pick them up.  Without this, images get resized to the wrong
+        # resolution → wrong visual token count → wrong mRoPE positions → bad ADE.
+        _min_px = getattr(hf_config, "min_pixels", None)
+        _max_px = getattr(hf_config, "max_pixels", None)
+        if _min_px is not None or _max_px is not None:
+            ip = getattr(_processor, "image_processor", None)
+            if ip is not None:
+                if _min_px is not None and getattr(ip, "min_pixels", None) is None:
+                    ip.min_pixels = _min_px
+                    logger.info("AlpamayoR1Processor: set image_processor.min_pixels=%d from model config", _min_px)
+                if _max_px is not None and getattr(ip, "max_pixels", None) is None:
+                    ip.max_pixels = _max_px
+                    logger.info("AlpamayoR1Processor: set image_processor.max_pixels=%d from model config", _max_px)
+
         # Initialize trajectory tokenizer configs
         self.hist_traj_tokenizer = DeltaTrajectoryTokenizer()
         

@@ -72,10 +72,7 @@ def _encode_rgb_tensor_to_png_base64(image: torch.Tensor, save_path: str | None 
 		) from e
 
 	img = Image.fromarray(array_hwc)
-	target_h = 336
-	if img.height != target_h:
-		target_w = max(1, round(img.width * target_h / img.height))
-		img = img.resize((target_w, target_h), resample=Image.Resampling.BILINEAR)
+
 	buf = io.BytesIO()
 	img.save(buf, format="PNG")
 	if save_path is not None:
@@ -140,10 +137,10 @@ messages = [
 resp = client.chat.completions.create(
 	model="Qwen/Qwen3-VL-8B-Instruct",
 	messages=messages,
-	max_tokens=32,
+	max_tokens=256,
     extra_body={"history_traj": history_traj, "continue_final_message": True},
-	temperature=0,
-	top_p=1,
+	temperature=0.6,
+	top_p=0.98,
 )
 
 print(resp.choices[0].message.content)
