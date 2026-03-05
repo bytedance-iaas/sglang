@@ -2323,7 +2323,7 @@ class Scheduler(
                 if eligible_reqs and all(
                     req.start_send_idx == 0 and req.is_chunked <= 0
                     for req in eligible_reqs
-                ):
+                ): 
                     kv_mgr.prepare_batch(self, batch)
                     batch.async_kv_prepared = True
                     set_layer_ready_callback(kv_mgr.mark_layer_ready)
