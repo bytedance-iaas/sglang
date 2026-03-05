@@ -731,6 +731,25 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        mamba_pool = getattr(self.linear_attn_backend.req_to_token_pool, "mamba_pool", None)
+        self._mamba_num_layers = (
+            int(getattr(mamba_pool, "num_mamba_layers", 0)) if mamba_pool is not None else 0
+        )
+        if self._mamba_num_layers > 0:
+            mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+            state_tensors = []
+            if mamba_cache is not None:
+                for field in vars(mamba_cache):
+                    if field in ("intermediate_ssm", "intermediate_conv_window"):
+                        continue
+                    value = getattr(mamba_cache, field)
+                    if isinstance(value, list):
+                        state_tensors.extend(value)
+                    else:
+                        state_tensors.append(value)
+            self._mamba_state_tensors_per_layer = len(state_tensors)
+        else:
+            self._mamba_state_tensors_per_layer = 0
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
@@ -894,6 +913,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         is_linear_attn = layer_id not in self.full_attn_layers
+        callback = forward_batch.layer_ready_callback
+        if callback is not None and not forward_batch.async_kv_batch_started:
+            forward_batch.async_kv_batch_started = True
+            callback(-1)
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
@@ -915,7 +938,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            out =  self.forward_extend(
                 layer,
                 forward_batch,
                 save_kv_cache,
@@ -927,6 +950,60 @@ class HybridLinearAttnBackend(AttentionBackend):
                 b,
                 **kwargs,
             )
+            if callback is not None and save_kv_cache:
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                full_layer_nums = getattr(
+                    token_to_kv_pool, "full_layer_nums", len(self.full_attn_layers)
+                )
+                use_mla = getattr(token_to_kv_pool, "use_mla", False)
+                kv_ntensors = full_layer_nums if use_mla else full_layer_nums * 2
+                if not is_linear_attn:
+                    mapping = getattr(token_to_kv_pool, "full_attention_layer_id_mapping", {})
+                    packed_id = mapping.get(layer_id)
+                    if packed_id is not None:
+                        # logger.info(
+                        #     "async kv trigger full-attn: model_layer=%s packed=%s k_tensor=%s v_tensor=%s",
+                        #     layer_id,
+                        #     packed_id,
+                        #     int(packed_id),
+                        #     (int(packed_id + full_layer_nums) if not use_mla else None),
+                        # )
+                        callback(int(packed_id))
+                        if not use_mla:
+                            callback(int(packed_id + full_layer_nums))
+                    else:
+                        logger.warning(
+                            "async kv trigger full-attn missing mapping: model_layer=%s",
+                            layer_id,
+                        )
+                else:
+                    mamba_map = getattr(forward_batch.req_to_token_pool, "mamba_map", {})
+                    mamba_layer_idx = mamba_map.get(layer_id)
+                    if mamba_layer_idx is not None and self._mamba_state_tensors_per_layer > 0:
+                        state_offset = kv_ntensors
+                        first = int(state_offset + 0 * self._mamba_num_layers + mamba_layer_idx)
+                        last = int(
+                            state_offset
+                            + (self._mamba_state_tensors_per_layer - 1) * self._mamba_num_layers
+                            + mamba_layer_idx
+                        )
+                        # logger.info(
+                        #     "async kv trigger linear: model_layer=%s mamba_layer=%s state_offset=%s tensors_per_layer=%s first_tensor=%s last_tensor=%s",
+                        #     layer_id,
+                        #     int(mamba_layer_idx),
+                        #     int(state_offset),
+                        #     int(self._mamba_state_tensors_per_layer),
+                        #     first,
+                        #     last,
+                        # )
+                        for t in range(self._mamba_state_tensors_per_layer):
+                            callback(int(state_offset + t * self._mamba_num_layers + mamba_layer_idx))
+                    else:
+                        logger.warning(
+                            "async kv trigger linear missing mapping: model_layer=%s",
+                            layer_id,
+                        )
+            return out
 
     def update_mamba_state_after_mtp_verify(
         self,
