@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
@@ -196,6 +197,13 @@ class PrefillBootstrapQueue:
             kv_args.state_type = "none"
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        if (
+            envs.SGLANG_MOONCAKE_ASYNC_KV.get()
+        ):
+            from sglang.srt.disaggregation.mooncake.async_kv_manager import (
+                MooncakeAsyncKVManager,
+            )
+            kv_manager_class = MooncakeAsyncKVManager
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
@@ -702,13 +710,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
             ):
                 # Mamba hybrid model: send single mamba state index
-                state_indices = [
+                mamba_state_idx = (
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         req.req_pool_idx
                     ]
                     .cpu()
                     .numpy()
-                ]
+                )
+                state_indices = [mamba_state_idx]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
