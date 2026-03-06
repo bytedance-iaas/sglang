@@ -1,12 +1,12 @@
 ARG BASE_IMG=pytorch/manylinux2_28-builder
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION_KERNEL_BUILD=12.9
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
-FROM ${BASE_IMG}:cuda${CUDA_VERSION} AS deps
+FROM ${BASE_IMG}:cuda${CUDA_VERSION_KERNEL_BUILD} AS deps
 
 # Overridable build arguments
 ARG ARCH=x86_64
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION_KERNEL_BUILD=12.9
 ARG PYTHON_VERSION=3.10
 # Manylinux python path tag, e.g. cp310-cp310 / cp312-cp312
 ARG PYTHON_TAG=cp310-cp310
@@ -73,12 +73,12 @@ RUN if [ "${USE_CCACHE}" = "1" ]; then \
 RUN set -eux; \
     if [ "${ARCH}" = "aarch64" ]; then _LIB=sbsa; else _LIB="${ARCH}"; fi; \
     mkdir -p /usr/lib/${ARCH}-linux-gnu/; \
-    ln -sf /usr/local/cuda-${CUDA_VERSION}/targets/${_LIB}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so
+    ln -sf /usr/local/cuda-${CUDA_VERSION_KERNEL_BUILD}/targets/${_LIB}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so
 
 # Install Python dependencies (torch + build tools)
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
-    case "${CUDA_VERSION}" in \
+    case "${CUDA_VERSION_KERNEL_BUILD}" in \
       13.0) TORCH_VER=2.9.1; CU_TAG=cu130 ;; \
       12.9) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
       12.8) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
