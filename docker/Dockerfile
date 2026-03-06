@@ -76,7 +76,7 @@ RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simpl
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
- && apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     ca-certificates \
     software-properties-common \
