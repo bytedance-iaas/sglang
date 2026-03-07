@@ -774,6 +774,35 @@ class ModelConfig:
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
+        if quant_cfg is not None and "quant_method" in quant_cfg:
+            model_type = getattr(self.hf_config, "model_type", None)
+            quant_method = quant_cfg.get("quant_method")
+            if (
+                model_type == "kimi_k25"
+                and quant_method in ("compressed-tensors", "compressed_tensors")
+            ):
+                quant_cfg["quant_method"] = "w4afp8"
+                if "group_size" not in quant_cfg:
+                    sizes = set()
+                    v = quant_cfg.get("group_size")
+                    if isinstance(v, int):
+                        sizes.add(v)
+                    for g in (quant_cfg.get("config_groups") or {}).values():
+                        if isinstance(g, dict):
+                            weights = g.get("weights")
+                            if isinstance(weights, dict):
+                                v = weights.get("group_size")
+                                if isinstance(v, int):
+                                    sizes.add(v)
+                            for sub in g.values():
+                                if isinstance(sub, dict):
+                                    v = sub.get("group_size")
+                                    if isinstance(v, int):
+                                        sizes.add(v)
+                    if len(sizes) == 1:
+                        quant_cfg["group_size"] = next(iter(sizes))
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
