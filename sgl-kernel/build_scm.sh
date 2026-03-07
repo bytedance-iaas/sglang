@@ -2,7 +2,7 @@
 set -ex
 
 PYTHON_VERSION="3.12"
-CUDA_VERSION="12.9.1"
+CUDA_VERSION="12.9"
 
 ROOT_PATH=$(pwd)
 OUTPUT_PATH=$ROOT_PATH/output
@@ -41,7 +41,6 @@ echo "CACHE_TAR_NAME: $CACHE_TAR_NAME"
 
 echo "VERSION_SUFFIX: $VERSION_SUFFIX"
 
-ENABLE_SM90A=$(( ${CUDA_VERSION%.*} >= 12 ? ON : OFF ))
 
 VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)
 # 移除可能存在的 byted 后缀，获取基础版本号
