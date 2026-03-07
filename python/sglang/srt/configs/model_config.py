@@ -696,6 +696,8 @@ class ModelConfig:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         if quant_cfg is None:
+            quant_cfg = getattr(self.hf_text_config, "compression_config", None)
+        if quant_cfg is None:
             # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
