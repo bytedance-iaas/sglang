@@ -106,6 +106,8 @@ docker run --rm \
   -v "${CCACHE_HOST_DIR}:/ccache" \
   -w /sgl-kernel \
   -e ARCH="${ARCH}" \
+  -e http_proxy="${PROXY_URL}" \
+  -e https_proxy="${PROXY_URL}" \
   "${DEPS_TAG}" \
   bash -c '
 set -eux

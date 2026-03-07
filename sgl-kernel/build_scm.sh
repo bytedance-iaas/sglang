@@ -78,20 +78,6 @@ else
     fi
 fi
 
-proxy_args=""
-if [ ! -z "$http_proxy" ]; then
-    proxy_args="$proxy_args -e http_proxy=$http_proxy"
-fi
-if [ ! -z "$https_proxy" ]; then
-    proxy_args="$proxy_args -e https_proxy=$https_proxy"
-fi
-
-# 如果设置了 pip 缓存参数，则删除 --no-cache-dir 参数，并映射 ~/.cache 到容器内
-if [ "$CUSTOM_CACHE_PIP" == "true" ]; then
-    cache_args="-v ~/.cache:/root/.cache"
-    sed -i 's|--no-cache-dir||g' build.sh  # 删除 pip 缓存参数
-fi
-
 sed -i "s|pytorch/manylinux|hub.byted.org/iaas/manylinux|g" build.sh
 sed -i 's|ARCH=$(uname -i)|ARCH=x86_64|g' build.sh  # DinD 可能不支持 ARCH=$(uname -i)
 
@@ -100,8 +86,6 @@ if [[ "${SCM_BUILD}" == "True" ]]; then
     source /root/start_dockerd.sh
 fi
 
-http_proxy=$http_proxy https_proxy=$https_proxy  \
-HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy  \
 USE_CCACHE=1 source build.sh $PYTHON_VERSION $CUDA_VERSION
 
 # 产物放到 output 目录下
