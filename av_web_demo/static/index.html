@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Physical AI AV: Video + Pred/GT Trajectory</title>
+  <style>
+    :root {
+      --bg: #f6f7f8;
+      --panel: #ffffff;
+      --line: #d9dce1;
+      --text: #19202a;
+      --muted: #606975;
+      --ok: #00895a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: radial-gradient(circle at 80% 5%, #eaf1ff 0, #f6f7f8 45%), var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    .wrap { display: grid; gap: 12px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+    .field { display: grid; gap: 4px; min-width: 0; }
+    label { font-size: 12px; color: var(--muted); }
+    input, select, button {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 14px;
+      background: #fff;
+      color: var(--text);
+    }
+    button {
+      cursor: pointer;
+      font-weight: 600;
+      background: linear-gradient(180deg, #ffffff, #f2f4f7);
+    }
+    button.active {
+      background: linear-gradient(180deg, #e0ffe0, #c8f0c8);
+      border-color: var(--ok);
+      color: var(--ok);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(420px, 2fr) minmax(340px, 1fr);
+      gap: 12px;
+    }
+    video {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #000;
+    }
+    canvas {
+      width: 100%;
+      height: 420px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 10px;
+      font-size: 13px;
+    }
+    .kv {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 8px;
+    }
+    .kv b { display: block; font-size: 12px; color: var(--muted); }
+    .status { font-size: 13px; color: var(--muted); }
+    .ok { color: var(--ok); }
+    pre {
+      margin: 0;
+      max-height: 140px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.35;
+      color: #273142;
+      background: #f9fafb;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    @media (max-width: 1280px) {
+      .controls { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
+      .row { grid-template-columns: 1fr; }
+      .meta { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <div class="controls">
+        <div class="field">
+          <label>Clip Num</label>
+          <select id="clipSelect"></select>
+        </div>
+        <div class="field">
+          <label>Video Camera</label>
+          <select id="cameraSelect"></select>
+        </div>
+        <div class="field">
+          <label>Inference Cameras (default 4 cams)</label>
+          <input id="inferCameras" />
+        </div>
+        <div class="field">
+          <label>Frames Per Camera</label>
+          <input id="numFrames" type="number" min="1" max="8" value="4" />
+        </div>
+        <div class="field">
+          <label>Sync Interval (s)</label>
+          <input id="syncStepS" type="number" min="0.1" step="0.1" value="3.0" />
+        </div>
+        <div class="field">
+          <label>Actions</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <button id="loadBtn">Load Video</button>
+            <button id="syncBtn">Start Sync</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="meta">
+        <div class="kv"><b>Status</b><span id="status" class="status">Idle</span></div>
+        <div class="kv"><b>Video Time (s)</b><span id="videoTime">0.00</span></div>
+        <div class="kv"><b>Last Slot (s)</b><span id="slotTime">-</span></div>
+        <div class="kv"><b>ADE / FDE (m)</b><span id="metrics">-</span></div>
+        <div class="kv"><b>Chosen t0_us</b><span id="chosenT0">-</span></div>
+        <div class="kv"><b>Input Images</b><span id="imageCount">-</span></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <label>Model raw text (optional debug)</label>
+      <pre id="debugText"></pre>
+    </div>
+
+    <div class="row">
+      <div class="panel" style="position:relative;">
+        <video id="video" controls preload="metadata"></video>
+        <div id="inferOverlay" style="display:none;position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.45);border-radius:12px;color:#fff;font-size:18px;font-weight:600;display:none;align-items:center;justify-content:center;pointer-events:none;">
+          Inferring...
+        </div>
+      </div>
+      <div class="panel">
+        <canvas id="trajCanvas" width="780" height="420"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const clipSelect = document.getElementById("clipSelect");
+    const cameraSelect = document.getElementById("cameraSelect");
+    const inferCamerasInput = document.getElementById("inferCameras");
+    const numFramesInput = document.getElementById("numFrames");
+    const syncStepInput = document.getElementById("syncStepS");
+    const loadBtn = document.getElementById("loadBtn");
+    const syncBtn = document.getElementById("syncBtn");
+
+    const statusEl = document.getElementById("status");
+    const video = document.getElementById("video");
+    const videoTimeEl = document.getElementById("videoTime");
+    const slotTimeEl = document.getElementById("slotTime");
+    const metricsEl = document.getElementById("metrics");
+    const chosenT0El = document.getElementById("chosenT0");
+    const imageCountEl = document.getElementById("imageCount");
+    const debugTextEl = document.getElementById("debugText");
+    const canvas = document.getElementById("trajCanvas");
+    const ctx = canvas.getContext("2d");
+    const inferOverlay = document.getElementById("inferOverlay");
+
+    function showInferring(show) {
+      inferOverlay.style.display = show ? "flex" : "none";
+    }
+
+    let syncEnabled = false;
+    let syncTimer = null;
+    let pendingSync = false;
+    let queuedSlotKey = null;
+    let latestRenderedSlotKey = null;
+    const predictionCache = new Map();
+    const predictionCacheOrder = [];
+
+    function setStatus(msg, isOk = false) {
+      statusEl.textContent = msg;
+      statusEl.className = isOk ? "status ok" : "status";
+    }
+
+    function updateSyncBtn() {
+      syncBtn.textContent = syncEnabled ? "Stop Sync" : "Start Sync";
+      syncBtn.className = syncEnabled ? "active" : "";
+    }
+
+    async function jfetch(url, options = {}) {
+      const res = await fetch(url, options);
+      let payload = null;
+      try { payload = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        const detail = payload && payload.detail ? payload.detail : `${res.status} ${res.statusText}`;
+        throw new Error(detail);
+      }
+      return payload;
+    }
+
+    function parseInferCameras() {
+      const text = inferCamerasInput.value.trim();
+      if (!text) return null;
+      return text.split(",").map(s => s.trim()).filter(Boolean);
+    }
+
+    function getSyncStepSec() {
+      const step = Number(syncStepInput.value);
+      if (!Number.isFinite(step) || step <= 0) return 1.0;
+      return step;
+    }
+
+    function quantizedSlotSec(timeSec, stepSec) {
+      return Math.floor(timeSec / stepSec) * stepSec;
+    }
+
+    function slotKey(slotSec) {
+      return slotSec.toFixed(3);
+    }
+
+    function putCache(key, value) {
+      if (!predictionCache.has(key)) {
+        predictionCacheOrder.push(key);
+        if (predictionCacheOrder.length > 200) {
+          const old = predictionCacheOrder.shift();
+          predictionCache.delete(old);
+        }
+      }
+      predictionCache.set(key, value);
+    }
+
+    function clearCache() {
+      predictionCache.clear();
+      predictionCacheOrder.length = 0;
+      queuedSlotKey = null;
+      latestRenderedSlotKey = null;
+    }
+
+    function clearCanvas() {
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#637083";
+      ctx.font = "14px IBM Plex Sans";
+      ctx.fillText("Trajectory panel: start sync to see predictions", 18, 28);
+    }
+
+    function drawPolyline(points, color) {
+      if (!points || points.length === 0) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(points[0][0], points[0][1]);
+      for (let i = 1; i < points.length; i += 1) {
+        ctx.lineTo(points[i][0], points[i][1]);
+      }
+      ctx.stroke();
+
+      ctx.fillStyle = color;
+      for (const p of points) {
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], 2.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function toCanvasPoints(xy, midX, midY, scale, cxCanvas, cyCanvas) {
+      return xy.map(([x, y]) => {
+        const px = cxCanvas + (x - midX) * scale;
+        const py = cyCanvas - (y - midY) * scale;
+        return [px, py];
+      });
+    }
+
+    function drawTraj(predXY, gtXY) {
+      clearCanvas();
+      if (!predXY || !gtXY || predXY.length === 0 || gtXY.length === 0) return;
+
+      const all = predXY.concat(gtXY);
+      const xs = all.map(p => p[0]);
+      const ys = all.map(p => p[1]);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const midX = (minX + maxX) / 2;
+      const midY = (minY + maxY) / 2;
+
+      const w = canvas.width;
+      const h = canvas.height;
+      const margin = 40;
+      const spanX = Math.max(maxX - minX, 1e-6);
+      const spanY = Math.max(maxY - minY, 1e-6);
+      const scale = Math.min((w - margin * 2) / spanX, (h - margin * 2) / spanY);
+
+      const cxCanvas = w / 2;
+      const cyCanvas = h / 2;
+
+      const predPts = toCanvasPoints(predXY, midX, midY, scale, cxCanvas, cyCanvas);
+      const gtPts = toCanvasPoints(gtXY, midX, midY, scale, cxCanvas, cyCanvas);
+
+      ctx.strokeStyle = "#d9dce1";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(margin, margin, w - margin * 2, h - margin * 2);
+
+      drawPolyline(gtPts, "#d62728");
+      drawPolyline(predPts, "#1f77b4");
+
+      ctx.fillStyle = "#111827";
+      ctx.font = "13px IBM Plex Sans";
+      ctx.fillText("Red: GT", margin, 20);
+      ctx.fillText("Blue: Pred", margin + 90, 20);
+    }
+
+    function renderPrediction(out, sourceSlotSec = null) {
+      metricsEl.textContent = `${out.ade_m.toFixed(3)} / ${out.fde_m.toFixed(3)}`;
+      chosenT0El.textContent = String(out.t0_us);
+      imageCountEl.textContent = `${out.num_input_images} (${out.num_cameras}x${out.num_frames_per_camera})`;
+      slotTimeEl.textContent = sourceSlotSec === null ? "manual" : sourceSlotSec.toFixed(3);
+      debugTextEl.textContent = out.assistant_text || "";
+      drawTraj(out.pred_xy_m, out.gt_xy_m);
+    }
+
+    // Minimum video time to ensure 1.6s of history data is available before t0
+    const MIN_VIDEO_TIME_S = 1.7;
+
+    async function requestPredictFromVideoTime(videoTimeSec) {
+      const clipNum = Number(clipSelect.value);
+      const camera = cameraSelect.value;
+      const safeVideoTime = Math.max(videoTimeSec, MIN_VIDEO_TIME_S);
+      const body = {
+        clip_num: clipNum,
+        camera_name: camera,
+        video_time_s: safeVideoTime,
+        camera_names: parseInferCameras(),
+        num_frames: Number(numFramesInput.value || 4),
+      };
+      return jfetch("/api/predict_from_video_time", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+
+    async function pauseVideoDuringPredict(runTask) {
+      const shouldResume = !video.paused && !video.ended;
+      if (shouldResume) {
+        video.pause();
+      }
+      try {
+        return await runTask();
+      } finally {
+        if (shouldResume) {
+          const wasMuted = video.muted;
+          video.muted = true;
+          try {
+            await video.play();
+          } catch (_) {
+            setStatus("Auto-resume blocked by browser. Click play manually.");
+          }
+          video.muted = wasMuted;
+        }
+      }
+    }
+
+    async function scheduleSlotPrediction(slotSec) {
+      const key = slotKey(slotSec);
+      if (predictionCache.has(key)) {
+        if (latestRenderedSlotKey !== key) {
+          renderPrediction(predictionCache.get(key), slotSec);
+          latestRenderedSlotKey = key;
+        }
+        return;
+      }
+
+      if (pendingSync) {
+        queuedSlotKey = key;
+        return;
+      }
+
+      pendingSync = true;
+      showInferring(true);
+      debugTextEl.textContent = "";
+      clearCanvas();
+      try {
+        await pauseVideoDuringPredict(async () => {
+          const predOut = await requestPredictFromVideoTime(slotSec);
+          putCache(key, predOut);
+          const step = getSyncStepSec();
+          const curKey = slotKey(quantizedSlotSec(video.currentTime || 0, step));
+          if (curKey === key || latestRenderedSlotKey !== key) {
+            renderPrediction(predOut, slotSec);
+            latestRenderedSlotKey = key;
+          }
+        });
+        setStatus(`Sync updated @ ${slotSec.toFixed(2)}s`, true);
+      } catch (err) {
+        setStatus(`Sync predict failed: ${err.message}`);
+      } finally {
+        showInferring(false);
+        pendingSync = false;
+        if (queuedSlotKey !== null) {
+          const nextKey = queuedSlotKey;
+          queuedSlotKey = null;
+          await scheduleSlotPrediction(Number(nextKey));
+        }
+      }
+    }
+
+    async function runSyncTick() {
+      if (!syncEnabled) return;
+      if (!video.src) return;
+      if (video.paused || video.ended) return;
+
+      const step = getSyncStepSec();
+      const slotSec = quantizedSlotSec(video.currentTime || 0, step);
+      await scheduleSlotPrediction(slotSec);
+    }
+
+    async function startSync() {
+      if (!video.src) {
+        setStatus("Load a video first");
+        return;
+      }
+      syncEnabled = true;
+      updateSyncBtn();
+      if (syncTimer !== null) clearInterval(syncTimer);
+      syncTimer = setInterval(() => { runSyncTick(); }, 250);
+      if (video.ended) {
+        video.currentTime = 0;
+      }
+      try {
+        await video.play();
+      } catch (err) {
+        setStatus(`Sync started, but autoplay failed: ${err.message}`);
+        return;
+      }
+      runSyncTick();
+      setStatus(`Sync running (step=${getSyncStepSec().toFixed(1)}s)`, true);
+    }
+
+    function stopSync() {
+      syncEnabled = false;
+      updateSyncBtn();
+      if (syncTimer !== null) {
+        clearInterval(syncTimer);
+        syncTimer = null;
+      }
+      setStatus("Sync stopped", true);
+    }
+
+    async function init() {
+      clearCanvas();
+      updateSyncBtn();
+      setStatus("Loading clip/camera list...");
+      const [clipResp, camResp] = await Promise.all([
+        jfetch("/api/clips?limit=200"),
+        jfetch("/api/cameras"),
+      ]);
+
+      clipSelect.innerHTML = "";
+      for (const clipItem of clipResp.clips) {
+        const opt = document.createElement("option");
+        opt.value = String(clipItem.clip_num);
+        opt.textContent = `#${clipItem.clip_num}`;
+        opt.dataset.clipId = clipItem.clip_id;
+        clipSelect.appendChild(opt);
+      }
+
+      cameraSelect.innerHTML = "";
+      for (const cam of camResp.cameras) {
+        const opt = document.createElement("option");
+        opt.value = cam;
+        opt.textContent = cam;
+        cameraSelect.appendChild(opt);
+      }
+      cameraSelect.value = "camera_front_wide_120fov";
+      inferCamerasInput.value = camResp.default_cameras.join(",");
+      numFramesInput.value = "4";
+      syncStepInput.value = "3.0";
+
+      setStatus("Ready", true);
+    }
+
+    async function loadClip() {
+      const clipNum = Number(clipSelect.value);
+      const clipId = clipSelect.options[clipSelect.selectedIndex]?.dataset?.clipId || "";
+      const camera = cameraSelect.value;
+      if (!Number.isFinite(clipNum) || !camera) {
+        setStatus("Please select clip and camera");
+        return;
+      }
+
+      stopSync();
+      clearCache();
+      setStatus("Loading video metadata...");
+      const videoMeta = await jfetch(`/api/video_meta_by_num/${clipNum}/${camera}`);
+      const videoUrl = `/api/video_by_num/${clipNum}/${camera}.mp4?v=${Date.now()}`;
+      video.src = videoUrl;
+      video.load();
+
+      metricsEl.textContent = "-";
+      chosenT0El.textContent = "-";
+      imageCountEl.textContent = "-";
+      slotTimeEl.textContent = "-";
+      debugTextEl.textContent = "";
+      clearCanvas();
+
+      setStatus(`Loaded #${clipNum} (${clipId}) / ${camera}`, true);
+    }
+
+    video.addEventListener("timeupdate", () => {
+      videoTimeEl.textContent = (video.currentTime || 0).toFixed(2);
+      if (!syncEnabled) return;
+      const step = getSyncStepSec();
+      const key = slotKey(quantizedSlotSec(video.currentTime || 0, step));
+      if (predictionCache.has(key) && latestRenderedSlotKey !== key) {
+        renderPrediction(predictionCache.get(key), Number(key));
+        latestRenderedSlotKey = key;
+      }
+    });
+
+    video.addEventListener("play", () => {
+      if (syncEnabled) {
+        runSyncTick();
+      }
+    });
+
+    loadBtn.addEventListener("click", async () => {
+      try { await loadClip(); } catch (err) { setStatus(`Load failed: ${err.message}`); }
+    });
+
+    syncBtn.addEventListener("click", async () => {
+      if (syncEnabled) {
+        stopSync();
+      } else {
+        try { await startSync(); } catch (err) { setStatus(`Sync failed: ${err.message}`); }
+      }
+    });
+
+    init().catch(err => setStatus(`Init failed: ${err.message}`));
+  </script>
+</body>
+</html>
