@@ -116,6 +116,15 @@ def load_physical_aiavdataset(
     ).astype(np.int64)
     future_timestamps = t0_us + future_offsets_us
 
+    # Clamp future timestamps to the egomotion valid range.
+    # Use floor (not round) and subtract 1 to stay strictly inside the Slerp bounds.
+    ego_max_us = int(egomotion.timestamps[-1] - egomotion.timestamps[0]) - 1
+    future_timestamps = future_timestamps[future_timestamps <= ego_max_us]
+    if future_timestamps.size == 0:
+        raise ValueError(
+            f"t0_us={t0_us} is too close to clip end (max={ego_max_us}us), no future steps available"
+        )
+
     # Get egomotion at history and future timestamps
     ego_history = egomotion(history_timestamps)
     ego_history_xyz = ego_history.pose.translation  # (num_history_steps, 3)

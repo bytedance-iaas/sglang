@@ -10,6 +10,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 
 
 
@@ -38,20 +39,18 @@ hist_traj_placeholder = (
 frames = data["image_frames"].flatten(0, 1)
 
 
-def _encode_rgb_tensor_to_png_base64(image: torch.Tensor, save_path: str | None = None) -> str:
-	"""Encode an RGB image tensor to a base64 PNG string.
+def _encode_rgb_tensor_to_base64(image: torch.Tensor, fmt: str = "JPEG", quality: int = 85) -> str:
+	"""Encode an RGB image tensor to a base64 string.
 
 	Expects `image` shaped (3, H, W). Accepts uint8 (0-255) or float (0-1).
-	If save_path is provided, also writes the PNG to disk.
+	fmt: "PNG" or "JPEG". JPEG is much faster to encode.
 	"""
-	if not isinstance(image, torch.Tensor):
-		raise TypeError(f"Expected torch.Tensor, got {type(image)}")
+	from PIL import Image
 
 	tensor = image.detach().cpu()
 	if tensor.ndim != 3:
 		raise ValueError(f"Expected a 3D tensor (C,H,W), got shape={tuple(tensor.shape)}")
 
-    
 	if tensor.shape[0] == 3:
 		tensor_chw = tensor
 	elif tensor.shape[-1] == 3:
@@ -63,23 +62,29 @@ def _encode_rgb_tensor_to_png_base64(image: torch.Tensor, save_path: str | None 
 		tensor_chw = (tensor_chw.clamp(0, 1) * 255).to(torch.uint8)
 
 	array_hwc = tensor_chw.permute(1, 2, 0).numpy()
-
-	try:
-		from PIL import Image
-	except ImportError as e:
-		raise ImportError(
-			"Pillow is required to encode frames as PNG. Install it with `pip install pillow`."
-		) from e
-
 	img = Image.fromarray(array_hwc)
 
 	buf = io.BytesIO()
-	img.save(buf, format="PNG")
-	if save_path is not None:
-		img.save(save_path, format="PNG")
+	if fmt == "JPEG":
+		img.save(buf, format="JPEG", quality=quality)
+	else:
+		img.save(buf, format="PNG")
 	return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-images = [image_b64 for image_b64 in [_encode_rgb_tensor_to_png_base64(frame) for frame in frames]]
+# Compare PNG vs JPEG encoding time
+t_enc = time.perf_counter()
+images_png = [_encode_rgb_tensor_to_base64(frame, fmt="PNG") for frame in frames]
+t_png = time.perf_counter() - t_enc
+print(f"PNG encoding: {t_png:.2f}s for {len(frames)} frames, total size: {sum(len(b) for b in images_png) / 1024:.0f} KB")
+
+t_enc = time.perf_counter()
+images_jpg = [_encode_rgb_tensor_to_base64(frame, fmt="JPEG", quality=85) for frame in frames]
+t_jpg = time.perf_counter() - t_enc
+print(f"JPEG encoding: {t_jpg:.2f}s for {len(frames)} frames, total size: {sum(len(b) for b in images_jpg) / 1024:.0f} KB")
+
+# Use JPEG for actual inference
+images = images_jpg
+IMG_MIME = "image/jpeg"
 # Extract trajectory history
 history_traj = {
     "ego_history_xyz": data["ego_history_xyz"].tolist(),
@@ -129,11 +134,13 @@ client = OpenAI(
 messages = [
   {"role": "system", "content": "You are a driving assistant that generates safe and accurate actions."},
   {"role": "user", "content": [
-      *[{"type":"image_url","image_url":{"url": f"data:image/png;base64,{b64}"}} for b64 in images],
+      *[{"type":"image_url","image_url":{"url": f"data:{IMG_MIME};base64,{b64}"}} for b64 in images],
       {"type":"text","text": f"{hist_traj_placeholder}output the chain-of-thought reasoning of the driving process, then output the future trajectory"},
   ]},
   {"role": "assistant", "content": "<|cot_start|>"},
 ]
+
+now = time.perf_counter()
 resp = client.chat.completions.create(
 	model="Qwen/Qwen3-VL-8B-Instruct",
 	messages=messages,
@@ -142,6 +149,9 @@ resp = client.chat.completions.create(
 	temperature=0.6,
 	top_p=0.98,
 )
+t_request = time.perf_counter() - now
+print(f"HTTP request (JPEG): {t_request:.2f}s")
+print(f"Total (encode + request): {t_jpg + t_request:.2f}s  (was PNG: {t_png + t_request:.2f}s estimated)")
 
 print(resp.choices[0].message.content)
 sglext = getattr(resp, "sglext", None)

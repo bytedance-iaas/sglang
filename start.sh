@@ -1,4 +1,4 @@
-SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0 \
+# SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=1 \
 CUDA_VISIBLE_DEVICES=7 \
 SGLANG_ALPAMAYO_FM_DEBUG=0 \
 SGLANG_ALPAMAYO_FM_DEBUG_MAX_STEPS=10 \
@@ -9,7 +9,7 @@ python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B \
  --disable-cuda-graph \
  --disable-overlap-schedule \
  --attention-backend triton \
- --skip-server-warmup 
+# --skip-server-warmup 
  # flashinfer has bug
  # triton GOOD
  # torch_native BUG

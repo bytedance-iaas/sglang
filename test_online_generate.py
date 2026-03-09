@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 
 clip_ids = pd.read_parquet("clip_ids.parquet")["clip_id"].tolist()
-clip_id = clip_ids[1]
+clip_id = clip_ids[80]
 pkl_filename = f"{clip_id}_data.pkl"
 
 if not os.path.exists(pkl_filename):
@@ -109,9 +109,9 @@ payload = {
     "image_data": image_data,
     "history_traj": history_traj,
     "sampling_params": {
-        "temperature": 0,
-        "top_p": 1,
-        "max_new_tokens": 32,
+        "temperature": 0.6,
+        "top_p": 0.98,
+        "max_new_tokens": 256,
     },
     "stream": False,
 }
