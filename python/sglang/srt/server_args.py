@@ -683,6 +683,8 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
+    
+    enable_batch_compute_mm_embeddings: bool = False
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
@@ -4751,6 +4753,14 @@ class ServerArgs:
             nargs="+",
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
         )
+        
+        parser.add_argument(
+            "--enable-batch-compute-mm-embeddings",
+            action="store_true",
+            default=ServerArgs.enable_batch_compute_mm_embeddings,
+            help="Enable batch computing of mm item embeddings across multiple requests.",
+        )
+        
         parser.add_argument(
             "--enable-deterministic-inference",
             action="store_true",
