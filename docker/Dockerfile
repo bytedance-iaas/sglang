@@ -233,11 +233,12 @@ RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ]; then \
 
 # 使用bytedance-iaas代码仓进行sglang安装
 ARG SGLANG_BRANCH
+ARG SGLANG_REPO=https://github.com/bytedance-iaas/sglang.git
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
     else \
-        git clone --depth=1 https://github.com/bytedance-iaas/sglang.git -b ${SGLANG_BRANCH} /sgl-workspace/sglang; \
+        git clone --depth=1 ${SGLANG_REPO} -b ${SGLANG_BRANCH} /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
 
