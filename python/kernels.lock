@@ -1,0 +1,24 @@
+[
+  {
+    "repo_id": "kernels-community/sgl-flash-attn3",
+    "sha": "9792b2c410f8cd6b133297b7a6cfb9fa259cff02",
+    "variants": {
+      "torch210-cxx11-cu128-x86_64-linux": {
+        "hash": "sha256-eaf7ff3fe4e938886877900c398af036302efe74276fe0c26757c4ff33793162",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch210-cxx11-cu130-x86_64-linux": {
+        "hash": "sha256-356068bfe6400feb564ef524b73d63fbd6b779f721616bf9353d2ded0325973f",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch29-cxx11-cu128-x86_64-linux": {
+        "hash": "sha256-d9f1b14586ba03bc4a2e8f9feb2f2844457059226ffaec40be90be0e095c289c",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch29-cxx11-cu130-x86_64-linux": {
+        "hash": "sha256-df8ad4e04f4c45dad87da0215dc2c33a22681777e43ff347fa1cb8cd1d7e7f77",
+        "hash_type": "git_lfs_concat"
+      }
+    }
+  }
+]
