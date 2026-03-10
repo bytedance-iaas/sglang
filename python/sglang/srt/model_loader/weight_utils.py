@@ -190,13 +190,32 @@ def get_quant_config(
 
     # Read the quantization config from the HF model config, if available.
     hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
+    compression_config = getattr(model_config.hf_config, "compression_config", None)
     # some vision model may keep quantization_config in their text_config
     hf_text_config = getattr(model_config.hf_config, "text_config", None)
     if hf_quant_config is None and hf_text_config is not None:
         hf_quant_config = getattr(hf_text_config, "quantization_config", None)
-    if hf_quant_config is None:
+    text_compression_config = None
+    if hf_text_config is not None:
+        text_compression_config = getattr(hf_text_config, "compression_config", None)
+    if compression_config is None and text_compression_config is not None:
+        compression_config = text_compression_config
+    if model_config.quantization == "w4afp8" and compression_config is not None:
+        if not isinstance(compression_config, dict):
+            compression_config = compression_config.to_dict()
+        merged_config = dict(compression_config)
+        merged_config.setdefault("format", "compressed-tensors")
+        merged_config["quant_method"] = "w4afp8"
+        if isinstance(hf_quant_config, dict) and "group_size" in hf_quant_config:
+            merged_config.setdefault("group_size", hf_quant_config["group_size"])
+        merged_config["packed_modules_mapping"] = packed_modules_mapping
+        return quant_cls.from_config(merged_config)
+    elif hf_quant_config is None:
         # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+        hf_quant_config = compression_config
+    # if hf_quant_config is None:
+    #     # compressed-tensors uses a compressions_config
+    #     hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
