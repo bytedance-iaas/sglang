@@ -328,7 +328,7 @@ fi
 # Download flashinfer cubins if the local set is incomplete
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
-# manually remove the nvidia-cutlass-dsl-libs-base package which has broken dependencies with cutedsl 0.4.3 and causes pip install to fail
+# Clean nvidia-cutlass-dsl-libs-base for cutedsl lower than 0.4.4
 $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
 $PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX || true
 
