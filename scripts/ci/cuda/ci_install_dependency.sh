@@ -227,11 +227,6 @@ fi
 # Show current packages
 $PIP_CMD list
 
-# manually remove the nvidia-cutlass-dsl-libs-base package which has broken dependencies with cutedsl 0.4.3 and causes pip install to fail
-$PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
-$PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX || true
-
-
 # Install other python dependencies
 $PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
@@ -333,8 +328,10 @@ fi
 # Download flashinfer cubins if the local set is incomplete
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
-# Clean nvidia-cutlass-dsl-libs-base for cutedsl lower than 0.4.4
+# manually remove the nvidia-cutlass-dsl-libs-base package which has broken dependencies with cutedsl 0.4.3 and causes pip install to fail
 $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+$PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX || true
+
 
 # Show current packages
 $PIP_CMD list
