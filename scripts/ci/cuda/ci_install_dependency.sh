@@ -227,6 +227,11 @@ fi
 # Show current packages
 $PIP_CMD list
 
+# manually remove the nvidia-cutlass-dsl-libs-base package which has broken dependencies with cutedsl 0.4.3 and causes pip install to fail
+$PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
+$PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX || true
+
+
 # Install other python dependencies
 $PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
@@ -334,6 +339,7 @@ $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
+python3 -c "import cutlass; import cutlass.cute;"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
