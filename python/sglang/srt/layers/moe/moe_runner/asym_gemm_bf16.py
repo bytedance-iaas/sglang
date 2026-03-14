@@ -160,6 +160,7 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             expected_m,
+            num_groups,
         )
         dispose_tensor(hidden_states)
 
@@ -195,6 +196,7 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
+            num_groups,
         )
 
         return down_output

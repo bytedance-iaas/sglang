@@ -264,15 +264,17 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
 
-    def execute(self, m):
-        asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
-            (self.lhs_q, self.lhs_s),
-            (self.rhs_q, self.rhs_s),
-            self.out,
-            masked_m=self.masked_m,
-            expected_m=m,
-        )
+    # def execute(self, m):
+    #     asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
+    #         (self.lhs_q, self.lhs_s),
+    #         (self.rhs_q, self.rhs_s),
+    #         self.out,
+    #         masked_m=self.masked_m,
+    #         expected_m=m,
+    #     )
 
+    def execute(self, m):
+        return
 
 class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
@@ -319,13 +321,91 @@ class _GroupedMaskedBf16WarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(
-            self.lhs,
-            self.rhs,
-            self.out,
-            masked_m=self.masked_m,
-            expected_m=m,
-        )
+        return
+    # def execute(self, m):
+    #     from .entrypoint import build_offsets_experts_from_masked_m
+        
+    #     num_groups = self.lhs.shape[0]
+    #     offsets, experts, list_size = build_offsets_experts_from_masked_m(
+    #         self.masked_m,
+    #         num_groups,
+    #     )
+
+    #     rhs = self.rhs.detach().to("cpu", non_blocking=False).pin_memory()
+
+    #     asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(
+    #         self.lhs,
+    #         rhs,
+    #         self.out,
+    #         offsets,
+    #         experts,
+    #         list_size,
+    #         m,
+    #         compiled_dims="nk",
+    #     )
+    # def execute(self, m):
+    #     from .entrypoint import build_offsets_experts_from_masked_m
+    #     device = self.lhs.device
+    #     num_groups = self.lhs.shape[0]
+
+    #     # 1) rhs 必须是 CPU pinned
+    #     rhs = self.rhs
+    #     if rhs.device.type == "cuda":
+    #         rhs = rhs.detach().to("cpu", non_blocking=False).pin_memory()
+    #     elif rhs.device.type == "cpu" and not rhs.is_pinned():
+    #         rhs = rhs.pin_memory()
+
+    #     # 2) warmup 不要用全 0 masked_m，至少给一个合法 active group
+    #     masked_m = self.masked_m.clone()
+    #     if int(masked_m.sum().item()) == 0:
+    #         masked_m.zero_()
+    #         masked_m[0] = m
+
+    #     # 3) 构造 offsets / experts，注意 device 跟随 lhs.device
+    #     offsets, experts, list_size = build_offsets_experts_from_masked_m(
+    #         masked_m,
+    #         num_groups,
+    #     )
+    #     offsets = offsets.to(device=device, dtype=torch.int32).contiguous()
+    #     experts = experts.to(device=device, dtype=torch.int32).contiguous()
+
+    #     # 4) 强约束检查
+    #     assert self.lhs.device == device
+    #     assert self.out.device == device
+    #     assert self.lhs.dtype == torch.bfloat16
+    #     assert self.out.dtype == torch.bfloat16
+    #     assert rhs.device.type == "cpu"
+    #     assert rhs.is_pinned()
+    #     assert offsets.dtype == torch.int32
+    #     assert experts.dtype == torch.int32
+    #     assert offsets.device == device
+    #     assert experts.device == device
+    #     assert offsets.is_contiguous()
+    #     assert experts.is_contiguous()
+    #     assert list_size == offsets.numel() == experts.numel()
+    #     assert offsets[-1].item() >= 0
+    #     assert experts[-1].item() == -1
+    #     assert masked_m.numel() == num_groups
+
+    #     print("=== AsymGEMM warmup debug ===")
+    #     print("lhs:", self.lhs.shape, self.lhs.device, self.lhs.dtype, self.lhs.is_contiguous())
+    #     print("rhs:", rhs.shape, rhs.device, rhs.dtype, rhs.is_pinned())
+    #     print("out:", self.out.shape, self.out.device, self.out.dtype, self.out.is_contiguous())
+    #     print("masked_m[:8]:", masked_m[:8], "sum=", int(masked_m.sum().item()))
+    #     print("offsets[:8]:", offsets[:8], "last=", int(offsets[-1].item()))
+    #     print("experts[:8]:", experts[:8], "last=", int(experts[-1].item()))
+    #     print("list_size:", list_size, "expected_m:", m)
+
+    #     asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(
+    #         self.lhs,
+    #         rhs,
+    #         self.out,
+    #         offsets,
+    #         experts,
+    #         list_size,
+    #         m,
+    #         compiled_dims="nk",
+    #     )
 
 
 @contextmanager

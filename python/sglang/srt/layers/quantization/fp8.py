@@ -22,6 +22,7 @@ from sglang.srt.layers.amx_utils import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.asym_gemm import AsymGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
@@ -355,7 +356,7 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         weight = ModelWeightParameter(
             data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+                output_size_per_partition, input_size_per_partition, dtype=weight_dtype,
             ),
             input_dim=1,
             output_dim=0,
@@ -820,6 +821,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size,
                     dtype=params_dtype,
+                    device="cpu" if get_moe_runner_backend().is_asym_gemm() else None,
+                    pin_memory=get_moe_runner_backend().is_asym_gemm(),
                 ),
                 requires_grad=False,
             )
@@ -829,6 +832,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition,
                     dtype=params_dtype,
+                    device="cpu" if get_moe_runner_backend().is_asym_gemm() else None,
+                    pin_memory=get_moe_runner_backend().is_asym_gemm(),
                 ),
                 requires_grad=False,
             )
@@ -1035,9 +1040,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and will_use_deepgemm
                 and not layer.w13_weight_scale_inv.format_ue8m0
             ):
-                assert isinstance(
-                    layer, DeepEPMoE
-                ), "DeepGemm MoE is only supported with DeepEPMoE"
+                # assert isinstance(
+                #     layer, DeepEPMoE
+                # ), "DeepGemm MoE is only supported with DeepEPMoE"
                 weight_block_size = self.quant_config.weight_block_size
                 requant_weight_ue8m0_inplace(
                     layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
@@ -1227,6 +1232,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.runner.runner_backend.is_asym_gemm() :
+            return 
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
             return
@@ -1444,8 +1451,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        else:
+            if moe_runner_backend.is_asym_gemm():
+                moe_runner_backend = MoeRunnerBackend.ASYM_GEMM
         if (
             moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_asym_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
@@ -1539,8 +1550,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 enable_es=(use_mxfp8, use_mxfp8),
             )
             return StandardCombineInput(hidden_states=output)
-
-        if self.runner.runner_backend.is_deep_gemm():
+        
+        if self.runner.runner_backend.is_deep_gemm() :
 
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
@@ -1649,6 +1660,43 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+            )
+        elif self.runner.runner_backend.is_asym_gemm() :
+
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+            if self.block_quant:
+                block_shape = self.quant_config.weight_block_size
+                w13_scale = layer.w13_weight_scale_inv
+                w2_scale = layer.w2_weight_scale_inv
+            else:
+                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+                scale_block_size = 128
+                block_shape = [scale_block_size, scale_block_size]
+                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                w13_scale = (
+                    layer.w13_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w13_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w13_scale_k, dim=2)
+                )
+                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+                w2_scale = (
+                    layer.w2_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w2_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w2_scale_k, dim=2)
+                )
+            quant_info = AsymGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=True,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=block_shape,
             )
         else:
             raise NotImplementedError(
