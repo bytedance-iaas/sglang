@@ -19,10 +19,15 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.eic_memory_pool import (
     EICMHATokenToKVPoolHost,
     EICMLATokenToKVPoolHost,
+    EICNSATokenToKVPoolHost,
     MemoryStateInt,
     get_eic_config_file_path,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
@@ -79,6 +84,57 @@ def mla_pool_transfer(
         self.kv_buffer[i][indices] = flat_data[i]
 
 
+def nsa_pool_get_flat_data(self: NSATokenToKVPool, indices: torch.Tensor):
+    num_pages = len(indices) // self.page_size
+
+    # Gather MLA (num_tokens, 1, kv_cache_dim) -> (layer_num, num_tokens, kv_cache_dim)
+    mla_data = torch.stack([self.kv_buffer[i][indices] for i in range(self.layer_num)])
+    # (layer_num, num_pages, mla_page_bytes)
+    mla_bytes = mla_data.view(self.layer_num, num_pages, -1).view(torch.uint8)
+
+    # Gather NSA
+    page_indices = indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+    # (layer_num, num_pages, 8448)
+    nsa_packed = torch.stack(
+        [self.index_k_with_scale_buffer[i][page_indices] for i in range(self.layer_num)]
+    )
+
+    combined = torch.cat(
+        [mla_bytes, nsa_packed], dim=-1
+    )  # (layer_num, num_pages, final_dim)
+    return combined
+
+
+def nsa_pool_transfer(
+    self: NSATokenToKVPool,
+    indices: torch.Tensor,
+    flat_data: torch.Tensor,
+):
+    flat_data = flat_data.to(device=self.device, non_blocking=False)
+    # flat_data: (layer_num, num_pages, final_dim)
+    num_pages = len(indices) // self.page_size
+    mla_page_bytes = self.kv_cache_dim * self.store_dtype.itemsize * self.page_size
+    page_indices = indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+
+    for i in range(self.layer_num):
+        layer_data = flat_data[i]  # (num_pages, final_dim)
+
+        # Split
+        mla_bytes = layer_data[:, :mla_page_bytes]
+        nsa_bytes = layer_data[:, mla_page_bytes:]
+
+        # Write MLA
+        mla_part = (
+            mla_bytes.reshape(-1)
+            .view(self.store_dtype)
+            .reshape(num_pages * self.page_size, 1, self.kv_cache_dim)
+        )
+        self.kv_buffer[i][indices] = mla_part
+
+        # Write NSA
+        self.index_k_with_scale_buffer[i][page_indices] = nsa_bytes
+
+
 class EICHiRadixCache(RadixCache):
 
     def __init__(
@@ -102,6 +158,18 @@ class EICHiRadixCache(RadixCache):
             )
             self.kv_cache.get_flat_data = partial(mha_pool_get_flat_data, self.kv_cache)
             self.kv_cache.transfer = partial(mha_pool_transfer, self.kv_cache)
+        elif isinstance(self.kv_cache, NSATokenToKVPool):
+            self.token_to_kv_pool_host = EICNSATokenToKVPoolHost(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                "cpu",
+                params.page_size,
+                self.rank,
+                extra_info=self.get_extra_info(params, server_args),
+            )
+            self.kv_cache.get_flat_data = partial(nsa_pool_get_flat_data, self.kv_cache)
+            self.kv_cache.transfer = partial(nsa_pool_transfer, self.kv_cache)
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
                 self.kv_cache,
@@ -115,7 +183,7 @@ class EICHiRadixCache(RadixCache):
             self.kv_cache.get_flat_data = partial(mla_pool_get_flat_data, self.kv_cache)
             self.kv_cache.transfer = partial(mla_pool_transfer, self.kv_cache)
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(f"HiRadixCache only supports MHA, MLA and NSA yet")
 
         self.load_cache_event = threading.Event()
         self.cache_controller = EICCacheController(
@@ -264,6 +332,7 @@ class EICHiRadixCache(RadixCache):
         for ack_id, success in zip(ack_list, flags):
             if (
                 not success
+                and not isinstance(self, EICPagedHiRadixCache)
                 and self.ongoing_write_through[ack_id].host_value is not None
             ):
                 if (
@@ -563,7 +632,7 @@ class EICHiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped:
+            while not last_node.backuped and last_node.parent is not None:
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
@@ -872,6 +941,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         temp_node = node
         local_evict_len = 0
         while temp_node.evicted:
+            while not temp_node.backuped and temp_node.parent is not None:
+                temp_node = temp_node.parent
+                local_evict_len = 0
+            if not temp_node.evicted:
+                break
             local_evict_len += len(temp_node.host_value)
             temp_node = temp_node.parent
         return local_prefix_len, local_evict_len, node
@@ -1021,7 +1095,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped:
+            while not last_node.backuped and last_node.parent is not None:
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
