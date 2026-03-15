@@ -21,6 +21,77 @@ if ENABLE_JIT_ASYMGEMM:
 
 _SANITY_CHECK = get_bool_env_var("SGLANG_ASYMGEMM_SANITY_CHECK")
 
+_debug_dump_done = False
+
+# def grouped_gemm_nt_f8f8bf16_masked(
+#     lhs: Tuple[torch.Tensor, torch.Tensor],
+#     rhs: Tuple[torch.Tensor, torch.Tensor],
+#     out: torch.Tensor,
+#     masked_m: torch.Tensor,
+#     expected_m: int,
+#     overlap_args: Optional[Any] = None,
+#     max_block_n: int = 256,
+# ):
+#     num_groups, _, k = lhs[0].shape
+#     _, n, _ = rhs[0].shape
+#     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+
+#     _sanity_check_input(lhs)
+#     _sanity_check_input(rhs)
+
+#     offsets, experts, list_size = build_offsets_experts_from_masked_m(
+#         masked_m, num_groups
+#     )
+
+#     with compile_utils.asym_gemm_execution_hook(
+#         expected_m, n, k, num_groups, kernel_type
+#     ):
+#         with configure_asym_gemm_num_sms(
+#             overlap_args.num_sms if overlap_args is not None else None
+#         ):
+#             active_experts = experts[:list_size - 1].cpu().tolist()
+
+#             debug_this_call = (17 in active_experts) and (106 in active_experts)
+
+#             if debug_this_call:
+#                 _PRINTED = True
+#                 idx = active_experts.index(106)
+#                 print("\nPY DEBUG >>> first call with expert 106")
+#                 print("segment idx =", idx)
+#                 print("offset range =", offsets[idx].item(), offsets[idx + 1].item())
+#                 print("BEFORE out[106,0,:8] =", out[106, 0, :8])
+
+#                 print("lhs[0][106,0,:8] =", lhs[0][106, 0, :8])
+#                 print("rhs[0][106,0,:8] =", rhs[0][106, 0, :8])
+
+#                 print("lhs[1][106,0,:] =", lhs[1][106, 0, :])
+#                 print("rhs[1][106,0,:] =", rhs[1][106, 0, :])
+
+#                 print("lhs nan/inf =", torch.isnan(lhs[0][106,0].float()).any().item(),
+#                     torch.isinf(lhs[0][106,0].float()).any().item())
+#                 print("rhs nan/inf =", torch.isnan(rhs[0][106].float()).any().item(),
+#                     torch.isinf(rhs[0][106].float()).any().item())
+            
+#             ret = asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
+#                 lhs,
+#                 rhs,
+#                 out,
+#                 offsets,
+#                 experts,
+#                 list_size, 
+#                 expected_m,
+#                 None,
+#                 "nk",
+#                 False,
+#             )
+
+#             if debug_this_call:
+#                 torch.cuda.synchronize()
+#                 print("AFTER  out[106,0,:8] =", out[106, 0, :8])
+
+#             return ret
+
+        
 
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -31,6 +102,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
+    
+
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
@@ -42,12 +115,48 @@ def grouped_gemm_nt_f8f8bf16_masked(
         masked_m, num_groups
     )
 
+    # ---------------- debug trigger ----------------
+    active_experts = experts[:list_size - 1].cpu().tolist()
+    debug_this_call = (17 in active_experts) and (106 in active_experts)
+
+    global _debug_dump_done
+
+    if debug_this_call and not _debug_dump_done:
+        _debug_dump_done = True
+
+        print("\n===== DEBUG DUMP TRIGGERED =====")
+        print("active_experts:", active_experts)
+        print("list_size:", list_size)
+        print("expected_m:", expected_m)
+        print("masked_m[17]:", masked_m[17].item())
+        print("masked_m[106]:", masked_m[106].item())
+
+        torch.save(
+            {
+                "lhs0": lhs[0].cpu(),
+                "lhs1": lhs[1].cpu(),
+                "rhs0": rhs[0].cpu(),
+                "rhs1": rhs[1].cpu(),
+                "masked_m": masked_m.cpu(),
+                "offsets": offsets.cpu(),
+                "experts": experts.cpu(),
+                "list_size": list_size,
+                "expected_m": expected_m,
+            },
+            "asym_gemm_bug_dump.pt",
+        )
+
+        print("Dump saved to asym_gemm_bug_dump.pt")
+        print("================================\n")
+    # ------------------------------------------------
+
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
         with configure_asym_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
+                  
             return asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
                 lhs,
                 rhs,
@@ -60,7 +169,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 "nk",
                 False,
             )
-
         
 def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -78,30 +186,45 @@ def grouped_gemm_nt_f8f8bf16_contig(
     with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(lhs, rhs, out, m_indices)
 
-def build_offsets_experts_from_masked_m(
-    masked_m: torch.Tensor,
-    num_groups: int,
-    block_m: int = 128,
-):
+# def build_offsets_experts_from_masked_m(
+#     masked_m: torch.Tensor,
+#     num_groups: int,
+#     block_m: int = 128,
+# ):
+#     offsets = []
+#     experts = []
+#     curr_offset = 0
+
+#     for g in range(num_groups):
+#         v = masked_m[g].item()
+#         if v > 0:
+#             offsets.append(curr_offset)
+#             experts.append(g)
+#             curr_offset += ((v + block_m - 1) // block_m) * block_m
+
+#     offsets.append(curr_offset)
+#     experts.append(-1)
+
+#     return (
+#         torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+#         torch.tensor(experts, dtype=torch.int32, device="cuda"),
+#         len(offsets),
+#     )
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
     offsets = []
     experts = []
     curr_offset = 0
-
     for g in range(num_groups):
         v = masked_m[g].item()
         if v > 0:
             offsets.append(curr_offset)
             experts.append(g)
             curr_offset += ((v + block_m - 1) // block_m) * block_m
-
     offsets.append(curr_offset)
     experts.append(-1)
-
-    return (
-        torch.tensor(offsets, dtype=torch.int32, device="cuda"),
-        torch.tensor(experts, dtype=torch.int32, device="cuda"),
-        len(offsets),
-    )
+    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
+            torch.tensor(experts, dtype=torch.int32, device='cuda'), 
+            len(offsets))
 
 def grouped_gemm_nt_bf16bf16bf16_masked(
     lhs: torch.Tensor,
