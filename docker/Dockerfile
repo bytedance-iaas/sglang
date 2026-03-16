@@ -321,6 +321,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
+RUN --mount=type=cache,target=/root/.cache/pip \
+   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall;
+
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \

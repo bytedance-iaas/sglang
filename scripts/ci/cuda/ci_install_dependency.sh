@@ -328,6 +328,9 @@ fi
 # Download flashinfer cubins if the local set is incomplete
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
+# Force reinstall nvidia-cutlass-dsl to avoid potential version mismatch issues
+$PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall $PIP_INSTALL_SUFFIX || true
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
