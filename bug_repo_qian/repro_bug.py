@@ -5,21 +5,49 @@ import asym_gemm
 from pathlib import Path
 import os
 
-def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128):
+    """
+    Build offsets and experts for sparse m-grouped masked GEMM with fixed per-group allocation.
+
+    Each group gets fixed allocation of max_m space, regardless of actual token count.
+    Only groups with masked_m[g] > 0 are included in the output mapping.
+    Each active group generates a pair of offsets (start, end).
+
+    Args:
+        masked_m: (num_groups,) tensor of actual token counts per group
+        num_groups: number of expert groups
+        max_m: maximum allocated space per group
+        block_m: block alignment for padding (default 128)
+
+    Returns:
+        offsets: flat tensor with pairs [start_0, end_0, start_1, end_1, ...]
+        experts: expert IDs for each active group + terminator (-1)
+        list_size: number of experts in output (excluding terminator)
+
+    Example:
+        masked_m = [0, 12, 0, 129], num_groups = 4, max_m = 4096
+        offsets = [4096, 4224, 12288, 12544]  # 4 offsets = 2 pairs
+        experts = [1, 3, -1]  # 2 active experts + terminator
+    """
     offsets = []
     experts = []
-    curr_offset = 0
+
     for g in range(num_groups):
         v = masked_m[g].item()
-        if v > 0:
-            offsets.append(curr_offset)
+        if v > 0:  # Only process active groups
+            start = g * max_m
+            # Pad actual tokens to block_m alignment
+            end = start + ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
             experts.append(g)
-            curr_offset += ((v + block_m - 1) // block_m) * block_m
-    offsets.append(curr_offset)
+
+    # Add terminator expert
     experts.append(-1)
-    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
-            torch.tensor(experts, dtype=torch.int32, device='cuda'), 
-            len(offsets))
+
+    return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+            torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+            len(experts))
 
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -36,10 +64,10 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     # kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    # deep_gemm.m_grouped_fp8_gemm_nt_masked(lhs, rhs, out, masked_m, 128, disable_ue8m0_cast=True)
+    # deep_gemm.m_grouped_fp8_gemm_nt_masked(lhs, rhs, out, masked_m, 1, disable_ue8m0_cast=True)
 
     offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m, num_groups
+        masked_m, num_groups, lhs[0].size()[1]
     )
 
     asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(lhs, rhs, out, offsets, experts, list_size, 128, disable_ue8m0_cast=True)
