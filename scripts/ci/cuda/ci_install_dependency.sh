@@ -178,17 +178,6 @@ fi
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
-# Remove flash_attn folder to avoid conflicts
-PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
-FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
-
-if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
-else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
-fi
-
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
