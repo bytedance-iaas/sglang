@@ -117,7 +117,7 @@ else
 fi
 
 # Clean up existing installations
-$PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
+$PIP_UNINSTALL_CMD sgl-kernel sglang sgl-fa4 $PIP_UNINSTALL_SUFFIX || true
 # Keep flashinfer packages installed if version matches to avoid re-downloading:
 # - flashinfer-cubin: 150+ MB, plus extra cubins from ci_download_flashinfer_cubin.sh
 # - flashinfer-jit-cache: 1.2+ GB, by far the largest download in CI
@@ -318,7 +318,6 @@ fi
 bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
 # Force reinstall nvidia-cutlass-dsl to avoid potential version mismatch issues
-$PIP_UNINSTALL_CMD sgl-fa4 $PIP_UNINSTALL_SUFFIX || true
 $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
 
 # Show current packages
