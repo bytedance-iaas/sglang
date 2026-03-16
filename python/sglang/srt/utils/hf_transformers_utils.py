@@ -170,6 +170,82 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+# Temporary hack for Alpamayo-R1 model
+def _load_alpamayo_r1_config(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    """Load Alpamayo-R1 config by building a proper Qwen3-VL config.
+
+    The original config has model_type='alpamayo_r1' which AutoConfig does not
+    recognize, and it's a flat JSON without nested text_config/vision_config.
+    We load the Qwen3-VL base config from tokenizer_path (which should point
+    to the base Qwen3-VL model), then overlay Alpamayo-specific fields.
+    """
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        alpamayo_json = json.load(f)
+
+    # Load the Qwen3-VL base config from tokenizer_path (the actual Qwen3-VL
+    # model directory) so we get correct text_config/vision_config dimensions.
+    # We try multiple sources for the tokenizer path since get_config may be
+    # called before global server_args is initialized.
+    tokenizer_path = None
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        tokenizer_path = server_args.tokenizer_path
+    except (ValueError, RuntimeError):
+        # Global server args not set yet (e.g. during ServerArgs.__post_init__).
+        # Fall back to reading --tokenizer-path from sys.argv.
+        import sys
+
+        for i, arg in enumerate(sys.argv):
+            if arg in ("--tokenizer-path", "--tokenizer_path") and i + 1 < len(sys.argv):
+                tokenizer_path = sys.argv[i + 1]
+                break
+
+    if tokenizer_path and tokenizer_path != model_path and os.path.exists(tokenizer_path):
+        config = AutoConfig.from_pretrained(
+            tokenizer_path, trust_remote_code=trust_remote_code, revision=revision
+        )
+    else:
+        raise RuntimeError(
+            "Failed to find a valid tokenizer path for loading Alpamayo-R1 config. ")
+
+
+    # The Qwen3-VL text_config may have rope_scaling=None if loaded from
+    # defaults. Ensure mRoPE is configured.
+    # if config.text_config.rope_scaling is None:
+    #     config.text_config.rope_scaling = {
+    #         "mrope_interleaved": True,
+    #         "mrope_section": [24, 20, 20],
+    #         "rope_type": "default",
+    #     }
+
+    # Overlay all Alpamayo-specific fields onto the config
+    for key, value in alpamayo_json.items():
+        if key in ("model_type", "transformers_version"):
+            continue
+        setattr(config, key, value)
+
+    # Update vocab_size in text_config to match Alpamayo's extended vocab
+    if hasattr(config, "text_config") and "vocab_size" in alpamayo_json:
+        config.text_config.vocab_size = alpamayo_json["vocab_size"]
+
+
+    # so current model_type is pretended to be qwen3_vl
+    setattr(config, "_name_or_path", model_path)
+    return config
+
+
 # Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_v32_model(
     model_path: str,
@@ -311,12 +387,17 @@ def get_config(
             config = AutoConfig.from_pretrained(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
-        except ValueError as e:
-            if not "deepseek_v32" in str(e):
+        except (ValueError, KeyError) as e:
+            if "alpamayo_r1" in str(e):
+                config = _load_alpamayo_r1_config(
+                    model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                )
+            elif "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                )
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
 
     if (
         config.architectures is not None
@@ -637,6 +718,7 @@ def get_processor(
                     revision=revision,
                     **kwargs,
                 )
+                logger.info(f"Loaded processor for {tokenizer_name} with model_type {config.model_type}")
 
     except ValueError as e:
         error_message = str(e)

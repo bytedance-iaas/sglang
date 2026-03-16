@@ -4,7 +4,8 @@ CUDA_VISIBLE_DEVICES=7 \
 SGLANG_ALPAMAYO_FM_DEBUG=0 \
 SGLANG_ALPAMAYO_FM_DEBUG_MAX_STEPS=10 \
 SGLANG_ALPAMAYO_FM_DISABLE_VLM_KV=0 \
-python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B \
+python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B-Origin \
+ --tokenizer-path /data/models/Qwen3-VL-8B-Instruct \
  --port 29003 \
  --tp 1 \
  --disable-cuda-graph \
