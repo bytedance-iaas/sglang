@@ -152,7 +152,12 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 def get_avdi() -> physical_ai_av.PhysicalAIAVDatasetInterface:
     global AVDI
     if AVDI is None:
-        AVDI = physical_ai_av.PhysicalAIAVDatasetInterface()
+        hf_home = os.environ.get("HF_HOME", "")
+        cache_dir = (Path(hf_home) / "hub") if hf_home else None
+        AVDI = physical_ai_av.PhysicalAIAVDatasetInterface(
+            revision="2ae73f49ffd2b5db43b404201beb7b92889f7afc",
+            cache_dir=cache_dir,
+        )
     return AVDI
 
 

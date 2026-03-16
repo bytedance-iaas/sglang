@@ -15,6 +15,8 @@
 
 """Load data from physical_ai_av.PhysicalAIAVDatasetInterface for model inference."""
 
+import os
+import pathlib
 from typing import Any
 
 import numpy as np
@@ -22,6 +24,13 @@ import physical_ai_av
 import scipy.spatial.transform as spt
 import torch
 from einops import rearrange
+
+
+def _default_cache_dir() -> pathlib.Path | None:
+    hf_home = os.environ.get("HF_HOME", "")
+    if hf_home:
+        return pathlib.Path(hf_home) / "hub"
+    return None
 
 
 def load_physical_aiavdataset(
@@ -68,7 +77,10 @@ def load_physical_aiavdataset(
             - clip_id: The clip ID
     """
     if avdi is None:
-        avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
+            revision="2ae73f49ffd2b5db43b404201beb7b92889f7afc",
+            cache_dir=_default_cache_dir(),
+        )
 
     if camera_features is None:
         camera_features = [
@@ -87,6 +99,10 @@ def load_physical_aiavdataset(
         "camera_rear_right_70fov": 5,
         "camera_front_tele_30fov": 6,
     }
+
+    # Pre-download the chunk files needed for this clip (no-op if already cached)
+    features_to_load = [avdi.features.LABELS.EGOMOTION] + list(camera_features)
+    avdi.download_clip_features(clip_id, features_to_load)
 
     # Load egomotion data
     egomotion = avdi.get_clip_feature(
