@@ -35,11 +35,6 @@ def _is_fa3_supported(device=None) -> bool:
         or torch.cuda.get_device_capability(device)[0] == 8
     )
 
-
-def _maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-
-
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -72,9 +67,6 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
-    score_mod=None,
-    aux_tensors=None,
-    ver=3,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -155,8 +147,6 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
-        score_mod [optional]: A callable that takes the attention scores and applies a modification.
-        aux_tensors [optional]: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -171,62 +161,32 @@ def flash_attn_with_kvcache(
 
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
-        )
-    if cache_seqlens is not None and isinstance(cache_seqlens, int):
-        cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
-        )
-        cache_seqlens = _maybe_contiguous(cache_seqlens)
-
-    q, k_cache, k, v = [_maybe_contiguous(x) for x in (q, k_cache, k, v)]
-    v_cache = (
-        v_cache.contiguous()
-        if v_cache.stride(-1) != 1 and v_cache.stride(-3) != 1
-        else v_cache
-    )
-    cu_seqlens_q, cu_seqlens_k_new = [
-        _maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k_new)
-    ]
-    page_table, cache_batch_idx, cache_leftpad = [
-        _maybe_contiguous(x) for x in (page_table, cache_batch_idx, cache_leftpad)
-    ]
-    rotary_cos, rotary_sin = [_maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
-    rotary_seqlens = _maybe_contiguous(rotary_seqlens)
-    attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
     ops = _load_fa3_kernels()
 
-    out, softmax_lse, *rest = ops.flash_attn_with_kvcache(
+    return ops.flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
         k,
         v,
         qv,
-        None,  # out
-        cu_seqlens_q,
-        None,  # cu_seqlens_k
-        cu_seqlens_k_new,
-        None,  # seqused_q
-        cache_seqlens,
-        max_seqlen_q,
-        None,  # max_seqlen_k
-        page_table,
-        cache_batch_idx,
-        cache_leftpad,
         rotary_cos,
         rotary_sin,
+        cache_seqlens,
+        cache_batch_idx,
+        cache_leftpad,
+        page_table,
+        cu_seqlens_q,
+        cu_seqlens_k_new,
+        max_seqlen_q,
         rotary_seqlens,
         q_descale,
         k_descale,
         v_descale,
         softmax_scale,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size,
         attention_chunk,
         softcap,
         rotary_interleaved,
@@ -234,10 +194,9 @@ def flash_attn_with_kvcache(
         num_splits,
         pack_gqa,
         sm_margin,
+        return_softmax_lse,
         sinks,
     )
-    # return (out, softmax_lse) if return_softmax_lse else out
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
 def flash_attn_varlen_func(
@@ -275,54 +234,31 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    # FA3 requires max_seqlen_q and max_seqlen_k
-    if max_seqlen_q is None or max_seqlen_k is None:
-        raise ValueError("max_seqlen_q and max_seqlen_k are required for FA3")
-
-    if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
-        )
-    attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
-
     ops = _load_fa3_kernels()
 
-    out, softmax_lse, *rest = ops.flash_attn_with_kvcache(
+    return ops.flash_attn_with_kvcache(
         q,
         k,
         v,
-        None,  # k_new
-        None,  # v_new
-        qv,  # qv
-        None,  # out
         cu_seqlens_q,
         cu_seqlens_k,
-        None,  # cu_seqlens_k_new
-        seqused_q,
-        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
-        None,  # page_table,
-        None,  # kv_batch_idx
-        None,  # leftpad_k
-        None,  # rotary cos
-        None,  # rotary sin
-        None,  # seqlens_rotary
+        seqused_q,
+        seqused_k,
+        page_table,
+        softmax_scale,
+        causal,
+        qv,
         q_descale,
         k_descale,
         v_descale,
-        softmax_scale,
-        causal,
-        window_size[0],
-        window_size[1],
+        window_size,
         attention_chunk,
         softcap,
-        is_rotary_interleaved=False,
-        scheduler_metadata=None,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=sm_margin,
-        sinks=sinks,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        return_softmax_lse,
+        sinks,
     )
-
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
