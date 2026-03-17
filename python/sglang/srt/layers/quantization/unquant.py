@@ -46,7 +46,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
@@ -199,7 +198,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
+            torch.empty(
+                num_experts, w13_weight_n, w13_weight_k,
+                dtype=params_dtype,
+                device="cpu" if get_moe_runner_backend().is_asym_gemm() else None,
+                pin_memory=get_moe_runner_backend().is_asym_gemm(),
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
@@ -221,7 +225,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
+            torch.empty(
+                num_experts, w2_weight_n, w2_weight_k,
+                dtype=params_dtype,
+                device="cpu" if get_moe_runner_backend().is_asym_gemm() else None,
+                pin_memory=get_moe_runner_backend().is_asym_gemm(),
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
