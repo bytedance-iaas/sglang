@@ -1,0 +1,28 @@
+[
+  {
+    "repo_id": "kernels-community/sgl-flash-attn3",
+    "sha": "2e86aff40bebd8cb8a9823e76f345d19a91a4a07",
+    "variants": {
+      "torch210-cxx11-cu128-x86_64-linux": {
+        "hash": "sha256-d85c85d5f13407ec69e6fa3e300c666b4342a9eab4c619a81728e7b70598acd0",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch210-cxx11-cu130-x86_64-linux": {
+        "hash": "sha256-fd64a4607113a73554499d1149d9f38575a526b72f3113cecd99bcc8c53dc709",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch29-cxx11-cu128-x86_64-linux": {
+        "hash": "sha256-f0e1f3e1614381cd457ae988d154a974f572b3b33c4a3917886e193e033f4417",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch29-cxx11-cu129-x86_64-linux": {
+        "hash": "sha256-e0d69f742bc8fd6e74010849bf53396ca36297ba9fe3091982c8ce9a2ac0eadd",
+        "hash_type": "git_lfs_concat"
+      },
+      "torch29-cxx11-cu130-x86_64-linux": {
+        "hash": "sha256-4bf007a81518bcc2a95403adf7704e822511fdb46fd90ed2c4c01a92d8ccc939",
+        "hash_type": "git_lfs_concat"
+      }
+    }
+  }
+]
