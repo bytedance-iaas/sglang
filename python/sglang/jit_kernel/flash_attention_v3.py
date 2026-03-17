@@ -1,9 +1,11 @@
+import logging
 from typing import Optional, Union
 
 import torch
-from kernels import load_kernel
 
 from sglang.jit_kernel.utils import cache_once
+
+logger = logging.getLogger(__name__)
 
 SGL_FA3_KERNEL_REPO = "kernels-community/sgl-flash-attn3"
 DEFAULT_FA3_KERNEL_LOCKFILE = "/sgl-workspace/sglang/python/kernels.lock"
@@ -12,6 +14,8 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "/sgl-workspace/sglang/python/kernels.lock"
 @cache_once
 def _load_fa3_kernels():
     try:
+        from kernels import load_kernel
+
         return load_kernel(SGL_FA3_KERNEL_REPO, lockfile=DEFAULT_FA3_KERNEL_LOCKFILE)
     except Exception as e:
         raise RuntimeError(
@@ -163,9 +167,16 @@ def flash_attn_with_kvcache(
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
-    ops = _load_fa3_kernels()
+    try:
+        flash_attn_with_kvcache = _load_fa3_kernels().flash_attn_with_kvcache
+    except Exception as e:
+        logger.warning(
+            f"Failed to load FlashAttention v3 kernel for flash_attn_with_kvcache: {e}."
+            "Rollback to implementation from sgl-kernel"
+        )
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-    return ops.flash_attn_with_kvcache(
+    return flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
@@ -225,9 +236,6 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
-    score_mod=None,
-    aux_tensors=None,
-    ver=3,
 ):
 
     if not _is_fa3_supported():
@@ -235,9 +243,16 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    ops = _load_fa3_kernels()
+    try:
+        flash_attn_varlen_func = _load_fa3_kernels().flash_attn_varlen_func
+    except Exception as e:
+        logger.warning(
+            f"Failed to load FlashAttention v3 kernel for flash_attn_varlen_func: {e}."
+            + "Rollback to implementation from sgl-kernel"
+        )
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    return ops.flash_attn_varlen_func(
+    return flash_attn_varlen_func(
         q,
         k,
         v,
