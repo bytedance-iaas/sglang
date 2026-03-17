@@ -1153,6 +1153,12 @@ def initialize_dummy_weights(
     """
     for param in model.state_dict().values():
         if torch.is_floating_point(param):
+            print(f"----------------- {param.device} {param.dtype} {param.shape}")
+            # fast path for CPU tensors
+            if param.device.type == "cpu":
+                param.fill_(0.5)
+                continue
+
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
             if torch.finfo(param.data.dtype).bits < 16:
