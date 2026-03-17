@@ -1021,6 +1021,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
+        elif self.runner.runner_backend.is_asym_gemm():
+            weight_block_size = self.quant_config.weight_block_size
+            requant_weight_ue8m0_inplace(
+                layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
+            )
+            requant_weight_ue8m0_inplace(
+                layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
+            )
+            layer.w13_weight_scale_inv.format_ue8m0 = True
+            layer.w2_weight_scale_inv.format_ue8m0 = True
+            return
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
