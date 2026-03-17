@@ -211,15 +211,14 @@ def _load_alpamayo_r1_config(
             if arg in ("--tokenizer-path", "--tokenizer_path") and i + 1 < len(sys.argv):
                 tokenizer_path = sys.argv[i + 1]
                 break
-
+    
     if tokenizer_path and tokenizer_path != model_path and os.path.exists(tokenizer_path):
         config = AutoConfig.from_pretrained(
             tokenizer_path, trust_remote_code=trust_remote_code, revision=revision
         )
     else:
-        raise RuntimeError(
-            "Failed to find a valid tokenizer path for loading Alpamayo-R1 config. ")
-
+        config = AutoConfig.from_pretrained("Qwen/Qwen3-VL-8B-Instruct",
+                                            trust_remote_code=trust_remote_code, revision=revision, **kwargs)
 
     # The Qwen3-VL text_config may have rope_scaling=None if loaded from
     # defaults. Ensure mRoPE is configured.
@@ -239,7 +238,6 @@ def _load_alpamayo_r1_config(
     # Update vocab_size in text_config to match Alpamayo's extended vocab
     if hasattr(config, "text_config") and "vocab_size" in alpamayo_json:
         config.text_config.vocab_size = alpamayo_json["vocab_size"]
-
 
     # so current model_type is pretended to be qwen3_vl
     setattr(config, "_name_or_path", model_path)
@@ -319,6 +317,7 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
 def _is_deepseek_ocr2_model(config: PretrainedConfig) -> bool:
     auto_map = getattr(config, "auto_map", None) or {}
     return auto_map.get("AutoModel") == "modeling_deepseekocr2.DeepseekOCR2ForCausalLM"
+
 
 
 def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
@@ -628,6 +627,17 @@ def get_tokenizer(
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
+        elif "alpamayo_r1" in str(e):
+            # Alpamayo model has no tokenizer files; fall back to the base
+            # Qwen3-VL tokenizer automatically.
+            tokenizer = AutoTokenizer.from_pretrained(
+                "Qwen/Qwen3-VL-8B-Instruct",
+                *args,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
+            )
         else:
             raise e
 
@@ -658,7 +668,7 @@ def get_processor(
     use_fast: Optional[bool] = True,
     **kwargs,
 ):
-    # pop 'revision' from kwargs if present.
+    # pop 'revision' from kwargs if present.      
     revision = kwargs.pop("revision", tokenizer_revision)
     if "mistral-large-3" in str(tokenizer_name).lower():
         config = _load_mistral_large_3_for_causal_LM(
@@ -669,12 +679,24 @@ def get_processor(
         )
     else:
         _ensure_llama_flash_attention2_compat()
-        config = AutoConfig.from_pretrained(
-            tokenizer_name,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        try:
+            config = AutoConfig.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs)
+        except (ValueError, KeyError) as e:
+            if "alpamayo_r1" in str(e):
+                # Alpamayo model has no tokenizer files; fall back to the base
+                # Qwen3-VL tokenizer/processor automatically.
+                tokenizer_name = "Qwen/Qwen3-VL-8B-Instruct"
+                config = AutoConfig.from_pretrained(
+                    tokenizer_name,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs)
+            else:
+                raise
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"
@@ -684,6 +706,7 @@ def get_processor(
         config.model_type = "deepseek-ocr"
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         _override_v_head_dim_if_zero(config)
+
 
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
@@ -718,7 +741,6 @@ def get_processor(
                     revision=revision,
                     **kwargs,
                 )
-                logger.info(f"Loaded processor for {tokenizer_name} with model_type {config.model_type}")
 
     except ValueError as e:
         error_message = str(e)
