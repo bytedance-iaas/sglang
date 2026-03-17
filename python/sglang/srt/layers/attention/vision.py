@@ -39,16 +39,17 @@ if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
     try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
-
-        from sglang.jit_kernel.flash_attention_v4 import (
+        from sglang.jit_kernel.flash_attention_v3 import (
+            flash_attn_varlen_func as flash_attn_varlen_func_fa3,
+        )
+        from sglang.jit_kernel.flash_attention_v3 import (
             flash_attn_varlen_func as flash_attn_varlen_func_fa4,
         )
 
         def flash_attn_func(*args, ver: int = 3, **kwargs):
             if ver == 4:
                 return flash_attn_varlen_func_fa4(*args, **kwargs)
-            return flash_attn_varlen_func(*args, **kwargs)
+            return flash_attn_varlen_func_fa3(*args, **kwargs)
 
     except ImportError as e:
         raise e

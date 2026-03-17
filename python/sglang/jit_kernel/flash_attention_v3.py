@@ -35,6 +35,7 @@ def _is_fa3_supported(device=None) -> bool:
         or torch.cuda.get_device_capability(device)[0] == 8
     )
 
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -236,7 +237,7 @@ def flash_attn_varlen_func(
 
     ops = _load_fa3_kernels()
 
-    return ops.flash_attn_with_kvcache(
+    return ops.flash_attn_varlen_func(
         q,
         k,
         v,
