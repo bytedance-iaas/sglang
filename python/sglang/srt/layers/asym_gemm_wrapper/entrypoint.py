@@ -165,9 +165,10 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 experts,
                 list_size, 
                 expected_m,
-                None,
-                "nk",
-                False,
+                disable_ue8m0_cast=False,
+                # None,
+                # "nk",
+                # False,
             )
         
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -210,21 +211,73 @@ def grouped_gemm_nt_f8f8bf16_contig(
 #         torch.tensor(experts, dtype=torch.int32, device="cuda"),
 #         len(offsets),
 #     )
+# def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
+#     offsets = []
+#     experts = []
+#     curr_offset = 0
+#     for g in range(num_groups):
+#         v = masked_m[g].item()
+#         if v > 0:
+#             offsets.append(curr_offset)
+#             experts.append(g)
+#             curr_offset += ((v + block_m - 1) // block_m) * block_m
+#     offsets.append(curr_offset)
+#     experts.append(-1)
+#     return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
+#             torch.tensor(experts, dtype=torch.int32, device='cuda'), 
+#             len(offsets))
+
 def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
+    """
+    Build offsets and experts for sparse m-grouped masked GEMM.
+
+    Generates LOCAL offset pairs for each active expert group. The kernel will add
+    (scheduler.current_group_idx * shape_m) to compute the global offset.
+
+    Only groups with masked_m[g] > 0 are included in the output mapping.
+    Each active group generates a pair of offsets (start, end) relative to that group.
+
+    Args:
+        masked_m: (num_groups,) tensor of actual token counts per group
+        num_groups: number of expert groups
+        block_m: block alignment for padding (default 128)
+
+    Returns:
+        offsets: flat tensor with LOCAL pairs [start_0, end_0, start_1, end_1, ...]
+        experts: expert IDs for each active group + terminator (-1)
+        list_size: number of experts in output (including terminator)
+
+    Example:
+        masked_m = torch.tensor([0, 12, 0, 129]), num_groups = 4
+        offsets = [0, 128, 0, 256]  # LOCAL offsets (padded to 128)
+        experts = [1, 3, -1]        # 2 active experts + terminator
+        list_size = 3
+
+    Note:
+        Kernel computes global M index as:
+        m_idx = (scheduler.current_group_idx * shape_m) + local_m_idx
+    """
     offsets = []
     experts = []
-    curr_offset = 0
+
     for g in range(num_groups):
         v = masked_m[g].item()
-        if v > 0:
-            offsets.append(curr_offset)
+        if v > 0:  # Only process active groups
+            # LOCAL offsets (relative to this group)
+            start = 0
+            # Pad actual tokens to block_m alignment
+            end = ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
             experts.append(g)
-            curr_offset += ((v + block_m - 1) // block_m) * block_m
-    offsets.append(curr_offset)
+
+    # Add terminator expert
     experts.append(-1)
-    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
-            torch.tensor(experts, dtype=torch.int32, device='cuda'), 
-            len(offsets))
+
+    return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+            torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+            len(experts))
+
 
 def grouped_gemm_nt_bf16bf16bf16_masked(
     lhs: torch.Tensor,

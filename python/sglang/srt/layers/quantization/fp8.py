@@ -1232,8 +1232,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if self.runner.runner_backend.is_asym_gemm() :
-            return 
+        # if self.runner.runner_backend.is_asym_gemm() :
+        #     return 
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
             return
