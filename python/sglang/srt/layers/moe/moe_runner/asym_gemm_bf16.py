@@ -107,7 +107,9 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
             hidden_states,
             quant_info.w13_weight,
             gateup_output,
-            m_indices,
+            runner_input.offsets,
+            runner_input.experts,
+            runner_input.list_size,
         )
 
         dispose_tensor(hidden_states)
@@ -131,7 +133,9 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
             down_input,
             quant_info.w2_weight,
             down_output,
-            m_indices,
+            runner_input.offsets,
+            runner_input.experts,
+            runner_input.list_size,
         )
 
         return down_output

@@ -256,11 +256,14 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         )
         if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
+
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
             gateup_output,
-            m_indices,
+            runner_input.offsets,
+            runner_input.experts,
+            runner_input.list_size,
         )
 
         dispose_tensor(hidden_states)
@@ -298,7 +301,9 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
             down_output,
-            m_indices,
+            runner_input.offsets,
+            runner_input.experts,
+            runner_input.list_size,
         )
 
         return down_output
