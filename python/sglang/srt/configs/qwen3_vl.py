@@ -244,6 +244,7 @@ class Qwen3VLConfig(PretrainedConfig):
         video_token_id=151656,
         vision_start_token_id=151652,
         vision_end_token_id=151653,
+        video_pruning_rate=0.0,
         tie_word_embeddings=False,
         **kwargs,
     ):
@@ -261,6 +262,7 @@ class Qwen3VLConfig(PretrainedConfig):
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
+        self.video_pruning_rate = video_pruning_rate
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 

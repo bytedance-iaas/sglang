@@ -66,6 +66,16 @@ class EVSProcessor:
         config_name = hf_config.__class__.__name__
         evs_model = config_to_evs_model.get(hf_config.__class__)
         if evs_model is None:
+            model_type = getattr(hf_config, "model_type", None)
+            compatible_models = [
+                candidate_model
+                for candidate_config, candidate_model in config_to_evs_model.items()
+                if candidate_config.__name__ == config_name
+                or getattr(candidate_config, "model_type", None) == model_type
+            ]
+            if len(compatible_models) == 1:
+                evs_model = compatible_models[0]
+        if evs_model is None:
             logger.info(
                 f"[EVS] no model matches {config_name} in {config_to_evs_model}"
             )

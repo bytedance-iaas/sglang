@@ -69,6 +69,7 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
 )
+from sglang.srt.multimodal.evs import EVS, EVSConfig
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
@@ -1047,7 +1048,7 @@ class Qwen3LLMModel(Qwen3Model):
         return hidden_states, aux_hidden_states
 
 
-class Qwen3VLForConditionalGeneration(nn.Module):
+class Qwen3VLForConditionalGeneration(EVS):
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
@@ -1070,7 +1071,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         prefix: str = "",
         language_model_cls=Qwen3LLMModel,
     ) -> None:
-        super().__init__()
+        super().__init__(config)
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
 
@@ -1128,6 +1129,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+
+    @staticmethod
+    def create_evs_config(config: Qwen3VLConfig) -> EVSConfig:
+        return EVSConfig(
+            video_pruning_rate=getattr(config, "video_pruning_rate", 0.0),
+            spatial_merge_size=1,
+        )
 
     def separate_deepstack_embeds(self, embedding):
         assert (

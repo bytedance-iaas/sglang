@@ -121,6 +121,7 @@ def get_rope_index(
                         image_grid_thw[image_index][2],
                     )
                     second_per_grid_t = 0
+                    mm_token_id = image_token_id
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
@@ -134,6 +135,7 @@ def get_rope_index(
                         second_per_grid_t = second_per_grid_ts[video_index]
                     else:
                         second_per_grid_t = 1.0
+                    mm_token_id = video_token_id
                     video_index += 1
                     remain_videos -= 1
                     ed = ed_video
@@ -141,6 +143,14 @@ def get_rope_index(
                 llm_grid_t = t_int
                 llm_grid_h = h_int // spatial_merge_size
                 llm_grid_w = w_int // spatial_merge_size
+                mm_token_count = 0
+                mm_cursor = ed
+                while (
+                    mm_cursor < len(input_tokens)
+                    and input_tokens[mm_cursor] == mm_token_id
+                ):
+                    mm_token_count += 1
+                    mm_cursor += 1
                 text_len = ed - st
                 st_idx = (
                     llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -180,10 +190,18 @@ def get_rope_index(
                     .expand(llm_grid_t, llm_grid_h, llm_grid_w)
                     .reshape(-1)
                 )
+                vision_pos_ids = torch.stack([t_index, h_index, w_index])
+                expected_mm_token_count = vision_pos_ids.shape[1]
+                if mm_token_count == 0:
+                    mm_token_count = expected_mm_token_count
+                if mm_token_count > expected_mm_token_count:
+                    raise ValueError(
+                        f"Found {mm_token_count} multimodal tokens, expected at most {expected_mm_token_count}."
+                    )
                 llm_pos_ids_list.append(
-                    torch.stack([t_index, h_index, w_index]) + text_len + st_idx
+                    vision_pos_ids[:, :mm_token_count] + text_len + st_idx
                 )
-                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+                st = ed + mm_token_count
             if st < len(input_tokens):
                 st_idx = (
                     llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0

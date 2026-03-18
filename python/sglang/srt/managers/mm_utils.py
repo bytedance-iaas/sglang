@@ -1264,7 +1264,7 @@ def general_mm_embed_routine(
             input_embeds = forward_batch.input_embeds
     else:
         input_embeds = None
-
+    # print("DEBUGG input_embeds.shape={}".format(input_embeds.shape))
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,

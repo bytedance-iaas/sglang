@@ -10,6 +10,7 @@ import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
+from sglang.srt.configs.qwen3_vl import Qwen3VLConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -22,6 +23,9 @@ from sglang.srt.models.qwen3_5 import (
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.multimodal.evs import EVSProcessor
+from sglang.srt.multimodal.evs.evs_core import tokens_per_frame
+from sglang.srt.multimodal.evs.evs_module import VideoEVSDataItem
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -250,6 +254,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             hf_config = hf_config.thinker_config
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.evs = EVSProcessor(
+            hf_config,
+            {Qwen3VLConfig: Qwen3VLForConditionalGeneration},
+        )
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
@@ -274,6 +282,101 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    def _maybe_apply_qwen3_evs(
+        self,
+        mm_items: List[MultimodalDataItem],
+        input_ids: torch.Tensor,
+    ) -> tuple[List[MultimodalDataItem], torch.Tensor]:
+        if self.evs.evs_config is None:
+            return mm_items, input_ids
+
+        video_item = next((item for item in mm_items if item.is_video()), None)
+        if video_item is None or not hasattr(video_item, "video_grid_thw"):
+            return mm_items, input_ids
+
+        video_grid_thw = video_item.video_grid_thw
+        if video_grid_thw is None or len(video_grid_thw) == 0:
+            return mm_items, input_ids
+
+        spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
+        merged_video_grid_thw = video_grid_thw.clone()
+        if merged_video_grid_thw[:, 1:].numel() > 0:
+            if torch.any(merged_video_grid_thw[:, 1:] % spatial_merge_size != 0):
+                logger.warning(
+                    "[EVS] skipping Qwen3-VL EVS because video_grid_thw is not divisible by spatial_merge_size"
+                )
+                return mm_items, input_ids
+            merged_video_grid_thw[:, 1:] = (
+                merged_video_grid_thw[:, 1:] // spatial_merge_size
+            )
+
+        estimated_tokens_per_frame = [
+            tokens_per_frame(
+                q=self.evs.evs_config.video_pruning_rate,
+                num_frames=int(grid_t),
+                frame_num_tokens=int(grid_h) * int(grid_w),
+            )
+            for grid_t, grid_h, grid_w in merged_video_grid_thw.tolist()
+        ]
+        flat_estimated_tokens = [
+            token_count
+            for per_video_tokens in estimated_tokens_per_frame
+            for token_count in per_video_tokens
+        ]
+
+        if len(video_item.offsets) != len(flat_estimated_tokens):
+            logger.warning(
+                "[EVS] skipping Qwen3-VL EVS because video offsets do not align with per-frame token groups"
+            )
+            return mm_items, input_ids
+
+        original_input_ids = input_ids.tolist()
+        rewritten_input_ids: list[int] = []
+        cursor = 0
+        for (start, end), token_count in zip(
+            video_item.offsets, flat_estimated_tokens, strict=True
+        ):
+            rewritten_input_ids.extend(original_input_ids[cursor:start])
+            rewritten_input_ids.extend([self.mm_tokens.video_token_id] * token_count)
+            cursor = end + 1
+        rewritten_input_ids.extend(original_input_ids[cursor:])
+
+        rewritten_input_ids_tensor = torch.tensor(
+            rewritten_input_ids,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        rewritten_video_offsets = self.get_mm_items_offset(
+            rewritten_input_ids_tensor, self.mm_tokens.video_token_id
+        )
+
+        evs_video_item = VideoEVSDataItem(
+            modality=Modality.VIDEO,
+            feature=video_item.feature,
+            offsets=rewritten_video_offsets,
+            thw_grids=[tuple(map(int, grid)) for grid in merged_video_grid_thw.tolist()],
+            pre_chunked_input_ids=rewritten_input_ids,
+            hash=video_item.hash,
+            pad_value=video_item.pad_value,
+            format=video_item.format,
+            precomputed_embeddings=video_item.precomputed_embeddings,
+        )
+        for key, value in video_item.model_specific_data.items():
+            evs_video_item.set(key, value)
+
+        rewritten_items: List[MultimodalDataItem] = []
+        for item in mm_items:
+            if item.is_video():
+                rewritten_items.append(evs_video_item)
+                continue
+
+            token_id = self.mm_tokens.get_token_id_by_modality(item.modality)
+            if token_id is not None:
+                item.offsets = self.get_mm_items_offset(rewritten_input_ids_tensor, token_id)
+            rewritten_items.append(item)
+
+        return rewritten_items, rewritten_input_ids_tensor
 
     def get_mm_data(self, prompt, embeddings, img_grid_thw):
         input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
@@ -358,6 +461,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 base_output, self.mm_tokens
             )
 
+        mm_items, input_ids = self._maybe_apply_qwen3_evs(mm_items, input_ids)
+        
         audio_feature_lengths = None
 
         if self.model_type == "qwen3_omni_moe":
