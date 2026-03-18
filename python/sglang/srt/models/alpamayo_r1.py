@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import copy
-import os
 from collections import defaultdict
 from typing import Iterable, List, Optional, Tuple
 
@@ -163,69 +162,6 @@ class AlpamayoR1(nn.Module):
         diffusion_cfg = getattr(config, "diffusion_cfg", {}) or {}
         self.num_inference_steps = diffusion_cfg.get("num_inference_steps", 10)
 
-        # Flow matching debug switches.
-        # Can be enabled by config.flow_matching_debug=True or env var:
-        #   SGLANG_ALPAMAYO_FM_DEBUG=1
-        self.flow_matching_debug = bool(
-            getattr(config, "flow_matching_debug", False)
-            or os.getenv("SGLANG_ALPAMAYO_FM_DEBUG", "0") == "1"
-        )
-        # Max number of Euler steps to log in detail (+ always logs the last step).
-        self.flow_matching_debug_max_steps = int(
-            os.getenv("SGLANG_ALPAMAYO_FM_DEBUG_MAX_STEPS", "3")
-        )
-        # Debug option: do not read VLM KV cache in expert flow-matching branch.
-        # This is useful to isolate whether run-to-run drift comes from VLM KV states.
-        self.flow_matching_disable_vlm_kv = (
-            os.getenv("SGLANG_ALPAMAYO_FM_DISABLE_VLM_KV", "0") == "1"
-        )
-
-    def _fm_should_log_step(self, step_i: int) -> bool:
-        if not self.flow_matching_debug:
-            return False
-        return (
-            step_i < self.flow_matching_debug_max_steps
-            or step_i == self.num_inference_steps - 1
-        )
-
-    def _fm_tensor_fingerprint(self, tag: str, tensor: torch.Tensor, sample_size: int = 4096):
-        """Print compact numeric fingerprint for drift debugging."""
-        if not self.flow_matching_debug:
-            return
-
-        with torch.no_grad():
-            x = tensor.detach().float().reshape(-1)
-            if x.numel() == 0:
-                logger.info(
-                    f"FM_DEBUG {tag}: empty shape={tuple(tensor.shape)} dtype={tensor.dtype}"
-                )
-                return
-
-            n = min(sample_size, x.numel())
-            s = x[:n]
-            idx = torch.arange(1, n + 1, device=s.device, dtype=s.dtype)
-
-            mean = s.mean().item()
-            std = s.std(unbiased=False).item()
-            min_v = s.min().item()
-            max_v = s.max().item()
-            l2 = torch.linalg.vector_norm(s).item()
-            checksum = (s * idx).sum().item()
-
-        logger.info(
-            "FM_DEBUG %s: shape=%s dtype=%s n=%d mean=%.8f std=%.8f min=%.8f max=%.8f l2=%.8f checksum=%.8f",
-            tag,
-            tuple(tensor.shape),
-            tensor.dtype,
-            n,
-            mean,
-            std,
-            min_v,
-            max_v,
-            l2,
-            checksum,
-        )
-
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -239,15 +175,6 @@ class AlpamayoR1(nn.Module):
             bstar = int(input_ids.shape[0])
             active_indices = []
             reqs = getattr(forward_batch, "reqs", None)
-            if self.flow_matching_debug:
-                # Log every decoded token ID to detect VLM non-determinism across runs.
-                # If the same request produces different token IDs between runs,
-                # that is the root cause of expert_hidden_flat divergence.
-                logger.info(
-                    "FM_DEBUG decode_token: input_ids=%s seq_lens=%s",
-                    input_ids.tolist(),
-                    forward_batch.seq_lens.tolist(),
-                )
             for i in range(bstar):
                 has_history_traj = False
                 if reqs is not None and i < len(reqs):
@@ -385,14 +312,9 @@ class AlpamayoR1(nn.Module):
         # VLM's current seq_lens for active requests (tokens already in KV cache)
         vlm_seq_lens = forward_batch.seq_lens[idx_tensor]
 
-        # Expert sees: prefix (VLM cached) + new action tokens
-        # In debug mode, we can disable VLM KV reading for reproducibility checks.
-        if self.flow_matching_disable_vlm_kv:
-            expert_seq_lens = torch.full_like(vlm_seq_lens, n_diff)
-            extend_prefix_lens = torch.zeros_like(vlm_seq_lens, dtype=torch.int32)
-        else:
-            expert_seq_lens = vlm_seq_lens + n_diff
-            extend_prefix_lens = vlm_seq_lens.to(torch.int32)
+        # Expert sees: prefix (VLM cached) + new action tokens.
+        expert_seq_lens = vlm_seq_lens + n_diff
+        extend_prefix_lens = vlm_seq_lens.to(torch.int32)
         extend_seq_lens = torch.full((bstar,), n_diff, dtype=torch.int32, device=device)
 
         # Cumulative start locations for the new tokens (each request contributes n_diff)
@@ -481,19 +403,6 @@ class AlpamayoR1(nn.Module):
             active_indices, forward_batch, mrope_positions
         )
 
-        if self.flow_matching_debug:
-            logger.info(
-                "FM_DEBUG meta: bstar=%d n_diff=%d action_dims=%s num_steps=%d disable_vlm_kv=%s",
-                bstar,
-                n_diff,
-                self.action_dims,
-                self.num_inference_steps,
-                self.flow_matching_disable_vlm_kv,
-            )
-            self._fm_tensor_fingerprint("mrope_positions", mrope_positions)
-            self._fm_tensor_fingerprint("forward_batch.seq_lens", forward_batch.seq_lens)
-            self._fm_tensor_fingerprint("expert_batch.seq_lens", expert_batch.seq_lens)
-
         # Initialize attention metadata (FlashInfer wrapper plans / Triton metadata)
         # This is safe because the VLM's decode is already finished;
         # the runtime will re-init metadata for the next batch.
@@ -548,7 +457,6 @@ class AlpamayoR1(nn.Module):
         )
 
         logger.info(f"start flowmatching {x[0,:2]}")
-        self._fm_tensor_fingerprint("x_init", x)
                     
         time_steps = torch.linspace(
             0.0, 1.0, self.num_inference_steps + 1, device=device
@@ -574,15 +482,6 @@ class AlpamayoR1(nn.Module):
                 bstar * n_diff, -1
             )
 
-            if self._fm_should_log_step(step_i):
-                self._fm_tensor_fingerprint(f"step{step_i}.x_in", x)
-                self._fm_tensor_fingerprint(
-                    f"step{step_i}.future_token_embeds", future_token_embeds
-                )
-                self._fm_tensor_fingerprint(
-                    f"step{step_i}.input_embeds_flat", input_embeds_flat
-                )
-
             # c. Run expert: bidirectional attention over action tokens,
             #    attending to VLM's cached prefix KV via shared layer_ids.
             #    ENCODER_ONLY ensures:
@@ -596,26 +495,16 @@ class AlpamayoR1(nn.Module):
                 input_embeds=input_embeds_flat,
             )  # (bstar * n_diff, hidden_size)
 
-            if self._fm_should_log_step(step_i):
-                self._fm_tensor_fingerprint(
-                    f"step{step_i}.expert_hidden_flat", expert_hidden
-                )
-
             # d. Project to action space
             expert_hidden = expert_hidden.view(
                 bstar, n_diff, -1
             )  # (bstar, n_diff, hidden_size)
             pred = self.action_out_proj(expert_hidden)  # (bstar, n_diff, action_dim)
             pred = pred.view(bstar, *self.action_dims)
-
-            if self._fm_should_log_step(step_i):
-                self._fm_tensor_fingerprint(f"step{step_i}.pred", pred)
             # --- step_fn end ---
 
             # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
             x = x + dt * pred
-            if self._fm_should_log_step(step_i):
-                self._fm_tensor_fingerprint(f"step{step_i}.x_out", x)
 
         # ---- Diagnostic: raw sampled actions (ALWAYS logged) ----
         with torch.no_grad():
