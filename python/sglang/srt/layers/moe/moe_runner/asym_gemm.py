@@ -74,6 +74,79 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
     return tensor_gpu
 
+def build_offsets_experts_from_masked_m(
+    masked_m: torch.Tensor,
+    num_groups: int | None = None,
+    block_m: int = 128,
+):
+    """
+    Build fixed-size offsets / experts buffers for masked grouped GEMM.
+
+    Contract:
+      - experts uses -1 as terminator / invalid entry
+      - offsets stores [start_0, end_0, start_1, end_1, ...]
+      - when num_groups == 0:
+            offsets = [0, 0]
+            experts = [-1]
+            list_size = 1
+
+    This version:
+      - avoids .item()
+      - avoids nonzero()
+      - keeps outputs CUDA-graph-friendly
+    """
+    device = masked_m.device
+    masked_m_i32 = masked_m.to(torch.int32)
+
+    actual_num_groups = masked_m_i32.numel()
+    if num_groups is None:
+        num_groups = actual_num_groups
+    else:
+        assert num_groups == actual_num_groups, (
+            f"num_groups ({num_groups}) != masked_m.numel() ({actual_num_groups})"
+        )
+
+    # Make sure we always have at least one entry:
+    #   num_groups == 0 -> one dummy entry for terminator.
+    rows = max(num_groups, 1)
+
+    active_mask = masked_m_i32 > 0
+    padded_end = ((masked_m_i32 + block_m - 1) // block_m) * block_m
+    padded_end = torch.where(
+        active_mask,
+        padded_end,
+        torch.zeros_like(padded_end),
+    )
+
+    # offsets: shape [rows, 2], flattened to [2 * rows]
+    offsets = torch.zeros(
+        (rows, 2),
+        dtype=torch.int32,
+        device=device,
+    )
+    if num_groups > 0:
+        offsets[:num_groups, 1] = padded_end
+    offsets = offsets.reshape(-1)
+
+    # experts: shape [rows]
+    # active group   -> expert id
+    # inactive group -> -1
+    # num_groups==0  -> [-1]
+    experts = torch.full(
+        (rows,),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    if num_groups > 0:
+        experts[:num_groups] = torch.where(
+            active_mask,
+            torch.arange(num_groups, device=device, dtype=torch.int32),
+            torch.full((num_groups,), -1, device=device, dtype=torch.int32),
+        )
+
+    list_size = rows
+    return offsets, experts, list_size
 
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):
@@ -83,6 +156,9 @@ class AsymGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    offsets: Optional[int] = None
+    experts: Optional[int] = None
+    list_size: int = 0
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -273,12 +349,16 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
+
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
             masked_m,
             expected_m,
+            runner_input.offsets,
+            runner_input.experts,
+            runner_input.list_size,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -355,6 +435,9 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
+            runner_input.offsets,
+            runner_input.experts,
+            runner_input.list_size,
             **gemm_overlap_args_dict,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
@@ -433,12 +516,21 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
 
+    offsets, experts, list_size = build_offsets_experts_from_masked_m(
+            masked_m,
+            hidden_states.shape[0],
+        )
+
     return AsymGemmRunnerInput(
         hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        offsets =  offsets,
+        experts = experts,
+        list_size = list_size,
+
     )
 
 
@@ -527,11 +619,19 @@ def _pre_permute_standard_to_asym_gemm_bf16(
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
 
+    offsets, experts, list_size = build_offsets_experts_from_masked_m(
+            masked_m,
+            hidden_states.shape[0],
+        )
+
     return AsymGemmBf16RunnerInput(
         hidden_states=gateup_input,
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        offsets =  offsets,
+        experts = experts,
+        list_size = list_size,
     )
 
 
@@ -598,6 +698,11 @@ def pre_permute_deepep_ll_to_asym_gemm(
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
 
+    offsets, experts, list_size = build_offsets_experts_from_masked_m(
+            masked_m,
+            hidden_states.shape[0],
+        )
+
     # Dtype-based dispatch
     if isinstance(quant_info, AsymGemmBf16MoeQuantInfo):
         return AsymGemmBf16RunnerInput(
@@ -605,6 +710,9 @@ def pre_permute_deepep_ll_to_asym_gemm(
             use_masked_gemm=True,
             masked_m=masked_m,
             expected_m=expected_m,
+            offsets =  offsets,
+            experts = experts,
+            list_size = list_size,
         )
 
     return AsymGemmRunnerInput(
@@ -613,6 +721,9 @@ def pre_permute_deepep_ll_to_asym_gemm(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        offsets =  offsets,
+        experts = experts,
+        list_size = list_size,
     )
 
 
