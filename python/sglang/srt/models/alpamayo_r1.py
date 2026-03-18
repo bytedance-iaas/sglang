@@ -451,7 +451,7 @@ class AlpamayoR1(nn.Module):
         # Match reference FlowMatching._euler: x is fp32 (default dtype)
         # so Euler accumulation x = x + dt * v stays in fp32 throughout.
 
-        torch.cuda.manual_seed_all(42)  # for reproducibility in testing
+        # torch.cuda.manual_seed_all(42)  # for reproducibility in testing
         x = torch.randn(
             bstar, *self.action_dims, device=device,
         )
@@ -505,29 +505,6 @@ class AlpamayoR1(nn.Module):
 
             # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
             x = x + dt * pred
-
-        # ---- Diagnostic: raw sampled actions (ALWAYS logged) ----
-        with torch.no_grad():
-            accel_ch = x[..., 0]  # (bstar, n_waypoints)
-            kappa_ch = x[..., 1]  # (bstar, n_waypoints)
-            logger.info(
-                "FM_DIAG sampled_action: accel  mean=%.6f std=%.6f min=%.6f max=%.6f",
-                accel_ch.mean().item(), accel_ch.std().item(),
-                accel_ch.min().item(), accel_ch.max().item(),
-            )
-            logger.info(
-                "FM_DIAG sampled_action: kappa  mean=%.6f std=%.6f min=%.6f max=%.6f",
-                kappa_ch.mean().item(), kappa_ch.std().item(),
-                kappa_ch.min().item(), kappa_ch.max().item(),
-            )
-            logger.info(
-                "FM_DIAG action_space buffers: accel_mean=%.8f accel_std=%.8f "
-                "curvature_mean=%.8f curvature_std=%.8f",
-                self.action_space.accel_mean.item(),
-                self.action_space.accel_std.item(),
-                self.action_space.curvature_mean.item(),
-                self.action_space.curvature_std.item(),
-            )
         return x  # (bstar, n_waypoints, action_dim)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):

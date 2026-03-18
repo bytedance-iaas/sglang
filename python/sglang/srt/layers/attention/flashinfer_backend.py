@@ -829,7 +829,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                if not self.is_dllm_model:
+                if not self.is_dllm_model and not (
+                    layer.is_cross_attention
+                    or layer.attn_type == AttentionType.ENCODER_ONLY
+                ):
                     # TODO: design a better interface
                     # For other models, use causal attention for the ragged part as previously
                     causal = True

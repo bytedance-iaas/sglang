@@ -1,4 +1,4 @@
-# SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=1 \
+#SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 CUDA_VISIBLE_DEVICES=6 \
 python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B-Origin \
@@ -6,12 +6,11 @@ python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B-Origin
  --port 29003 \
  --tp 1 \
  --disable-cuda-graph \
- --disable-overlap-schedule \
- --attention-backend triton 
+ --attention-backend torch_native 
 # --tokenizer-path Qwen/Qwen3-VL-8B-Instruct \
 # --tokenizer-path /data/models/Qwen3-VL-8B-Instruct \
 # --skip-server-warmup 
- # flashinfer has bug
+ # flashinfer GOOD
  # triton GOOD
  # torch_native BUG
  # trtllm_mha has bug
