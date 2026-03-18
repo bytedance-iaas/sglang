@@ -288,18 +288,20 @@ class AlpamayoR1(nn.Module):
         active_indices: List[int],
         forward_batch: ForwardBatch,
         mrope_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
     ) -> ForwardBatch:
         """Build an EXTEND-mode ForwardBatch for the expert model.
 
         The expert reads the VLM's KV cache (shared layer_ids) and processes
         n_diffusion_tokens new action embeddings per request, using bidirectional
-        attention (ENCODER_ONLY) without writing to KV cache.
+        attention (ENCODER_ONLY). KV cache slots are pre-allocated by the caller.
 
         Args:
             active_indices: Indices of requests that need flow matching.
             forward_batch: The original decode-mode ForwardBatch from VLM.
             mrope_positions: Multimodal RoPE positions for action tokens,
                 shape (3, bstar * n_diff).
+            cache_slots: Pre-allocated KV cache slot indices for action tokens.
 
         Returns:
             A ForwardBatch configured for EXTEND mode with the expert.
@@ -322,11 +324,9 @@ class AlpamayoR1(nn.Module):
             0, bstar * n_diff, n_diff, dtype=torch.int32, device=device
         )
 
-        # Dummy out_cache_loc — ENCODER_ONLY skips KV cache writes,
-        # but the tensor must exist with the correct shape.
-        out_cache_loc = torch.zeros(
-            bstar * n_diff, dtype=torch.int32, device=device
-        )
+        # out_cache_loc points to allocated KV cache slots so backends
+        # write action-token KV normally.
+        out_cache_loc = cache_slots.to(torch.int32)
 
         expert_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -398,60 +398,36 @@ class AlpamayoR1(nn.Module):
             positions_list.append(action_pos)
         mrope_positions = torch.cat(positions_list, dim=1)  # (3, bstar * n_diff)
 
-        # --- 2. Build the expert ForwardBatch (EXTEND mode) ---
+        # --- 2. Allocate KV cache slots for action tokens ---
+        # Action tokens need real KV cache slots so all backends can write/read
+        # KV normally. We free them after the flow matching loop.
+        allocator = forward_batch.attn_backend.token_to_kv_pool_allocator
+        cache_slots = allocator.alloc(bstar * n_diff)
+
+        # Map action token positions → allocated cache slots in req_to_token
+        idx_tensor = torch.tensor(active_indices, device=device, dtype=torch.long)
+        vlm_seq_lens = forward_batch.seq_lens[idx_tensor]
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        for i, idx in enumerate(active_indices):
+            req_pool_idx = forward_batch.req_pool_indices[idx]
+            vlm_len = vlm_seq_lens[i]
+            slots = cache_slots[i * n_diff : (i + 1) * n_diff]
+            req_to_token[req_pool_idx, vlm_len : vlm_len + n_diff] = slots
+
+        # --- 3. Build the expert ForwardBatch (EXTEND mode) ---
         expert_batch = self._build_expert_forward_batch(
-            active_indices, forward_batch, mrope_positions
+            active_indices, forward_batch, mrope_positions, cache_slots
         )
 
         # Initialize attention metadata (FlashInfer wrapper plans / Triton metadata)
-        # This is safe because the VLM's decode is already finished;
-        # the runtime will re-init metadata for the next batch.
-        #
-        # BUG FIX: The expert uses ENCODER_ONLY attention (bidirectional self-attention
-        # among action tokens + cross-attention to VLM prefix KV).  FlashInfer's EXTEND
-        # mode has two code paths:
-        #
-        #   use_ragged=True  (correct for ENCODER_ONLY):
-        #     - Ragged wrapper:  Q(64) × local K,V(64) computed in-memory, non-causal
-        #     - Paged wrapper:   Q(64) × VLM prefix KV(3190), non-causal
-        #     - Merge with log-sum-exp
-        #     - ENCODER_ONLY suppresses KV cache write and forces causal=False
-        #     - paged_kernel_lens = prefix_lens = 3190  (no garbage)
-        #
-        #   use_ragged=False (buggy for ENCODER_ONLY, forced by is_multimodal + enable_deterministic):
-        #     - Paged wrapper only, causal=True (wrong!), save_kv_cache=True (wrong!)
-        #     - out_cache_loc=zeros → writes all 64 action-token KVs to physical slot 0,
-        #       corrupting VLM token 0's KV stored there
-        #     - paged_kernel_lens = seq_lens = 3254 → req_to_token[3190..3253] are
-        #       uninitialized, all pointing to slot 0 which holds corrupted KV
-        #     - Between runs, VLM tokens land on different physical slots, so the
-        #       corruption propagates differently → non-deterministic output
-        #
-        # Fix: temporarily clear is_multimodal and enable_deterministic so
-        # init_forward_metadata chooses use_ragged=True for this expert batch.
-        # The expert's paged attention (3190 prefix tokens < tile_size 4096) has no
-        # split-K and processes the same KV values in the same logical order each run
-        # → fully deterministic.
-
         backend = forward_batch.attn_backend
-        logger.info(f"attention_backend={backend}")
-        # backend.init_forward_metadata(expert_batch)
+        backend.init_forward_metadata(expert_batch)
 
-        _orig_is_multimodal = getattr(backend, "is_multimodal", False)
-        _orig_enable_deterministic = getattr(backend, "enable_deterministic", False)
-        backend.is_multimodal = False
-        backend.enable_deterministic = False
-        try:
-            backend.init_forward_metadata(expert_batch)
-        finally:
-            backend.is_multimodal = _orig_is_multimodal
-            backend.enable_deterministic = _orig_enable_deterministic
-
-        # --- 3. Euler integration loop ---
+        # --- 4. Euler integration loop ---
         # Match reference FlowMatching._euler: x is fp32 (default dtype)
         # so Euler accumulation x = x + dt * v stays in fp32 throughout.
 
-        # torch.cuda.manual_seed_all(42)  # for reproducibility in testing
+        torch.cuda.manual_seed_all(42)  # for reproducibility in testing
         x = torch.randn(
             bstar, *self.action_dims, device=device,
         )
@@ -484,10 +460,8 @@ class AlpamayoR1(nn.Module):
 
             # c. Run expert: bidirectional attention over action tokens,
             #    attending to VLM's cached prefix KV via shared layer_ids.
-            #    ENCODER_ONLY ensures:
-            #      - Ragged attn: action tokens attend bidirectionally to each other
-            #      - Paged attn:  action tokens attend to VLM's cached KV
-            #      - No KV is written to the cache pool
+            #    ENCODER_ONLY ensures bidirectional (non-causal) attention.
+            #    KV cache is written to pre-allocated slots and freed after the loop.
             expert_hidden = self.expert(
                 input_ids=None,
                 positions=mrope_positions,
@@ -505,6 +479,10 @@ class AlpamayoR1(nn.Module):
 
             # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
             x = x + dt * pred
+
+        # Free the KV cache slots allocated for action tokens
+        allocator.free(cache_slots)
+
         return x  # (bstar, n_waypoints, action_dim)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):

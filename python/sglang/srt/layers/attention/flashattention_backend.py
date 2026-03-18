@@ -379,6 +379,7 @@ class FlashAttentionBackend(AttentionBackend):
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
@@ -745,10 +746,6 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
-        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
-            save_kv_cache = False
-
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1089,10 +1086,6 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
-        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
-            save_kv_cache = False
-
         if k is not None:
             assert v is not None
             if save_kv_cache:

@@ -145,6 +145,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -777,7 +778,7 @@ class FlashInferAttnBackend(AttentionBackend):
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
+                causal=not (layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY),
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
                 # - Sliding window could cut across item boundaries, breaking semantic coherence
@@ -812,9 +813,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
-            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
-                save_kv_cache = False
-
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:

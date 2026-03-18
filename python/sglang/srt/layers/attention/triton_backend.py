@@ -811,10 +811,6 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
-        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
-            save_kv_cache = False
-
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1019,10 +1015,6 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
-
-        # ENCODER_ONLY layers (e.g. Alpamayo expert) must not write KV cache.
-        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
-            save_kv_cache = False
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
