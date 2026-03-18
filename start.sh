@@ -7,7 +7,7 @@ python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B-Origin
  --tp 1 \
  --disable-cuda-graph \
  --enable-deterministic-inference \
- --attention-backend fa3
+ --attention-backend triton \  
 # --tokenizer-path Qwen/Qwen3-VL-8B-Instruct \
 # --tokenizer-path /data/models/Qwen3-VL-8B-Instruct \
 # --enable-deterministic-inference \

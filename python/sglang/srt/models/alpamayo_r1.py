@@ -28,6 +28,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.utils import logger
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.managers.schedule_batch import MultimodalInputs
@@ -288,20 +290,19 @@ class AlpamayoR1(nn.Module):
         active_indices: List[int],
         forward_batch: ForwardBatch,
         mrope_positions: torch.Tensor,
-        cache_slots: torch.Tensor,
     ) -> ForwardBatch:
         """Build an EXTEND-mode ForwardBatch for the expert model.
 
         The expert reads the VLM's KV cache (shared layer_ids) and processes
         n_diffusion_tokens new action embeddings per request, using bidirectional
-        attention (ENCODER_ONLY). KV cache slots are pre-allocated by the caller.
+        attention (ENCODER_ONLY). KV save is skipped via monkey-patch so no real
+        cache slots are needed.
 
         Args:
             active_indices: Indices of requests that need flow matching.
             forward_batch: The original decode-mode ForwardBatch from VLM.
             mrope_positions: Multimodal RoPE positions for action tokens,
                 shape (3, bstar * n_diff).
-            cache_slots: Pre-allocated KV cache slot indices for action tokens.
 
         Returns:
             A ForwardBatch configured for EXTEND mode with the expert.
@@ -324,9 +325,8 @@ class AlpamayoR1(nn.Module):
             0, bstar * n_diff, n_diff, dtype=torch.int32, device=device
         )
 
-        # out_cache_loc points to allocated KV cache slots so backends
-        # write action-token KV normally.
-        out_cache_loc = cache_slots.to(torch.int32)
+        # Dummy out_cache_loc — KV save is skipped so this is never used.
+        out_cache_loc = torch.zeros(bstar * n_diff, dtype=torch.int32, device=device)
 
         expert_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -398,30 +398,41 @@ class AlpamayoR1(nn.Module):
             positions_list.append(action_pos)
         mrope_positions = torch.cat(positions_list, dim=1)  # (3, bstar * n_diff)
 
-        # --- 2. Allocate KV cache slots for action tokens ---
-        # Action tokens need real KV cache slots so all backends can write/read
-        # KV normally. We free them after the flow matching loop.
-        allocator = forward_batch.attn_backend.token_to_kv_pool_allocator
-        cache_slots = allocator.alloc(bstar * n_diff)
-
-        # Map action token positions → allocated cache slots in req_to_token
-        idx_tensor = torch.tensor(active_indices, device=device, dtype=torch.long)
-        vlm_seq_lens = forward_batch.seq_lens[idx_tensor]
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        for i, idx in enumerate(active_indices):
-            req_pool_idx = forward_batch.req_pool_indices[idx]
-            vlm_len = vlm_seq_lens[i]
-            slots = cache_slots[i * n_diff : (i + 1) * n_diff]
-            req_to_token[req_pool_idx, vlm_len : vlm_len + n_diff] = slots
+        # --- 2. Backend check ---
+        # Only triton and flashinfer backends support skip-KV-save mode,
+        # because their extend implementations use K,V tensors directly
+        # (ragged attention) without needing to read from the KV pool.
+        backend = forward_batch.attn_backend
+        if not isinstance(backend, (FlashInferAttnBackend, TritonAttnBackend)):
+            raise RuntimeError(
+                f"Alpamayo flow matching requires triton or flashinfer backend, "
+                f"got {type(backend).__name__}"
+            )
 
         # --- 3. Build the expert ForwardBatch (EXTEND mode) ---
         expert_batch = self._build_expert_forward_batch(
-            active_indices, forward_batch, mrope_positions, cache_slots
+            active_indices, forward_batch, mrope_positions
         )
 
-        # Initialize attention metadata (FlashInfer wrapper plans / Triton metadata)
-        backend = forward_batch.attn_backend
-        backend.init_forward_metadata(expert_batch)
+        # Initialize attention metadata.
+        # For FlashInfer, force ragged path (use_ragged=True) by temporarily
+        # clearing is_multimodal and enable_deterministic. The non-ragged (paged-only)
+        # path would read uninitialized req_to_token slots for action tokens
+        # (since we don't allocate real cache slots), producing garbage results.
+        # The ragged path uses K,V tensors directly for new tokens and only
+        # reads paged KV for the VLM prefix — which is correctly mapped.
+        if isinstance(backend, FlashInferAttnBackend):
+            orig_is_multimodal = getattr(backend, "is_multimodal", False)
+            orig_enable_deterministic = getattr(backend, "enable_deterministic", False)
+            backend.is_multimodal = False
+            backend.enable_deterministic = False
+            try:
+                backend.init_forward_metadata(expert_batch)
+            finally:
+                backend.is_multimodal = orig_is_multimodal
+                backend.enable_deterministic = orig_enable_deterministic
+        else:
+            backend.init_forward_metadata(expert_batch)
 
         # --- 4. Euler integration loop ---
         # Match reference FlowMatching._euler: x is fp32 (default dtype)
@@ -460,8 +471,8 @@ class AlpamayoR1(nn.Module):
 
             # c. Run expert: bidirectional attention over action tokens,
             #    attending to VLM's cached prefix KV via shared layer_ids.
-            #    ENCODER_ONLY ensures bidirectional (non-causal) attention.
-            #    KV cache is written to pre-allocated slots and freed after the loop.
+            #    ENCODER_ONLY ensures bidirectional (non-causal) attention
+            #    and skips KV cache save (handled in RadixAttention.forward).
             expert_hidden = self.expert(
                 input_ids=None,
                 positions=mrope_positions,
@@ -479,9 +490,6 @@ class AlpamayoR1(nn.Module):
 
             # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
             x = x + dt * pred
-
-        # Free the KV cache slots allocated for action tokens
-        allocator.free(cache_slots)
 
         return x  # (bstar, n_waypoints, action_dim)
 
