@@ -63,7 +63,9 @@ def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
-    m_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: int,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -73,7 +75,9 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(rhs)
 
     with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+        asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(lhs, rhs, out, offsets, experts, list_size,
+            disable_ue8m0_cast=disable_ue8m0_cast
+        )
 
 
 def grouped_gemm_nt_bf16bf16bf16_masked(
@@ -106,71 +110,19 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
         )
 
 
-def _m_indices_to_offsets_experts(m_indices: torch.Tensor):
-    """Convert m_indices (per-token expert IDs) to offsets/experts/list_size format.
-
-    This function matches the C++ build_offsets_experts_from_indices() logic in
-    AsymGEMM (sm100_fp8_asym_gemm_1d1d.hpp:83-113).
-
-    Args:
-        m_indices: 1D tensor of shape [M] where each element is the expert ID for that token.
-                   -1 is treated as a sentinel value (invalid expert).
-
-    Returns:
-        offsets: 1D tensor of shape [list_size] containing start index for each expert segment.
-        experts: 1D tensor of shape [list_size] containing expert ID for each segment.
-        list_size: Number of expert segments (including sentinel).
-    """
-    # Move to CPU for processing
-    m_indices_cpu = m_indices.cpu()
-    mi = m_indices_cpu.tolist()
-
-    # Build offsets/experts on CPU
-    m = len(mi)
-    offsets_list = []
-    experts_list = []
-
-    if m > 0:
-        # Emit first token if valid (not sentinel -1)
-        if mi[0] != -1:
-            current_expert = mi[0]
-            start_idx = 0
-            for i in range(1, m):
-                if mi[i] != current_expert:
-                    # Emit segment for current_expert
-                    offsets_list.append(start_idx)
-                    experts_list.append(current_expert)
-                    start_idx = i
-                    current_expert = mi[i]
-            # Emit last segment
-            offsets_list.append(start_idx)
-            experts_list.append(current_expert)
-
-    # Append sentinel
-    offsets_list.append(m)
-    experts_list.append(-1)
-
-    list_size = len(offsets_list)
-
-    offsets = torch.tensor(offsets_list, device=m_indices.device, dtype=torch.int32)
-    experts = torch.tensor(experts_list, device=m_indices.device, dtype=torch.int32)
-
-    return offsets, experts, list_size
-
-
 def grouped_gemm_nt_bf16bf16bf16_contig(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     out: torch.Tensor,
-    m_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: int,
 ):
     m, k = lhs.shape
     num_groups, n, _ = rhs.shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
     with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        # Convert m_indices to offsets/experts/list_size format for AsymGEMM API
-        offsets, experts, list_size = _m_indices_to_offsets_experts(m_indices)
         asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
             lhs, rhs, out, offsets, experts, list_size
         )
