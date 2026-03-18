@@ -22,79 +22,24 @@ if ENABLE_JIT_ASYMGEMM:
 _SANITY_CHECK = get_bool_env_var("SGLANG_ASYMGEMM_SANITY_CHECK")
  
 
-
-def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
-    """
-    Build offsets and experts for sparse m-grouped masked GEMM.
-
-    Generates LOCAL offset pairs for each active expert group. The kernel will add
-    (scheduler.current_group_idx * shape_m) to compute the global offset.
-
-    Only groups with masked_m[g] > 0 are included in the output mapping.
-    Each active group generates a pair of offsets (start, end) relative to that group.
-
-    Args:
-        masked_m: (num_groups,) tensor of actual token counts per group
-        num_groups: number of expert groups
-        block_m: block alignment for padding (default 128)
-
-    Returns:
-        offsets: flat tensor with LOCAL pairs [start_0, end_0, start_1, end_1, ...]
-        experts: expert IDs for each active group + terminator (-1)
-        list_size: number of experts in output (including terminator)
-
-    Example:
-        masked_m = torch.tensor([0, 12, 0, 129]), num_groups = 4
-        offsets = [0, 128, 0, 256]  # LOCAL offsets (padded to 128)
-        experts = [1, 3, -1]        # 2 active experts + terminator
-        list_size = 3
-
-    Note:
-        Kernel computes global M index as:
-        m_idx = (scheduler.current_group_idx * shape_m) + local_m_idx
-    """
-    offsets = []
-    experts = []
-
-    for g in range(num_groups):
-        v = masked_m[g].item()
-        if v > 0:  # Only process active groups
-            # LOCAL offsets (relative to this group)
-            start = 0
-            # Pad actual tokens to block_m alignment
-            end = ((v + block_m - 1) // block_m) * block_m
-            offsets.append(start)
-            offsets.append(end)
-            experts.append(g)
-
-    # Add terminator expert
-    experts.append(-1)
-
-    return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
-            torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-            len(experts))
-
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
-    
-
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
-
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m, num_groups
-    )
 
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -138,15 +83,13 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
     num_groups: int,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: int,
 ):
     num_groups, m_max, k = lhs.shape
     _, n, _ = rhs.shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
-
-    # Compact offsets for the asym_gemm kernel
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m, num_groups
-    )
 
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
