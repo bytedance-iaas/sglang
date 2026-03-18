@@ -22,10 +22,8 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 
 from sglang.jit_kernel.flash_attention_v3 import (
-    flash_attn_varlen_func as flash_attn_varlen_func_fa3,
-)
-from sglang.jit_kernel.flash_attention_v3 import (
-    flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
 )
 
 
@@ -503,7 +501,7 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache_fa3(
+            result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
@@ -524,25 +522,23 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = (
-                    flash_attn_with_kvcache_fa3(
-                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k_cache=key_cache,
-                        v_cache=value_cache,
-                        page_table=self.forward_metadata_spec_decode_expand.page_table,
-                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                        softmax_scale=layer.scaling,
-                        causal=False,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        return_softmax_lse=True,
-                        **kwargs,
-                    )
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                    **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -570,7 +566,7 @@ class XPUAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    output = flash_attn_varlen_func_fa3(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -584,7 +580,7 @@ class XPUAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output = flash_attn_varlen_func_fa3(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -627,7 +623,7 @@ class XPUAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                result = flash_attn_with_kvcache_fa3(
+                result = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
@@ -647,7 +643,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache_fa3(
+                        flash_attn_with_kvcache(
                             q=q_rope,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
@@ -766,7 +762,7 @@ class XPUAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
-                o = flash_attn_with_kvcache_fa3(
+                o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -785,7 +781,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
-                o = flash_attn_with_kvcache_fa3(
+                o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -812,7 +808,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
-                result = flash_attn_with_kvcache_fa3(
+                result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -833,7 +829,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache_fa3(
+                        flash_attn_with_kvcache(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -888,7 +884,7 @@ class XPUAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            result = flash_attn_with_kvcache_fa3(
+            result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -907,25 +903,23 @@ class XPUAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = (
-                    flash_attn_with_kvcache_fa3(
-                        q=q_rope,
-                        k_cache=k_rope_cache,
-                        v_cache=c_kv_cache,
-                        qv=q_nope,
-                        page_table=self.forward_metadata_spec_decode_expand.page_table,
-                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                        softmax_scale=layer.scaling,
-                        causal=False,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        return_softmax_lse=True,
-                    )
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q_rope,
+                    k_cache=k_rope_cache,
+                    v_cache=c_kv_cache,
+                    qv=q_nope,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
                 )
                 o, _ = merge_state_v2(
                     o,

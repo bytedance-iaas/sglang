@@ -521,6 +521,9 @@ class Envs:
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
+    # Sglang Cache Dir
+    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+
 
 envs = Envs()
 EnvField._allow_set_name = False

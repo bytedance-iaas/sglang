@@ -1,27 +1,56 @@
 import logging
+import os
 from typing import Optional, Union
 
 import torch
+from kernels import get_kernel, load_kernel
 
 from sglang.jit_kernel.utils import cache_once
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 SGL_FA3_KERNEL_REPO = "kernels-community/sgl-flash-attn3"
-DEFAULT_FA3_KERNEL_LOCKFILE = "/sgl-workspace/sglang/python/kernels.lock"
+SGL_FA3_KERNEL_REVISION = "v1"
+DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 @cache_once
 def _load_fa3_kernels():
+    lockfile_path = os.path.join(
+        envs.SGLANG_CACHE_DIR.get(), DEFAULT_FA3_KERNEL_LOCKFILE
+    )
     try:
-        from kernels import load_kernel
+        # When the lock file provided, load from the kernel cache directory,
+        # otherwise, load from the repo, which require download from huggingface hub
+        # but always works as long as the repo is accessible.
+        if os.path.exists(DEFAULT_FA3_KERNEL_LOCKFILE):
+            ops = load_kernel(SGL_FA3_KERNEL_REPO, lockfile_path)
+        else:
+            ops = get_kernel(SGL_FA3_KERNEL_REPO, revision=SGL_FA3_KERNEL_REVISION)
 
-        return load_kernel(SGL_FA3_KERNEL_REPO, lockfile=DEFAULT_FA3_KERNEL_LOCKFILE)
+        return {
+            "flash_attn_with_kvcache": ops.flash_attn_with_kvcache,
+            "flash_attn_varlen_func": ops.flash_attn_varlen_func,
+        }
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to load FlashAttention v3 kernels from {SGL_FA3_KERNEL_REPO}. "
-            "Please ensure the kernel repository is correctly set up and the lockfile is present."
-        ) from e
+        # When the kernels from the repo or the cache directory cannot be loaded
+        # we catch the exception and log a warning, and then fallback to the implementation
+        # from sgl-kernel, which is expected to be less efficient but more compatible.
+        logger.warning(
+            f"Rollback to implementation from sgl-kernel since loading FlashAttention v3 "
+            f"kernels from {SGL_FA3_KERNEL_REPO} with lockfile {lockfile_path} failed: {e}"
+        )
+
+        from sgl_kernel.flash_attn import (
+            flash_attn_varlen_func,
+            flash_attn_with_kvcache,
+        )
+
+        return {
+            "flash_attn_with_kvcache": flash_attn_with_kvcache,
+            "flash_attn_varlen_func": flash_attn_varlen_func,
+        }
 
 
 @cache_once
@@ -167,16 +196,7 @@ def flash_attn_with_kvcache(
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
-    try:
-        flash_attn_with_kvcache = _load_fa3_kernels().flash_attn_with_kvcache
-    except Exception as e:
-        logger.warning(
-            f"Failed to load FlashAttention v3 kernel for flash_attn_with_kvcache: {e}."
-            "Rollback to implementation from sgl-kernel"
-        )
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-    return flash_attn_with_kvcache(
+    return _load_fa3_kernels()["flash_attn_with_kvcache"](
         q,
         k_cache,
         v_cache,
@@ -243,16 +263,7 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    try:
-        flash_attn_varlen_func = _load_fa3_kernels().flash_attn_varlen_func
-    except Exception as e:
-        logger.warning(
-            f"Failed to load FlashAttention v3 kernel for flash_attn_varlen_func: {e}."
-            + "Rollback to implementation from sgl-kernel"
-        )
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
-
-    return flash_attn_varlen_func(
+    return _load_fa3_kernels()["flash_attn_varlen_func"](
         q,
         k,
         v,

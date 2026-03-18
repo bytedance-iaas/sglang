@@ -261,6 +261,7 @@ inputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
+python/kernel.lock
 
 
 # MUSA section

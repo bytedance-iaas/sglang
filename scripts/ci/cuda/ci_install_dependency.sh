@@ -335,6 +335,8 @@ $PIP_CMD install nvidia-cutlass-dsl==4.3.5 --force-reinstall $PIP_INSTALL_SUFFIX
 
 # Download kernels from kernels community
 kernels download python || true
+kernels lock python || true
+mv python/kernels.lock ${HOME}/.cache/sglang || true
 
 # Show current packages
 $PIP_CMD list
