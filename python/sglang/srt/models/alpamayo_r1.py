@@ -28,6 +28,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.utils import logger
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.managers.schedule_batch import MultimodalInputs
@@ -398,7 +400,15 @@ class AlpamayoR1(nn.Module):
             positions_list.append(action_pos)
         mrope_positions = torch.cat(positions_list, dim=1)  # (3, bstar * n_diff)
 
-        # --- 2. Build the expert ForwardBatch (EXTEND mode) ---
+        # --- 2. Backend check ---
+        backend = forward_batch.attn_backend
+        if not isinstance(backend, (FlashInferAttnBackend, TritonAttnBackend)):
+            raise RuntimeError(
+                f"Alpamayo flow matching requires triton or flashinfer backend, "
+                f"got {type(backend).__name__}"
+            )
+
+        # --- 3. Build the expert ForwardBatch (EXTEND mode) ---
         expert_batch = self._build_expert_forward_batch(
             active_indices, forward_batch, mrope_positions
         )
@@ -433,9 +443,7 @@ class AlpamayoR1(nn.Module):
         # split-K and processes the same KV values in the same logical order each run
         # → fully deterministic.
 
-        backend = forward_batch.attn_backend
         logger.info(f"attention_backend={backend}")
-        # backend.init_forward_metadata(expert_batch)
 
         _orig_is_multimodal = getattr(backend, "is_multimodal", False)
         _orig_enable_deterministic = getattr(backend, "enable_deterministic", False)

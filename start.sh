@@ -6,7 +6,7 @@ python3 -m sglang.launch_server --model-path /data/models/Alpamayo-R1-10B-Origin
  --port 29003 \
  --tp 1 \
  --disable-cuda-graph \
- --attention-backend torch_native 
+ --attention-backend flashinfer  
 # --tokenizer-path Qwen/Qwen3-VL-8B-Instruct \
 # --tokenizer-path /data/models/Qwen3-VL-8B-Instruct \
 # --skip-server-warmup 
