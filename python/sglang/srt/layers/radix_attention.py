@@ -104,9 +104,7 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        if save_kv_cache and self.attn_type == AttentionType.ENCODER_ONLY:
-            save_kv_cache = False
-
+        
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

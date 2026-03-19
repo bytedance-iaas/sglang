@@ -28,7 +28,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.utils import logger
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -158,6 +157,11 @@ class AlpamayoR1(nn.Module):
         for layer in self.expert.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
                 layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
+                # Force save_kv_cache=False
+                original_forward = layer.self_attn.attn.forward
+                def _patched_forward(q, k, v, forward_batch, save_kv_cache=False, _orig=original_forward, **kwargs):
+                    return _orig(q, k, v, forward_batch, save_kv_cache=False, **kwargs)
+                layer.self_attn.attn.forward = _patched_forward
         # Flow matching parameters
         self.n_diffusion_tokens = n_waypoints
         self.action_dims = [n_waypoints, action_dim]
@@ -402,7 +406,7 @@ class AlpamayoR1(nn.Module):
 
         # --- 2. Backend check ---
         backend = forward_batch.attn_backend
-        if not isinstance(backend, (FlashInferAttnBackend, TritonAttnBackend)):
+        if not isinstance(backend, (TritonAttnBackend)):
             raise RuntimeError(
                 f"Alpamayo flow matching requires triton or flashinfer backend, "
                 f"got {type(backend).__name__}"
@@ -444,22 +448,13 @@ class AlpamayoR1(nn.Module):
         # → fully deterministic.
 
         logger.info(f"attention_backend={backend}")
+        backend.init_forward_metadata(expert_batch)
 
-        _orig_is_multimodal = getattr(backend, "is_multimodal", False)
-        _orig_enable_deterministic = getattr(backend, "enable_deterministic", False)
-        backend.is_multimodal = False
-        backend.enable_deterministic = False
-        try:
-            backend.init_forward_metadata(expert_batch)
-        finally:
-            backend.is_multimodal = _orig_is_multimodal
-            backend.enable_deterministic = _orig_enable_deterministic
 
         # --- 3. Euler integration loop ---
         # Match reference FlowMatching._euler: x is fp32 (default dtype)
         # so Euler accumulation x = x + dt * v stays in fp32 throughout.
 
-        # torch.cuda.manual_seed_all(42)  # for reproducibility in testing
         x = torch.randn(
             bstar, *self.action_dims, device=device,
         )
