@@ -18,7 +18,6 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
-    SSD = auto()
     SSD_V1 = auto()
     NGRAM = auto()
     NONE = auto()
@@ -46,19 +45,13 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.STANDALONE
     
     def is_ssd(self) -> bool:
-        return self == SpeculativeAlgorithm.SSD or self == SpeculativeAlgorithm.SSD_V1
-
-    def is_ssd_v2(self) -> bool:
-        return self == SpeculativeAlgorithm.SSD
-
-    def is_ssd_v1(self) -> bool:
-        return self == SpeculativeAlgorithm.SSD_V1
+        return self == self == SpeculativeAlgorithm.SSD_V1
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone() or self.is_ssd_v2()
+        return self.is_eagle() or self.is_standalone()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -104,22 +97,13 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorker
         elif self.is_ssd():
-            if self.is_ssd_v1():
-                if enable_overlap:
-                    raise ValueError(
-                        "Speculative algorithm SSD_V1 does not support overlap (spec v2). "
-                        "Set env SGLANG_ENABLE_SPEC_V2=False."
-                    )
-                from sglang.srt.speculative.ssd_worker import SSDWorkerV1
-                return SSDWorkerV1
             if enable_overlap:
-                from sglang.srt.speculative.ssd_worker_v2 import SSDWorkerV2
-
-                return SSDWorkerV2
-            raise ValueError(
-                "Speculative algorithm SSD currently requires overlap (spec v2). "
-                "Set env SGLANG_ENABLE_SPEC_V2=True."
-            )
+                raise ValueError(
+                    "Speculative algorithm SSD_V1 does not support overlap (spec v2). "
+                    "Set env SGLANG_ENABLE_SPEC_V2=False."
+                )
+            from sglang.srt.speculative.ssd_worker import SSDWorkerV1
+            return SSDWorkerV1
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
