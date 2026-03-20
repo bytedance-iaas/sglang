@@ -313,6 +313,16 @@ def _load_alpamayo_r1_config(
     if hasattr(config, "text_config") and "vocab_size" in alpamayo_json:
         config.text_config.vocab_size = alpamayo_json["vocab_size"]
 
+    # Synthesize rope_parameters on text_config for transformers-v5 compatibility.
+    # qwen3.py expects config.rope_parameters dict; Qwen3VLTextConfig (transformers v4)
+    # only has rope_theta / rope_scaling as separate attributes.
+    if hasattr(config, "text_config") and not hasattr(config.text_config, "rope_parameters"):
+        tc = config.text_config
+        rope_params = {"rope_type": "default", "rope_theta": getattr(tc, "rope_theta", 1000000)}
+        if getattr(tc, "rope_scaling", None):
+            rope_params.update(tc.rope_scaling)
+        tc.rope_parameters = rope_params
+
     # so current model_type is pretended to be qwen3_vl
     setattr(config, "_name_or_path", model_path)
     return config
