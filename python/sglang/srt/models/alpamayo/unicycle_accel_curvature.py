@@ -16,15 +16,15 @@
 import logging
 
 import torch
-from sglang.srt.models.action_space_base import ActionSpace
-from sglang.srt.models.action_space_utils import (
+from .action_space_base import ActionSpace
+from .action_space_utils import (
     dxy_theta_to_v,
     dxy_theta_to_v_without_v0,
     solve_xs_eq_y,
     theta_smooth,
     unwrap_angle,
 )
-from sglang.srt.models.rotation import (
+from .rotation import (
     rot_2d_to_3d,
     rotation_matrix_torch,
     so3_to_yaw_torch,

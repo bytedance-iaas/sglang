@@ -31,8 +31,8 @@ from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.utils import logger
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.managers.schedule_batch import MultimodalInputs
-from .action_in_proj import PerWaypointActionInProjV2
-from .unicycle_accel_curvature import UnicycleAccelCurvatureActionSpace
+from .alpamayo.action_in_proj import PerWaypointActionInProjV2
+from .alpamayo.unicycle_accel_curvature import UnicycleAccelCurvatureActionSpace
 
 
 class AlpamayoR1LogitsProcessor(LogitsProcessor):
@@ -69,14 +69,10 @@ class AlpamayoR1(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        
-        logger.info("AlpamayoR1 initialized")
 
         # Store config for later use
         self.config = config
-
         qwen_config = config
-
         # we increaset vocab size to match Alpamayo's tokenizer, which may have additional special tokens compared to the base Qwen3-VL config
         qwen_config.text_config.vocab_size = config.vocab_size
 

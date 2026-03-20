@@ -17,7 +17,7 @@ import logging
 
 import einops
 import torch
-from sglang.srt.models.rotation import round_2pi_torch, so3_to_yaw_torch
+from .rotation import round_2pi_torch, so3_to_yaw_torch
 
 logger = logging.getLogger(__name__)
 
