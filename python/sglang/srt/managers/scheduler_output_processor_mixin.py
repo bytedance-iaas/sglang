@@ -391,7 +391,32 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                getattr(result, "ssd_cache_hits_sum", 0),
+                getattr(result, "ssd_cache_hits_count", 0),
+                getattr(result, "ssd_subtree_reuse_attempts", 0),
+                getattr(result, "ssd_subtree_reuse_fallbacks", 0),
+                getattr(result, "ssd_recovery_in_draft_tree_sum", 0),
+                getattr(result, "ssd_recovery_in_draft_tree_count", 0),
+                getattr(result, "ssd_recovery_fork_covered_sum", 0),
+                getattr(result, "ssd_recovery_fork_covered_count", 0),
+                getattr(result, "ssd_recovery_fork_prefetch_selected_sum", 0),
+                getattr(result, "ssd_recovery_fork_prefetch_selected_count", 0),
+                getattr(result, "ssd_recovery_fork_prefetch_put_sum", 0),
+                getattr(result, "ssd_recovery_fork_prefetch_capped_sum", 0),
+                getattr(result, "ssd_next_verify_prefetch_put_sum", 0),
+                getattr(result, "ssd_recovery_fork_contains_true_sum", 0),
+                getattr(result, "ssd_recovery_fork_contains_true_count", 0),
+                getattr(result, "ssd_fork_token_prefetch_put_sum", 0),
+                getattr(result, "ssd_prev_fork_map_found_sum", 0),
+                getattr(result, "ssd_prev_fork_map_found_count", 0),
+                getattr(result, "ssd_fork_prefetch_hits_sum", 0),
+                getattr(result, "ssd_fork_prefetch_hits_count", 0),
+                getattr(result, "ssd_fork_precise_hits_sum", 0),
+                getattr(result, "ssd_fork_precise_hits_count", 0),
+            )
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
