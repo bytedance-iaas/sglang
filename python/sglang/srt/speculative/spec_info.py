@@ -45,7 +45,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.STANDALONE
     
     def is_ssd(self) -> bool:
-        return self == self == SpeculativeAlgorithm.SSD_V1
+        return self == SpeculativeAlgorithm.SSD_V1
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
