@@ -16,7 +16,6 @@ import copy
 from collections import defaultdict
 from typing import Iterable, List, Optional, Tuple
 
-import einops
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
@@ -34,18 +33,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from .action_in_proj import PerWaypointActionInProjV2
 from .unicycle_accel_curvature import UnicycleAccelCurvatureActionSpace
-
-
-# class AlpamayoR1Config(PretrainedConfig):
-#     """Minimal config for AlpamayoR1 that wraps Qwen3-VL."""
-#     model_type = "alpamayo_r1"
-    
-#     def __init__(self, **kwargs):
-#         super().__init__(**kwargs)
-#         Store the vlm_name_or_path if provided
-#         self.vlm_name_or_path = "Qwen/Qwen3-VL-8B-Instruct"
-#         self.vlm_backend = "qwenvl3"
-#         self.vocab_size = kwargs.get("vocab_size", 155697)  # Default vocab size for AlpamayoR1
 
 
 class AlpamayoR1LogitsProcessor(LogitsProcessor):
@@ -71,12 +58,10 @@ class AlpamayoR1LogitsProcessor(LogitsProcessor):
     
 
 class AlpamayoR1(nn.Module):
-    """
-    Dummy implementation of AlpamayoR1 for SGLang.
-    AlpamayoR1 wraps Qwen3VLForConditionalGeneration as its language model (vlm).
-    
-    This implementation bypasses the standard HF config loading since Alpamayo
-    uses a custom config.json format with training-specific fields.
+    """AlpamayoR1: VLM + expert diffusion model for trajectory prediction.
+
+    Wraps Qwen3VLForConditionalGeneration as VLM and a separate Qwen3Model
+    as the expert branch for flow-matching-based action generation.
     """
     def __init__(
         self,
@@ -85,7 +70,7 @@ class AlpamayoR1(nn.Module):
     ):
         super().__init__()
         
-        logger.info(f"AlpamayoR1 initialized")
+        logger.info("AlpamayoR1 initialized")
 
         # Store config for later use
         self.config = config
@@ -106,8 +91,7 @@ class AlpamayoR1(nn.Module):
                                                                 traj_token_start_idx=config.traj_token_start_idx, 
                                                                 traj_vocab_size=config.traj_vocab_size)
 
-        logger.info(f"AlpamayoR1: Successfully initialized Qwen3-VL as self.vlm")
-
+        logger.info("AlpamayoR1: Successfully initialized Qwen3-VL as self.vlm")
 
         # Build expert from text_config only (same as AutoModel.from_config(text_config)).
         expert_config = copy.deepcopy(self.vlm.config.text_config)
@@ -126,7 +110,6 @@ class AlpamayoR1(nn.Module):
         action_space_cfg = config.traj_tokenizer_cfg["action_space_cfg"]
         n_waypoints = action_space_cfg["n_waypoints"]
         action_dim = len(traj_tokenizer_cfg["dims_max"])
-
 
         # Instantiate action space (UnicycleAccelCurvatureActionSpace)
         action_space_kwargs = {
@@ -195,15 +178,6 @@ class AlpamayoR1(nn.Module):
                 )
 
                 if should_trigger_flow_matching:
-                    # Avoid recomputing if already attached once for this request.
-                    # if (
-                    #     reqs is not None
-                    #     and i < len(reqs)
-                    #     and getattr(reqs[i], "customized_info", None) is not None
-                    #     and "traj_xyz" in reqs[i].customized_info
-                    # ):
-                    #     continue
-
                     # Force generation to stop immediately
                     ret.next_token_logits[i, :] = float("-inf")
                     ret.next_token_logits[i, self.traj_force_stop_token_id] = 0.0
@@ -406,9 +380,9 @@ class AlpamayoR1(nn.Module):
 
         # --- 2. Backend check ---
         backend = forward_batch.attn_backend
-        if not isinstance(backend, (TritonAttnBackend)):
+        if not isinstance(backend, TritonAttnBackend):
             raise RuntimeError(
-                f"Alpamayo flow matching requires triton or flashinfer backend, "
+                f"Alpamayo flow matching requires triton backend, "
                 f"got {type(backend).__name__}"
             )
 
@@ -417,37 +391,6 @@ class AlpamayoR1(nn.Module):
             active_indices, forward_batch, mrope_positions
         )
 
-        # Initialize attention metadata (FlashInfer wrapper plans / Triton metadata)
-        # This is safe because the VLM's decode is already finished;
-        # the runtime will re-init metadata for the next batch.
-        #
-        # BUG FIX: The expert uses ENCODER_ONLY attention (bidirectional self-attention
-        # among action tokens + cross-attention to VLM prefix KV).  FlashInfer's EXTEND
-        # mode has two code paths:
-        #
-        #   use_ragged=True  (correct for ENCODER_ONLY):
-        #     - Ragged wrapper:  Q(64) × local K,V(64) computed in-memory, non-causal
-        #     - Paged wrapper:   Q(64) × VLM prefix KV(3190), non-causal
-        #     - Merge with log-sum-exp
-        #     - ENCODER_ONLY suppresses KV cache write and forces causal=False
-        #     - paged_kernel_lens = prefix_lens = 3190  (no garbage)
-        #
-        #   use_ragged=False (buggy for ENCODER_ONLY, forced by is_multimodal + enable_deterministic):
-        #     - Paged wrapper only, causal=True (wrong!), save_kv_cache=True (wrong!)
-        #     - out_cache_loc=zeros → writes all 64 action-token KVs to physical slot 0,
-        #       corrupting VLM token 0's KV stored there
-        #     - paged_kernel_lens = seq_lens = 3254 → req_to_token[3190..3253] are
-        #       uninitialized, all pointing to slot 0 which holds corrupted KV
-        #     - Between runs, VLM tokens land on different physical slots, so the
-        #       corruption propagates differently → non-deterministic output
-        #
-        # Fix: temporarily clear is_multimodal and enable_deterministic so
-        # init_forward_metadata chooses use_ragged=True for this expert batch.
-        # The expert's paged attention (3190 prefix tokens < tile_size 4096) has no
-        # split-K and processes the same KV values in the same logical order each run
-        # → fully deterministic.
-
-        logger.info(f"attention_backend={backend}")
         backend.init_forward_metadata(expert_batch)
 
 
@@ -459,8 +402,6 @@ class AlpamayoR1(nn.Module):
             bstar, *self.action_dims, device=device,
         )
 
-        logger.info(f"start flowmatching {x[0,:2]}")
-                    
         time_steps = torch.linspace(
             0.0, 1.0, self.num_inference_steps + 1, device=device
         )
@@ -485,12 +426,7 @@ class AlpamayoR1(nn.Module):
                 bstar * n_diff, -1
             )
 
-            # c. Run expert: bidirectional attention over action tokens,
-            #    attending to VLM's cached prefix KV via shared layer_ids.
-            #    ENCODER_ONLY ensures:
-            #      - Ragged attn: action tokens attend bidirectionally to each other
-            #      - Paged attn:  action tokens attend to VLM's cached KV
-            #      - No KV is written to the cache pool
+            # c. Run expert: bidirectional attention over action tokens
             expert_hidden = self.expert(
                 input_ids=None,
                 positions=mrope_positions,
@@ -513,8 +449,6 @@ class AlpamayoR1(nn.Module):
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.vlm.pad_input_ids(input_ids, mm_inputs)
 
-
-    
     def _load_expert_weights(
         self,
         expert_weights: Iterable[Tuple[str, torch.Tensor]],
