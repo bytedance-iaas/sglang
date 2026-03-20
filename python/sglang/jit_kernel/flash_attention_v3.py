@@ -24,7 +24,7 @@ def _load_fa3_kernels():
         # When the lock file provided, load from the kernel cache directory,
         # otherwise, load from the repo, which require download from huggingface hub
         # but always works as long as the repo is accessible.
-        if os.path.exists(DEFAULT_FA3_KERNEL_LOCKFILE):
+        if os.path.exists(lockfile_path):
             ops = load_kernel(SGL_FA3_KERNEL_REPO, lockfile_path)
         else:
             ops = get_kernel(SGL_FA3_KERNEL_REPO, revision=SGL_FA3_KERNEL_REVISION)
