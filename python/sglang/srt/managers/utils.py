@@ -52,24 +52,6 @@ class GenerationBatchResult:
     ssd_cache_hits_count: int = 0
     ssd_subtree_reuse_attempts: int = 0
     ssd_subtree_reuse_fallbacks: int = 0
-    ssd_recovery_in_draft_tree_sum: int = 0
-    ssd_recovery_in_draft_tree_count: int = 0
-    ssd_recovery_fork_covered_sum: int = 0
-    ssd_recovery_fork_covered_count: int = 0
-    ssd_recovery_fork_prefetch_selected_sum: int = 0
-    ssd_recovery_fork_prefetch_selected_count: int = 0
-    ssd_recovery_fork_prefetch_put_sum: int = 0
-    ssd_recovery_fork_prefetch_capped_sum: int = 0
-    ssd_next_verify_prefetch_put_sum: int = 0
-    ssd_recovery_fork_contains_true_sum: int = 0
-    ssd_recovery_fork_contains_true_count: int = 0
-    ssd_fork_token_prefetch_put_sum: int = 0
-    ssd_prev_fork_map_found_sum: int = 0
-    ssd_prev_fork_map_found_count: int = 0
-    ssd_fork_prefetch_hits_sum: int = 0
-    ssd_fork_prefetch_hits_count: int = 0
-    ssd_fork_precise_hits_sum: int = 0
-    ssd_fork_precise_hits_count: int = 0
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
