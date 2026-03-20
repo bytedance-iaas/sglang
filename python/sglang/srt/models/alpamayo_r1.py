@@ -452,12 +452,11 @@ class AlpamayoR1(nn.Module):
     def _load_expert_weights(
         self,
         expert_weights: Iterable[Tuple[str, torch.Tensor]],
-        strict: bool = True,
     ):
         """Load expert (Qwen3 text backbone) weights.
 
         Returns:
-            A tuple ``(loaded_cnt, missing_params, unexpected_ckpt_keys)``.
+            The number of checkpoint tensors loaded.
         """
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -474,10 +473,8 @@ class AlpamayoR1(nn.Module):
         loaded_stacked_shards = defaultdict(set)
         unexpected_ckpt_keys = []
         loaded_cnt = 0
-        seen_any_expert_weight = False
 
         for name, loaded_weight in expert_weights:
-            seen_any_expert_weight = True
             # Keep compatibility with checkpoints that include an extra "model." prefix.
             if name.startswith("model."):
                 name = name[len("model.") :]
@@ -547,69 +544,43 @@ class AlpamayoR1(nn.Module):
                 missing_params.append(pname)
 
         logger.info(f"AlpamayoR1: loaded {loaded_cnt} expert tensors")
-        if strict:
-            if not seen_any_expert_weight:
-                raise RuntimeError(
-                    "AlpamayoR1 strict load failed: no checkpoint weights were routed "
-                    "to expert."
-                )
-            if missing_params or unexpected_ckpt_keys:
-                raise RuntimeError(
-                    "AlpamayoR1 strict expert load failed: "
-                    f"missing={len(missing_params)}, "
-                    f"unexpected={len(unexpected_ckpt_keys)}. "
-                    f"Sample missing={missing_params[:8]}, "
-                    f"sample unexpected={unexpected_ckpt_keys[:8]}"
-                )
-        return loaded_cnt, missing_params, unexpected_ckpt_keys
+        if missing_params or unexpected_ckpt_keys:
+            raise RuntimeError(
+                "AlpamayoR1 expert load failed: "
+                f"missing={len(missing_params)}, "
+                f"unexpected={len(unexpected_ckpt_keys)}. "
+                f"Sample missing={missing_params[:8]}, "
+                f"sample unexpected={unexpected_ckpt_keys[:8]}"
+            )
+        return loaded_cnt
 
     def _load_plain_module_weights(
         self,
         module: nn.Module,
         module_name: str,
         module_weights: Iterable[Tuple[str, torch.Tensor]],
-        strict: bool = True,
     ):
         state_dict = {name: tensor for name, tensor in module_weights}
         if not state_dict:
-            msg = f"AlpamayoR1: no weights found for {module_name}"
-            if strict:
-                raise RuntimeError(f"AlpamayoR1 strict load failed: {msg}")
-            logger.info(msg)
-            return
-
-        incompatible = module.load_state_dict(state_dict, strict=strict)
-        if incompatible.missing_keys:
-            logger.warning(
-                f"AlpamayoR1: {module_name} missing keys: {incompatible.missing_keys}"
+            raise RuntimeError(
+                f"AlpamayoR1: no weights found for {module_name}"
             )
-        if incompatible.unexpected_keys:
-            logger.warning(
-                f"AlpamayoR1: {module_name} unexpected keys: {incompatible.unexpected_keys}"
-            )
-        logger.info(f"AlpamayoR1: loaded {len(state_dict)} tensors into {module_name}")
+        module.load_state_dict(state_dict, strict=True)
 
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
         strict: bool = True,
     ):
-        """Load weights into the model.
-        
-        The weights from Alpamayo checkpoint may have keys prefixed with 'vlm.'
-        We split and load weights into:
-        - self.vlm
-        - self.expert
-        - self.action_in_proj
-        - self.action_out_proj
-        We skip unrelated modules (e.g. diffusion/action_space).
+        """
+        Load checkpoint weights for AlpamayoR1, routing them to the correct
+        submodules (vlm, expert, action_in_proj, action_out_proj, action_space).
         """
         vlm_weights = []
         expert_weights = []
         action_in_proj_weights = []
         action_out_proj_weights = []
         action_space_weights = []
-        skipped_weights = []
 
         for name, tensor in weights:
             if name.startswith("vlm."):
@@ -650,9 +621,7 @@ class AlpamayoR1(nn.Module):
         logger.info(f"AlpamayoR1: loaded {len(vlm_weights)} vlm tensors")
 
         # 2) Load expert weights.
-        expert_loaded_cnt, expert_missing, expert_unexpected = self._load_expert_weights(
-            expert_weights, strict=strict
-        )
+        expert_loaded_cnt = self._load_expert_weights(expert_weights)
 
         # 3) Load action space buffers (accel_mean, accel_std, etc.).
         # IMPORTANT: convert action_space to float32 BEFORE loading weights,
@@ -665,7 +634,6 @@ class AlpamayoR1(nn.Module):
                 self.action_space,
                 "action_space",
                 action_space_weights,
-                strict=False,  # scalar hyperparams are not in state_dict
             )
 
         # 4) Load action projection modules.
@@ -673,13 +641,11 @@ class AlpamayoR1(nn.Module):
             self.action_in_proj,
             "action_in_proj",
             action_in_proj_weights,
-            strict=strict,
         )
         self._load_plain_module_weights(
             self.action_out_proj,
             "action_out_proj",
             action_out_proj_weights,
-            strict=strict,
         )
 
         logger.info(
@@ -688,12 +654,9 @@ class AlpamayoR1(nn.Module):
             f"vlm_ckpt_tensors={len(vlm_weights)}, "
             f"expert_ckpt_tensors={len(expert_weights)}, "
             f"expert_loaded_tensors={expert_loaded_cnt}, "
-            f"expert_missing_params={len(expert_missing)}, "
-            f"expert_unexpected_ckpt_keys={len(expert_unexpected)}, "
             f"action_in_proj_ckpt_tensors={len(action_in_proj_weights)}, "
             f"action_out_proj_ckpt_tensors={len(action_out_proj_weights)}, "
             f"action_space_ckpt_tensors={len(action_space_weights)}, "
-            f"skipped_tensors={len(skipped_weights)}"
         )
 
 # Entry point for SGLang model registry
