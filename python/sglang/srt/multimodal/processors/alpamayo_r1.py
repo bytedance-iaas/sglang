@@ -19,8 +19,6 @@ from typing import Any, Dict, List, Optional, Union
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 # from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.alpamayo_r1 import AlpamayoR1
-from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-
 from sglang.utils import logger
 
 # Constants from alpamayo_r1/models/base_model.py
@@ -165,10 +163,7 @@ def tokenize_history_trajectory(
 
 
 class AlpamayoR1Processor(QwenVLImageProcessor):
-    # Reuse Qwen3VLForConditionalGeneration temporarily, should be AlpamayoR1
-    # But user said "reference alpamayo_r1.py", I can register AlpamayoR1 class here if needed?
-    # Or just use the processor with any model that matches config.
-    models = [AlpamayoR1] 
+    models = [AlpamayoR1]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # IMPORTANT: Add trajectory tokens to the tokenizer BEFORE calling super().__init__
@@ -178,21 +173,10 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         
         # Apply min_pixels / max_pixels from model config to the HF image processor.
-        # Alpamayo's config.json specifies min_pixels=163840, max_pixels=196608 at the
-        # root level, but these are NOT in preprocessor_config.json so AutoProcessor
-        # doesn't pick them up.  Without this, images get resized to the wrong
-        # resolution → wrong visual token count → wrong mRoPE positions → bad ADE.
-        _min_px = getattr(hf_config, "min_pixels", None)
-        _max_px = getattr(hf_config, "max_pixels", None)
-        if _min_px is not None or _max_px is not None:
-            ip = getattr(_processor, "image_processor", None)
-            if ip is not None:
-                if _min_px is not None and getattr(ip, "min_pixels", None) is None:
-                    ip.min_pixels = _min_px
-                    logger.info("AlpamayoR1Processor: set image_processor.min_pixels=%d from model config", _min_px)
-                if _max_px is not None and getattr(ip, "max_pixels", None) is None:
-                    ip.max_pixels = _max_px
-                    logger.info("AlpamayoR1Processor: set image_processor.max_pixels=%d from model config", _max_px)
+        if hasattr(hf_config, "min_pixels"):
+            _processor.image_processor.min_pixels = hf_config.min_pixels
+        if hasattr(hf_config, "max_pixels"):
+            _processor.image_processor.max_pixels = hf_config.max_pixels
 
         # Initialize trajectory tokenizer configs
         self.hist_traj_tokenizer = DeltaTrajectoryTokenizer()
@@ -242,11 +226,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         request_obj,
         *args,
         **kwargs,
-    ):
-
-        logger.info("AlpamayoR1Processor: Starting to process multimodal data with trajectory fusion.")
-
-        
+    ):        
         # 1. Reuse Qwen3-VL processor logic
         result = await super().process_mm_data_async(image_data, input_text, request_obj, *args, **kwargs)
         
@@ -262,24 +242,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             # Prepare traj_data converting lists to tensors if necessary
             traj_data = {}
             for k, v in history_traj.items():
-                if isinstance(v, (list, np.ndarray)):
-                     # Convert to torch tensor
-                     t = torch.tensor(v)
-                     # Ensure 4D shape [B, n_traj, T, 3] if it was just passed as list/numpy
-                     # If passed from API, it might be nested list. torch.tensor handles it.
-                     # We assume batch dim is included in the passed data or we need to unsqueeze?
-                     # request_obj corresponds to a SINGLE request usually in process_mm_data_async?
-                     # No, request_obj is per request. But input_ids from QwenVLProcessor is 1D list (flattened).
-                     # Wait, input_ids in result is 1D list?
-                     # In qwen_vl.py: "input_ids": input_ids.tolist() where input_ids.flatten().
-                     # So it is 1D.
-                     
-                     # But fuse_traj_tokens expects [B, L]. So we unsqueeze(0).
-                     traj_data[k] = t
-                elif isinstance(v, torch.Tensor):
-                    traj_data[k] = v
-                else:
-                    traj_data[k] = v
+                traj_data[k] = torch.tensor(v) if isinstance(v, (list, np.ndarray)) else v
             
             # Ensure traj_data elements have correct dimensions. 
             # If the user passes numpy array without batch dim (since it's per request), we might need to unsqueeze.
@@ -287,20 +250,10 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             # So traj_data should have batch=1.
             
             if "ego_history_xyz" in traj_data:
-                 t = traj_data["ego_history_xyz"]
-                 if t.ndim == 3: # [n_traj, T, 3]
-                      traj_data["ego_history_xyz"] = t.unsqueeze(0)
-                 elif t.ndim == 2: # [T, 3] (single traj)
-                      traj_data["ego_history_xyz"] = t.unsqueeze(0).unsqueeze(0)
-            
-            if "ego_history_rot" in traj_data:
-                 t = traj_data["ego_history_rot"]
-                 if t.ndim == 3: # [n_traj, T, 3] -> wait rot is 3x3?
-                      # ego_history_rot usually [B, n, T, 3, 3]
-                      pass
-                      
-                 # Just trust input for now, or ensure 4D/5D?
-                 # tokenize_history_trajectory asserts 4D for xyz.
+                t = traj_data["ego_history_xyz"]
+                while t.ndim < 4:  # 需要 [B, n_traj, T, 3]
+                    t = t.unsqueeze(0)
+                traj_data["ego_history_xyz"] = t
             
             # Fuse tokens
             fused_ids = self.fuse_traj_tokens(input_ids_tensor, traj_data)
@@ -308,11 +261,6 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             # Update result
             result["input_ids"] = fused_ids.squeeze(0).tolist()
         
-        # Expand bundled multimodal items (e.g. multiple images in one item)
-        # so each image gets an independent pad_value and offset mapping.
-        # if "mm_items" in result and result["mm_items"]:
-        #     result["mm_items"] = get_new_expanded_mm_items(result["mm_items"])
-
         return result
 
     def fuse_traj_tokens(
@@ -324,6 +272,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             or traj_data.get("ego_history_xyz") is None
             or traj_data.get("ego_history_rot") is None
         ):
+            logger.warning("Trajectory data is missing or incomplete. Skipping trajectory fusion.")
             return input_ids
 
         # Reuse tokenize_history_trajectory helper
@@ -332,12 +281,10 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         )
         
         # We need the history placeholder token ID.
-        placeholder_id = self.traj_token_ids.get("history")
+        placeholder_id = self.traj_token_ids.get("history")        
         if placeholder_id is None:
-             # Fallback or error?
-             logger.warning("AlpamayoR1Processor: 'history' token id not found in config.traj_token_ids. "
-                            "Cannot fuse trajectory tokens.")
-             return input_ids
+            raise ValueError("History placeholder token ID not found in tokenizer. Ensure it was added correctly.")
+
 
         input_ids = replace_pad_token(
             input_ids, hist_idx, placeholder_id
