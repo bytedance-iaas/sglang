@@ -25,6 +25,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
+
 import psutil
 import setproctitle
 import torch
@@ -1326,12 +1330,21 @@ class Scheduler(
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
+        # In DP attention mode, use the globally synchronized is_extend_in_batch
+        # so all DP ranks make the same overlap decision (avoiding deadlock).
+        # In non-DP mode, use the local forward_mode directly.
+        if self.require_mlp_sync:
+            is_extend = lambda b: b and b.is_extend_in_batch
+        else:
+            is_extend = lambda b: b and b.forward_mode.is_extend()
+
+        batch_is_extend = is_extend(batch)
+        last_batch_is_extend = is_extend(self.last_batch)
+
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-            and batch
-            and batch.forward_mode.is_extend()
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and batch_is_extend
+            and last_batch_is_extend
         )
 
         # We do not support overlap + spec + grammar yet,
@@ -2122,7 +2135,24 @@ class Scheduler(
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            _, token_usage, _, _ = self._get_token_info()
+            # Get token usage from several pools
+            token_usage = None
+            if self.is_hybrid_swa:
+                _, _, full_token_usage, swa_token_usage, *_ = self._get_swa_token_info()
+                token_usage = max(full_token_usage, swa_token_usage)
+            if self.is_hybrid_ssm:
+                _, _, full_token_usage, mamba_token_usage, *_ = (
+                    self._get_mamba_token_info()
+                )
+                token_usage = (
+                    max(token_usage, mamba_token_usage)
+                    if token_usage is not None
+                    else max(full_token_usage, mamba_token_usage)
+                )
+            if token_usage is None:
+                _, token_usage, _, _ = self._get_token_info()
+
+            assert token_usage is not None
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=token_usage
             )
@@ -2284,9 +2314,8 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        can_run_set = set(can_run_list)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -2674,8 +2703,8 @@ class Scheduler(
         idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch results
-            # instantly, but they still indicate the server is not fully idle.
+            # Grammar queue and prefill inflight queue may not produce batch
+            # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
@@ -2684,6 +2713,16 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+
+            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
+            # destructive operations like attach/detach/flush_cache.
+            if self.enable_hierarchical_cache:
+                tc = self.tree_cache
+                idle &= len(tc.ongoing_write_through) == 0
+                idle &= len(tc.ongoing_load_back) == 0
+                if tc.enable_storage:
+                    idle &= len(tc.ongoing_prefetch) == 0
+                    idle &= len(tc.ongoing_backup) == 0
 
         return idle
 
