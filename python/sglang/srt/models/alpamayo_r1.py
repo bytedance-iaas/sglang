@@ -159,11 +159,11 @@ class AlpamayoR1(nn.Module):
         if forward_batch.forward_mode.is_decode():
             bstar = int(input_ids.shape[0])
             active_indices = []
-            reqs = getattr(forward_batch, "reqs", None)
+            trajs = forward_batch.history_trajs
             for i in range(bstar):
-                has_history_traj = False
-                if reqs is not None and i < len(reqs):
-                    has_history_traj = getattr(reqs[i], "history_traj", None) is not None
+                has_history_traj = (
+                    trajs is not None and i < len(trajs) and trajs[i] is not None
+                )
 
                 should_trigger_flow_matching = (
                     input_ids[i] == self.traj_future_start_token_id
@@ -183,9 +183,9 @@ class AlpamayoR1(nn.Module):
                 sampled_actions = self._run_flow_matching(
                     active_indices, forward_batch
                 )
-                # Convert sampled actions → trajectories and write to req.customized_info
+                # Convert sampled actions → trajectories and write to ret.customized_info
                 self._attach_traj_to_reqs(
-                    sampled_actions, active_indices, forward_batch
+                    sampled_actions, active_indices, forward_batch, ret, bstar
                 )
 
         return ret
@@ -195,31 +195,36 @@ class AlpamayoR1(nn.Module):
         sampled_actions: torch.Tensor,
         active_indices: List[int],
         forward_batch: "ForwardBatch",
+        logits_output,
+        bstar: int,
     ) -> None:
-        """Convert sampled actions to trajectories and write to req.customized_info.
+        """Convert sampled actions to trajectories and write to logits_output.customized_info.
 
         Args:
             sampled_actions: (bstar, n_waypoints, action_dim) on GPU.
             active_indices: batch-slot indices of active requests.
-            forward_batch: ForwardBatch carrying per-req objects.
+            forward_batch: ForwardBatch carrying per-req history_trajs.
+            logits_output: LogitsProcessorOutput to write customized_info into.
+            bstar: total batch size.
         """
-        reqs = getattr(forward_batch, "reqs", None)
-        if reqs is None:
-            logger.warning("_attach_traj_to_reqs: forward_batch.reqs is None; skipping action_to_traj")
+        trajs = forward_batch.history_trajs
+        if trajs is None:
+            logger.warning("_attach_traj_to_reqs: forward_batch.history_trajs is None; skipping action_to_traj")
             return
 
         device = sampled_actions.device
+        traj_xyz_list: List = [None] * bstar
+        traj_rot_list: List = [None] * bstar
 
         for j, slot_i in enumerate(active_indices):
-            req = reqs[slot_i]
-            history_traj = getattr(req, "history_traj", None) or {}
+            history_traj = trajs[slot_i] or {}
 
             hist_xyz_raw = history_traj.get("ego_history_xyz")
             hist_rot_raw = history_traj.get("ego_history_rot")
 
             if hist_xyz_raw is None or hist_rot_raw is None:
                 logger.warning(
-                    f"_attach_traj_to_reqs: req {req.rid} missing history_traj; "
+                    f"_attach_traj_to_reqs: slot {slot_i} missing history_traj; "
                     "skipping action_to_traj for this request"
                 )
                 continue
@@ -250,10 +255,13 @@ class AlpamayoR1(nn.Module):
                     action_j, hist_xyz, hist_rot
                 )  # (1, n_waypoints, 3), (1, n_waypoints, 3, 3)
 
-            if req.customized_info is None:
-                req.customized_info = {}
-            req.customized_info["traj_xyz"] = pred_xyz[0].cpu().tolist()
-            req.customized_info["traj_rot"] = pred_rot[0].cpu().tolist()
+            traj_xyz_list[slot_i] = pred_xyz[0].cpu().tolist()
+            traj_rot_list[slot_i] = pred_rot[0].cpu().tolist()
+
+        logits_output.customized_info = {
+            "traj_xyz": traj_xyz_list,
+            "traj_rot": traj_rot_list,
+        }
 
         logger.info(
             f"_attach_traj_to_reqs: converted {len(active_indices)} sampled_actions to trajectories"
