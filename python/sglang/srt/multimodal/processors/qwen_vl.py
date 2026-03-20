@@ -355,7 +355,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             modality=Modality.VIDEO,
             feature=video_item.feature,
             offsets=rewritten_video_offsets,
-            thw_grids=[tuple(map(int, grid)) for grid in merged_video_grid_thw.tolist()],
+            thw_grids=[
+                tuple(map(int, grid)) for grid in merged_video_grid_thw.tolist()
+            ],
             pre_chunked_input_ids=rewritten_input_ids,
             hash=video_item.hash,
             pad_value=video_item.pad_value,
@@ -373,7 +375,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
             token_id = self.mm_tokens.get_token_id_by_modality(item.modality)
             if token_id is not None:
-                item.offsets = self.get_mm_items_offset(rewritten_input_ids_tensor, token_id)
+                item.offsets = self.get_mm_items_offset(
+                    rewritten_input_ids_tensor, token_id
+                )
             rewritten_items.append(item)
 
         return rewritten_items, rewritten_input_ids_tensor
@@ -462,7 +466,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             )
 
         mm_items, input_ids = self._maybe_apply_qwen3_evs(mm_items, input_ids)
-        
+
         audio_feature_lengths = None
 
         if self.model_type == "qwen3_omni_moe":
