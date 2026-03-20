@@ -103,6 +103,32 @@ class SchedulerMetricsMixin:
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        self.ssd_cache_hits_sum = 0
+        self.ssd_cache_hits_count = 0
+        self.ssd_subtree_reuse_attempts = 0
+        self.ssd_subtree_reuse_fallbacks = 0
+        self.ssd_recovery_in_draft_tree_sum = 0
+        self.ssd_recovery_in_draft_tree_count = 0
+        self.ssd_recovery_fork_covered_sum = 0
+        self.ssd_recovery_fork_covered_count = 0
+        self.ssd_recovery_fork_prefetch_selected_sum = 0
+        self.ssd_recovery_fork_prefetch_selected_count = 0
+        self.ssd_recovery_fork_prefetch_put_sum = 0
+        self.ssd_recovery_fork_prefetch_capped_sum = 0
+        self.ssd_next_verify_prefetch_put_sum = 0
+        self.ssd_recovery_fork_contains_true_sum = 0
+        self.ssd_recovery_fork_contains_true_count = 0
+        self.ssd_fork_token_prefetch_put_sum = 0
+        self.ssd_recovery_fork_contains_true_sum = 0
+        self.ssd_recovery_fork_contains_true_count = 0
+        self.ssd_prev_fork_map_found_sum = 0
+        self.ssd_prev_fork_map_found_count = 0
+        self.ssd_fork_prefetch_hits_sum = 0
+        self.ssd_fork_prefetch_hits_count = 0
+        self.ssd_fork_precise_hits_sum = 0
+        self.ssd_fork_precise_hits_count = 0
+        self.ssd_fork_precise_hits_sum = 0
+        self.ssd_fork_precise_hits_count = 0
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -170,10 +196,58 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(
+        self: Scheduler,
+        bs: int,
+        num_accepted_tokens: int,
+        ssd_cache_hits_sum: int = 0,
+        ssd_cache_hits_count: int = 0,
+        ssd_subtree_reuse_attempts: int = 0,
+        ssd_subtree_reuse_fallbacks: int = 0,
+        ssd_recovery_in_draft_tree_sum: int = 0,
+        ssd_recovery_in_draft_tree_count: int = 0,
+        ssd_recovery_fork_covered_sum: int = 0,
+        ssd_recovery_fork_covered_count: int = 0,
+        ssd_recovery_fork_prefetch_selected_sum: int = 0,
+        ssd_recovery_fork_prefetch_selected_count: int = 0,
+        ssd_recovery_fork_prefetch_put_sum: int = 0,
+        ssd_recovery_fork_prefetch_capped_sum: int = 0,
+        ssd_next_verify_prefetch_put_sum: int = 0,
+        ssd_recovery_fork_contains_true_sum: int = 0,
+        ssd_recovery_fork_contains_true_count: int = 0,
+        ssd_fork_token_prefetch_put_sum: int = 0,
+        ssd_prev_fork_map_found_sum: int = 0,
+        ssd_prev_fork_map_found_count: int = 0,
+        ssd_fork_prefetch_hits_sum: int = 0,
+        ssd_fork_prefetch_hits_count: int = 0,
+        ssd_fork_precise_hits_sum: int = 0,
+        ssd_fork_precise_hits_count: int = 0,
+    ):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+        self.ssd_cache_hits_sum += ssd_cache_hits_sum
+        self.ssd_cache_hits_count += ssd_cache_hits_count
+        self.ssd_subtree_reuse_attempts += ssd_subtree_reuse_attempts
+        self.ssd_subtree_reuse_fallbacks += ssd_subtree_reuse_fallbacks
+        self.ssd_recovery_in_draft_tree_sum += ssd_recovery_in_draft_tree_sum
+        self.ssd_recovery_in_draft_tree_count += ssd_recovery_in_draft_tree_count
+        self.ssd_recovery_fork_covered_sum += ssd_recovery_fork_covered_sum
+        self.ssd_recovery_fork_covered_count += ssd_recovery_fork_covered_count
+        self.ssd_recovery_fork_prefetch_selected_sum += ssd_recovery_fork_prefetch_selected_sum
+        self.ssd_recovery_fork_prefetch_selected_count += ssd_recovery_fork_prefetch_selected_count
+        self.ssd_recovery_fork_prefetch_put_sum += ssd_recovery_fork_prefetch_put_sum
+        self.ssd_recovery_fork_prefetch_capped_sum += ssd_recovery_fork_prefetch_capped_sum
+        self.ssd_next_verify_prefetch_put_sum += ssd_next_verify_prefetch_put_sum
+        self.ssd_recovery_fork_contains_true_sum += ssd_recovery_fork_contains_true_sum
+        self.ssd_recovery_fork_contains_true_count += ssd_recovery_fork_contains_true_count
+        self.ssd_fork_token_prefetch_put_sum += ssd_fork_token_prefetch_put_sum
+        self.ssd_prev_fork_map_found_sum += ssd_prev_fork_map_found_sum
+        self.ssd_prev_fork_map_found_count += ssd_prev_fork_map_found_count
+        self.ssd_fork_prefetch_hits_sum += ssd_fork_prefetch_hits_sum
+        self.ssd_fork_prefetch_hits_count += ssd_fork_prefetch_hits_count
+        self.ssd_fork_precise_hits_sum += ssd_fork_precise_hits_sum
+        self.ssd_fork_precise_hits_count += ssd_fork_precise_hits_count
 
     def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
@@ -182,6 +256,30 @@ class SchedulerMetricsMixin:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+        self.ssd_cache_hits_sum = 0
+        self.ssd_cache_hits_count = 0
+        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_forward_ct = 0
+        self.ssd_subtree_reuse_attempts = 0
+        self.ssd_subtree_reuse_fallbacks = 0
+        self.ssd_recovery_in_draft_tree_sum = 0
+        self.ssd_recovery_in_draft_tree_count = 0
+        self.ssd_recovery_fork_covered_sum = 0
+        self.ssd_recovery_fork_covered_count = 0
+        self.ssd_recovery_fork_prefetch_selected_sum = 0
+        self.ssd_recovery_fork_prefetch_selected_count = 0
+        self.ssd_recovery_fork_prefetch_put_sum = 0
+        self.ssd_recovery_fork_prefetch_capped_sum = 0
+        self.ssd_next_verify_prefetch_put_sum = 0
+        self.ssd_recovery_fork_contains_true_sum = 0
+        self.ssd_recovery_fork_contains_true_count = 0
+        self.ssd_fork_token_prefetch_put_sum = 0
+        self.ssd_prev_fork_map_found_sum = 0
+        self.ssd_prev_fork_map_found_count = 0
+        self.ssd_fork_prefetch_hits_sum = 0
+        self.ssd_fork_prefetch_hits_count = 0
+        self.ssd_fork_precise_hits_sum = 0
+        self.ssd_fork_precise_hits_count = 0
 
     def report_prefill_stats(
         self: Scheduler,
@@ -465,6 +563,85 @@ class SchedulerMetricsMixin:
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            if self.ssd_cache_hits_count > 0:
+                msg += (
+                    f"ssd_cache_hits: {self.ssd_cache_hits_sum}/{self.ssd_cache_hits_count}, "
+                )
+            if self.ssd_subtree_reuse_attempts > 0:
+                reuse_hits = (
+                    self.ssd_subtree_reuse_attempts - self.ssd_subtree_reuse_fallbacks
+                )
+                msg += (
+                    f"ssd_subtree_reuse: {reuse_hits}/{self.ssd_subtree_reuse_attempts}, "
+                )
+            if self.ssd_recovery_in_draft_tree_count > 0:
+                msg += (
+                    "ssd_recovery_in_draft_tree: "
+                    f"{self.ssd_recovery_in_draft_tree_sum}/{self.ssd_recovery_in_draft_tree_count}, "
+                )
+            if self.ssd_recovery_fork_covered_count > 0:
+                msg += (
+                    "ssd_recovery_fork_covered: "
+                    f"{self.ssd_recovery_fork_covered_sum}/{self.ssd_recovery_fork_covered_count}, "
+                )
+            if self.ssd_recovery_fork_prefetch_selected_count > 0:
+                msg += (
+                    "ssd_recovery_fork_prefetch_selected: "
+                    f"{self.ssd_recovery_fork_prefetch_selected_sum}/{self.ssd_recovery_fork_prefetch_selected_count}, "
+                )
+                if self.ssd_recovery_fork_prefetch_selected_sum > 0:
+                    msg += (
+                        "ssd_recovery_fork_prefetch_capped: "
+                        f"{self.ssd_recovery_fork_prefetch_capped_sum}/{self.ssd_recovery_fork_prefetch_selected_sum}, "
+                    )
+            if self.ssd_recovery_fork_prefetch_put_sum > 0:
+                msg += f"ssd_recovery_fork_prefetch_put: {self.ssd_recovery_fork_prefetch_put_sum}, "
+            if self.ssd_next_verify_prefetch_put_sum > 0:
+                msg += f"ssd_next_verify_prefetch_put: {self.ssd_next_verify_prefetch_put_sum}, "
+            if self.ssd_recovery_fork_contains_true_count > 0:
+                msg += (
+                    "ssd_recovery_fork_contains_true: "
+                    f"{self.ssd_recovery_fork_contains_true_sum}/{self.ssd_recovery_fork_contains_true_count}, "
+                )
+            if self.ssd_prev_fork_map_found_count > 0:
+                msg += (
+                    "ssd_prev_fork_map_found: "
+                    f"{self.ssd_prev_fork_map_found_sum}/{self.ssd_prev_fork_map_found_count}, "
+                )
+            if self.ssd_fork_token_prefetch_put_sum > 0:
+                msg += f"ssd_fork_token_prefetch_put: {self.ssd_fork_token_prefetch_put_sum}, "
+            if self.ssd_fork_prefetch_hits_count > 0:
+                msg += (
+                    "ssd_fork_prefetch_hits: "
+                    f"{self.ssd_fork_prefetch_hits_sum}/{self.ssd_fork_prefetch_hits_count}, "
+                )
+            if self.ssd_fork_precise_hits_count > 0:
+                msg += (
+                    "ssd_fork_precise_hits: "
+                    f"{self.ssd_fork_precise_hits_sum}/{self.ssd_fork_precise_hits_count}, "
+                )
+            self.ssd_cache_hits_sum = 0
+            self.ssd_cache_hits_count = 0
+            self.ssd_subtree_reuse_attempts = 0
+            self.ssd_subtree_reuse_fallbacks = 0
+            self.ssd_recovery_in_draft_tree_sum = 0
+            self.ssd_recovery_in_draft_tree_count = 0
+            self.ssd_recovery_fork_covered_sum = 0
+            self.ssd_recovery_fork_covered_count = 0
+            self.ssd_recovery_fork_prefetch_selected_sum = 0
+            self.ssd_recovery_fork_prefetch_selected_count = 0
+            self.ssd_recovery_fork_prefetch_put_sum = 0
+            self.ssd_recovery_fork_prefetch_capped_sum = 0
+            self.ssd_next_verify_prefetch_put_sum = 0
+            self.ssd_recovery_fork_contains_true_sum = 0
+            self.ssd_recovery_fork_contains_true_count = 0
+            self.ssd_fork_token_prefetch_put_sum = 0
+            self.ssd_prev_fork_map_found_sum = 0
+            self.ssd_prev_fork_map_found_count = 0
+            self.ssd_fork_prefetch_hits_sum = 0
+            self.ssd_fork_prefetch_hits_count = 0
+            self.ssd_fork_precise_hits_sum = 0
+            self.ssd_fork_precise_hits_count = 0
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
