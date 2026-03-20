@@ -421,6 +421,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # Per-request objects (populated for Alpamayo to access history_traj)
+    reqs: Optional[List] = None
+
     @classmethod
     def init_new(
         cls,
@@ -467,6 +470,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            reqs=batch.reqs,
         )
         device = model_runner.device
 

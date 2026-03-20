@@ -291,11 +291,20 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        extra_body = request.extra_body if isinstance(request.extra_body, dict) else {}
+        extra_json = request.extra_json if isinstance(request.extra_json, dict) else {}
+        history_traj = (
+            request.history_traj
+            or extra_body.get("history_traj")
+            or extra_json.get("history_traj")
+        )
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
+            history_traj=history_traj,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
@@ -634,6 +643,8 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        traj_xyz_map = {}
+        traj_rot_map = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -648,6 +659,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                traj_xyz_map[index] = content["meta_info"].get("traj_xyz", None)
+                traj_rot_map[index] = content["meta_info"].get("traj_rot", None)
 
                 # Handle logprobs
                 finish_reason = content["meta_info"].get("finish_reason", None)
@@ -848,20 +861,34 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
-                first_routed_experts = next(
-                    (v for v in routed_experts.values() if v is not None), None
+            first_routed_experts = next(
+                (v for v in routed_experts.values() if v is not None), None
+            )
+            first_traj_xyz = next(
+                (v for v in traj_xyz_map.values() if v is not None), None
+            )
+            first_traj_rot = next(
+                (v for v in traj_rot_map.values() if v is not None), None
+            )
+            if (
+                (request.return_routed_experts and first_routed_experts is not None)
+                or first_traj_xyz is not None
+                or first_traj_rot is not None
+            ):
+                routed_experts_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # sglext is at response level
+                    model=request.model,
+                    sglext=SglExt(
+                        routed_experts=(
+                            first_routed_experts if request.return_routed_experts else None
+                        ),
+                        traj_xyz=first_traj_xyz,
+                        traj_rot=first_traj_rot,
+                    ),
                 )
-                if first_routed_experts is not None:
-                    routed_experts_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[],  # sglext is at response level
-                        model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
-                    )
-                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+                yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
@@ -927,11 +954,15 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        traj_xyz = first_ret["meta_info"].get("traj_xyz", None)
+        traj_rot = first_ret["meta_info"].get("traj_rot", None)
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or traj_xyz is not None or traj_rot is not None:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                traj_xyz=traj_xyz,
+                traj_rot=traj_rot,
             )
 
         for idx, ret_item in enumerate(ret):
