@@ -9,6 +9,7 @@ try:
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
+    print(_e)
 else:
     _flash_attn_import_error = None
 

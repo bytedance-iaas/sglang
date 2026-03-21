@@ -30,6 +30,9 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+
+
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
@@ -99,6 +102,8 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
     64 * 1024,
     128 * 1024,
 ]
+
+HOPPER_TMA_ALIGN_BYTE = 16
 
 
 @dataclasses.dataclass
@@ -377,6 +382,23 @@ class VisionTritonAttention(nn.Module):
         return output
 
 
+
+def pad_last_dim_to_multiple_zero(x: torch.Tensor, multiple: int):
+    orig_d = x.shape[-1]
+    padded_d = ((orig_d + multiple - 1) // multiple) * multiple
+    if padded_d == orig_d:
+        return x, orig_d
+
+    out = torch.zeros(
+        *x.shape[:-1],
+        padded_d,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    out[..., :orig_d] = x
+    return out, orig_d
+
+
 class VisionFlash3Attention(nn.Module):
     def __init__(
         self,
@@ -406,35 +428,120 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        
+        """
+        use fp8 version FA3:
+        1. per_head quantization is necessary
+        2. due to TMA need 16byte alignment head_size like 72 (for Qwen-VL seralize ) can not use FP8 version FA3
+        3. currently solution: quant to fp8 firstly, then pad zero at Q/K/V's last dim : why this can work: Q*K.T( pad zero is ok) = S S*V (pad zero at head_dim also do not change the result of do slice for output) 
+        4. currently dfraft version is : [1] per-tensor quantization [2] the only changed part is root(head_dim) which is now root(aligned_head_dim), we should pass the softmax scale in 
+        5. for best peformance: should define aligned tensor, use a kernel to do per_head_quant and write in to aligned tensor directly (avoid cat(copy again))
+        
+        
+        """
+        
+        if envs.SGLANG_VISION_ATTN_FP8.get():
+            
+            if isinstance(cu_seqlens, list):
+                cu_seqlens_tensor = cu_seqlens[0]
+            else:
+                cu_seqlens_tensor = cu_seqlens
+                
+            
+            ori_shape = q.shape
+            ori_headsize = ori_shape[2]
+            aligned_headsize = ((ori_headsize-1) // HOPPER_TMA_ALIGN_BYTE  + 1) *  HOPPER_TMA_ALIGN_BYTE
+            aligned_shape = [ori_shape[0], ori_shape[1], ori_headsize ]
+            
+            
+            # print(aligned_shape)
+            q_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
+            k_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
+            v_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
+            
+            scale_q = torch.ones((1), device = "cuda", dtype = torch.float32)
+            scale_k = torch.ones((1), device = "cuda", dtype = torch.float32)
+            scale_v = torch.ones((1), device = "cuda", dtype = torch.float32)
+
+            
+            per_tensor_quant_fp8(q, q_quant, scale_q)
+            per_tensor_quant_fp8(k, k_quant, scale_k)
+            per_tensor_quant_fp8(v, v_quant, scale_v)
+            
+            q_quant_pad, _ = pad_last_dim_to_multiple_zero(q_quant, HOPPER_TMA_ALIGN_BYTE)
+            k_quant_pad,_ = pad_last_dim_to_multiple_zero(k_quant, HOPPER_TMA_ALIGN_BYTE)
+            v_quant_pad, _ = pad_last_dim_to_multiple_zero(v_quant, HOPPER_TMA_ALIGN_BYTE)
+            
+            scale_q = scale_q.expand(cu_seqlens_tensor.size(0)-1, q.shape[1])
+            scale_k = scale_k.expand(cu_seqlens_tensor.size(0)-1, k.shape[1])
+            scale_v = scale_v.expand(cu_seqlens_tensor.size(0)-1, v.shape[1])
+
+        
+        
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
-            output = flash_attn_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens[0],
-                cu_seqlens_k=cu_seqlens[0],
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-            )
+            if envs.SGLANG_VISION_ATTN_FP8.get():
+                output = flash_attn_func(
+                    q_quant_pad,
+                    k_quant_pad,
+                    v_quant_pad,
+                    cu_seqlens_q=cu_seqlens[0],
+                    cu_seqlens_k=cu_seqlens[0],
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    q_descale = scale_q,
+                    k_descale = scale_k,
+                    v_descale = scale_v,   
+                )
+                
+                ret = output[:, :, :ori_headsize]
+            else:
+                ret = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens[0],
+                    cu_seqlens_k=cu_seqlens[0],
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                )
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
-
-            output = flash_attn_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-            )
-
-        return output
-
+            
+            
+            
+            if envs.SGLANG_VISION_ATTN_FP8.get():
+                output = flash_attn_func(
+                    q_quant_pad,
+                    k_quant_pad,
+                    v_quant_pad,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    q_descale = scale_q,
+                    k_descale = scale_k,
+                    v_descale = scale_v,
+                    
+                )
+                
+                ret = output[:, :, :ori_headsize]
+            else:
+                
+                ret = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen
+                )
+                
+        return ret
 
 class VisionFlash4Attention(nn.Module):
     def __init__(
