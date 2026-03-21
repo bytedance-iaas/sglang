@@ -1,0 +1,5 @@
+# AlpamayoR1 Feature / Task List
+
+- [done] Create consolidated test file test/manual/test_alpamayo_r1.py (chat + generate API, hardcoded clip_ids, ADE + plot)
+- [done] Fix p.py to import load_physical_aiavdataset from test/manual/models/alpamayo_utils.py and repair the broken image encoding branch
+- [done] Move Alpamayo dataset loader into a packaged sglang module so manual tests and pip-installed users can import it without PATH changes
