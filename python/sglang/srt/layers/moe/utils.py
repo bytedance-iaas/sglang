@@ -75,6 +75,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    CUTLASS_W4AFP8 = "cutlass_w4afp8"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -108,6 +109,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_cutlass_w4afp8(self):
+        return self == MoeRunnerBackend.CUTLASS_W4AFP8
 
 
 class DeepEPMode(Enum):
@@ -202,6 +206,14 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     if MOE_RUNNER_BACKEND is None:
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
+
+
+def get_moe_quantization() -> str:
+    global MOE_QUANTIZATION
+    if MOE_QUANTIZATION is None:
+        logger.warning("MOE_QUANTIZATION is not initialized, using no quantization")
+        MOE_QUANTIZATION = "none"
+    return MOE_QUANTIZATION
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
