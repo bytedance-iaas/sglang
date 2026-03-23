@@ -11,7 +11,12 @@ import torch
 import yaml
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import synchronized
 
 try:
@@ -85,10 +90,18 @@ class MemoryStateInt(IntEnum):
 
 
 class FlexibleKVCacheMemoryPool:
-    def __init__(self, conn, kvcache_shape, kvcache_dtype, device):
+    def __init__(
+        self, conn, kvcache_shape, kvcache_dtype, device, use_nsa=False, nsa_info=None
+    ):
         self.connection = conn
         self.kvcache_shape = kvcache_shape
         self.kvcache_dtype = kvcache_dtype
+        self.use_nsa = use_nsa
+        self.nsa_info = nsa_info
+        if use_nsa:
+            self.page_size = nsa_info["page_size"]
+            self.indexer_buffer_shape = nsa_info["index_k_with_scale_buffer_shape"]
+            self.indexer_buffer_dtype = nsa_info["index_k_with_scale_buffer_dtype"]
 
         self.kv_cache_numel = 1
         for i in kvcache_shape:
@@ -117,10 +130,20 @@ class FlexibleKVCacheMemoryPool:
             self.kvcache_mempool = torch.zeros(
                 (mempool_size,) + kvcache_shape, dtype=kvcache_dtype, device=self.device
             )
-
         for i in range(mempool_size):
             self.free_data_addr.add(i)
             self.data_ptr_to_index[self.kvcache_mempool[i].data_ptr()] = i
+
+        if use_nsa:
+            # indexer_k_buffer is 0.25 of kvcache_mempool
+            self.indexer_mempool = torch.zeros(
+                (mempool_size,) + self.indexer_buffer_shape,
+                dtype=self.indexer_buffer_dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for i in range(mempool_size):
+                self.data_ptr_to_index[self.indexer_mempool[i].data_ptr()] = i
 
         meminfo = eic.MemoryInfo()
         meminfo.type = eic.MemoryType.MEMORY_CUDA
@@ -131,6 +154,12 @@ class FlexibleKVCacheMemoryPool:
             self.kvcache_mempool.numel() * self.kvcache_mempool.element_size(),
             True,
         )
+        if use_nsa:
+            vals.append(
+                self.indexer_mempool.data_ptr(),
+                self.indexer_mempool.numel() * self.indexer_mempool.element_size(),
+                True,
+            )
         self.connection.register_memory(vals, meminfo)
         logger.info(
             f"allocate memory pool, size {self.kvcache_mempool.numel() * self.kvcache_mempool.element_size()}, device {self.device}"
@@ -151,10 +180,14 @@ class FlexibleKVCacheMemoryPool:
 
         ret = []
         indices = []
+        indexer_ret = []
         for _ in range(count):
             free_index = self.free_data_addr.pop()
             ret.append(self.kvcache_mempool[free_index])
+            if self.use_nsa:
+                indexer_ret.append(self.indexer_mempool[free_index])
             indices.append(free_index)
+        ret.extend(indexer_ret)
         return ret, indices
 
     def free_to_mempool(self, data_ptr):
@@ -177,7 +210,7 @@ class EICKVClient:
     The remote url should start with "eic://" and only have one host-port pair
     """
 
-    def __init__(self, kv_cache_dtype, kv_cache_shape, device="cpu"):
+    def __init__(self, kv_cache_dtype, kv_cache_shape, device_pool, device="cpu"):
         if eic is None:
             raise ImportError("eic module is not found, please install eic package")
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect, G_EnableAsyncKVSet
@@ -311,6 +344,22 @@ class EICKVClient:
         self.trans_type = eic.TransportType(eic_trans_type)
         self.kv_cache_shape = kv_cache_shape
         self.kv_cache_dtype = kv_cache_dtype
+        self.device_pool = device_pool
+        self.use_nsa = isinstance(device_pool, NSATokenToKVPool)
+        self.nsa_info = None
+        if self.use_nsa:
+            self.indexer_buffer_shape = (
+                self.device_pool.layer_num,
+                1,
+                self.device_pool.index_k_with_scale_buffer[0].shape[-1],
+            )
+            self.indexer_buffer_dtype = self.device_pool.index_k_with_scale_buffer_dtype
+            self.nsa_info = {
+                "layer_num": self.device_pool.layer_num,
+                "page_size": self.device_pool.page_size,
+                "index_k_with_scale_buffer_shape": self.indexer_buffer_shape,
+                "index_k_with_scale_buffer_dtype": self.indexer_buffer_dtype,
+            }
 
         # use for kv get
         self.kv_cache_read_mem_pool = FlexibleKVCacheMemoryPool(
@@ -318,12 +367,19 @@ class EICKVClient:
             self.kv_cache_shape,
             self.kv_cache_dtype,
             self.device if G_EnableKVGetGPUDirect else "cpu",
+            self.use_nsa,
+            self.nsa_info,
         )
 
         if G_EnableAsyncKVSet:
             logger.info("enable async kv set")
             self.kv_cache_write_mem_pool = FlexibleKVCacheMemoryPool(
-                self.connection, self.kv_cache_shape, self.kv_cache_dtype, "cpu"
+                self.connection,
+                self.kv_cache_shape,
+                self.kv_cache_dtype,
+                "cpu",
+                self.use_nsa,
+                self.nsa_info,
             )
         else:
             logger.info("enable sync kv set")
@@ -332,6 +388,8 @@ class EICKVClient:
                 self.kv_cache_shape,
                 self.kv_cache_dtype,
                 self.device if G_EnableKVSetGPUDirect else "cpu",
+                self.use_nsa,
+                self.nsa_info,
             )
 
         self.write_queue = queue.Queue()
@@ -381,10 +439,13 @@ class EICKVClient:
     ) -> bool:
         logger.debug(f"eic async_batch_set {len(keys)}")
         start_time = time.perf_counter()
+        count = len(keys)
+        if self.use_nsa:
+            count //= 2
 
-        if self.kv_cache_write_mem_pool.left_count() >= len(keys):
+        if self.kv_cache_write_mem_pool.left_count() >= count:
             objs, host_indices = self.kv_cache_write_mem_pool.try_allocate_kv_cache(
-                obj_inputs[0].shape, obj_inputs[0].dtype, len(keys)
+                self.kv_cache_shape, self.kv_cache_dtype, count
             )
             if objs is None:
                 return False
@@ -416,11 +477,18 @@ class EICKVClient:
                 objs = [item.cpu() for item in obj_inputs]
             elif device_indices is not None and copy_func is not None:
                 large_tensor = torch.empty(
-                    (len(keys),) + self.kv_cache_shape,
+                    (count,) + self.kv_cache_shape,
                     dtype=self.kv_cache_dtype,
                     device="cpu",
                 )
                 objs = [large_tensor[i] for i in range(len(keys))]
+                if self.use_nsa:
+                    indexer_tensor = torch.empty(
+                        (count,) + self.indexer_buffer_shape,
+                        dtype=self.indexer_buffer_dtype,
+                        device="cpu",
+                    )
+                    objs.extend([indexer_tensor[i] for i in range(len(keys))])
                 copy_func(device_indices, objs)
             else:
                 logger.error(
@@ -469,6 +537,37 @@ class EICKVClient:
             res.append(err_code == eic.StatusCode.SUCCESS)
         return res
 
+    def allocate_eic_read_buffer(self, count):
+        registered = True
+        tensors, indices = self.kv_cache_read_mem_pool.try_allocate_kv_cache(
+            self.kv_cache_shape, self.kv_cache_dtype, count
+        )
+        host_memory_pool = self.kv_cache_read_mem_pool.kvcache_mempool
+        if self.use_nsa:
+            host_memory_pool = [
+                self.kv_cache_read_mem_pool.kvcache_mempool,
+                self.kv_cache_read_mem_pool.indexer_mempool,
+            ]
+        if tensors is None:
+            logger.error("can not allocate tensor from pool")
+            registered = False
+            kvcache_tensor = torch.empty(
+                (count,) + self.kv_cache_shape, dtype=self.kv_cache_dtype, device="cpu"
+            )
+            tensors = [kvcache_tensor[i] for i in range(count)]
+            host_memory_pool = kvcache_tensor
+            indices = range(count)
+            if self.use_nsa:
+                indexer_tensor = torch.empty(
+                    (count,) + self.indexer_buffer_shape,
+                    dtype=self.indexer_buffer_dtype,
+                    device="cpu",
+                )
+                indexer_tensors = [indexer_tensor[i] for i in range(count)]
+                tensors.extend(indexer_tensors)
+                host_memory_pool = [kvcache_tensor, indexer_tensor]
+        return tensors, host_memory_pool, indices, registered
+
     def batch_get(
         self, keys: List[str], device_indices: torch.Tensor = None, copy_func=None
     ) -> Tuple[Optional[List[torch.Tensor]], List[bool]]:
@@ -481,23 +580,12 @@ class EICKVClient:
         objs = None
         success_mask = [True for _ in range(len(keys))]
         count = len(keys)
+        if self.use_nsa:
+            count //= 2
 
-        registered = False
-        items, host_indices = self.kv_cache_read_mem_pool.try_allocate_kv_cache(
-            self.kv_cache_shape, self.kv_cache_dtype, count
+        objs, host_memory_pool, host_indices, registered = (
+            self.allocate_eic_read_buffer(count)
         )
-        host_memory_pool = self.kv_cache_read_mem_pool.kvcache_mempool
-        if items is None:
-            large_tensor = torch.empty(
-                (count,) + self.kv_cache_shape, dtype=self.kv_cache_dtype, device="cpu"
-            )
-            objs = [large_tensor[i] for i in range(count)]
-            host_memory_pool = large_tensor
-            host_indices = [i for i in range(count)]
-            logger.error("can not allocate tensor from pool")
-        else:
-            objs = items
-            registered = True
 
         for i, key in enumerate(keys):
             data_keys.append(key)
@@ -516,7 +604,7 @@ class EICKVClient:
         device_copy = False
         # copy before free
         if device_indices is None or copy_func is None:
-            if items is not None:
+            if registered:
                 for obj in objs:
                     result.append(obj.clone())
             else:
@@ -544,6 +632,11 @@ class EICKVClient:
                 result = None
                 success_mask = [False for _ in range(len(keys))]
                 fail_count = len(keys)
+        if self.use_nsa:
+            new_mask = [True] * count
+            for i in range(count):
+                new_mask[i] = success_mask[i * 2] and success_mask[i * 2 + 1]
+            success_mask = new_mask
 
         if fail_count != 0:
             # Note that fail count only means how many keys failed in this batch get, not really failed in prefix cache
@@ -560,14 +653,35 @@ class EICKVClient:
             if suc_count > 0:
                 copy_func(device_indices, host_memory_pool, host_indices[:suc_count])
 
-        if items is not None:
-            for item in items:
+        if registered:
+            for item in objs:
                 self.kv_cache_read_mem_pool.free_to_mempool(item.data_ptr())
 
         get_data_end_time = time.perf_counter()
         get_data_execution_time = (get_data_end_time - get_data_start_time) * 1e6
         logger.debug(f"eic get {count} keys data cost %.2f us", get_data_execution_time)
         return result, success_mask
+
+    def allocate_eic_write_buffer(self, count):
+        registered = True
+        objs, _ = self.kv_cache_write_mem_pool.try_allocate_kv_cache(
+            self.kv_cache_shape, self.kv_cache_dtype, count
+        )
+        if objs is None:
+            logger.error("can not allocate tensor from pool")
+            registered = False
+            kvcache_tensor = torch.empty(
+                (count,) + self.kv_cache_shape, dtype=self.kv_cache_dtype, device="cpu"
+            )
+            objs = [kvcache_tensor[i] for i in range(count)]
+            if self.use_nsa:
+                indexer_tensor = torch.empty(
+                    (count,) + self.indexer_buffer_shape,
+                    dtype=self.indexer_buffer_dtype,
+                    device="cpu",
+                )
+                objs.extend([indexer_tensor[i] for i in range(count)])
+        return objs, registered
 
     def set(
         self,
@@ -590,21 +704,10 @@ class EICKVClient:
         keys_vec = eic.StringVector()
         vals_vec = eic.IOBuffers()
         count = len(keys)
+        if self.use_nsa:
+            count //= 2
 
-        registered = False
-        items, host_indices = self.kv_cache_write_mem_pool.try_allocate_kv_cache(
-            self.kv_cache_shape, self.kv_cache_dtype, count
-        )
-        if items is None:
-            large_tensor = torch.empty(
-                (count,) + self.kv_cache_shape, dtype=self.kv_cache_dtype, device="cpu"
-            )
-            objs = [large_tensor[i] for i in range(count)]
-            logger.error("can not allocate tensor from pool")
-        else:
-            objs = items
-            registered = True
-
+        objs, registered = self.allocate_eic_write_buffer(count)
         values_data_ptrs = []
 
         if obj_inputs is not None:
@@ -656,8 +759,8 @@ class EICKVClient:
         else:
             logger.debug(f"eic mset {len(keys)} success")
 
-        if items is not None:
-            for item in items:
+        if registered:
+            for item in objs:
                 self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
 
         err_code = set_outcome.status_codes[0]
@@ -678,10 +781,13 @@ class EICKVClient:
             obj = value
             # set data key & value
             keys_vec.append(key)
+            registered = self.kv_cache_write_mem_pool.check_data_ptr_allocated(
+                obj.data_ptr()
+            )
             vals_vec.append(
                 obj.data_ptr(),
                 obj.element_size() * obj.numel(),
-                self.kv_cache_write_mem_pool.check_data_ptr_allocated(obj.data_ptr()),
+                registered,
             )
 
         # set options
@@ -741,6 +847,7 @@ class EICBaseTokenToKVPoolHost:
         self.deploy_key = self._get_deploy_info()
         self.device_backup_func = self.device_backup
         self.device_writeback_func = self.device_writeback
+        self.use_nsa = False
 
     def _encode_key_exclusive(self, indices):
         return [
@@ -770,7 +877,16 @@ class EICBaseTokenToKVPoolHost:
         return deploy_key
 
     def _encode_key_shared(self, content_hashs):
-        return [f"{content_hash}@{self.deploy_key}" for content_hash in content_hashs]
+        if not self.use_nsa:
+            return [
+                f"{content_hash}@{self.deploy_key}" for content_hash in content_hashs
+            ]
+        else:
+            return [
+                f"{content_hash}@{self.deploy_key[0]}" for content_hash in content_hashs
+            ], [
+                f"{content_hash}@{self.deploy_key[1]}" for content_hash in content_hashs
+            ]
 
     def batch_exist_page(self, content_hashes):
         """
@@ -790,7 +906,11 @@ class EICBaseTokenToKVPoolHost:
         masks = []
 
         for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
+            if self.use_nsa:
+                key, indexer_key = keys[i : i + bs]
+                key.extend(indexer_key)
+            else:
+                key = keys[i : i + bs]
             indices = device_indices[i : i + bs]
             _, success_mask = self.eic_client.batch_get(
                 key, indices, self.device_writeback_func
@@ -803,17 +923,26 @@ class EICBaseTokenToKVPoolHost:
     def get_flat_data_common(self, keys, device_indices=None):
         bs = G_GDRBounceTensorCount // 2
         ret = []
+        indexer_ret = []
         masks = []
         suc_count = 0
 
         for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
+            if self.use_nsa:
+                key, indexer_key = keys[i : i + bs]
+                key.extend(indexer_key)
+            else:
+                key = keys[i : i + bs]
             objs, success_mask = self.eic_client.batch_get(key)
             if objs is None:
                 logger.debug(f"get_page_data keys {key} failed, eic_client return none")
                 break
             # todo(zhongwei.ren): preallocate recv tensors
-            ret.extend(objs)
+            if self.use_nsa:
+                indexer_ret.extend(objs[len(objs) // 2 :])
+                ret.extend(objs[: len(objs) // 2])
+            else:
+                ret.extend(objs)
             masks.extend(success_mask)
 
             if not all(success_mask):
@@ -825,7 +954,14 @@ class EICBaseTokenToKVPoolHost:
             else:
                 break
         if suc_count > 0:
-            flat_data = torch.cat(ret[:suc_count], dim=self.split_dim)
+            if self.use_nsa:
+                kvcache_flat_data = torch.cat(ret[:suc_count], dim=self.split_dim)
+                indexer_flat_data = torch.cat(
+                    indexer_ret[:suc_count], dim=self.split_dim
+                )
+                flat_data = [kvcache_flat_data, indexer_flat_data]
+            else:
+                flat_data = torch.cat(ret[:suc_count], dim=self.split_dim)
             self.device_pool.transfer(
                 device_indices[: suc_count * self.page_size], flat_data
             )
@@ -842,19 +978,27 @@ class EICBaseTokenToKVPoolHost:
     def assign_flat_data_common(self, keys, flat_data, device_indices=None) -> bool:
         if flat_data is None:
             flat_data = self.device_pool.get_flat_data(device_indices)
-        flat_data = flat_data.contiguous()
         start_time = time.perf_counter()
-        if not G_EnableKVSetGPUDirect:
-            values = torch.split(flat_data.cpu(), 1, dim=self.split_dim)
+        if self.use_nsa:
+            flat_data = [part.contiguous() for part in flat_data]
+            values = torch.split(flat_data[0], 1, dim=self.split_dim)
+            indexer_values = torch.split(flat_data[1], 1, dim=self.split_dim)
         else:
+            flat_data = flat_data.contiguous()
             values = torch.split(flat_data, 1, dim=self.split_dim)
 
         bs = G_GDRBounceTensorCount
         split_time = time.perf_counter()
-
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
-            value = values[i : i + bs]
+        count = len(keys[0]) if self.use_nsa else len(keys)
+        for i in range(0, count, bs):
+            if self.use_nsa:
+                key, indexer_key = keys[0][i : i + bs], keys[1][i : i + bs]
+                key.extend(indexer_key)
+                value = list(values[i : i + bs])
+                value.extend(list(indexer_values[i : i + bs]))
+            else:
+                key = keys[i : i + bs]
+                value = values[i : i + bs]
             if G_EnableAsyncKVSet:
                 ret = self.eic_client.async_batch_set(key, value)
             else:
@@ -878,8 +1022,13 @@ class EICBaseTokenToKVPoolHost:
 
         bs = G_GDRBounceTensorCount
         start_time = time.perf_counter()
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
+        count = len(keys[0]) if self.use_nsa else len(keys)
+        for i in range(0, count, bs):
+            if self.use_nsa:
+                key, indexer_key = keys[0][i : i + bs], keys[1][i : i + bs]
+                key.extend(indexer_key)
+            else:
+                key = keys[i : i + bs]
             indices = device_indices[i : i + bs]
             if G_EnableAsyncKVSet:
                 ret = self.eic_client.async_batch_set(
@@ -946,9 +1095,13 @@ class EICBaseTokenToKVPoolHost:
     def get_page_data_direct(self, keys, device_indices=None):
         bs = G_GDRBounceTensorCount
         masks = []
-
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
+        count = len(keys[0]) if self.use_nsa else len(keys)
+        for i in range(0, count, bs):
+            if self.use_nsa:
+                key, indexer_key = keys[0][i : i + bs], keys[1][i : i + bs]
+                key.extend(indexer_key)
+            else:
+                key = keys[i : i + bs]
             indices = device_indices[i : i + bs * self.page_size]
             _, success_mask = self.eic_client.batch_get(
                 key, indices, self.device_writeback_func
@@ -959,19 +1112,29 @@ class EICBaseTokenToKVPoolHost:
         return masks
 
     def get_page_data_common(self, keys, device_indices=None):
+        count = len(keys[0]) if self.use_nsa else len(keys)
         bs = G_GDRBounceTensorCount // 2
         ret = []
+        indexer_ret = []
         masks = []
         suc_count = 0
 
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
+        for i in range(0, count, bs):
+            if self.use_nsa:
+                key, indexer_key = keys[0][i : i + bs], keys[1][i : i + bs]
+                key.extend(indexer_key)
+            else:
+                key = keys[i : i + bs]
             objs, success_mask = self.eic_client.batch_get(key)
             if objs is None:
                 logger.debug(f"get_page_data keys {key} failed, eic_client return none")
                 break
             # todo(zhongwei.ren): preallocate recv tensors
-            ret.extend(objs)
+            if self.use_nsa:
+                indexer_ret.extend(objs[len(objs) // 2 :])
+                ret.extend(objs[: len(objs) // 2])
+            else:
+                ret.extend(objs)
             masks.extend(success_mask)
 
             if not all(success_mask):
@@ -984,7 +1147,14 @@ class EICBaseTokenToKVPoolHost:
                 break
 
         if suc_count > 0:
-            flat_data = torch.cat(ret[:suc_count], dim=self.split_dim)
+            if self.use_nsa:
+                kvcache_flat_data = torch.cat(ret[:suc_count], dim=self.split_dim)
+                indexer_flat_data = torch.cat(
+                    indexer_ret[:suc_count], dim=self.split_dim
+                )
+                flat_data = [kvcache_flat_data, indexer_flat_data]
+            else:
+                flat_data = torch.cat(ret[:suc_count], dim=self.split_dim)
             self.device_pool.transfer(
                 device_indices[: suc_count * self.page_size], flat_data
             )
@@ -1001,17 +1171,30 @@ class EICBaseTokenToKVPoolHost:
     def assign_page_data_common(self, keys, flat_data, device_indices=None) -> bool:
         if flat_data is None:
             flat_data = self.device_pool.get_flat_data(device_indices)
-        flat_data = flat_data.contiguous()
         start_time = time.perf_counter()
-        values = torch.split(flat_data, self.page_size, dim=self.split_dim)
+        if self.use_nsa:
+            flat_data = [part.contiguous() for part in flat_data]
+            values = torch.split(flat_data[0], self.page_size, dim=self.split_dim)
+            # indexer_values is page aligned
+            indexer_values = torch.split(flat_data[1], 1, dim=self.split_dim)
+        else:
+            flat_data = flat_data.contiguous()
+            values = torch.split(flat_data, self.page_size, dim=self.split_dim)
+
         bs = G_GDRBounceTensorCount
         split_time = time.perf_counter()
-
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
-            value = values[i : i + bs]
+        count = len(keys[0]) if self.use_nsa else len(keys)
+        for i in range(0, count, bs):
+            if self.use_nsa:
+                key, indexer_key = keys[0][i : i + bs], keys[1][i : i + bs]
+                key.extend(indexer_key)
+                value = list(values[i : i + bs])
+                value.extend(list(indexer_values[i : i + bs]))
+            else:
+                key = keys[i : i + bs]
+                value = values[i : i + bs]
             if G_EnableAsyncKVSet:
-                ret = self.eic_client.async_batch_set(key, values)
+                ret = self.eic_client.async_batch_set(key, value)
             else:
                 ret = self.eic_client.set(key, value)
             if not ret:
@@ -1033,9 +1216,13 @@ class EICBaseTokenToKVPoolHost:
             return False
         start_time = time.perf_counter()
         bs = G_GDRBounceTensorCount
-
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
+        count = len(keys[0]) if self.use_nsa else len(keys)
+        for i in range(0, count, bs):
+            if self.use_nsa:
+                key, indexer_key = keys[0][i : i + bs], keys[1][i : i + bs]
+                key.extend(indexer_key)
+            else:
+                key = keys[i : i + bs]
             indices = device_indices[i : i + bs * self.page_size]
             if G_EnableAsyncKVSet:
                 ret = self.eic_client.async_batch_set(
@@ -1198,7 +1385,7 @@ class EICMHATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         )
         self.kvcache_device = device_pool.device
         self.eic_client = EICKVClient(
-            self.dtype, self.kvcache_shape, self.kvcache_device
+            self.dtype, self.kvcache_shape, device_pool, self.kvcache_device
         )
 
     def device_backup(
@@ -1278,7 +1465,7 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         )
         self.kvcache_device = device_pool.device
         self.eic_client = EICKVClient(
-            self.dtype, self.kvcache_shape, self.kvcache_device
+            self.dtype, self.kvcache_shape, device_pool, self.kvcache_device
         )
         self.split_dim = 1
 
@@ -1314,11 +1501,24 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         ret_inputs = None
         ret_device_indices = None
         if obj_inputs is not None:
-            ret_inputs = obj_inputs.narrow(
-                dim=self.split_dim,
-                start=start * self.page_size,
-                length=tp_keys_len * self.page_size,
-            )
+            if self.use_nsa:
+                kvcache_part = obj_inputs[0].narrow(
+                    dim=self.split_dim,
+                    start=start * self.page_size,
+                    length=tp_keys_len * self.page_size,
+                )
+                indexer_part = obj_inputs[1].narrow(
+                    dim=self.split_dim,
+                    start=start * self.page_size,
+                    length=tp_keys_len * self.page_size,
+                )
+                ret_inputs = (kvcache_part, indexer_part)
+            else:
+                ret_inputs = obj_inputs.narrow(
+                    dim=self.split_dim,
+                    start=start * self.page_size,
+                    length=tp_keys_len * self.page_size,
+                )
         if device_indices is not None:
             ret_device_indices = device_indices.narrow(
                 dim=0,
@@ -1352,7 +1552,7 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             self.layer_num,
             count,
             1,
-            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.kv_cache_dim,
             dtype=self.dtype,
             device="cpu",
         )
@@ -1376,6 +1576,151 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             self.device_pool.kv_buffer[layer_id][device_indices] = src_tensor[
                 src_indices, layer_id
             ].flatten(0, 1)
+
+
+class EICNSATokenToKVPoolHost(EICMLATokenToKVPoolHost):
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        device: str = "cpu",
+        page_size: int = 1,
+        rank: int = 0,
+        extra_info: Optional[dict] = None,
+    ):
+        EICBaseTokenToKVPoolHost.__init__(
+            self,
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            device,
+            page_size,
+            rank,
+            extra_info,
+        )
+        self.kv_lora_rank = self.device_pool.kv_lora_rank
+        self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+        self.nsa_index_dim = self.device_pool.index_k_with_scale_buffer[0].shape[-1]
+        self.kv_cache_dim = self.device_pool.kv_cache_dim
+        self.layer_num = self.device_pool.layer_num
+        self.size_per_token = self.kv_cache_dim * 1 * self.dtype.itemsize
+        self.kvcache_shape = (
+            self.layer_num,
+            page_size,
+            1,
+            self.kv_cache_dim,
+        )
+        self.kvcache_device = device_pool.device
+        self.indexer_buffer_shape = (
+            self.layer_num,
+            1,
+            self.nsa_index_dim,
+        )
+        self.indexer_buffer_dtype = self.device_pool.index_k_with_scale_buffer_dtype
+        self.eic_client = EICKVClient(
+            self.dtype, self.kvcache_shape, device_pool, self.kvcache_device
+        )
+        self.split_dim = 1
+        self.use_nsa = True
+
+    def _get_deploy_info(self):
+        model_path = self.extra_info.get("model_path", "fake_model_path")
+        page_size = self.page_size
+        framework = self.extra_info.get("framework", "sglang")
+        pp_size = self.extra_info.get("pp_size", 1)
+        if pp_size > 1:
+            pp_rank = self.extra_info.get("pp_rank", 0)
+            kvcache_key = f"{model_path}_{pp_size}_{pp_rank}_{page_size}@{framework}"
+            indexer_key = (
+                f"{model_path}_{pp_size}_{pp_rank}_{page_size}_indexer@{framework}"
+            )
+        else:
+            kvcache_key = f"{model_path}_{page_size}@{framework}"
+            indexer_key = f"{model_path}_{page_size}_indexer@{framework}"
+        return kvcache_key, indexer_key
+
+    def batch_exist_page(self, content_hashes):
+        """
+        for multi prompt detect prefix key
+        """
+        batch_size = self.eic_client.eic_check_bs
+        kvcache_keys, indexer_keys = self._encode_key_shared(content_hashes)
+
+        exist_result = []
+        for i in range(0, len(kvcache_keys), batch_size):
+            kvcache_batch_ret = self.eic_client.exists_batch(
+                kvcache_keys[i : i + batch_size]
+            )
+            indexer_batch_ret = self.eic_client.exists_batch(
+                indexer_keys[i : i + batch_size]
+            )
+            exist_result.extend(
+                [
+                    kvcache_ret and indexer_ret
+                    for kvcache_ret, indexer_ret in zip(
+                        kvcache_batch_ret, indexer_batch_ret
+                    )
+                ]
+            )
+        return exist_result
+
+    def device_backup(
+        self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]
+    ) -> None:
+        count = len(device_indices)
+        page_indices = (
+            device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        )
+        dst_kvcache_tensors = dst_tensors[: len(dst_tensors) // 2]
+        dst_indexer_tensors = dst_tensors[len(dst_tensors) // 2 :]
+        kvcache_tensor = torch.empty(
+            self.layer_num,
+            count,
+            1,
+            self.kv_cache_dim,
+            dtype=self.dtype,
+            device="cpu",
+        )
+        indexer_tensor = torch.empty(
+            self.layer_num,
+            len(page_indices),
+            self.nsa_index_dim,
+            dtype=self.indexer_buffer_dtype,
+            device="cpu",
+        )
+        for layer_id in range(self.layer_num):
+            kvcache_tensor[layer_id].copy_(
+                self.device_pool.kv_buffer[layer_id][device_indices], non_blocking=True
+            )
+            indexer_tensor[layer_id].copy_(
+                self.device_pool.index_k_with_scale_buffer[layer_id][page_indices],
+                non_blocking=True,
+            )
+        torch.cuda.current_stream().synchronize()
+        for i, dst in enumerate(dst_kvcache_tensors):
+            start = i * self.page_size
+            end = start + self.page_size
+            dst.copy_(kvcache_tensor[:, start:end, :, :].contiguous())
+        for i, dst in enumerate(dst_indexer_tensors):
+            dst.copy_(indexer_tensor[:, i, :].unsqueeze(1).contiguous())
+
+    def device_writeback(self, device_indices, src_tensor, src_indices):
+        suc_count = len(src_indices)
+        kvcache_tensor, indxer_tensor = src_tensor[0].to(
+            self.kvcache_device
+        ), src_tensor[1].to(self.kvcache_device)
+        device_indices = device_indices[: suc_count * self.page_size]
+        device_page_indices = (
+            device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        )
+        for layer_id in range(self.layer_num):
+            self.device_pool.kv_buffer[layer_id][device_indices] = kvcache_tensor[
+                src_indices, layer_id
+            ].flatten(0, 1)
+            self.device_pool.index_k_with_scale_buffer[layer_id][
+                device_page_indices
+            ] = indxer_tensor[src_indices, layer_id].squeeze(1)
 
 
 if __name__ == "__main__":

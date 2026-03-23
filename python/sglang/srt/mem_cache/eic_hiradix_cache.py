@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import yaml
@@ -19,10 +19,15 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.eic_memory_pool import (
     EICMHATokenToKVPoolHost,
     EICMLATokenToKVPoolHost,
+    EICNSATokenToKVPoolHost,
     MemoryStateInt,
     get_eic_config_file_path,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
@@ -79,6 +84,29 @@ def mla_pool_transfer(
         self.kv_buffer[i][indices] = flat_data[i]
 
 
+def nsa_pool_get_flat_data(self: NSATokenToKVPool, indices: torch.Tensor):
+    mla_part = torch.stack([self.kv_buffer[i][indices] for i in range(self.layer_num)])
+    page_indices = indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+    indexer_part = torch.stack(
+        [self.index_k_with_scale_buffer[i][page_indices] for i in range(self.layer_num)]
+    )
+    return (mla_part, indexer_part)
+
+
+def nsa_pool_transfer(
+    self: NSATokenToKVPool,
+    indices: torch.Tensor,
+    flat_data: Tuple[torch.Tensor, torch.Tensor],
+):
+    mla_part, indexer_part = flat_data
+    mla_part = mla_part.to(device=self.device, non_blocking=False)
+    indexer_part = indexer_part.to(device=self.device, non_blocking=False)
+    page_indices = indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+    for i in range(self.layer_num):
+        self.kv_buffer[i][indices] = mla_part[i]
+        self.index_k_with_scale_buffer[i][page_indices] = indexer_part[i]
+
+
 class EICHiRadixCache(RadixCache):
 
     def __init__(
@@ -102,6 +130,18 @@ class EICHiRadixCache(RadixCache):
             )
             self.kv_cache.get_flat_data = partial(mha_pool_get_flat_data, self.kv_cache)
             self.kv_cache.transfer = partial(mha_pool_transfer, self.kv_cache)
+        elif isinstance(self.kv_cache, NSATokenToKVPool):
+            self.token_to_kv_pool_host = EICNSATokenToKVPoolHost(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                "cpu",
+                params.page_size,
+                self.rank,
+                extra_info=self.get_extra_info(params, server_args),
+            )
+            self.kv_cache.get_flat_data = partial(nsa_pool_get_flat_data, self.kv_cache)
+            self.kv_cache.transfer = partial(nsa_pool_transfer, self.kv_cache)
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
                 self.kv_cache,
@@ -115,7 +155,7 @@ class EICHiRadixCache(RadixCache):
             self.kv_cache.get_flat_data = partial(mla_pool_get_flat_data, self.kv_cache)
             self.kv_cache.transfer = partial(mla_pool_transfer, self.kv_cache)
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(f"HiRadixCache only supports MHA, MLA and NSA yet")
 
         self.load_cache_event = threading.Event()
         self.cache_controller = EICCacheController(
