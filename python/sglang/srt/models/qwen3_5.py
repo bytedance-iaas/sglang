@@ -77,7 +77,14 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    is_cuda,
+    is_npu,
+    make_layers,
+    set_weight_attrs,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -836,7 +843,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
-
+        
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
@@ -1045,9 +1052,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(len(self.layers))
+                    if isinstance(self.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
+                }
+            )
         return loaded_params
-
+    
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
@@ -1380,8 +1397,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(len(self.model.layers))
+                    if isinstance(
+                        self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock
+                    )
+                }
+            )
         return loaded_params
+    
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
