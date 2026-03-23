@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+        # Init backend (XQA or TRTLLM-GEN)
+        # We need to specify q_type and out_type for different backend
+        # XQA: (q_type must be bf16)
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = bf16, out_type=model_runner.dtype
+        # TRTLLM-GEN:
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = fp8, out_type=model_runner.dtype
+        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
