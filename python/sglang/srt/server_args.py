@@ -1827,9 +1827,10 @@ class ServerArgs:
                     )
 
         elif model_arch in ["MiniMaxM2ForCausalLM"]:
-            if self.moe_a2a_backend == "deepep":
-                # When using DeepEP, we need to make sure activation dtype is bf16 and not float16
-                # otherwise DeepEP will error due to activation dtype mismatch.
+            if self.moe_a2a_backend == "deepep" or self.disaggregation_mode != "null":
+                # MiniMax M2 requires bf16 activations when DeepEP is used on the decode side.
+                # Under PD disaggregation, prefill and decode must keep the same activation dtype,
+                # so force bf16 on both sides to avoid precision mismatches.
                 self.dtype = "bfloat16"
 
         elif model_arch in [
