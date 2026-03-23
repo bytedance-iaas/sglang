@@ -117,10 +117,51 @@ if [ -z "$CUSTOM_TOS_AK" ] && [ -z "$CUSTOM_TOS_SK" ]; then
 else
     # 安装 tosutil
     wget $TOS_UTIL_URL -O /usr/bin/tosutil && chmod +x /usr/bin/tosutil
-    # 上传制品到 tos
-    for wheel_file in $(find $OUTPUT_PATH -name "*.whl"); do
-        echo "uploading $wheel_file to tos..."
-        tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) -re cn-beijing -e dualstack.cn-beijing.tos.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+    # # 上传制品到 tos
+    # for wheel_file in $(find $OUTPUT_PATH -name "*.whl"); do
+    #     echo "uploading $wheel_file to tos..."
+    #     tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) -re cn-beijing -e dualstack.cn-beijing.tos.volces.com -i $CUSTOM_TOS_AK -k $CUSTOM_TOS_SK
+    # done
+    ENDPOINTS=(
+      "dualstack.cn-beijing.tos.volces.com"
+      "tos-cn-beijing.volces.com"
+    )
+    MAX_RETRY_PER_ENDPOINT=2
+    RETRY_INTERVAL=10
+
+    for wheel_file in $(find $OUTPUT_PATH -name "*.whl" 2>/dev/null || true); do
+        if [ -z "$wheel_file" ]; then continue; fi
+        
+        echo "开始上传: $wheel_file"
+        upload_success=0
+
+        for ((retry_cnt=1; retry_cnt<=MAX_RETRY_PER_ENDPOINT; retry_cnt++)); do
+            for endpoint in "${ENDPOINTS[@]}"; do
+                echo "第 $retry_cnt 次尝试，使用Endpoint: $endpoint"
+                
+                # 修改点1：修复 \ 后的注释问题
+                # 修改点2：利用 if 阻断 set -e 的自动退出
+                if tosutil cp $wheel_file tos://${CUSTOM_TOS_BUCKET}/packages/sgl-kernel/$(basename $wheel_file) \
+                  -re cn-beijing \
+                  -e $endpoint \
+                  -i $CUSTOM_TOS_AK \
+                  -k $CUSTOM_TOS_SK \
+                  -r 1; then
+                  
+                    echo "✅ 上传成功！Endpoint: $endpoint，重试次数: $retry_cnt"
+                    upload_success=1
+                    break 2
+                else
+                    echo "❌ 当前Endpoint上传失败，等待 $RETRY_INTERVAL 秒后重试..."
+                    sleep $RETRY_INTERVAL
+                fi
+            done
+        done
+
+        if [ $upload_success -eq 0 ]; then
+            echo "ERROR: $wheel_file 所有Endpoint、所有重试均失败，上传终止"
+            exit 1
+        fi
     done
 fi
 
