@@ -112,8 +112,7 @@ else
                   -re cn-beijing \
                   -e $endpoint \
                   -i $CUSTOM_TOS_AK \
-                  -k $CUSTOM_TOS_SK 
-                  ; then
+                  -k $CUSTOM_TOS_SK; then
 
                     echo "✅ 上传成功！Endpoint: $endpoint，重试次数: $retry_cnt"
                     upload_success=1
