@@ -478,9 +478,7 @@ class DataParallelController:
             return
 
         self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(
-            self.workers
-        )
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):

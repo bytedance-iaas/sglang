@@ -226,7 +226,6 @@ class MooncakeKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
             )
 
-
     def _ensure_failure_tracking(self):
         if not hasattr(self, "failure_lock"):
             self.failure_lock = threading.Lock()

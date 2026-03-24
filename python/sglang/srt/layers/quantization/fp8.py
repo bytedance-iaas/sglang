@@ -16,7 +16,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -542,7 +547,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        if get_moe_runner_backend().is_cutlass() or get_moe_runner_backend().is_cutlass_w4afp8():
+        if (
+            get_moe_runner_backend().is_cutlass()
+            or get_moe_runner_backend().is_cutlass_w4afp8()
+        ):
             assert (
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -1119,7 +1127,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if get_moe_runner_backend().is_cutlass_w4afp8() or get_moe_runner_backend().is_cutlass():
+        if (
+            get_moe_runner_backend().is_cutlass_w4afp8()
+            or get_moe_runner_backend().is_cutlass()
+        ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(

@@ -11,7 +11,6 @@ from sgl_kernel import (
 )
 
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.moe.ep_moe.kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
@@ -23,6 +22,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_masked_post_per_tensor_quant_fwd,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
+from sglang.srt.utils import get_bool_env_var
 
 
 def cutlass_w4a8_moe(
@@ -532,7 +532,7 @@ def cutlass_w4a8_moe_deepep_ll(
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale
     )
-    del c1 , gateup_input
+    del c1, gateup_input
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,

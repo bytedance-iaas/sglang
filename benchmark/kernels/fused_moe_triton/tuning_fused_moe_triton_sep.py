@@ -135,7 +135,10 @@ def benchmark_config(
 
     def prepare(i: int):
         input_gating = gating_output[i]
-        topk_ids = torch.load(f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt", map_location=hidden_states.device)
+        topk_ids = torch.load(
+            f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt",
+            map_location=hidden_states.device,
+        )
         new_topk_output = select_experts(hidden_states, input_gating, topk_config)
         topk_output.topk_weights.copy_(new_topk_output.topk_weights)
         tokens, _topk = topk_output.topk_ids.shape
@@ -159,7 +162,9 @@ def benchmark_config(
 
             topk = topk_ids.shape[1]
             padded_tokens = (
-                min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1) if moe_use_tma else 0
+                min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
+                if moe_use_tma
+                else 0
             )
             total_tokens = M * topk + padded_tokens
             cache = torch.empty(
@@ -182,7 +187,9 @@ def benchmark_config(
             compute_type = (
                 tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
             )
-            apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
+            apply_router_weight_on_input = (
+                moe_runner_config.apply_router_weight_on_input
+            )
 
             with override_config(config):
                 start_event = torch.cuda.Event(enable_timing=True)
@@ -261,32 +268,32 @@ def benchmark_config(
         except RuntimeError as e:
             print(f"Error in run  {e}", flush=True)
             print(
-                        hidden_states,
-                        w1,
-                        None,
-                        intermediate_cache1,
-                        None,
-                        w1_scale,
-                        None,
-                        topk_weights,
-                        topk_ids,
-                        sorted_token_ids,
-                        expert_ids,
-                        num_tokens_post_padded,
-                        apply_router_weight_on_input,
-                        topk_ids.shape[1],
-                        config,
-                        compute_type=compute_type,
-                        use_fp8_w8a8=use_fp8_w8a8,
-                        use_int8_w8a8=use_int8_w8a8,
-                        use_int8_w8a16=False,
-                        use_int4_w4a16=False,
-                        per_channel_quant=True,
-                        block_shape=block_shape,
-                        b_use_tma=moe_use_tma,
-                        c_sorted=moe_use_tma,
-                        filter_expert=False,
-                )
+                hidden_states,
+                w1,
+                None,
+                intermediate_cache1,
+                None,
+                w1_scale,
+                None,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=False,
+                use_int4_w4a16=False,
+                per_channel_quant=True,
+                block_shape=block_shape,
+                b_use_tma=moe_use_tma,
+                c_sorted=moe_use_tma,
+                filter_expert=False,
+            )
             time_cost0, time_cost1 = float("inf"), float("inf")
         return time_cost0, time_cost1
 
