@@ -752,16 +752,16 @@ class DeepseekV2MoE(nn.Module):
     def get_moe_weights(self):
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
             return [
-                 x.data
-                 for name, x in self.experts.named_parameters()
-                 if name not in ["correction_bias"]
-             ][:-2]
-        else:
-             return [
-                 x.data
-                 for name, x in self.experts.named_parameters()
+                x.data
+                for name, x in self.experts.named_parameters()
                 if name not in ["correction_bias"]
-             ]
+            ][:-2]
+        else:
+            return [
+                x.data
+                for name, x in self.experts.named_parameters()
+                if name not in ["correction_bias"]
+            ]
 
     def forward(
         self,
@@ -1167,7 +1167,11 @@ class DeepseekV2MoE(nn.Module):
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
-                **(dict(static_scale=self.experts.w13_input_scale.float()) if self.experts.w13_input_scale is not None else dict()),
+                **(
+                    dict(static_scale=self.experts.w13_input_scale.float())
+                    if self.experts.w13_input_scale is not None
+                    else dict()
+                ),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 

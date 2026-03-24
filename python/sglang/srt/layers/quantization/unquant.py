@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import os
+from logging import Logger
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-
 import triton
 import triton.language as tl
+from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
@@ -34,10 +34,10 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
-
-from sglang.srt.utils.kernel_selector import get_kernel_selector, append_string_if_not_exists
-from logging import Logger
-
+from sglang.srt.utils.kernel_selector import (
+    append_string_if_not_exists,
+    get_kernel_selector,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -45,8 +45,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-L20_DEVICE_NAME = 'NVIDIA L20'
-H20_DEVICE_NAME = 'NVIDIA H20'
+L20_DEVICE_NAME = "NVIDIA L20"
+H20_DEVICE_NAME = "NVIDIA H20"
 
 DEEP_GEMM_AVAILABLE = True
 try:
@@ -86,44 +86,56 @@ def deep_gemm_matmul(a, b):
 
 @triton.jit
 def matmul_kernel(
-        a_ptr, b_ptr, c_ptr,
-        bias_ptr,
-        M, N, K,
-        stride_am, stride_ak,  #
-        stride_bk, stride_bn,  #
-        stride_cm, stride_cn,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-        GROUP_SIZE_M: tl.constexpr,  #
-        ACTIVATION: tl.constexpr  #
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,  #
+    stride_bk,
+    stride_bn,  #
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
+    ACTIVATION: tl.constexpr,  #
 ):
 
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     # See above `L2 Cache Optimizations` section for details.
-    
+
     # we assume that each program_id is  solving a  (BLOCK_SIZE_M, BLOCK_SIZE_N) size problem
     # then pid will range from  0 ~ (M/ BLOCK_SIZE_M) *  (N/BLOCK_SIZE_N)
     # size_m = M / BLOCK_SIZE__M
     # size_n = N / BLOCK_SIZE_N
-    
+
     # here we need to get every  prgram  will deal which block in output
     # in a normal case: can just use  pid // size_n, pid % size_n
     # then can compute each block's start as (pid // size_n *  BLOCK_SIZE_M) * N, (pid * size_n) * BLOCK_SIZE_N
-    
+
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     # now access block in zig-zag order: need to decide blong to which group first:
-    
-    
+
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     # decide this group has a total group size or less than group_size_m
-    
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m) # get which row the block was in (in a size_m * size_n matrix)
-    pid_n = (pid % num_pid_in_group) // group_size_m # get which column the block was in (in a size_m * size_n matrix)
+
+    pid_m = first_pid_m + (
+        (pid % num_pid_in_group) % group_size_m
+    )  # get which row the block was in (in a size_m * size_n matrix)
+    pid_n = (
+        pid % num_pid_in_group
+    ) // group_size_m  # get which column the block was in (in a size_m * size_n matrix)
 
     # -----------------------------------------------------------
     # Add some integer bound assumptions.
@@ -145,22 +157,20 @@ def matmul_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     # See above `Pointer Arithmetic` section for details
-     
+
     # this is for all threads in the block , so we need to use a tl.arrange to  get an offset for every threads in the block
     # in case of OOB need to %M
     # the same for col (offset_bn)
-    
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M 
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    
-    
+
     # since we use a size_k tile each time need to plus this stride in a/b matrix
-    offs_k = tl.arange(0, BLOCK_SIZE_K) 
-    
-    
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
     # here we not only compute a  pointer's start (address) but also need to express a (BLOCK_SIZE_M, BLOCK_SIZE_K) input matrix (also for B)
     # so use None to get (BLOCK_SIZE_M,1) also use None to get (1, BLOLCK_SIZE_K) and the final size will be (BLOCK_SIZE_M, BLOCK_SIZE_K) tile
-    
+
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -169,22 +179,22 @@ def matmul_kernel(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    
+
     # used to store output
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
-        
+
         # will load a (BLOCK_SIZE_M, BLOCK_SIZE_K) tile automatically
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        
+
         # will load a (BLOCK_SIZE_K, BLOCK_SIZE_N) tile automatically
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         accumulator = tl.dot(a, b, accumulator)
         # Advance the ptrs to the next K block.
-        
+
         # only need to move left-top corner of pointer
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -195,7 +205,7 @@ def matmul_kernel(
         bias_ptrs = bias_ptr + offs_bn
         bias = tl.load(bias_ptrs)
         # add none @ need to broadcast dim
-        accumulator+=bias[None, :]
+        accumulator += bias[None, :]
     c = accumulator.to(tl.float16)
 
     # -----------------------------------------------------------
@@ -206,15 +216,16 @@ def matmul_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
-def triton_matmul(a, b, bias = None, launch_configs= [64,64,64,8,8,4,1]):
-    if len(launch_configs)!= 7:
+
+def triton_matmul(a, b, bias=None, launch_configs=[64, 64, 64, 8, 8, 4, 1]):
+    if len(launch_configs) != 7:
         Logger.info("invalid luanch config , use default config")
-        launch_configs =  [64,64,64,8,8,4,1]
-    
+        launch_configs = [64, 64, 64, 8, 8, 4, 1]
+
     activation = ""
     if not (bias is None):
         activation = "add_bias"
-      
+
     # Check constraints.
     # assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -233,27 +244,38 @@ def triton_matmul(a, b, bias = None, launch_configs= [64,64,64,8,8,4,1]):
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16).contiguous()
     # print("c.shape {}".format(c.shape))
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    #BLOCK_SIZE_M: 512, BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32, GROUP_SIZE_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    # BLOCK_SIZE_M: 512, BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32, GROUP_SIZE_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4
     matmul_kernel[grid](
-        a, b, c, bias,#
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(1), b.stride(0),  #
-        c.stride(0), c.stride(1),  #
+        a,
+        b,
+        c,
+        bias,  #
+        M,
+        N,
+        K,  #
+        a.stride(0),
+        a.stride(1),  #
+        b.stride(1),
+        b.stride(0),  #
+        c.stride(0),
+        c.stride(1),  #
         BLOCK_SIZE_M=launch_configs[0],
         BLOCK_SIZE_N=launch_configs[1],
-        BLOCK_SIZE_K= launch_configs[2],
-        GROUP_SIZE_M= launch_configs[3],
+        BLOCK_SIZE_K=launch_configs[2],
+        GROUP_SIZE_M=launch_configs[3],
         ACTIVATION=activation,
-        num_warps = launch_configs[4],
-        num_stages = launch_configs[5],
-        num_ctas = launch_configs[6],
+        num_warps=launch_configs[4],
+        num_stages=launch_configs[5],
+        num_ctas=launch_configs[6],
     )
-    
+
     if need_unsequeeze:
         c.unsqueeze_(squeeze_position)
     return c
+
 
 @triton.jit
 def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
@@ -263,6 +285,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     pid_m = first_pid_m + (tile_id % group_size_m)
     pid_n = (tile_id % num_pid_in_group) // group_size_m
     return pid_m, pid_n
+
 
 @triton.jit
 def matmul_kernel_descriptor_persistent(
@@ -282,7 +305,6 @@ def matmul_kernel_descriptor_persistent(
     WARP_SPECIALIZE: tl.constexpr,  #
     FLATTEN: tl.constexpr,
     ACTIVATION: tl.constexpr,
-    
 ):
     # Matmul using TMA and device-side descriptor creation
     dtype = c_ptr.dtype.element_ty
@@ -308,7 +330,10 @@ def matmul_kernel_descriptor_persistent(
         c_ptr,
         shape=[M, N],
         strides=[N, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2],
+        block_shape=[
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+        ],
     )
 
     # tl.assume(num_pid_m >= 0)
@@ -319,29 +344,35 @@ def matmul_kernel_descriptor_persistent(
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+    for tile_id in tl.range(
+        start_pid, num_tiles, NUM_SMS, flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE
+    ):
+        pid_m, pid_n = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
-        
+
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
-        
+
         tile_id_c += NUM_SMS
-        #GLOBAL
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        # GLOBAL
+        pid_m, pid_n = _compute_pid(
+            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
-        
+
         offs_bn_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         if ACTIVATION == "add_bias":
             bias_ptrs = bias_ptr + offs_bn_bias
             bias = tl.load(bias_ptrs)
-            accumulator+=bias[None, :]
+            accumulator += bias[None, :]
 
         if EPILOGUE_SUBTILE:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
@@ -356,25 +387,33 @@ def matmul_kernel_descriptor_persistent(
             c_desc.store([offs_cm, offs_cn], c)
 
 
-def triton_matmul_persistent_tma(is_hopper, sm_num, a, b, bias = None, launch_configs= [64,64,64,8, False, True, 4, 4, 1]):
-    if len(launch_configs)!= 9:
+def triton_matmul_persistent_tma(
+    is_hopper,
+    sm_num,
+    a,
+    b,
+    bias=None,
+    launch_configs=[64, 64, 64, 8, False, True, 4, 4, 1],
+):
+    if len(launch_configs) != 9:
         Logger.info("invalid luanch config , use default config")
-        launch_configs =  [64,64,64,8, False, True, 4, 4, 1]
+        launch_configs = [64, 64, 64, 8, False, True, 4, 4, 1]
 
     global set_allocator
-    
+
     if not set_allocator:
+
         def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-          return torch.empty(size, device="cuda", dtype=torch.int8)
+            return torch.empty(size, device="cuda", dtype=torch.int8)
 
         triton.set_allocator(alloc_fn)
-        
+
         set_allocator = True
-    
+
     activation = ""
     if not (bias is None):
         activation = "add_bias"
-      
+
     assert a.is_contiguous(), "Matrix A must be contiguous"
     need_unsequeeze = False
     squeeze_position = 0
@@ -391,31 +430,42 @@ def triton_matmul_persistent_tma(is_hopper, sm_num, a, b, bias = None, launch_co
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16).contiguous()
     # print("c.shape {}".format(c.shape))
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (min(sm_num, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
-    #BLOCK_SIZE_M: 512, BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32, GROUP_SIZE_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4
-    
+    grid = lambda META: (
+        min(
+            sm_num,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ),
+    )
+    # BLOCK_SIZE_M: 512, BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32, GROUP_SIZE_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4
+
     warp_specialize = launch_configs[5]
     flatten = False if (warp_specialize and is_hopper) else True
     matmul_kernel_descriptor_persistent[grid](
-        a, b, c, bias,#
-        M, N, K,  ##
+        a,
+        b,
+        c,
+        bias,  #
+        M,
+        N,
+        K,  ##
         BLOCK_SIZE_M=launch_configs[0],
         BLOCK_SIZE_N=launch_configs[1],
-        BLOCK_SIZE_K= launch_configs[2],
-        GROUP_SIZE_M= launch_configs[3],
-        EPILOGUE_SUBTILE= launch_configs[4],
-        WARP_SPECIALIZE= launch_configs[5],
-        num_warps = launch_configs[6],
-        num_stages = launch_configs[7],
-        num_ctas = launch_configs[8],
-        NUM_SMS= sm_num,
-        FLATTEN= flatten,
-        ACTIVATION= activation
+        BLOCK_SIZE_K=launch_configs[2],
+        GROUP_SIZE_M=launch_configs[3],
+        EPILOGUE_SUBTILE=launch_configs[4],
+        WARP_SPECIALIZE=launch_configs[5],
+        num_warps=launch_configs[6],
+        num_stages=launch_configs[7],
+        num_ctas=launch_configs[8],
+        NUM_SMS=sm_num,
+        FLATTEN=flatten,
+        ACTIVATION=activation,
     )
-    
+
     if need_unsequeeze:
         c.unsqueeze_(squeeze_position)
     return c
+
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
@@ -454,6 +504,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+
 def align_to_closest(x, align):
     if not isinstance(align, int) or align <= 0:
         raise ValueError("align must be a positive integer")
@@ -467,17 +518,18 @@ def align_to_closest(x, align):
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
+
     def __init__(self):
         super().__init__()
-        
+
         if not hasattr(self, "is_hopper"):
             self.is_hopper = torch.cuda.get_device_capability()[0] == 9
-     
+
         if not hasattr(self, "sm_num"):
             self.sm_num = torch.cuda.get_device_properties("cuda").multi_processor_count
-            
+
         if not hasattr(self, "device_name"):
-            self.device_name =  torch.cuda.get_device_name()
+            self.device_name = torch.cuda.get_device_name()
 
     def create_weights(
         self,
@@ -524,53 +576,56 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
-        bias_shape = "none" if  bias is None else bias.shape
+        bias_shape = "none" if bias is None else bias.shape
         # print(bias_shape)
         # print("check_shape weight {} input {} bias {} ".format(layer.weight.shape, x.shape,  bias_shape))
-        
+
         shape_collect = []
         if len(x.shape) == 3:
             for s in x.shape:
-                if s==1:
+                if s == 1:
                     continue
                 shape_collect.append(s)
-        elif len(x.shape) == 2 :
+        elif len(x.shape) == 2:
             shape_collect = x.shape
-        
+
         do_kernel_selection = get_int_env_var("SGLANG_GEMM_KERNEL_SELC")
         M, N, K = shape_collect[0], layer.weight.shape[0], shape_collect[1]
         call_in_graph = torch.cuda.is_current_stream_capturing()
-        
-        if M <=256:
+
+        if M <= 256:
             M = M
-        elif M>=256 and M <512:
+        elif M >= 256 and M < 512:
             M = align_to_closest(M, 8)
-        elif M>=512 and M <1024:
+        elif M >= 512 and M < 1024:
             M = align_to_closest(M, 16)
-        elif M >=1024:
+        elif M >= 1024:
             M = align_to_closest(M, 32)
-            
+
         # only collect valid shape
         if len(shape_collect) == 2 and get_bool_env_var("SGLANG_RECORD_TUNE"):
-            device_parts = self.device_name.split(" ")         
-            device_name = device_parts[1] if (len(device_parts) == 2 and device_parts[0]== "NVIDIA") else "unknown"
+            device_parts = self.device_name.split(" ")
+            device_name = (
+                device_parts[1]
+                if (len(device_parts) == 2 and device_parts[0] == "NVIDIA")
+                else "unknown"
+            )
             save_path = os.getenv("gemm_tune_record_path")
-            file_name = "{}_GEMM_graph_{}_BF16.txt".format(device_name, call_in_graph) 
+            file_name = "{}_GEMM_graph_{}_BF16.txt".format(device_name, call_in_graph)
             file_name = os.path.join(save_path, file_name)
-            to_save_mnk ="{}_{}_{}".format(M, N, K)
+            to_save_mnk = "{}_{}_{}".format(M, N, K)
             append_string_if_not_exists(file_name, to_save_mnk)
-        
-        if len(shape_collect) == 2  and do_kernel_selection:
+
+        if len(shape_collect) == 2 and do_kernel_selection:
             kernel_selector = get_kernel_selector()
             # if not hasattr(self, "shape_table"):
             #     shape_table = set()
             #     setattr(self, "shape_table", shape_table)
-                
+
             hash_device_name = self.device_name.split(" ")
             if hash_device_name[0] == "NVIDIA" and len(hash_device_name) == 2:
                 hash_device_name = hash_device_name[1]
-            
-            
+
             hash_dtype = ""
             if x.dtype == torch.float32:
                 hash_dtype = "FP32"
@@ -578,9 +633,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 hash_dtype = "BF16"
             elif x.dtype == torch.float16:
                 hash_dtype = "FP16"
-            
-            selection_rets = kernel_selector.query_kernel_data(hash_device_name, (M,N,K), hash_dtype, "GEMM", call_in_graph)
-            
+
+            selection_rets = kernel_selector.query_kernel_data(
+                hash_device_name, (M, N, K), hash_dtype, "GEMM", call_in_graph
+            )
+
             # all case use default
             if not isinstance(selection_rets, list) or len(selection_rets) == 0:
                 kernel_selector.update_kernel_data("cublas", "GEMM")
@@ -589,28 +646,35 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 selection_ret = selection_rets[-1]
                 kernel_type = selection_ret["kernel_type"]
                 kernel_config = selection_ret["kernel_config"]
-                
+
                 if kernel_type == "deep_gemm":
                     # deepgemm currently not support gemm with bias
                     if (bias is None) and DEEP_GEMM_AVAILABLE:
                         kernel_selector.update_kernel_data("deep_gemm", "GEMM")
                         return deep_gemm_matmul(x, layer.weight)
                     else:
-                        if len(selection_rets)!=0:
+                        if len(selection_rets) != 0:
                             selection_ret = selection_rets[-2]
                             kernel_type = selection_ret["kernel_type"]
                             kernel_config = selection_ret["kernel_config"]
-                
+
                 kernel_selector.update_kernel_data(kernel_type, "GEMM")
-                
+
                 if kernel_type == "triton":
                     return triton_matmul(x, layer.weight, bias, kernel_config)
                 elif kernel_type == "triton_tma":
-                    return triton_matmul_persistent_tma(self.is_hopper, self.sm_num, x, layer.weight, bias, kernel_config)
+                    return triton_matmul_persistent_tma(
+                        self.is_hopper,
+                        self.sm_num,
+                        x,
+                        layer.weight,
+                        bias,
+                        kernel_config,
+                    )
         # else:
-            # print("check this case x.shape {} shape_collect {}".format(x.shape, shape_collect))                
-        
-        ret =  F.linear(x, layer.weight, bias)
+        # print("check this case x.shape {} shape_collect {}".format(x.shape, shape_collect))
+
+        ret = F.linear(x, layer.weight, bias)
         # print("ret shape {}".format(ret.shape))
         return ret
 

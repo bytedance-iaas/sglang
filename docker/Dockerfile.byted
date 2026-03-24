@@ -23,10 +23,10 @@ RUN wget -O DeepSeek-R1_prefill_ep16_3500_1500.json https://github.com/user-atta
 RUN wget -O DeepSeek-R1_decode_ep32_3500_1500.json https://github.com/user-attachments/files/20903460/DeepSeek-R1_decode_ep32_3500_1500.json
 
 # sglang 安装
-RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-build-isolation --no-deps 
+RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-build-isolation --no-deps
 
 # sgl-kernel安装
-RUN http_proxy='' pip install sgl_kernel==${sgl_kernel_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-deps 
+RUN http_proxy='' pip install sgl_kernel==${sgl_kernel_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-deps
 
 # sglang-router安装
 RUN if [ "x$sglang_router_version" = "x"  ]; then \
