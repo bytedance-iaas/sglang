@@ -459,9 +459,9 @@ class VisionFlash3Attention(nn.Module):
             k_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
             v_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
             
-            scale_q = torch.ones((1), device = "cuda", dtype = torch.float32)
-            scale_k = torch.ones((1), device = "cuda", dtype = torch.float32)
-            scale_v = torch.ones((1), device = "cuda", dtype = torch.float32)
+            scale_q = torch.empty((1), device = "cuda", dtype = torch.float32)
+            scale_k = torch.empty((1), device = "cuda", dtype = torch.float32)
+            scale_v = torch.empty((1), device = "cuda", dtype = torch.float32)
 
             
             per_tensor_quant_fp8(q, q_quant, scale_q)
