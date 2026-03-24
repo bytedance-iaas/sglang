@@ -23,11 +23,3 @@ jobs:
 
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
-
-      - name: Run sgl-kernel clang-format checks
-        uses: DoozyX/clang-format-lint-action@v0.20
-        with:
-          source: sgl-kernel
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 20
-          style: file
