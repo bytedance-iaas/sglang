@@ -980,6 +980,168 @@ def compute_identity_kernel(
         mask=(dim_offset + tl.arange(0, BLOCK_SIZE)) < hidden_dim,
     )
 
+@triton.jit
+def compute_problem_sizes_w4a8_kernel(
+    masked_m_ptr,
+    problem_sizes1_ptr,
+    problem_sizes2_ptr,
+    n,
+    k,
+    num_experts,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = pid < num_experts
+    final_occurrences = tl.load(masked_m_ptr + pid, mask=mask, other=0)
+
+    ps1_idx_0 = pid * 3
+    ps1_idx_1 = ps1_idx_0 + 1
+    ps1_idx_2 = ps1_idx_0 + 2
+
+    ps2_idx_0 = pid * 3
+    ps2_idx_1 = ps2_idx_0 + 1
+    ps2_idx_2 = ps2_idx_0 + 2
+
+    ps1_mask_0 = ps1_idx_0 < num_experts * 3
+    ps1_mask_1 = ps1_idx_1 < num_experts * 3
+    ps1_mask_2 = ps1_idx_2 < num_experts * 3
+    ps2_mask_0 = ps2_idx_0 < num_experts * 3
+    ps2_mask_1 = ps2_idx_1 < num_experts * 3
+    ps2_mask_2 = ps2_idx_2 < num_experts * 3
+
+    tl.store(problem_sizes1_ptr + ps1_idx_0, 2 * n, mask=ps1_mask_0)
+    tl.store(problem_sizes1_ptr + ps1_idx_1, final_occurrences, mask=ps1_mask_1)
+    tl.store(problem_sizes1_ptr + ps1_idx_2, k, mask=ps1_mask_2)
+
+    tl.store(problem_sizes2_ptr + ps2_idx_0, k, mask=ps2_mask_0)
+    tl.store(problem_sizes2_ptr + ps2_idx_1, final_occurrences, mask=ps2_mask_1)
+    tl.store(problem_sizes2_ptr + ps2_idx_2, n, mask=ps2_mask_2)
+
+
+def compute_problem_sizes_w4a8(
+    masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
+):
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
+    compute_problem_sizes_w4a8_kernel[grid](
+        masked_m,
+        problem_sizes1,
+        problem_sizes2,
+        n,
+        k,
+        num_experts,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return problem_sizes1, problem_sizes2
+
+
+@triton.jit
+def compute_expert_offsets_w4a8_kernel(
+    problem_sizes_ptr, expert_offsets_ptr, num_experts, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    block_end = min(block_start + BLOCK_SIZE, num_experts)
+    tot_offset = 0
+    if pid == 0:
+        tl.store(expert_offsets_ptr + 0, 0)
+    for i in range(block_start, block_end):
+        problem_size = tl.load(problem_sizes_ptr + i * 3 + 1)
+        tot_offset += problem_size
+        tl.store(expert_offsets_ptr + i + 1, tot_offset)
+
+
+def compute_expert_offsets_w4a8(
+    problem_sizes: torch.Tensor, expert_offsets: torch.Tensor
+):
+    num_experts = problem_sizes.size(0)
+    BLOCK_SIZE = 32
+    grid = lambda meta: (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
+
+    compute_expert_offsets_w4a8_kernel[grid](
+        problem_sizes,
+        expert_offsets,
+        num_experts,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return expert_offsets
+
+
+def deepep_ll_get_cutlass_w4a8_moe_mm_data(
+    masked_m,
+    problem_sizes1,
+    problem_sizes2,
+    num_experts,
+    n,
+    k,
+):
+    problem_sizes1, problem_sizes2 = compute_problem_sizes_w4a8(
+        masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
+    )
+    return (
+        problem_sizes1.to(torch.int32),
+        problem_sizes2.to(torch.int32),
+    )
+
+
+@triton.jit
+def _silu_mul_and_static_tensor_quant_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    scale_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    UNROLL_FACTOR: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+    scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id,
+        token_num_cur_expert,
+        block_num_per_expert,
+        loop_unroll_factor=UNROLL_FACTOR,
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        gate = gate / (1 + tl.exp(-gate))
+        gate_up = up * gate * scale_inv
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            gate_up.to(output_ptr.dtype.element_ty),
+            mask=offs_in_d < size_n,
+        )
+
 
 def zero_experts_compute_triton(
     expert_indices, expert_scales, num_experts, zero_expert_type, hidden_states

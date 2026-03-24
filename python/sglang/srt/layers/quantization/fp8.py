@@ -30,7 +30,12 @@ except ImportError:
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -526,6 +531,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        if get_moe_runner_backend().is_cutlass_fp8():
+            assert (
+                cutlass_fp8_supported()
+            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
+            assert is_sm100_supported() or is_sm90_supported()
 
     def create_weights(
         self,
@@ -633,8 +644,58 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if self._should_use_cutlass_fused_experts():
-                self._ensure_cutlass_buffers_initialized(layer)
+            if get_moe_runner_backend().is_cutlass_fp8():
+                self.ab_strides1 = torch.full(
+                    (num_experts,),
+                    hidden_size,
+                    device=w13_weight.device,
+                    dtype=torch.int64,
+                )
+                self.c_strides1 = torch.full(
+                    (num_experts,),
+                    2 * intermediate_size_per_partition,
+                    device=w13_weight.device,
+                    dtype=torch.int64,
+                )
+                self.ab_strides2 = torch.full(
+                    (num_experts,),
+                    intermediate_size_per_partition,
+                    device=w2_weight.device,
+                    dtype=torch.int64,
+                )
+                self.c_strides2 = torch.full(
+                    (num_experts,),
+                    hidden_size,
+                    device=w2_weight.device,
+                    dtype=torch.int64,
+                )
+                self.workspace = torch.empty(
+                    90000, device=w13_weight.device, dtype=torch.uint8
+                )
+                self.a_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.b_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.out_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.a_scales_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.b_scales_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.expert_offsets = torch.empty(
+                    num_experts + 1, device=w13_weight.device, dtype=torch.int32
+                )
+                self.problem_sizes1 = torch.empty(
+                    num_experts, 3, device=w13_weight.device, dtype=torch.int32
+                )
+                self.problem_sizes2 = torch.empty(
+                    num_experts, 3, device=w13_weight.device, dtype=torch.int32
+                )
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1023,7 +1084,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if self._should_use_cutlass_fused_experts():
+        if get_moe_runner_backend().is_cutlass_fp8():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output

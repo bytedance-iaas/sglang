@@ -337,6 +337,11 @@ class CommonKVReceiver(BaseKVReceiver):
         # FIXME: alias here: target_dp_group -> prefill_dp_rank
         self.target_dp_group = self.prefill_dp_rank
 
+        if self.prefill_pp_size == self.kv_mgr.pp_size:
+            self.target_pp_ranks = [self.kv_mgr.pp_rank]
+        else:
+            self.target_pp_ranks = [rank for rank in range(self.prefill_pp_size)]
+
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
         )
@@ -348,7 +353,7 @@ class CommonKVReceiver(BaseKVReceiver):
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
             for target_tp_rank in self.target_tp_ranks:
-                for target_pp_rank in range(self.prefill_pp_size):
+                for target_pp_rank in reversed(self.target_pp_ranks):
                     bootstrap_info = self._get_bootstrap_info_from_server(
                         target_tp_rank, self.target_dp_group, target_pp_rank
                     )

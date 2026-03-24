@@ -24,7 +24,7 @@ RUN wget -O DeepSeek-R1_decode_ep32_3500_1500.json https://github.com/user-attac
 
 # flash MLA
 WORKDIR /sgl-workspace
-RUN git clone --branch support_fp8  https://github.com/bytedance-iaas/FlashMLA.git
+RUN git clone --branch fp8_wz  https://github.com/bytedance-iaas/FlashMLA.git
 WORKDIR /sgl-workspace/FlashMLA
 RUN pip install . --break-system-packages --no-build-isolation
 

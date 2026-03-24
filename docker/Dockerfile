@@ -17,8 +17,8 @@ RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
+ARG DEEPEP_COMMIT=dcfd954851157f0bf683e1c3f1a7778f78344759
+ARG FLASHMLA_COMMIT=de6beecb2ff0fe7e17a743a1492921464b760f82
 ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ARG SGL_KERNEL_VERSION=0.3.16.post4
@@ -158,7 +158,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 1fd57b0276311d035d16176bb0076426166e52f3 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \
-      git clone https://github.com/deepseek-ai/DeepEP.git \
+      git clone https://github.com/bytedance-iaas/DeepEP.git \
       && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     fi \
     && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
@@ -200,7 +200,7 @@ RUN cd /sgl-workspace/DeepEP && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
-RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+RUN git clone https://github.com/bytedance-iaas/FlashMLA.git flash-mla && \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
       git submodule update --init --recursive && \

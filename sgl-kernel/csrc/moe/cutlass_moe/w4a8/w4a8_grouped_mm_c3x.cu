@@ -79,8 +79,9 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
-  uint32_t const m = a_tensors.size(0) / topk;
+    int64_t topk,
+    int64_t expected_m_per_group) {
+  uint32_t const m = expected_m_per_group;
   uint32_t const n = d_tensors.size(1);
   uint32_t const k = a_tensors.size(1);
 
@@ -88,6 +89,20 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 1
     if (m <= 4) {
       invoke_gemm<SM90_PP<64, 32, 512, 2, 1, 1>>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 8) {
+      invoke_gemm<SM90_PP<64, 16, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -114,8 +129,36 @@ void dispatch_w4a8_moe_mm_sm90(
           d_strides,
           s_strides,
           chunk_size);
-    } else if (m <= 256) {
-      invoke_gemm<SM90_CO<128, 16, 512, 1, 1, 1>>(
+    } else if (m <= 32) {
+      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 64) {
+      invoke_gemm<SM90_CO<128, 64, 512, 1, 1, 1>>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 512) {
+      invoke_gemm<SM90_CO<128, 64, 512, 1, 2, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -129,7 +172,7 @@ void dispatch_w4a8_moe_mm_sm90(
           s_strides,
           chunk_size);
     } else if (m <= 1024) {
-      invoke_gemm<SM90_CO<128, 32, 512, 2, 1, 1>>(
+      invoke_gemm<SM90_CO<128, 64, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -159,53 +202,22 @@ void dispatch_w4a8_moe_mm_sm90(
     }
   } else if (n == 7168 && k == 2048) {
     // group gemm 2
-    if (m <= 8) {
-      invoke_gemm<SM90_PP<64, 16, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else if (m <= 512) {
-      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else {
-      invoke_gemm<SM90_CO<128, 64, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    }
-  } else if (n == 512 && k == 7168) {
-    // group gemm 1 for tp
     if (m <= 4) {
       invoke_gemm<SM90_PP<64, 32, 512, 2, 1, 1>>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 8) {
+      invoke_gemm<SM90_PP<64, 16, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -232,8 +244,8 @@ void dispatch_w4a8_moe_mm_sm90(
           d_strides,
           s_strides,
           chunk_size);
-    } else if (m <= 256) {
-      invoke_gemm<SM90_CO<128, 16, 512, 2, 1, 1>>(
+    } else if (m <= 32) {
+      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -246,21 +258,7 @@ void dispatch_w4a8_moe_mm_sm90(
           d_strides,
           s_strides,
           chunk_size);
-    } else if (m <= 1024) {
-      invoke_gemm<SM90_CO<128, 32, 512, 2, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else {
+    } else if (m <= 64) {
       invoke_gemm<SM90_CO<128, 64, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
@@ -274,25 +272,8 @@ void dispatch_w4a8_moe_mm_sm90(
           d_strides,
           s_strides,
           chunk_size);
-    }
-  } else if (n == 7168 && k == 256) {
-    // group gemm 2 for tp
-    if (m <= 8) {
-      invoke_gemm<SM90_PP<64, 16, 128, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
     } else if (m <= 512) {
-      invoke_gemm<SM90_PP<128, 32, 128, 2, 1, 1>>(
+      invoke_gemm<SM90_CO<128, 64, 512, 1, 2, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -306,7 +287,7 @@ void dispatch_w4a8_moe_mm_sm90(
           s_strides,
           chunk_size);
     } else {
-      invoke_gemm<SM90_PP<128, 64, 128, 1, 1, 1>>(
+      invoke_gemm<SM90_CO<128, 64, 512, 2, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -321,35 +302,19 @@ void dispatch_w4a8_moe_mm_sm90(
           chunk_size);
     }
   } else {
-    if (k % 512 == 0) {
-      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    } else {
-      invoke_gemm<SM90_PP<128, 64, 128, 1, 1, 1>>(
-          d_tensors,
-          a_tensors,
-          b_tensors,
-          a_scales,
-          b_scales,
-          expert_offsets,
-          problem_sizes,
-          a_strides,
-          b_strides,
-          d_strides,
-          s_strides,
-          chunk_size);
-    }
+    invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
+        d_tensors,
+        a_tensors,
+        b_tensors,
+        a_scales,
+        b_scales,
+        expert_offsets,
+        problem_sizes,
+        a_strides,
+        b_strides,
+        d_strides,
+        s_strides,
+        chunk_size);
   }
 }
 
@@ -368,7 +333,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
+    int64_t topk,
+    int64_t expected_m_per_group) {
   dispatch_w4a8_moe_mm_sm90(
       d_tensors,
       a_tensors,
@@ -382,5 +348,6 @@ void cutlass_w4a8_moe_mm_sm90(
       d_strides,
       s_strides,
       chunk_size,
-      topk);
+      topk,
+      expected_m_per_group);
 }

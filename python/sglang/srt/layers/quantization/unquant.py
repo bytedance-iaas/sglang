@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+import triton
+import triton.language as tl
+
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -18,6 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     is_cpu,
     is_hip,
     set_weight_attrs,
@@ -30,6 +34,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+L20_DEVICE_NAME = 'NVIDIA L20'
+H20_DEVICE_NAME = 'NVIDIA H20'
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
@@ -40,6 +46,182 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+
+# class general_linear:
+#     def __init__(self):
+#         self.linear_method_map = {}
+    
+#     def infer(self, input, weight, bias)
+
+@triton.jit
+def matmul_kernel(
+        a_ptr, b_ptr, c_ptr,
+        bias_ptr,
+        M, N, K,
+        stride_am, stride_ak,  #
+        stride_bk, stride_bn,  #
+        stride_cm, stride_cn,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
+        GROUP_SIZE_M: tl.constexpr,  #
+        ACTIVATION: tl.constexpr  #
+):
+
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    
+    # we assume that each program_id is  solving a  (BLOCK_SIZE_M, BLOCK_SIZE_N) size problem
+    # then pid will range from  0 ~ (M/ BLOCK_SIZE_M) *  (N/BLOCK_SIZE_N)
+    # size_m = M / BLOCK_SIZE__M
+    # size_n = N / BLOCK_SIZE_N
+    
+    # here we need to get every  prgram  will deal which block in output
+    # in a normal case: can just use  pid // size_n, pid % size_n
+    # then can compute each block's start as (pid // size_n *  BLOCK_SIZE_M) * N, (pid * size_n) * BLOCK_SIZE_N
+    
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    # now access block in zig-zag order: need to decide blong to which group first:
+    
+    
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    # decide this group has a total group size or less than group_size_m
+    
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m) # get which row the block was in (in a size_m * size_n matrix)
+    pid_n = (pid % num_pid_in_group) // group_size_m # get which column the block was in (in a size_m * size_n matrix)
+
+    # -----------------------------------------------------------
+    # Add some integer bound assumptions.
+    # This helps to guide integer analysis in the backend to optimize
+    # load/store offset address calculation
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # See above `Pointer Arithmetic` section for details
+     
+    # this is for all threads in the block , so we need to use a tl.arrange to  get an offset for every threads in the block
+    # in case of OOB need to %M
+    # the same for col (offset_bn)
+    
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M 
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    
+    
+    # since we use a size_k tile each time need to plus this stride in a/b matrix
+    offs_k = tl.arange(0, BLOCK_SIZE_K) 
+    
+    
+    # here we not only compute a  pointer's start (address) but also need to express a (BLOCK_SIZE_M, BLOCK_SIZE_K) input matrix (also for B)
+    # so use None to get (BLOCK_SIZE_M,1) also use None to get (1, BLOLCK_SIZE_K) and the final size will be (BLOCK_SIZE_M, BLOCK_SIZE_K) tile
+    
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+    
+    # used to store output
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the K dimension.
+        # If it is out of bounds, set it to 0.
+        
+        # will load a (BLOCK_SIZE_M, BLOCK_SIZE_K) tile automatically
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        
+        # will load a (BLOCK_SIZE_K, BLOCK_SIZE_N) tile automatically
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        # We accumulate along the K dimension.
+        accumulator = tl.dot(a, b, accumulator)
+        # Advance the ptrs to the next K block.
+        
+        # only need to move left-top corner of pointer
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    # You can fuse arbitrary activation functions here
+    # while the accumulator is still in FP32!
+
+    if ACTIVATION == "add_bias":
+        bias_ptrs = bias_ptr + offs_bn
+        bias = tl.load(bias_ptrs)
+        # add none @ need to broadcast dim
+        accumulator+=bias[None, :]
+    c = accumulator.to(tl.float16)
+
+    # -----------------------------------------------------------
+    # Write back the block of the output matrix C with masks.
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def triton_matmul(a, b, bias = None, launch_configs= [64,64,64,8,8,4,1]):
+    activation = ""
+    if not (bias is None):
+        activation = "add_bias"
+      
+    # Check constraints.
+    # assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
+    need_unsequeeze = False
+    squeeze_position = 0
+    if len(a.shape) == 3:
+        if a.shape[0] == 1:
+            squeeze_position = 0
+        elif a.shape[1] == 1:
+            squeeze_position = 1
+        a = a.squeeze(squeeze_position)
+        need_unsequeeze = True
+    M, K = a.shape
+    N, K = b.shape
+    # Allocates output.
+    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16).contiguous()
+    # print("c.shape {}".format(c.shape))
+    # 1D launch kernel where each block gets its own program.
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    #BLOCK_SIZE_M: 512, BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32, GROUP_SIZE_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4
+    matmul_kernel[grid](
+        a, b, c, bias,#
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(1), b.stride(0),  #
+        c.stride(0), c.stride(1),  #
+        BLOCK_SIZE_M=launch_configs[0],
+        BLOCK_SIZE_N=launch_configs[1],
+        BLOCK_SIZE_K= launch_configs[2],
+        GROUP_SIZE_M= launch_configs[3],
+        ACTIVATION=activation,
+        num_warps = launch_configs[4],
+        num_stages = launch_configs[5],
+        num_ctas = launch_configs[6],
+    )
+    
+    if need_unsequeeze:
+        c.unsqueeze_(squeeze_position)
+    return c
+
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -128,8 +310,134 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+        bias_shape = "none" if  bias is None else bias.shape
+        # print("check_shape weight {} input {} bias {} ".format(layer.weight.shape, x.shape,  bias_shape))
+        
+        shape_collect = []
+        for s in x.shape:
+            if s==1:
+                continue
+            shape_collect.append(s)
+        
+        using_tuned_kernel_level = get_int_env_var("SGLANG_GEMM_TUNE")
+        if not hasattr(self, "device_name"):
+            setattr(self, "device_name", torch.cuda.get_device_name())
+        
+        is_h20 = self.device_name == H20_DEVICE_NAME
+        is_l20 = self.device_name == L20_DEVICE_NAME
+        
+        
+        if len(shape_collect) == 2 :            
+            M, K = shape_collect
+            
+            N = layer.weight.shape[0]
+            
+            launch_config = []
+            # 4524 1162
+            # 6526 1595
+            vit_1 = 4524
+            llm_1 = 1162
+            
+            vit_2 = 6526
+            llm_2 = 1595
+            
+            
+            fit_shape = lambda  x,y :  0.9 * y <= x and x <= 1.1 * y  
+            
+            if (N,K) == (3840, 1280) and using_tuned_kernel_level >=1:
+                # print("vit attn1")
+                if is_h20 and fit_shape( M, vit_1):
+                    launch_config = [64, 128, 32, 8, 4, 5, 2]  
+                elif is_h20 and fit_shape( M, vit_2):
+                    launch_config = [64, 128, 32, 16, 4, 5, 2]
+                
+                elif is_l20 and fit_shape( M, vit_1):
+                    launch_config = [64, 64, 64, 16, 4, 3, 1] 
+                elif is_l20 and fit_shape( M, vit_2):
+                    launch_config = [128, 64, 32,4,4,3,1]
 
-        return F.linear(x, layer.weight, bias)
+                # print("ret1 shape {}".format(ret_1.shape))
+            elif (N,K) == (1280, 1280) and using_tuned_kernel_level >=2:
+                if is_h20 and fit_shape( M, vit_1):
+                    launch_config = [64, 64, 32, 8, 4, 4, 2] 
+                elif is_h20 and fit_shape( M, vit_2):
+                    launch_config = [64, 64, 32, 16, 4, 4, 2]
+                elif is_l20 and fit_shape( M, vit_1):
+                    launch_config = [128, 128, 32, 4, 4, 4, 1] 
+                elif is_l20 and fit_shape( M, vit_2):
+                    launch_config = [64, 64, 64, 4,4,3,1]
+   
+                # print("vit attn2")
+            elif (N,K) == (4524, 6848, 1280) and using_tuned_kernel_level >=3:
+                # print("vit mlp1")
+                if is_h20 and fit_shape( M, vit_1):
+                    launch_config = [64, 64, 32, 8, 4, 4, 1] 
+                elif is_h20 and fit_shape( M, vit_2):
+                    launch_config = [64, 64, 32, 8, 4, 5, 1]
+                elif is_l20 and fit_shape( M, vit_1):
+                    launch_config = [128, 64, 32, 4,2,3,1] 
+                elif is_l20 and fit_shape( M, vit_2):
+                    launch_config = [128, 128, 32, 8, 4, 3, 1]
+        
+            elif (N,K) == (1280, 3424) and using_tuned_kernel_level >=4:
+                # print("vit mlp2")
+                if is_h20 and fit_shape( M, vit_1):
+                    launch_config = [64, 64, 32, 8, 4, 4, 2] 
+                elif is_h20 and fit_shape( M, vit_2):
+                    launch_config = [64, 128, 32, 8, 4, 4, 2]
+                elif is_l20 and fit_shape( M, vit_1):
+                    launch_config = [128, 64, 32, 16, 2, 3, 1] 
+                elif is_l20 and fit_shape( M, vit_2):
+                    launch_config = [64, 64, 64, 4,4, 3, 1]
+
+            elif (N,K) == (4608, 3584) and using_tuned_kernel_level >=5:
+                # print("LLM att1")
+                if is_h20 and fit_shape( M, llm_1):
+                    launch_config = [64, 64, 32, 8, 4, 4, 1] 
+                elif is_h20 and fit_shape( M, llm_2):
+                    launch_config = [64, 64, 64, 8, 4, 3, 2]
+                elif is_l20 and fit_shape( M, llm_1):
+                    launch_config = [64, 64, 64, 8, 4, 3, 1] 
+                elif is_l20 and fit_shape( M, llm_2):
+                    launch_config = [64 , 128, 32, 8, 2, 3, 1]
+
+            elif (N,K) == (3584, 3584) and using_tuned_kernel_level >=6:
+                # print("LLM att2")
+                if is_h20 and fit_shape( M, llm_1):
+                    launch_config = [64, 64, 32, 8, 4, 5, 1] 
+                elif is_h20 and fit_shape( M, llm_2):
+                    launch_config = [64, 128, 64, 8, 4, 3, 1]
+                elif is_l20 and fit_shape( M, llm_1):
+                    launch_config = [64, 128, 32, 8, 2, 3, 1] 
+                elif is_l20 and fit_shape( M, llm_2):
+                    launch_config = [64, 128, 32, 8, 2, 3, 1]
+   
+            elif (N,K) == (37888, 3584) and using_tuned_kernel_level >=7:
+                # print("LLM mlp1")  
+                
+                if is_h20 and fit_shape( M, llm_2):
+                    launch_config = [64, 128, 64,8, 4, 4, 1]
+                elif is_l20 and fit_shape( M, llm_1):
+                    launch_config = [64, 128, 64, 16, 4, 3, 1] 
+                elif is_l20 and fit_shape( M, llm_2):
+                    launch_config = [128, 128, 32, 16, 4, 3, 1]
+            elif (N,K) == (3584, 18944) and using_tuned_kernel_level >=8:
+                # print("LLM mlp2") 
+
+                if is_h20 and fit_shape( M, llm_2):
+                    launch_config = [64, 128, 64, 16, 4, 4, 1]
+                elif is_l20 and fit_shape( M, llm_1):
+                    launch_config = [64, 128, 64, 16, 4, 3, 1] 
+                elif is_l20 and fit_shape( M, llm_2):
+                    launch_config = [128, 128, 64, 4, 4, 3, 1]
+                    
+            if len(launch_config) != 0:
+            
+                return triton_matmul(x, layer.weight, bias, launch_config)
+        
+        ret =  F.linear(x, layer.weight, bias)
+        # print("ret shape {}".format(ret.shape))
+        return ret
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
