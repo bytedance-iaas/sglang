@@ -25,6 +25,7 @@ jobs:
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
   cpu-ut:
+    needs: lint
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
