@@ -61,7 +61,7 @@ if [[ $CMD_ARGS =~ --speculative-algo[[:space:]]+NEXTN ]]; then
     if [[ $CMD_ARGS =~ --speculative-draft[[:space:]]+([^[:space:]]+) ]]; then
         draft_path="${BASH_REMATCH[1]}"
         echo "speculative-draft = $draft_path"
-        # check if draft_path exsits
+        # check if draft_path exists
         if [ ! -d "$draft_path" ]; then
           draft_parent_path=$(dirname "$draft_path")
           draft_name=$(basename "$draft_path")
