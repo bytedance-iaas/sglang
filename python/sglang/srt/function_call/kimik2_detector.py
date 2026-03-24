@@ -33,7 +33,7 @@ def _strip_special_tokens(text: str) -> str:
 
 class KimiK2Detector(BaseFormatDetector):
     """
-    Detector for Kimi K2 model function call format.
+    Detector for Kimi K2 / K2.5 model function call format.
 
     Format Structure:
     ```
@@ -56,7 +56,6 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_argument_begin_token: str = "<|tool_call_argument_begin|>"
 
         # Support hyphenated function names (common in MCP tools, e.g. mcp__portal__search-documents)
-
         self.tool_call_regex = re.compile(
             r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
             re.DOTALL,
