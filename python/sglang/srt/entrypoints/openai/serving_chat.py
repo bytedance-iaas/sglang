@@ -668,8 +668,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
-        traj_xyz_map = {}
-        traj_rot_map = {}
+        pred_traj_map = {}
 
         stream_started = False
         try:
@@ -693,8 +692,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
-                traj_xyz_map[index] = content["meta_info"].get("traj_xyz", None)
-                traj_rot_map[index] = content["meta_info"].get("traj_rot", None)
+                pred_traj_map[index] = content["meta_info"].get("pred_traj", None)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -893,16 +891,12 @@ class OpenAIServingChat(OpenAIServingBase):
             first_routed_experts = next(
                 (v for v in routed_experts.values() if v is not None), None
             )
-            first_traj_xyz = next(
-                (v for v in traj_xyz_map.values() if v is not None), None
-            )
-            first_traj_rot = next(
-                (v for v in traj_rot_map.values() if v is not None), None
+            first_pred_traj = next(
+                (v for v in pred_traj_map.values() if v is not None), None
             )
             if (
                 (request.return_routed_experts and first_routed_experts is not None)
-                or first_traj_xyz is not None
-                or first_traj_rot is not None
+                or first_pred_traj is not None
             ):
                 routed_experts_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -915,8 +909,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             if request.return_routed_experts
                             else None
                         ),
-                        traj_xyz=first_traj_xyz,
-                        traj_rot=first_traj_rot,
+                        pred_traj=first_pred_traj,
                     ),
                 )
                 yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
@@ -988,20 +981,13 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
-        traj_xyz = first_ret["meta_info"].get("traj_xyz", None)
-        traj_rot = first_ret["meta_info"].get("traj_rot", None)
+        pred_traj = first_ret["meta_info"].get("pred_traj", None)
         response_sglext = None
-        if (
-            routed_experts
-            or cached_tokens_details
-            or traj_xyz is not None
-            or traj_rot is not None
-        ):
+        if routed_experts or cached_tokens_details or pred_traj is not None:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
-                traj_xyz=traj_xyz,
-                traj_rot=traj_rot,
+                pred_traj=pred_traj,
             )
 
         for idx, ret_item in enumerate(ret):

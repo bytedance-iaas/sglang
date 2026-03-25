@@ -224,8 +224,7 @@ class AlpamayoR1(nn.Module):
             return
 
         device = sampled_actions.device
-        traj_xyz_list: List = [None] * bstar
-        traj_rot_list: List = [None] * bstar
+        pred_traj_list: List = [None] * bstar
 
         for j, slot_i in enumerate(active_indices):
             history_traj = trajs[slot_i] or {}
@@ -270,17 +269,12 @@ class AlpamayoR1(nn.Module):
                     action_j, hist_xyz, hist_rot
                 )  # (1, n_waypoints, 3), (1, n_waypoints, 3, 3)
 
-            traj_xyz_list[slot_i] = pred_xyz[0].cpu().tolist()
-            traj_rot_list[slot_i] = pred_rot[0].cpu().tolist()
+            pred_traj_list[slot_i] = {
+                "traj_xyz": pred_xyz[0].cpu().tolist(),
+                "traj_rot": pred_rot[0].cpu().tolist(),
+            }
 
-        logits_output.customized_info = {
-            "traj_xyz": traj_xyz_list,
-            "traj_rot": traj_rot_list,
-        }
-
-        logger.info(
-            f"_attach_traj_to_reqs: converted {len(active_indices)} sampled_actions to trajectories"
-        )
+        logits_output.customized_info = {"pred_traj": pred_traj_list}
 
     def _build_expert_forward_batch(
         self,

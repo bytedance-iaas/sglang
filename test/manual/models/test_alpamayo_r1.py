@@ -187,14 +187,14 @@ class TestAlpamayoR1(CustomTestCase):
         for clip_id in CLIP_IDS:
             with self.subTest(clip_id=clip_id):
                 ade = self._run_generate(clip_id)
-                self.assertIsNotNone(ade, "traj_xyz was empty in response")
+                self.assertIsNotNone(ade, "pred_traj.traj_xyz was empty in response")
                 print(f"  [generate] {clip_id[:12]}... ADE={ade:.4f}m")
 
     def test_chat_api(self):
         for clip_id in CLIP_IDS:
             with self.subTest(clip_id=clip_id):
                 ade = self._run_chat(clip_id)
-                self.assertIsNotNone(ade, "sglext.traj_xyz not found in response")
+                self.assertIsNotNone(ade, "sglext.pred_traj.traj_xyz not found in response")
                 print(f"  [chat] {clip_id[:12]}... ADE={ade:.4f}m")
 
     # ---- generate API ----
@@ -246,7 +246,8 @@ class TestAlpamayoR1(CustomTestCase):
         print(f"  Generated text: {ret.get('text', '')[:200]}...")
 
         meta_info = ret.get("meta_info", {})
-        pred_xyz = np.asarray(meta_info.get("traj_xyz", []))
+        _pred_traj = next((x for x in reversed(meta_info.get("pred_traj", [])) if x is not None), None)
+        pred_xyz = np.asarray(_pred_traj["traj_xyz"] if _pred_traj else [])
         if pred_xyz.size == 0:
             return None
 
@@ -310,10 +311,13 @@ class TestAlpamayoR1(CustomTestCase):
         if sglext is None:
             sglext = getattr(resp, "model_extra", {}).get("sglext")
 
-        if not sglext or "traj_xyz" not in sglext:
+        if not sglext or "pred_traj" not in sglext:
             return None
 
-        pred_xyz = np.asarray(sglext["traj_xyz"])
+        _pred_traj = next((x for x in reversed(sglext["pred_traj"]) if x is not None), None)
+        if _pred_traj is None:
+            return None
+        pred_xyz = np.asarray(_pred_traj["traj_xyz"])
         if pred_xyz.size == 0:
             return None
 
