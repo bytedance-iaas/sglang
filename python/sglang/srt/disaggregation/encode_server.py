@@ -219,7 +219,27 @@ class MMEncoder:
             self.embedding_to_send = dict()
             self.background_tasks: Set[asyncio.Task] = set()
 
+        self.enable_batch_encode = (
+            int(os.environ.get("SGLANG_ENCODER_ENABLE_BATCHING", 0)) == 1
+        )
+        if self.enable_batch_encode:
+            # --- Batching Implementation ---
+            self.batch_queue = asyncio.Queue()
+            self.max_batch_size = int(
+                os.environ.get("SGLANG_ENCODER_MAX_BATCH_SIZE", 8)
+            )
+            logger.info(
+                f"Batching enabled for encoder. max_batch_size={self.max_batch_size}"
+            )
+        else:
+            logger.info("Batching disabled for encoder.")
+
         logger.info(f"rank {rank} init finish ")
+
+    def start_batch_processing(self):
+        """Start the background batch processing loop."""
+        if self.enable_batch_encode:
+            asyncio.create_task(self.batch_processing_loop())
 
     def _load_single_item(
         self,
@@ -312,6 +332,83 @@ class MMEncoder:
             async_futures = [asyncio.wrap_future(f) for f in futures]
             return await asyncio.gather(*async_futures)
 
+    async def batch_processing_loop(self):
+        """Background loop to process requests in batches."""
+        logger.info("Batch processing loop started.")
+        while True:
+            batch_items = []
+            batch_futures = []
+
+            try:
+                # 1. Block and wait for the first item
+                item, future = await self.batch_queue.get()
+                batch_items.append(item)
+                batch_futures.append(future)
+
+                # 2. Drain the queue up to max_batch_size without waiting
+                while len(batch_items) < self.max_batch_size:
+                    try:
+                        # get_nowait() will raise QueueEmpty if queue is empty
+                        item, future = self.batch_queue.get_nowait()
+                        batch_items.append(item)
+                        batch_futures.append(future)
+                    except asyncio.QueueEmpty:
+                        break
+
+                # 3. Process the batch
+                if batch_items:
+                    pixel_values_list = [item.feature for item in batch_items]
+                    grid_thw_list = [item.image_grid_thw for item in batch_items]
+                    token_num_list = []
+                    for item in batch_items:
+                        token_num = 0
+                        for thw in item.image_grid_thw:
+                            token_num += (
+                                thw.prod() // self.image_processor.merge_size**2
+                            )
+                        token_num_list.append(token_num)
+                    cum_token_num_list = [0] + list(np.cumsum(token_num_list))
+                    assert len(cum_token_num_list) == len(batch_items) + 1
+
+                    batched_item = MultimodalDataItem(
+                        modality=batch_items[0].modality,
+                        feature=torch.cat(pixel_values_list, dim=0),
+                        model_specific_data={
+                            "image_grid_thw": torch.cat(grid_thw_list, dim=0)
+                        },
+                    )
+                    try:
+                        loop = asyncio.get_running_loop()
+                        mm_embeddings = await loop.run_in_executor(
+                            self.io_executor, self._run_batch_encode, [batched_item]
+                        )
+
+                        # 4. Distribute results
+                        for i in range(len(batch_items)):
+                            res = mm_embeddings[
+                                cum_token_num_list[i] : cum_token_num_list[i + 1]
+                            ]
+                            batch_futures[i].set_result(res)
+
+                    except Exception as e:
+                        logger.error(f"Batch inference failed: {e}")
+                        for f in batch_futures:
+                            if not f.done():
+                                f.set_exception(e)
+
+            except Exception as e:
+                logger.error(f"Error in batch loop: {e}")
+                await asyncio.sleep(0.1)
+
+    def _run_batch_encode(self, batch_items):
+        """Run inference on a batch of items (executed in thread pool)."""
+        with torch.inference_mode():
+            features = self.model.get_image_feature(batch_items)
+            # Move to CPU here to avoid holding GPU memory in queue
+            if isinstance(features, torch.Tensor):
+                return features.cpu()
+            return features
+
     async def _encode(self, mm_items) -> torch.Tensor:
         try:
             images = await self._flatten_and_load_images(mm_items)
@@ -319,8 +416,16 @@ class MMEncoder:
             raise BadRequestError(f"Failed to load images from input: {str(e)}")
 
         try:
-            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-            images_input = self.image_processor(images=images, **kwargs)
+            # kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+            # images_input = self.image_processor(images=images, **kwargs)
+            loop = asyncio.get_running_loop()
+            images_input = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self.image_processor(
+                    images=images,
+                    **({"device": self.device} if self.use_image_processor_gpu else {}),
+                ),
+            )
             feature = images_input["pixel_values"]
             mm_item = MultimodalDataItem.from_dict(
                 {
@@ -346,9 +451,20 @@ class MMEncoder:
                         mm_embedding = mm_cache.embedding
 
             if mm_embedding is None:
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-                    mm_embedding = mm_embedding.cpu()
+                if self.enable_batch_encode:
+                    # Create a future to receive the result
+                    future = loop.create_future()
+                    # Put item and future into queue
+                    await self.batch_queue.put((mm_item, future))
+                    # Wait for result
+                    mm_embedding = await future
+                else:
+                    with torch.inference_mode():
+                        mm_embedding: torch.Tensor = self.model.get_image_feature(
+                            [mm_item]
+                        )
+                        mm_embedding = mm_embedding.cpu()
+
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
@@ -625,7 +741,19 @@ class EncoderProfiler:
         return True, None
 
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    if encoder is not None:
+        encoder.start_batch_processing()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+# app = FastAPI()
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
 
@@ -634,6 +762,7 @@ async def run_encoder(
     server_args: ServerArgs, schedule_path, dist_init_method, rank: int
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
+    encoder.start_batch_processing()  # Start the batch loop explicitly
     while True:
         request = await encoder.schedule_socket.recv_pyobj()
         if isinstance(request, ProfileReq):
