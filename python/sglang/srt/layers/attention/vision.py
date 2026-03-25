@@ -31,6 +31,7 @@ from sglang.srt.utils.multi_stream_utils import (
 )
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.srt.layers.attention.triton_ops.fused_vision_attn_quant import fused_qkv_per_tensor_quant_pad
 
 
 _is_cuda = is_cuda()
@@ -441,40 +442,53 @@ class VisionFlash3Attention(nn.Module):
         """
         
         if envs.SGLANG_VISION_ATTN_FP8.get():
-            
             if isinstance(cu_seqlens, list):
                 cu_seqlens_tensor = cu_seqlens[0]
             else:
                 cu_seqlens_tensor = cu_seqlens
-                
-            
+
             ori_shape = q.shape
             ori_headsize = ori_shape[2]
-            aligned_headsize = ((ori_headsize-1) // HOPPER_TMA_ALIGN_BYTE  + 1) *  HOPPER_TMA_ALIGN_BYTE
-            aligned_shape = [ori_shape[0], ori_shape[1], ori_headsize ]
-            
-            
-            # print(aligned_shape)
-            q_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
-            k_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
-            v_quant = torch.empty(aligned_shape, dtype= torch.float8_e4m3fn, device = "cuda").contiguous()
-            
-            scale_q = torch.empty((1), device = "cuda", dtype = torch.float32)
-            scale_k = torch.empty((1), device = "cuda", dtype = torch.float32)
-            scale_v = torch.empty((1), device = "cuda", dtype = torch.float32)
+            aligned_headsize = (
+                (ori_headsize - 1) // HOPPER_TMA_ALIGN_BYTE + 1
+            ) * HOPPER_TMA_ALIGN_BYTE
 
-            
-            per_tensor_quant_fp8(q, q_quant, scale_q)
-            per_tensor_quant_fp8(k, k_quant, scale_k)
-            per_tensor_quant_fp8(v, v_quant, scale_v)
-            
-            q_quant_pad, _ = pad_last_dim_to_multiple_zero(q_quant, HOPPER_TMA_ALIGN_BYTE)
-            k_quant_pad,_ = pad_last_dim_to_multiple_zero(k_quant, HOPPER_TMA_ALIGN_BYTE)
-            v_quant_pad, _ = pad_last_dim_to_multiple_zero(v_quant, HOPPER_TMA_ALIGN_BYTE)
-            
-            scale_q = scale_q.expand(cu_seqlens_tensor.size(0)-1, q.shape[1])
-            scale_k = scale_k.expand(cu_seqlens_tensor.size(0)-1, k.shape[1])
-            scale_v = scale_v.expand(cu_seqlens_tensor.size(0)-1, v.shape[1])
+            # Lazy buffer allocation to avoid repeated CUDA allocation
+            if not hasattr(self, "q_quant_pad") or self.q_quant_pad.shape[0] < ori_shape[0]:
+                self.q_quant_pad = torch.empty(
+                    (ori_shape[0], ori_shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.k_quant_pad = torch.empty(
+                    (ori_shape[0], ori_shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.v_quant_pad = torch.empty(
+                    (ori_shape[0], ori_shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.scale_q_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                self.scale_k_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+
+            # Use slices of the pre-allocated buffers
+            q_quant_pad = self.q_quant_pad[:ori_shape[0]]
+            k_quant_pad = self.k_quant_pad[:ori_shape[0]]
+            v_quant_pad = self.v_quant_pad[:ori_shape[0]]
+            scale_q = self.scale_q_raw
+            scale_k = self.scale_k_raw
+            scale_v = self.scale_v_raw
+
+            fused_qkv_per_tensor_quant_pad(
+                q, k, v, q_quant_pad, k_quant_pad, v_quant_pad, scale_q, scale_k, scale_v
+            )
+
+            scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
+            scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
+            scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
 
         
         
