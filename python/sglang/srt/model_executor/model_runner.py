@@ -1848,9 +1848,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "turboquant":
-            # TurboQuant stores data as uint8 indices internally.
-            # The working dtype remains the model dtype for attention computation.
-            self.kv_cache_dtype = torch.uint8
+            # TurboQuant stores bit-packed indices internally but dequantizes
+            # to the model dtype before attention. The attention backend sees
+            # the working dtype, not the storage dtype.
+            self.kv_cache_dtype = self.dtype
             self._turboquant_enabled = True
             log_info_on_rank0(
                 logger,
