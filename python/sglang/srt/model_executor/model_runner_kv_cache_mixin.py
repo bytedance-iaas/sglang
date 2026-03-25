@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.turboquant_memory_pool import MHATokenToKVPoolTurboQuant
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -70,6 +71,24 @@ _is_npu = is_npu()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
+        # TurboQuant: bit-packed indices + float32 norm per K and V head
+        if getattr(self, "_turboquant_enabled", False):
+            from sglang.srt.layers.quantization.turboquant_kernels import (
+                _next_power_of_2,
+                compute_packed_dim,
+            )
+
+            head_dim = self.model_config.head_dim
+            padded_dim = _next_power_of_2(head_dim)
+            num_kv_heads = self.model_config.get_num_kv_heads(
+                get_attention_tp_size()
+            )
+            bits = 4  # default
+            mse_bits = bits  # mse mode
+            per_head = compute_packed_dim(padded_dim, mse_bits) + 4  # packed indices + norm
+            cell_size = num_kv_heads * per_head * 2 * num_layers  # x2 for K and V
+            return cell_size
+
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -613,7 +632,28 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if getattr(self, "_turboquant_enabled", False):
+                    self.token_to_kv_pool = MHATokenToKVPoolTurboQuant(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.dtype,  # working dtype, not storage dtype
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        bits=4,
+                        mode="mse",
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

@@ -1847,6 +1847,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "turboquant":
+            # TurboQuant stores data as uint8 indices internally.
+            # The working dtype remains the model dtype for attention computation.
+            self.kv_cache_dtype = torch.uint8
+            self._turboquant_enabled = True
+            log_info_on_rank0(
+                logger,
+                "TurboQuant KV cache compression enabled (3-4 bit, ICLR 2026)",
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
