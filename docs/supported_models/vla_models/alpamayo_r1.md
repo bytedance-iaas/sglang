@@ -140,7 +140,9 @@ sglext = getattr(resp, "sglext", None)
 if sglext is None:
     sglext = getattr(resp, "model_extra", {}).get("sglext")
 
-traj_xyz = np.asarray(sglext["traj_xyz"])
+# pred_traj is a list of per-decode-step dicts; take the last non-None entry
+pred_traj = next((x for x in reversed(sglext["pred_traj"]) if x is not None), None)
+traj_xyz = np.asarray(pred_traj["traj_xyz"])
 
 # Normalize to (n_samples, n_waypoints, 3)
 while traj_xyz.ndim > 3:
