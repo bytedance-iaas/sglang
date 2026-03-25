@@ -1,7 +1,49 @@
 import torch
 import triton
 import triton.language as tl
+import json
+import os
 
+# 配置持久化路径
+CONFIG_FILE = "/tmp/fused_vision_attn_quant_configs.json"
+
+def load_configs():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_configs(configs):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(configs, f)
+    except:
+        pass
+
+# 全局配置缓存
+_CONFIG_CACHE = load_configs()
+
+# 原始 Kernel 逻辑保持不变，但增加 autotune 装饰器
+@triton.autotune(
+    configs=[
+        # 针对大分辨率 (M > 30000) 的强力配置
+        triton.Config({'BLOCK_SIZE_M': 1024, 'BLOCK_SIZE_N': 128}, num_warps=16),
+        triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 128}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 64}, num_warps=8),
+        # 针对中分辨率 (M ~ 10000)
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_warps=4),
+        # 针对小分辨率 (M < 10000)
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_warps=2),
+    ],
+    key=['M', 'N'],
+)
 @triton.jit
 def fused_qkv_quant_pad_kernel(
     q_ptr, k_ptr, v_ptr,
@@ -61,20 +103,49 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     N = q.shape[2]
     aligned_N = qp.shape[2]
     
-    # 2. Launch Fused QKV Triton kernel
-    BLOCK_SIZE_M = 256
-    BLOCK_SIZE_N = 128 if aligned_N <= 128 else 64
+    cache_key = f"{M}_{N}"
     
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(aligned_N, BLOCK_SIZE_N))
-    
-    fused_qkv_quant_pad_kernel[grid](
-        q, k, v,
-        qp, kp, vp,
-        sq, sk, sv,
-        M, N, aligned_N,
-        q.stride(1), q.stride(2),
-        qp.stride(1), qp.stride(2),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        num_warps=8,
-    )
+    # 2. 如果命中持久化缓存，直接绕过 autotune 使用最优参数运行
+    if cache_key in _CONFIG_CACHE:
+        best_config = _CONFIG_CACHE[cache_key]
+        BLOCK_SIZE_M = best_config['BLOCK_SIZE_M']
+        BLOCK_SIZE_N = best_config['BLOCK_SIZE_N']
+        num_warps = best_config['num_warps']
+        
+        print(f"[Triton Persistence] Hit Cache for {cache_key}: {best_config}", flush=True)
+        
+        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(aligned_N, BLOCK_SIZE_N))
+        
+        # 使用 .fn 绕过 autotune 装饰器直接运行内核
+        fused_qkv_quant_pad_kernel.fn[grid](
+            q, k, v, qp, kp, vp, sq, sk, sv,
+            M, N, aligned_N,
+            q.stride(1), q.stride(2),
+            qp.stride(1), qp.stride(2),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            num_warps=num_warps,
+        )
+    else:
+        # 3. 未命中缓存，触发原生 autotune
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']),
+            triton.cdiv(aligned_N, META['BLOCK_SIZE_N']),
+        )
+        
+        fused_qkv_quant_pad_kernel[grid](
+            q, k, v, qp, kp, vp, sq, sk, sv,
+            M, N, aligned_N,
+            q.stride(1), q.stride(2),
+            qp.stride(1), qp.stride(2),
+        )
+        
+        # 4. 获取测量后的最优配置并存入持久化文件
+        best_config_obj = fused_qkv_quant_pad_kernel.best_config
+        _CONFIG_CACHE[cache_key] = {
+            'BLOCK_SIZE_M': best_config_obj.kwargs['BLOCK_SIZE_M'],
+            'BLOCK_SIZE_N': best_config_obj.kwargs['BLOCK_SIZE_N'],
+            'num_warps': best_config_obj.num_warps,
+        }
+        print(f"[Triton Tuning] {cache_key} tuned: {_CONFIG_CACHE[cache_key]}", flush=True)
+        save_configs(_CONFIG_CACHE)
