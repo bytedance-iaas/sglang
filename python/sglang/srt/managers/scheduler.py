@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.models.alpamayo.scheduler_mixin import SchedulerFlowMatchingMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.mamba.ops import (
@@ -274,6 +275,7 @@ class Scheduler(
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
+    SchedulerFlowMatchingMixin,
     SchedulerDllmMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
@@ -389,6 +391,7 @@ class Scheduler(
 
         # Init diffusion LLM
         self.init_diffusion_llm()
+        self.init_flow_matching()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -2088,6 +2091,11 @@ class Scheduler(
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
+        # Flow matching batch has higher priority than prefill (frees KV cache quickly)
+        fm_batch = self.get_new_batch_flow_matching()
+        if fm_batch is not None:
+            return fm_batch
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2640,7 +2648,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if batch.forward_mode.is_decode():
+        if batch.forward_mode.is_flow_matching():
+            self.process_batch_result_flow_matching(batch, result)
+        elif batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():

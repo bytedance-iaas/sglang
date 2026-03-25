@@ -399,6 +399,31 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Intercept flow-matching-triggered requests before the decode loop.
+        # Move them to flow_matching_queue; they will be processed in a dedicated
+        # FLOW_MATCHING batch in the next scheduler tick.
+        if (
+            logits_output is not None
+            and logits_output.flow_matching_triggered is not None
+            and hasattr(self, "flow_matching_queue")
+        ):
+            triggered_reqs = []
+            remaining_reqs = []
+            remaining_token_ids = []
+            for i, (req, next_token_id) in enumerate(
+                zip(batch.reqs, next_token_ids)
+            ):
+                if logits_output.flow_matching_triggered[i]:
+                    req.needs_flow_matching = True
+                    self.flow_matching_queue.append(req)
+                    triggered_reqs.append(req)
+                else:
+                    remaining_reqs.append(req)
+                    remaining_token_ids.append(next_token_id)
+            if triggered_reqs:
+                batch.reqs = remaining_reqs
+                next_token_ids = remaining_token_ids
+
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 

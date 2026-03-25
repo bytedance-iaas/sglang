@@ -104,6 +104,10 @@ class LogitsProcessorOutput:
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    ## Part 6: Flow matching trigger signal (Alpamayo-R1)
+    # True for requests that triggered flow matching during this decode step
+    flow_matching_triggered: Optional[List[bool]] = None
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
 

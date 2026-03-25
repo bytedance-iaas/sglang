@@ -20,7 +20,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils import get_layer_id
@@ -191,11 +191,12 @@ class AlpamayoR1(nn.Module):
                     active_indices.append(i)
 
             if active_indices:
-                sampled_actions = self._run_flow_matching(active_indices, forward_batch)
-                # Convert sampled actions → trajectories and write to ret.customized_info
-                self._attach_traj_to_reqs(
-                    sampled_actions, active_indices, forward_batch, ret, bstar
-                )
+                # Signal the scheduler to run flow matching in a dedicated phase.
+                # The scheduler will move these requests to flow_matching_queue and
+                # call forward_flow_matching() in a separate batch.
+                ret.flow_matching_triggered = [
+                    i in active_indices for i in range(bstar)
+                ]
 
         return ret
 
@@ -459,6 +460,32 @@ class AlpamayoR1(nn.Module):
             # Euler update: x_{i+1} = x_i + dt * v(x_i, t_i)
             x = x + dt * pred
         return x  # (bstar, n_waypoints, action_dim)
+
+    @torch.no_grad()
+    def forward_flow_matching(
+        self,
+        input_ids: torch.LongTensor,
+        positions: torch.LongTensor,
+        forward_batch: "ForwardBatch",
+        **kwargs,
+    ) -> LogitsProcessorOutput:
+        """Entry point for the dedicated scheduler-driven flow matching phase.
+
+        Called by model_runner when forward_mode == FLOW_MATCHING. The batch
+        contains only requests that need flow matching; all are active.
+
+        Returns a LogitsProcessorOutput with customized_info containing
+        trajectory data for each request.
+        """
+        bstar = forward_batch.batch_size
+        active_indices = list(range(bstar))
+
+        ret = LogitsProcessorOutput(next_token_logits=None)
+        sampled_actions = self._run_flow_matching(active_indices, forward_batch)
+        self._attach_traj_to_reqs(
+            sampled_actions, active_indices, forward_batch, ret, bstar
+        )
+        return ret
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.vlm.pad_input_ids(input_ids, mm_inputs)

@@ -2686,7 +2686,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_flow_matching():
+            ret = self.model.forward_flow_matching(
+                input_ids=forward_batch.input_ids,
+                positions=forward_batch.positions,
+                forward_batch=forward_batch,
+            )
+        elif forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

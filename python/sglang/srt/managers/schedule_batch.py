@@ -725,6 +725,9 @@ class Req(ReqDllmMixin):
         # Alpamayo: history trajectory for action_to_traj conversion
         self.history_traj: Optional[Dict[str, Any]] = None
 
+        # Alpamayo-R1: set True when this request is waiting for / running flow matching
+        self.needs_flow_matching: bool = False
+
         # Embedding (return values)
         self.embedding = None
 

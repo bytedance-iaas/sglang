@@ -99,6 +99,9 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
+    # Used in Alpamayo-R1 flow matching phase
+    FLOW_MATCHING = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -123,6 +126,9 @@ class ForwardMode(IntEnum):
                 else False
             )
         )
+
+    def is_flow_matching(self):
+        return self == ForwardMode.FLOW_MATCHING
 
     def is_decode(self):
         return self == ForwardMode.DECODE
