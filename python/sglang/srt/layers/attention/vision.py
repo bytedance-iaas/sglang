@@ -447,26 +447,26 @@ class VisionFlash3Attention(nn.Module):
             else:
                 cu_seqlens_tensor = cu_seqlens
 
-            ori_shape = q.shape
-            ori_headsize = ori_shape[2]
+            ori_shape_v = v.shape
+            ori_headsize = ori_shape_v[2]
             aligned_headsize = (
                 (ori_headsize - 1) // HOPPER_TMA_ALIGN_BYTE + 1
             ) * HOPPER_TMA_ALIGN_BYTE
 
             # Lazy buffer allocation to avoid repeated CUDA allocation
-            if not hasattr(self, "q_quant_pad") or self.q_quant_pad.shape[0] < ori_shape[0]:
+            if not hasattr(self, "q_quant_pad") or self.q_quant_pad.shape[0] < ori_shape_v[0]:
                 self.q_quant_pad = torch.empty(
-                    (ori_shape[0], ori_shape[1], aligned_headsize),
+                    (ori_shape_v[0], q.shape[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
                     device="cuda",
                 )
                 self.k_quant_pad = torch.empty(
-                    (ori_shape[0], ori_shape[1], aligned_headsize),
+                    (ori_shape_v[0], k.shape[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
                     device="cuda",
                 )
                 self.v_quant_pad = torch.empty(
-                    (ori_shape[0], ori_shape[1], aligned_headsize),
+                    (ori_shape_v[0], ori_shape_v[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
                     device="cuda",
                 )
@@ -475,16 +475,32 @@ class VisionFlash3Attention(nn.Module):
                 self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
 
             # Use slices of the pre-allocated buffers
-            q_quant_pad = self.q_quant_pad[:ori_shape[0]]
-            k_quant_pad = self.k_quant_pad[:ori_shape[0]]
-            v_quant_pad = self.v_quant_pad[:ori_shape[0]]
+            q_quant_pad = self.q_quant_pad[:ori_shape_v[0]]
+            k_quant_pad = self.k_quant_pad[:ori_shape_v[0]]
+            v_quant_pad = self.v_quant_pad[:ori_shape_v[0]]
             scale_q = self.scale_q_raw
             scale_k = self.scale_k_raw
             scale_v = self.scale_v_raw
 
-            fused_qkv_per_tensor_quant_pad(
-                q, k, v, q_quant_pad, k_quant_pad, v_quant_pad, scale_q, scale_k, scale_v
-            )
+            # Check if q and k are already padded (e.g. from fused RoPE)
+            if q.shape[2] == aligned_headsize and k.shape[2] == aligned_headsize:
+                # v is not padded, pad it now using copy_pad
+                if not hasattr(self, "v_pad") or self.v_pad.shape[0] < ori_shape_v[0]:
+                    self.v_pad = torch.empty((ori_shape_v[0], ori_shape_v[1], aligned_headsize), dtype=v.dtype, device=v.device)
+                
+                v_pad = self.v_pad[:ori_shape_v[0]]
+                from sglang.srt.layers.attention.triton_ops.fused_rope_pad import copy_pad
+                copy_pad(v, v_pad)
+                
+                # Now q, k, v_pad are all padded, use the original high-performance per_tensor_quant_fp8
+                per_tensor_quant_fp8(q, q_quant_pad, scale_q)
+                per_tensor_quant_fp8(k, k_quant_pad, scale_k)
+                per_tensor_quant_fp8(v_pad, v_quant_pad, scale_v)
+            else:
+                # fallback to fused quant pad if not already padded
+                fused_qkv_per_tensor_quant_pad(
+                    q, k, v, q_quant_pad, k_quant_pad, v_quant_pad, scale_q, scale_k, scale_v
+                )
 
             scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
             scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
@@ -1184,9 +1200,26 @@ class VisionAttention(nn.Module):
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            q = q.view(original_shape)
-            k = k.view(original_shape)
+            if envs.SGLANG_VISION_ATTN_FP8.get() and is_cuda():
+                aligned_headsize = ((self.head_size - 1) // HOPPER_TMA_ALIGN_BYTE + 1) * HOPPER_TMA_ALIGN_BYTE
+                
+                if not hasattr(self, "q_pad") or self.q_pad.shape[0] < q.shape[0]:
+                    self.q_pad = torch.empty((q.shape[0], q.shape[1], aligned_headsize), dtype=q.dtype, device=q.device)
+                    self.k_pad = torch.empty((k.shape[0], k.shape[1], aligned_headsize), dtype=k.dtype, device=k.device)
+                
+                q_pad = self.q_pad[:q.shape[0]]
+                k_pad = self.k_pad[:k.shape[0]]
+                
+                from sglang.srt.layers.attention.triton_ops.fused_rope_pad import fused_rope_pad
+                fused_rope_pad(q, cos, sin, q_pad)
+                fused_rope_pad(k, cos, sin, k_pad)
+                
+                q = q_pad.view(original_shape[:-1] + (aligned_headsize,))
+                k = k_pad.view(original_shape[:-1] + (aligned_headsize,))
+            else:
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                q = q.view(original_shape)
+                k = k.view(original_shape)
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
