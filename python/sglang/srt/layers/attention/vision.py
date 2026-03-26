@@ -447,6 +447,7 @@ class VisionFlash3Attention(nn.Module):
             else:
                 cu_seqlens_tensor = cu_seqlens
 
+            ori_shape = q.shape
             ori_shape_v = v.shape
             ori_headsize = ori_shape_v[2]
             aligned_headsize = (
@@ -454,14 +455,14 @@ class VisionFlash3Attention(nn.Module):
             ) * HOPPER_TMA_ALIGN_BYTE
 
             # Lazy buffer allocation to avoid repeated CUDA allocation
-            if not hasattr(self, "q_quant_pad") or self.q_quant_pad.shape[0] < ori_shape_v[0]:
+            if not hasattr(self, "q_quant_pad") or self.q_quant_pad.shape[0] < ori_shape[0]:
                 self.q_quant_pad = torch.empty(
-                    (ori_shape_v[0], q.shape[1], aligned_headsize),
+                    (ori_shape[0], q.shape[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
                     device="cuda",
                 )
                 self.k_quant_pad = torch.empty(
-                    (ori_shape_v[0], k.shape[1], aligned_headsize),
+                    (ori_shape[0], k.shape[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
                     device="cuda",
                 )
@@ -474,13 +475,13 @@ class VisionFlash3Attention(nn.Module):
                 self.scale_k_raw = torch.empty((1), device="cuda", dtype=torch.float32)
                 self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
                 # 新增 Per-head Scale Buffer
-                self.scale_q_per_head = torch.empty((ori_shape[1]), device="cuda", dtype=torch.float32)
-                self.scale_k_per_head = torch.empty((ori_shape[1]), device="cuda", dtype=torch.float32)
+                self.scale_q_per_head = torch.empty((q.shape[1]), device="cuda", dtype=torch.float32)
+                self.scale_k_per_head = torch.empty((k.shape[1]), device="cuda", dtype=torch.float32)
 
             # Use slices of the pre-allocated buffers
             q_quant_pad = self.q_quant_pad[:ori_shape[0]]
             k_quant_pad = self.k_quant_pad[:ori_shape[0]]
-            v_quant_pad = self.v_quant_pad[:ori_shape[0]]
+            v_quant_pad = self.v_quant_pad[:ori_shape_v[0]]
             scale_q = self.scale_q_raw
             scale_k = self.scale_k_raw
             scale_v = self.scale_v_raw
