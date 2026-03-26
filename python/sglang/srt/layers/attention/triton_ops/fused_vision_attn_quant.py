@@ -1,66 +1,104 @@
+import json
+import os
+
 import torch
 import triton
 import triton.language as tl
-import json
-import os
 
 # Update the persistent config file name, add _tma suffix
 CONFIG_FILE = "/tmp/fused_vision_attn_quant_configs_tma.json"
 
+
 def load_configs():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, "r") as f:
                 return json.load(f)
         except:
             return {}
     return {}
 
+
 def save_configs(configs):
     try:
-        with open(CONFIG_FILE, 'w') as f:
+        with open(CONFIG_FILE, "w") as f:
             json.dump(configs, f)
     except:
         pass
 
+
 # Global configuration cache
 _CONFIG_CACHE = load_configs()
+
 
 @triton.autotune(
     configs=[
         # Added num_stages and more num_warps options
-        triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 64}, num_warps=16, num_stages=2),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_warps=16, num_stages=2),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_warps=4, num_stages=5),
+        triton.Config(
+            {"BLOCK_SIZE_M": 512, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 512, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 512, "BLOCK_SIZE_N": 64}, num_warps=16, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=4
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=16, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=3
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=4
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=4
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32}, num_warps=4, num_stages=5
+        ),
     ],
-    key=['M', 'N'],
+    key=["M", "N"],
 )
 @triton.jit
 def fused_qkv_quant_pad_tma_kernel(
-    q_ptr, k_ptr, v_ptr,
-    qp_ptr, kp_ptr, vp_ptr,
-    sq_ptr, sk_ptr, sv_ptr,
-    M, N, aligned_N,
-    stride_im, stride_in,
-    stride_om, stride_on,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    qp_ptr,
+    kp_ptr,
+    vp_ptr,
+    sq_ptr,
+    sk_ptr,
+    sv_ptr,
+    M,
+    N,
+    aligned_N,
+    stride_im,
+    stride_in,
+    stride_om,
+    stride_on,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    
+
     # Load scales (scalars)
     sq = tl.load(sq_ptr)
     sk = tl.load(sk_ptr)
     sv = tl.load(sv_ptr)
-    
+
     iq = 1.0 / (sq + 1e-12)
     ik = 1.0 / (sk + 1e-12)
     iv = 1.0 / (sv + 1e-12)
@@ -119,7 +157,7 @@ def fused_qkv_quant_pad_tma_kernel(
         order=(1, 0),
     )
 
-    # Use tl.load to asynchronously load data blocks. 
+    # Use tl.load to asynchronously load data blocks.
     # Triton 3.5 automatically compiles this to TMA instructions on Hopper.
     xq = tl.load(q_in_block_ptr, boundary_check=(0, 1), padding_option="zero")
     xk = tl.load(k_in_block_ptr, boundary_check=(0, 1), padding_option="zero")
@@ -129,6 +167,7 @@ def fused_qkv_quant_pad_tma_kernel(
     tl.store(qp_out_block_ptr, (xq * iq).to(tl.float8e4nv), boundary_check=(0, 1))
     tl.store(kp_out_block_ptr, (xk * ik).to(tl.float8e4nv), boundary_check=(0, 1))
     tl.store(vp_out_block_ptr, (xv * iv).to(tl.float8e4nv), boundary_check=(0, 1))
+
 
 def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     """
@@ -140,16 +179,16 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     sq.copy_(torch.max(torch.abs(q)) / 448.0)
     sk.copy_(torch.max(torch.abs(k)) / 448.0)
     sv.copy_(torch.max(torch.abs(v)) / 448.0)
-    
+
     # Ensure contiguity to avoid TMA page faults or stride errors
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    
+
     M = q.shape[0] * q.shape[1]
     N = q.shape[2]
     aligned_N = qp.shape[2]
-    
+
     # Flatten to 2D for easier processing
     q_2d = q.view(-1, N)
     k_2d = k.view(-1, N)
@@ -157,26 +196,38 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     qp_2d = qp.view(-1, aligned_N)
     kp_2d = kp.view(-1, aligned_N)
     vp_2d = vp.view(-1, aligned_N)
-    
+
     cache_key = f"{M}_{N}"
-    
+
     # 2. Persistence cache check
     if cache_key in _CONFIG_CACHE:
         best_config = _CONFIG_CACHE[cache_key]
-        BLOCK_SIZE_M = best_config['BLOCK_SIZE_M']
-        BLOCK_SIZE_N = best_config['BLOCK_SIZE_N']
-        num_warps = best_config['num_warps']
-        num_stages = best_config.get('num_stages', 2)
-        
+        BLOCK_SIZE_M = best_config["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = best_config["BLOCK_SIZE_N"]
+        num_warps = best_config["num_warps"]
+        num_stages = best_config.get("num_stages", 2)
+
         # print(f"[Triton Persistence] Hit TMA Cache for {cache_key}: {best_config}", flush=True)
-        
+
         grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(aligned_N, BLOCK_SIZE_N))
-        
+
         fused_qkv_quant_pad_tma_kernel.fn[grid](
-            q_2d, k_2d, v_2d, qp_2d, kp_2d, vp_2d, sq, sk, sv,
-            M, N, aligned_N,
-            q_2d.stride(0), q_2d.stride(1),
-            qp_2d.stride(0), qp_2d.stride(1),
+            q_2d,
+            k_2d,
+            v_2d,
+            qp_2d,
+            kp_2d,
+            vp_2d,
+            sq,
+            sk,
+            sv,
+            M,
+            N,
+            aligned_N,
+            q_2d.stride(0),
+            q_2d.stride(1),
+            qp_2d.stride(0),
+            qp_2d.stride(1),
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             num_warps=num_warps,
@@ -185,24 +236,39 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     else:
         # 3. Tuning
         grid = lambda META: (
-            triton.cdiv(M, META['BLOCK_SIZE_M']),
-            triton.cdiv(aligned_N, META['BLOCK_SIZE_N']),
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(aligned_N, META["BLOCK_SIZE_N"]),
         )
-        
+
         fused_qkv_quant_pad_tma_kernel[grid](
-            q_2d, k_2d, v_2d, qp_2d, kp_2d, vp_2d, sq, sk, sv,
-            M, N, aligned_N,
-            q_2d.stride(0), q_2d.stride(1),
-            qp_2d.stride(0), qp_2d.stride(1),
+            q_2d,
+            k_2d,
+            v_2d,
+            qp_2d,
+            kp_2d,
+            vp_2d,
+            sq,
+            sk,
+            sv,
+            M,
+            N,
+            aligned_N,
+            q_2d.stride(0),
+            q_2d.stride(1),
+            qp_2d.stride(0),
+            qp_2d.stride(1),
         )
-        
+
         # 4. Save the best configuration
         best_config_obj = fused_qkv_quant_pad_tma_kernel.best_config
         _CONFIG_CACHE[cache_key] = {
-            'BLOCK_SIZE_M': best_config_obj.kwargs['BLOCK_SIZE_M'],
-            'BLOCK_SIZE_N': best_config_obj.kwargs['BLOCK_SIZE_N'],
-            'num_warps': best_config_obj.num_warps,
-            'num_stages': best_config_obj.num_stages,
+            "BLOCK_SIZE_M": best_config_obj.kwargs["BLOCK_SIZE_M"],
+            "BLOCK_SIZE_N": best_config_obj.kwargs["BLOCK_SIZE_N"],
+            "num_warps": best_config_obj.num_warps,
+            "num_stages": best_config_obj.num_stages,
         }
-        print(f"[Triton TMA Tuning] {cache_key} tuned: {_CONFIG_CACHE[cache_key]}", flush=True)
+        print(
+            f"[Triton TMA Tuning] {cache_key} tuned: {_CONFIG_CACHE[cache_key]}",
+            flush=True,
+        )
         save_configs(_CONFIG_CACHE)
