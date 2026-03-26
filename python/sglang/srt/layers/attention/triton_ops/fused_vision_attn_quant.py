@@ -168,7 +168,7 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
         num_warps = best_config['num_warps']
         num_stages = best_config.get('num_stages', 2)
         
-        print(f"[Triton Persistence] Hit TMA Cache for {cache_key}: {best_config}", flush=True)
+        # print(f"[Triton Persistence] Hit TMA Cache for {cache_key}: {best_config}", flush=True)
         
         grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(aligned_N, BLOCK_SIZE_N))
         
