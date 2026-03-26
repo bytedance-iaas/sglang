@@ -473,38 +473,67 @@ class VisionFlash3Attention(nn.Module):
                 self.scale_q_raw = torch.empty((1), device="cuda", dtype=torch.float32)
                 self.scale_k_raw = torch.empty((1), device="cuda", dtype=torch.float32)
                 self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                # 新增 Per-head Scale Buffer
+                self.scale_q_per_head = torch.empty((ori_shape[1]), device="cuda", dtype=torch.float32)
+                self.scale_k_per_head = torch.empty((ori_shape[1]), device="cuda", dtype=torch.float32)
 
             # Use slices of the pre-allocated buffers
-            q_quant_pad = self.q_quant_pad[:ori_shape_v[0]]
-            k_quant_pad = self.k_quant_pad[:ori_shape_v[0]]
-            v_quant_pad = self.v_quant_pad[:ori_shape_v[0]]
+            q_quant_pad = self.q_quant_pad[:ori_shape[0]]
+            k_quant_pad = self.k_quant_pad[:ori_shape[0]]
+            v_quant_pad = self.v_quant_pad[:ori_shape[0]]
             scale_q = self.scale_q_raw
             scale_k = self.scale_k_raw
             scale_v = self.scale_v_raw
+            scale_q_ph = self.scale_q_per_head
+            scale_k_ph = self.scale_k_per_head
 
-            # Check if q and k are already padded (e.g. from fused RoPE)
-            if q.shape[2] == aligned_headsize and k.shape[2] == aligned_headsize:
-                # v is not padded, pad it now using copy_pad
+            # Check if we need to do Fused RoPE + Quantization (Small Shape Path)
+            rope_cos = kwargs.get("rope_cos", None)
+            rope_sin = kwargs.get("rope_sin", None)
+
+            if rope_cos is not None and rope_sin is not None:
+                # 1. 对 Q 和 K 进行全融合处理 (BF16 -> FP8 Pad, 同时算 Scale)
+                from sglang.srt.layers.attention.triton_ops.fused_rope_pad import fused_rope_quant
+                fused_rope_quant(q, rope_cos, rope_sin, q_quant_pad, scale_q_ph)
+                fused_rope_quant(k, rope_cos, rope_sin, k_quant_pad, scale_k_ph)
+                
+                # 2. 对 V 进行 Padding 和量化
                 if not hasattr(self, "v_pad") or self.v_pad.shape[0] < ori_shape_v[0]:
                     self.v_pad = torch.empty((ori_shape_v[0], ori_shape_v[1], aligned_headsize), dtype=v.dtype, device=v.device)
-                
                 v_pad = self.v_pad[:ori_shape_v[0]]
                 from sglang.srt.layers.attention.triton_ops.fused_rope_pad import copy_pad
                 copy_pad(v, v_pad)
-                
-                # Now q, k, v_pad are all padded, use the original high-performance per_tensor_quant_fp8
-                per_tensor_quant_fp8(q, q_quant_pad, scale_q)
-                per_tensor_quant_fp8(k, k_quant_pad, scale_k)
                 per_tensor_quant_fp8(v_pad, v_quant_pad, scale_v)
+                
+                # 准备传给 FA3 的 descales
+                # 注意：此时 scale_q_ph 和 scale_k_ph 已经是 (H,) 的 Per-head scale
+                scale_q = scale_q_ph.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
+                scale_k = scale_k_ph.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
+                scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
             else:
-                # fallback to fused quant pad if not already padded
-                fused_qkv_per_tensor_quant_pad(
-                    q, k, v, q_quant_pad, k_quant_pad, v_quant_pad, scale_q, scale_k, scale_v
-                )
-
-            scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
-            scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
-            scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
+                # Check if q and k are already padded (e.g. from fused RoPE in large shape)
+                if q.shape[2] == aligned_headsize and k.shape[2] == aligned_headsize:
+                    # v is not padded, pad it now using copy_pad
+                    if not hasattr(self, "v_pad") or self.v_pad.shape[0] < ori_shape_v[0]:
+                        self.v_pad = torch.empty((ori_shape_v[0], ori_shape_v[1], aligned_headsize), dtype=v.dtype, device=v.device)
+                    
+                    v_pad = self.v_pad[:ori_shape_v[0]]
+                    from sglang.srt.layers.attention.triton_ops.fused_rope_pad import copy_pad
+                    copy_pad(v, v_pad)
+                    
+                    # Now q, k, v_pad are all padded, use the original high-performance per_tensor_quant_fp8
+                    per_tensor_quant_fp8(q, q_quant_pad, scale_q)
+                    per_tensor_quant_fp8(k, k_quant_pad, scale_k)
+                    per_tensor_quant_fp8(v_pad, v_quant_pad, scale_v)
+                else:
+                    # fallback to fused quant pad if not already padded
+                    fused_qkv_per_tensor_quant_pad(
+                        q, k, v, q_quant_pad, k_quant_pad, v_quant_pad, scale_q, scale_k, scale_v
+                    )
+                
+                scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
+                scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
+                scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
 
         
         
@@ -1201,21 +1230,23 @@ class VisionAttention(nn.Module):
                 sin = torch.cat([sin, sin], dim=-1)
 
             if envs.SGLANG_VISION_ATTN_FP8.get() and is_cuda():
-                aligned_headsize = ((self.head_size - 1) // HOPPER_TMA_ALIGN_BYTE + 1) * HOPPER_TMA_ALIGN_BYTE
-                
-                if not hasattr(self, "q_pad") or self.q_pad.shape[0] < q.shape[0]:
-                    self.q_pad = torch.empty((q.shape[0], q.shape[1], aligned_headsize), dtype=q.dtype, device=q.device)
-                    self.k_pad = torch.empty((k.shape[0], k.shape[1], aligned_headsize), dtype=k.dtype, device=k.device)
-                
-                q_pad = self.q_pad[:q.shape[0]]
-                k_pad = self.k_pad[:k.shape[0]]
-                
-                from sglang.srt.layers.attention.triton_ops.fused_rope_pad import fused_rope_pad
-                fused_rope_pad(q, cos, sin, q_pad)
-                fused_rope_pad(k, cos, sin, k_pad)
-                
-                q = q_pad.view(original_shape[:-1] + (aligned_headsize,))
-                k = k_pad.view(original_shape[:-1] + (aligned_headsize,))
+                if q.shape[0] < 1280:
+                    # 小图场景：不在这里做 RoPE，把 cos/sin 传给后端做全融合
+                    kwargs["rope_cos"] = cos
+                    kwargs["rope_sin"] = sin
+                else:
+                    # 大图场景：维持原有的 Fused RoPE Pad 逻辑
+                    aligned_headsize = ((self.head_size - 1) // HOPPER_TMA_ALIGN_BYTE + 1) * HOPPER_TMA_ALIGN_BYTE
+                    if not hasattr(self, "q_pad") or self.q_pad.shape[0] < q.shape[0]:
+                        self.q_pad = torch.empty((q.shape[0], q.shape[1], aligned_headsize), dtype=q.dtype, device=q.device)
+                        self.k_pad = torch.empty((k.shape[0], k.shape[1], aligned_headsize), dtype=k.dtype, device=k.device)
+                    q_pad = self.q_pad[:q.shape[0]]
+                    k_pad = self.k_pad[:k.shape[0]]
+                    from sglang.srt.layers.attention.triton_ops.fused_rope_pad import fused_rope_pad
+                    fused_rope_pad(q, cos, sin, q_pad)
+                    fused_rope_pad(k, cos, sin, k_pad)
+                    q = q_pad.view(original_shape[:-1] + (aligned_headsize,))
+                    k = k_pad.view(original_shape[:-1] + (aligned_headsize,))
             else:
                 q, k = apply_rotary_pos_emb(q, k, cos, sin)
                 q = q.view(original_shape)
