@@ -42,12 +42,15 @@ class TurboQuantConfig(QuantizationConfig):
 
     def __init__(
         self,
-        bits: int = TURBOQUANT_DEFAULT_BITS,
+        bits: float = TURBOQUANT_DEFAULT_BITS,
         mode: str = TURBOQUANT_DEFAULT_MODE,
     ) -> None:
         super().__init__()
-        if bits < 1 or bits > 4:
-            raise ValueError(f"TurboQuant bits must be 1-4, got {bits}")
+        allowed_bits = {1, 2, 2.5, 3, 3.5, 4}
+        if bits not in allowed_bits:
+            raise ValueError(
+                f"TurboQuant bits must be one of {sorted(allowed_bits)}, got {bits}"
+            )
         if mode not in ("mse", "prod"):
             raise ValueError(f"TurboQuant mode must be 'mse' or 'prod', got {mode}")
         self.bits = bits
@@ -61,7 +64,7 @@ class TurboQuantConfig(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
-        # Requires SM80+ (A100) for good Triton performance
+        # Requires SM80+ for Triton kernel support
         return 80
 
     @classmethod

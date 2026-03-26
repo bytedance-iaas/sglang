@@ -1853,9 +1853,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # the working dtype, not the storage dtype.
             self.kv_cache_dtype = self.dtype
             self._turboquant_enabled = True
+            self._turboquant_bits = self.server_args.turboquant_bits
+            self._turboquant_mode = self.server_args.turboquant_mode
             log_info_on_rank0(
                 logger,
-                "TurboQuant KV cache compression enabled (3-4 bit, ICLR 2026)",
+                f"TurboQuant KV cache compression enabled "
+                f"({self._turboquant_bits}-bit, mode={self._turboquant_mode}, ICLR 2026)",
             )
         else:
             raise ValueError(

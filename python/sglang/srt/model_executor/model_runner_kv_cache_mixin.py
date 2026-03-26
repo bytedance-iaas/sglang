@@ -71,11 +71,14 @@ _is_npu = is_npu()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        # TurboQuant: bit-packed indices + float32 norm per K and V head
+        # TurboQuant: bit-packed indices + float32 norm per K and V head,
+        # plus a pair of shared workspace buffers (one K, one V) that are
+        # reused across layers for dequantized data.
         if getattr(self, "_turboquant_enabled", False):
             from sglang.srt.layers.quantization.turboquant_kernels import (
                 _next_power_of_2,
-                compute_packed_dim,
+                compute_packed_dim_mixed,
+                parse_bits,
             )
 
             head_dim = self.model_config.head_dim
@@ -83,10 +86,13 @@ class ModelRunnerKVCacheMixin:
             num_kv_heads = self.model_config.get_num_kv_heads(
                 get_attention_tp_size()
             )
-            bits = 4  # default
-            mse_bits = bits  # mse mode
-            per_head = compute_packed_dim(padded_dim, mse_bits) + 4  # packed indices + norm
+            bits = getattr(self, "_turboquant_bits", 4.0)
+            per_head = compute_packed_dim_mixed(padded_dim, bits) + 4  # packed + norm
+            # Compressed storage is per-layer
             cell_size = num_kv_heads * per_head * 2 * num_layers  # x2 for K and V
+            # Shared workspace buffers (one K + one V, NOT per-layer)
+            dtype_size = torch._utils._element_size(self.dtype)
+            cell_size += num_kv_heads * head_dim * dtype_size * 2  # K + V workspace
             return cell_size
 
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
@@ -644,8 +650,8 @@ class ModelRunnerKVCacheMixin:
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        bits=4,
-                        mode="mse",
+                        bits=getattr(self, "_turboquant_bits", 4.0),
+                        mode=getattr(self, "_turboquant_mode", "mse"),
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,
