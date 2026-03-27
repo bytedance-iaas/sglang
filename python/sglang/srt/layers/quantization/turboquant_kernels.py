@@ -16,7 +16,7 @@ For KV cache compression at b total bits per coordinate:
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import torch
 import triton
@@ -72,14 +72,40 @@ CENTROIDS_4BIT = [
     2.733,
 ]
 
+CENTROIDS_TABLE = {1: CENTROIDS_1BIT, 2: CENTROIDS_2BIT, 3: CENTROIDS_3BIT, 4: CENTROIDS_4BIT}
+
+centroids_cache: Optional[Dict[Tuple[int, str], torch.Tensor]] = None  # (bits, device_str) -> tensor
 
 def _get_centroids_tensor(bits: int, device: torch.device) -> torch.Tensor:
     """Return the centroid tensor for the given bit-width."""
-    table = {1: CENTROIDS_1BIT, 2: CENTROIDS_2BIT, 3: CENTROIDS_3BIT, 4: CENTROIDS_4BIT}
-    if bits not in table:
+    if bits not in CENTROIDS_TABLE:
         raise ValueError(f"TurboQuant supports 1-4 bits, got {bits}")
-    return torch.tensor(table[bits], dtype=torch.float32, device=device)
 
+    if centroids_cache is None:
+        raise ValueError("Centroids cache not initialized. Call initialize_centroids_cache(device) first.")
+
+    res = centroids_cache.get((bits, str(device)))
+    if res is None:
+        raise ValueError(f"Centroids for bits={bits} not found in cache for device {device}.")
+
+    return res
+
+
+def initialize_centroids_cache(device: torch.device):
+    """Pre-initialize centroid tensors on the given device."""
+    global centroids_cache
+
+    if centroids_cache is None:
+        centroids_cache = {}
+    if str(device) in [d for _, d in centroids_cache.keys()]:
+        return  # Already initialized for this device
+
+    for bits in CENTROIDS_TABLE.keys():
+        centroids_cache[(bits, str(device))] = torch.tensor(
+            CENTROIDS_TABLE[bits],
+            dtype=torch.float32,
+            device=device
+        )
 
 # ---------------------------------------------------------------------------
 # Fast Walsh-Hadamard Transform (FWHT) — used as the random rotation.

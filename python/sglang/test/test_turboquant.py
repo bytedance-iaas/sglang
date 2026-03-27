@@ -39,8 +39,10 @@ turboquant_quantize = _mod.turboquant_quantize
 turboquant_dequantize = _mod.turboquant_dequantize
 turboquant_quantize_mixed = _mod.turboquant_quantize_mixed
 turboquant_dequantize_mixed = _mod.turboquant_dequantize_mixed
+initialize_centroids_cache = _mod.initialize_centroids_cache
 
 DEVICE = torch.device("cuda")
+initialize_centroids_cache(torch.empty(1, device=DEVICE).device)  # Ensure centroids are ready before any tests run
 
 # Paper's theoretical MSE upper bounds (Theorem 1)
 PAPER_MSE = {1: 0.36, 2: 0.117, 3: 0.03, 4: 0.009}

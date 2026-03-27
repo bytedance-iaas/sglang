@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.turboquant_kernels import (
     turboquant_dequantize_mixed,
     turboquant_quantize,
     turboquant_quantize_mixed,
+    initialize_centroids_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -138,6 +139,8 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=enable_kv_cache_copy,
         )
+
+        initialize_centroids_cache(self._k_workspace.device)
 
     def _create_buffers(self):
         """Allocate bit-packed compressed storage buffers + shared workspace."""
