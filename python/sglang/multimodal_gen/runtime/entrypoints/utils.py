@@ -356,6 +356,19 @@ def save_outputs(
     output_paths: list[str] = []
     for idx, output in enumerate(outputs):
         save_file_path = build_output_path(idx)
+        if data_type == DataType.VIDEO and save_file_path:
+            _, ext = os.path.splitext(save_file_path)
+            video_exts = {".mp4", ".mov", ".mkv", ".webm"}
+            if not ext or ext.lower() not in video_exts:
+                base = save_file_path if not ext else save_file_path[: -len(ext)]
+                corrected_path = f"{base}.mp4"
+                logger.warning(
+                    "Video output path %s has non-video extension %s; saving as %s",
+                    save_file_path,
+                    ext or "<none>",
+                    corrected_path,
+                )
+                save_file_path = corrected_path
         sample = output
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
@@ -483,14 +496,29 @@ def post_process_sample(
                 quality = (
                     output_compression / 10 if output_compression is not None else 5
                 )
-                imageio.mimsave(
-                    save_file_path,
-                    frames,
-                    fps=fps,
-                    format=data_type.get_default_extension(),
-                    codec="libx264",
-                    quality=quality,
-                )
+                try:
+                    imageio.mimsave(
+                        save_file_path,
+                        frames,
+                        fps=fps,
+                        format=data_type.get_default_extension(),
+                        codec="libx264",
+                        quality=quality,
+                    )
+                except TypeError as exc:
+                    if "quality" not in str(exc):
+                        raise
+                    logger.warning(
+                        "Video writer does not support quality parameter; retrying without it: %s",
+                        exc,
+                    )
+                    imageio.mimsave(
+                        save_file_path,
+                        frames,
+                        fps=fps,
+                        format=data_type.get_default_extension(),
+                        codec="libx264",
+                    )
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,
