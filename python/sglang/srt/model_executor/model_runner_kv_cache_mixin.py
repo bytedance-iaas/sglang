@@ -82,12 +82,14 @@ class ModelRunnerKVCacheMixin:
             )
 
             head_dim = self.model_config.head_dim
-            padded_dim = _next_power_of_2(head_dim)
             num_kv_heads = self.model_config.get_num_kv_heads(
                 get_attention_tp_size()
             )
             bits = getattr(self, "_turboquant_bits", 4.0)
-            per_head = compute_packed_dim_mixed(padded_dim, bits) + 4  # packed + norm
+            is_mixed = parse_bits(bits)[0]
+            # packed indices + norms (2 norms per head for mixed, 1 for uniform)
+            norm_bytes = 8 if is_mixed else 4  # float32 per norm
+            per_head = compute_packed_dim_mixed(head_dim, bits) + norm_bytes
             # Compressed storage is per-layer
             cell_size = num_kv_heads * per_head * 2 * num_layers  # x2 for K and V
             # Shared workspace buffers (one K + one V, NOT per-layer)

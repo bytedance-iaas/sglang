@@ -16,7 +16,7 @@ For KV cache compression at b total bits per coordinate:
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -555,15 +555,20 @@ def turboquant_dequantize(
 # ---------------------------------------------------------------------------
 # Mixed-precision quantization (paper's 2.5-bit and 3.5-bit configs)
 #
-# After Hadamard rotation, coordinates are near-i.i.d., so a fixed 50/50
-# split is effectively optimal.  The first half gets bits_hi, the second
-# half gets bits_lo.  Effective bits = (bits_hi + bits_lo) / 2.
+# Paper: "splitting channels into outlier and non-outlier sets, and applying
+# two independent instances of TurboQuant to each, allocating higher bit
+# precision to outliers."
+#
+# Implementation: split raw channels BEFORE rotation into two groups, each
+# getting its own independent Hadamard rotation and quantization.  The
+# split is a fixed 50/50 by default.  A per-layer outlier-aware split can
+# be configured by passing channel indices (see `outlier_indices` param).
 # ---------------------------------------------------------------------------
 
 # Allowed effective bit-widths and their (high, low) decomposition
 MIXED_PRECISION_CONFIGS = {
-    2.5: (3, 2),  # 64 coords @ 3-bit + 64 coords @ 2-bit
-    3.5: (4, 3),  # 64 coords @ 4-bit + 64 coords @ 3-bit
+    2.5: (3, 2),  # split_dim coords @ 3-bit + rest @ 2-bit
+    3.5: (4, 3),  # split_dim coords @ 4-bit + rest @ 3-bit
 }
 
 
@@ -582,67 +587,75 @@ def parse_bits(bits) -> tuple:
     return (False, bits, bits)
 
 
-def compute_packed_dim_mixed(padded_dim: int, bits) -> int:
-    """Compute packed byte size for uniform or mixed-precision."""
+def compute_packed_dim_mixed(head_dim: int, bits) -> int:
+    """Compute total packed byte size for uniform or mixed-precision.
+
+    For mixed-precision, each channel group is independently padded to
+    a power of 2 and packed at its own bit-width.  The returned size
+    includes both groups' packed indices but NOT norms (those are
+    accounted for separately in memory accounting).
+    """
     is_mixed, bits_hi, bits_lo = parse_bits(bits)
     if not is_mixed:
-        return compute_packed_dim(padded_dim, bits_hi)
-    split = padded_dim // 2
-    return compute_packed_dim(split, bits_hi) + compute_packed_dim(split, bits_lo)
+        padded = _next_power_of_2(head_dim)
+        return compute_packed_dim(padded, bits_hi)
+    split = head_dim // 2
+    hi_padded = _next_power_of_2(split)
+    lo_padded = _next_power_of_2(head_dim - split)
+    return compute_packed_dim(hi_padded, bits_hi) + compute_packed_dim(lo_padded, bits_lo)
 
 
 def turboquant_quantize_mixed(
     x: torch.Tensor,
-    hadamard: HadamardTransform,
+    hadamard_hi: HadamardTransform,
+    hadamard_lo: HadamardTransform,
     bits_hi: int,
     bits_lo: int,
+    split_dim: Optional[int] = None,
 ) -> dict:
-    """Mixed-precision quantization: split rotated coords into two halves.
+    """Mixed-precision quantization with two independent TurboQuant instances.
 
-    First half quantized at bits_hi, second half at bits_lo.
-    Effective bit-width = (bits_hi + bits_lo) / 2.
+    Splits raw channels BEFORE rotation.  Each group gets its own
+    Hadamard rotation and quantization at a different bit-width.
+
+    Args:
+        x: (num_tokens, dim) input tensor
+        hadamard_hi: HadamardTransform for the first (outlier) channel group
+        hadamard_lo: HadamardTransform for the second channel group
+        bits_hi: bit-width for the first group
+        bits_lo: bit-width for the second group
+        split_dim: number of channels in the first group (default: dim // 2)
 
     Returns dict with:
-        - "packed_indices": concatenated packed bytes [hi_packed | lo_packed]
-        - "norms": float32 L2 norms
-        - "padded_dim": int
-        - "split_packed_offset": byte offset where lo_packed starts
+        - "packed_hi": packed indices for the high-bit group
+        - "packed_lo": packed indices for the low-bit group
+        - "norms_hi": float32 L2 norms of the high-bit group
+        - "norms_lo": float32 L2 norms of the low-bit group
+        - "padded_dim_hi", "padded_dim_lo": padded dims per group
+        - "split_dim": channel split point
         - "bits_hi", "bits_lo": for dequantization
     """
     num_tokens, dim = x.shape
     device = x.device
+    if split_dim is None:
+        split_dim = dim // 2
 
-    norms = torch.norm(x.float(), dim=-1)
-    rotated = hadamard.forward(x.float())
-    padded_dim = rotated.shape[-1]
-    rotated_normalized = rotated / (norms.unsqueeze(-1) + 1e-10)
+    # Split raw channels BEFORE rotation
+    x_hi = x[:, :split_dim]
+    x_lo = x[:, split_dim:]
 
-    split = padded_dim // 2
-    rot_hi = rotated_normalized[:, :split]
-    rot_lo = rotated_normalized[:, split:]
-
-    # Quantize each half
-    def _quantize_chunk(chunk, bits):
-        centroids = _get_centroids_tensor(bits, device)
-        scaled = centroids / math.sqrt(padded_dim)
-        indices = torch.zeros(num_tokens, chunk.shape[1], dtype=torch.uint8, device=device)
-        BLOCK_SIZE = 128
-        num_blocks = triton.cdiv(chunk.shape[1], BLOCK_SIZE)
-        _turboquant_quantize_kernel[(num_tokens, num_blocks)](
-            chunk, indices, scaled,
-            chunk.stride(0), indices.stride(0),
-            DIM=chunk.shape[1], NUM_CENTROIDS=len(centroids), BLOCK_SIZE=BLOCK_SIZE,
-        )
-        return pack_indices(indices, bits)
-
-    packed_hi = _quantize_chunk(rot_hi, bits_hi)
-    packed_lo = _quantize_chunk(rot_lo, bits_lo)
+    # Independent TurboQuant instance for each group
+    q_hi = turboquant_quantize(x_hi, hadamard_hi, bits_hi, mode="mse")
+    q_lo = turboquant_quantize(x_lo, hadamard_lo, bits_lo, mode="mse")
 
     return {
-        "packed_indices": torch.cat([packed_hi, packed_lo], dim=-1),
-        "norms": norms,
-        "padded_dim": padded_dim,
-        "split_packed_offset": packed_hi.shape[-1],
+        "packed_hi": q_hi["packed_indices"],
+        "packed_lo": q_lo["packed_indices"],
+        "norms_hi": q_hi["norms"],
+        "norms_lo": q_lo["norms"],
+        "padded_dim_hi": q_hi["padded_dim"],
+        "padded_dim_lo": q_lo["padded_dim"],
+        "split_dim": split_dim,
         "bits_hi": bits_hi,
         "bits_lo": bits_lo,
     }
@@ -650,54 +663,33 @@ def turboquant_quantize_mixed(
 
 def turboquant_dequantize_mixed(
     quantized: dict,
-    hadamard: HadamardTransform,
+    hadamard_hi: HadamardTransform,
+    hadamard_lo: HadamardTransform,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize mixed-precision packed data."""
-    packed = quantized["packed_indices"]
-    norms = quantized["norms"]
-    padded_dim = quantized["padded_dim"]
-    offset = quantized["split_packed_offset"]
+    """Dequantize mixed-precision data from two independent TurboQuant instances."""
     bits_hi = quantized["bits_hi"]
     bits_lo = quantized["bits_lo"]
-    num_tokens = packed.shape[0]
-    device = packed.device
-    split = padded_dim // 2
+    split_dim = quantized["split_dim"]
 
-    packed_hi = packed[:, :offset]
-    packed_lo = packed[:, offset:]
+    # Reconstruct each group independently
+    q_hi = {
+        "packed_indices": quantized["packed_hi"],
+        "norms": quantized["norms_hi"],
+        "padded_dim": quantized["padded_dim_hi"],
+    }
+    q_lo = {
+        "packed_indices": quantized["packed_lo"],
+        "norms": quantized["norms_lo"],
+        "padded_dim": quantized["padded_dim_lo"],
+    }
 
-    def _dequant_chunk(packed_chunk, bits, chunk_dim):
-        centroids = _get_centroids_tensor(bits, device)
-        scaled = centroids / math.sqrt(padded_dim)
-        out = torch.zeros(num_tokens, chunk_dim, dtype=torch.float32, device=device)
-        if bits == 4:
-            BLOCK_SIZE = 128
-            num_blocks = triton.cdiv(packed_chunk.shape[-1], BLOCK_SIZE)
-            _turboquant_dequantize_packed_4bit_kernel[(num_tokens, num_blocks)](
-                packed_chunk, out, scaled,
-                packed_chunk.stride(0), out.stride(0),
-                PADDED_DIM=chunk_dim, PACKED_DIM=packed_chunk.shape[-1],
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
-        else:
-            indices = unpack_indices(packed_chunk, bits, chunk_dim)
-            BLOCK_SIZE = 128
-            num_blocks = triton.cdiv(chunk_dim, BLOCK_SIZE)
-            _turboquant_dequantize_kernel[(num_tokens, num_blocks)](
-                indices, out, scaled,
-                indices.stride(0), out.stride(0),
-                DIM=chunk_dim, BLOCK_SIZE=BLOCK_SIZE,
-            )
-        return out
+    recon_hi = turboquant_dequantize(q_hi, hadamard_hi, bits_hi, "mse", output_dtype)
+    recon_lo = turboquant_dequantize(q_lo, hadamard_lo, bits_lo, "mse", output_dtype)
 
-    dequant_hi = _dequant_chunk(packed_hi, bits_hi, split)
-    dequant_lo = _dequant_chunk(packed_lo, bits_lo, split)
-
-    dequant = torch.cat([dequant_hi, dequant_lo], dim=-1)
-    dequant = dequant * norms.unsqueeze(-1)
-    reconstructed = hadamard.inverse(dequant)
-    return reconstructed.to(output_dtype)
+    # turboquant_dequantize already trims to hadamard.dim (the original
+    # unpadded dimension for each group), so just concatenate.
+    return torch.cat([recon_hi, recon_lo], dim=-1)
 
 
 # ---------------------------------------------------------------------------

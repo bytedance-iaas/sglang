@@ -91,20 +91,24 @@ def test_compression_ratios():
 
 
 def test_mixed_precision():
-    """2.5-bit and 3.5-bit mixed-precision: MSE between component bit-widths."""
-    h = HadamardTransform(128, seed=42, device=DEVICE)
-    x = torch.randn(64, 128, device=DEVICE)
+    """2.5-bit and 3.5-bit mixed-precision with two independent TurboQuant instances."""
+    dim = 128
+    split = dim // 2
+    x = torch.randn(64, dim, device=DEVICE)
+    h_full = HadamardTransform(dim, seed=42, device=DEVICE)
     for eff, (bh, bl) in [(3.5, (4, 3)), (2.5, (3, 2))]:
-        qm = turboquant_quantize_mixed(x, h, bh, bl)
-        rm = turboquant_dequantize_mixed(qm, h, torch.float32)[:, :128]
+        h_hi = HadamardTransform(split, seed=42, device=DEVICE)
+        h_lo = HadamardTransform(dim - split, seed=43, device=DEVICE)
+        qm = turboquant_quantize_mixed(x, h_hi, h_lo, bh, bl, split)
+        rm = turboquant_dequantize_mixed(qm, h_hi, h_lo, torch.float32)
         mse_mixed = ((x.float() - rm) ** 2).mean().item() / (x.float() ** 2).mean().item()
-        # Should be between the two component MSEs
-        q_lo = turboquant_quantize(x, h, bl, "mse")
-        mse_lo = ((x.float() - turboquant_dequantize(q_lo, h, bl, "mse", torch.float32)[:, :128]) ** 2).mean().item() / (x.float() ** 2).mean().item()
-        q_hi = turboquant_quantize(x, h, bh, "mse")
-        mse_hi = ((x.float() - turboquant_dequantize(q_hi, h, bh, "mse", torch.float32)[:, :128]) ** 2).mean().item() / (x.float() ** 2).mean().item()
+        # Should be between the two uniform component MSEs
+        q_lo = turboquant_quantize(x, h_full, bl, "mse")
+        mse_lo = ((x.float() - turboquant_dequantize(q_lo, h_full, bl, "mse", torch.float32)[:, :dim]) ** 2).mean().item() / (x.float() ** 2).mean().item()
+        q_hi = turboquant_quantize(x, h_full, bh, "mse")
+        mse_hi = ((x.float() - turboquant_dequantize(q_hi, h_full, bh, "mse", torch.float32)[:, :dim]) ** 2).mean().item() / (x.float() ** 2).mean().item()
         assert mse_hi < mse_mixed < mse_lo, f"{eff}b: {mse_hi:.4f} < {mse_mixed:.4f} < {mse_lo:.4f} failed"
-        print(f"  {eff}b mixed: MSE={mse_mixed:.6f} (between {bl}b={mse_lo:.6f} and {bh}b={mse_hi:.6f})")
+        print(f"  {eff}b mixed (independent instances): MSE={mse_mixed:.6f} (between {bl}b={mse_lo:.6f} and {bh}b={mse_hi:.6f})")
     print("PASS: test_mixed_precision")
 
 
@@ -112,28 +116,56 @@ def test_mixed_precision():
 # E2E model benchmark helpers
 # ---------------------------------------------------------------------------
 
-def _tq_generate(model, tokenizer, inputs, k_h, v_h, bits, max_new=50):
+# Hadamard seeds must match turboquant_memory_pool.py
+_SEED_K, _SEED_K_LO, _SEED_V, _SEED_V_LO = 42, 43, 137, 138
+
+
+def _make_hadamard_set(hd, bits):
+    """Create the Hadamard transforms needed for a given bit-width config."""
+    is_mixed, bh, bl = parse_bits(bits)
+    if is_mixed:
+        split = hd // 2
+        return {
+            "k_h": None, "v_h": None,
+            "k_hi": HadamardTransform(split, seed=_SEED_K, device=DEVICE),
+            "k_lo": HadamardTransform(hd - split, seed=_SEED_K_LO, device=DEVICE),
+            "v_hi": HadamardTransform(split, seed=_SEED_V, device=DEVICE),
+            "v_lo": HadamardTransform(hd - split, seed=_SEED_V_LO, device=DEVICE),
+            "k_split": split, "v_split": split,
+        }
+    return {
+        "k_h": HadamardTransform(hd, seed=_SEED_K, device=DEVICE),
+        "v_h": HadamardTransform(hd, seed=_SEED_V, device=DEVICE),
+    }
+
+
+def _quantize_roundtrip(flat, bits, hs, is_key=True):
+    """Quantize and dequantize a flat tensor using the right method for the bit-width."""
+    is_mixed, bh, bl = parse_bits(bits)
+    if is_mixed:
+        hi = hs["k_hi"] if is_key else hs["v_hi"]
+        lo = hs["k_lo"] if is_key else hs["v_lo"]
+        sp = hs["k_split"] if is_key else hs["v_split"]
+        q = turboquant_quantize_mixed(flat, hi, lo, bh, bl, sp)
+        return turboquant_dequantize_mixed(q, hi, lo, torch.bfloat16)
+    h = hs["k_h"] if is_key else hs["v_h"]
+    q = turboquant_quantize(flat, h, int(bits), "mse")
+    return turboquant_dequantize(q, h, int(bits), "mse", torch.bfloat16)
+
+
+def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=50):
     """Autoregressive generation with TQ-compressed KV cache."""
     from transformers import DynamicCache
-    is_mixed, bh, bl = parse_bits(bits)
-
-    def _quantize_flat(flat, h_use):
-        if is_mixed:
-            q = turboquant_quantize_mixed(flat, h_use, bh, bl)
-            return turboquant_dequantize_mixed(q, h_use, torch.bfloat16)
-        else:
-            q = turboquant_quantize(flat, h_use, int(bits), "mse")
-            return turboquant_dequantize(q, h_use, int(bits), "mse", torch.bfloat16)
+    hs = _make_hadamard_set(hd, bits)
 
     with torch.no_grad():
         out = model(**inputs, use_cache=True)
-        # Quantize prefill KV
         tql = []
         for lkv in out.past_key_values:
             k, v = lkv[0], lkv[1]
             b, h, s, dk = k.shape; dv = v.shape[-1]
-            kr = _quantize_flat(k.permute(0,2,1,3).reshape(-1,dk), k_h)[:,:dk].reshape(b,s,h,dk).permute(0,2,1,3)
-            vr = _quantize_flat(v.permute(0,2,1,3).reshape(-1,dv), v_h)[:,:dv].reshape(b,s,h,dv).permute(0,2,1,3)
+            kr = _quantize_roundtrip(k.permute(0,2,1,3).reshape(-1,dk), bits, hs, True)[:,:dk].reshape(b,s,h,dk).permute(0,2,1,3)
+            vr = _quantize_roundtrip(v.permute(0,2,1,3).reshape(-1,dv), bits, hs, False)[:,:dv].reshape(b,s,h,dv).permute(0,2,1,3)
             tql.append((kr, vr))
         tc = DynamicCache()
         for li, (kt, vt) in enumerate(tql):
@@ -148,8 +180,8 @@ def _tq_generate(model, tokenizer, inputs, k_h, v_h, bits, max_new=50):
                 kf, vf = lkv[0], lkv[1]
                 kn, vn = kf[:,:,-1:,:], vf[:,:,-1:,:]
                 b2, h2, _, dk2 = kn.shape; dv2 = vn.shape[-1]
-                kr2 = _quantize_flat(kn.permute(0,2,1,3).reshape(-1,dk2), k_h)[:,:dk2].reshape(b2,1,h2,dk2).permute(0,2,1,3)
-                vr2 = _quantize_flat(vn.permute(0,2,1,3).reshape(-1,dv2), v_h)[:,:dv2].reshape(b2,1,h2,dv2).permute(0,2,1,3)
+                kr2 = _quantize_roundtrip(kn.permute(0,2,1,3).reshape(-1,dk2), bits, hs, True)[:,:dk2].reshape(b2,1,h2,dk2).permute(0,2,1,3)
+                vr2 = _quantize_roundtrip(vn.permute(0,2,1,3).reshape(-1,dv2), bits, hs, False)[:,:dv2].reshape(b2,1,h2,dv2).permute(0,2,1,3)
                 nl.append((torch.cat([kf[:,:,:-1,:], kr2], dim=2),
                            torch.cat([vf[:,:,:-1,:], vr2], dim=2)))
             tc = DynamicCache()
@@ -173,8 +205,6 @@ def _benchmark_model(model_id, prompts, bit_widths):
     model.eval()
     cfg = model.config
     hd = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
-    k_h = HadamardTransform(hd, seed=42, device=DEVICE)
-    v_h = HadamardTransform(hd, seed=137, device=DEVICE)
 
     # K-norm analysis
     inp0 = tokenizer(prompts[0][1], return_tensors="pt").to(DEVICE)
@@ -188,19 +218,14 @@ def _benchmark_model(model_id, prompts, bit_widths):
     # MSE at each bit-width
     mse_results = {}
     for bits in bit_widths:
-        is_mixed, bh, bl = parse_bits(bits)
+        hs = _make_hadamard_set(hd, bits)
         ms = []
         with torch.no_grad():
             for lkv in o.past_key_values:
                 for idx, orig in enumerate([lkv[0], lkv[1]]):
                     flat = orig.float().reshape(-1, orig.shape[-1])
-                    hu = k_h if idx == 0 else v_h
-                    if is_mixed:
-                        q = turboquant_quantize_mixed(flat, hu, bh, bl)
-                        r = turboquant_dequantize_mixed(q, hu, torch.float32)[:, :flat.shape[-1]]
-                    else:
-                        q = turboquant_quantize(flat, hu, int(bits), "mse")
-                        r = turboquant_dequantize(q, hu, int(bits), "mse", torch.float32)[:, :flat.shape[-1]]
+                    r = _quantize_roundtrip(flat, bits, hs, is_key=(idx == 0))
+                    r = r.float()[:, :flat.shape[-1]]
                     ms.append(((flat - r) ** 2).mean().item() / ((flat ** 2).mean().item() + 1e-10))
         mse_results[bits] = sum(ms) / len(ms)
 
@@ -213,7 +238,7 @@ def _benchmark_model(model_id, prompts, bit_widths):
             with torch.no_grad():
                 bf = model.generate(**inp, max_new_tokens=50, do_sample=False)
             bg = bf[0].tolist()[inp["input_ids"].shape[1]:]
-            tg = _tq_generate(model, tokenizer, inp, k_h, v_h, bits, 50)
+            tg = _tq_generate(model, tokenizer, inp, bits, hd, 50)
             n = min(len(bg), len(tg))
             m = sum(1 for a, b in zip(bg, tg) if a == b)
             total_m += m
