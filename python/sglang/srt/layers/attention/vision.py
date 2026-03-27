@@ -18,10 +18,11 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
-    is_blackwell,
+    is_blackwell_supported,
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     print_info_once,
 )
 from sglang.srt.utils.multi_stream_utils import (
@@ -29,12 +30,33 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.srt.layers.attention.triton_ops.fused_vision_attn_quant import fused_qkv_per_tensor_quant_pad
+
+
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        from sglang.jit_kernel.flash_attention_v4 import (
+            flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+        )
+
+        def flash_attn_func(*args, ver: int = 3, **kwargs):
+            if ver == 4:
+                return flash_attn_varlen_func_fa4(*args, **kwargs)
+            return flash_attn_varlen_func(*args, **kwargs)
+
+    except ImportError as e:
+        raise e
+
 
 if _is_npu:
     import torch_npu
@@ -56,11 +78,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import (
-    apply_rotary_pos_emb,
-    connect_qkv_and_attn_compile,
-    connect_qkv_and_attn_no_compile,
-)
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
@@ -68,7 +86,25 @@ ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
 
-TORCH_COMPILE_SHAPE = 128
+# === Vision Encoder === #
+FLASHINFER_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
+
+# Batch buckets for cuDNN graph caching - graphs are cached per bucket size
+# This avoids creating a new graph for each unique batch size at runtime
+BATCH_BUCKETS = [8, 16, 32, 64]
+
+# Bucketized max seqlens to reduce cuDNN recompilation frequency while
+# preserving a tighter upper bound than a single fixed max seqlen.
+FLASHINFER_MAX_SEQLEN_BUCKETS = [
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+]
+
+HOPPER_TMA_ALIGN_BYTE = 16
 
 
 @dataclasses.dataclass
@@ -338,13 +374,30 @@ class VisionTritonAttention(nn.Module):
                 k,
                 v,
                 output,
-                cu_seqlens.cuda(),
-                seq_lens.cuda(),
+                cu_seqlens.to(q.device),
+                seq_lens.to(q.device),
                 max_seqlen,
                 is_causal=False,
             )
 
         return output
+
+
+
+def pad_last_dim_to_multiple_zero(x: torch.Tensor, multiple: int):
+    orig_d = x.shape[-1]
+    padded_d = ((orig_d + multiple - 1) // multiple) * multiple
+    if padded_d == orig_d:
+        return x, orig_d
+
+    out = torch.zeros(
+        *x.shape[:-1],
+        padded_d,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    out[..., :orig_d] = x
+    return out, orig_d
 
 
 class VisionFlash3Attention(nn.Module):
@@ -376,32 +429,304 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        
+        """
+        use fp8 version FA3:
+        1. per_head quantization is necessary
+        2. due to TMA need 16byte alignment head_size like 72 (for Qwen-VL seralize ) can not use FP8 version FA3
+        3. currently solution: quant to fp8 firstly, then pad zero at Q/K/V's last dim : why this can work: Q*K.T( pad zero is ok) = S S*V (pad zero at head_dim also do not change the result of do slice for output) 
+        4. currently dfraft version is : [1] per-tensor quantization [2] the only changed part is root(head_dim) which is now root(aligned_head_dim), we should pass the softmax scale in 
+        5. for best peformance: should define aligned tensor, use a kernel to do per_head_quant and write in to aligned tensor directly (avoid cat(copy again))
+        
+        
+        """
+        
+        if envs.SGLANG_VISION_ATTN_FP8.get():
+            if isinstance(cu_seqlens, list):
+                cu_seqlens_tensor = cu_seqlens[0]
+            else:
+                cu_seqlens_tensor = cu_seqlens
+
+            # Calculate average image length to determine if it is a large image
+            num_images = cu_seqlens_tensor.size(0) - 1
+            avg_len = q.shape[0] / num_images if num_images > 0 else q.shape[0]
+            
+            # Use FP8 TMA optimization for thresholds above 4800
+            use_fp8 = avg_len > 4800
+        else:
+            use_fp8 = False
+
+        if use_fp8:
+            ori_shape = q.shape
+            ori_shape_v = v.shape
+            ori_headsize = ori_shape_v[2]
+            aligned_headsize = (
+                (ori_headsize - 1) // HOPPER_TMA_ALIGN_BYTE + 1
+            ) * HOPPER_TMA_ALIGN_BYTE
+
+            # Lazy buffer allocation to avoid repeated CUDA allocation
+            if not hasattr(self, "q_quant_pad") or self.q_quant_pad.shape[0] < ori_shape[0]:
+                self.q_quant_pad = torch.empty(
+                    (ori_shape[0], q.shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.k_quant_pad = torch.empty(
+                    (ori_shape[0], k.shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.v_quant_pad = torch.empty(
+                    (ori_shape_v[0], ori_shape_v[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.scale_q_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                self.scale_k_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+
+            # Use slices of the pre-allocated buffers
+            q_quant_pad = self.q_quant_pad[:ori_shape[0]]
+            k_quant_pad = self.k_quant_pad[:ori_shape[0]]
+            v_quant_pad = self.v_quant_pad[:ori_shape_v[0]]
+            scale_q = self.scale_q_raw
+            scale_k = self.scale_k_raw
+            scale_v = self.scale_v_raw
+
+            # Large image path: always call the TMA version of the quantization kernel
+            from sglang.srt.layers.attention.triton_ops.fused_vision_attn_quant import fused_qkv_per_tensor_quant_pad
+            fused_qkv_per_tensor_quant_pad(
+                q, k, v, q_quant_pad, k_quant_pad, v_quant_pad, scale_q, scale_k, scale_v
+            )
+
+            scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
+            scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
+            scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
+        
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
-            output = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens[0],
-                cu_seqlens_k=cu_seqlens[0],
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-            )
+            if use_fp8:
+                output = flash_attn_func(
+                    q_quant_pad,
+                    k_quant_pad,
+                    v_quant_pad,
+                    cu_seqlens_q=cu_seqlens[0],
+                    cu_seqlens_k=cu_seqlens[0],
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    q_descale = scale_q,
+                    k_descale = scale_k,
+                    v_descale = scale_v,   
+                )
+                ret = output[:, :, :ori_headsize]
+            else:
+                ret = flash_attn_func(
+                    q, k, v,
+                    cu_seqlens_q=cu_seqlens[0],
+                    cu_seqlens_k=cu_seqlens[0],
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                )
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
+            
+            if use_fp8:
+                output = flash_attn_func(
+                    q_quant_pad,
+                    k_quant_pad,
+                    v_quant_pad,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    q_descale = scale_q,
+                    k_descale = scale_k,
+                    v_descale = scale_v,
+                )
+                ret = output[:, :, :ori_headsize]
+            else:
+                ret = flash_attn_func(
+                    q, k, v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen
+                )
+        return ret
 
-            output = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
+class VisionFlash4Attention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionFlash4Attention is only available for cuda")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            ver=4,
+        )
+
+        return output
+
+
+class VisionFlashInferAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionFlashInferAttention is only available for cuda")
+        super().__init__()
+        self.workspace_buffer = (
+            kwargs["workspace_buffer"] if "workspace_buffer" in kwargs else None
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if "sequence_lengths" not in kwargs:
+            raise RuntimeError(
+                "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
             )
+        if "max_seqlen" not in kwargs:
+            raise RuntimeError(
+                "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
+            )
+
+        sequence_lengths = kwargs["sequence_lengths"]  # (B_padded,) or (B_padded,1,1,1)
+        max_seqlen = kwargs["max_seqlen"]
+
+        # max_seqlen must be python int
+        if isinstance(max_seqlen, torch.Tensor):
+            if max_seqlen.is_cuda:
+                max_seqlen = int(max_seqlen.detach().cpu().item())
+            else:
+                max_seqlen = int(max_seqlen.item())
+        else:
+            max_seqlen = int(max_seqlen)
+
+        # flatten if caller gives (b, s, h, d)
+        is_reshaped = q.dim() == 4
+        if is_reshaped:
+            reshape_batch_size = q.shape[0]
+            q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+
+        if not isinstance(cu_seqlens, torch.Tensor):
+            raise RuntimeError(
+                "flashinfer_cudnn expects packed indptrs as a torch.Tensor"
+            )
+
+        # sequence_lengths -> (B,)
+        if not isinstance(sequence_lengths, torch.Tensor):
+            raise RuntimeError("sequence_lengths must be a torch.Tensor")
+        seq_lens_1d = sequence_lengths.view(-1).to(device=q.device, dtype=torch.int32)
+        B = int(seq_lens_1d.numel())
+
+        # cu_seqlens contains packed *element indptrs*:
+        # [qk_indptr(B+1), v_indptr(B+1), o_indptr(B+1)] => total 3*(B+1)
+        cu_seqlens_1d = cu_seqlens.view(-1).to(device=q.device, dtype=torch.int32)
+        expected = 3 * (B + 1)
+        if int(cu_seqlens_1d.numel()) != expected:
+            raise RuntimeError(
+                f"packed indptr numel mismatch: got {cu_seqlens_1d.numel()}, expected {expected} (= 3*(B+1))"
+            )
+
+        split = B + 1
+        indptr_qk = cu_seqlens_1d[:split].view(split, 1, 1, 1)
+        indptr_v = cu_seqlens_1d[split : 2 * split].view(split, 1, 1, 1)
+        indptr_o = cu_seqlens_1d[2 * split :].view(split, 1, 1, 1)
+
+        # cuDNN style: (B,1,1,1)
+        seq_lens_4d = seq_lens_1d.view(B, 1, 1, 1)
+
+        # indptr are in ELEMENT offsets (not token offsets)
+        token_width_q = int(q.shape[1] * q.shape[2])  # heads * head_dim on this rank
+        total_elems_q = int(q.numel())
+
+        # check each real sequence fits
+        # (skip padded tail where seq_len==0)
+        start_elems = indptr_qk.view(-1)[:-1]  # (B,)
+        end_elems = start_elems + seq_lens_1d * token_width_q
+        if (end_elems > total_elems_q).any():
+            raise RuntimeError("offset + len out of bounds; packed indptr is wrong")
+
+        _, _, head_size = q.shape
+        scale = head_size**-0.5
+
+        output, _ = cudnn_batch_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            scale,
+            self.workspace_buffer,
+            max_token_per_sequence=max_seqlen,
+            max_sequence_kv=max_seqlen,
+            actual_seq_lens_q=seq_lens_4d,
+            actual_seq_lens_kv=seq_lens_4d,
+            causal=False,
+            return_lse=True,
+            batch_offsets_q=indptr_qk,
+            batch_offsets_k=indptr_qk,
+            batch_offsets_v=indptr_v,
+            batch_offsets_o=indptr_o,
+            is_cuda_graph_compatible=True,
+        )
+
+        if is_reshaped:
+            output = rearrange(output, "(b s) h d -> b s h d", b=reshape_batch_size)
 
         return output
 
@@ -476,28 +801,33 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if "output_ws" not in kwargs:
+                raise RuntimeError("output_ws should be prepared for npu-graph mode")
+            output = kwargs["output_ws"]
+            # graph mode: runner already passes seq_lens (int32 on CPU)
+            seq_len_arg = cu_seqlens
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            if seq_lens.is_npu:
+                seq_lens = seq_lens.to("cpu")
+            output = torch.empty_like(q)
+            seq_len_arg = seq_lens.to(torch.int32)
 
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        if seq_lens.is_npu:
-            # cu_seqlens must be on cpu because of operator restriction
-            seq_lens = seq_lens.to("cpu")
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
-        output = torch.empty_like(q)
 
-        # operator requires pta version >= 2.5.1
         torch_npu._npu_flash_attention_unpad(
             query=q,
             key=k,
             value=v,
-            seq_len=seq_lens.to(torch.int32),
+            seq_len=seq_len_arg,
             scale_value=head_size**-0.5,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             out=output,
         )
-
         return output
 
 
@@ -505,6 +835,8 @@ QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
+    "fa4": VisionFlash4Attention,
+    "flashinfer_cudnn": VisionFlashInferAttention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
 }
@@ -539,12 +871,15 @@ class VisionAttention(nn.Module):
         num_dummy_heads: int = 0,
         qkv_bias: bool = True,
         qk_normalization: bool = False,
+        qk_normalization_by_head_size: bool = False,
         layer_norm_eps: float = 1e-06,
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         super().__init__()
@@ -566,30 +901,19 @@ class VisionAttention(nn.Module):
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
 
         self.qk_normalization = qk_normalization
+        self.qk_normalization_by_head_size = qk_normalization_by_head_size
 
         # Additional dummy heads are used to enable TP for common GPU counts.
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
+            self.q_norm, self.k_norm = self._init_qk_norm(
+                self.dummy_dim, layer_norm_eps, embed_dim
             )
-            self.q_norm = RMSNorm(
-                self.dummy_dim,
-                eps=layer_norm_eps,
-                var_hidden_size=embed_dim,
-                **norm_kwargs,
-            )
-            self.k_norm = RMSNorm(
-                self.dummy_dim,
-                eps=layer_norm_eps,
-                var_hidden_size=embed_dim,
-                **norm_kwargs,
+
+        elif self.qk_normalization_by_head_size:
+            self.q_norm, self.k_norm = self._init_qk_norm(
+                self.head_size, layer_norm_eps
             )
 
         # Select attention backend via a unified method
@@ -613,6 +937,7 @@ class VisionAttention(nn.Module):
             flatten_batch=flatten_batch,
             softmax_in_single_precision=softmax_in_single_precision,
             use_data_parallel=use_data_parallel,
+            workspace_buffer=workspace_buffer,
         )
 
         self.use_qkv_parallel = use_qkv_parallel
@@ -646,9 +971,37 @@ class VisionAttention(nn.Module):
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
+
+        self.workspace_buffer = workspace_buffer
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
+
+    def _init_qk_norm(
+        self, norm_dim: int, eps: float, var_hidden_size: Optional[int] = None
+    ):
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        q_norm = RMSNorm(
+            norm_dim,
+            eps=eps,
+            var_hidden_size=var_hidden_size,
+            **norm_kwargs,
+        )
+        k_norm = RMSNorm(
+            norm_dim,
+            eps=eps,
+            var_hidden_size=var_hidden_size,
+            **norm_kwargs,
+        )
+        return q_norm, k_norm
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -675,12 +1028,24 @@ class VisionAttention(nn.Module):
                 backend = "aiter_attn"
             else:
                 backend = "triton_attn"
+        elif _is_xpu:
+            backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell():
+        if backend == "fa3" and is_blackwell_supported():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
+
+    def _apply_qk_norm_head_size(self, q: torch.Tensor, k: torch.Tensor):
+        """apply qk norm for GLM-OCR vit attn"""
+        q_by_head = q.reshape(-1, self.head_size)
+        q_by_head = self.q_norm(q_by_head)
+        k_by_head = k.reshape(-1, self.head_size)
+        k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
@@ -755,112 +1120,107 @@ class VisionAttention(nn.Module):
         kv_head = self.num_attention_kv_heads_per_partition
 
         attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
-
-        if envs.SGLANG_VIT_FRAG_OPT.get():
+        max_seqlen = kwargs["max_seqlen"] if "max_seqlen" in kwargs else None
+        sequence_lengths = (
+            kwargs["sequence_lengths"] if "sequence_lengths" in kwargs else None
+        )
+        if self.use_qkv_parallel:
+            # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            # [b, s, embed_dim] --> [b * s, head, head_size]
+            q = q.reshape(bsz * s, head, -1).contiguous()
+            k = k.reshape(bsz * s, kv_head, -1).contiguous()
+            v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            if self.qk_normalization_by_head_size:
+                q, k = self._apply_qk_norm_head_size(q, k)
+        else:
+            # [b, s, embed_dim] --> [s, b, embed_dim]
+            x = rearrange(x, "b s ... -> s b ...")
+            # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
+            qkv, _ = self.qkv_proj(x)
+
+            # [s, b, head, head_dim_sum]
+            new_x_shape = qkv.size()[:-1] + (
+                head,
+                self.q_size + 2 * self.kv_size,
+            )
+            qkv = qkv.view(*new_x_shape)
+
+            # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            # [s, b, head, head_size] --> [b, s, head, head_size]
+            q, k, v = [
+                rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
+            ]
+
+            if self.qk_normalization_by_head_size:
+                q, k = self._apply_qk_norm_head_size(q, k)
+
+        cos = None
+        sin = None
+
+        if position_embeddings is not None:
+            if self.customized_position_embedding_applier is not None:
+                q, k = self.customized_position_embedding_applier(
+                    q, k, position_embeddings, x_shape
+                )
+            else:
+                cos, sin = position_embeddings
+        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             cos = rotary_pos_emb_cos
             sin = rotary_pos_emb_sin
-            if qkv.shape[1] >= TORCH_COMPILE_SHAPE:
-                q, k, v = connect_qkv_and_attn_compile(
-                    qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin
+
+        if cos is not None and sin is not None:
+            original_shape = q.shape
+
+            # [total_tokens, head, head_size]
+            q = q.view(-1, head, self.head_size)
+            k = k.view(-1, head, self.head_size)
+
+            if cos.size(-1) * 2 == self.head_size:
+                cos = torch.cat([cos, cos], dim=-1)
+                sin = torch.cat([sin, sin], dim=-1)
+
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            q = q.view(original_shape)
+            k = k.view(original_shape)
+
+        if q.dim() == 4:
+            # [b, s, head, head_size] --> [b * s, head, head_size]
+            q = rearrange(q, "b s ... -> (b s) ...")
+        if k.dim() == 4:
+            # [b, s, head, head_size] --> [b * s, head, head_size]
+            k = rearrange(k, "b s ... -> (b s) ...")
+        if v.dim() == 4:
+            # [b, s, head, head_size] --> [b * s, head, head_size]
+            v = rearrange(v, "b s ... -> (b s) ...")
+
+        assert q.dim() == 3, q.dim()
+        assert k.dim() == 3, k.dim()
+        assert v.dim() == 3, v.dim()
+
+        # internvl
+        if self.qk_normalization and not self.qk_normalization_by_head_size:
+            # jit kernel
+            if can_use_jit_qk_norm(self.head_size, q.dtype):
+
+                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
+                head_dim_for_norm = head * self.head_size
+
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=head_dim_for_norm,
+                    alt_stream=self.aux_stream,
                 )
+
             else:
-                q, k, v = connect_qkv_and_attn_no_compile(
-                    qkv, self.q_size, self.kv_size, bsz, s, head, kv_head, cos, sin
-                )
-        else:
-            if self.use_qkv_parallel:
-                # [b, s, embed_dim] --> [b, s, embed_dim]
-                qkv, _ = self.qkv_proj(x)
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-                # [b, s, embed_dim] --> [b * s, head, head_size]
-                q = q.reshape(bsz * s, head, -1).contiguous()
-                k = k.reshape(bsz * s, kv_head, -1).contiguous()
-                v = v.reshape(bsz * s, kv_head, -1).contiguous()
-            else:
-                # [b, s, embed_dim] --> [s, b, embed_dim]
-                x = rearrange(x, "b s ... -> s b ...")
-                # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
-                qkv, _ = self.qkv_proj(x)
-
-                # [s, b, head, head_dim_sum]
-                new_x_shape = qkv.size()[:-1] + (
-                    head,
-                    self.q_size + 2 * self.kv_size,
-                )
-                qkv = qkv.view(*new_x_shape)
-
-                # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-                # [s, b, head, head_size] --> [b, s, head, head_size]
-                q, k, v = [
-                    rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
-                ]
-
-            cos = None
-            sin = None
-
-            if position_embeddings is not None:
-                if self.customized_position_embedding_applier is not None:
-                    q, k = self.customized_position_embedding_applier(
-                        q, k, position_embeddings, x_shape
-                    )
-                else:
-                    cos, sin = position_embeddings
-            elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-                cos = rotary_pos_emb_cos
-                sin = rotary_pos_emb_sin
-
-            if cos is not None and sin is not None:
-                original_shape = q.shape
-
-                # [total_tokens, head, head_size]
-                q = q.view(-1, head, self.head_size)
-                k = k.view(-1, head, self.head_size)
-
-                if cos.size(-1) * 2 == self.head_size:
-                    cos = torch.cat([cos, cos], dim=-1)
-                    sin = torch.cat([sin, sin], dim=-1)
-
-                q, k = apply_rotary_pos_emb(q, k, cos, sin)
-                q = q.view(original_shape)
-                k = k.view(original_shape)
-
-            if q.dim() == 4:
-                # [b, s, head, head_size] --> [b * s, head, head_size]
-                q = rearrange(q, "b s ... -> (b s) ...")
-            if k.dim() == 4:
-                # [b, s, head, head_size] --> [b * s, head, head_size]
-                k = rearrange(k, "b s ... -> (b s) ...")
-            if v.dim() == 4:
-                # [b, s, head, head_size] --> [b * s, head, head_size]
-                v = rearrange(v, "b s ... -> (b s) ...")
-
-            assert q.dim() == 3, q.dim()
-            assert k.dim() == 3, k.dim()
-            assert v.dim() == 3, v.dim()
-
-            # internvl
-            if self.qk_normalization:
-                # jit kernel
-                if can_use_jit_qk_norm(self.head_size, q.dtype):
-
-                    # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
-                    head_dim_for_norm = head * self.head_size
-
-                    q, k = apply_qk_norm(
-                        q=q,
-                        k=k,
-                        q_norm=self.q_norm,
-                        k_norm=self.k_norm,
-                        head_dim=head_dim_for_norm,
-                        alt_stream=self.aux_stream,
-                    )
-
-                else:
-                    q, k = self._apply_qk_norm(q, k)
+                q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,
@@ -870,6 +1230,8 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            sequence_lengths=sequence_lengths,
+            max_seqlen=max_seqlen,
             output_ws=attn_output_ws,
         )
 
