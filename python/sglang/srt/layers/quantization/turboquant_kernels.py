@@ -22,6 +22,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.hadamard import hadamard_transform
+
 # ---------------------------------------------------------------------------
 # Precomputed optimal centroids for the Beta-distributed coordinates after
 # random rotation. These are the MSE-optimal scalar quantizer centroids for
@@ -163,9 +165,7 @@ class HadamardTransform:
         x = x * self.signs
 
         # In-place Fast Walsh-Hadamard Transform
-        x = self._fwht(x)
-
-        return x * self.scale
+        return hadamard_transform(x, scale=self.scale)
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
@@ -174,26 +174,8 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        x = self._fwht(y) * self.scale
-        x = x * self.signs
+        x = hadamard_transform(y, scale=self.scale) * self.signs
         return x[..., : self.dim]
-
-    @staticmethod
-    def _fwht(x: torch.Tensor) -> torch.Tensor:
-        """Fast Walsh-Hadamard Transform along the last dimension."""
-        orig_shape = x.shape
-        n = orig_shape[-1]
-        x = x.reshape(-1, n).float()
-        h = 1
-        while h < n:
-            # Split into pairs and butterfly
-            x = x.view(-1, n // (2 * h), 2, h)
-            a = x[:, :, 0, :]
-            b = x[:, :, 1, :]
-            x = torch.stack([a + b, a - b], dim=2)
-            x = x.view(-1, n)
-            h *= 2
-        return x.view(orig_shape)
 
 
 # ---------------------------------------------------------------------------

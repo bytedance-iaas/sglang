@@ -12,6 +12,8 @@ import gc
 import importlib.util
 import os
 import sys
+import pytest
+import math
 
 import torch
 import torch.nn.functional as F
@@ -288,6 +290,131 @@ def test_benchmark_qwen3_4b():
     assert mse[4] < 0.015, f"4-bit MSE {mse[4]:.4f} too high"
     print("PASS: test_benchmark_qwen3_4b")
 
+def _generate_random_signs(dim: int, seed: int, device: torch.device) -> torch.Tensor:
+    """Generate a deterministic Rademacher vector (+1/-1) for the randomized Hadamard."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    return (torch.randint(0, 2, (dim,), generator=gen).float() * 2 - 1).to(device)
+
+class MockHadamardTransform:
+    """Manages the randomized Hadamard transform for TurboQuant.
+
+    The transform is:  y = (1/sqrt(d)) * H_d * diag(signs) * x
+
+    where H_d is the Walsh-Hadamard matrix and signs are random +/-1.
+    """
+
+    def __init__(self, dim: int, seed: int = 42, device: torch.device = None):
+        if device is None:
+            device = torch.device("cuda")
+        self.dim = dim
+        self.padded_dim = _next_power_of_2(dim)
+        self.signs = _generate_random_signs(self.padded_dim, seed, device)
+        self.scale = 1.0 / math.sqrt(self.padded_dim)
+        self.device = device
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply randomized Hadamard: y = scale * H * diag(signs) * x.
+
+        Args:
+            x: (..., dim) tensor
+        Returns:
+            (..., padded_dim) tensor of rotated coordinates
+        """
+        shape = x.shape
+        d = shape[-1]
+
+        # Pad to power-of-2 if needed
+        if d < self.padded_dim:
+            x = torch.nn.functional.pad(x, (0, self.padded_dim - d))
+
+        # Apply random signs
+        x = x * self.signs
+
+        # In-place Fast Walsh-Hadamard Transform
+        return self._fwht(x) * self.scale
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
+
+        Since H is symmetric and orthogonal: H^{-1} = H / d.
+        So full inverse = diag(signs) * (1/d) * H * (y / scale)
+        But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
+        """
+        x = self._fwht(y) * self.scale
+        x = x * self.signs
+        return x[..., : self.dim]
+
+    @staticmethod
+    def _fwht(x: torch.Tensor) -> torch.Tensor:
+        """Fast Walsh-Hadamard Transform along the last dimension."""
+        orig_shape = x.shape
+        n = orig_shape[-1]
+        x = x.reshape(-1, n).float()
+        h = 1
+        while h < n:
+            # Split into pairs and butterfly
+            x = x.view(-1, n // (2 * h), 2, h)
+            a = x[:, :, 0, :]
+            b = x[:, :, 1, :]
+            x = torch.stack([a + b, a - b], dim=2)
+            x = x.view(-1, n)
+            h *= 2
+        return x.view(orig_shape)
+
+
+def _time_cuda_ms(fn, warmup: int = 10, iters: int = 50) -> float:
+    import time
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+
+    return (time.perf_counter() - t0) * 1e3 / iters
+
+
+# @pytest.mark.skipif(
+#     os.environ.get("SGLANG_TEST_PERF", "0") != "1",
+#     reason="Performance tests are opt-in; set SGLANG_TEST_PERF=1",
+# )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hadamard_transform_fwht_perf_triton_vs_torch():
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+
+    dims = [128, 192, 256]
+    batches = [128, 256, 512, 1024, 524288]
+
+    for (dim, batch) in [(x, y) for x in dims for y in batches]:
+        padded_dim = 1 << (dim - 1).bit_length()
+        x = torch.randn(batch, padded_dim, device=device, dtype=torch.float16)
+
+        h = HadamardTransform(dim=dim, seed=42, device=device)
+        mock = MockHadamardTransform(dim=dim, seed=42, device=device)
+
+        def triton_impl():
+            return h.forward(x)
+
+        def torch_impl():
+            return mock.forward(x)
+
+        y_triton = triton_impl()
+        y_torch = torch_impl()
+        torch.testing.assert_close(y_triton, y_torch, rtol=0, atol=0)
+
+        ms_triton = _time_cuda_ms(triton_impl)
+        ms_torch = _time_cuda_ms(torch_impl)
+
+        print(
+            f"FWHT perf dim={dim} padded={padded_dim} batch={batch}: "
+            f"triton={ms_triton:.3f} ms, torch={ms_torch:.3f} ms, "
+            f"speedup={ms_torch / ms_triton:.2f}x"
+        )
 
 # ---------------------------------------------------------------------------
 # Main: run all tests and print comparison grid
