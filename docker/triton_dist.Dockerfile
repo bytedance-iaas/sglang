@@ -1,6 +1,11 @@
 ARG BASE_IMAGE=lmsysorg/sglang:latest
 FROM ${BASE_IMAGE}
 
+# 将当前代码仓库复制到官方镜像的源码目录并重新安装
+COPY . /sgl-workspace/sglang
+WORKDIR /sgl-workspace/sglang
+RUN pip3 install -e "python[all]"
+
 WORKDIR /sgl-workspace/
 RUN git clone https://github.com/ByteDance-Seed/Triton-distributed.git
 WORKDIR /sgl-workspace/Triton-distributed
