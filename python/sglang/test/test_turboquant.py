@@ -397,23 +397,23 @@ def test_hadamard_transform_fwht_perf_triton_vs_torch():
         h = HadamardTransform(dim=dim, seed=42, device=device)
         mock = MockHadamardTransform(dim=dim, seed=42, device=device)
 
-        def triton_impl():
+        def jit_kernel_impl():
             return h.forward(x)
 
         def torch_impl():
             return mock.forward(x)
 
-        y_triton = triton_impl()
+        y_jit = jit_kernel_impl()
         y_torch = torch_impl()
-        torch.testing.assert_close(y_triton, y_torch, rtol=0, atol=0)
+        torch.testing.assert_close(y_jit, y_torch, rtol=0, atol=0)
 
-        ms_triton = _time_cuda_ms(triton_impl)
+        ms_jit = _time_cuda_ms(jit_kernel_impl)
         ms_torch = _time_cuda_ms(torch_impl)
 
         print(
             f"FWHT perf dim={dim} padded={padded_dim} batch={batch}: "
-            f"triton={ms_triton:.3f} ms, torch={ms_torch:.3f} ms, "
-            f"speedup={ms_torch / ms_triton:.2f}x"
+            f"jit_kernel={ms_jit:.3f} ms, torch={ms_torch:.3f} ms, "
+            f"speedup={ms_torch / ms_jit:.2f}x"
         )
 
 # ---------------------------------------------------------------------------

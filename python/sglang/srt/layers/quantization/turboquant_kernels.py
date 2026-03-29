@@ -22,8 +22,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.hadamard import hadamard_transform
-
 # ---------------------------------------------------------------------------
 # Precomputed optimal centroids for the Beta-distributed coordinates after
 # random rotation. These are the MSE-optimal scalar quantizer centroids for
@@ -165,7 +163,9 @@ class HadamardTransform:
         x = x * self.signs
 
         # In-place Fast Walsh-Hadamard Transform
-        return hadamard_transform(x, scale=self.scale)
+        x = self._fwht(x)
+
+        return x * self.scale
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
@@ -174,8 +174,26 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        x = hadamard_transform(y, scale=self.scale) * self.signs
+        x = self._fwht(y) * self.scale
+        x = x * self.signs
         return x[..., : self.dim]
+
+    @staticmethod
+    def _fwht(x: torch.Tensor) -> torch.Tensor:
+        """Fast Walsh-Hadamard Transform along the last dimension."""
+        orig_shape = x.shape
+        n = orig_shape[-1]
+        x = x.reshape(-1, n).float()
+        h = 1
+        while h < n:
+            # Split into pairs and butterfly
+            x = x.view(-1, n // (2 * h), 2, h)
+            a = x[:, :, 0, :]
+            b = x[:, :, 1, :]
+            x = torch.stack([a + b, a - b], dim=2)
+            x = x.view(-1, n)
+            h *= 2
+        return x.view(orig_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +304,10 @@ def unpack_indices(packed: torch.Tensor, bits: int, padded_dim: int) -> torch.Te
 # Scaled centroids cache — avoid recomputing centroids / sqrt(d) every call
 # ---------------------------------------------------------------------------
 _scaled_centroids_cache: Optional[Dict[Tuple[int, int, str], torch.Tensor]] = None
+# Pre-computed boundary midpoints for sorted centroids (binary/linear search)
+_midpoints_cache: Optional[Dict[Tuple[int, int, str], torch.Tensor]] = None
+# Pre-computed positive half-boundaries for symmetric binary search
+_positive_boundaries_cache: Optional[Dict[Tuple[int, int, str], torch.Tensor]] = None
 
 
 def _get_scaled_centroids(bits: int, padded_dim: int, device: torch.device) -> torch.Tensor:
@@ -298,6 +320,37 @@ def _get_scaled_centroids(bits: int, padded_dim: int, device: torch.device) -> t
         centroids = _get_centroids_tensor(bits, device)
         _scaled_centroids_cache[key] = centroids / math.sqrt(padded_dim)
     return _scaled_centroids_cache[key]
+
+
+def _get_positive_boundaries(bits: int, padded_dim: int, device: torch.device) -> torch.Tensor:
+    """Return pre-computed boundary midpoints for the POSITIVE half of symmetric centroids.
+
+    For 4-bit (16 centroids symmetric around 0), the positive half has 8 centroids
+    [c8, c9, ..., c15] and 7 boundaries between them.  We also add boundary[0] = 0
+    (the symmetry axis) for a total of 8 boundaries.
+
+    Binary search on 8 boundaries = 3 comparisons → 4x faster than 15 linear.
+    """
+    global _positive_boundaries_cache
+    if _positive_boundaries_cache is None:
+        _positive_boundaries_cache = {}
+    key = (bits, padded_dim, str(device))
+    if key not in _positive_boundaries_cache:
+        sc = _get_scaled_centroids(bits, padded_dim, device)
+        n = len(sc)
+        half = n // 2
+        # Positive centroids: sc[half], sc[half+1], ..., sc[n-1]
+        pos_centroids = sc[half:]
+        # 7 midpoints between consecutive positive centroids
+        mids = (pos_centroids[:-1] + pos_centroids[1:]) * 0.5
+        # Prepend 0.0 as the boundary between negative and positive halves
+        # Actually: the boundary between c[7] and c[8] is their midpoint
+        # which for symmetric centroids = 0.
+        zero_boundary = torch.tensor([0.0], dtype=torch.float32, device=device)
+        # 8 boundaries total: [0, mid(c8,c9), mid(c9,c10), ..., mid(c14,c15)]
+        boundaries = torch.cat([zero_boundary, mids])
+        _positive_boundaries_cache[key] = boundaries
+    return _positive_boundaries_cache[key]
 
 
 # ---------------------------------------------------------------------------
@@ -314,124 +367,187 @@ def _get_scaled_centroids(bits: int, padded_dim: int, device: torch.device) -> t
 # ---------------------------------------------------------------------------
 
 
-# ---- Fused kernels for optimized quantize/dequantize paths ----
+# ---- Mega-fused kernels: single kernel per quantize/dequantize step ----
+# These do norm + normalize + centroid-search + nibble-pack (quantize)
+# or unpack + lookup + rescale (dequantize) in ONE kernel launch.
+# For 4-bit with dim=128: one program per row, zero intermediate buffers.
+
+@triton.jit
+def _turboquant_mega_fused_quantize_4bit_kernel(
+    # Input: post-Hadamard rotated data
+    rotated_ptr,       # [N, D] bf16 or float32
+    # Outputs
+    packed_ptr,        # [N, D//2] uint8 (nibble-packed centroid indices)
+    norms_ptr,         # [N] float32 (L2 norms)
+    # Pre-scaled centroids (sorted ascending, pre-divided by sqrt(d))
+    centroids_ptr,     # [16] float32
+    # Strides
+    stride_rot: tl.constexpr,
+    stride_pack: tl.constexpr,
+    # Constants
+    HALF_DIM: tl.constexpr,   # D // 2 (= packed_dim)
+):
+    """Single-kernel quantize: norm + normalize + centroid search + nibble pack.
+
+    One program per row.  Loads data as two interleaved halves (even/odd)
+    so packing is trivial — no intermediate unpacked buffer needed.
+
+    Uses boundary comparison for sorted centroids: 15 comparisons vs 16
+    for the old linear scan, and is branchless + fully vectorized.
+    """
+    row = tl.program_id(0)
+
+    # Load as two halves: even positions (0,2,4,...) and odd (1,3,5,...)
+    half_offs = tl.arange(0, HALF_DIM)
+    even_offs = half_offs * 2
+    odd_offs = half_offs * 2 + 1
+
+    x_even = tl.load(rotated_ptr + row * stride_rot + even_offs).to(tl.float32)
+    x_odd = tl.load(rotated_ptr + row * stride_rot + odd_offs).to(tl.float32)
+
+    # Compute L2 norm inline (single reduction, no separate kernel)
+    norm_sq = tl.sum(x_even * x_even, axis=0) + tl.sum(x_odd * x_odd, axis=0)
+    norm = tl.sqrt(norm_sq)
+    tl.store(norms_ptr + row, norm)
+
+    # Normalize inline
+    inv_norm = 1.0 / (norm + 1e-10)
+    x_even = x_even * inv_norm
+    x_odd = x_odd * inv_norm
+
+    # Find nearest centroid using sorted-boundary comparison (branchless).
+    # For 16 sorted centroids c[0] < c[1] < ... < c[15], the optimal
+    # assignment is: idx = #{boundaries below x}, where boundary[i] =
+    # (c[i] + c[i+1]) / 2.  This is 15 comparisons, fully vectorized.
+    idx_even = tl.zeros([HALF_DIM], dtype=tl.int32)
+    idx_odd = tl.zeros([HALF_DIM], dtype=tl.int32)
+
+    for i in range(15):  # 15 midpoint boundaries for 16 centroids
+        ci = tl.load(centroids_ptr + i)
+        ci1 = tl.load(centroids_ptr + i + 1)
+        mid = (ci + ci1) * 0.5
+        idx_even = tl.where(x_even > mid, i + 1, idx_even)
+        idx_odd = tl.where(x_odd > mid, i + 1, idx_odd)
+
+    # Nibble pack: packed[i] = (odd_idx << 4) | even_idx
+    packed = ((idx_odd << 4) | (idx_even & 0x0F)).to(tl.uint8)
+    tl.store(packed_ptr + row * stride_pack + half_offs, packed)
+
+
+@triton.jit
+def _turboquant_mega_fused_dequantize_4bit_kernel(
+    # Input
+    packed_ptr,        # [N, D//2] uint8 (nibble-packed)
+    # Output
+    output_ptr,        # [N, D] bf16 or float32 (rescaled, ready for inverse Hadamard)
+    # Pre-scaled centroids
+    centroids_ptr,     # [16] float32
+    norms_ptr,         # [N] float32
+    # Strides
+    stride_pack: tl.constexpr,
+    stride_out: tl.constexpr,
+    # Constants
+    HALF_DIM: tl.constexpr,
+    OUTPUT_BF16: tl.constexpr,  # 1 = output bf16, 0 = output fp32
+):
+    """Single-kernel dequantize: unpack + centroid lookup + norm rescale.
+
+    One program per row.  Outputs directly in the dtype needed by the
+    inverse Hadamard kernel, avoiding a separate dtype-cast kernel.
+    """
+    row = tl.program_id(0)
+
+    half_offs = tl.arange(0, HALF_DIM)
+    packed = tl.load(packed_ptr + row * stride_pack + half_offs).to(tl.int32)
+
+    # Unpack nibbles
+    idx_even = packed & 0x0F
+    idx_odd = (packed >> 4) & 0x0F
+
+    # Centroid lookup
+    val_even = tl.load(centroids_ptr + idx_even)
+    val_odd = tl.load(centroids_ptr + idx_odd)
+
+    # Rescale by norm inline
+    norm = tl.load(norms_ptr + row)
+    val_even = val_even * norm
+    val_odd = val_odd * norm
+
+    # Store interleaved at even/odd positions
+    even_offs = half_offs * 2
+    odd_offs = half_offs * 2 + 1
+
+    if OUTPUT_BF16 == 1:
+        tl.store(output_ptr + row * stride_out + even_offs, val_even.to(tl.bfloat16))
+        tl.store(output_ptr + row * stride_out + odd_offs, val_odd.to(tl.bfloat16))
+    else:
+        tl.store(output_ptr + row * stride_out + even_offs, val_even)
+        tl.store(output_ptr + row * stride_out + odd_offs, val_odd)
+
+
+# ---- Legacy fused kernels (kept for backward compat, non-4bit, prod mode) ----
 
 @triton.jit
 def _turboquant_fused_normalize_quantize_kernel(
-    # Pointers
-    rotated_ptr,       # [num_tokens, padded_dim] float32 (post-Hadamard)
-    indices_ptr,       # [num_tokens, padded_dim] uint8 output (unpacked)
-    norms_ptr,         # [num_tokens] float32 (pre-computed norms)
-    centroids_ptr,     # [NUM_CENTROIDS] float32 (pre-scaled by 1/sqrt(d))
-    # Strides
-    rotated_stride_0: tl.constexpr,
-    indices_stride_0: tl.constexpr,
-    # Constants
-    PADDED_DIM: tl.constexpr,
-    NUM_CENTROIDS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    rotated_ptr, indices_ptr, norms_ptr, centroids_ptr,
+    rotated_stride_0: tl.constexpr, indices_stride_0: tl.constexpr,
+    PADDED_DIM: tl.constexpr, NUM_CENTROIDS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused normalize-by-norm + nearest-centroid quantize.
-    Eliminates separate normalization kernel + separate zeros allocation.
-    """
+    """Fused normalize-by-norm + nearest-centroid quantize (non-4bit fallback)."""
     token_id = tl.program_id(0)
     block_id = tl.program_id(1)
-
     offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < PADDED_DIM
-
-    # Load rotated values and norm in one shot
     vals = tl.load(rotated_ptr + token_id * rotated_stride_0 + offs, mask=mask, other=0.0)
     norm = tl.load(norms_ptr + token_id)
-
-    # Normalize inline
     vals = vals / (norm + 1e-10)
-
-    # Find nearest centroid
     best_idx = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     best_dist = tl.full([BLOCK_SIZE], float("inf"), dtype=tl.float32)
-
     for c in range(NUM_CENTROIDS):
         centroid = tl.load(centroids_ptr + c)
         dist = (vals - centroid) * (vals - centroid)
         closer = dist < best_dist
         best_idx = tl.where(closer, c, best_idx)
         best_dist = tl.where(closer, dist, best_dist)
-
     tl.store(indices_ptr + token_id * indices_stride_0 + offs, best_idx.to(tl.uint8), mask=mask)
 
 
 @triton.jit
 def _turboquant_pack_4bit_kernel(
-    # Pointers
-    indices_ptr,       # [num_tokens, padded_dim] uint8 input (unpacked)
-    packed_ptr,        # [num_tokens, packed_dim] uint8 output (nibble-packed)
-    # Strides
-    indices_stride_0: tl.constexpr,
-    packed_stride_0: tl.constexpr,
-    # Constants
-    PACKED_DIM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    indices_ptr, packed_ptr,
+    indices_stride_0: tl.constexpr, packed_stride_0: tl.constexpr,
+    PACKED_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
-    """Pack unpacked 4-bit indices into nibble-packed uint8.
-    Each thread block handles BLOCK_SIZE packed elements (= 2*BLOCK_SIZE unpacked).
-    """
+    """Pack 4-bit indices (fallback for non-mega path)."""
     token_id = tl.program_id(0)
     block_id = tl.program_id(1)
-
     offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < PACKED_DIM
-
-    even_offs = offs * 2
-    odd_offs = offs * 2 + 1
-
-    even = tl.load(indices_ptr + token_id * indices_stride_0 + even_offs, mask=mask, other=0).to(tl.int32)
-    odd = tl.load(indices_ptr + token_id * indices_stride_0 + odd_offs, mask=mask, other=0).to(tl.int32)
-
+    even = tl.load(indices_ptr + token_id * indices_stride_0 + offs * 2, mask=mask, other=0).to(tl.int32)
+    odd = tl.load(indices_ptr + token_id * indices_stride_0 + offs * 2 + 1, mask=mask, other=0).to(tl.int32)
     packed = ((odd << 4) | (even & 0x0F)).to(tl.uint8)
     tl.store(packed_ptr + token_id * packed_stride_0 + offs, packed, mask=mask)
 
 
 @triton.jit
 def _turboquant_fused_dequantize_rescale_4bit_kernel(
-    # Pointers
-    packed_ptr,        # [num_tokens, packed_dim] uint8 input (nibble-packed)
-    output_ptr,        # [num_tokens, padded_dim] float32 output (rescaled by norm)
-    centroids_ptr,     # [num_centroids] float32 (pre-scaled by 1/sqrt(d))
-    norms_ptr,         # [num_tokens] float32
-    # Strides
-    packed_stride_0: tl.constexpr,
-    output_stride_0: tl.constexpr,
-    # Constants
-    PADDED_DIM: tl.constexpr,
-    PACKED_DIM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    packed_ptr, output_ptr, centroids_ptr, norms_ptr,
+    packed_stride_0: tl.constexpr, output_stride_0: tl.constexpr,
+    PADDED_DIM: tl.constexpr, PACKED_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused: unpack 4-bit → centroid lookup → multiply by norm.
-    Eliminates separate dequant + rescale kernels.
-    """
+    """Fused dequant+rescale (fallback for non-mega path)."""
     token_id = tl.program_id(0)
     block_id = tl.program_id(1)
-
     offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < PACKED_DIM
-
-    # Load packed nibbles
     packed = tl.load(packed_ptr + token_id * packed_stride_0 + offs, mask=mask, other=0).to(tl.int32)
-
     idx_even = packed & 0x0F
     idx_odd = (packed >> 4) & 0x0F
-
-    # Centroid lookup
     val_even = tl.load(centroids_ptr + idx_even, mask=mask, other=0.0)
     val_odd = tl.load(centroids_ptr + idx_odd, mask=mask, other=0.0)
-
-    # Load norm and rescale inline (fuses the separate multiply kernel)
     norm = tl.load(norms_ptr + token_id)
     val_even = val_even * norm
     val_odd = val_odd * norm
-
-    # Store interleaved
     coord_even = offs * 2
     coord_odd = offs * 2 + 1
     tl.store(output_ptr + token_id * output_stride_0 + coord_even, val_even,
@@ -564,52 +680,57 @@ def turboquant_quantize(
     """
     num_tokens, dim = x.shape
     device = x.device
-
-    # Compute L2 norms before rotation (preserved by orthogonal transform)
-    norms = torch.norm(x.float(), dim=-1)
+    mse_bits = bits - 1 if mode == "prod" else bits
 
     # Step 1: Rotate via randomized Hadamard
     rotated = hadamard.forward(x.float())  # (num_tokens, padded_dim)
     padded_dim = rotated.shape[-1]
+    half_dim = padded_dim // 2
 
     # Get pre-scaled centroids (cached)
-    mse_bits = bits - 1 if mode == "prod" else bits
     scaled_centroids = _get_scaled_centroids(mse_bits, padded_dim, device)
 
+    # ── MEGA-FUSED PATH: 4-bit MSE (the common KV cache case) ──
+    # Single kernel: norm + normalize + boundary-search + nibble-pack
+    # Norm is computed from rotated data (Hadamard preserves L2 norm).
+    if mse_bits == 4 and mode == "mse":
+        packed_indices = torch.empty(num_tokens, half_dim, dtype=torch.uint8, device=device)
+        norms = torch.empty(num_tokens, dtype=torch.float32, device=device)
+
+        _turboquant_mega_fused_quantize_4bit_kernel[(num_tokens,)](
+            rotated,
+            packed_indices,
+            norms,
+            scaled_centroids,
+            stride_rot=rotated.stride(0),
+            stride_pack=packed_indices.stride(0),
+            HALF_DIM=half_dim,
+        )
+
+        return {
+            "packed_indices": packed_indices,
+            "norms": norms,
+            "padded_dim": padded_dim,
+        }
+
+    # ── FALLBACK PATH: non-4bit or prod mode ──
+    norms = torch.norm(x.float(), dim=-1)
     BLOCK_SIZE = 128
     num_blocks = triton.cdiv(padded_dim, BLOCK_SIZE)
 
-    # Use optimized fused path for 4-bit MSE (the common KV cache case)
-    use_fused_4bit = (mse_bits == 4 and mode == "mse")
-
-    # Step 2: Fused normalize + quantize (saves separate division kernel + zeros alloc)
     indices = torch.empty(num_tokens, padded_dim, dtype=torch.uint8, device=device)
-
     _turboquant_fused_normalize_quantize_kernel[(num_tokens, num_blocks)](
-        rotated,
-        indices,
-        norms,
-        scaled_centroids,
-        rotated.stride(0),
-        indices.stride(0),
-        PADDED_DIM=padded_dim,
-        NUM_CENTROIDS=len(scaled_centroids),
-        BLOCK_SIZE=BLOCK_SIZE,
+        rotated, indices, norms, scaled_centroids,
+        rotated.stride(0), indices.stride(0),
+        PADDED_DIM=padded_dim, NUM_CENTROIDS=len(scaled_centroids), BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    # Step 3: Bit-pack the indices
-    if use_fused_4bit:
-        # Use Triton pack kernel instead of PyTorch ops (saves ~3 kernel launches)
-        packed_dim = padded_dim // 2
-        packed_indices = torch.empty(num_tokens, packed_dim, dtype=torch.uint8, device=device)
-        pack_blocks = triton.cdiv(packed_dim, BLOCK_SIZE)
+    if mse_bits == 4:
+        packed_indices = torch.empty(num_tokens, half_dim, dtype=torch.uint8, device=device)
+        pack_blocks = triton.cdiv(half_dim, BLOCK_SIZE)
         _turboquant_pack_4bit_kernel[(num_tokens, pack_blocks)](
-            indices,
-            packed_indices,
-            indices.stride(0),
-            packed_indices.stride(0),
-            PACKED_DIM=packed_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+            indices, packed_indices, indices.stride(0), packed_indices.stride(0),
+            PACKED_DIM=half_dim, BLOCK_SIZE=BLOCK_SIZE,
         )
     else:
         packed_indices = pack_indices(indices, mse_bits)
@@ -620,28 +741,17 @@ def turboquant_quantize(
         "padded_dim": padded_dim,
     }
 
-    # Step 4 (mode="prod" only): QJL on residual
     if mode == "prod":
-        # Reconstruct MSE approximation to compute residual
-        # Need normalized rotated for residual computation
         rotated_normalized = rotated / (norms.unsqueeze(-1) + 1e-10)
         dequant_normalized = torch.zeros_like(rotated_normalized)
         _turboquant_dequantize_kernel[(num_tokens, num_blocks)](
-            indices,
-            dequant_normalized,
-            scaled_centroids,
-            indices.stride(0),
-            dequant_normalized.stride(0),
-            DIM=padded_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+            indices, dequant_normalized, scaled_centroids,
+            indices.stride(0), dequant_normalized.stride(0),
+            DIM=padded_dim, BLOCK_SIZE=BLOCK_SIZE,
         )
-
         residual = rotated_normalized - dequant_normalized
         residual_norms = torch.norm(residual, dim=-1)
-
-        # QJL: store sign bits of residual (1 bit per coordinate)
         qjl_signs_raw = (residual >= 0).to(torch.uint8)
-        # Pack QJL signs at 1-bit
         result["qjl_signs"] = pack_indices(qjl_signs_raw, 1)
         result["residual_norms"] = residual_norms
 
@@ -672,78 +782,77 @@ def turboquant_dequantize(
     padded_dim = quantized["padded_dim"]
     num_tokens = packed_indices.shape[0]
     device = packed_indices.device
-
     mse_bits = bits - 1 if mode == "prod" else bits
     scaled_centroids = _get_scaled_centroids(mse_bits, padded_dim, device)
-
     packed_dim = packed_indices.shape[-1]
+    half_dim = padded_dim // 2
 
-    # Use fused Triton kernel for 4-bit (the common case): unpack + lookup + rescale in one kernel
+    # ── MEGA-FUSED PATH: 4-bit MSE ──
+    # Single kernel: unpack + centroid lookup + norm rescale
+    # Then output bf16 directly if the inverse Hadamard accepts bf16,
+    # otherwise fp32.
+    if mse_bits == 4 and mode == "mse":
+        # Output in bf16 directly if inverse Hadamard can handle it (saves a cast)
+        use_bf16_output = (output_dtype == torch.bfloat16)
+        out_dtype = torch.bfloat16 if use_bf16_output else torch.float32
+        dequant = torch.empty(num_tokens, padded_dim, dtype=out_dtype, device=device)
+
+        _turboquant_mega_fused_dequantize_4bit_kernel[(num_tokens,)](
+            packed_indices,
+            dequant,
+            scaled_centroids,
+            norms,
+            stride_pack=packed_indices.stride(0),
+            stride_out=dequant.stride(0),
+            HALF_DIM=half_dim,
+            OUTPUT_BF16=1 if use_bf16_output else 0,
+        )
+
+        # Inverse Hadamard → output
+        reconstructed = hadamard.inverse(dequant)
+        return reconstructed.to(output_dtype)
+
+    # ── FALLBACK PATH ──
     if mse_bits == 4:
         dequant = torch.empty(num_tokens, padded_dim, dtype=torch.float32, device=device)
         BLOCK_SIZE = 128
         num_blocks = triton.cdiv(packed_dim, BLOCK_SIZE)
-
-        if mode == "mse":
-            # Fused path: unpack + centroid lookup + norm rescale in ONE kernel
+        if mode != "prod":
             _turboquant_fused_dequantize_rescale_4bit_kernel[(num_tokens, num_blocks)](
-                packed_indices,
-                dequant,
-                scaled_centroids,
-                norms,
-                packed_indices.stride(0),
-                dequant.stride(0),
-                PADDED_DIM=padded_dim,
-                PACKED_DIM=packed_dim,
-                BLOCK_SIZE=BLOCK_SIZE,
+                packed_indices, dequant, scaled_centroids, norms,
+                packed_indices.stride(0), dequant.stride(0),
+                PADDED_DIM=padded_dim, PACKED_DIM=packed_dim, BLOCK_SIZE=BLOCK_SIZE,
             )
-            # dequant is already rescaled by norm — go straight to inverse Hadamard
             reconstructed = hadamard.inverse(dequant)
             return reconstructed.to(output_dtype)
         else:
-            # Prod mode: need separate dequant (without norm) for QJL correction
             _turboquant_dequantize_packed_4bit_kernel[(num_tokens, num_blocks)](
-                packed_indices,
-                dequant,
-                scaled_centroids,
-                packed_indices.stride(0),
-                dequant.stride(0),
-                PADDED_DIM=padded_dim,
-                PACKED_DIM=packed_dim,
-                BLOCK_SIZE=BLOCK_SIZE,
+                packed_indices, dequant, scaled_centroids,
+                packed_indices.stride(0), dequant.stride(0),
+                PADDED_DIM=padded_dim, PACKED_DIM=packed_dim, BLOCK_SIZE=BLOCK_SIZE,
             )
     else:
-        # Unpack then dequant via existing kernel
         indices = unpack_indices(packed_indices, mse_bits, padded_dim)
         dequant = torch.empty(num_tokens, padded_dim, dtype=torch.float32, device=device)
         BLOCK_SIZE = 128
         num_blocks = triton.cdiv(padded_dim, BLOCK_SIZE)
         _turboquant_dequantize_kernel[(num_tokens, num_blocks)](
-            indices,
-            dequant,
-            scaled_centroids,
-            indices.stride(0),
-            dequant.stride(0),
-            DIM=padded_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+            indices, dequant, scaled_centroids,
+            indices.stride(0), dequant.stride(0),
+            DIM=padded_dim, BLOCK_SIZE=BLOCK_SIZE,
         )
 
-    # Add QJL correction if mode="prod"
+    # QJL correction (prod mode only)
     if mode == "prod" and "qjl_signs" in quantized:
         qjl_packed = quantized["qjl_signs"]
         residual_norms = quantized["residual_norms"]
-        # Unpack 1-bit QJL signs and convert to +1/-1
         qjl_unpacked = unpack_indices(qjl_packed, 1, padded_dim).float()
-        qjl_signs = qjl_unpacked * 2.0 - 1.0  # 0/1 -> -1/+1
+        qjl_signs = qjl_unpacked * 2.0 - 1.0
         qjl_scale = math.sqrt(math.pi / 2) / padded_dim
         dequant += qjl_scale * residual_norms.unsqueeze(-1) * qjl_signs
 
-    # Rescale by original norm
     dequant = dequant * norms.unsqueeze(-1)
-
-    # Inverse Hadamard to get back to original space
     reconstructed = hadamard.inverse(dequant)
-
     return reconstructed.to(output_dtype)
 
 
