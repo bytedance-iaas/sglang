@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
+import sglang.multimodal_gen.runtime.pipelines_core.stages.denoising as denoising_module
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
@@ -148,27 +150,29 @@ def test_dummy_denoising_loop_accuracy():
     transformer = DummyTransformer().to(device)
     scheduler = DummyScheduler(num_steps=num_steps)
     server_args = DummyServerArgs()
+    previous_server_args = server_args_module._global_server_args
     set_global_server_args(server_args)
-    import sglang.multimodal_gen.runtime.pipelines_core.stages.denoising as denoising_module
+    try:
+        denoising_module.get_attn_backend = lambda *args, **kwargs: DummyAttnBackend()
+        denoising_module.get_sp_world_size = lambda: 1
+        stage = MinimalDenoisingStage(transformer=transformer, scheduler=scheduler)
 
-    denoising_module.get_attn_backend = lambda *args, **kwargs: DummyAttnBackend()
-    denoising_module.get_sp_world_size = lambda: 1
-    stage = MinimalDenoisingStage(transformer=transformer, scheduler=scheduler)
+        latents = torch.randn(
+            batch_size, channels, spatial_size, spatial_size, device=device
+        )
+        batch = Req(
+            prompt="dummy",
+            raw_latent_shape=[batch_size, channels, spatial_size, spatial_size],
+            latents=latents.clone(),
+            timesteps=scheduler.timesteps.to(device),
+            num_inference_steps=num_steps,
+            guidance_scale=1.0,
+            do_classifier_free_guidance=False,
+            return_trajectory_latents=False,
+        )
+        batch.extra = {}
+        result = stage.forward(batch=batch, server_args=server_args)
 
-    latents = torch.randn(
-        batch_size, channels, spatial_size, spatial_size, device=device
-    )
-    batch = Req(
-        prompt="dummy",
-        raw_latent_shape=[batch_size, channels, spatial_size, spatial_size],
-        latents=latents.clone(),
-        timesteps=scheduler.timesteps.to(device),
-        num_inference_steps=num_steps,
-        guidance_scale=1.0,
-        do_classifier_free_guidance=False,
-        return_trajectory_latents=False,
-    )
-    batch.extra = {}
-    result = stage.forward(batch=batch, server_args=server_args)
-
-    assert torch.allclose(result.latents, latents)
+        assert torch.allclose(result.latents, latents)
+    finally:
+        server_args_module._global_server_args = previous_server_args
