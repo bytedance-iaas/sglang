@@ -725,6 +725,9 @@ class Req(ReqDllmMixin):
         # Alpamayo: history trajectory for action_to_traj conversion
         self.history_traj: Optional[Dict[str, Any]] = None
 
+        # Alpamayo-R1: set True when request is waiting for flow matching phase
+        self.needs_flow_matching: bool = False
+
         # Embedding (return values)
         self.embedding = None
 
@@ -2110,6 +2113,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
+    def prepare_for_flow_matching(self):
+        """Prepare the ScheduleBatch for the Alpamayo-R1 flow matching phase.
+
+        Sets up the minimum fields needed for get_model_worker_batch() →
+        ForwardBatch.init_new() to work. No KV cache allocation — FM reuses
+        the VLM's KV cache from the decode phase.
+        """
+        bs = len(self.reqs)
+        self.input_ids = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.tensor(
+            [req.req_pool_idx for req in self.reqs],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.seq_lens = torch.tensor(
+            [len(req.fill_ids) for req in self.reqs],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.seq_lens_cpu = self.seq_lens.cpu()
+        self.orig_seq_lens = self.seq_lens.clone()
+        self.seq_lens_sum = int(self.seq_lens.sum())
+        self.out_cache_loc = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        self.multimodal_inputs = [req.multimodal_inputs for req in self.reqs]
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2253,7 +2281,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
+        if self.forward_mode.is_decode_or_idle() or self.forward_mode.is_flow_matching():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens

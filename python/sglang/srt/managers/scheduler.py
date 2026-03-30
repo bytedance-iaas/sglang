@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.flow_matching.mixin.scheduler import SchedulerFlowMatchingMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.mamba.ops import (
@@ -277,6 +278,7 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
+    SchedulerFlowMatchingMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -393,6 +395,9 @@ class Scheduler(
 
         # Init diffusion LLM
         self.init_diffusion_llm()
+
+        # Init flow matching queue (Alpamayo-R1)
+        self.init_flow_matching()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -2141,6 +2146,20 @@ class Scheduler(
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
+        # Alpamayo-R1: remove FM reqs from running_batch BEFORE constructing
+        # the next decode batch, so they don't get decoded again in overlap mode.
+        if hasattr(self, "flow_matching_queue") and self.flow_matching_queue:
+            fm_set = set(id(r) for r in self.flow_matching_queue)
+            self.running_batch.reqs = [
+                r for r in self.running_batch.reqs if id(r) not in fm_set
+            ]
+
+        # Alpamayo-R1: flow matching has highest priority (frees KV cache quickly)
+        fm_batch = self.get_new_batch_flow_matching()
+        if fm_batch is not None:
+            set_schedule_time_batch(fm_batch)
+            return fm_batch
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2547,6 +2566,13 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+
+        # Alpamayo-R1: FM skips sampling & overlap — dedicated path
+        if batch.forward_mode.is_flow_matching():
+            worker_batch = batch.get_model_worker_batch()
+            batch_result = self.model_worker.forward_batch_generation(worker_batch)
+            return batch_result
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
@@ -2562,6 +2588,7 @@ class Scheduler(
                 self.record_batch_in_overlap(model_worker_batch)
 
                 # Sampling info will be modified during forward, so we store a copy.
+                # FM batches have no sampling_info (they produce trajectories, not tokens).
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
@@ -2579,7 +2606,10 @@ class Scheduler(
                         )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
+                    if batch.forward_mode.is_flow_matching():
+                        # FM produces trajectories, not token IDs — skip overlap sampling storage.
+                        pass
+                    elif batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
@@ -2705,7 +2735,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if batch.forward_mode.is_decode():
+        if batch.forward_mode.is_flow_matching():
+            self.process_batch_result_flow_matching(batch, result)
+        elif batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():

@@ -20,7 +20,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils import get_layer_id
@@ -191,12 +191,41 @@ class AlpamayoR1(nn.Module):
                     active_indices.append(i)
 
             if active_indices:
-                sampled_actions = self._run_flow_matching(active_indices, forward_batch)
-                # Convert sampled actions → trajectories and write to ret.customized_info
-                self._attach_traj_to_reqs(
-                    sampled_actions, active_indices, forward_batch, ret, bstar
-                )
+                # Signal the scheduler to move these requests to the FM queue.
+                # Flow matching now runs as a dedicated scheduler phase via
+                # forward_flow_matching(), not synchronously here.
+                ret.flow_matching_triggered = [False] * bstar
+                for idx in active_indices:
+                    ret.flow_matching_triggered[idx] = True
 
+        return ret
+
+    def forward_flow_matching(
+        self,
+        input_ids: torch.LongTensor,
+        positions: torch.LongTensor,
+        forward_batch: "ForwardBatch",
+        **kwargs,
+    ) -> "LogitsProcessorOutput":
+        """Entry point for the dedicated FLOW_MATCHING scheduler phase.
+
+        The scheduler calls this after moving flow-matching requests out of the
+        running decode batch.  All requests in forward_batch need flow matching.
+        We run all Euler steps here and attach trajectories to ret.customized_info.
+        """
+        # forward_batch contains one slot per FM request.  We treat every slot
+        # as active.
+        bstar = forward_batch.batch_size
+        active_indices = list(range(bstar))
+
+        # We need a LogitsProcessorOutput to attach customized_info.
+        # Create a minimal one (no logits needed – FM produces trajectories).
+        ret = LogitsProcessorOutput(next_token_logits=None)
+
+        sampled_actions = self._run_flow_matching(active_indices, forward_batch)
+        self._attach_traj_to_reqs(
+            sampled_actions, active_indices, forward_batch, ret, bstar
+        )
         return ret
 
     def _attach_traj_to_reqs(

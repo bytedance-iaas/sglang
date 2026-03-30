@@ -2732,6 +2732,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        elif forward_batch.forward_mode.is_flow_matching():
+            ret = self.model.forward_flow_matching(
+                input_ids=None,
+                positions=None,
+                forward_batch=forward_batch,
+            )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:

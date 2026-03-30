@@ -106,6 +106,9 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
+    # Used in Alpamayo-R1 flow matching phase
+    FLOW_MATCHING = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -190,6 +193,9 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
+
+    def is_flow_matching(self):
+        return self == ForwardMode.FLOW_MATCHING
 
 
 @total_ordering
@@ -546,7 +552,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify() or ret.forward_mode.is_flow_matching():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
@@ -755,7 +761,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
+            if self.forward_mode.is_decode() or self.forward_mode.is_flow_matching():
                 # 3 * N
                 if (
                     mm_input is None

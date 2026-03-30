@@ -401,6 +401,39 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Alpamayo-R1: intercept flow-matching-triggered requests before check_finished.
+        # The model signals FM via logits_output.flow_matching_triggered (List[bool]).
+        # Move those requests to the flow_matching_queue and remove them from the
+        # current decode batch so the normal finish loop ignores them.
+        if (
+            hasattr(self, "flow_matching_queue")
+            and logits_output is not None
+            and logits_output.flow_matching_triggered is not None
+        ):
+            fm_triggered = logits_output.flow_matching_triggered
+            surviving_reqs = []
+            surviving_token_ids = []
+            fm_reqs = []
+            for req, tok_id, is_fm in zip(batch.reqs, next_token_ids, fm_triggered):
+                if is_fm:
+                    req.needs_flow_matching = True
+                    # Append the FM trigger token so output_ids stays in sync
+                    # with kv_committed_len (prevents 1-token KV cache leak).
+                    req.output_ids.append(tok_id)
+                    self.flow_matching_queue.append(req)
+                    fm_reqs.append(req)
+                else:
+                    surviving_reqs.append(req)
+                    surviving_token_ids.append(tok_id)
+            batch.reqs = surviving_reqs
+            next_token_ids = surviving_token_ids
+            # Remove FM reqs from running_batch so they are not decoded again.
+            if fm_reqs and hasattr(self, "running_batch"):
+                fm_set = set(id(r) for r in fm_reqs)
+                self.running_batch.reqs = [
+                    r for r in self.running_batch.reqs if id(r) not in fm_set
+                ]
+
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 

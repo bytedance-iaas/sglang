@@ -104,6 +104,10 @@ class LogitsProcessorOutput:
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    ## Part 6: Alpamayo-R1 flow matching signal
+    # Set by alpamayo_r1.py forward() to signal which requests need FM phase.
+    flow_matching_triggered: Optional[List[bool]] = None
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
 

@@ -471,6 +471,14 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
+        if forward_batch.forward_mode.is_flow_matching():
+            # FM produces trajectories, not token IDs — skip sampling entirely.
+            out = self.model_runner.forward(forward_batch)
+            return GenerationBatchResult(
+                logits_output=out.logits_output,
+                can_run_cuda_graph=False,
+            )
+
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
                 forward_batch,
