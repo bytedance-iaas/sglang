@@ -2060,7 +2060,9 @@ class DumperControlReqOutput(BaseReq):
 
 # Type unions for each IPC channel direction
 SchedulerToDetokenizerMsg = Union[BatchTokenIDOutput, BatchEmbeddingOutput, FreezeGCReq]
-DetokenizerToTokenizerMsg = Union[BatchStrOutput, BatchEmbeddingOutput]
+DetokenizerToTokenizerMsg = Union[
+    BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput
+]
 
 _msgpack_encoder = msgspec.msgpack.Encoder()
 _s2d_decoder = msgspec.msgpack.Decoder(SchedulerToDetokenizerMsg)
