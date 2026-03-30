@@ -30,6 +30,7 @@ from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, Union
 
+import msgspec
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -86,7 +87,10 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=False)
-        send_msgpack(self._mapping[ipc_name], output)
+        if isinstance(output, msgspec.Struct):
+            send_msgpack(self._mapping[ipc_name], output)
+        else:
+            self._mapping[ipc_name].send_pyobj(output)
 
 
 def _extract_bytes_field_by_index(output: Any, field_name: str, index: int) -> Any:
