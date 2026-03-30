@@ -255,7 +255,7 @@ def get_hf_text_config(config: PretrainedConfig):
 
 
 # Temporary hack for Alpamayo-R1 model
-def _load_alpamayo_r1_config(
+def _load_alpamayo_config(
     model_path: str,
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
@@ -605,8 +605,8 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except (ValueError, KeyError) as e:
-            if "alpamayo_r1" in str(e):
-                config = _load_alpamayo_r1_config(
+            if "alpamayo" in str(e) or "alpamayo" in str(model).lower():
+                config = _load_alpamayo_config(
                     model,
                     trust_remote_code=trust_remote_code,
                     revision=revision,
@@ -993,7 +993,7 @@ def get_tokenizer(
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
-        elif "alpamayo_r1" in str(e):
+        elif "alpamayo" in str(e) or "alpamayo" in tokenizer_name.lower():
             # Alpamayo model has no tokenizer files; fall back to the base
             # Qwen3-VL tokenizer automatically.
             tokenizer = AutoTokenizer.from_pretrained(
@@ -1366,7 +1366,7 @@ def get_processor(
                 **kwargs,
             )
         except (ValueError, KeyError) as e:
-            if "alpamayo_r1" in str(e):
+            if "alpamayo" in str(e) or "alpamayo" in tokenizer_name.lower():
                 # Alpamayo model has no tokenizer files; fall back to the base
                 # Qwen3-VL tokenizer/processor automatically.
                 tokenizer_name = "Qwen/Qwen3-VL-8B-Instruct"
