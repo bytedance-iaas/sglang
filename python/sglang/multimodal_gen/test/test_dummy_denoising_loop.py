@@ -152,6 +152,8 @@ def test_dummy_denoising_loop_accuracy():
     server_args = DummyServerArgs()
     previous_server_args = server_args_module._global_server_args
     set_global_server_args(server_args)
+    previous_get_attn_backend = denoising_module.get_attn_backend
+    previous_get_sp_world_size = denoising_module.get_sp_world_size
     try:
         denoising_module.get_attn_backend = lambda *args, **kwargs: DummyAttnBackend()
         denoising_module.get_sp_world_size = lambda: 1
@@ -175,4 +177,6 @@ def test_dummy_denoising_loop_accuracy():
 
         assert torch.allclose(result.latents, latents)
     finally:
+        denoising_module.get_attn_backend = previous_get_attn_backend
+        denoising_module.get_sp_world_size = previous_get_sp_world_size
         server_args_module._global_server_args = previous_server_args
