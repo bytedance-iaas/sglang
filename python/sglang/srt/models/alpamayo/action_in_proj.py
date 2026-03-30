@@ -61,7 +61,7 @@ class MLPEncoder(nn.Module):
 class FourierEncoderV2(nn.Module):
     """Improved Fourier feature encoder with logarithmically-spaced frequencies."""
 
-    def __init__(self, dim: int, max_freq: float = 100.0):
+    def __init__(self, dim: int, max_freq: float = 100.0, persistent: bool = True):
         """Initialize the Fourier encoder V2.
 
         Args:
@@ -69,12 +69,15 @@ class FourierEncoderV2(nn.Module):
                 sine and cosine components.
             max_freq: Maximum frequency for the logarithmic frequency spacing.
                 Defaults to 100.0.
+            persistent: Whether the freqs buffer is persistent in the state dict.
+                Set True for models whose checkpoints include freqs (e.g. AlpamayoR1),
+                False for models that recompute freqs at runtime (e.g. Alpamayo1_5).
         """
         super().__init__()
         half = dim // 2
         freqs = torch.logspace(0, math.log10(max_freq), steps=half)
         self.out_dim = dim
-        self.register_buffer("freqs", freqs[None, :])  # (1, half)
+        self.register_buffer("freqs", freqs[None, :], persistent=persistent)  # (1, half)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the Fourier encoder V2.
@@ -104,6 +107,7 @@ class PerWaypointActionInProjV2(torch.nn.Module):
         hidden_size: int = 1024,
         max_freq: float = 100.0,
         num_fourier_feats: int = 20,
+        fourier_persistent: bool = True,
     ):
         """Initialize the per-waypoint action projection module V2.
 
@@ -115,16 +119,17 @@ class PerWaypointActionInProjV2(torch.nn.Module):
             hidden_size: Hidden dimension size of the MLP encoder. Defaults to 1024.
             max_freq: Maximum frequency for the Fourier encoding. Defaults to 100.0.
             num_fourier_feats: Number of Fourier features for encoding. Defaults to 20.
+            fourier_persistent: Passed to FourierEncoderV2 as persistent. Defaults to True.
         """
         super().__init__()
         self.in_dims = in_dims
         self.out_dim = out_dim
         sinus = []
         for _ in range(in_dims[-1]):
-            sinus.append(FourierEncoderV2(dim=num_fourier_feats, max_freq=max_freq))
+            sinus.append(FourierEncoderV2(dim=num_fourier_feats, max_freq=max_freq, persistent=fourier_persistent))
         self.sinus = nn.ModuleList(sinus)
         self.timestep_fourier_encoder = FourierEncoderV2(
-            dim=num_fourier_feats, max_freq=max_freq
+            dim=num_fourier_feats, max_freq=max_freq, persistent=fourier_persistent
         )
         num_input_feats = (
             sum(s.out_dim for s in self.sinus) + self.timestep_fourier_encoder.out_dim

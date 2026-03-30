@@ -64,6 +64,8 @@ class AlpamayoR1(nn.Module):
     as the expert branch for flow-matching-based action generation.
     """
 
+    _fourier_persistent: bool = True  # R1 checkpoint includes freqs buffers
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -126,6 +128,7 @@ class AlpamayoR1(nn.Module):
             num_enc_layers=action_in_proj_cfg["num_enc_layers"],
             max_freq=action_in_proj_cfg["max_freq"],
             num_fourier_feats=action_in_proj_cfg["num_fourier_feats"],
+            fourier_persistent=self._fourier_persistent,
         )
         self.action_out_proj = torch.nn.Linear(expert_config.hidden_size, action_dim)
 
@@ -646,6 +649,17 @@ class AlpamayoR1(nn.Module):
             action_out_proj_weights,
         )
 
+        # 5) Match reference: convert action_in_proj / action_out_proj to
+        #    the same dtype as the expert (bf16).  This is critical because
+        #    FourierEncoderV2.freqs is a non-persistent buffer that is NOT
+        #    loaded from the checkpoint -- without .to() it stays in fp32,
+        #    producing different Fourier features than training time.
+        expert_dtype = next(self.expert.parameters()).dtype
+        keep_same_dtype = getattr(self.vlm.config, "keep_same_dtype", True)
+        if keep_same_dtype:
+            self.action_in_proj = self.action_in_proj.to(dtype=expert_dtype)
+            self.action_out_proj = self.action_out_proj.to(dtype=expert_dtype)
+
         logger.info(
             "AlpamayoR1 load summary: "
             f"strict={strict}, "
@@ -658,5 +672,10 @@ class AlpamayoR1(nn.Module):
         )
 
 
+# Architecture name alias used in HuggingFace config (architectures: ['Alpamayo1_5'])
+class Alpamayo1_5(AlpamayoR1):
+    _fourier_persistent: bool = False  # 1.5 recomputes freqs at runtime
+
+
 # Entry point for SGLang model registry
-EntryClass = AlpamayoR1
+EntryClass = [AlpamayoR1, Alpamayo1_5]

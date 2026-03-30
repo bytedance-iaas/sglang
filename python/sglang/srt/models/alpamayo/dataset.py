@@ -78,7 +78,6 @@ def load_physical_aiavdataset(
     """
     if avdi is None:
         avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
-            revision="2ae73f49ffd2b5db43b404201beb7b92889f7afc",
             cache_dir=_default_cache_dir(),
         )
 

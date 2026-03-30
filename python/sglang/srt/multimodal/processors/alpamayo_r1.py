@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 # from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.alpamayo_r1 import AlpamayoR1
+from sglang.srt.models.alpamayo_r1 import Alpamayo1_5, AlpamayoR1
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.utils import logger
 
@@ -172,7 +172,7 @@ def tokenize_history_trajectory(
 
 
 class AlpamayoR1Processor(QwenVLImageProcessor):
-    models = [AlpamayoR1]
+    models = [AlpamayoR1, Alpamayo1_5]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # IMPORTANT: Add trajectory tokens to the tokenizer BEFORE calling super().__init__
