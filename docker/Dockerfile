@@ -212,7 +212,7 @@ RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ]; then \
       curl -s https://luban-source.byted.org/repository/scm/toutiao.tos.toscli_1.0.0.20.tar.gz -o - | tar xz -C . ./toscli \
       && chmod +x ./toscli \
       && mv ./toscli /usr/bin/ \
-      && CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH}.tar.gz" \
+      && CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH//\//-}.tar.gz" \
       && echo "Downloading cache from TOS: ${CACHE_TAR_NAME}" \
       && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} get -filename /tmp/${CACHE_TAR_NAME} cache/sglang-image/${CACHE_TAR_NAME} || true \
       && if [ -f "/tmp/${CACHE_TAR_NAME}" ]; then \
@@ -517,7 +517,7 @@ ARG CUSTOM_CACHE_TOS_AK
 ARG CUSTOM_CACHE_TOS_BUCKET
 ARG CUDA_VERSION
 RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ] ; then \
-      CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH}.tar.gz" \
+      CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH//\//-}.tar.gz" \
       && echo "=== Preparing to upload cache to TOS: ${CACHE_TAR_NAME} ===" \
       && rm -rf /root/.cache/cargo-target /root/.cache/flashinfer \
       && echo "Cache contents before archiving:" \
