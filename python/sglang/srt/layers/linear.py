@@ -1501,16 +1501,24 @@ class RowParallelLinear(LinearBase):
                 param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_, skip_all_reduce=False):
-        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
-            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-            if self.gemm_ar_attn_op:
-                output = self.gemm_ar_attn_op.forward(input_, self.weight, bias_)
-            else:
-                output = self.gemm_ar_mlp_op.forward(input_, self.weight, bias_)
+        # if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+        #     bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        #     if self.gemm_ar_attn_op:
+        #         output = self.gemm_ar_attn_op.forward(input_, self.weight, bias_)
+        #     else:
+        #         output = self.gemm_ar_mlp_op.forward(input_, self.weight, bias_)
 
+        #     output_bias = self.bias if self.skip_bias_add else None
+        #     return output, output_bias
+        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            if self.gemm_ar_attn_op:
+                output = self.gemm_ar_attn_op.forward(input_, self.weight)
+            else:
+                output = self.gemm_ar_mlp_op.forward(input_, self.weight)
+            if not self.skip_bias_add and self.bias is not None:
+                output = output + self.bias
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
-
         if self.input_is_parallel:
             input_parallel = input_
         else:
