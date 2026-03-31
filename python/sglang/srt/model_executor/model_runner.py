@@ -2687,6 +2687,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if forward_batch.forward_mode.is_decode() and hasattr(
+                self.model, "check_flow_matching_trigger"
+            ):
+                self.model.check_flow_matching_trigger(
+                    forward_batch.input_ids, forward_batch, ret
+                )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -2749,6 +2755,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
+        if forward_batch.forward_mode.is_decode() and hasattr(
+            self.model, "check_flow_matching_trigger"
+        ):
+            self.model.check_flow_matching_trigger(
+                forward_batch.input_ids, forward_batch, ret
+            )
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(

@@ -168,37 +168,46 @@ class AlpamayoR1(nn.Module):
         **kwargs,
     ):
         ret = self.vlm(input_ids, positions, forward_batch, **kwargs)
-
-        if forward_batch.forward_mode.is_decode():
-            bstar = int(input_ids.shape[0])
-            active_indices = []
-            trajs = forward_batch.history_trajs
-            for i in range(bstar):
-                has_history_traj = (
-                    trajs is not None and i < len(trajs) and trajs[i] is not None
-                )
-
-                should_trigger_flow_matching = input_ids[
-                    i
-                ] == self.traj_future_start_token_id or (
-                    has_history_traj and input_ids[i] == self.traj_force_stop_token_id
-                )
-
-                if should_trigger_flow_matching:
-                    # Force generation to stop immediately
-                    ret.next_token_logits[i, :] = float("-inf")
-                    ret.next_token_logits[i, self.traj_force_stop_token_id] = 0.0
-                    active_indices.append(i)
-
-            if active_indices:
-                # Signal the scheduler to move these requests to the FM queue.
-                # Flow matching now runs as a dedicated scheduler phase via
-                # forward_flow_matching(), not synchronously here.
-                ret.flow_matching_triggered = [False] * bstar
-                for idx in active_indices:
-                    ret.flow_matching_triggered[idx] = True
-
         return ret
+
+    def check_flow_matching_trigger(
+        self,
+        input_ids: torch.LongTensor,
+        forward_batch: "ForwardBatch",
+        logits_output,
+    ) -> None:
+        """Check whether any request in the batch should trigger flow matching.
+
+        This runs *outside* the CUDA graph capture region (called from
+        ModelRunner.forward after replay/forward completes) so that the
+        CPU-side indexing of input_ids does not cause
+        cudaErrorStreamCaptureUnsupported.
+        """
+        bstar = int(input_ids.shape[0])
+        active_indices = []
+        trajs = forward_batch.history_trajs
+        for i in range(bstar):
+            has_history_traj = (
+                trajs is not None and i < len(trajs) and trajs[i] is not None
+            )
+
+            should_trigger_flow_matching = input_ids[
+                i
+            ] == self.traj_future_start_token_id or (
+                has_history_traj and input_ids[i] == self.traj_force_stop_token_id
+            )
+
+            if should_trigger_flow_matching:
+                # Force generation to stop immediately
+                logits_output.next_token_logits[i, :] = float("-inf")
+                logits_output.next_token_logits[i, self.traj_force_stop_token_id] = 0.0
+                active_indices.append(i)
+
+        if active_indices:
+            # Signal the scheduler to move these requests to the FM queue.
+            logits_output.flow_matching_triggered = [False] * bstar
+            for idx in active_indices:
+                logits_output.flow_matching_triggered[idx] = True
 
     def forward_flow_matching(
         self,
