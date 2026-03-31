@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.jit_kernel.flash_attention_v3 import (
+from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )

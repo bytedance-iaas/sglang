@@ -61,11 +61,9 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sglang.jit_kernel.flash_attention_v3 import (
+    from sglang.jit_kernel.flash_attention import (
         flash_attn_varlen_func,
-    )
-    from sglang.jit_kernel.flash_attention_v3 import (
-        flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
+        flash_attn_with_kvcache,
     )
 
 
@@ -1634,7 +1632,7 @@ class NativeSparseAttnBackend(
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
-        o = flash_attn_with_kvcache_fa3(
+        o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,

@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from utils import parametrize, precision
 
-from sglang.jit_kernel.flash_attention_v3 import flash_attn_varlen_func
+from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)

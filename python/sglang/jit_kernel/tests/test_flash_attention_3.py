@@ -1106,7 +1106,7 @@ def test_flash_attn_varlen_output(
     dtype,
     has_sink,
 ):
-    from sglang.jit_kernel.flash_attention_v3 import flash_attn_varlen_func
+    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 
     device = "cuda"
     # set seed

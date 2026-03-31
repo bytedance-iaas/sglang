@@ -27,17 +27,10 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.jit_kernel.flash_attention_v3 import (
-    flash_attn_varlen_func as flash_attn_varlen_func_fa3,
-)
-from sglang.jit_kernel.flash_attention_v3 import (
-    flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
-)
-from sglang.jit_kernel.flash_attention_v4 import (
-    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-)
-from sglang.jit_kernel.flash_attention_v4 import (
-    flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+from sglang.jit_kernel.flash_attention import (
+    FlashAttnVersion,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
 )
 
 
@@ -332,7 +325,7 @@ class FlashAttentionBackend(AttentionBackend):
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
-        fa_impl_ver=3,
+        fa_impl_ver=FlashAttnVersion.V3,
     ):
         super().__init__()
 
@@ -397,7 +390,7 @@ class FlashAttentionBackend(AttentionBackend):
             1
             if model_runner.server_args.enable_deterministic_inference
             or (
-                self.fa_impl_ver == 4
+                self.fa_impl_ver == FlashAttnVersion.V4
                 and not model_runner.server_args.disable_cuda_graph
             )
             else 0
@@ -800,7 +793,7 @@ class FlashAttentionBackend(AttentionBackend):
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
+            and self.fa_impl_ver != FlashAttnVersion.V4
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
@@ -829,20 +822,6 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
             and not is_swa_layer
-        )
-
-        flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
-
-        flash_attn_varlen_func = (
-            flash_attn_varlen_func_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_varlen_func_base
-        )
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
         )
 
         kwargs = {}
@@ -922,6 +901,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_descale=v_descale,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
 
@@ -949,6 +929,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
 
@@ -976,6 +957,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1015,6 +997,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 else:
@@ -1040,6 +1023,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 if forward_batch.mha_return_lse:
@@ -1048,7 +1032,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
+                assert self.fa_impl_ver == FlashAttnVersion.V3, "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -1091,6 +1075,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1113,6 +1098,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -1169,9 +1155,6 @@ class FlashAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
-        flash_attn_varlen_func = flash_attn_varlen_func_fa3
-        flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
-
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
@@ -1192,14 +1175,6 @@ class FlashAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
-
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
-
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -1244,6 +1219,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -1264,6 +1240,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             else:
@@ -1301,6 +1278,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1323,6 +1301,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                             **kwargs,
                         )
                     )
@@ -1379,6 +1358,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1400,6 +1380,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
                 o, _ = merge_state_v2(
                     o,

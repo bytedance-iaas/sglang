@@ -15,11 +15,9 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_func,
 )
 
-from sglang.jit_kernel.flash_attention_v3 import (
-    flash_attn_varlen_func as flash_attn_varlen_func_fa3,
-)
-from sglang.jit_kernel.flash_attention_v3 import (
-    flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
+from sglang.jit_kernel.flash_attention import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -371,7 +369,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         if not save_kv_cache:
             # profile run
-            o = flash_attn_varlen_func_fa3(
+            o = flash_attn_varlen_func(
                 q=query,
                 k=key,
                 v=value,
@@ -1405,7 +1403,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 s_lse = s_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
             return res, s_lse
 
-        output, softmax_lse, *rest = flash_attn_varlen_func_fa3(
+        output, softmax_lse, *rest = flash_attn_varlen_func(
             q=query_states,
             k=key_states,
             v=value_states,
@@ -1572,7 +1570,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         softmax_scale: float,
         causal: bool,
     ):
-        out, softmax_lse, *rest_expand = flash_attn_with_kvcache_fa3(
+        out, softmax_lse, *rest_expand = flash_attn_with_kvcache(
             q=query,
             k_cache=key_cache,
             v_cache=value_cache,
