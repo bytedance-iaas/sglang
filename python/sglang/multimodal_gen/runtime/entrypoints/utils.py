@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import inspect
 import os
 import shutil
 import subprocess
@@ -38,6 +39,30 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
+
+
+VIDEO_OUTPUT_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm"})
+
+
+def _video_writer_likely_supports_quality_kwarg(*, save_file_path: str) -> bool:
+    """Best-effort check whether the selected video writer supports `quality=`.
+
+    This is intentionally conservative: if we can't confidently determine support,
+    we return False and avoid passing `quality`.
+    """
+
+    try:
+        fmt = imageio.formats.search_write_format(save_file_path)
+        writer_cls = getattr(fmt, "Writer", None)
+        if writer_cls is None:
+            return False
+        params = inspect.signature(writer_cls.__init__).parameters
+        if "quality" in params:
+            return True
+        # If Writer uses **kwargs, it may still reject unknown kwargs later, so be conservative.
+        return False
+    except Exception:
+        return False
 
 
 @dataclass
@@ -358,8 +383,7 @@ def save_outputs(
         save_file_path = build_output_path(idx)
         if data_type == DataType.VIDEO and save_file_path:
             _, ext = os.path.splitext(save_file_path)
-            video_exts = {".mp4", ".mov", ".mkv", ".webm"}
-            if not ext or ext.lower() not in video_exts:
+            if not ext or ext.lower() not in VIDEO_OUTPUT_EXTENSIONS:
                 base = save_file_path if not ext else save_file_path[: -len(ext)]
                 corrected_path = f"{base}.mp4"
                 logger.warning(
@@ -493,32 +517,25 @@ def post_process_sample(
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
-                quality = (
-                    output_compression / 10 if output_compression is not None else 5
-                )
+                mimsave_kwargs = {
+                    "fps": fps,
+                    "format": data_type.get_default_extension(),
+                    "codec": "libx264",
+                }
+                if (
+                    output_compression is not None
+                    and _video_writer_likely_supports_quality_kwarg(
+                        save_file_path=save_file_path
+                    )
+                ):
+                    mimsave_kwargs["quality"] = output_compression / 10
+
                 try:
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                        codec="libx264",
-                        quality=quality,
-                    )
-                except TypeError as exc:
-                    if "quality" not in str(exc):
-                        raise
-                    logger.warning(
-                        "Video writer does not support quality parameter; retrying without it: %s",
-                        exc,
-                    )
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                        codec="libx264",
-                    )
+                    imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
+                except TypeError:
+                    # As a final fallback, retry without optional kwargs that may not be supported.
+                    mimsave_kwargs.pop("quality", None)
+                    imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,
