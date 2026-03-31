@@ -1,0 +1,173 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","kind":"Pod","metadata":{"annotations":{},"labels":{"app":"sglang-dev-workspace"},"name":"sglang-dev-workspace","namespace":"default"},"spec":{"containers":[{"command":["/bin/bash","-c","sleep infinity"],"env":[{"name":"HF_ENDPOINT","value":"https://hf-mirror.com"}],"image":"iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:triton-dist-dev","imagePullPolicy":"IfNotPresent","name":"dev-container","resources":{"limits":{"cpu":8,"memory":"40Gi","nvidia.com/gpu":4},"requests":{"cpu":2,"memory":"16Gi","nvidia.com/gpu":4}},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/root/.cache/huggingface","name":"hf-cache"},{"mountPath":"/etc/localtime","name":"localtime","readOnly":true},{"mountPath":"/workspace","name":"workspace"},{"mountPath":"/data","name":"extra-data"}]}],"imagePullSecrets":[{"name":"volc-registry-secret"}],"volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"10Gi"},"name":"shm"},{"hostPath":{"path":"/data/hf-cache","type":"DirectoryOrCreate"},"name":"hf-cache"},{"hostPath":{"path":"/etc/localtime","type":"File"},"name":"localtime"},{"name":"workspace","persistentVolumeClaim":{"claimName":"sglang-dev-workspace-pvc"}},{"name":"extra-data","persistentVolumeClaim":{"claimName":"sglang-dev-data-pvc"}}]}}
+    vke.volcengine.com/cello-pod-evict-policy: allow
+  creationTimestamp: "2026-03-23T10:03:03Z"
+  labels:
+    app: sglang-dev-workspace
+  name: sglang-dev-workspace
+  namespace: default
+  resourceVersion: "9701275"
+  uid: b3f98319-b859-4034-a944-d8c4e49f6de7
+spec:
+  containers:
+  - command:
+    - /bin/bash
+    - -c
+    - sleep infinity
+    env:
+    - name: HF_ENDPOINT
+      value: https://hf-mirror.com
+    image: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:triton-dist-dev
+    imagePullPolicy: Always
+    name: dev-container
+    resources:
+      limits:
+        cpu: "8"
+        memory: 40Gi
+        nvidia.com/gpu: "4"
+        vke.volcengine.com/eni-ip: "1"
+      requests:
+        cpu: "2"
+        memory: 16Gi
+        nvidia.com/gpu: "4"
+        vke.volcengine.com/eni-ip: "1"
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /dev/shm
+      name: shm
+    - mountPath: /root/.cache/huggingface
+      name: hf-cache
+    - mountPath: /etc/localtime
+      name: localtime
+      readOnly: true
+    - mountPath: /workspace
+      name: workspace
+    - mountPath: /data
+      name: extra-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-6vjvj
+      readOnly: true
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  imagePullSecrets:
+  - name: volc-registry-secret
+  nodeName: 192.168.1.146
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  serviceAccount: default
+  serviceAccountName: default
+  terminationGracePeriodSeconds: 30
+  tolerations:
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+    tolerationSeconds: 300
+  - effect: NoExecute
+    key: node.kubernetes.io/unreachable
+    operator: Exists
+    tolerationSeconds: 300
+  volumes:
+  - emptyDir:
+      medium: Memory
+      sizeLimit: 10Gi
+    name: shm
+  - hostPath:
+      path: /data/hf-cache
+      type: DirectoryOrCreate
+    name: hf-cache
+  - hostPath:
+      path: /etc/localtime
+      type: File
+    name: localtime
+  - name: workspace
+    persistentVolumeClaim:
+      claimName: sglang-dev-workspace-pvc
+  - name: extra-data
+    persistentVolumeClaim:
+      claimName: sglang-dev-data-pvc
+  - name: kube-api-access-6vjvj
+    projected:
+      defaultMode: 420
+      sources:
+      - serviceAccountToken:
+          expirationSeconds: 3607
+          path: token
+      - configMap:
+          items:
+          - key: ca.crt
+            path: ca.crt
+          name: kube-root-ca.crt
+      - downwardAPI:
+          items:
+          - fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+            path: namespace
+status:
+  conditions:
+  - lastProbeTime: null
+    lastTransitionTime: "2026-03-23T10:07:19Z"
+    status: "True"
+    type: PodReadyToStartContainers
+  - lastProbeTime: null
+    lastTransitionTime: "2026-03-23T10:03:06Z"
+    status: "True"
+    type: Initialized
+  - lastProbeTime: null
+    lastTransitionTime: "2026-03-23T10:07:19Z"
+    status: "True"
+    type: Ready
+  - lastProbeTime: null
+    lastTransitionTime: "2026-03-23T10:07:19Z"
+    status: "True"
+    type: ContainersReady
+  - lastProbeTime: null
+    lastTransitionTime: "2026-03-23T10:03:06Z"
+    status: "True"
+    type: PodScheduled
+  containerStatuses:
+  - containerID: containerd://63bd148b6a1c833e00ed190e2e7f42ab18718c15ff35645f55bcd59e7e49a80c
+    image: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:triton-dist-dev
+    imageID: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:b480f99848fe2dbc5e8051b362814807ab3bc1b195b5f8c5edf45afc5eb0816a
+    lastState: {}
+    name: dev-container
+    ready: true
+    restartCount: 0
+    started: true
+    state:
+      running:
+        startedAt: "2026-03-23T10:07:18Z"
+    volumeMounts:
+    - mountPath: /dev/shm
+      name: shm
+    - mountPath: /root/.cache/huggingface
+      name: hf-cache
+    - mountPath: /etc/localtime
+      name: localtime
+      readOnly: true
+      recursiveReadOnly: Disabled
+    - mountPath: /workspace
+      name: workspace
+    - mountPath: /data
+      name: extra-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-6vjvj
+      readOnly: true
+      recursiveReadOnly: Disabled
+  hostIP: 192.168.1.146
+  hostIPs:
+  - ip: 192.168.1.146
+  phase: Running
+  podIP: 192.168.1.164
+  podIPs:
+  - ip: 192.168.1.164
+  qosClass: Burstable
+  startTime: "2026-03-23T10:03:06Z"

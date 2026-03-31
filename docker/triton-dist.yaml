@@ -1,0 +1,126 @@
+# 1. 申请一块 100G 的云盘，专门用来存你的代码，这样哪怕 Pod 删了代码也不丢
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: triton-dist-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce # 火山引擎 ebs-ssd 通常只支持单节点读写
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: ebs-ssd # 使用集群中存在的 StorageClass
+  volumeMode: Filesystem
+---
+# 1.5 额外申请一块 500G 的云盘，用来存放大型数据集或模型
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sglang-dev-data-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: ebs-ssd
+  volumeMode: Filesystem
+---
+# 2. 启动开发舱 Pod（完全复用你成功的环境配置）
+apiVersion: v1
+kind: Pod
+metadata:
+  name: triton-dist
+  labels:
+    app: triton-dist
+spec:
+  # 必须保留的私有镜像仓库凭证
+  imagePullSecrets:
+    - name: volc-registry-secret
+  containers:
+    - name: dev-container
+      image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+      imagePullPolicy: IfNotPresent
+      
+      # 【核心改动 1】强行覆盖启动命令，让容器无限期休眠，作为你的云端开发机
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      
+      env:
+        - name: HF_ENDPOINT
+          value: "https://hf-mirror.com"
+        # 配置 HTTP 代理
+        - name: HTTP_PROXY
+          value: "http://100.68.162.211:3128"
+        - name: http_proxy
+          value: "http://100.68.162.211:3128"
+        
+        # 配置 HTTPS 代理
+        - name: HTTPS_PROXY
+          value: "http://100.68.162.211:3128"
+        - name: https_proxy
+          value: "http://100.68.162.211:3128"
+        
+        # 配置不走代理的地址（非常重要！防止 K8s 内部通信断网）
+        - name: NO_PROXY
+          value: "localhost,127.0.0.1,.local,ivolces.com,volces.com,192.168.0.0/16"
+        - name: no_proxy
+          value: "localhost,127.0.0.1,.local,ivolces.com,volces.com,192.168.0.0/16"      
+      # 完全继承你原来成功的资源配置（保证拿到 4 张卡）
+      resources:
+        limits:
+          nvidia.com/gpu: 4
+          cpu: 8
+          memory: 40Gi
+        requests:
+          cpu: 2
+          memory: 16Gi
+          nvidia.com/gpu: 4
+          
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: localtime
+          mountPath: /etc/localtime
+          readOnly: true
+        # 【核心改动 2】把上面的 PVC 挂载为开发目录
+        - name: workspace
+          mountPath: /workspace
+        # 新增挂载 500G 的数据盘
+        - name: extra-data
+          mountPath: /data
+          
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 10Gi
+    - name: hf-cache
+      hostPath:
+        path: /data/hf-cache # 继续复用你物理机上的模型缓存目录
+        type: DirectoryOrCreate
+    - name: localtime
+      hostPath:
+        path: /etc/localtime
+        type: File
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: triton-dist-pvc
+    - name: extra-data
+      persistentVolumeClaim:
+        claimName: sglang-dev-data-pvc
+---
+# 3. 对外暴露端口的服务（当你用魔改代码启动 SGLang 时，可以通过它访问）
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-dev-service
+spec:
+  selector:
+    app: triton-dist
+  ports:
+    - protocol: TCP
+      port: 80 
+      targetPort: 30000 
+  type: LoadBalancer # 保持你之前的外部暴露方式

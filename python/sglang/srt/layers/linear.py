@@ -1502,10 +1502,11 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, input_, skip_all_reduce=False):
         if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
             if self.gemm_ar_attn_op:
-                output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+                output = self.gemm_ar_attn_op.forward(input_, self.weight, bias_)
             else:
-                output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+                output = self.gemm_ar_mlp_op.forward(input_, self.weight, bias_)
 
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
