@@ -10,6 +10,11 @@ from einops import rearrange, repeat
 
 apply_rotary_emb = None
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
+
 
 def is_hopper():
     #  Only Hopper supports different V headdim
