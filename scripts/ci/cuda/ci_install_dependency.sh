@@ -298,7 +298,7 @@ if [ "$CU_VERSION" = "cu130" ]; then
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.10 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
@@ -356,6 +356,12 @@ $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.
 kernels download python || true
 kernels lock python || true
 mv python/kernels.lock ${HOME}/.cache/sglang || true
+
+# Install human-eval
+pip install "setuptools==70.0.0"
+git clone https://github.com/merrymercy/human-eval.git
+cd human-eval
+pip install -e . --no-build-isolation
 
 # ------------------------------------------------------------------------------
 # Prepare runner
