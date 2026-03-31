@@ -307,7 +307,8 @@ class UpscalerModel:
             )
 
         # Convert to float32 for stable post-processing before returning uint8.
-        out_np = out.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).float().cpu().numpy()
+        # Do the dtype conversion on CPU to avoid an extra GPU cast+copy for fp16 outputs.
+        out_np = out.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).cpu().float().numpy()
         return (out_np * 255.0).astype(np.uint8)
 
 
@@ -342,7 +343,24 @@ class ImageUpscaler:
         resolved_path = _resolve_model_path(model_path)
 
         device = current_platform.get_local_torch_device()
-        use_half = self._half_precision and device.type in ("cuda", "mps")
+        use_half = False
+        if self._half_precision:
+            if device.type == "cuda":
+                # CUDA supports fp16 tensors broadly, but very old GPUs/drivers can be flaky.
+                # Gate on minimum compute capability that has native fp16 support.
+                cc = None
+                try:
+                    cc = torch.cuda.get_device_capability(device)
+                except Exception:
+                    try:
+                        cc = torch.cuda.get_device_capability()
+                    except Exception:
+                        cc = None
+
+                use_half = cc is None or cc >= (5, 3)
+            elif device.type == "mps":
+                use_half = True
+
         target_dtype = torch.float16 if use_half else torch.float32
         cache_key = (resolved_path, str(device), target_dtype)
 
