@@ -27,8 +27,10 @@ logger = init_logger(__name__)
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
 
-# Module-level cache: model_path -> UpscalerModel instance
-_MODEL_CACHE: dict[str, "UpscalerModel"] = {}
+# Module-level cache: (model_path, device, dtype) -> UpscalerModel instance
+# NOTE: dtype is part of the key to avoid fp16/fp32 collisions when
+# `half_precision` differs between calls.
+_MODEL_CACHE: dict[tuple[str, str, torch.dtype], "UpscalerModel"] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +265,15 @@ class UpscalerModel:
     def device(self) -> torch.device:
         return next(self.net.parameters()).device
 
+    @property
+    def dtype(self) -> torch.dtype:
+        # Prefer parameter dtype; fall back to buffer dtype if needed.
+        for p in self.net.parameters():
+            return p.dtype
+        for b in self.net.buffers():
+            return b.dtype
+        return torch.float32
+
     def upscale(self, frame: np.ndarray, outscale: float | None = None) -> np.ndarray:
         """Upscale a single HWC uint8 frame → HWC uint8 frame.
 
@@ -276,7 +287,13 @@ class UpscalerModel:
         """
         h, w = frame.shape[:2]
         img = frame.astype(np.float32) / 255.0
-        img_t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        # Match input dtype to model weights (e.g., fp16 weights require fp16 inputs).
+        img_t = (
+            torch.from_numpy(img)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=self.dtype)
+        )
         with torch.no_grad():
             out = self.net(img_t)
 
@@ -289,7 +306,8 @@ class UpscalerModel:
                 out, size=(target_h, target_w), mode="bicubic", align_corners=False
             )
 
-        out_np = out.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy()
+        # Convert to float32 for stable post-processing before returning uint8.
+        out_np = out.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).float().cpu().numpy()
         return (out_np * 255.0).astype(np.uint8)
 
 
@@ -323,8 +341,13 @@ class ImageUpscaler:
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
 
-        if resolved_path in _MODEL_CACHE:
-            return _MODEL_CACHE[resolved_path]
+        device = current_platform.get_local_torch_device()
+        use_half = self._half_precision and device.type in ("cuda", "mps")
+        target_dtype = torch.float16 if use_half else torch.float32
+        cache_key = (resolved_path, str(device), target_dtype)
+
+        if cache_key in _MODEL_CACHE:
+            return _MODEL_CACHE[cache_key]
 
         logger.info("Loading Real-ESRGAN weights from %s", resolved_path)
         try:
@@ -356,10 +379,16 @@ class ImageUpscaler:
             ) from e
         net.eval()
 
-        device = current_platform.get_local_torch_device()
-        if self._half_precision:
-            net = net.half()
+        if self._half_precision and not use_half:
+            logger.warning(
+                "Real-ESRGAN half_precision=True requested, but device=%s does not "
+                "support reliable fp16 execution; falling back to fp32.",
+                device,
+            )
+
         net = net.to(device)
+        if use_half:
+            net = net.half()
 
         # Detect the model's native scale from network architecture
         native_scale = 4  # sensible default
@@ -369,10 +398,11 @@ class ImageUpscaler:
             native_scale = net.scale
 
         model = UpscalerModel(net=net, scale=native_scale)
-        _MODEL_CACHE[resolved_path] = model
+        _MODEL_CACHE[cache_key] = model
         logger.info(
-            "Real-ESRGAN model loaded on device: %s (native_scale=%dx, outscale=%s)",
+            "Real-ESRGAN model loaded on device: %s (dtype=%s, native_scale=%dx, outscale=%s)",
             device,
+            str(target_dtype).replace("torch.", ""),
             native_scale,
             f"{self._scale}x" if self._scale != native_scale else "native",
         )
