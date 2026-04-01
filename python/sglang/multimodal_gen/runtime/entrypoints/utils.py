@@ -41,7 +41,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_
 logger = init_logger(__name__)
 
 
-VIDEO_OUTPUT_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm"})
+# NOTE: we currently write videos via libx264 and optionally mux audio via ffmpeg
+# into an MP4 container. Keep the output extension consistent with the actual
+# container we write.
+VIDEO_OUTPUT_EXTENSIONS = frozenset({".mp4"})
 
 
 def _video_writer_likely_supports_quality_kwarg(*, save_file_path: str) -> bool:
