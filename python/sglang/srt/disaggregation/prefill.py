@@ -146,9 +146,7 @@ class PrefillBootstrapQueue:
         kv_args.total_mamba_layer_ids = getattr(
             self.token_to_kv_pool, "total_mamba_layer_ids", []
         )
-        kv_args.mamba_layer_ids = getattr(
-            self.token_to_kv_pool, "mamba_layer_ids", []
-        )
+        kv_args.mamba_layer_ids = getattr(self.token_to_kv_pool, "mamba_layer_ids", [])
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
