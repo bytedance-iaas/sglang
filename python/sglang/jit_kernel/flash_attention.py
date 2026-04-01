@@ -134,7 +134,7 @@ def flash_attn_with_kvcache(
     """
 
     if ver == 3:
-        fa3_flash_attn_with_kvcache(
+        return fa3_flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -168,7 +168,7 @@ def flash_attn_with_kvcache(
             sinks=sinks,
         )
     elif ver == 4:
-        fa4_flash_attn_with_kvcache(
+        return fa4_flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
