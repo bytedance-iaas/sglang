@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import time
 from contextlib import contextmanager
 from typing import Optional, Union
 
