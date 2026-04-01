@@ -345,20 +345,29 @@ class ImageUpscaler:
         device = current_platform.get_local_torch_device()
         use_half = False
         if self._half_precision:
-            if device.type == "cuda":
+            if current_platform.is_cuda():
                 # CUDA supports fp16 tensors broadly, but very old GPUs/drivers can be flaky.
                 # Gate on minimum compute capability that has native fp16 support.
+                # Enable fp16 only on GPUs with native fp16 support.
                 cc = None
-                try:
-                    cc = torch.cuda.get_device_capability(device)
-                except Exception:
+                for candidate in (device, None):
                     try:
-                        cc = torch.cuda.get_device_capability()
+                        cc = torch.cuda.get_device_capability(candidate)
+                        break
                     except Exception:
-                        cc = None
+                        pass
 
-                use_half = cc is None or cc >= (5, 3)
-            elif device.type == "mps":
+                # Enable fp16 only if we successfully determined compute capability
+                # and it meets the minimum requirement (5.3 = Maxwell/GTX 900 series).
+                # If cc is None (unknown), conservatively disable fp16.
+                use_half = cc is not None and cc >= (5, 3)
+            elif (
+                current_platform.is_rocm()
+                or current_platform.is_mps()
+                or current_platform.is_musa()
+                or current_platform.is_npu()
+            ):
+                # ROCM, MPS, MUSA, and NPU generally support fp16
                 use_half = True
 
         target_dtype = torch.float16 if use_half else torch.float32
