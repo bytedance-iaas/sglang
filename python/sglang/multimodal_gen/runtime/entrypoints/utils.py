@@ -46,6 +46,11 @@ logger = init_logger(__name__)
 # container we write.
 VIDEO_OUTPUT_EXTENSIONS = frozenset({".mp4"})
 
+# Audio sample-rate bounds used for best-effort validation/inference.
+MIN_AUDIO_SAMPLE_RATE = 8000
+MAX_AUDIO_SAMPLE_RATE = 192000
+DEFAULT_AUDIO_SAMPLE_RATE = 24000
+
 
 def _video_writer_likely_supports_quality_kwarg(*, save_file_path: str) -> bool:
     """Best-effort check whether the selected video writer supports `quality=`.
@@ -177,8 +182,10 @@ def _pick_audio_sample_rate(
 ) -> int:
     """Pick a plausible sample rate, falling back to inferring from video duration."""
     selected_sr = int(audio_sample_rate) if audio_sample_rate is not None else None
-    if selected_sr is None or not (8000 <= selected_sr <= 192000):
-        selected_sr = 24000
+    if selected_sr is None or not (
+        MIN_AUDIO_SAMPLE_RATE <= selected_sr <= MAX_AUDIO_SAMPLE_RATE
+    ):
+        selected_sr = DEFAULT_AUDIO_SAMPLE_RATE
         try:
             duration_s = float(num_frames) / float(fps) if fps else 0.0
             if duration_s > 0:
@@ -188,7 +195,7 @@ def _pick_audio_sample_rate(
                     else int(audio_np.shape[-1])
                 )
                 inferred_sr = int(round(float(audio_len) / duration_s))
-                if 8000 <= inferred_sr <= 192000:
+                if MIN_AUDIO_SAMPLE_RATE <= inferred_sr <= MAX_AUDIO_SAMPLE_RATE:
                     selected_sr = inferred_sr
         except Exception:
             pass
