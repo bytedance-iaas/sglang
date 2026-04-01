@@ -212,7 +212,7 @@ RUN if [ -n "$CUSTOM_CACHE_TOS_AK" ]; then \
       curl -s https://luban-source.byted.org/repository/scm/toutiao.tos.toscli_1.0.0.20.tar.gz -o - | tar xz -C . ./toscli \
       && chmod +x ./toscli \
       && mv ./toscli /usr/bin/ \
-      &&SGLANG_BRANCH_SAFE=$(echo "$SGLANG_BRANCH" | tr '/' '-') \
+      && SGLANG_BRANCH_SAFE=$(echo "$SGLANG_BRANCH" | tr '/' '-') \
       && CACHE_TAR_NAME="ccache-${CUDA_VERSION}-${SGLANG_BRANCH_SAFE}.tar.gz" \
       && echo "Downloading cache from TOS: ${CACHE_TAR_NAME}" \
       && http_proxy= https_proxy= toscli -endpoint tos-cn-north.byted.org -timeout 30m -bucket ${CUSTOM_CACHE_TOS_BUCKET} -accessKey ${CUSTOM_CACHE_TOS_AK} get -filename /tmp/${CACHE_TAR_NAME} cache/sglang-image/${CACHE_TAR_NAME} || true \
