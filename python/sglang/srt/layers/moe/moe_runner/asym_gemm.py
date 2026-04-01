@@ -75,56 +75,108 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
-def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
+# def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
+#     """
+#     Build offsets and experts for sparse m-grouped masked GEMM.
+
+#     Generates LOCAL offset pairs for each active expert group. The kernel will add
+#     (scheduler.current_group_idx * shape_m) to compute the global offset.
+
+#     Only groups with masked_m[g] > 0 are included in the output mapping.
+#     Each active group generates a pair of offsets (start, end) relative to that group.
+
+#     Args:
+#         masked_m: (num_groups,) tensor of actual token counts per group
+#         num_groups: number of expert groups
+#         block_m: block alignment for padding (default 128)
+
+#     Returns:
+#         offsets: flat tensor with LOCAL pairs [start_0, end_0, start_1, end_1, ...]
+#         experts: expert IDs for each active group + terminator (-1)
+#         list_size: number of experts in output (including terminator)
+
+#     Example:
+#         masked_m = torch.tensor([0, 12, 0, 129]), num_groups = 4
+#         offsets = [0, 128, 0, 256]  # LOCAL offsets (padded to 128)
+#         experts = [1, 3, -1]        # 2 active experts + terminator
+#         list_size = 3
+
+#     Note:
+#         Kernel computes global M index as:
+#         m_idx = (scheduler.current_group_idx * shape_m) + local_m_idx
+#     """
+#     offsets = []
+#     experts = []
+
+#     print(f"~~~~~~~ {masked_m} {num_groups} {block_m}")
+
+#     for g in range(num_groups):
+#         v = masked_m[g].item()
+#         if v > 0:  # Only process active groups
+#             # LOCAL offsets (relative to this group)
+#             # start = 0
+#             # Pad actual tokens to block_m alignment
+#             # end = ((v + block_m - 1) // block_m) * block_m
+#             end= v *block_mb
+#             offsets.append(end-block_m)
+#             offsets.append(end)
+#             experts.append(g)
+
+#     # Add terminator expert
+#     experts.append(-1)
+
+#     print(f"----- offsets {offsets}")
+#     print(f"------ experts {len(experts)} {experts}")
+
+#     return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+#             torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+#             len(experts))
+
+def build_offsets_experts_from_masked_m(
+    masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
+):
     """
     Build offsets and experts for sparse m-grouped masked GEMM.
 
-    Generates LOCAL offset pairs for each active expert group. The kernel will add
-    (scheduler.current_group_idx * shape_m) to compute the global offset.
-
+    Each group gets a fixed allocation of max_m rows in the A matrix.
     Only groups with masked_m[g] > 0 are included in the output mapping.
-    Each active group generates a pair of offsets (start, end) relative to that group.
+    Each active group produces an (start, end) offset pair where:
+        start = g * max_m
+        end   = start + ceil(masked_m[g] / block_m) * block_m
 
     Args:
-        masked_m: (num_groups,) tensor of actual token counts per group
+        masked_m:   (num_groups,) tensor of actual token counts per group
         num_groups: number of expert groups
-        block_m: block alignment for padding (default 128)
+        max_m:      allocated row stride per group (e.g. m_max)
+        block_m:    block-M alignment for padding (default 128)
 
     Returns:
-        offsets: flat tensor with LOCAL pairs [start_0, end_0, start_1, end_1, ...]
-        experts: expert IDs for each active group + terminator (-1)
-        list_size: number of experts in output (including terminator)
-
-    Example:
-        masked_m = torch.tensor([0, 12, 0, 129]), num_groups = 4
-        offsets = [0, 128, 0, 256]  # LOCAL offsets (padded to 128)
-        experts = [1, 3, -1]        # 2 active experts + terminator
-        list_size = 3
-
-    Note:
-        Kernel computes global M index as:
-        m_idx = (scheduler.current_group_idx * shape_m) + local_m_idx
+        offsets:   flat int32 tensor [start_0, end_0, start_1, end_1, ...]
+        experts:   int32 tensor of active expert IDs + terminator (-1)
+        list_size: len(experts), i.e. num_active_experts + 1
     """
     offsets = []
     experts = []
 
     for g in range(num_groups):
         v = masked_m[g].item()
-        if v > 0:  # Only process active groups
-            # LOCAL offsets (relative to this group)
-            start = 0
-            # Pad actual tokens to block_m alignment
-            end = ((v + block_m - 1) // block_m) * block_m
+        if v > 0:
+            start = g * max_m
+            end = start + ((v + block_m - 1) // block_m) * block_m
             offsets.append(start)
             offsets.append(end)
             experts.append(g)
 
-    # Add terminator expert
     experts.append(-1)
 
-    return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
-            torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-            len(experts))
+    # print(f"----- offsets {offsets}")
+    # print(f"------ experts {len(experts)} {experts}")
+
+    return (
+        torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+        torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+        len(experts),
+    )
 
 
 @dataclass
@@ -501,9 +553,10 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     running_state["src2dst"] = src2dst
 
     offsets, experts, list_size = build_offsets_experts_from_masked_m(
-            masked_m,
-            hidden_states.shape[0],
-        )
+        masked_m,
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+    )
 
     return AsymGemmRunnerInput(
         hidden_states=hidden_states,
@@ -511,10 +564,9 @@ def _pre_permute_standard_to_asym_gemm_fp8(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        offsets =  offsets,
-        experts = experts,
-        list_size = list_size,
-
+        offsets=offsets,
+        experts=experts,
+        list_size=list_size,
     )
 
 
@@ -604,9 +656,10 @@ def _pre_permute_standard_to_asym_gemm_bf16(
     running_state["src2dst"] = src2dst
 
     offsets, experts, list_size = build_offsets_experts_from_masked_m(
-            masked_m,
-            hidden_states.shape[0],
-        )
+        masked_m,
+        num_local_experts,
+        m_max,
+    )
 
     return AsymGemmBf16RunnerInput(
         hidden_states=gateup_input,
@@ -683,9 +736,10 @@ def pre_permute_deepep_ll_to_asym_gemm(
     running_state["hidden_states_device"] = hidden_states.device
 
     offsets, experts, list_size = build_offsets_experts_from_masked_m(
-            masked_m,
-            hidden_states.shape[0],
-        )
+        masked_m,
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+    )
 
     # Dtype-based dispatch
     if isinstance(quant_info, AsymGemmBf16MoeQuantInfo):
@@ -694,9 +748,9 @@ def pre_permute_deepep_ll_to_asym_gemm(
             use_masked_gemm=True,
             masked_m=masked_m,
             expected_m=expected_m,
-            offsets =  offsets,
-            experts = experts,
-            list_size = list_size,
+            offsets=offsets,
+            experts=experts,
+            list_size=list_size,
         )
 
     return AsymGemmRunnerInput(
