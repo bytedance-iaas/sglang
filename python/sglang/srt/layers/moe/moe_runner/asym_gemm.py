@@ -74,79 +74,58 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
     return tensor_gpu
 
-def build_offsets_experts_from_masked_m(
-    masked_m: torch.Tensor,
-    num_groups: int | None = None,
-    block_m: int = 128,
-):
+
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
     """
-    Build fixed-size offsets / experts buffers for masked grouped GEMM.
+    Build offsets and experts for sparse m-grouped masked GEMM.
 
-    Contract:
-      - experts uses -1 as terminator / invalid entry
-      - offsets stores [start_0, end_0, start_1, end_1, ...]
-      - when num_groups == 0:
-            offsets = [0, 0]
-            experts = [-1]
-            list_size = 1
+    Generates LOCAL offset pairs for each active expert group. The kernel will add
+    (scheduler.current_group_idx * shape_m) to compute the global offset.
 
-    This version:
-      - avoids .item()
-      - avoids nonzero()
-      - keeps outputs CUDA-graph-friendly
+    Only groups with masked_m[g] > 0 are included in the output mapping.
+    Each active group generates a pair of offsets (start, end) relative to that group.
+
+    Args:
+        masked_m: (num_groups,) tensor of actual token counts per group
+        num_groups: number of expert groups
+        block_m: block alignment for padding (default 128)
+
+    Returns:
+        offsets: flat tensor with LOCAL pairs [start_0, end_0, start_1, end_1, ...]
+        experts: expert IDs for each active group + terminator (-1)
+        list_size: number of experts in output (including terminator)
+
+    Example:
+        masked_m = torch.tensor([0, 12, 0, 129]), num_groups = 4
+        offsets = [0, 128, 0, 256]  # LOCAL offsets (padded to 128)
+        experts = [1, 3, -1]        # 2 active experts + terminator
+        list_size = 3
+
+    Note:
+        Kernel computes global M index as:
+        m_idx = (scheduler.current_group_idx * shape_m) + local_m_idx
     """
-    device = masked_m.device
-    masked_m_i32 = masked_m.to(torch.int32)
+    offsets = []
+    experts = []
 
-    actual_num_groups = masked_m_i32.numel()
-    if num_groups is None:
-        num_groups = actual_num_groups
-    else:
-        assert num_groups == actual_num_groups, (
-            f"num_groups ({num_groups}) != masked_m.numel() ({actual_num_groups})"
-        )
+    for g in range(num_groups):
+        v = masked_m[g].item()
+        if v > 0:  # Only process active groups
+            # LOCAL offsets (relative to this group)
+            start = 0
+            # Pad actual tokens to block_m alignment
+            end = ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
+            experts.append(g)
 
-    # Make sure we always have at least one entry:
-    #   num_groups == 0 -> one dummy entry for terminator.
-    rows = max(num_groups, 1)
+    # Add terminator expert
+    experts.append(-1)
 
-    active_mask = masked_m_i32 > 0
-    padded_end = ((masked_m_i32 + block_m - 1) // block_m) * block_m
-    padded_end = torch.where(
-        active_mask,
-        padded_end,
-        torch.zeros_like(padded_end),
-    )
+    return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+            torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+            len(experts))
 
-    # offsets: shape [rows, 2], flattened to [2 * rows]
-    offsets = torch.zeros(
-        (rows, 2),
-        dtype=torch.int32,
-        device=device,
-    )
-    if num_groups > 0:
-        offsets[:num_groups, 1] = padded_end
-    offsets = offsets.reshape(-1)
-
-    # experts: shape [rows]
-    # active group   -> expert id
-    # inactive group -> -1
-    # num_groups==0  -> [-1]
-    experts = torch.full(
-        (rows,),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    if num_groups > 0:
-        experts[:num_groups] = torch.where(
-            active_mask,
-            torch.arange(num_groups, device=device, dtype=torch.int32),
-            torch.full((num_groups,), -1, device=device, dtype=torch.int32),
-        )
-
-    list_size = rows
-    return offsets, experts, list_size
 
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):

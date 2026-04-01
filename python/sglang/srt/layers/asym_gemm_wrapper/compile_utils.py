@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -167,7 +168,9 @@ def _compile_asym_gemm_one_type_all(
             executor.execute(m=m)
         asym_gemm.set_compile_mode(old_compile_mode)
 
+        _sync_t0 = time.perf_counter()
         torch.cuda.current_stream().synchronize()
+        logger.info("[CUDA_SYNC] _compile_asym_gemm_one_type_all/stream.synchronize: %.3f ms", (time.perf_counter() - _sync_t0) * 1000)
         del executor
         torch.cuda.empty_cache()
     finally:

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import time
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -118,7 +119,9 @@ class PyNcclCommunicator:
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
             self.all_reduce(data)
+            _sync_t0 = time.perf_counter()
             self.stream.synchronize()
+            logger.info("[CUDA_SYNC] PyNcclCommunicator.__init__/stream.synchronize: %.3f ms", (time.perf_counter() - _sync_t0) * 1000)
             del data
 
         # by default it is disabled, e.g. in profiling models and prefill phase.

@@ -395,7 +395,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
         elif self.use_triton_kernels:
-            backend = MoeRunnerBackend.TRITON_KERNEL)
+            backend = MoeRunnerBackend.TRITON_KERNEL
         elif moe_runner_backend.is_asym_gemm():
             backend = MoeRunnerBackend.ASYM_GEMM
         else:

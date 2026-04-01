@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -33,6 +34,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+
+def _timed_event_synchronize(event, location: str) -> None:
+    """Synchronize a CUDA event and log the wall-clock time spent waiting."""
+    t0 = time.perf_counter()
+    event.synchronize()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info("[CUDA_SYNC] %s: %.3f ms", location, elapsed_ms)
 
 
 class SchedulerOutputProcessorMixin:
@@ -127,7 +136,7 @@ class SchedulerOutputProcessorMixin:
 
         if self.is_generation:
             if result.copy_done is not None:
-                result.copy_done.synchronize()
+                _timed_event_synchronize(result.copy_done, "process_batch_result_prefill/generation/copy_done")
 
             (
                 logits_output,
@@ -275,7 +284,7 @@ class SchedulerOutputProcessorMixin:
 
         else:  # embedding or reward model
             if result.copy_done is not None:
-                result.copy_done.synchronize()
+                _timed_event_synchronize(result.copy_done, "process_batch_result_prefill/embedding/copy_done")
 
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -361,7 +370,7 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            _timed_event_synchronize(result.copy_done, "process_batch_result_idle/copy_done")
 
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -373,7 +382,7 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            _timed_event_synchronize(result.copy_done, "process_batch_result_decode/copy_done")
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,

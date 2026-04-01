@@ -7,6 +7,8 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -15,6 +17,8 @@ import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import get_compiler_backend
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -243,7 +247,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
+            _sync_t0 = time.perf_counter()
             torch.cuda.synchronize()
+            logger.info("[CUDA_SYNC] KtEpWrapper.process_weights_after_loading/torch.cuda.synchronize: %.3f ms", (time.perf_counter() - _sync_t0) * 1000)
 
             # Get expert location metadata for CPU expert mapping
             from sglang.srt.eplb.expert_location_dispatch import (
