@@ -5,7 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.flash_attention import FlashAttnVersion, flash_attn_varlen_func
+from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
@@ -49,9 +49,9 @@ def flash_attn_varlen_func_fake_out(
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
-    ver: FlashAttnVersion = FlashAttnVersion.V4,
+    ver: int = 4,
 ) -> torch.Tensor:
-    assert ver == FlashAttnVersion.V4, "only support flash attention v4"
+    assert ver == 4, "only support flash attention v4"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -109,9 +109,9 @@ def flash_attn_varlen_func_fake_out_lse(
     sm_margin: int = 0,
     return_softmax_lse: bool = True,
     sinks: Optional[torch.Tensor] = None,
-    ver: FlashAttnVersion = FlashAttnVersion.V4,
+    ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert ver == FlashAttnVersion.V4, "only support flash attention v4"
+    assert ver == 4, "only support flash attention v4"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -184,7 +184,7 @@ def flash_attn_varlen_func_op(
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
-    ver: FlashAttnVersion = FlashAttnVersion.V4,
+    ver: int = 4,
 ) -> torch.Tensor:
     if window_size is None:
         window_size = [-1, -1]
@@ -248,7 +248,7 @@ def flash_attn_varlen_func_op_lse(
     sm_margin: int = 0,
     return_softmax_lse: bool = True,
     sinks: Optional[torch.Tensor] = None,
-    ver: FlashAttnVersion = FlashAttnVersion.V4,
+    ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if window_size is None:
         window_size = [-1, -1]
@@ -293,12 +293,12 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 
-fa_ver = FlashAttnVersion.V3
+fa_ver = 3
 
 
 def set_fa_ver(ver: int) -> None:
     global fa_ver
-    fa_ver = FlashAttnVersion(ver)
+    fa_ver = ver
 
 
 @dataclass
@@ -394,7 +394,7 @@ class FlashAttentionImpl(AttentionImpl):
         # FA version selection:
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
         # - fa_ver == 4: call custom ops with FIXED return schema
-        if fa_ver == FlashAttnVersion.V3:
+        if fa_ver == 3:
             flash_attn_op = flash_attn_varlen_func
             output = flash_attn_op(
                 q=query,
@@ -411,7 +411,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
             return output
 
-        if fa_ver == FlashAttnVersion.V4:
+        if fa_ver == 4:
             if return_softmax_lse:
                 out_tensor, softmax_lse = flash_attn_varlen_func_op_lse(
                     q=query,

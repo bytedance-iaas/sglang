@@ -1,25 +1,11 @@
-from enum import Enum
 from typing import Optional, Union
 
 import torch
 
-# TODO: the following import may cause error
-try:
-    from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
-    from .flash_attention_v3 import (
-        flash_attn_with_kvcache as fa3_flash_attn_with_kvcache,
-    )
-    from .flash_attention_v4 import flash_attn_varlen_func as fa4_flash_attn_varlen_func
-    from .flash_attention_v4 import (
-        flash_attn_with_kvcache as fa4_flash_attn_with_kvcache,
-    )
-except ImportError as e:
-    raise e
-
-
-class FlashAttnVersion(Enum):
-    V3 = 3
-    V4 = 4
+from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
+from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+from .flash_attention_v4 import flash_attn_varlen_func as fa4_flash_attn_varlen_func
+from .flash_attention_v4 import flash_attn_with_kvcache as fa4_flash_attn_with_kvcache
 
 
 def flash_attn_with_kvcache(
@@ -56,7 +42,7 @@ def flash_attn_with_kvcache(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
-    ver=FlashAttnVersion.V3,
+    ver=3,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -147,7 +133,7 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
-    if ver == FlashAttnVersion.V3:
+    if ver == 3:
         fa3_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -181,7 +167,7 @@ def flash_attn_with_kvcache(
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
         )
-    elif ver == FlashAttnVersion.V4:
+    elif ver == 4:
         fa4_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -243,10 +229,10 @@ def flash_attn_varlen_func(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
-    ver=FlashAttnVersion.V3,
+    ver=3,
 ):
 
-    if ver == FlashAttnVersion.V3:
+    if ver == 3:
         return fa3_flash_attn_varlen_func(
             q,
             k,
@@ -273,7 +259,7 @@ def flash_attn_varlen_func(
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
         )
-    elif ver == FlashAttnVersion.V4:
+    elif ver == 4:
         return fa4_flash_attn_varlen_func(
             q,
             k,

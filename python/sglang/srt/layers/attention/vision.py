@@ -39,7 +39,6 @@ if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
     from sglang.jit_kernel.flash_attention import (
-        FlashAttnVersion,
         flash_attn_varlen_func,
     )
 
@@ -471,7 +470,7 @@ class VisionFlash4Attention(nn.Module):
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            ver=FlashAttnVersion.FA4,
+            ver=4,
         )
 
         return output

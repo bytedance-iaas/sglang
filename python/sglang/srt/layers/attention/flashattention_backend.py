@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 
 from sglang.jit_kernel.flash_attention import (
-    FlashAttnVersion,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
@@ -325,7 +324,7 @@ class FlashAttentionBackend(AttentionBackend):
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
-        fa_impl_ver=FlashAttnVersion.V3,
+        fa_impl_ver=3,
     ):
         super().__init__()
 
@@ -390,7 +389,7 @@ class FlashAttentionBackend(AttentionBackend):
             1
             if model_runner.server_args.enable_deterministic_inference
             or (
-                self.fa_impl_ver == FlashAttnVersion.V4
+                self.fa_impl_ver == 4
                 and not model_runner.server_args.disable_cuda_graph
             )
             else 0
@@ -793,7 +792,7 @@ class FlashAttentionBackend(AttentionBackend):
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
-            and self.fa_impl_ver != FlashAttnVersion.V4
+            and self.fa_impl_ver != 4
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
@@ -1032,7 +1031,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver == FlashAttnVersion.V3, "Only FA3 support here"
+                assert self.fa_impl_ver == 3, "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
