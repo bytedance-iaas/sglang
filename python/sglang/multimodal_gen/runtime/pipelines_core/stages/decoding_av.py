@@ -37,9 +37,16 @@ class LTX2AVDecodingStage(DecodingStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        original_dtype = vae_dtype
-        self.vae.to(torch.bfloat16)
-        latents = latents.to(torch.bfloat16)
+        try:
+            original_dtype = self.vae.dtype
+        except AttributeError:
+            try:
+                original_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                original_dtype = torch.float32
+
+        self.vae.to(dtype=vae_dtype)
+        latents = latents.to(dtype=vae_dtype)
         std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
         mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
         latents = latents * std + mean
