@@ -53,6 +53,14 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KvtcCalibrateReqInput,
+    KvtcCalibrateReqOutput,
+    KvtcRecordDumpReqInput,
+    KvtcRecordDumpReqOutput,
+    KvtcRecordStartReqInput,
+    KvtcRecordStartReqOutput,
+    KvtcRecordStopReqInput,
+    KvtcRecordStopReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -219,6 +227,18 @@ class TokenizerCommunicatorMixin:
         self.pin_prefix_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.kvtc_calibrate_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.kvtc_record_start_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.kvtc_record_stop_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.kvtc_record_dump_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -312,6 +332,22 @@ class TokenizerCommunicatorMixin:
                 (
                     PinPrefixReqOutput,
                     self.pin_prefix_communicator.handle_recv,
+                ),
+                (
+                    KvtcCalibrateReqOutput,
+                    self.kvtc_calibrate_communicator.handle_recv,
+                ),
+                (
+                    KvtcRecordStartReqOutput,
+                    self.kvtc_record_start_communicator.handle_recv,
+                ),
+                (
+                    KvtcRecordStopReqOutput,
+                    self.kvtc_record_stop_communicator.handle_recv,
+                ),
+                (
+                    KvtcRecordDumpReqOutput,
+                    self.kvtc_record_dump_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -434,6 +470,79 @@ class TokenizerCommunicatorMixin:
             success=all_success, nodes_pinned=total, message=all_message
         )
 
+    async def kvtc_calibrate(
+        self: TokenizerManager,
+        output_path: str,
+        max_pages: int = 256,
+        ratio: float = 4.0,
+        output_dtype: str = "float16",
+    ) -> KvtcCalibrateReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.kvtc_calibrate_communicator(
+            KvtcCalibrateReqInput(
+                output_path=output_path,
+                max_pages=max_pages,
+                ratio=ratio,
+                output_dtype=output_dtype,
+            )
+        )
+        all_success, all_message = _Communicator.merge_results(results)
+        num_pages = max([r.num_pages for r in results], default=0)
+        return KvtcCalibrateReqOutput(
+            success=all_success,
+            message=all_message,
+            output_path=output_path,
+            num_pages=num_pages,
+        )
+
+    async def kvtc_record_start(
+        self: TokenizerManager,
+        max_pages: int = 256,
+    ) -> KvtcRecordStartReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.kvtc_record_start_communicator(
+            KvtcRecordStartReqInput(max_pages=max_pages)
+        )
+        all_success, all_message = _Communicator.merge_results(results)
+        return KvtcRecordStartReqOutput(
+            success=all_success, message=all_message, max_pages=max_pages
+        )
+
+    async def kvtc_record_stop(self: TokenizerManager) -> KvtcRecordStopReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.kvtc_record_stop_communicator(KvtcRecordStopReqInput())
+        all_success, all_message = _Communicator.merge_results(results)
+        num_pages = max([r.num_pages for r in results], default=0)
+        return KvtcRecordStopReqOutput(
+            success=all_success, message=all_message, num_pages=num_pages
+        )
+
+    async def kvtc_record_dump(
+        self: TokenizerManager,
+        output_path: str,
+        ratio: float = 4.0,
+        output_dtype: str = "float16",
+        max_k: int = 256,
+    ) -> KvtcRecordDumpReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.kvtc_record_dump_communicator(
+            KvtcRecordDumpReqInput(
+                output_path=output_path,
+                ratio=ratio,
+                output_dtype=output_dtype,
+                max_k=max_k,
+            )
+        )
+        all_success = all([r.success for r in results])
+        all_message = " | ".join([r.message for r in results if r.message])
+        num_pages = max([r.num_pages for r in results], default=0)
+        return KvtcRecordDumpReqOutput(
+            success=all_success,
+            message=all_message,
+            output_path=output_path,
+            num_pages=num_pages,
+        )
+    
     async def start_profile(
         self: TokenizerManager,
         output_dir: Optional[str] = None,
