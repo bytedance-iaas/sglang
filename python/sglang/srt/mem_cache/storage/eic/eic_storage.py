@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, NSATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -263,11 +263,16 @@ class EICStorage(HiCacheStorage):
         self.trans_type = eic.TransportType(eic_trans_type)
         self.kv_cache_dtype = self.memory_pool_host.dtype
         self.is_mla_model = hicache_config.is_mla_model
-        self.rank = hicache_config.tp_rank
+        self.is_nsa_model = isinstance(memory_pool_host, NSATokenToKVPoolHost)
+        self.tp_rank = hicache_config.tp_rank
         self.world_size = hicache_config.tp_size
         self.page_size = self.memory_pool_host.page_size
-        self.use_zero_copy = self.memory_pool_host.layout == "page_first"
+        self.use_zero_copy = hicache_config.is_page_first_layout
+        self.pp_rank = hicache_config.pp_rank
+        self.pp_size = hicache_config.pp_size
         if not self.use_zero_copy:
+            if self.is_nsa_model:
+                raise RuntimeError("nsa model must use zero copy")
             self.kv_cache_shape = self.memory_pool_host.get_data_page(
                 0, flat=True
             ).shape
@@ -311,13 +316,23 @@ class EICStorage(HiCacheStorage):
         )
         self.connection.register_memory(vals, meminfo)
 
-    def _init_eic_prefix(self):
-        if self.is_mla_model:
-            self.eic_prefix = (
-                f"{self.model_name}_mla_att_{self.host_kvcache_layout}@sglang"
+        if self.is_nsa_model:
+            buffer = memory_pool_host.index_k_with_scale_buffer
+            vals = eic.IOBuffers()
+            vals.append(
+                buffer.data_ptr(),
+                buffer.numel() * buffer.element_size(),
+                True,
             )
+            self.connection.register_memory(vals, meminfo)
+
+    def _init_eic_prefix(self):
+        if self.is_nsa_model:
+            self.eic_prefix = f"{self.model_name}_nsa_att_{self.host_kvcache_layout}_{self.pp_rank}_{self.pp_size}@sglang"
+        elif self.is_mla_model:
+            self.eic_prefix = f"{self.model_name}_mla_att_{self.host_kvcache_layout}_{self.pp_rank}_{self.pp_size}@sglang"
         else:
-            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_@sglang"
+            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.tp_rank}_{self.world_size}_{self.pp_rank}_{self.pp_size}@sglang"
 
     def _get_eic_key(self, keys: List[str]) -> str:
         return [f"{self.eic_prefix}_{key}" for key in keys]
@@ -410,8 +425,12 @@ class EICStorage(HiCacheStorage):
     ) -> int:
         if len(keys) == 0:
             return 0
-        if self.use_zero_copy and not self.is_mla_model:
-            keys = self._get_mha_zero_copy_keys(keys)
+        if self.use_zero_copy:
+            if self.is_nsa_model:
+                keys = self._get_nsa_zero_copy_keys(keys)
+            elif not self.is_mla_model:
+                keys = self._get_mha_zero_copy_keys(keys)
+
         exist_mask = self._batch_exists_impl(keys)
         prefix_success = 0
         for exist in exist_mask:
@@ -419,7 +438,9 @@ class EICStorage(HiCacheStorage):
                 prefix_success += 1
             else:
                 break
-        if not self.is_mla_model and self.use_zero_copy:
+
+        if self.use_zero_copy and not self.is_mla_model:
+            # For MHA (K and V) and NSA (KV and IDX), we have 2 keys per page
             prefix_success = prefix_success // 2
         return prefix_success
 
@@ -438,8 +459,8 @@ class EICStorage(HiCacheStorage):
     def _filter_kv_cache(self, total_len) -> Tuple[int, int]:
         mean_len = total_len // self.world_size
         remainder = total_len % self.world_size
-        tp_keys_len = mean_len + (1 if self.rank < remainder else 0)
-        start = self.rank * mean_len + min(self.rank, remainder)
+        tp_keys_len = mean_len + (1 if self.tp_rank < remainder else 0)
+        start = self.tp_rank * mean_len + min(self.tp_rank, remainder)
         end = start + tp_keys_len
         logger.debug(f"start: {start}, end: {end}, tp_keys_len: {tp_keys_len}")
         return start, end
@@ -696,6 +717,25 @@ class EICStorage(HiCacheStorage):
             new_values.append(value[1])
         return new_values
 
+    def _get_nsa_zero_copy_keys(self, keys):
+        new_keys = []
+        for key in keys:
+            new_keys.append(key + "_kv")
+            new_keys.append(key + "_idx")
+        return new_keys
+
+    def _get_nsa_zero_copy_values(self, host_indices):
+        page_num = len(host_indices) // self.page_size
+        new_values = []
+        for i in range(page_num):
+            index = host_indices[i * self.page_size].item()
+            kv_page = self.memory_pool_host.get_data_page(index, flat=False)
+            new_values.append(kv_page)
+            host_page_idx = index // self.page_size
+            idx_page = self.memory_pool_host.index_k_with_scale_buffer[host_page_idx]
+            new_values.append(idx_page)
+        return new_values
+
     def _batch_get_preprocess(self, keys, host_indices):
         page_num = len(host_indices) // self.page_size
         # use memory pool directly or dummy page
@@ -713,31 +753,33 @@ class EICStorage(HiCacheStorage):
             ]
         )
 
-        if self.use_zero_copy and not self.is_mla_model:
-            keys = self._get_mha_zero_copy_keys(keys)
-            values = self._get_mha_zero_copy_values(values)
+        if self.use_zero_copy:
+            if self.is_nsa_model:
+                keys = self._get_nsa_zero_copy_keys(keys)
+                values = self._get_nsa_zero_copy_values(host_indices)
+            elif not self.is_mla_model:
+                keys = self._get_mha_zero_copy_keys(keys)
+                values = self._get_mha_zero_copy_values(values)
 
         return keys, values
 
     def _batch_get_postprocess(self, host_indices, values, results):
         page_num = len(host_indices) // self.page_size
-
         if self.use_zero_copy:
             if not self.is_mla_model:
-                results = [
-                    (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
-                ]
-                results = results[:page_num]
+                # For MHA (K and V) and NSA (KV and IDX), we have 2 keys per page
+                new_results = []
+                for i in range(page_num):
+                    new_results.append(results[i * 2] and results[i * 2 + 1])
+                return new_results
             return results
 
-        # dummy page copy to host memory pool
-        for i in range(page_num):
-            if not results[i]:
-                break
-            self.memory_pool_host.set_from_flat_data_page(
-                host_indices[i * self.memory_pool_host.page_size], values[i]
-            )
-
+        if not self.use_zero_copy:
+            for i in range(page_num):
+                if results[i]:
+                    self.memory_pool_host.set_from_flat_data_page(
+                        host_indices[i * self.page_size], values[i]
+                    )
         return results
 
     def batch_get_v1(
@@ -760,9 +802,13 @@ class EICStorage(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.use_zero_copy and not self.is_mla_model:
-            keys = self._get_mha_zero_copy_keys(keys)
-            values = self._get_mha_zero_copy_values(values)
+        if self.use_zero_copy:
+            if self.is_nsa_model:
+                keys = self._get_nsa_zero_copy_keys(keys)
+                values = self._get_nsa_zero_copy_values(host_indices)
+            elif not self.is_mla_model:
+                keys = self._get_mha_zero_copy_keys(keys)
+                values = self._get_mha_zero_copy_values(values)
 
         return keys, values
 
