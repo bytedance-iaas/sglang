@@ -27,8 +27,8 @@ logger = init_logger(__name__)
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
 
-# Module-level cache: model_path -> UpscalerModel instance
-_MODEL_CACHE: dict[str, "UpscalerModel"] = {}
+# Module-level cache: (model_path, device, half_precision) -> UpscalerModel
+_MODEL_CACHE: dict[tuple[str, str, bool], "UpscalerModel"] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +323,11 @@ class ImageUpscaler:
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
 
-        if resolved_path in _MODEL_CACHE:
-            return _MODEL_CACHE[resolved_path]
+        device = current_platform.get_local_torch_device()
+        cache_key = (resolved_path, str(device), self._half_precision)
+
+        if cache_key in _MODEL_CACHE:
+            return _MODEL_CACHE[cache_key]
 
         logger.info("Loading Real-ESRGAN weights from %s", resolved_path)
         try:
@@ -356,7 +359,6 @@ class ImageUpscaler:
             ) from e
         net.eval()
 
-        device = current_platform.get_local_torch_device()
         if self._half_precision:
             net = net.half()
         net = net.to(device)
@@ -369,7 +371,7 @@ class ImageUpscaler:
             native_scale = net.scale
 
         model = UpscalerModel(net=net, scale=native_scale)
-        _MODEL_CACHE[resolved_path] = model
+        _MODEL_CACHE[cache_key] = model
         logger.info(
             "Real-ESRGAN model loaded on device: %s (native_scale=%dx, outscale=%s)",
             device,
