@@ -1510,15 +1510,17 @@ class RowParallelLinear(LinearBase):
 
         #     output_bias = self.bias if self.skip_bias_add else None
         #     return output, output_bias
-        # if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
-        #     if self.gemm_ar_attn_op:
-        #         output = self.gemm_ar_attn_op.forward(input_, self.weight)
-        #     else:
-        #         output = self.gemm_ar_mlp_op.forward(input_, self.weight)
-        #     if not self.skip_bias_add and self.bias is not None:
-        #         output = output + self.bias
-        #     output_bias = self.bias if self.skip_bias_add else None
-        #     return output, output_bias
+        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1 and not self.gemm_ar_attn_op:
+            if self.gemm_ar_attn_op:
+                output = self.gemm_ar_attn_op.forward(input_, self.weight)
+            else:
+                output = self.gemm_ar_mlp_op.forward(input_, self.weight)
+
+            if not self.skip_bias_add and self.bias is not None:
+                output = output + self.bias
+
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
         if self.input_is_parallel:
             input_parallel = input_
         else:
