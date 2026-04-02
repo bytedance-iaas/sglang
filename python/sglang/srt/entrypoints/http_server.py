@@ -962,8 +962,6 @@ async def dump_expert_distribution_record_async():
 async def start_kvtc_record_async(obj: Optional[KvtcRecordStartReqInput] = None):
     if obj is None:
         obj = KvtcRecordStartReqInput()
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
-        return _admin_api_key_missing_response()
     ret = await _global_state.tokenizer_manager.kvtc_record_start(
         max_pages=obj.max_pages
     )
@@ -980,8 +978,6 @@ async def start_kvtc_record_async(obj: Optional[KvtcRecordStartReqInput] = None)
 @app.api_route("/stop_kvtc_record", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_kvtc_record_async():
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
-        return _admin_api_key_missing_response()
     ret = await _global_state.tokenizer_manager.kvtc_record_stop()
     return ORJSONResponse(
         content={
@@ -996,8 +992,6 @@ async def stop_kvtc_record_async():
 @app.api_route("/dump_kvtc_record", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def dump_kvtc_record_async(obj: KvtcRecordDumpReqInput):
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
-        return _admin_api_key_missing_response()
     ret = await _global_state.tokenizer_manager.kvtc_record_dump(
         output_path=obj.output_path,
         ratio=obj.ratio,
