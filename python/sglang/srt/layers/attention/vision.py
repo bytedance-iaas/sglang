@@ -45,8 +45,6 @@ if _is_cuda:
 if _is_npu:
     import torch_npu
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -65,6 +63,8 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
