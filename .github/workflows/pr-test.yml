@@ -70,7 +70,7 @@ permissions:
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
-    runs-on: ubuntu-latest
+    runs-on: sglang-runner-1gpu
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }} # sgl-kernel tests only run when kernels are rebuilt
@@ -200,7 +200,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: sglang-runner-1gpu
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
     steps:
@@ -261,7 +261,7 @@ jobs:
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: sglang-runner-1gpu
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
     steps:
@@ -376,7 +376,7 @@ jobs:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently) and when target_stage is set
     if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: x64-kernel-build-node
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     strategy:
       matrix:
@@ -479,7 +479,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -519,7 +519,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -559,7 +559,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       CI: true
@@ -685,7 +685,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -719,7 +719,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -766,7 +766,7 @@ jobs:
           (needs.check-changes.outputs.main_package == 'true')
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     steps:
       - name: Free disk space
@@ -812,7 +812,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-5090
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-5090
@@ -866,7 +866,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -916,7 +916,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: sglang-runner-2gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -965,7 +965,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-5090
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-5090
@@ -1013,7 +1013,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -1062,7 +1062,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: sglang-runner-2gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -1107,7 +1107,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-5090
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-5090
@@ -1158,7 +1158,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: sglang-runner-2gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -1254,7 +1254,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 4-gpu-h100
+    runs-on: sglang-runner-4gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -1340,7 +1340,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -1391,7 +1391,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: sglang-runner-2gpu
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -1442,7 +1442,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 4-gpu-h100
+    runs-on: sglang-runner-4gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -1495,7 +1495,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 8-gpu-h200
+    runs-on: sglang-runner-8gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -1554,7 +1554,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 8-gpu-h20
+    runs-on: sglang-runner-8gpu
     timeout-minutes: 60
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
@@ -1608,7 +1608,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 4-gpu-h100
+    runs-on: sglang-runner-4gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -1841,7 +1841,7 @@ jobs:
         # unit-test-backend-4-gpu-gb200,  # Disabled: GB200 runner needs repair
       ]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: sglang-runner-1gpu
     steps:
       - name: Check all dependent job statuses
         run: |
