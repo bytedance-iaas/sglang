@@ -425,7 +425,7 @@ jobs:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently) and when target_stage is set
     if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: arm-kernel-build-node
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     strategy:
       matrix:
@@ -612,7 +612,7 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
@@ -1206,7 +1206,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
@@ -1299,7 +1299,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
@@ -1706,7 +1706,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    runs-on: sglang-runner-1gpu
     timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
