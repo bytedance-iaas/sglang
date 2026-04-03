@@ -6,11 +6,12 @@ from collections.abc import Mapping
 from enum import Enum
 from importlib.metadata import version
 from typing import Optional
+
 from sglang.srt.observability_buckets import (
     _GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
+    _GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS,
     _GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN_BUCKETS,
     _GEN_AI_SERVER_TIME_TO_FIRST_TOKEN_BUCKETS,
-    _GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS,
 )
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
@@ -36,7 +37,6 @@ try:
     )
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import (
-        MetricExporter,
         PeriodicExportingMetricReader,
     )
     from opentelemetry.sdk.trace import TracerProvider
@@ -236,7 +236,7 @@ def init_genai_metrics(meter: Meter) -> None:
             name=Meters.LLM_TOKEN_USAGE,
             unit="token",
             description="Measures number of input and output tokens used",
-            explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS
+            explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS,
         )
         # Meters.chat_token_recoder = meter.create_observable_counter()
         Meters.chat_choice_counter = meter.create_counter(
@@ -249,7 +249,7 @@ def init_genai_metrics(meter: Meter) -> None:
             name=Meters.LLM_OPERATION_DURATION,
             unit="s",
             description="GenAI operation duration",
-            explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS
+            explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
         )
 
         Meters.chat_exception_counter = meter.create_counter(
@@ -262,19 +262,19 @@ def init_genai_metrics(meter: Meter) -> None:
             name=Meters.LLM_STREAMING_TIME_TO_FIRST_TOKEN,
             unit="s",
             description="Time to first token in streaming chat completions",
-            explicit_bucket_boundaries_advisory=_GEN_AI_SERVER_TIME_TO_FIRST_TOKEN_BUCKETS
+            explicit_bucket_boundaries_advisory=_GEN_AI_SERVER_TIME_TO_FIRST_TOKEN_BUCKETS,
         )
         Meters.streaming_time_to_generate = meter.create_histogram(
             name=Meters.LLM_STREAMING_TIME_TO_GENERATE,
             unit="s",
             description="Time between first token and completion in streaming chat completions",
-            explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS
+            explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
         )
         Meters.streaming_time_per_output_token = meter.create_histogram(
             name=Meters.LLM_STREAMING_TIME_PER_OUTPUT_TOKEN,
             unit="s",
             description="Time per output token in streaming chat completions",
-            explicit_bucket_boundaries_advisory=_GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN_BUCKETS
+            explicit_bucket_boundaries_advisory=_GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN_BUCKETS,
         )
         Meters.is_metrics_inited = True
     except Exception as ex:  # pylint: disable=broad-except
@@ -380,7 +380,7 @@ class SpanAttributes:
     GEN_AI_STREAMING_TIME_PER_OUTPUT_TOKEN = (
         "gen_ai.chat_completions.streaming_time_per_output_token"
     )
-    GEN_AI_STREAMING_TIME_TO_GENERATE= (
+    GEN_AI_STREAMING_TIME_TO_GENERATE = (
         "gen_ai.chat_completions.streaming_time_to_generate"
     )
 
@@ -586,7 +586,12 @@ def accumulate_stream_items(item, complete_response):
     if is_otel_available():
 
         if complete_response is None:
-            complete_response = {"choices": [], "model": "", "usage": None, "error": None}
+            complete_response = {
+                "choices": [],
+                "model": "",
+                "usage": None,
+                "error": None,
+            }
         item = model_as_dict(item)
         if not isinstance(item, dict):
             return
@@ -600,7 +605,9 @@ def accumulate_stream_items(item, complete_response):
 
         # prompt filter results
         if item.get("prompt_filter_results"):
-            complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
+            complete_response["prompt_filter_results"] = item.get(
+                "prompt_filter_results"
+            )
 
         if item.get("choices"):
             for choice in item.get("choices"):
@@ -649,7 +656,10 @@ def accumulate_stream_items(item, complete_response):
                         if tool_call_function and tool_call_function.get("name"):
                             span_function["name"] = tool_call_function.get("name")
                         if tool_call_function and tool_call_function.get("arguments"):
-                            span_function["arguments"] += tool_call_function.get("arguments")
+                            span_function["arguments"] += tool_call_function.get(
+                                "arguments"
+                            )
+
 
 class OpenTelemetryProvider:
     def __init__(self):
@@ -750,7 +760,7 @@ class OpenTelemetryProvider:
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_FIRST_TOKEN,
-                        time_of_first_token - start_time
+                        time_of_first_token - start_time,
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_GENERATE,
