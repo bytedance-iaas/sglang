@@ -31,8 +31,8 @@ from sgl_kernel import merge_state_v2
 _is_musa = is_musa()
 if not _is_musa:
     from sglang.jit_kernel.flash_attention import (
-      flash_attn_varlen_func,
-      flash_attn_with_kvcache,
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
     )
 else:
     from flash_attn import flash_attn_varlen_func
@@ -40,11 +40,7 @@ else:
     from sglang.srt.hardware_backend.musa.attention import (
         FlashAttentionContext,
         FlashAttentionContextManager,
-    )
-    from sglang.srt.hardware_backend.musa.attention import (
-        flash_attn_with_kvcache
-    )
-    from sglang.srt.hardware_backend.musa.attention import (
+        flash_attn_with_kvcache,
         update_flash_attention_context,
     )
 
@@ -1074,6 +1070,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                             **kwargs,
                         )
                     )
@@ -1348,14 +1345,6 @@ class FlashAttentionBackend(AttentionBackend):
         **kwargs,
     ):
         """Internal implementation of forward_decode, wrapped by context manager."""
-        k_descale, v_descale = None, None
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
-
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
