@@ -1,0 +1,4 @@
+transport_p50_ms: 1.6
+transport_p95_ms: 4.4
+throughput_mb_s: 930
+output: results/eic_microbench.json

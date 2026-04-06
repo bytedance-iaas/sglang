@@ -1,0 +1,8 @@
+backend: gpu_only
+replay: shared_context_replay
+cache_mode: online_built_cache
+num_requests: 64
+ttft_base_ms: 110
+ttft_jitter_ms: 20
+success_prob: 0.98
+results_dir: results
