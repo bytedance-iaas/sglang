@@ -3,7 +3,6 @@ import os
 from typing import Optional, Union
 
 import torch
-from kernels import get_kernel, load_kernel
 
 from sglang.jit_kernel.utils import cache_once
 from sglang.kernel_api_logging import debug_kernel_api
@@ -30,7 +29,10 @@ def _load_fa3_kernels():
     lockfile_path = os.path.join(
         envs.SGLANG_CACHE_DIR.get(), DEFAULT_FA3_KERNEL_LOCKFILE
     )
+
     try:
+        from kernels import get_kernel, load_kernel
+
         # When the lock file provided, load from the kernel cache directory,
         # otherwise, load from the repo, which require download from huggingface hub
         # but always works as long as the repo is accessible.
