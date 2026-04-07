@@ -735,6 +735,35 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         return hidden_states
 
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        """Set the layers to capture for EAGLE3 speculative decoding."""
+        if not hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+            raise AttributeError(
+                "language_model does not support EAGLE3 speculative decoding."
+            )
+
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get embedding and LM head weights for speculative decoding."""
+        if not hasattr(self.language_model, "get_embed_and_head"):
+            raise AttributeError(
+                "language_model does not support get_embed_and_head()."
+            )
+
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+        """Set embedding and LM head weights for speculative decoding."""
+        if not hasattr(self.language_model, "set_embed_and_head"):
+            raise AttributeError(
+                "language_model does not support set_embed_and_head()."
+            )
+
+        self.language_model.set_embed_and_head(embed, head)
+    
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         mapper = getattr(self, "hf_to_sglang_mapper", None)
