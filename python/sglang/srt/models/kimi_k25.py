@@ -759,6 +759,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             raise AttributeError("language_model does not support set_embed_and_head.")
 
         self.language_model.set_embed_and_head(embed, head)
+
     
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
