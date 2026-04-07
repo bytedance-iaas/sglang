@@ -749,18 +749,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get embedding and LM head weights for speculative decoding."""
         if not hasattr(self.language_model, "get_embed_and_head"):
-            raise AttributeError(
-                "language_model does not support get_embed_and_head."
-            )
+            raise AttributeError("language_model does not support get_embed_and_head.")
 
         return self.language_model.get_embed_and_head()
 
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
         """Set embedding and LM head weights for speculative decoding."""
         if not hasattr(self.language_model, "set_embed_and_head"):
-            raise AttributeError(
-                "language_model does not support set_embed_and_head."
-            )
+            raise AttributeError("language_model does not support set_embed_and_head.")
 
         self.language_model.set_embed_and_head(embed, head)
     
