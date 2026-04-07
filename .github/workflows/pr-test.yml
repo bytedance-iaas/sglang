@@ -876,7 +876,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -932,7 +932,8 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
@@ -988,7 +989,7 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1044,7 +1045,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1101,7 +1102,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -1557,7 +1558,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
