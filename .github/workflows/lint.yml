@@ -59,7 +59,7 @@ jobs:
 
   arc-smoke-1gpu:
     needs: lint
-    runs-on: 1-gpu-runner
+    runs-on: [self-hosted, 1-gpu-runner]
     timeout-minutes: 15
     steps:
       - name: Show runner labels
