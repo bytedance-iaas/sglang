@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from enum import Enum
 from importlib.metadata import version
 from typing import Optional
+
 from sglang.srt.observability_buckets import (
     _GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
     _GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN_BUCKETS,
