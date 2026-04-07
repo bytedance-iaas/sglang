@@ -1515,7 +1515,7 @@ class RowParallelLinear(LinearBase):
                 output = self.gemm_ar_attn_op.forward(input_, self.weight)
             else:
                 output = self.gemm_ar_mlp_op.forward(input_, self.weight)
-
+            print("output shape:", output.shape, "input shape:", input_.shape, "weight shape:", self.weight.shape)
             if not self.skip_bias_add and self.bias is not None:
                 output = output + self.bias
 
