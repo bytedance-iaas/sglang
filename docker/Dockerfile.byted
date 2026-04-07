@@ -7,6 +7,7 @@ ARG sglang_router_version=
 ARG gdkv_sdk_version=
 ARG pris_sdk_version=
 ARG eic_sdk_version=
+ARG TRANSFORMERS_VERSION=5.2.0
 # ARG absl_version=2.3.0
 ARG branch=
 
@@ -27,6 +28,9 @@ RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url
 
 # sgl-kernel安装
 RUN http_proxy='' pip install sgl_kernel==${sgl_kernel_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple --no-deps
+
+# 明确覆盖 transformers 版本。由于 sglang 以 --no-deps 安装，这里需要单独安装。
+RUN http_proxy='' pip install "transformers==${TRANSFORMERS_VERSION}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
 
 # sglang-router安装
 RUN if [ "x$sglang_router_version" = "x"  ]; then \
