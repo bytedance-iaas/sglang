@@ -37,6 +37,7 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.3
 ARG MOONCAKE_VERSION=0.3.9
+ARG TRANSFORMERS_VERSION=5.2.0
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -268,6 +269,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi \
     && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+    && python3 -m pip install --force-reinstall "transformers==${TRANSFORMERS_VERSION}" \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
