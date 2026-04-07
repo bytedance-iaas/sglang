@@ -745,11 +745,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
                         remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, index, complete_response,
+                            parser,
+                            content,
+                            request,
+                            index,
+                            complete_response,
                         )
                         if remaining_chunk:
                             yield remaining_chunk
-
 
                 else:
                     # Regular content

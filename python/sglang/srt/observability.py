@@ -9,9 +9,9 @@ from typing import Optional
 
 from sglang.srt.observability_buckets import (
     _GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
+    _GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS,
     _GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN_BUCKETS,
     _GEN_AI_SERVER_TIME_TO_FIRST_TOKEN_BUCKETS,
-    _GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS,
 )
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
@@ -603,7 +603,9 @@ def accumulate_stream_items(item, complete_response):
 
         # prompt filter results
         if item.get("prompt_filter_results"):
-            complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
+            complete_response["prompt_filter_results"] = item.get(
+                "prompt_filter_results"
+            )
 
         if item.get("choices"):
             for choice in item.get("choices"):
@@ -652,7 +654,10 @@ def accumulate_stream_items(item, complete_response):
                         if tool_call_function and tool_call_function.get("name"):
                             span_function["name"] = tool_call_function.get("name")
                         if tool_call_function and tool_call_function.get("arguments"):
-                            span_function["arguments"] += tool_call_function.get("arguments")
+                            span_function["arguments"] += tool_call_function.get(
+                                "arguments"
+                            )
+
 
 class OpenTelemetryProvider:
     def __init__(self):
@@ -753,7 +758,7 @@ class OpenTelemetryProvider:
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_FIRST_TOKEN,
-                        time_of_first_token - start_time
+                        time_of_first_token - start_time,
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_GENERATE,
