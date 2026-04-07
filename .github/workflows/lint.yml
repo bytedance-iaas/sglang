@@ -55,3 +55,18 @@ jobs:
         working-directory: test
         run: |
           python3 run_suite.py --hw cpu --suite stage-a-cpu-only
+
+
+  arc-smoke-1gpu:
+    needs: lint
+    runs-on: 1-gpu-runner
+    timeout-minutes: 15
+    steps:
+      - name: Show runner labels
+        run: echo "Running on self-hosted 1-gpu runner"
+
+      - name: Check GPU visibility
+        run: nvidia-smi --query-gpu=name --format=csv,noheader
+
+      - name: Check docker sidecar
+        run: docker version
