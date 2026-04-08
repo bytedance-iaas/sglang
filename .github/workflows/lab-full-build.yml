@@ -56,12 +56,12 @@ jobs:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: x64-kernel-build-node
     env:
-      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
-      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
-      ALL_PROXY: ${{ env.RUNNER_PROXY }}
-      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
-      SGLANG_BUILD_PROXY_URL: ${{ env.RUNNER_PROXY }}
-      SGLANG_BUILD_NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      SGLANG_BUILD_PROXY_URL: http://100.68.160.245:3128
+      SGLANG_BUILD_NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
       BUILD_JOBS: "32"
       NVCC_THREADS: "8"
@@ -143,10 +143,10 @@ jobs:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: x64-docker-build-node
     env:
-      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
-      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
-      ALL_PROXY: ${{ env.RUNNER_PROXY }}
-      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
     steps:
       - name: Checkout repository
@@ -186,10 +186,10 @@ jobs:
       - gateway-wheel
       - gateway-docker
     env:
-      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
-      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
-      ALL_PROXY: ${{ env.RUNNER_PROXY }}
-      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
     steps:
       - name: Checkout repository
@@ -237,10 +237,10 @@ jobs:
     needs:
       - docker-framework
     env:
-      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
-      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
-      ALL_PROXY: ${{ env.RUNNER_PROXY }}
-      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
     steps:
       - name: Checkout repository
