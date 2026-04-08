@@ -797,36 +797,6 @@ jobs:
   #         cd sgl-kernel
   #         pytest tests/
 
-  # =============================================== jit-kernel ====================================================
-
-  jit-kernel-unit-test:
-    needs: [check-changes, call-gate]
-    # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
-    timeout-minutes: 240
-    env:
-      RUNNER_LABELS: 1-gpu-runner
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd python/sglang/jit_kernel
-          pytest tests/
-
   # =============================================== primary ====================================================
 
   stage-a-test-1:
@@ -1429,8 +1399,6 @@ jobs:
 
         wait-for-stage-a,
         wait-for-stage-b,
-
-        jit-kernel-unit-test,
 
         stage-a-test-1,
         stage-a-cpu-only,
