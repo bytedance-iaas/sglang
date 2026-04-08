@@ -1,6 +1,13 @@
 name: Build Development Docker Image (PR)
 
 on:
+  push:
+    paths:
+      - ".github/workflows/build-docker-dev-pr.yml"
+      - "docker/**"
+      - "python/**"
+      - "sgl-kernel/**"
+      - "scripts/**"
   pull_request:
     branches:
       - ep_main
@@ -10,15 +17,9 @@ on:
       - "python/**"
       - "sgl-kernel/**"
       - "scripts/**"
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: "PR number to build from (leave empty to use current branch)"
-        required: false
-        default: ""
 
 concurrency:
-  group: build-docker-dev-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref_name }}
+  group: build-docker-dev-pr-${{ github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -43,8 +44,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
 
       - name: Show runner context
         run: |
