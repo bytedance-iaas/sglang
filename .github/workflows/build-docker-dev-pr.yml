@@ -31,6 +31,8 @@ jobs:
     env:
       # The runner service itself also carries these proxy vars so action archive download
       # works during the Set up job phase before workflow steps begin.
+      # The runner user also needs docker group membership because the very first smoke step
+      # executes `docker version` before buildx setup.
       HTTP_PROXY: http://100.68.160.245:3128
       HTTPS_PROXY: http://100.68.160.245:3128
       ALL_PROXY: http://100.68.160.245:3128
