@@ -26,7 +26,7 @@ permissions:
 
 env:
   RUNNER_PROXY: http://100.68.160.245:3128
-  RUNNER_NO_PROXY: localhost,127.0.0.1,::1,hub.byted.org,mirrors.byted.org,bytedpypi.byted.org,luban-source.byted.org,tosv.byted.org,tos-cn-north.byted.org
+  RUNNER_NO_PROXY: localhost,127.0.0.1,::1
 
 jobs:
   build-dev-x64:
@@ -35,8 +35,6 @@ jobs:
     env:
       # The runner service itself also carries these proxy vars so action archive download
       # works during the Set up job phase before workflow steps begin.
-      # The runner user also needs docker group membership because the very first smoke step
-      # executes `docker version` before buildx setup.
       HTTP_PROXY: ${{ env.RUNNER_PROXY }}
       HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
       ALL_PROXY: ${{ env.RUNNER_PROXY }}
