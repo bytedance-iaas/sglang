@@ -29,6 +29,8 @@ jobs:
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
+      # The runner service itself also carries these proxy vars so action archive download
+      # works during the Set up job phase before workflow steps begin.
       HTTP_PROXY: http://100.68.160.245:3128
       HTTPS_PROXY: http://100.68.160.245:3128
       ALL_PROXY: http://100.68.160.245:3128
