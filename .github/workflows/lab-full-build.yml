@@ -1,0 +1,283 @@
+name: Lab Full Build Validation
+
+on:
+  push:
+    branches:
+      - codex/full-build-lab
+    paths:
+      - .github/workflows/lab-full-build.yml
+      - docker/**
+      - python/**
+      - sgl-kernel/**
+      - sgl-model-gateway/**
+  workflow_dispatch:
+
+concurrency:
+  group: lab-full-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUNNER_PROXY: http://100.68.160.245:3128
+  RUNNER_NO_PROXY: localhost,127.0.0.1,::1
+
+jobs:
+  python-wheel:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build Python wheel
+        run: |
+          cd python
+          python3 -m pip install --upgrade build wheel setuptools
+          cp ../README.md ../LICENSE .
+          python3 -m build --wheel
+          ls -lh dist/
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel
+          path: python/dist/*.whl
+
+  kernel-wheel:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-kernel-build-node
+    env:
+      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
+      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
+      ALL_PROXY: ${{ env.RUNNER_PROXY }}
+      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      SGLANG_BUILD_PROXY_URL: ${{ env.RUNNER_PROXY }}
+      SGLANG_BUILD_NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+      BUILD_JOBS: "32"
+      NVCC_THREADS: "8"
+      USE_CCACHE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Show runner context
+        run: |
+          whoami
+          uname -a
+          docker version
+
+      - name: Build kernel wheel
+        run: |
+          cd sgl-kernel
+          chmod +x ./build.sh
+          ./build.sh 3.10 12.9
+
+      - name: Upload kernel wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-wheel
+          path: sgl-kernel/dist/*.whl
+
+  gateway-wheel:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build gateway wheel and binary
+        working-directory: sgl-model-gateway
+        run: |
+          python3 -m pip install --upgrade maturin
+          cargo build --release --bin sgl-model-gateway --bin smg --bin amg --features vendored-openssl
+          cd bindings/python
+          maturin build --release --features vendored-openssl --out dist
+          ls -lh dist/
+          ls -lh ../../target/release/sgl-model-gateway ../../target/release/smg ../../target/release/amg
+
+      - name: Upload gateway artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-artifacts
+          path: |
+            sgl-model-gateway/bindings/python/dist/*
+            sgl-model-gateway/target/release/sgl-model-gateway
+            sgl-model-gateway/target/release/smg
+            sgl-model-gateway/target/release/amg
+
+  gateway-docker:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    env:
+      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
+      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
+      ALL_PROXY: ${{ env.RUNNER_PROXY }}
+      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Bootstrap builder
+        run: docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
+
+      - name: Build gateway router image
+        run: |
+          docker buildx build \
+            --builder "${{ steps.buildx.outputs.name }}" \
+            --target router-image \
+            --load \
+            -f docker/gateway.Dockerfile \
+            -t sglang-lab:gateway \
+            .
+
+      - name: Smoke test gateway image
+        run: |
+          docker run --rm sglang-lab:gateway python3 -m sglang_router --version
+
+  docker-framework:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    needs:
+      - python-wheel
+      - kernel-wheel
+      - gateway-wheel
+      - gateway-docker
+    env:
+      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
+      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
+      ALL_PROXY: ${{ env.RUNNER_PROXY }}
+      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pre-pull public base image
+        run: docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Bootstrap builder
+        run: docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
+
+      - name: Build framework image
+        run: |
+          docker buildx build \
+            --builder "${{ steps.buildx.outputs.name }}" \
+            --target framework \
+            --load \
+            -f docker/Dockerfile \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg BASE_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 \
+            --build-arg USE_INTERNAL_MIRRORS=0 \
+            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=0 \
+            -t sglang-lab:framework \
+            .
+
+      - name: Smoke test framework image
+        run: |
+          docker run --rm sglang-lab:framework \
+            python3 -c "import sglang, sgl_kernel, sglang_router; print('framework-import-ok')"
+
+  docker-runtime:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    needs:
+      - docker-framework
+    env:
+      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
+      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
+      ALL_PROXY: ${{ env.RUNNER_PROXY }}
+      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pre-pull public base image
+        run: docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Bootstrap builder
+        run: docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
+
+      - name: Build runtime image
+        run: |
+          docker buildx build \
+            --builder "${{ steps.buildx.outputs.name }}" \
+            --target runtime \
+            --load \
+            -f docker/Dockerfile \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg BASE_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 \
+            --build-arg USE_INTERNAL_MIRRORS=0 \
+            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=0 \
+            -t sglang-lab:runtime \
+            .
+
+      - name: Smoke test runtime image
+        run: |
+          docker run --rm sglang-lab:runtime \
+            python3 -c "import sglang; print('runtime-import-ok')"

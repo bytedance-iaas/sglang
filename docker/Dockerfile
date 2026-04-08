@@ -1,7 +1,8 @@
 ARG CUDA_VERSION=12.9.1
-# 使用已缓存好的base镜像
-FROM hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 as base
+ARG BASE_IMAGE=hub.byted.org/iaas/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
+FROM ${BASE_IMAGE} as base
 ARG TARGETARCH
+ARG USE_INTERNAL_MIRRORS=1
 
 ARG GRACE_BLACKWELL=0
 # 配置 apt 将缓存放到 /root/.cache/apt 目录
@@ -11,8 +12,10 @@ RUN mkdir -p /root/.cache/apt/archives/partial /root/.cache/apt/lists/partial \
  && echo 'Dir::State::lists "/root/.cache/apt/lists";' >> /etc/apt/apt.conf.d/99custom-cache \
  && echo 'APT::Sandbox::User "root";' >> /etc/apt/apt.conf.d/99custom-cache
 # 编译之前，将源统一设置成内网的
-RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list
+RUN if [ "${USE_INTERNAL_MIRRORS}" = "1" ]; then \
+      sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
+      sed -i 's/security.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list; \
+    fi
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
@@ -74,7 +77,9 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # 在安装pip后，设置pip源为火山内网源
-RUN python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple
+RUN if [ "${USE_INTERNAL_MIRRORS}" = "1" ] && [ -z "${PIP_DEFAULT_INDEX}" ]; then \
+      python3 -m pip config set global.index-url https://bytedpypi.byted.org/simple; \
+    fi
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -194,6 +199,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG DEEPEP_COMMIT
 ARG TRITON_LANG_COMMIT
 ARG GITHUB_ARTIFACTORY
+ARG USE_INTERNAL_MIRRORS
 
 WORKDIR /sgl-workspace
 ARG CUSTOM_CACHE_TOS_AK
@@ -240,8 +246,14 @@ ARG SGLANG_BRANCH
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
-    else \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    elif [ -n "$SGL_VERSION" ]; then \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    elif [ -n "$SGLANG_BRANCH" ]; then \
         git clone --depth=1 https://github.com/bytedance-iaas/sglang.git -b ${SGLANG_BRANCH} /sgl-workspace/sglang; \
+    else \
+        echo "Either BRANCH_TYPE=local, USE_LATEST_SGLANG=1, SGL_VERSION, or SGLANG_BRANCH must be provided" && exit 1; \
     fi \
     && rm -rf /tmp/local_src
 
@@ -470,11 +482,14 @@ RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/clang-format \
     && chmod +x /usr/local/bin/clang-format
 
 # Install clangd
-# 使用clangd的缓存包加速编译
-RUN wget https://tosv.byted.org/obj/iaas-servingkit/clangd-linux-18.1.3.zip \
-    && mv clangd-linux-18.1.3.zip clangd.zip \
-#RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
-    && unzip clangd.zip \
+RUN if [ "${USE_INTERNAL_MIRRORS}" = "1" ]; then \
+      wget https://tosv.byted.org/obj/iaas-servingkit/clangd-linux-18.1.3.zip && \
+      mv clangd-linux-18.1.3.zip clangd.zip; \
+    else \
+      curl --retry 3 --retry-delay 2 -fsSL -o clangd.zip \
+        https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip; \
+    fi \
+    && unzip -q clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
     && rm -rf clangd_18.1.3 clangd.zip
@@ -483,7 +498,12 @@ RUN wget https://tosv.byted.org/obj/iaas-servingkit/clangd-linux-18.1.3.zip \
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && wget "https://tosv.byted.org/obj/iaas-servingkit/${CMAKE_INSTALLER}.tar.gz" \
+    && if [ "${USE_INTERNAL_MIRRORS}" = "1" ]; then \
+         wget "https://tosv.byted.org/obj/iaas-servingkit/${CMAKE_INSTALLER}.tar.gz"; \
+       else \
+         curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
+           "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz"; \
+       fi \
     && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
@@ -546,9 +566,11 @@ RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
 WORKDIR /sgl-workspace/sglang
 
 # 将源统一切换成火山源
-RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
-RUN rm -rf /var/lib/apt/lists/* && \
-    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
-    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list
+RUN if [ "${USE_INTERNAL_MIRRORS}" = "1" ]; then \
+      pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/; \
+      rm -rf /var/lib/apt/lists/* && \
+      sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+      sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list; \
+    fi
 
 CMD ["/bin/bash"]

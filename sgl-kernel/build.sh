@@ -27,15 +27,30 @@ CCACHE_HOST_DIR="${CACHE_DIR}/ccache"
 mkdir -p "${BUILDX_CACHE_DIR}" "${CCACHE_HOST_DIR}"
 
 # Proxy settings
-PROXY_URL="http://sys-proxy-rd-relay.byted.org:8118"
-NO_PROXY_LIST="localhost,127.0.0.1,::1"
+PROXY_URL="${SGLANG_BUILD_PROXY_URL:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-http://sys-proxy-rd-relay.byted.org:8118}}}}}"
+NO_PROXY_LIST="${SGLANG_BUILD_NO_PROXY:-${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}}"
 
 # Ensure a buildx builder with docker-container driver (required for cache export)
 BUILDER_NAME="sgl-kernel-builder"
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap   --driver-opt network=host \
-  --driver-opt env.http_proxy="${PROXY_URL}" \
-  --driver-opt env.https_proxy="${PROXY_URL}"
+  BUILDX_CREATE_ARGS=(
+    --name "${BUILDER_NAME}"
+    --driver docker-container
+    --use
+    --bootstrap
+    --driver-opt network=host
+  )
+  if [ -n "${PROXY_URL}" ]; then
+    BUILDX_CREATE_ARGS+=(
+      --driver-opt env.http_proxy="${PROXY_URL}"
+      --driver-opt env.https_proxy="${PROXY_URL}"
+      --driver-opt env.HTTP_PROXY="${PROXY_URL}"
+      --driver-opt env.HTTPS_PROXY="${PROXY_URL}"
+      --driver-opt env.no_proxy="${NO_PROXY_LIST}"
+      --driver-opt env.NO_PROXY="${NO_PROXY_LIST}"
+    )
+  fi
+  docker buildx create "${BUILDX_CREATE_ARGS[@]}"
 else
   docker buildx use "${BUILDER_NAME}"
 fi
@@ -69,6 +84,8 @@ BUILD_ARGS=()
 [ -n "${USE_CCACHE:-}" ]           && BUILD_ARGS+=(--build-arg USE_CCACHE="${USE_CCACHE}")
 [ -n "${BUILD_JOBS:-}" ]           && BUILD_ARGS+=(--build-arg BUILD_JOBS="${BUILD_JOBS}")
 [ -n "${NVCC_THREADS:-}" ]         && BUILD_ARGS+=(--build-arg NVCC_THREADS="${NVCC_THREADS}")
+[ -n "${PROXY_URL}" ]              && BUILD_ARGS+=(--build-arg http_proxy="${PROXY_URL}" --build-arg https_proxy="${PROXY_URL}")
+[ -n "${NO_PROXY_LIST}" ]          && BUILD_ARGS+=(--build-arg no_proxy="${NO_PROXY_LIST}")
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
@@ -81,9 +98,6 @@ docker buildx build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
-  --build-arg http_proxy="${PROXY_URL}" \
-  --build-arg https_proxy="${PROXY_URL}" \
-  --build-arg no_proxy="${NO_PROXY_LIST}" \
   "${BUILD_ARGS[@]}" \
   --cache-from type=local,src=${BUILDX_CACHE_DIR} \
   --cache-to type=local,dest=${BUILDX_CACHE_DIR},mode=max \
@@ -106,8 +120,9 @@ docker run --rm \
   -v "${CCACHE_HOST_DIR}:/ccache" \
   -w /sgl-kernel \
   -e ARCH="${ARCH}" \
-  -e http_proxy="${PROXY_URL}" \
-  -e https_proxy="${PROXY_URL}" \
+  ${PROXY_URL:+-e http_proxy="${PROXY_URL}"} \
+  ${PROXY_URL:+-e https_proxy="${PROXY_URL}"} \
+  ${NO_PROXY_LIST:+-e no_proxy="${NO_PROXY_LIST}"} \
   "${DEPS_TAG}" \
   bash -c '
 set -eux
