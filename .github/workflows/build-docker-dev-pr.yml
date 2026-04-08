@@ -61,6 +61,9 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@v3
         with:
+          # Use the daemon-backed driver so Docker Hub auth stays on the local daemon
+          # after the explicit pre-pull, instead of re-entering the proxy-sensitive
+          # anonymous token flow inside a separate buildkit container.
           driver: docker
 
       - name: Bootstrap builder
