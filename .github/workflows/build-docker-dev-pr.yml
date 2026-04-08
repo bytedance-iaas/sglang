@@ -53,17 +53,15 @@ jobs:
           echo "RUNNER_ARCH=${RUNNER_ARCH}"
           docker version
 
+      - name: Pre-pull public base image
+        run: |
+          docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
         with:
-          driver-opts: |
-            env.http_proxy=${{ env.RUNNER_PROXY }}
-            env.https_proxy=${{ env.RUNNER_PROXY }}
-            env.HTTP_PROXY=${{ env.RUNNER_PROXY }}
-            env.HTTPS_PROXY=${{ env.RUNNER_PROXY }}
-            env.no_proxy=${{ env.RUNNER_NO_PROXY }}
-            env.NO_PROXY=${{ env.RUNNER_NO_PROXY }}
+          driver: docker
 
       - name: Bootstrap builder
         run: |
