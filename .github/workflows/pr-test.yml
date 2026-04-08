@@ -896,7 +896,7 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-small-1-gpu:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -958,7 +958,7 @@ jobs:
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-large-1-gpu:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1013,7 +1013,7 @@ jobs:
           artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-large-2-gpu:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1071,7 +1071,7 @@ jobs:
 
 
   stage-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -1125,7 +1125,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   stage-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -1185,7 +1185,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   stage-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -1240,7 +1240,7 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   stage-c-test-deepep-4-gpu:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -1288,7 +1288,7 @@ jobs:
         if: always()
 
   stage-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -1336,7 +1336,7 @@ jobs:
         if: always()
 
   stage-c-test-4-gpu-gb200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
@@ -1396,9 +1396,6 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
         sgl-kernel-b200-test,
-
-        wait-for-stage-a,
-        wait-for-stage-b,
 
         stage-a-test-1,
         stage-a-cpu-only,
