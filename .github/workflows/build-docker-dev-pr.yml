@@ -34,12 +34,11 @@ jobs:
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
-      # The runner service itself also carries these proxy vars so action archive download
-      # works during the Set up job phase before workflow steps begin.
-      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
-      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
-      ALL_PROXY: ${{ env.RUNNER_PROXY }}
-      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
+      # Keep job-side proxy env literal so workflow planning stays valid.
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
     steps:
       - name: Checkout repository
