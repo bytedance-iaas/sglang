@@ -4,15 +4,23 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
+from sglang.jit_kernel.utils import cache_once
 from sglang.kernel_api_logging import debug_kernel_api
 
-try:
-    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
-except Exception as _e:  # pragma: no cover
-    _flash_attn_varlen_func = None
-    _flash_attn_import_error = _e
-else:
-    _flash_attn_import_error = None
+
+@cache_once
+def _load_fa4_kernels():
+    try:
+        from flash_attn.cute import flash_attn_varlen_func
+
+        return {
+            "flash_attn_varlen_func": flash_attn_varlen_func,
+        }
+    except Exception as e:  # pragma: no cover
+        raise ImportError(
+            "Vendored FlashAttention CUTE is not available (cannot import "
+            "flash_attn.cute). Please check your source tree."
+        ) from e
 
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -43,12 +51,6 @@ def flash_attn_varlen_func(
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
 ):
-    if _flash_attn_varlen_func is None:  # pragma: no cover
-        raise ImportError(
-            "Vendored FlashAttention CUTE is not available (cannot import "
-            "flash_attn.cute). Please check your source tree."
-        ) from _flash_attn_import_error
-
     q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
     cu_seqlens_q, cu_seqlens_k = [
         _maybe_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k)
@@ -62,7 +64,7 @@ def flash_attn_varlen_func(
     if window_size == (-1, -1):
         window_size = (None, None)
 
-    result = _flash_attn_varlen_func(
+    result = _load_fa4_kernels()["flash_attn_varlen_func"](
         q=q,
         k=k,
         v=v,
