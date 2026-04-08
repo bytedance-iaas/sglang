@@ -24,6 +24,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  RUNNER_PROXY: http://100.68.160.245:3128
+  RUNNER_NO_PROXY: localhost,127.0.0.1,::1,hub.byted.org,mirrors.byted.org,bytedpypi.byted.org,luban-source.byted.org,tosv.byted.org,tos-cn-north.byted.org
+
 jobs:
   build-dev-x64:
     runs-on: x64-docker-build-node
@@ -33,10 +37,10 @@ jobs:
       # works during the Set up job phase before workflow steps begin.
       # The runner user also needs docker group membership because the very first smoke step
       # executes `docker version` before buildx setup.
-      HTTP_PROXY: http://100.68.160.245:3128
-      HTTPS_PROXY: http://100.68.160.245:3128
-      ALL_PROXY: http://100.68.160.245:3128
-      NO_PROXY: localhost,127.0.0.1,::1
+      HTTP_PROXY: ${{ env.RUNNER_PROXY }}
+      HTTPS_PROXY: ${{ env.RUNNER_PROXY }}
+      ALL_PROXY: ${{ env.RUNNER_PROXY }}
+      NO_PROXY: ${{ env.RUNNER_NO_PROXY }}
       BUILDKIT_NO_CLIENT_TOKEN: "true"
     steps:
       - name: Checkout repository
@@ -56,10 +60,12 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
-            env.http_proxy=http://100.68.160.245:3128
-            env.https_proxy=http://100.68.160.245:3128
-            env.HTTP_PROXY=http://100.68.160.245:3128
-            env.HTTPS_PROXY=http://100.68.160.245:3128
+            env.http_proxy=${{ env.RUNNER_PROXY }}
+            env.https_proxy=${{ env.RUNNER_PROXY }}
+            env.HTTP_PROXY=${{ env.RUNNER_PROXY }}
+            env.HTTPS_PROXY=${{ env.RUNNER_PROXY }}
+            env.no_proxy=${{ env.RUNNER_NO_PROXY }}
+            env.NO_PROXY=${{ env.RUNNER_NO_PROXY }}
 
       - name: Bootstrap builder
         run: |
