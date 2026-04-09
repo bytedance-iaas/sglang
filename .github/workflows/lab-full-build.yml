@@ -57,10 +57,6 @@ jobs:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: x64-kernel-build-node
     env:
-      HTTP_PROXY: http://100.68.160.245:3128
-      HTTPS_PROXY: http://100.68.160.245:3128
-      ALL_PROXY: http://100.68.160.245:3128
-      NO_PROXY: localhost,127.0.0.1,::1
       SGLANG_BUILD_PROXY_URL: http://100.68.160.245:3128
       SGLANG_BUILD_NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
@@ -85,6 +81,11 @@ jobs:
           docker version
 
       - name: Build kernel wheel
+        env:
+          HTTP_PROXY: http://100.68.160.245:3128
+          HTTPS_PROXY: http://100.68.160.245:3128
+          ALL_PROXY: http://100.68.160.245:3128
+          NO_PROXY: localhost,127.0.0.1,::1
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
@@ -100,75 +101,75 @@ jobs:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          path: sglang-repo
+
+      - name: Move sgl-model-gateway folder to root
+        run: |
+          mv sglang-repo/sgl-model-gateway/* .
+          rm -rf sglang-repo
+          ls -alt
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
+      - name: Build gateway wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: x86_64
+          manylinux: auto
+          args: --release --out dist --features vendored-openssl --interpreter 3.9 3.10 3.11 3.12 3.13 3.14
+          rust-toolchain: stable
+          before-script-linux: |
+            if command -v yum &> /dev/null; then
+              yum update -y && yum install -y wget unzip gcc gcc-c++ perl-core make
+            elif command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y wget unzip gcc g++ perl make
+            fi
+            (cd /tmp && \
+             wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+             unzip protoc-32.0-linux-x86_64.zip -d /usr/local && \
+             rm protoc-32.0-linux-x86_64.zip)
+            protoc --version
 
-      - name: Install Rust toolchain
+      - name: Check gateway wheel
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build gateway wheel and binary
-        working-directory: sgl-model-gateway
-        run: |
-          python3 -m pip install --upgrade maturin
-          cargo build --release --bin sgl-model-gateway --bin smg --bin amg --features vendored-openssl
-          cd bindings/python
-          maturin build --release --features vendored-openssl --out dist
-          ls -lh dist/
-          ls -lh ../../target/release/sgl-model-gateway ../../target/release/smg ../../target/release/amg
+          python3 -m pip install -U twine
+          twine check --strict bindings/python/dist/*
+          ls -lh bindings/python/dist/
 
       - name: Upload gateway artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gateway-artifacts
-          path: |
-            sgl-model-gateway/bindings/python/dist/*
-            sgl-model-gateway/target/release/sgl-model-gateway
-            sgl-model-gateway/target/release/smg
-            sgl-model-gateway/target/release/amg
+          path: bindings/python/dist/*
 
   gateway-docker:
     if: github.repository == 'bytedance-iaas/sglang'
-    runs-on: x64-docker-build-node
-    env:
-      HTTP_PROXY: http://100.68.160.245:3128
-      HTTPS_PROXY: http://100.68.160.245:3128
-      ALL_PROXY: http://100.68.160.245:3128
-      NO_PROXY: localhost,127.0.0.1,::1
-      BUILDKIT_NO_CLIENT_TOKEN: "true"
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker
-
-      - name: Bootstrap builder
-        run: docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
 
       - name: Build gateway router image
         run: |
           docker buildx build \
             --builder "${{ steps.buildx.outputs.name }}" \
             --target router-image \
+            --platform linux/amd64 \
             --load \
             -f docker/gateway.Dockerfile \
             -t sglang-lab:gateway \
