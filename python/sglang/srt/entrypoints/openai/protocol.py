@@ -623,9 +623,8 @@ class ChatCompletionRequest(BaseModel):
     min_dynamic_patch: Optional[int] = None
     # History trajectory for VLA processors.
     history_traj: Optional[Dict[str, Any]] = None
-    # Compatibility fields for clients that nest extension params.
+    # Compatibility field for clients that nest extension params.
     extra_body: Optional[Dict[str, Any]] = None
-    extra_json: Optional[Dict[str, Any]] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

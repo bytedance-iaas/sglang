@@ -298,11 +298,9 @@ class OpenAIServingChat(OpenAIServingBase):
             request
         )
         extra_body = request.extra_body if isinstance(request.extra_body, dict) else {}
-        extra_json = request.extra_json if isinstance(request.extra_json, dict) else {}
         history_traj = (
             request.history_traj
             or extra_body.get("history_traj")
-            or extra_json.get("history_traj")
         )
 
         adapted_request = GenerateReqInput(
