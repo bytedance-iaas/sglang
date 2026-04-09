@@ -1,4 +1,5 @@
 name: Lab Full Build Validation
+# Branch-scoped lab workflow for validating the full build graph before touching ep_main.
 
 on:
   push:
