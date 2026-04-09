@@ -56,7 +56,7 @@ import torch
 import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-
+_LOW_LATENCY_PROFILE_LOG = get_bool_env_var("SGLANG_DEEPEP_LOW_LATENCY_PROFILE_LOG")
 logger = logging.getLogger(__name__)
 
 
@@ -386,6 +386,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids = topk_ids.to(torch.int64)
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_moe_runner_backend().is_deep_gemm()
             and not get_moe_runner_backend().is_cutlass()
             and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
@@ -466,7 +467,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                128
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_moe_runner_backend().is_deep_gemm()
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -491,7 +497,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            or _use_aiter
+            or _is_npu
+            or get_moe_runner_backend().is_triton()
+            or get_moe_runner_backend().is_triton_kernels()
+        ):
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
@@ -613,6 +625,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
+        capture_active = (
+            hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+        )
+        profile_enabled = _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda and not capture_active
+        if profile_enabled:
+            dispatch_start = torch.cuda.Event(enable_timing=True)
+            dispatch_end = torch.cuda.Event(enable_timing=True)
+            dispatch_start.record()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -634,6 +654,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
+        if profile_enabled:
+            dispatch_end.record()
+            dispatch_end.synchronize()
+            logger.warning(
+                "DEEPEP_LL_PROFILE_DISPATCH rank=%s hidden_shape=%s topk_shape=%s recv_hidden_shape=%s masked_sum=%s dispatch_ms=%.3f",
+                dist.get_rank(self.group),
+                tuple(hidden_states.shape),
+                tuple(topk_ids.shape),
+                tuple(packed_recv_hidden.shape),
+                int(self.packed_recv_count.sum().item()),
+                dispatch_start.elapsed_time(dispatch_end),
+            )
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
@@ -695,6 +727,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args_dict = {}
 
         with ctx:
+            capture_active = (
+                hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+            )
+            profile_enabled = (
+                _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda and not capture_active
+            )
+            if profile_enabled:
+                combine_start = torch.cuda.Event(enable_timing=True)
+                combine_end = torch.cuda.Event(enable_timing=True)
+                combine_start.record()
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
@@ -704,6 +746,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
             )
+            if profile_enabled:
+                combine_end.record()
+                combine_end.synchronize()
+                logger.warning(
+                    "DEEPEP_LL_PROFILE_COMBINE rank=%s input_shape=%s topk_shape=%s output_shape=%s combine_ms=%.3f",
+                    dist.get_rank(self.group),
+                    tuple(hidden_states.shape),
+                    tuple(topk_ids.shape),
+                    tuple(combined_hidden_states.shape),
+                    combine_start.elapsed_time(combine_end),
+                )
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
