@@ -2576,14 +2576,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        _fd_t0 = time.perf_counter()
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = self.decode_attn_backend
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
-        _fd_t1 = time.perf_counter()
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -2593,12 +2591,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.positions,
             forward_batch,
             **kwargs,
-        )
-        _fd_t2 = time.perf_counter()
-        logger.info(
-            "[FWD_DECODE_TIMING] attn_init=%.1fms model_fwd_cpu=%.1fms",
-            (_fd_t1 - _fd_t0) * 1e3,
-            (_fd_t2 - _fd_t1) * 1e3,
         )
         return ret
 
@@ -2629,22 +2621,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 can_run_graph,
             )
 
-        _fe_t0 = time.perf_counter()
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
-        _fe_t1 = time.perf_counter()
 
         ret = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
-        )
-        _fe_t2 = time.perf_counter()
-        logger.info(
-            "[FWD_EXTEND_TIMING] attn_init=%.1fms model_fwd_cpu=%.1fms",
-            (_fe_t1 - _fe_t0) * 1e3,
-            (_fe_t2 - _fe_t1) * 1e3,
         )
         return (ret, can_run_graph,)
 
@@ -2767,28 +2751,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if can_run_graph:
-            _gr_t0 = time.perf_counter()
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            torch.cuda.synchronize()
-            _gr_t1 = time.perf_counter()
-            logger.info(
-                "[FWD_RAW_TIMING] mode=%s cuda_graph_replay=%.1fms (synced)",
-                forward_batch.forward_mode,
-                (_gr_t1 - _gr_t0) * 1e3,
-            )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
-        _fwr_t0 = time.perf_counter()
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
-        _fwr_t1 = time.perf_counter()
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
@@ -2809,7 +2783,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
-        _fwr_t2 = time.perf_counter()
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -2833,26 +2806,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        _fwr_t3 = time.perf_counter()
         if (
             forward_batch.global_num_tokens_cpu is not None
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
-        _fwr_t4 = time.perf_counter()
-
-        torch.cuda.synchronize()
-        _fwr_t5 = time.perf_counter()
-        logger.info(
-            "[FWD_RAW_TIMING] mode=%s | prepare=%.1fms misc_setup=%.1fms "
-            "model_fwd=%.1fms post_fwd=%.1fms gpu_sync_wait=%.1fms",
-            forward_batch.forward_mode,
-            (_fwr_t1 - _fwr_t0) * 1e3,
-            (_fwr_t2 - _fwr_t1) * 1e3,
-            (_fwr_t3 - _fwr_t2) * 1e3,
-            (_fwr_t4 - _fwr_t3) * 1e3,
-            (_fwr_t5 - _fwr_t4) * 1e3,
-        )
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

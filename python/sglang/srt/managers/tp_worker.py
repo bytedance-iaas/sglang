@@ -449,12 +449,10 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
-        import time as _time
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
         # Get forward batch from model worker batch
-        _fbg_t0 = _time.perf_counter()
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
@@ -463,7 +461,6 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-        _fbg_t1 = _time.perf_counter()
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
@@ -474,7 +471,6 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
-            _fbg_t2 = _time.perf_counter()
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -505,15 +501,6 @@ class TpModelWorker(BaseTpWorker):
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
-                )
-                _fbg_t3 = _time.perf_counter()
-                _mode = forward_batch.forward_mode
-                logger.info(
-                    "[FBG_TIMING] mode=%s | init_fwd_batch=%.1fms model_fwd=%.1fms sample=%.1fms",
-                    _mode,
-                    (_fbg_t1 - _fbg_t0) * 1e3,
-                    (_fbg_t2 - _fbg_t1) * 1e3,
-                    (_fbg_t3 - _fbg_t2) * 1e3,
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU

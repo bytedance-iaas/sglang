@@ -1272,48 +1272,22 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
-        _loop_step_ct = 0
-        _LOG_INTERVAL = 20  # log every N steps that have a batch
         while True:
-            _t0 = time.time()
-
             # Receive requests
             recv_reqs = self.recv_requests()
-            _t1 = time.time()
             self.process_input_requests(recv_reqs)
-            _t2 = time.time()
             if self._engine_paused:
                 self.cancel_bubble_timer()
                 continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
-            _t3 = time.time()
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                _t4 = time.time()
                 self.process_batch_result(batch, result)
-                _t5 = time.time()
-
-                _loop_step_ct += 1
-                if _loop_step_ct % _LOG_INTERVAL == 1:
-                    _mode = getattr(batch, "forward_mode", "?")
-                    _bs = len(getattr(batch, "reqs", []))
-                    logger.info(
-                        "[LOOP_TIMING] step=%d mode=%s bs=%d | "
-                        "recv=%.1fms proc_inp=%.1fms get_batch=%.1fms "
-                        "run_batch=%.1fms proc_result=%.1fms total=%.1fms",
-                        _loop_step_ct, _mode, _bs,
-                        (_t1 - _t0) * 1e3,
-                        (_t2 - _t1) * 1e3,
-                        (_t3 - _t2) * 1e3,
-                        (_t4 - _t3) * 1e3,
-                        (_t5 - _t4) * 1e3,
-                        (_t5 - _t0) * 1e3,
-                    )
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()

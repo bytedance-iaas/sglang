@@ -75,63 +75,6 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
-# def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
-#     """
-#     Build offsets and experts for sparse m-grouped masked GEMM.
-
-#     Generates LOCAL offset pairs for each active expert group. The kernel will add
-#     (scheduler.current_group_idx * shape_m) to compute the global offset.
-
-#     Only groups with masked_m[g] > 0 are included in the output mapping.
-#     Each active group generates a pair of offsets (start, end) relative to that group.
-
-#     Args:
-#         masked_m: (num_groups,) tensor of actual token counts per group
-#         num_groups: number of expert groups
-#         block_m: block alignment for padding (default 128)
-
-#     Returns:
-#         offsets: flat tensor with LOCAL pairs [start_0, end_0, start_1, end_1, ...]
-#         experts: expert IDs for each active group + terminator (-1)
-#         list_size: number of experts in output (including terminator)
-
-#     Example:
-#         masked_m = torch.tensor([0, 12, 0, 129]), num_groups = 4
-#         offsets = [0, 128, 0, 256]  # LOCAL offsets (padded to 128)
-#         experts = [1, 3, -1]        # 2 active experts + terminator
-#         list_size = 3
-
-#     Note:
-#         Kernel computes global M index as:
-#         m_idx = (scheduler.current_group_idx * shape_m) + local_m_idx
-#     """
-#     offsets = []
-#     experts = []
-
-#     print(f"~~~~~~~ {masked_m} {num_groups} {block_m}")
-
-#     for g in range(num_groups):
-#         v = masked_m[g].item()
-#         if v > 0:  # Only process active groups
-#             # LOCAL offsets (relative to this group)
-#             # start = 0
-#             # Pad actual tokens to block_m alignment
-#             # end = ((v + block_m - 1) // block_m) * block_m
-#             end= v *block_mb
-#             offsets.append(end-block_m)
-#             offsets.append(end)
-#             experts.append(g)
-
-#     # Add terminator expert
-#     experts.append(-1)
-
-#     print(f"----- offsets {offsets}")
-#     print(f"------ experts {len(experts)} {experts}")
-
-#     return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
-#             torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-#             len(experts))
-
 def build_offsets_experts_from_masked_m(
     masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
 ):
@@ -168,9 +111,6 @@ def build_offsets_experts_from_masked_m(
             experts.append(g)
 
     experts.append(-1)
-
-    # print(f"----- offsets {offsets}")
-    # print(f"------ experts {len(experts)} {experts}")
 
     return (
         torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
