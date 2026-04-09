@@ -1041,3 +1041,17 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
+
+    def apply_deepep_normal(self, layer, dispatch_output):
+        if not hasattr(layer.scheme, "apply_deepep_normal"):
+            raise NotImplementedError(
+                f"{layer.scheme.__class__.__name__} does not support DeepEP normal mode."
+            )
+        return layer.scheme.apply_deepep_normal(layer, dispatch_output)
+    
+    def apply_deepep_ll(self, layer, dispatch_output):
+        if not hasattr(layer.scheme, "apply_deepep_ll"):
+            raise NotImplementedError(
+                f"{layer.scheme.__class__.__name__} does not support DeepEP low latency mode."
+            )
+        return layer.scheme.apply_deepep_ll(layer, dispatch_output)
