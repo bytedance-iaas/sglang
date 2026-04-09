@@ -21,7 +21,14 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_cp_rank, get_attention_tp_size
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
+    cp_allgather_and_save_kv_cache,
+    cp_attn_forward_extend,
+    cp_use_prefill,
+    is_prefill_cp_round_robin_split,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -538,6 +545,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
+        use_prefill_cp = cp_use_prefill(forward_batch)
+        cp_size = get_global_server_args().attn_cp_size
+        full_k_for_cp = None
+        full_v_for_cp = None
 
         # Save kv cache
         if save_kv_cache and k is not None:
@@ -547,6 +558,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer, cache_loc, k, k_rope
                     )
+                elif use_prefill_cp:
+                    cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size)
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
@@ -557,19 +570,121 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         if self.forward_metadata.use_ragged:
             # ragged prefill
-            if q_rope is not None:
-                q = torch.cat([q, q_rope], dim=-1)
-            qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            if k_rope is not None:
-                k = torch.cat([k, k_rope], dim=-1)
-            o = self.prefill_wrapper_ragged.forward(
-                qall,
-                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
+            if use_prefill_cp and q_rope is None and not is_prefill_cp_round_robin_split():
+                assert k is not None and v is not None
+                full_k_for_cp = cp_all_gather_rerange_kv_cache(
+                    k.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
+                )
+                full_v_for_cp = cp_all_gather_rerange_kv_cache(
+                    v.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
+                )
+
+                def _cp_ragged_mha_attn(
+                    q_chunk, _cu_seqlens_q_cp, cache_seqlens_cp, _max_seqlen_q_cp
+                ):
+                    kv_len = int(cache_seqlens_cp[0].item())
+                    qo_indptr = torch.tensor(
+                        [0, q_chunk.shape[0]], device=q_chunk.device, dtype=torch.int32
+                    )
+                    kv_indptr = torch.tensor(
+                        [0, kv_len], device=q_chunk.device, dtype=torch.int32
+                    )
+                    self.prefill_wrapper_ragged.begin_forward(
+                        qo_indptr=qo_indptr,
+                        kv_indptr=kv_indptr,
+                        num_qo_heads=layer.tp_q_head_num,
+                        num_kv_heads=layer.tp_k_head_num,
+                        head_dim_qk=layer.head_dim,
+                        head_dim_vo=layer.v_head_dim,
+                        q_data_type=q_chunk.dtype,
+                        causal=True,
+                    )
+                    return self.prefill_wrapper_ragged.forward(
+                        q_chunk.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        full_k_for_cp[:kv_len]
+                        .view(-1, layer.tp_k_head_num, layer.head_dim)
+                        .to(q_chunk.dtype),
+                        full_v_for_cp[:kv_len]
+                        .view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                        .to(q_chunk.dtype),
+                        causal=True,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+
+                o = cp_attn_forward_extend(
+                    forward_batch,
+                    q,
+                    q.device,
+                    _cp_ragged_mha_attn,
+                )
+            elif use_prefill_cp and q_rope is None and is_prefill_cp_round_robin_split():
+                assert k is not None and v is not None
+                full_k_for_cp = cp_all_gather_rerange_kv_cache(
+                    k.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
+                )
+                full_v_for_cp = cp_all_gather_rerange_kv_cache(
+                    v.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
+                )
+                q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                prefix_len = 0
+                if (
+                    forward_batch.seq_lens_cpu is not None
+                    and len(forward_batch.seq_lens_cpu) == 1
+                ):
+                    prefix_len = max(
+                        int(forward_batch.seq_lens_cpu[0]) - int(full_k_for_cp.shape[0]),
+                        0,
+                    )
+                cp_rank = get_attention_cp_rank()
+                outputs = []
+                for token_idx in range(q_all.shape[0]):
+                    kv_len = prefix_len + cp_rank + token_idx * cp_size + 1
+                    qo_indptr = torch.tensor(
+                        [0, 1], device=q_all.device, dtype=torch.int32
+                    )
+                    kv_indptr = torch.tensor(
+                        [0, kv_len], device=q_all.device, dtype=torch.int32
+                    )
+                    self.prefill_wrapper_ragged.begin_forward(
+                        qo_indptr=qo_indptr,
+                        kv_indptr=kv_indptr,
+                        num_qo_heads=layer.tp_q_head_num,
+                        num_kv_heads=layer.tp_k_head_num,
+                        head_dim_qk=layer.head_dim,
+                        head_dim_vo=layer.v_head_dim,
+                        q_data_type=q_all.dtype,
+                        causal=True,
+                    )
+                    outputs.append(
+                        self.prefill_wrapper_ragged.forward(
+                            q_all[token_idx : token_idx + 1],
+                            full_k_for_cp[:kv_len]
+                            .view(-1, layer.tp_k_head_num, layer.head_dim)
+                            .to(q_all.dtype),
+                            full_v_for_cp[:kv_len]
+                            .view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                            .to(q_all.dtype),
+                            causal=True,
+                            sm_scale=layer.scaling,
+                            logits_soft_cap=logits_soft_cap,
+                        )
+                    )
+                o = torch.cat(outputs, dim=0)
+            else:
+                if q_rope is not None:
+                    q = torch.cat([q, q_rope], dim=-1)
+                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                if k_rope is not None:
+                    k = torch.cat([k, k_rope], dim=-1)
+                o = self.prefill_wrapper_ragged.forward(
+                    qall,
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                    v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(

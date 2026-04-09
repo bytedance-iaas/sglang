@@ -283,9 +283,12 @@ def nsa_cp_round_robin_split_q_seqs(
 
 def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
-        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        nsa_enable_prefill_cp = get_global_server_args().prefill_cp_enabled()
     if (
-        forward_batch.nsa_cp_metadata is not None
+        (
+            forward_batch.nsa_cp_metadata is not None
+            or forward_batch.attn_cp_metadata is not None
+        )
         and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):

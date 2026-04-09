@@ -1541,11 +1541,11 @@ class ServerArgs:
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
                 if not is_npu():  # CUDA or ROCm GPU
-                    if self.enable_nsa_prefill_context_parallel:
+                    if self.prefill_cp_enabled():
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
-                        if self.nsa_prefill_cp_mode == "in-seq-split":
+                        if self.get_prefill_cp_mode() == "in-seq-split":
                             # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
                             self.enable_dp_attention = True
                             self.moe_dense_tp_size = 1
@@ -1592,13 +1592,38 @@ class ServerArgs:
                     self._set_default_nsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
-                if self.enable_nsa_prefill_context_parallel:
+                if self.prefill_cp_enabled():
                     assert (
                         self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                    ), "CP is only supported for prefill when PD disaggregation, please remove the CP enable flags."
 
             else:
                 # DeepSeek V3/R1/V3.1
+                if self.prefill_cp_enabled():
+                    logger.warning(
+                        "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
+                    )
+                    if self.get_prefill_cp_mode() == "in-seq-split":
+                        self.enable_dp_attention = True
+                        self.moe_dense_tp_size = 1
+                        self.moe_a2a_backend = "deepep"
+                        self.ep_size = self.tp_size
+                        logger.warning(
+                            "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                        )
+                    else:
+                        self.enable_dp_attention = True
+                        self.moe_dense_tp_size = 1
+                        assert (
+                            self.dp_size == 1
+                        ), "For round-robin split mode, dp attention is not supported."
+                    assert (
+                        self.tp_size == 8
+                    ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                    self.attn_cp_size = self.tp_size // self.dp_size
+                    logger.warning(
+                        f"Enable Context Parallel opt for DeepSeek/Kimi MLA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
+                    )
                 if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
@@ -6089,6 +6114,16 @@ class ServerArgs:
 
         model_config = self.get_model_config()
         return model_config.attention_arch == AttentionArch.MLA
+
+    def prefill_cp_enabled(self) -> bool:
+        return self.enable_prefill_context_parallel or self.enable_nsa_prefill_context_parallel
+
+    def get_prefill_cp_mode(self) -> str:
+        if self.enable_prefill_context_parallel:
+            return self.prefill_cp_mode
+        if self.enable_nsa_prefill_context_parallel:
+            return self.nsa_prefill_cp_mode
+        return self.prefill_cp_mode
 
     def is_attention_backend_not_set(self):
         return (
