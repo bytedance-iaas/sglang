@@ -248,7 +248,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
         history_traj: Dict[str, Any] = getattr(request_obj, "history_traj", None)
 
         if history_traj:
-            input_ids_list = result["input_ids"]
+            input_ids_list = result.input_ids
             # Convert to tensor for manipulation. Note: SGLang processors return CPU lists usually.
             input_ids_tensor = torch.tensor(input_ids_list, dtype=torch.long).unsqueeze(
                 0
@@ -276,7 +276,7 @@ class AlpamayoR1Processor(QwenVLImageProcessor):
             fused_ids = self.fuse_traj_tokens(input_ids_tensor, traj_data)
 
             # Update result
-            result["input_ids"] = fused_ids.squeeze(0).tolist()
+            result.input_ids = fused_ids.squeeze(0).tolist()
 
         return result
 

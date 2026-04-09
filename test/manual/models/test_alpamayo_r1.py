@@ -82,10 +82,167 @@ def _encode_rgb_tensor_to_base64(
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _default_cache_dir():
+    import pathlib
+
+    hf_home = os.environ.get("HF_HOME", "")
+    if hf_home:
+        return pathlib.Path(hf_home) / "hub"
+    return None
+
+
+def load_physical_aiavdataset(
+    clip_id: str,
+    t0_us: int = 5_100_000,
+    avdi=None,
+    maybe_stream: bool = True,
+    num_history_steps: int = 16,
+    num_future_steps: int = 64,
+    time_step: float = 0.1,
+    camera_features: list | None = None,
+    num_frames: int = 4,
+):
+    """Load data from physical_ai_av for AlpamayoR1 model inference."""
+    import physical_ai_av
+    import scipy.spatial.transform as spt
+    from einops import rearrange
+
+    if avdi is None:
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
+            cache_dir=_default_cache_dir(),
+        )
+
+    if camera_features is None:
+        camera_features = [
+            avdi.features.CAMERA.CAMERA_CROSS_LEFT_120FOV,
+            avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV,
+            avdi.features.CAMERA.CAMERA_CROSS_RIGHT_120FOV,
+            avdi.features.CAMERA.CAMERA_FRONT_TELE_30FOV,
+        ]
+
+    camera_name_to_index = {
+        "camera_cross_left_120fov": 0,
+        "camera_front_wide_120fov": 1,
+        "camera_cross_right_120fov": 2,
+        "camera_rear_left_70fov": 3,
+        "camera_rear_tele_30fov": 4,
+        "camera_rear_right_70fov": 5,
+        "camera_front_tele_30fov": 6,
+    }
+
+    features_to_load = [avdi.features.LABELS.EGOMOTION] + list(camera_features)
+    avdi.download_clip_features(clip_id, features_to_load)
+
+    egomotion = avdi.get_clip_feature(
+        clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=maybe_stream,
+    )
+
+    assert (
+        t0_us > num_history_steps * time_step * 1_000_000
+    ), "t0_us must be greater than the history time range"
+
+    history_offsets_us = np.arange(
+        -(num_history_steps - 1) * time_step * 1_000_000,
+        time_step * 1_000_000 / 2, time_step * 1_000_000,
+    ).astype(np.int64)
+    history_timestamps = t0_us + history_offsets_us
+
+    future_offsets_us = np.arange(
+        time_step * 1_000_000,
+        (num_future_steps + 0.5) * time_step * 1_000_000,
+        time_step * 1_000_000,
+    ).astype(np.int64)
+    future_timestamps = t0_us + future_offsets_us
+
+    ego_max_us = int(egomotion.timestamps[-1] - egomotion.timestamps[0]) - 1
+    future_timestamps = future_timestamps[future_timestamps <= ego_max_us]
+    if future_timestamps.size == 0:
+        raise ValueError(
+            f"t0_us={t0_us} is too close to clip end (max={ego_max_us}us), no future steps available"
+        )
+
+    ego_history = egomotion(history_timestamps)
+    ego_history_xyz = ego_history.pose.translation
+    ego_history_quat = ego_history.pose.rotation.as_quat()
+
+    ego_future = egomotion(future_timestamps)
+    ego_future_xyz = ego_future.pose.translation
+    ego_future_quat = ego_future.pose.rotation.as_quat()
+
+    t0_xyz = ego_history_xyz[-1].copy()
+    t0_quat = ego_history_quat[-1].copy()
+    t0_rot = spt.Rotation.from_quat(t0_quat)
+    t0_rot_inv = t0_rot.inv()
+
+    ego_history_xyz_local = t0_rot_inv.apply(ego_history_xyz - t0_xyz)
+    ego_future_xyz_local = t0_rot_inv.apply(ego_future_xyz - t0_xyz)
+
+    ego_history_rot_local = (
+        t0_rot_inv * spt.Rotation.from_quat(ego_history_quat)
+    ).as_matrix()
+    ego_future_rot_local = (
+        t0_rot_inv * spt.Rotation.from_quat(ego_future_quat)
+    ).as_matrix()
+
+    ego_history_xyz_tensor = torch.from_numpy(ego_history_xyz_local).float().unsqueeze(0).unsqueeze(0)
+    ego_history_rot_tensor = torch.from_numpy(ego_history_rot_local).float().unsqueeze(0).unsqueeze(0)
+    ego_future_xyz_tensor = torch.from_numpy(ego_future_xyz_local).float().unsqueeze(0).unsqueeze(0)
+    ego_future_rot_tensor = torch.from_numpy(ego_future_rot_local).float().unsqueeze(0).unsqueeze(0)
+
+    image_frames_list = []
+    camera_indices_list = []
+    timestamps_list = []
+
+    image_timestamps = np.array(
+        [t0_us - (num_frames - 1 - i) * int(time_step * 1_000_000) for i in range(num_frames)],
+        dtype=np.int64,
+    )
+
+    for cam_feature in camera_features:
+        camera = avdi.get_clip_feature(clip_id, cam_feature, maybe_stream=maybe_stream)
+        frames, frame_timestamps = camera.decode_images_from_timestamps(image_timestamps)
+        frames_tensor = torch.from_numpy(frames)
+        frames_tensor = rearrange(frames_tensor, "t h w c -> t c h w")
+
+        if isinstance(cam_feature, str):
+            cam_name = cam_feature.split("/")[-1] if "/" in cam_feature else cam_feature
+            cam_name = cam_name.lower()
+        else:
+            raise ValueError(f"Unexpected camera feature type: {type(cam_feature)}")
+        cam_idx = camera_name_to_index.get(cam_name, 0)
+
+        image_frames_list.append(frames_tensor)
+        camera_indices_list.append(cam_idx)
+        timestamps_list.append(torch.from_numpy(frame_timestamps.astype(np.int64)))
+
+    image_frames = torch.stack(image_frames_list, dim=0)
+    camera_indices = torch.tensor(camera_indices_list, dtype=torch.int64)
+    all_timestamps = torch.stack(timestamps_list, dim=0)
+
+    sort_order = torch.argsort(camera_indices)
+    image_frames = image_frames[sort_order]
+    camera_indices = camera_indices[sort_order]
+    all_timestamps = all_timestamps[sort_order]
+
+    camera_tmin = all_timestamps.min()
+    relative_timestamps = (all_timestamps - camera_tmin).float() * 1e-6
+
+    return {
+        "image_frames": image_frames,
+        "camera_indices": camera_indices,
+        "ego_history_xyz": ego_history_xyz_tensor,
+        "ego_history_rot": ego_history_rot_tensor,
+        "ego_future_xyz": ego_future_xyz_tensor,
+        "ego_future_rot": ego_future_rot_tensor,
+        "relative_timestamps": relative_timestamps,
+        "absolute_timestamps": all_timestamps,
+        "t0_us": t0_us,
+        "clip_id": clip_id,
+    }
+
+
 def _prepare_data(clip_id: str, t0_us: int = 5_100_000):
     """Load dataset and encode images. Returns (data, images_b64, history_traj)."""
-    from sglang.srt.models.alpamayo.dataset import load_physical_aiavdataset
-
     print(f"  Loading dataset for clip_id={clip_id} ...")
     data = load_physical_aiavdataset(clip_id, t0_us=t0_us)
     print("  Dataset loaded.")

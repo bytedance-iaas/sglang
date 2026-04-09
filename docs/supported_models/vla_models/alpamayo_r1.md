@@ -41,18 +41,116 @@ pip install physical-ai-av einops scipy
 
 ### Inference Script
 
-This example uses the OpenAI-compatible `/v1/chat/completions` endpoint. The data loading utility is provided at `python/sglang/srt/models/alpamayo/dataset.py` in the SGLang repo.
+This example uses the OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ```python
 import base64
 import io
+import os
+import pathlib
 
 import numpy as np
+import physical_ai_av
+import scipy.spatial.transform as spt
 import torch
+from einops import rearrange
 from openai import OpenAI
 from PIL import Image
 
-from sglang.srt.models.alpamayo.dataset import load_physical_aiavdataset
+
+def _default_cache_dir():
+    hf_home = os.environ.get("HF_HOME", "")
+    if hf_home:
+        return pathlib.Path(hf_home) / "hub"
+    return None
+
+
+def load_physical_aiavdataset(
+    clip_id: str,
+    t0_us: int = 5_100_000,
+    avdi=None,
+    maybe_stream: bool = True,
+    num_history_steps: int = 16,
+    num_future_steps: int = 64,
+    time_step: float = 0.1,
+    camera_features: list | None = None,
+    num_frames: int = 4,
+):
+    """Load data from physical_ai_av for AlpamayoR1 model inference."""
+    if avdi is None:
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=_default_cache_dir())
+
+    if camera_features is None:
+        camera_features = [
+            avdi.features.CAMERA.CAMERA_CROSS_LEFT_120FOV,
+            avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV,
+            avdi.features.CAMERA.CAMERA_CROSS_RIGHT_120FOV,
+            avdi.features.CAMERA.CAMERA_FRONT_TELE_30FOV,
+        ]
+
+    camera_name_to_index = {
+        "camera_cross_left_120fov": 0, "camera_front_wide_120fov": 1,
+        "camera_cross_right_120fov": 2, "camera_rear_left_70fov": 3,
+        "camera_rear_tele_30fov": 4, "camera_rear_right_70fov": 5,
+        "camera_front_tele_30fov": 6,
+    }
+
+    features_to_load = [avdi.features.LABELS.EGOMOTION] + list(camera_features)
+    avdi.download_clip_features(clip_id, features_to_load)
+    egomotion = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=maybe_stream)
+
+    history_offsets_us = np.arange(
+        -(num_history_steps - 1) * time_step * 1_000_000,
+        time_step * 1_000_000 / 2, time_step * 1_000_000,
+    ).astype(np.int64)
+    future_offsets_us = np.arange(
+        time_step * 1_000_000, (num_future_steps + 0.5) * time_step * 1_000_000, time_step * 1_000_000,
+    ).astype(np.int64)
+    future_timestamps = (t0_us + future_offsets_us)
+    ego_max_us = int(egomotion.timestamps[-1] - egomotion.timestamps[0]) - 1
+    future_timestamps = future_timestamps[future_timestamps <= ego_max_us]
+
+    ego_history = egomotion(t0_us + history_offsets_us)
+    ego_future = egomotion(future_timestamps)
+
+    t0_rot = spt.Rotation.from_quat(ego_history.pose.rotation.as_quat()[-1])
+    t0_rot_inv = t0_rot.inv()
+    t0_xyz = ego_history.pose.translation[-1]
+
+    def to_local_xyz(xyz):
+        return torch.from_numpy(t0_rot_inv.apply(xyz - t0_xyz)).float().unsqueeze(0).unsqueeze(0)
+
+    def to_local_rot(quat):
+        return torch.from_numpy((t0_rot_inv * spt.Rotation.from_quat(quat)).as_matrix()).float().unsqueeze(0).unsqueeze(0)
+
+    image_timestamps = np.array(
+        [t0_us - (num_frames - 1 - i) * int(time_step * 1_000_000) for i in range(num_frames)], dtype=np.int64
+    )
+    image_frames_list, camera_indices_list, timestamps_list = [], [], []
+    for cam_feature in camera_features:
+        camera = avdi.get_clip_feature(clip_id, cam_feature, maybe_stream=maybe_stream)
+        frames, frame_ts = camera.decode_images_from_timestamps(image_timestamps)
+        frames_tensor = rearrange(torch.from_numpy(frames), "t h w c -> t c h w")
+        cam_name = (cam_feature.split("/")[-1] if isinstance(cam_feature, str) else cam_feature).lower()
+        image_frames_list.append(frames_tensor)
+        camera_indices_list.append(camera_name_to_index.get(cam_name, 0))
+        timestamps_list.append(torch.from_numpy(frame_ts.astype(np.int64)))
+
+    image_frames = torch.stack(image_frames_list)
+    camera_indices = torch.tensor(camera_indices_list, dtype=torch.int64)
+    all_timestamps = torch.stack(timestamps_list)
+    sort_order = torch.argsort(camera_indices)
+
+    return {
+        "image_frames": image_frames[sort_order],
+        "camera_indices": camera_indices[sort_order],
+        "ego_history_xyz": to_local_xyz(ego_history.pose.translation),
+        "ego_history_rot": to_local_rot(ego_history.pose.rotation.as_quat()),
+        "ego_future_xyz": to_local_xyz(ego_future.pose.translation),
+        "ego_future_rot": to_local_rot(ego_future.pose.rotation.as_quat()),
+        "relative_timestamps": (all_timestamps[sort_order] - all_timestamps.min()).float() * 1e-6,
+        "t0_us": t0_us, "clip_id": clip_id,
+    }
 
 
 def encode_image_to_base64(image: torch.Tensor) -> str:
