@@ -10,6 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
+    DeepEPMode,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -37,6 +38,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
@@ -133,6 +135,23 @@ class DeepEPMoE(FusedMoE):
         self.deepep_mode = get_deepep_mode()
 
         if (
+            (
+                isinstance(quant_config, MoeWNA16Config)
+                or isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            )
+            and self.deepep_mode.enable_low_latency()
+            and not hasattr(self.quant_method, "apply_deepep_ll")
+        ):
+            self.deepep_mode = DeepEPMode.NORMAL
+            if hasattr(self.dispatcher, "deepep_mode"):
+                self.dispatcher.deepep_mode = DeepEPMode.NORMAL
+            if not DeepEPMoE._has_printed:
+                logger.warning(
+                    "W4A16 currently supports DeepEP normal mode only; forcing --deepep-mode=normal."
+                )
+                DeepEPMoE._has_printed = True
+
+        if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
             and not _is_hip
@@ -140,6 +159,7 @@ class DeepEPMoE(FusedMoE):
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config.get_name() == "modelopt_fp4"
             )
+            and not hasattr(self.quant_method, "apply_deepep_ll")
         ):
             # AMD HIP, NPU supports low_latency deepep without deepgemm
             # NV FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
@@ -234,6 +254,8 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
+            elif hasattr(self.quant_method, "apply_deepep_normal"):
+                output = self.quant_method.apply_deepep_normal(self, dispatch_output)
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
@@ -244,6 +266,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+            elif hasattr(self.quant_method, "apply_deepep_ll"):
+                output = self.quant_method.apply_deepep_ll(self, dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -795,4 +819,24 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
 
+    if get_moe_runner_backend().is_flashinfer_trtllm():
+        # NEW: Direct FP4 detection (bypasses EP requirements)
+        # Check for FP4 quantization with TRTLLM flag, regardless of EP
+        # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
+
+            return FlashInferFP4MoE
+        elif (
+            quant_config is None
+            or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "mxfp8"
+            or quant_config.get_name() == "modelopt_fp8"
+            or quant_config.get_name() == "compressed_tensors"
+        ):
+            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
+            return FusedMoE
+
+    if get_moe_runner_backend().is_flashinfer_cutlass():
+        return FusedMoE
     return FusedMoE
