@@ -12,7 +12,7 @@ on:
 
 jobs:
   pr-gate:
-    # 1. for commits on main: no gating needed
+    # 1. for commits on ep_main: no gating needed
     # 2. for workflow_dispatch: this can only be triggered by users with write access
     runs-on: ubuntu-latest
     steps:
@@ -104,7 +104,7 @@ jobs:
                 owner,
                 repo,
                 path: ".github/CI_PERMISSIONS.json",
-                ref: "main",
+                ref: "ep_main",
               });
 
               if (!Array.isArray(contentResp.data) && contentResp.data && "content" in contentResp.data) {
