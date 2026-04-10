@@ -1559,6 +1559,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
+        _is_asym_gemm = get_moe_runner_backend().is_asym_gemm()
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
@@ -1567,6 +1568,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             input_dim=1,
             output_dim=2,
@@ -1582,12 +1585,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             input_dim=1,
             output_dim=2,
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
+
+        if _is_asym_gemm:
+            logger.debug(
+                "ModelOptNvFp4FusedMoEMethod: asym_gemm mode — "
+                "w13_weight device=%s pin_memory=%s, "
+                "w2_weight device=%s pin_memory=%s",
+                w13_weight.device,
+                w13_weight.is_pinned(),
+                w2_weight.device,
+                w2_weight.is_pinned(),
+            )
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -1671,6 +1687,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+
+        # asym_gemm path: keep original FP4 weights (uint8) on CPU pinned memory
+        # and scales on GPU as-is.  device_loading_context's finally block restores
+        # the weights back to CPU automatically.  Dequantization to BF16 happens
+        # inside AsymGemmFp4RunnerCore on each forward pass.
+        if get_moe_runner_backend().is_asym_gemm():
+            layer_id = getattr(layer, "layer_id", "?")
+            w13_mb = layer.w13_weight.nbytes / 1024**2
+            w2_mb = layer.w2_weight.nbytes / 1024**2
+            logger.debug(
+                "ModelOptFp4FusedMoEMethod: offloaded MoE weights to CPU pinned memory — "
+                "layer_id=%s, "
+                "w13_weight shape=%s dtype=%s %.1f MiB, "
+                "w2_weight shape=%s dtype=%s %.1f MiB, "
+                "total %.1f MiB",
+                layer_id,
+                tuple(layer.w13_weight.shape),
+                layer.w13_weight.dtype,
+                w13_mb,
+                tuple(layer.w2_weight.shape),
+                layer.w2_weight.dtype,
+                w2_mb,
+                w13_mb + w2_mb,
+            )
+            return
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1883,7 +1924,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        if get_moe_runner_backend().is_asym_gemm():
+            self.runner = MoeRunner(MoeRunnerBackend.ASYM_GEMM, moe_runner_config)
+        elif get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
@@ -1904,6 +1947,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
+
+        # asym_gemm path: activations are pre-quantized to FP4 in the
+        # pre-permute step; both GEMMs use grouped_gemm_nt_fp4_fp4_bf16.
+        if get_moe_runner_backend().is_asym_gemm():
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+                AsymGemmFp4MoeQuantInfo,
+            )
+
+            quant_info = AsymGemmFp4MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm
