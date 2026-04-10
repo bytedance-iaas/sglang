@@ -388,25 +388,17 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        down_input = torch.empty(
-            (
-                all_tokens,
-                N // 2,
-            ),
-            device=gateup_output.device,
-            dtype=torch.bfloat16,
-        )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
-        del gateup_output
-
+        # Fuse silu_and_mul + FP8 quantization into a single kernel
         down_input_fp8, down_input_scale = _hp_get("quant_fp8")(
-            down_input,
+            gateup_output.view(-1, N),
             scale_block_size,
             column_major_scales=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
             scale_tma_aligned=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
             scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
+            fuse_silu_and_mul=True,
+            enable_v2=True,
         )
-        del down_input
+        del gateup_output
 
         down_output = torch.empty(
             (all_tokens, K),
