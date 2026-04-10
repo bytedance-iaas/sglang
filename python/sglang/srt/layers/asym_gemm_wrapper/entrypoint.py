@@ -76,7 +76,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(lhs, rhs, out, offsets, experts, list_size,
-            disable_ue8m0_cast=disable_ue8m0_cast
+            disable_ue8m0_cast=False,
         )
 
 

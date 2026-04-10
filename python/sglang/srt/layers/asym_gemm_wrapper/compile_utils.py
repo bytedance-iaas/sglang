@@ -246,15 +246,21 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
-        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        # Single segment: all tokens belong to expert 0
+        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
+        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
 
     def execute(self, m):
+        self.offsets[1] = m
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.offsets,
+            self.experts,
+            self.list_size,
         )
 
 
