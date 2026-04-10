@@ -1016,7 +1016,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
-                                room=room_id,
+                                room=kv_chunk.room,
                             )
                         else:
                             ret = self.send_kvcache_slice(
@@ -1028,7 +1028,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
-                                room=room_id,
+                                room=kv_chunk.room,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -1062,7 +1062,7 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_state_data_ptrs,
                                     executor,
                                     target_rank_registration_info,
-                                    room=room_id,
+                                    room=kv_chunk.room,
                                 )
 
                             # Only the last chunk we need to send the aux data
@@ -1070,7 +1070,7 @@ class MooncakeKVManager(CommonKVManager):
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
-                                room=room_id,
+                                room=kv_chunk.room,
                             )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
