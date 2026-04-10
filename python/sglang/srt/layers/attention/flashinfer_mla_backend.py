@@ -23,8 +23,6 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.dp_attention import get_attention_cp_rank, get_attention_tp_size
 from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_kv_cache,
-    cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
     cp_use_prefill,
     is_prefill_cp_round_robin_split,
@@ -534,6 +532,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        # CP contract:
+        # When `cp_use_prefill(forward_batch)` is true, callers must provide `k/v` that
+        # are already all-gathered and reranked into the global token order expected
+        # by the CP metadata. This backend will not re-allgather/rerank the input KV.
         if forward_batch.attn_attend_prefix_cache is not None and any(
             forward_batch.extend_prefix_lens_cpu
         ):  # MHA Chunk
@@ -547,21 +549,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
         use_prefill_cp = cp_use_prefill(forward_batch)
         cp_size = get_global_server_args().attn_cp_size
-        full_k_for_cp = None
-        full_v_for_cp = None
 
         # Save kv cache
         if save_kv_cache and k is not None:
             assert v is not None
-            if save_kv_cache:
-                if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, cache_loc, k, k_rope
-                    )
-                elif use_prefill_cp:
-                    cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size)
-                else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if k_rope is not None:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, cache_loc, k, k_rope
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -572,12 +569,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             # ragged prefill
             if use_prefill_cp and q_rope is None and not is_prefill_cp_round_robin_split():
                 assert k is not None and v is not None
-                full_k_for_cp = cp_all_gather_rerange_kv_cache(
-                    k.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
-                )
-                full_v_for_cp = cp_all_gather_rerange_kv_cache(
-                    v.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
-                )
+                k_all = k.to(q.dtype).view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_all = v.to(q.dtype).view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
                 def _cp_ragged_mha_attn(
                     q_chunk, _cu_seqlens_q_cp, cache_seqlens_cp, _max_seqlen_q_cp
@@ -601,12 +594,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     )
                     return self.prefill_wrapper_ragged.forward(
                         q_chunk.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        full_k_for_cp[:kv_len]
-                        .view(-1, layer.tp_k_head_num, layer.head_dim)
-                        .to(q_chunk.dtype),
-                        full_v_for_cp[:kv_len]
-                        .view(-1, layer.tp_k_head_num, layer.v_head_dim)
-                        .to(q_chunk.dtype),
+                        k_all[:kv_len],
+                        v_all[:kv_len],
                         causal=True,
                         sm_scale=layer.scaling,
                         logits_soft_cap=logits_soft_cap,
@@ -620,20 +609,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 )
             elif use_prefill_cp and q_rope is None and is_prefill_cp_round_robin_split():
                 assert k is not None and v is not None
-                full_k_for_cp = cp_all_gather_rerange_kv_cache(
-                    k.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
-                )
-                full_v_for_cp = cp_all_gather_rerange_kv_cache(
-                    v.contiguous(), cp_size, forward_batch, torch.cuda.current_stream()
-                )
                 q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_all = k.to(q.dtype).view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_all = v.to(q.dtype).view(-1, layer.tp_k_head_num, layer.v_head_dim)
                 prefix_len = 0
                 if (
                     forward_batch.seq_lens_cpu is not None
                     and len(forward_batch.seq_lens_cpu) == 1
                 ):
                     prefix_len = max(
-                        int(forward_batch.seq_lens_cpu[0]) - int(full_k_for_cp.shape[0]),
+                        int(forward_batch.seq_lens_cpu[0]) - int(k_all.shape[0]),
                         0,
                     )
                 cp_rank = get_attention_cp_rank()
@@ -659,12 +644,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     outputs.append(
                         self.prefill_wrapper_ragged.forward(
                             q_all[token_idx : token_idx + 1],
-                            full_k_for_cp[:kv_len]
-                            .view(-1, layer.tp_k_head_num, layer.head_dim)
-                            .to(q_all.dtype),
-                            full_v_for_cp[:kv_len]
-                            .view(-1, layer.tp_k_head_num, layer.v_head_dim)
-                            .to(q_all.dtype),
+                            k_all[:kv_len],
+                            v_all[:kv_len],
                             causal=True,
                             sm_scale=layer.scaling,
                             logits_soft_cap=logits_soft_cap,
@@ -674,13 +655,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             else:
                 if q_rope is not None:
                     q = torch.cat([q, q_rope], dim=-1)
-                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 if k_rope is not None:
                     k = torch.cat([k, k_rope], dim=-1)
+                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_all = k.to(q.dtype).view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_all = v.to(q.dtype).view(-1, layer.tp_k_head_num, layer.v_head_dim)
                 o = self.prefill_wrapper_ragged.forward(
                     qall,
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                    v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                    k_all,
+                    v_all,
                     causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
