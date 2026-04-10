@@ -408,6 +408,19 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             debug_info["submit_count"] = int(
                                 debug_info.get("submit_count", 0)
                             ) + 1
+                            prepare_ts = debug_info.get("prepare_ts")
+                            batch_start_ts = debug_info.get("batch_start_ts")
+                            last_submit_ts = debug_info["last_submit_ts"]
+                            debug_info["last_submit_prepare_to_submit_ms"] = (
+                                (last_submit_ts - prepare_ts) * 1000.0
+                                if prepare_ts is not None
+                                else None
+                            )
+                            debug_info["last_submit_batch_to_submit_ms"] = (
+                                (last_submit_ts - batch_start_ts) * 1000.0
+                                if batch_start_ts is not None
+                                else None
+                            )
 
     def mark_layer_ready(self, layer_id: int):
         tensor_id = layer_id
@@ -696,10 +709,19 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             first_submit_ts = debug_info.get("first_submit_ts")
             self._debug_log_room(
                 rid,
-                "flush_start is_last=%s prepare_to_flush_ms=%s first_submit_to_flush_ms=%s submit_count=%s seen_count=%s",
+                "flush_start is_last=%s prepare_to_flush_ms=%s first_submit_to_flush_ms=%s last_submit_to_flush_ms=%s batch_to_last_submit_ms=%s prepare_to_last_submit_ms=%s submit_count=%s seen_count=%s",
                 is_last,
                 f'{(start_time - prepare_ts) * 1000.0:.3f}' if prepare_ts is not None else "na",
                 f'{(start_time - first_submit_ts) * 1000.0:.3f}' if first_submit_ts is not None else "na",
+                f'{(start_time - debug_info["last_submit_ts"]) * 1000.0:.3f}'
+                if debug_info.get("last_submit_ts") is not None
+                else "na",
+                f'{debug_info["last_submit_batch_to_submit_ms"]:.3f}'
+                if debug_info.get("last_submit_batch_to_submit_ms") is not None
+                else "na",
+                f'{debug_info["last_submit_prepare_to_submit_ms"]:.3f}'
+                if debug_info.get("last_submit_prepare_to_submit_ms") is not None
+                else "na",
                 debug_info.get("submit_count", 0),
                 len(self._req_tensor_seen.get(rid, set())),
             )
