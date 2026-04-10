@@ -293,18 +293,12 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
-        m_indices = runner_input.m_indices
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -322,7 +316,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
         if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
-            hidden_states_scale = tma_align_input_scale(hidden_states_scale)
+            hidden_states_scale = _hp_get("tma_align")(hidden_states_scale)
 
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
@@ -347,7 +341,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
-        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+        down_input_fp8, down_input_scale = _hp_get("quant_fp8")(
             down_input,
             scale_block_size,
             column_major_scales=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
@@ -362,7 +356,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
         if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
-            down_input_scale = tma_align_input_scale(down_input_scale)
+            down_input_scale = _hp_get("tma_align")(down_input_scale)
 
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
