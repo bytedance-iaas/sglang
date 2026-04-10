@@ -1,0 +1,97 @@
+name: Build Development Docker Image (PR)
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-docker-dev-pr.yml"
+      - "docker/**"
+      - "python/**"
+      - "sgl-kernel/**"
+      - "scripts/**"
+  pull_request:
+    branches:
+      - ep_main
+    paths:
+      - ".github/workflows/build-docker-dev-pr.yml"
+      - "docker/**"
+      - "python/**"
+      - "sgl-kernel/**"
+      - "scripts/**"
+
+concurrency:
+  group: build-docker-dev-pr-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUNNER_PROXY: http://100.68.160.245:3128
+  RUNNER_NO_PROXY: localhost,127.0.0.1,::1
+
+jobs:
+  build-dev-x64:
+    runs-on: x64-docker-build-node
+    timeout-minutes: 240
+    env:
+      # Keep job-side proxy env literal so workflow planning stays valid.
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner context
+        run: |
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "RUNNER_ARCH=${RUNNER_ARCH}"
+          docker version
+
+      - name: Pre-pull public base image
+        run: |
+          docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use the daemon-backed driver so Docker Hub auth stays on the local daemon
+          # after the explicit pre-pull, instead of re-entering the proxy-sensitive
+          # anonymous token flow inside a separate buildkit container.
+          driver: docker
+
+      - name: Bootstrap builder
+        run: |
+          docker buildx inspect --builder "${{ steps.buildx.outputs.name }}" --bootstrap
+
+      - name: Build framework image
+        run: |
+          docker buildx build \
+            --builder "${{ steps.buildx.outputs.name }}" \
+            --platform linux/amd64 \
+            --target framework \
+            --load \
+            --progress=plain \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg SGLANG_BRANCH=${{ github.head_ref || github.ref_name }} \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            -t local/sglang-dev:${{ github.sha }} \
+            .
+
+      - name: Inspect built image
+        run: |
+          docker image inspect local/sglang-dev:${{ github.sha }} --format 'tag={{index .RepoTags 0}} size={{.Size}}'
+
+      - name: Dump builder state
+        if: always()
+        run: |
+          docker buildx ls
