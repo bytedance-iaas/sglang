@@ -273,6 +273,26 @@ def _build_offsets_direct_kernel(
         tl.store(experts_ptr + slot, g)
 
 
+def _invert_permutation(sorted_indices: torch.Tensor, n: int) -> torch.Tensor:
+    """Build inverse permutation: src2dst[sorted_indices[i]] = i, using a single Triton kernel."""
+    src2dst = torch.empty(n, device=sorted_indices.device, dtype=torch.int32)
+    BLOCK = 1024
+    grid = ((n + BLOCK - 1) // BLOCK,)
+    _invert_permutation_kernel[grid](sorted_indices, src2dst, n, BLOCK=BLOCK)
+    return src2dst
+
+
+@triton.jit
+def _invert_permutation_kernel(
+    sorted_indices_ptr, src2dst_ptr, n, BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    idx = tl.load(sorted_indices_ptr + offs, mask=mask)
+    tl.store(src2dst_ptr + idx, offs.to(tl.int32), mask=mask)
+
+
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -668,11 +688,8 @@ def _pre_permute_standard_to_asym_gemm_fp8_contiguous(
     flat_topk_ids = topk_ids.view(-1)  # (all_tokens,)
     sorted_expert_ids, sorted_indices = torch.sort(flat_topk_ids, stable=True)
 
-    # 2. Build src2dst: original flat index → sorted position
-    src2dst = torch.empty(all_tokens, device=device, dtype=torch.int32)
-    src2dst[sorted_indices] = torch.arange(
-        all_tokens, device=device, dtype=torch.int32
-    )
+    # 2. Build src2dst: original flat index → sorted position (fused kernel)
+    src2dst = _invert_permutation(sorted_indices, all_tokens)
 
     # 3. Gather hidden states in expert-sorted order
     original_token_indices = sorted_indices // top_k
