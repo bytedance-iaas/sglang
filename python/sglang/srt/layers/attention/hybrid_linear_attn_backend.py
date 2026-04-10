@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, Union
 
 import torch
@@ -30,6 +31,8 @@ if not is_cpu():
     )
 
 logger = logging.getLogger(__name__)
+_ASYNC_KV_MAPPING_DEBUG = os.getenv("SGLANG_ASYNC_KV_DEBUG", "0") == "1"
+_ASYNC_KV_MAPPING_LOGGED = False
 
 
 # Kernel to track mamba states if needed based on track mask
@@ -957,9 +960,20 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
                 use_mla = getattr(token_to_kv_pool, "use_mla", False)
                 kv_ntensors = full_layer_nums if use_mla else full_layer_nums * 2
+                global _ASYNC_KV_MAPPING_LOGGED
                 if not is_linear_attn:
                     mapping = getattr(token_to_kv_pool, "full_attention_layer_id_mapping", {})
                     packed_id = mapping.get(layer_id)
+                    if _ASYNC_KV_MAPPING_DEBUG and not _ASYNC_KV_MAPPING_LOGGED:
+                        logger.info(
+                            "async kv debug mapping full_attn model_layer=%s packed_id=%s use_mla=%s full_layer_nums=%s kv_ntensors=%s",
+                            layer_id,
+                            packed_id,
+                            use_mla,
+                            full_layer_nums,
+                            kv_ntensors,
+                        )
+                        _ASYNC_KV_MAPPING_LOGGED = True
                     if packed_id is not None:
                         callback(int(packed_id))
                         if not use_mla:
@@ -972,6 +986,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 else:
                     mamba_map = getattr(forward_batch.req_to_token_pool, "mamba_map", {})
                     mamba_layer_idx = mamba_map.get(layer_id)
+                    if _ASYNC_KV_MAPPING_DEBUG and not _ASYNC_KV_MAPPING_LOGGED:
+                        logger.info(
+                            "async kv debug mapping linear_attn model_layer=%s mamba_layer_idx=%s mamba_num_layers=%s state_tensors_per_layer=%s kv_ntensors=%s",
+                            layer_id,
+                            mamba_layer_idx,
+                            self._mamba_num_layers,
+                            self._mamba_state_tensors_per_layer,
+                            kv_ntensors,
+                        )
+                        _ASYNC_KV_MAPPING_LOGGED = True
                     if mamba_layer_idx is not None and self._mamba_state_tensors_per_layer > 0:
                         state_offset = kv_ntensors
                         for t in range(self._mamba_state_tensors_per_layer):

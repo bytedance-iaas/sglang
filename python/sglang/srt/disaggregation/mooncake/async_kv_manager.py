@@ -155,13 +155,34 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         self._async_kv_missing_wait_ms = int(
             os.getenv("SGLANG_ASYNC_KV_MISSING_WAIT_MS", "20")
         )
+        self._async_kv_debug = os.getenv("SGLANG_ASYNC_KV_DEBUG", "0") == "1"
+        self._async_kv_debug_max_rooms = int(
+            os.getenv("SGLANG_ASYNC_KV_DEBUG_MAX_ROOMS", "8")
+        )
         self._mamba_per_layer_cuda_sync_warned = False
         self._mamba_per_layer_event_sync_warned = False
         self._mamba_layer_ready_events: Dict[Tuple[int, int], object] = {}
+        self._room_debug_info: Dict[int, Dict[str, object]] = {}
 
     @property
     def is_support_async(self):
         return True
+
+    def _should_debug_room(self, room: int) -> bool:
+        return self._async_kv_debug and (
+            room in self._room_debug_info
+            or len(self._room_debug_info) < self._async_kv_debug_max_rooms
+        )
+
+    def _get_room_debug_info(self, room: int) -> Dict[str, object]:
+        return self._room_debug_info.setdefault(room, {})
+
+    def _debug_log_room(self, room: int, message: str, *args) -> None:
+        if self._should_debug_room(room):
+            logger.info("async kv debug room=%s " + message, room, *args)
+
+    def _cleanup_room_debug_info(self, room: int) -> None:
+        self._room_debug_info.pop(room, None)
 
     def _put_kvcache_func(self):
         try:
@@ -356,6 +377,37 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             if room_id not in self._req_bids:
                                 self._req_bids[room_id] = deque()
                             self._req_bids[room_id].appendleft(status)
+                        if self._should_debug_room(room_id):
+                            debug_info = self._get_room_debug_info(room_id)
+                            if "first_submit_ts" not in debug_info:
+                                debug_info["first_submit_ts"] = time.time()
+                                prepare_ts = debug_info.get("prepare_ts")
+                                batch_start_ts = debug_info.get("batch_start_ts")
+                                prepare_to_submit_ms = (
+                                    (debug_info["first_submit_ts"] - prepare_ts) * 1000.0
+                                    if prepare_ts is not None
+                                    else None
+                                )
+                                batch_to_submit_ms = (
+                                    (debug_info["first_submit_ts"] - batch_start_ts) * 1000.0
+                                    if batch_start_ts is not None
+                                    else None
+                                )
+                                self._debug_log_room(
+                                    room_id,
+                                    "first_submit tensor=%s prepare_to_submit_ms=%s batch_to_submit_ms=%s",
+                                    layer_id,
+                                    f"{prepare_to_submit_ms:.3f}"
+                                    if prepare_to_submit_ms is not None
+                                    else "na",
+                                    f"{batch_to_submit_ms:.3f}"
+                                    if batch_to_submit_ms is not None
+                                    else "na",
+                                )
+                            debug_info["last_submit_ts"] = time.time()
+                            debug_info["submit_count"] = int(
+                                debug_info.get("submit_count", 0)
+                            ) + 1
 
     def mark_layer_ready(self, layer_id: int):
         tensor_id = layer_id
@@ -372,6 +424,20 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                         self._req_begin_count[rid] = deque()
                     self._req_begin_count[rid].appendleft(begin_count)
                     self._room_to_kv_chunk_info[rid] = (self._current_kv_chunk_infos, idx)
+                    if self._should_debug_room(rid):
+                        debug_info = self._get_room_debug_info(rid)
+                        debug_info.setdefault("batch_start_ts", time.time())
+                        debug_info["begin_count"] = begin_count
+                        debug_info["waiting_rooms_at_batch_start"] = waiting_len
+                        debug_info["tensor_total"] = self._tensor_ntensors_total
+                        debug_info["kv_tensor_total"] = self._kv_tensor_ntensors
+                        debug_info["state_tensor_total"] = self._state_tensor_ntensors
+                        self._debug_log_room(
+                            rid,
+                            "batch_start begin_count=%s waiting_rooms=%s",
+                            begin_count,
+                            waiting_len,
+                        )
             else:
                 logger.warning(
                     f"async kv layer0: no waiting rooms, waiting_len={waiting_len}"
@@ -489,6 +555,26 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 self._mamba_layer_ready_events[(int(rid), int(tensor_id))] = event
                 except Exception:
                     pass
+            if self._current_kv_chunk_infos:
+                now = time.time()
+                for rid in self._current_kv_chunk_infos.rooms:
+                    if self._should_debug_room(rid):
+                        debug_info = self._get_room_debug_info(rid)
+                        if "first_layer_ready_ts" not in debug_info:
+                            debug_info["first_layer_ready_ts"] = now
+                            batch_start_ts = debug_info.get("batch_start_ts")
+                            if batch_start_ts is not None:
+                                self._debug_log_room(
+                                    rid,
+                                    "first_layer_ready tensor=%s kind=%s batch_to_first_layer_ms=%.3f",
+                                    tensor_id,
+                                    kind,
+                                    (now - batch_start_ts) * 1000.0,
+                                )
+                        debug_info["last_layer_ready_ts"] = now
+                        debug_info["layer_ready_count"] = int(
+                            debug_info.get("layer_ready_count", 0)
+                        ) + 1
             kv_role = None
             kv_layer = None
             if kind == "kv" and not self.is_mla_backend and self._kv_cache_nlayers > 0:
@@ -603,6 +689,20 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         if rid not in self._req_begin_count:
             return
         start_time = time.time()
+        if self._should_debug_room(rid):
+            debug_info = self._get_room_debug_info(rid)
+            debug_info["flush_start_ts"] = start_time
+            prepare_ts = debug_info.get("prepare_ts")
+            first_submit_ts = debug_info.get("first_submit_ts")
+            self._debug_log_room(
+                rid,
+                "flush_start is_last=%s prepare_to_flush_ms=%s first_submit_to_flush_ms=%s submit_count=%s seen_count=%s",
+                is_last,
+                f'{(start_time - prepare_ts) * 1000.0:.3f}' if prepare_ts is not None else "na",
+                f'{(start_time - first_submit_ts) * 1000.0:.3f}' if first_submit_ts is not None else "na",
+                debug_info.get("submit_count", 0),
+                len(self._req_tensor_seen.get(rid, set())),
+            )
         if is_last:
             statuses = []
             while len(self._req_begin_count[rid]):
@@ -667,6 +767,24 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             len(seen),
                             self._tensor_ntensors_total,
                         )
+                    if self._should_debug_room(rid):
+                        debug_info = self._get_room_debug_info(rid)
+                        finish_ts = time.time()
+                        debug_info["flush_finish_ts"] = finish_ts
+                        batch_start_ts = debug_info.get("batch_start_ts")
+                        first_layer_ready_ts = debug_info.get("first_layer_ready_ts")
+                        first_submit_ts = debug_info.get("first_submit_ts")
+                        self._debug_log_room(
+                            rid,
+                            "flush_done statuses=%s seen=%s missing=%s batch_to_flush_done_ms=%s first_layer_to_flush_done_ms=%s first_submit_to_flush_done_ms=%s total_flush_wait_ms=%.3f",
+                            len(statuses),
+                            len(seen),
+                            len(missing),
+                            f'{(finish_ts - batch_start_ts) * 1000.0:.3f}' if batch_start_ts is not None else "na",
+                            f'{(finish_ts - first_layer_ready_ts) * 1000.0:.3f}' if first_layer_ready_ts is not None else "na",
+                            f'{(finish_ts - first_submit_ts) * 1000.0:.3f}' if first_submit_ts is not None else "na",
+                            (finish_ts - start_time) * 1000.0,
+                        )
                     with self._lock:
                         self._req_tensor_seen.pop(rid, None)
                     self._room_to_kv_chunk_info.pop(rid, None)
@@ -677,9 +795,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             ]
                             for k in keys_to_remove:
                                 self._mamba_layer_ready_events.pop(k, None)
+                    self._cleanup_room_debug_info(rid)
             self._req_begin_count.pop(rid, None)
 
     def prepare_batch(self, sch: "Scheduler", batch: "ScheduleBatch"):
+        prepare_ts = time.time()
         rooms = []
         prefill_kv_indices = []
         index_slices = []
@@ -759,11 +879,44 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 index_slices=tuple(index_slices),
                 prefill_state_indices=tuple(prefill_state_indices),
             )
+            if self._async_kv_debug:
+                for room, page_indices, index_slice, state_idx in zip(
+                    rooms, prefill_kv_indices, index_slices, prefill_state_indices
+                ):
+                    if self._should_debug_room(room):
+                        debug_info = self._get_room_debug_info(room)
+                        debug_info["prepare_ts"] = prepare_ts
+                        debug_info["num_pages"] = len(page_indices)
+                        debug_info["index_slice_start"] = index_slice.start
+                        debug_info["index_slice_stop"] = index_slice.stop
+                        debug_info["state_idx"] = state_idx
+                        self._debug_log_room(
+                            room,
+                            "prepare pages=%s tokens=%s index_slice=[%s,%s) state_idx=%s skips(chunked=%s fake=%s ineligible=%s empty=%s)",
+                            len(page_indices),
+                            len(page_indices) * self.kv_args.page_size,
+                            index_slice.start,
+                            index_slice.stop,
+                            state_idx,
+                            skip_chunked,
+                            skip_fake,
+                            skip_ineligible,
+                            skip_empty,
+                        )
         else:
             kv_chunk_info_set = None
         with self._queue_lock:
             self._waiting_rooms.appendleft(kv_chunk_info_set)
         waiting_len = len(self._waiting_rooms)
+        if self._async_kv_debug and rooms:
+            for room in rooms:
+                if self._should_debug_room(room):
+                    self._debug_log_room(
+                        room,
+                        "prepare_enqueued waiting_rooms=%s room_count=%s",
+                        waiting_len,
+                        len(rooms),
+                    )
 
     def get_layer_count(self) -> int:
         return self._kv_cache_nlayers
