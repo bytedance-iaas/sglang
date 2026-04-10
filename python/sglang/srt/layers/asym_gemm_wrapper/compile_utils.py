@@ -76,6 +76,8 @@ class AsymGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_FP4_MASKED = auto()
+    GROUPED_GEMM_NT_FP4_CONTIG = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[AsymGemmKernelType, int, int, int], bool] = dict()
@@ -185,6 +187,8 @@ class _BaseWarmupExecutor:
             AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             AsymGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _GroupedContBf16WarmupExecutor,
             AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _GroupedMaskedBf16WarmupExecutor,
+            AsymGemmKernelType.GROUPED_GEMM_NT_FP4_CONTIG: _GroupedContFp4WarmupExecutor,
+            AsymGemmKernelType.GROUPED_GEMM_NT_FP4_MASKED: _GroupedMaskedFp4WarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -207,6 +211,26 @@ class _BaseWarmupExecutor:
             return (
                 num_groups * max_m * k * 2
                 + num_groups * n * k * 2
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == AsymGemmKernelType.GROUPED_GEMM_NT_FP4_CONTIG:
+            # FP4 packs two elements per byte, so data buffers are k/2 bytes wide.
+            # Scales are 1 E4M3 byte per group_size=16 k-elements.
+            return (
+                max_m * (k // 2)
+                + num_groups * n * (k // 2)
+                + max_m * (k // 16)
+                + num_groups * n * (k // 16)
+                + max_m * 4
+                + max_m * n * 2
+            ) / _GB
+        elif kernel_type == AsymGemmKernelType.GROUPED_GEMM_NT_FP4_MASKED:
+            return (
+                num_groups * max_m * (k // 2)
+                + num_groups * n * (k // 2)
+                + num_groups * max_m * (k // 16)
+                + num_groups * n * (k // 16)
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
@@ -350,6 +374,83 @@ class _GroupedMaskedBf16WarmupExecutor(_BaseWarmupExecutor):
             self.list_size,
             m,
             compiled_dims="nk",
+        )
+
+
+def _empty_packed_fp4(size):
+    """Allocate a packed-FP4 tensor and matching E4M3 scale tensor.
+
+    Packed layout: last dim holds two FP4 elements per uint8 byte → k_packed = k/2.
+    Scales use group_size=16 along the K dim.
+    """
+    *dims, k = size
+    assert k % 2 == 0
+    group_size = 16
+    assert k % group_size == 0
+    packed = torch.empty((*dims, k // 2), device="cuda", dtype=torch.uint8)
+    scale = torch.empty(
+        (*dims, k // group_size), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    return packed, scale
+
+
+class _GroupedContFp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_packed_fp4((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_packed_fp4((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
+        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
+
+    def execute(self, m):
+        self.offsets[1] = m
+        lhs_q, lhs_s = self.lhs_q[:m], self.lhs_s[:m]
+        rhs_q, rhs_s = self.rhs_q, self.rhs_s
+        out = self.out[:m]
+        logger.info(
+            "m_grouped_fp4_asym_gemm_nt_contiguous param dtypes: "
+            "lhs_q=%s (shape=%s), lhs_s=%s (shape=%s), "
+            "rhs_q=%s (shape=%s), rhs_s=%s (shape=%s), "
+            "out=%s (shape=%s), offsets=%s (shape=%s), "
+            "experts=%s (shape=%s), list_size=%s (shape=%s)",
+            lhs_q.dtype, lhs_q.shape, lhs_s.dtype, lhs_s.shape,
+            rhs_q.dtype, rhs_q.shape, rhs_s.dtype, rhs_s.shape,
+            out.dtype, out.shape, self.offsets.dtype, self.offsets.shape,
+            self.experts.dtype, self.experts.shape, self.list_size.dtype, self.list_size.shape,
+        )
+        asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
+            (lhs_q, lhs_s),
+            (rhs_q, rhs_s),
+            out,
+            self.offsets,
+            self.experts,
+            self.list_size,
+            disable_ue8m0_cast=True,
+        )
+
+
+class _GroupedMaskedFp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_packed_fp4((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_packed_fp4((num_groups, n, k))
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
+        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
+
+    def execute(self, m):
+        asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            self.offsets,
+            self.experts,
+            self.list_size,
+            m,
+            disable_ue8m0_cast=True,
         )
 
 

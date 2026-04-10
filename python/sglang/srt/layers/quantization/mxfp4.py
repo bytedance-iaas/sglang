@@ -28,6 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.asym_gemm import AsymGemmMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -372,6 +373,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
         self.hidden_size = hidden_size
+        _is_asym_gemm = get_moe_runner_backend().is_asym_gemm()
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -379,6 +381,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             requires_grad=False,
         )
@@ -415,6 +419,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition_after_pad // 2,
                 dtype=weight_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             requires_grad=False,
         )
@@ -686,6 +692,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
 
+        if self.runner.runner_backend.is_asym_gemm():
+            from sglang.srt.utils.offloader import update_param
+            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+
+            w13_weight_bf16 = upcast_from_mxfp(
+                layer.w13_weight.cuda(),
+                layer.w13_weight_scale.cuda(),
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+            w2_weight_bf16 = upcast_from_mxfp(
+                layer.w2_weight.cuda(),
+                layer.w2_weight_scale.cuda(),
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            # Write BF16 result back to CPU pinned memory via offloader,
+            # mirroring requant_weight_ue8m0_inplace in fp8.py
+            update_param(layer.w13_weight, w13_weight_bf16)
+            update_param(layer.w2_weight, w2_weight_bf16)
+            torch.cuda.empty_cache()
+            return
+
         if self.use_triton_kernels:
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
@@ -743,11 +774,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_asym_gemm():
+            backend = MoeRunnerBackend.ASYM_GEMM
+        elif self.use_triton_kernels:
+            backend = MoeRunnerBackend.TRITON_KERNELS
+        else:
+            backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
@@ -870,7 +903,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
+        if backend.is_asym_gemm():
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
+                AsymGemmBf16MoeQuantInfo,
+            )
+
+            quant_info = AsymGemmBf16MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+        elif backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )
@@ -917,12 +959,15 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        _is_asym_gemm = get_moe_runner_backend().is_asym_gemm()
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             requires_grad=False,
         )
@@ -932,6 +977,8 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             requires_grad=False,
         )
@@ -981,6 +1028,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         return w, mx_scales
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_moe_runner_backend().is_asym_gemm():
+            # Skip MXFP4 quantization: keep weights as BF16 on CPU pinned memory
+            # for the AsymGemmBf16 runner to stream to GPU during inference.
+            return
+
         w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 
@@ -1002,6 +1054,10 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if get_moe_runner_backend().is_asym_gemm():
+            self.runner = MoeRunner(MoeRunnerBackend.ASYM_GEMM, moe_runner_config)
+        else:
+            self.runner = None
 
     def apply(
         self,
@@ -1009,6 +1065,17 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if self.runner is not None and self.runner.runner_backend.is_asym_gemm():
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
+                AsymGemmBf16MoeQuantInfo,
+            )
+
+            quant_info = AsymGemmBf16MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

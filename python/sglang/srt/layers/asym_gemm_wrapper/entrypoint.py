@@ -80,6 +80,82 @@ def grouped_gemm_nt_f8f8bf16_contig(
         )
 
 
+# NVFP4 uses per-row scales for activations and per-row scales for weights
+# (granularity_mn=1, granularity_k=16). Scales are stored as E4M3 payload bytes;
+# the kernel internally re-packs them into the TMA-aligned uint32 layout required
+# by block-scaled NVFP4 MMA.
+_FP4_RECIPE = (1, 1, 16)
+
+
+def grouped_gemm_nt_fp4fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: torch.Tensor,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+    recipe: Optional[Tuple[int, int, int]] = None,
+):
+    print("~~~~~~~~~~~~~~~~~~~~~~~ 1")
+    num_groups, _, k_packed = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    k = k_packed * 2
+    kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_FP4_MASKED
+
+    with compile_utils.asym_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        with configure_asym_gemm_num_sms(
+            overlap_args.num_sms if overlap_args is not None else None
+        ):
+            print("~~~~~~~~~~~~~~~~~~~~~~~ 3")
+            return asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
+                lhs,
+                rhs,
+                out,
+                offsets,
+                experts,
+                list_size,
+                expected_m,
+                recipe=recipe if recipe is not None else _FP4_RECIPE,
+                disable_ue8m0_cast=True,
+            )
+
+
+def grouped_gemm_nt_fp4fp4bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+):
+
+    print("~~~~~~~~~~~~~~~~~~~~~~~ 2")
+    m, k_packed = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    k = k_packed * 2
+    kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_FP4_CONTIG
+
+    with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        print("~~~~~~~~~~~~~~~~~~~~~~~ 4")
+        asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            offsets,
+            experts,
+            list_size,
+            recipe=recipe if recipe is not None else _FP4_RECIPE,
+            disable_ue8m0_cast=True,
+        )
+
+
 def grouped_gemm_nt_bf16bf16bf16_masked(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
