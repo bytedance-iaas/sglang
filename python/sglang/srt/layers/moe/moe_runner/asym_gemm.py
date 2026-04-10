@@ -215,6 +215,64 @@ def _build_offsets_experts_contig_kernel(
         tl.store(experts_ptr + slot, g)
 
 
+def build_offsets_experts_direct(
+    sorted_expert_ids: torch.Tensor, num_groups: int, all_tokens: int
+):
+    """Build offsets/experts/list_size directly from sorted expert IDs via binary search.
+    Fuses compute_seg_indptr + build_offsets into a single kernel launch."""
+    offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=sorted_expert_ids.device)
+    experts = torch.full(
+        (num_groups + 1,), -1, dtype=torch.int32, device=sorted_expert_ids.device
+    )
+    list_size = torch.zeros(1, 1, dtype=torch.int32, device=sorted_expert_ids.device)
+
+    _build_offsets_direct_kernel[(num_groups,)](
+        sorted_expert_ids, offsets, experts, list_size, all_tokens,
+    )
+    list_size.add_(1)
+    return offsets, experts, list_size
+
+
+@triton.jit
+def _build_offsets_direct_kernel(
+    sorted_ids_ptr,
+    offsets_ptr,
+    experts_ptr,
+    list_size_ptr,
+    all_tokens,
+):
+    """Binary search for start/end of each expert in sorted IDs, then build offsets."""
+    g = tl.program_id(0)
+
+    # Binary search for start: first index where sorted_ids >= g
+    lo = 0
+    hi = all_tokens
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if tl.load(sorted_ids_ptr + mid) < g:
+            lo = mid + 1
+        else:
+            hi = mid
+    start = lo
+
+    # Binary search for end: first index where sorted_ids >= g+1
+    lo2 = start
+    hi2 = all_tokens
+    while lo2 < hi2:
+        mid2 = (lo2 + hi2) // 2
+        if tl.load(sorted_ids_ptr + mid2) < g + 1:
+            lo2 = mid2 + 1
+        else:
+            hi2 = mid2
+    end = lo2
+
+    if end > start:
+        slot = tl.atomic_add(list_size_ptr, 1)
+        tl.store(offsets_ptr + slot * 2, start.to(tl.int32))
+        tl.store(offsets_ptr + slot * 2 + 1, end.to(tl.int32))
+        tl.store(experts_ptr + slot, g)
+
+
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -640,15 +698,9 @@ def _pre_permute_standard_to_asym_gemm_fp8_contiguous(
     )
     del sorted_hidden
 
-    # 5. Build seg_indptr and then offsets/experts/list_size for contiguous layout
-    seg_indptr = torch.zeros(
-        num_local_experts + 1, device=device, dtype=torch.int64
-    )
-    _hp_get("seg_indptr")[(num_local_experts + 1,)](
-        sorted_expert_ids, seg_indptr, all_tokens
-    )
-    offsets, experts, list_size = build_offsets_experts_from_seg_indptr(
-        seg_indptr, num_local_experts
+    # 5. Build offsets/experts/list_size directly via binary search (fused kernel)
+    offsets, experts, list_size = build_offsets_experts_direct(
+        sorted_expert_ids, num_local_experts, all_tokens
     )
 
     running_state["topk_ids"] = topk_ids
