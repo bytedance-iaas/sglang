@@ -204,6 +204,73 @@ if _is_cuda:
         if expert_id == num_experts - 1:
             tl.store(num_tokens_post_padded_ptr, running)
 
+
+def _select_deepep_ll_direct_block_size(
+    masked_m: torch.Tensor,
+    *,
+    capture_active: bool,
+    expected_m: Optional[int] = None,
+) -> tuple[int, int, int]:
+    def _select_three_tier_block(
+        token_upper: int,
+        active_experts: int,
+        total_tokens: int,
+    ) -> int:
+        # Three-tier policy for LL decode:
+        # - 8: tiny sparse cases, best latency on current H100 traces
+        # - 16: default middle ground for moderate token upper bound
+        # - 32: only when upper bound is clearly larger and can amortize block cost
+        if token_upper <= 8:
+            return 8
+        if token_upper <= 16:
+            return 16
+        if token_upper > 32:
+            return 32
+
+        padded_16 = ((total_tokens + 15) // 16) * 16
+        padded_32 = ((total_tokens + 31) // 32) * 32
+        # Stay on 16 unless 32 meaningfully reduces block count or the upper bound
+        # is already close to 32 and enough experts are active.
+        if padded_32 + max(active_experts, 2) < padded_16 or (
+            token_upper >= 24 and active_experts >= 2
+        ):
+            return 32
+        return 16
+
+    if capture_active:
+        token_upper = int(expected_m or 0)
+        if token_upper <= 0:
+            token_upper = 8
+        return (
+            _select_three_tier_block(
+                token_upper,
+                int(masked_m.numel()),
+                token_upper * max(int(masked_m.numel()), 1),
+            ),
+            int(masked_m.numel()),
+            token_upper,
+        )
+
+    if masked_m.numel() == 0:
+        return 8, 0, 0
+
+    masked_m_host = masked_m.detach().cpu() if masked_m.is_cuda else masked_m
+    if masked_m_host.dtype != torch.int32:
+        masked_m_host = masked_m_host.to(dtype=torch.int32)
+
+    active = masked_m_host[masked_m_host > 0]
+    if active.numel() == 0:
+        return 8, 0, 0
+
+    active_experts = int(active.numel())
+    token_upper = int(active.max().item())
+    total_tokens = int(active.sum().item())
+    return (
+        _select_three_tier_block(token_upper, active_experts, total_tokens),
+        active_experts,
+        token_upper,
+    )
+
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
@@ -579,7 +646,6 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             if m * topk / e / block_size_m < 0.9:
                 break
 
-        marlin_runtime = getattr(layer, "_deepep_ll_marlin_runtime", None)
         device = hidden_states.device
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         max_blocks_per_expert = triton.cdiv(m, block_size_m)
@@ -590,6 +656,23 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         workspace_size = min(workspace_size, sms * 4)
         workspace_size = max(workspace_size, 128)
         intermediate13_size = m * max(2 * n, k)
+        runtime_key = (
+            device.index,
+            str(hidden_states.dtype),
+            e,
+            m,
+            n,
+            k,
+            block_size_m,
+        )
+        if capture_active:
+            marlin_runtime_map = getattr(layer, "_deepep_ll_marlin_runtime_map", None)
+            if marlin_runtime_map is None:
+                marlin_runtime_map = {}
+                layer._deepep_ll_marlin_runtime_map = marlin_runtime_map
+            marlin_runtime = marlin_runtime_map.get(runtime_key)
+        else:
+            marlin_runtime = getattr(layer, "_deepep_ll_marlin_runtime", None)
         if (
             marlin_runtime is None
             or marlin_runtime["device"] != device
@@ -638,7 +721,40 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 "masked_m_int": masked_m_int,
                 "aligned_prefix": aligned_prefix,
             }
-            layer._deepep_ll_marlin_runtime = marlin_runtime
+            if capture_active:
+                marlin_runtime_map[runtime_key] = marlin_runtime
+            else:
+                layer._deepep_ll_marlin_runtime = marlin_runtime
+            if _LOW_LATENCY_PROFILE_LOG and capture_active:
+                logger.warning(
+                    "DEEPEP_LL_DEBUG_RUNTIME_CREATE rank=%s layer_id=%s key=%s m=%s block_m=%s hidden_shape=%s workspace_ptr=%s cache13_ptr=%s cache2_ptr=%s sorted_ptr=%s expert_ptr=%s",
+                    getattr(layer, "moe_ep_rank", -1),
+                    id(layer),
+                    runtime_key,
+                    m,
+                    block_size_m,
+                    tuple(hidden_states.shape),
+                    marlin_runtime["workspace"].data_ptr(),
+                    marlin_runtime["intermediate_cache13"].data_ptr(),
+                    marlin_runtime["intermediate_cache2"].data_ptr(),
+                    marlin_runtime["sorted_token_ids"].data_ptr(),
+                    marlin_runtime["expert_ids"].data_ptr(),
+                )
+        elif _LOW_LATENCY_PROFILE_LOG and capture_active:
+            logger.warning(
+                "DEEPEP_LL_DEBUG_RUNTIME_REUSE rank=%s layer_id=%s key=%s m=%s block_m=%s hidden_shape=%s workspace_ptr=%s cache13_ptr=%s cache2_ptr=%s sorted_ptr=%s expert_ptr=%s",
+                getattr(layer, "moe_ep_rank", -1),
+                id(layer),
+                runtime_key,
+                m,
+                block_size_m,
+                tuple(hidden_states.shape),
+                marlin_runtime["workspace"].data_ptr(),
+                marlin_runtime["intermediate_cache13"].data_ptr(),
+                marlin_runtime["intermediate_cache2"].data_ptr(),
+                marlin_runtime["sorted_token_ids"].data_ptr(),
+                marlin_runtime["expert_ids"].data_ptr(),
+            )
 
         workspace = marlin_runtime["workspace"]
         sorted_token_ids = marlin_runtime["sorted_token_ids"]
@@ -781,6 +897,192 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
         return output
 
+    def _fused_marlin_deepep_ll_direct(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        masked_m: torch.Tensor,
+        *,
+        expected_m: Optional[int],
+        capture_active: bool,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            get_scalar_type,
+        )
+        # Prefer Stage-B direct_gemm if available
+        try:
+            from sglang.jit_kernel.deepep_moe_wna16_marlin_direct import (
+                deepep_moe_wna16_marlin_direct_gemm as _direct_gemm,
+            )
+            use_direct = True
+        except Exception:
+            from sglang.jit_kernel.deepep_moe_wna16_marlin import (
+                deepep_moe_wna16_marlin as _direct_gemm,
+            )
+            use_direct = False
+
+        assert hidden_states.ndim == 3
+        assert masked_m.ndim == 1
+
+        num_experts = hidden_states.shape[0]
+        active_tokens = (
+            int(masked_m.sum().item()) if not capture_active else int(expected_m or 1)
+        )
+        if not capture_active and active_tokens == 0:
+            return torch.zeros_like(hidden_states)
+
+        block_size_m, active_experts, token_upper = _select_deepep_ll_direct_block_size(
+            masked_m,
+            capture_active=capture_active,
+            expected_m=expected_m,
+        )
+        if capture_active:
+            direct_expected_m = token_upper if expected_m is None else int(expected_m)
+        else:
+            direct_expected_m = token_upper
+
+        profile_enabled = _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda
+        if profile_enabled:
+            marlin_start = torch.cuda.Event(enable_timing=True)
+            marlin_end = torch.cuda.Event(enable_timing=True)
+            marlin_start.record()
+
+        if use_direct:
+            # Stage-B direct_gemm path
+            size_m = hidden_states.shape[1]
+            size_k = hidden_states.shape[2]
+            size_n = layer.w2_weight_packed.shape[1] * 16
+            logical_m = max(min(direct_expected_m, size_m), 1)
+            runtime_cache = getattr(layer, "_deepep_ll_direct_runtime_cache", None)
+            if runtime_cache is None:
+                runtime_cache = {}
+                layer._deepep_ll_direct_runtime_cache = runtime_cache
+            runtime_key = (
+                hidden_states.device.index,
+                str(hidden_states.dtype),
+                num_experts,
+                logical_m,
+                size_k,
+                size_n,
+                block_size_m,
+            )
+            runtime = runtime_cache.get(runtime_key)
+            if runtime is None:
+                runtime = {
+                    "tmp1": torch.empty(
+                        (num_experts, logical_m, 2 * size_n),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                    "tmp2": torch.empty(
+                        (num_experts, logical_m, size_n),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                    "output_small": torch.empty(
+                        (num_experts, logical_m, size_k),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                    "w13_runtime": {},
+                    "w2_runtime": {},
+                }
+                runtime_cache[runtime_key] = runtime
+            runtime["tmp1"].zero_()
+            #runtime["tmp2"].zero_()
+            runtime["output_small"].zero_()
+            # W13
+            tmp1 = _direct_gemm(
+                hidden_states[:, :logical_m, :],
+                runtime["tmp1"],
+                layer.w13_weight_packed,
+                None,
+                layer.w13_weight_scale,
+                None,
+                None,
+                None,
+                masked_m,
+                direct_expected_m,
+                block_size_m,
+                get_scalar_type(self.num_bits, False),
+                logical_m,
+                2 * size_n,
+                size_k,
+                is_k_full=self.is_k_full,
+                use_atomic_add=False,
+                use_fp32_reduce=False,
+                is_zp_float=False,
+                runtime_cache=runtime["w13_runtime"],
+            )
+            # SiLU+Mul
+            from sgl_kernel import silu_and_mul
+
+            tmp2 = runtime["tmp2"]
+            silu_and_mul(tmp1, tmp2)
+            # W2
+            output = _direct_gemm(
+                tmp2,
+                runtime["output_small"],
+                layer.w2_weight_packed,
+                None,
+                layer.w2_weight_scale,
+                None,
+                None,
+                None,
+                masked_m,
+                direct_expected_m,
+                block_size_m,
+                get_scalar_type(self.num_bits, False),
+                logical_m,
+                hidden_states.shape[2],
+                size_n,
+                is_k_full=self.is_k_full,
+                use_atomic_add=False,
+                use_fp32_reduce=False,
+                is_zp_float=False,
+                runtime_cache=runtime["w2_runtime"],
+            )
+            full_output = hidden_states
+            full_output[:, :logical_m, :].copy_(output)
+            output = full_output
+        else:
+            # Stage-A batched wrapper fallback
+            runtime_cache = getattr(layer, "_deepep_ll_direct_marlin_runtime", None)
+            if runtime_cache is None:
+                runtime_cache = {}
+                layer._deepep_ll_direct_marlin_runtime = runtime_cache
+            output = _direct_gemm(
+                hidden_states,
+                masked_m,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                layer.w13_weight_g_idx,
+                layer.w2_weight_g_idx,
+                layer.w13_g_idx_sort_indices,
+                layer.w2_g_idx_sort_indices,
+                self.num_bits,
+                self.is_k_full,
+                block_size_m,
+                runtime_cache,
+            )
+
+        if profile_enabled:
+            marlin_end.record()
+            marlin_end.synchronize()
+            logger.warning(
+                "DEEPEP_LL_PROFILE_MARLIN_DIRECT rank=%s active_tokens=%s active_experts=%s token_upper=%s num_experts=%s block_m=%s marlin_ms=%.3f",
+                getattr(layer, "moe_ep_rank", -1),
+                active_tokens,
+                active_experts,
+                token_upper,
+                num_experts,
+                block_size_m,
+                marlin_start.elapsed_time(marlin_end),
+            )
+        return output
+
     def _get_deepep_ll_max_active_tokens(self, dispatch_topk_ids: torch.Tensor) -> int:
         return max(int(dispatch_topk_ids.numel()), 1)
 
@@ -870,7 +1172,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         return output
 
     def apply_deepep_ll(self, layer: torch.nn.Module, dispatch_output):
-        hidden_states, hidden_states_scale, dispatch_topk_ids, _, masked_m, _ = (
+        hidden_states, hidden_states_scale, dispatch_topk_ids, _, masked_m, expected_m = (
             dispatch_output
         )
 
@@ -894,72 +1196,147 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         max_active_tokens = int(dispatch_topk_ids.numel())
         if max_active_tokens == 0:
             return torch.zeros_like(hidden_states)
+        active_tokens = max_active_tokens
         profile_enabled = _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda and not capture_active
         if not capture_active:
             active_tokens = int(masked_m.sum().item())
             if active_tokens == 0:
                 return torch.zeros_like(hidden_states)
             token_upper_bound = min(padded_m, max(int(masked_m.max().item()), 1))
-            prefix_sum = torch.empty(
-                (num_local_experts + 1,),
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
-            compact_hidden_states = torch.empty(
-                (active_tokens, hidden_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            expanded_output = hidden_states
         else:
-            cached_layout = getattr(layer, "_deepep_ll_marlin_layout", None)
-            if (
-                cached_layout is None
-                or cached_layout["device"] != hidden_states.device
-                or cached_layout["num_local_experts"] != num_local_experts
-                or cached_layout["padded_m"] != padded_m
-                or cached_layout["max_active_tokens"] != max_active_tokens
-            ):
-                compact_hidden_states = torch.empty(
-                    (max_active_tokens, hidden_size),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
+            active_tokens = max_active_tokens
+            token_upper_bound = min(padded_m, max_active_tokens)
+        has_act_order = (
+            layer.w13_weight_g_idx.numel() > 0 or layer.w2_weight_g_idx.numel() > 0
+        )
+
+        if _is_cuda and not has_act_order:
+            if profile_enabled:
+                total_start = torch.cuda.Event(enable_timing=True)
+                total_end = torch.cuda.Event(enable_timing=True)
+                total_start.record()
+            output = self._fused_marlin_deepep_ll_direct(
+                layer,
+                hidden_states,
+                masked_m,
+                expected_m=expected_m,
+                capture_active=capture_active,
+            )
+            if profile_enabled:
+                total_end.record()
+                total_end.synchronize()
+                logger.warning(
+                    "DEEPEP_LL_PROFILE_COMPUTE rank=%s capture=%s active_tokens=%s token_upper=%s hidden_shape=%s compact_ms=%.3f marlin_ms=%.3f expand_ms=%.3f total_ms=%.3f",
+                    getattr(layer, "moe_ep_rank", -1),
+                    capture_active,
+                    active_tokens,
+                    token_upper_bound,
+                    tuple(hidden_states.shape),
+                    0.0,
+                    total_start.elapsed_time(total_end),
+                    0.0,
+                    total_start.elapsed_time(total_end),
                 )
+            return output
+
+        if _is_cuda:
+            if not capture_active:
+                # token_upper_bound 已在上文非 capture 分支中计算
                 prefix_sum = torch.empty(
                     (num_local_experts + 1,),
                     dtype=torch.int32,
                     device=hidden_states.device,
                 )
-                cached_layout = {
-                    "device": hidden_states.device,
-                    "num_local_experts": num_local_experts,
-                    "padded_m": padded_m,
-                    "max_active_tokens": max_active_tokens,
-                    "compact_hidden_states": compact_hidden_states,
-                    "prefix_sum": prefix_sum,
-                }
-                layer._deepep_ll_marlin_layout = cached_layout
+                compact_hidden_states = torch.empty(
+                    (active_tokens, hidden_size),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                expanded_output = hidden_states
+            else:
+                layout_key = (
+                    hidden_states.device.index,
+                    str(hidden_states.dtype),
+                    num_local_experts,
+                    padded_m,
+                    hidden_size,
+                    max_active_tokens,
+                )
+                layout_cache = getattr(layer, "_deepep_ll_marlin_layout_map", None)
+                if layout_cache is None:
+                    layout_cache = {}
+                    layer._deepep_ll_marlin_layout_map = layout_cache
+                cached_layout = layout_cache.get(layout_key)
+                if (
+                    cached_layout is None
+                    or cached_layout["device"] != hidden_states.device
+                    or cached_layout["num_local_experts"] != num_local_experts
+                    or cached_layout["padded_m"] != padded_m
+                    or cached_layout["max_active_tokens"] != max_active_tokens
+                ):
+                    compact_hidden_states = torch.empty(
+                        (max_active_tokens, hidden_size),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    prefix_sum = torch.empty(
+                        (num_local_experts + 1,),
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    cached_layout = {
+                        "device": hidden_states.device,
+                        "num_local_experts": num_local_experts,
+                        "padded_m": padded_m,
+                        "max_active_tokens": max_active_tokens,
+                        "compact_hidden_states": compact_hidden_states,
+                        "prefix_sum": prefix_sum,
+                    }
+                    layout_cache[layout_key] = cached_layout
+                    if _LOW_LATENCY_PROFILE_LOG:
+                        logger.warning(
+                            "DEEPEP_LL_DEBUG_LAYOUT_CREATE rank=%s layer_id=%s key=%s graph_max_active=%s experts=%s padded_m=%s hidden_size=%s compact_ptr=%s prefix_ptr=%s",
+                            getattr(layer, "moe_ep_rank", -1),
+                            id(layer),
+                            layout_key,
+                            max_active_tokens,
+                            num_local_experts,
+                            padded_m,
+                            hidden_size,
+                            compact_hidden_states.data_ptr(),
+                            prefix_sum.data_ptr(),
+                        )
+                elif _LOW_LATENCY_PROFILE_LOG:
+                    logger.warning(
+                        "DEEPEP_LL_DEBUG_LAYOUT_REUSE rank=%s layer_id=%s key=%s graph_max_active=%s experts=%s padded_m=%s hidden_size=%s compact_ptr=%s prefix_ptr=%s",
+                        getattr(layer, "moe_ep_rank", -1),
+                        id(layer),
+                        layout_key,
+                        max_active_tokens,
+                        num_local_experts,
+                        padded_m,
+                        hidden_size,
+                        cached_layout["compact_hidden_states"].data_ptr(),
+                        cached_layout["prefix_sum"].data_ptr(),
+                    )
 
-            prefix_sum = cached_layout["prefix_sum"]
-            compact_hidden_states = cached_layout["compact_hidden_states"]
-            expanded_output = hidden_states
-            active_tokens = max_active_tokens
-            token_upper_bound = min(padded_m, max_active_tokens)
+                prefix_sum = cached_layout["prefix_sum"]
+                compact_hidden_states = cached_layout["compact_hidden_states"]
+                expanded_output = hidden_states
+                # token_upper_bound 已在上文 capture 分支中计算
 
-        if _is_cuda:
             _build_deepep_ll_prefix_sum_kernel[(num_local_experts + 1,)](
                 masked_m,
                 prefix_sum,
                 num_local_experts,
             )
 
-        if profile_enabled:
-            total_start = torch.cuda.Event(enable_timing=True)
-            compact_end = torch.cuda.Event(enable_timing=True)
-            marlin_end = torch.cuda.Event(enable_timing=True)
-            expand_end = torch.cuda.Event(enable_timing=True)
-            total_start.record()
-        if _is_cuda:
+            if profile_enabled:
+                total_start = torch.cuda.Event(enable_timing=True)
+                compact_end = torch.cuda.Event(enable_timing=True)
+                marlin_end = torch.cuda.Event(enable_timing=True)
+                expand_end = torch.cuda.Event(enable_timing=True)
+                total_start.record()
             grid = (
                 triton.cdiv(hidden_size, 256),
                 token_upper_bound,
@@ -1011,7 +1388,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                     "DEEPEP_LL_PROFILE_COMPUTE rank=%s capture=%s active_tokens=%s token_upper=%s hidden_shape=%s compact_ms=%.3f marlin_ms=%.3f expand_ms=%.3f total_ms=%.3f",
                     getattr(layer, "moe_ep_rank", -1),
                     capture_active,
-                    max_active_tokens,
+                    active_tokens,
                     token_upper_bound,
                     tuple(hidden_states.shape),
                     total_start.elapsed_time(compact_end),
