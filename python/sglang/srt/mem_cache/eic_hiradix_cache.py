@@ -273,7 +273,7 @@ class EICHiRadixCache(RadixCache):
                 node_id=node.id,
             )
         if host_indices is not None:
-            node.host_value = host_indices
+            node.host_value = host_indices.clone()
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 self.inc_lock_ref(node)
@@ -706,11 +706,11 @@ class EICHiRadixCache(RadixCache):
         if child.evicted:
             new_node.value = None
         else:
-            new_node.value = child.value[:split_len]
-            child.value = child.value[split_len:]
+            new_node.value = child.value[:split_len].clone()
+            child.value = child.value[split_len:].clone()
         if child.backuped:
-            new_node.host_value = child.host_value[:split_len]
-            child.host_value = child.host_value[split_len:]
+            new_node.host_value = child.host_value[:split_len].clone()
+            child.host_value = child.host_value[split_len:].clone()
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -874,11 +874,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         if child.evicted:
             new_node.value = None
         else:
-            new_node.value = child.value[:split_len]
-            child.value = child.value[split_len:]
+            new_node.value = child.value[:split_len].clone()
+            child.value = child.value[split_len:].clone()
         if child.backuped:
-            new_node.host_value = child.host_value[:split_len]
-            child.host_value = child.host_value[split_len:]
+            new_node.host_value = child.host_value[:split_len].clone()
+            child.host_value = child.host_value[split_len:].clone()
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -1146,7 +1146,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             content_hash=node.content_hash,
         )
         if host_indices is not None:
-            node.host_value = host_indices
+            node.host_value = host_indices.clone()
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 self.inc_lock_ref(node)
