@@ -266,18 +266,24 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
-
-    # def execute(self, m):
-    #     asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
-    #         (self.lhs_q, self.lhs_s),
-    #         (self.rhs_q, self.rhs_s),
-    #         self.out,
-    #         masked_m=self.masked_m,
-    #         expected_m=m,
-    #     )
+        self.num_groups = num_groups
+        # Build dummy offsets/experts/list_size for warmup
+        # Single segment: all tokens belong to expert 0
+        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
+        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
 
     def execute(self, m):
-        return
+        asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            self.offsets,
+            self.experts,
+            self.list_size,
+            m,
+            disable_ue8m0_cast=False,
+        )
 
 class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
@@ -288,6 +294,7 @@ class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
         # Pre-allocate buffers for offsets/experts conversion
         self.offsets = torch.empty((max_m + 1,), device="cuda", dtype=torch.int32)
         self.experts = torch.empty((max_m + 1,), device="cuda", dtype=torch.int32)
+        self.list_size = torch.empty(1, 1, device="cuda", dtype=torch.int32)
 
     def _convert_m_indices(self, m: int):
         """Convert m_indices to offsets/experts format matching C++ build_offsets_experts_from_indices."""
@@ -296,17 +303,17 @@ class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
         self.m_indices[:m].fill_(0)
         self.offsets[:2].copy_(torch.tensor([0, m], device="cuda", dtype=torch.int32))
         self.experts[:2].copy_(torch.tensor([0, -1], device="cuda", dtype=torch.int32))
-        return 2  # list_size
+        self.list_size.fill_(2)
 
     def execute(self, m):
-        list_size = self._convert_m_indices(m)
+        self._convert_m_indices(m)
         asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
             self.lhs[:m],
             self.rhs,
             self.out[:m],
-            self.offsets[:list_size],
-            self.experts[:list_size],
-            list_size,
+            self.offsets,
+            self.experts,
+            self.list_size,
         )
 
 
@@ -322,36 +329,28 @@ class _GroupedMaskedBf16WarmupExecutor(_BaseWarmupExecutor):
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
+        # Build dummy offsets/experts/list_size for warmup
+        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
+        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
 
     def execute(self, m):
-        return
-    # def execute(self, m):
-    #     from .entrypoint import build_offsets_experts_from_masked_m
-        
-    #     num_groups = self.lhs.shape[0]
-    #     offsets, experts, list_size = build_offsets_experts_from_masked_m(
-    #         self.masked_m,
-    #         num_groups,
-    #     )
-
-    #     rhs = self.rhs.detach().to("cpu", non_blocking=False).pin_memory()
-
-    #     asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(
-    #         self.lhs,
-    #         rhs,
-    #         self.out,
-    #         offsets,
-    #         experts,
-    #         list_size,
-    #         m,
-    #         compiled_dims="nk",
-    #     )
+        asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(
+            self.lhs,
+            self.rhs,
+            self.out,
+            self.offsets,
+            self.experts,
+            self.list_size,
+            m,
+            compiled_dims="nk",
+        )
 
 
 @contextmanager
 def asym_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: AsymGemmKernelType
 ):
-    if m > 0:
+    if m > 0 and not torch.cuda.is_current_stream_capturing():
         _maybe_compile_asym_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield

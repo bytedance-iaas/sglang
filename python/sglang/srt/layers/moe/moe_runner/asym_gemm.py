@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers import asym_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -80,12 +82,13 @@ def build_offsets_experts_from_masked_m(
 ):
     """
     Build offsets and experts for sparse m-grouped masked GEMM.
+    Fixed-size output tensors; active experts are compacted to the front
+    (unordered), inactive slots are -1.
 
-    Each group gets a fixed allocation of max_m rows in the A matrix.
-    Only groups with masked_m[g] > 0 are included in the output mapping.
-    Each active group produces an (start, end) offset pair where:
-        start = g * max_m
-        end   = start + ceil(masked_m[g] / block_m) * block_m
+    Example with num_groups=256, active experts 0, 1, 128:
+        experts = [0, 1, 128, -1, -1, ..., -1]  (size num_groups+1)
+        offsets = [s0, e0, s1, e1, s128, e128, 0, 0, ...]  (size 2*num_groups)
+        list_size = 4  (3 active + 1 terminator)
 
     Args:
         masked_m:   (num_groups,) tensor of actual token counts per group
@@ -94,29 +97,43 @@ def build_offsets_experts_from_masked_m(
         block_m:    block-M alignment for padding (default 128)
 
     Returns:
-        offsets:   flat int32 tensor [start_0, end_0, start_1, end_1, ...]
-        experts:   int32 tensor of active expert IDs + terminator (-1)
-        list_size: len(experts), i.e. num_active_experts + 1
+        offsets:   flat int32 tensor of size 2*num_groups
+        experts:   int32 tensor of size num_groups+1
+        list_size: num_active + 1
     """
-    offsets = []
-    experts = []
-
-    for g in range(num_groups):
-        v = masked_m[g].item()
-        if v > 0:
-            start = g * max_m
-            end = start + ((v + block_m - 1) // block_m) * block_m
-            offsets.append(start)
-            offsets.append(end)
-            experts.append(g)
-
-    experts.append(-1)
-
-    return (
-        torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
-        torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-        len(experts),
+    offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=masked_m.device)
+    experts = torch.full(
+        (num_groups + 1,), -1, dtype=torch.int32, device=masked_m.device
     )
+    list_size = torch.zeros(1, 1, dtype=torch.int32, device=masked_m.device)
+
+    _build_offsets_experts_kernel[(num_groups,)](
+        masked_m, offsets, experts, list_size, max_m, block_m
+    )
+    # list_size = num_active + 1 (the +1 accounts for the -1 terminator)
+    list_size.add_(1)
+
+    return offsets, experts, list_size
+
+
+@triton.jit
+def _build_offsets_experts_kernel(
+    masked_m_ptr,
+    offsets_ptr,
+    experts_ptr,
+    list_size_ptr,
+    max_m: int,
+    block_m: int,
+):
+    g = tl.program_id(0)
+    v = tl.load(masked_m_ptr + g)
+    if v > 0:
+        slot = tl.atomic_add(list_size_ptr, 1)
+        start = g * max_m
+        end = start + ((v + block_m - 1) // block_m) * block_m
+        tl.store(offsets_ptr + slot * 2, start)
+        tl.store(offsets_ptr + slot * 2 + 1, end)
+        tl.store(experts_ptr + slot, g)
 
 
 @dataclass
@@ -127,9 +144,9 @@ class AsymGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    offsets: Optional[int] = None
-    experts: Optional[int] = None
-    list_size: int = 0
+    offsets: Optional[torch.Tensor] = None
+    experts: Optional[torch.Tensor] = None
+    list_size: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
