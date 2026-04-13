@@ -55,23 +55,20 @@ jobs:
         run: |
           docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
 
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          # Use the daemon-backed driver so Docker Hub auth stays on the local daemon
-          # after the explicit pre-pull, instead of re-entering the proxy-sensitive
-          # anonymous token flow inside a separate buildkit container.
-          driver: docker
-
-      - name: Bootstrap builder
+      - name: Select daemon-backed Buildx builder
         run: |
-          docker buildx inspect --builder "${{ steps.buildx.outputs.name }}" --bootstrap
+          # This self-hosted runner already ships with a working daemon-backed
+          # `default` builder. Reuse it instead of creating a new builder:
+          # - additional docker-driver builders cannot be created here
+          # - docker-container builders time out when resolving docker.io metadata
+          docker buildx version
+          docker buildx use default
+          docker buildx inspect --builder default --bootstrap
 
       - name: Build framework image
         run: |
           docker buildx build \
-            --builder "${{ steps.buildx.outputs.name }}" \
+            --builder default \
             --platform linux/amd64 \
             --target framework \
             --load \
@@ -83,7 +80,9 @@ jobs:
             --build-arg BRANCH_TYPE=local \
             --build-arg SGLANG_BRANCH=${{ github.head_ref || github.ref_name }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            # Smoke validation should verify the Docker build path itself, not
+            # block on a multi-GB optional JIT cache preload from GitHub releases.
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=0 \
             -t local/sglang-dev:${{ github.sha }} \
             .
 
