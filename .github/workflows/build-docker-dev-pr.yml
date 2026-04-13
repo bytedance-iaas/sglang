@@ -68,6 +68,8 @@ jobs:
 
       - name: Build framework image
         run: |
+          # Smoke validation should verify the Docker build path itself, not
+          # block on a multi-GB optional JIT cache preload from GitHub releases.
           docker buildx build \
             --builder default \
             --platform linux/amd64 \
@@ -81,8 +83,6 @@ jobs:
             --build-arg BRANCH_TYPE=local \
             --build-arg SGLANG_BRANCH=${{ github.head_ref || github.ref_name }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
-            # Smoke validation should verify the Docker build path itself, not
-            # block on a multi-GB optional JIT cache preload from GitHub releases.
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=0 \
             -t local/sglang-dev:${{ github.sha }} \
             .
