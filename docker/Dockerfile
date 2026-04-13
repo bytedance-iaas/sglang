@@ -135,7 +135,7 @@ fi
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
     && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
-        https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
+        https://codeload.github.com/NVIDIA/gdrcopy/tar.gz/refs/tags/v${GDRCOPY_VERSION} \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
     && CUDA=/usr/local/cuda ./build-deb-packages.sh \
@@ -216,9 +216,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi \
     && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
-    fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
+        && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin \
+    ; \
+    fi
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
@@ -242,7 +243,7 @@ RUN set -eux; \
       cd .. ; \
     else \
         curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
-            https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
+            https://codeload.github.com/deepseek-ai/DeepEP/zip/${DEEPEP_COMMIT} && \
         unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
         sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
@@ -287,8 +288,30 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         make -j$(nproc) && \
         make install; \
     else \
-        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
-        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+        echo "CUDA < 13, installing mooncake-transfer-engine from prebuilt wheel"; \
+        printf '%s\n' \
+            'import platform' \
+            'import re' \
+            'import sys' \
+            'import urllib.parse' \
+            'import urllib.request' \
+            "version = '${MOONCAKE_VERSION}'" \
+            "python_tag = f'cp{sys.version_info.major}{sys.version_info.minor}'" \
+            "arch = {'x86_64': 'x86_64', 'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(platform.machine())" \
+            "assert arch, f'Unsupported architecture: {platform.machine()}'" \
+            "base = 'https://mirrors.ivolces.com/pypi/simple/mooncake-transfer-engine/'" \
+            'html = urllib.request.urlopen(base).read().decode()' \
+            "pattern = rf'href=\"([^\"]*mooncake_transfer_engine-{re.escape(version)}-{python_tag}-{python_tag}-manylinux_2_35_{arch}\\.whl[^\"]*)\"'" \
+            'match = re.search(pattern, html)' \
+            "assert match, f'Failed to locate mooncake wheel for {version} {python_tag} {arch}'" \
+            "print(urllib.parse.urljoin(base, match.group(1).split('#', 1)[0]))" \
+            > /tmp/mooncake-wheel-url.py && \
+        MOONCAKE_WHEEL_URL="$(python3 /tmp/mooncake-wheel-url.py)" && \
+        rm -f /tmp/mooncake-wheel-url.py && \
+        MOONCAKE_WHEEL_PATH="/tmp/$(basename "${MOONCAKE_WHEEL_URL}")" && \
+        curl --retry 3 --retry-delay 2 -fsSL -o "${MOONCAKE_WHEEL_PATH}" "${MOONCAKE_WHEEL_URL}" && \
+        python3 -m pip install "${MOONCAKE_WHEEL_PATH}" && \
+        rm -f "${MOONCAKE_WHEEL_PATH}"; \
     fi
 # Install essential Python packages
 RUN --mount=type=cache,target=/root/.cache/pip \

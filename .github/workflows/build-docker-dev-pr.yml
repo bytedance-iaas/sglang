@@ -1,0 +1,98 @@
+name: Build Development Docker Image (PR)
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-docker-dev-pr.yml"
+      - "docker/**"
+      - "python/**"
+      - "sgl-kernel/**"
+      - "sgl-model-gateway/**"
+      - "scripts/**"
+  pull_request:
+    branches:
+      - ep_main
+    paths:
+      - ".github/workflows/build-docker-dev-pr.yml"
+      - "docker/**"
+      - "python/**"
+      - "sgl-kernel/**"
+      - "sgl-model-gateway/**"
+      - "scripts/**"
+
+concurrency:
+  group: build-docker-dev-pr-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUNNER_PROXY: http://100.68.160.245:3128
+  RUNNER_NO_PROXY: localhost,127.0.0.1,::1
+
+jobs:
+  build-dev-x64:
+    runs-on: x64-docker-build-node
+    timeout-minutes: 240
+    env:
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner context
+        run: |
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "RUNNER_ARCH=${RUNNER_ARCH}"
+          docker version
+
+      - name: Pre-pull public base image
+        run: |
+          docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+
+      - name: Select daemon-backed Buildx builder
+        run: |
+          # This self-hosted runner already ships with a working daemon-backed
+          # `default` builder. Reuse it instead of creating a new builder:
+          # - additional docker-driver builders cannot be created here
+          # - docker-container builders time out when resolving docker.io metadata
+          # - RUN-stage proxy behavior is supplied by the build node's Docker config
+          docker buildx version
+          docker buildx use default
+          docker buildx inspect --builder default --bootstrap
+
+      - name: Build framework image
+        run: |
+          # Smoke validation should verify the Docker build path itself, not
+          # block on a multi-GB optional JIT cache preload from GitHub releases.
+          docker buildx build \
+            --builder default \
+            --platform linux/amd64 \
+            --target framework \
+            --load \
+            --progress=plain \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg SGLANG_BRANCH=${{ github.head_ref || github.ref_name }} \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=0 \
+            -t local/sglang-dev:${{ github.sha }} \
+            .
+
+      - name: Inspect built image
+        run: |
+          docker image inspect local/sglang-dev:${{ github.sha }} --format 'tag={{index .RepoTags 0}} size={{.Size}}'
+
+      - name: Dump builder state
+        if: always()
+        run: |
+          docker buildx ls
