@@ -1,0 +1,8 @@
+results_dir: results
+base:
+  backend: eic_offload
+  replay: shared_context_replay
+  cache_mode: online_built_cache
+  num_requests: 64
+sweep:
+  reuse_distance: [1, 4, 8, 16, 32]

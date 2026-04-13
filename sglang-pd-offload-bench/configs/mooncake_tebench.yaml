@@ -1,0 +1,4 @@
+transport_p50_ms: 2.0
+transport_p95_ms: 5.8
+throughput_mb_s: 760
+output: results/mooncake_tebench.json
