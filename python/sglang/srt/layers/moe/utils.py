@@ -25,6 +25,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    NCCL_EP = "nccl_ep"
 
     @classmethod
     def _missing_(cls, value):
@@ -53,6 +54,8 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_nccl_ep(self):
+        return self == MoeA2ABackend.NCCL_EP
 
 class MoeRunnerBackend(Enum):
 

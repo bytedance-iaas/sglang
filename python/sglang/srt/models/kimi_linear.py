@@ -30,6 +30,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer
@@ -115,6 +116,12 @@ class KimiMoE(nn.Module):
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
 
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_nccl_ep()
+            or get_moe_a2a_backend().is_mooncake()
+        )
+
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiMLP(
@@ -123,9 +130,22 @@ class KimiMoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                **(dict(tp_rank=0, tp_size=1) if self._enable_a2a_moe else {}),
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._enable_a2a_moe:
+            from sglang.srt.distributed import get_moe_expert_parallel_world_size
+
+            self.ep_size = get_moe_expert_parallel_world_size()
+
+    def forward(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch = None,
+    ) -> torch.Tensor:
+        if self._enable_a2a_moe:
+            return self.forward_deepep(hidden_states, forward_batch)
+        return self.forward_normal(hidden_states)
+
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
@@ -161,6 +181,50 @@ class KimiMoE(nn.Module):
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
+
+    def forward_deepep(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+
+        shared_output = None
+        if hidden_states.shape[0] > 0:
+            router_logits, _ = self.gate(hidden_states)
+            if self.num_shared_experts is not None:
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self.shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self.shared_experts(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx,
+                ),
+            )
+        else:
+            topk_output = self.topk.empty_topk_output(device=hidden_states.device)
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+
+        if (
+            hidden_states.shape[0] > 0
+            and shared_output is not None
+            and self.alt_stream is not None
+        ):
+            torch.cuda.current_stream().wait_event(shared_event)
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
+        return final_hidden_states
 
 
 class KimiDeltaAttention(nn.Module):
@@ -521,7 +585,10 @@ class KimiDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if self.is_moe:
+            hidden_states = self.mlp(hidden_states, forward_batch)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 

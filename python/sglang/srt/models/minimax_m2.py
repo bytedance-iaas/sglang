@@ -377,7 +377,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.layer_id = layer_id
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_nccl_ep():
             self.ep_size = get_moe_expert_parallel_world_size()
             self.top_k = config.num_experts_per_tok
 
@@ -389,7 +389,7 @@ class MiniMaxM2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_nccl_ep():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(hidden_states)
@@ -455,7 +455,7 @@ class MiniMaxM2MoE(nn.Module):
                 )
             )
             with ctx:
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
+                state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
@@ -464,21 +464,14 @@ class MiniMaxM2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
         """Dispatch A operation for TBO - start async dispatch"""
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
+            self.experts.dispatcher.dispatch_a(
                 hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_batch=state.forward_batch,
+                topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -493,24 +486,21 @@ class MiniMaxM2MoE(nn.Module):
                 )
             )
             with ctx:
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
 
     def op_experts(self, state):
         """Expert computation for TBO"""
-        state.hidden_states_experts_output = self.experts.moe_impl(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         """Combine A operation for TBO - start async combine"""
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
-                topk_weights=state.dispatch_output.topk_weights,
-                forward_batch=state.forward_batch,
+            self.experts.dispatcher.combine_a(
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
@@ -519,7 +509,7 @@ class MiniMaxM2MoE(nn.Module):
         """Combine B operation for TBO - complete async combine"""
         if self.ep_size > 1:
             state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
+                self.experts.dispatcher.combine_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
             )

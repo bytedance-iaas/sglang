@@ -414,13 +414,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_nccl_ep()
                     or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake() or get_moe_a2a_backend().is_nccl_ep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -437,7 +438,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake() or get_moe_a2a_backend().is_nccl_ep()
         )
 
     def get_moe_weights(self):
@@ -458,7 +459,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if not get_moe_a2a_backend().is_deepep():
+        if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
@@ -1045,8 +1046,8 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_nccl_ep():
+            disable_reason = "Shared experts fusion is not supported when Deepep/NCCL-EP MoE backend is enabled."
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True

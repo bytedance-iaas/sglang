@@ -474,6 +474,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_nccl_ep()
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
@@ -518,6 +519,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nccl_ep()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -539,6 +541,7 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nccl_ep()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
@@ -2619,6 +2622,7 @@ class DeepseekV2Model(nn.Module):
                         a2a_backend.is_deepep()
                         or a2a_backend.is_mori()
                         or a2a_backend.is_mooncake()
+                        or a2a_backend.is_nccl_ep()
                     )
                     tp_size = (
                         1 if is_a2a_moe else get_tensor_model_parallel_world_size()
@@ -2641,7 +2645,7 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake() or get_moe_a2a_backend().is_nccl_ep():
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
@@ -2889,7 +2893,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori() or get_moe_a2a_backend().is_nccl_ep()
         ):
             disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":

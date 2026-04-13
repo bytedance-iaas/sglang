@@ -193,6 +193,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mori",
     "ascend_fuseep",
     "flashinfer",
+    "nccl_ep",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -494,7 +495,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer", "nccl_ep"
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -2224,6 +2225,15 @@ class ServerArgs:
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.moe_a2a_backend == "nccl_ep":
+            if self.deepep_mode == "normal":
+                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+                self.disable_cuda_graph = True
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"NCCL-EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+			
         if self.moe_a2a_backend == "ascend_fuseep":
             self.ep_size = self.tp_size
             logger.warning(

@@ -162,7 +162,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake() or get_moe_a2a_backend().is_nccl_ep():
             self.compile_config.add_split_op(
                 "sglang.moe_forward_piecewise_cuda_graph_impl"
             )
