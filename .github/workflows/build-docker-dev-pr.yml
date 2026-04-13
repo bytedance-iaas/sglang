@@ -61,6 +61,7 @@ jobs:
           # `default` builder. Reuse it instead of creating a new builder:
           # - additional docker-driver builders cannot be created here
           # - docker-container builders time out when resolving docker.io metadata
+          # - RUN-stage proxy behavior is supplied by the build node's Docker config
           docker buildx version
           docker buildx use default
           docker buildx inspect --builder default --bootstrap
