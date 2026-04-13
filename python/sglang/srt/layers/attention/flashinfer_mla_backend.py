@@ -339,6 +339,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
+                padded_qo_len=forward_batch.extend_num_tokens if use_ragged else None,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -953,6 +954,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
+        padded_qo_len: Optional[int] = None,
         spec_info: Optional[SpecInput] = None,
     ):
         if use_ragged:
@@ -973,6 +975,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.kv_indptr,
             self.qo_indptr,
             use_ragged,
+            padded_qo_len,
             spec_info,
         )
 
@@ -988,6 +991,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
+        padded_qo_len: Optional[int] = None,
         spec_info: Optional[SpecInput] = None,
     ):
         bs = len(seq_lens)
@@ -1026,6 +1030,15 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 )
             )
 
+        if use_ragged and padded_qo_len is not None:
+            actual_qo_tokens = int(qo_indptr[-1].item())
+            if padded_qo_len > actual_qo_tokens:
+                # DP/TP sync may pad extend tokens (e.g. 44 -> 48). Append one dummy
+                # request for the padded tail so flashinfer's shape check matches q.shape[0].
+                qo_indptr = torch.cat(
+                    [qo_indptr, qo_indptr.new_tensor([padded_qo_len])]
+                )
+
         # #region debug-point A:prefill-metadata
         try:
             import json
@@ -1060,6 +1073,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                                 "paged_kernel_lens": [
                                     int(x) for x in paged_kernel_lens.tolist()
                                 ],
+                                "padded_qo_len": padded_qo_len,
                                 "qo_indptr": [int(x) for x in qo_indptr.tolist()],
                                 "kv_indptr": [int(x) for x in kv_indptr.tolist()],
                             },
