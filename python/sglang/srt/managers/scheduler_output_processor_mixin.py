@@ -480,7 +480,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     if self.enable_hisparse:
                         self.hisparse_coordinator.request_finished(req)
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(req, self.tree_cache, is_decode=True)
 
                 req.time_stats.set_completion_time()
 
