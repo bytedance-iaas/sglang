@@ -1,27 +1,21 @@
-name: Build Development Docker Image (PR)
+name: Build Development Docker Image (Manual)
 
 on:
-  push:
-    paths:
-      - ".github/workflows/build-docker-dev-pr.yml"
-      - "docker/**"
-      - "python/**"
-      - "sgl-kernel/**"
-      - "sgl-model-gateway/**"
-      - "scripts/**"
-  pull_request:
-    branches:
-      - ep_main
-    paths:
-      - ".github/workflows/build-docker-dev-pr.yml"
-      - "docker/**"
-      - "python/**"
-      - "sgl-kernel/**"
-      - "sgl-model-gateway/**"
-      - "scripts/**"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to build from (leave empty to use current branch)"
+        required: false
+        default: ""
+      tag:
+        description: "Optional local image tag suffix"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 0 * * *"
 
 concurrency:
-  group: build-docker-dev-pr-${{ github.event.pull_request.number || github.ref_name }}
+  group: build-docker-dev-manual-${{ inputs.tag || inputs.pr_number || 'nightly' }}
   cancel-in-progress: true
 
 permissions:
@@ -33,6 +27,7 @@ env:
 
 jobs:
   build-dev-x64:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' }}
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
@@ -41,9 +36,12 @@ jobs:
       ALL_PROXY: http://100.68.160.245:3128
       NO_PROXY: localhost,127.0.0.1,::1
       BUILDKIT_NO_CLIENT_TOKEN: "true"
+      GITHUB_ARTIFACTORY: ${{ vars.GITHUB_ARTIFACTORY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
 
       - name: Show runner context
         run: |
@@ -69,8 +67,24 @@ jobs:
 
       - name: Build framework image
         run: |
-          # Smoke validation should verify the Docker build path itself, not
-          # block on a multi-GB optional JIT cache preload from GitHub releases.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            SOURCE_ARG="--build-arg USE_LATEST_SGLANG=1"
+          else
+            SOURCE_ARG="--build-arg BRANCH_TYPE=local"
+          fi
+
+          IMAGE_TAG="${{ github.sha }}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            IMAGE_TAG="${{ inputs.tag }}"
+          elif [ -n "${{ inputs.pr_number }}" ]; then
+            IMAGE_TAG="pr-${{ inputs.pr_number }}"
+          fi
+
+          ARTIFACTORY_ARG=()
+          if [ -n "${GITHUB_ARTIFACTORY}" ]; then
+            ARTIFACTORY_ARG+=(--build-arg "GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}")
+          fi
+
           docker buildx build \
             --builder default \
             --platform linux/amd64 \
@@ -81,16 +95,22 @@ jobs:
             --build-arg CUDA_VERSION=12.9.1 \
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
-            --build-arg BRANCH_TYPE=local \
-            --build-arg SGLANG_BRANCH=${{ github.head_ref || github.ref_name }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=0 \
-            -t local/sglang-dev:${{ github.sha }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${SOURCE_ARG} \
+            "${ARTIFACTORY_ARG[@]}" \
+            -t local/sglang-dev:${IMAGE_TAG} \
             .
 
       - name: Inspect built image
         run: |
-          docker image inspect local/sglang-dev:${{ github.sha }} --format 'tag={{index .RepoTags 0}} size={{.Size}}'
+          IMAGE_TAG="${{ github.sha }}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            IMAGE_TAG="${{ inputs.tag }}"
+          elif [ -n "${{ inputs.pr_number }}" ]; then
+            IMAGE_TAG="pr-${{ inputs.pr_number }}"
+          fi
+          docker image inspect local/sglang-dev:${IMAGE_TAG} --format 'tag={{index .RepoTags 0}} size={{.Size}}'
 
       - name: Dump builder state
         if: always()
