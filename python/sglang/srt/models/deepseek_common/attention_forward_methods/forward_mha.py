@@ -358,6 +358,54 @@ class DeepseekMHAForwardMixin:
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
+        # #region debug-point C:mha-one-shot-inputs
+        try:
+            import json
+            import os
+            import time
+
+            _log_path = ".dbg/trae-debug-log-ragged-qo-mismatch.ndjson"
+            os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+            with open(_log_path, "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "ragged-qo-mismatch",
+                            "runId": "pre-fix",
+                            "hypothesisId": "C",
+                            "ts": int(time.time() * 1000),
+                            "location": "forward_mha.py:forward_normal_one_shot_core",
+                            "msg": "[DEBUG] one-shot core inputs",
+                            "data": {
+                                "batch_size": int(forward_batch.batch_size),
+                                "mha_one_shot": bool(
+                                    getattr(forward_batch, "mha_one_shot", False)
+                                ),
+                                "has_extend_prefix": bool(has_extend_prefix),
+                                "q_shape": [int(x) for x in q.shape],
+                                "k_shape": [int(x) for x in k.shape],
+                                "v_shape": [int(x) for x in v.shape],
+                                "seq_lens_cpu": (
+                                    [int(x) for x in forward_batch.seq_lens_cpu]
+                                    if forward_batch.seq_lens_cpu is not None
+                                    else None
+                                ),
+                                "extend_prefix_lens_cpu": (
+                                    [
+                                        int(x)
+                                        for x in forward_batch.extend_prefix_lens_cpu
+                                    ]
+                                    if forward_batch.extend_prefix_lens_cpu is not None
+                                    else None
+                                ),
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         return self.forward_normal_core(q, k, v, forward_batch)
 
     def _chunked_prefix_attn_mha(

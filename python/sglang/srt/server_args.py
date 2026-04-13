@@ -162,7 +162,7 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
+PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
@@ -5740,7 +5740,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.prefill_cp_mode,
             choices=PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase under context parallelism. Optional values: 'in-seq-split' (default)",
+            help="Token splitting mode for the prefill phase under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",

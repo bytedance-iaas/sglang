@@ -660,6 +660,70 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_all = k.to(q.dtype).view(-1, layer.tp_k_head_num, layer.head_dim)
                 v_all = v.to(q.dtype).view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                # #region debug-point B:ragged-forward-shapes
+                try:
+                    import json
+                    import os
+                    import time
+
+                    _log_path = ".dbg/trae-debug-log-ragged-qo-mismatch.ndjson"
+                    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+                    with open(_log_path, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "ragged-qo-mismatch",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "B",
+                                    "ts": int(time.time() * 1000),
+                                    "location": "flashinfer_mla_backend.py:forward_extend",
+                                    "msg": "[DEBUG] ragged forward input shapes",
+                                    "data": {
+                                        "use_prefill_cp": bool(use_prefill_cp),
+                                        "piecewise_cuda_graph": bool(
+                                            is_in_piecewise_cuda_graph()
+                                        ),
+                                        "batch_size": int(forward_batch.batch_size),
+                                        "mha_one_shot": bool(
+                                            getattr(forward_batch, "mha_one_shot", False)
+                                        ),
+                                        "q_shape": [int(x) for x in qall.shape],
+                                        "k_shape": [int(x) for x in k_all.shape],
+                                        "v_shape": [int(x) for x in v_all.shape],
+                                        "self_qo_indptr": [
+                                            int(x)
+                                            for x in self.qo_indptr[
+                                                : forward_batch.batch_size + 1
+                                            ].tolist()
+                                        ],
+                                        "self_kv_indptr": [
+                                            int(x)
+                                            for x in self.kv_indptr[
+                                                : forward_batch.batch_size + 1
+                                            ].tolist()
+                                        ],
+                                        "seq_lens_cpu": (
+                                            [int(x) for x in forward_batch.seq_lens_cpu]
+                                            if forward_batch.seq_lens_cpu is not None
+                                            else None
+                                        ),
+                                        "extend_prefix_lens_cpu": (
+                                            [
+                                                int(x)
+                                                for x in forward_batch.extend_prefix_lens_cpu
+                                            ]
+                                            if forward_batch.extend_prefix_lens_cpu
+                                            is not None
+                                            else None
+                                        ),
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+                # #endregion
                 o = self.prefill_wrapper_ragged.forward(
                     qall,
                     k_all,
@@ -961,6 +1025,51 @@ class FlashInferMLAIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+
+        # #region debug-point A:prefill-metadata
+        try:
+            import json
+            import os
+            import time
+
+            _log_path = ".dbg/trae-debug-log-ragged-qo-mismatch.ndjson"
+            os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+            with open(_log_path, "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "ragged-qo-mismatch",
+                            "runId": "pre-fix",
+                            "hypothesisId": "A",
+                            "ts": int(time.time() * 1000),
+                            "location": "flashinfer_mla_backend.py:call_begin_forward",
+                            "msg": "[DEBUG] prefill metadata prepared",
+                            "data": {
+                                "bs": int(bs),
+                                "use_ragged": bool(use_ragged),
+                                "spec_info": spec_info is not None,
+                                "piecewise_cuda_graph": bool(
+                                    is_in_piecewise_cuda_graph()
+                                ),
+                                "seq_lens": [int(x) for x in seq_lens.tolist()],
+                                "prefix_lens": (
+                                    [int(x) for x in prefix_lens.tolist()]
+                                    if prefix_lens is not None
+                                    else None
+                                ),
+                                "paged_kernel_lens": [
+                                    int(x) for x in paged_kernel_lens.tolist()
+                                ],
+                                "qo_indptr": [int(x) for x in qo_indptr.tolist()],
+                                "kv_indptr": [int(x) for x in kv_indptr.tolist()],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
 
         if use_ragged:
             # ragged prefill
