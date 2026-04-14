@@ -18,10 +18,21 @@ concurrency:
   group: release-docker-dev-${{ inputs.tag || inputs.pr_number || 'nightly' }}
   cancel-in-progress: true
 
+env:
+  RUNNER_PROXY: http://100.68.160.245:3128
+  RUNNER_NO_PROXY: localhost,127.0.0.1,::1
+
 jobs:
   build-dev:
-    if: ${{ github.repository == 'sgl-project/sglang' }}
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     runs-on: ${{ matrix.runner }}
+    env:
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+      GITHUB_ARTIFACTORY: ${{ vars.GITHUB_ARTIFACTORY }}
     strategy:
       matrix:
         include:
@@ -76,7 +87,15 @@ jobs:
           docker volume prune -af
 
       - name: Set up Docker Buildx
+        if: ${{ matrix.runner != 'x64-docker-build-node' }}
         uses: docker/setup-buildx-action@v3
+
+      - name: Select daemon-backed Buildx builder
+        if: ${{ matrix.runner == 'x64-docker-build-node' }}
+        run: |
+          docker buildx version
+          docker buildx use default
+          docker buildx inspect --builder default --bootstrap
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -93,7 +112,18 @@ jobs:
             SOURCE_ARG="--build-arg BRANCH_TYPE=local"
           fi
 
+          BUILDER_ARG=()
+          if [ "${{ matrix.runner }}" = "x64-docker-build-node" ]; then
+            BUILDER_ARG+=(--builder default)
+          fi
+
+          ARTIFACTORY_ARG=()
+          if [ -n "${GITHUB_ARTIFACTORY}" ]; then
+            ARTIFACTORY_ARG+=(--build-arg "GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}")
+          fi
+
           docker buildx build \
+            "${BUILDER_ARG[@]}" \
             --platform ${{ matrix.platform }} \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             --target framework \
@@ -104,6 +134,7 @@ jobs:
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
             ${SOURCE_ARG} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            "${ARTIFACTORY_ARG[@]}" \
             --metadata-file /tmp/metadata.json \
             --no-cache \
             .
@@ -122,7 +153,7 @@ jobs:
   create-manifests:
     runs-on: ubuntu-22.04
     needs: [build-dev]
-    if: ${{ github.repository == 'sgl-project/sglang' }}
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     strategy:
       matrix:
         variant:

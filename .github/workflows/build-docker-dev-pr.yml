@@ -11,11 +11,9 @@ on:
         description: "Optional local image tag suffix"
         required: false
         default: ""
-  schedule:
-    - cron: "0 0 * * *"
 
 concurrency:
-  group: build-docker-dev-manual-${{ inputs.tag || inputs.pr_number || 'nightly' }}
+  group: build-docker-dev-manual-${{ inputs.tag || inputs.pr_number || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -27,7 +25,7 @@ env:
 
 jobs:
   build-dev-x64:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' }}
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
@@ -67,12 +65,6 @@ jobs:
 
       - name: Build framework image
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            SOURCE_ARG="--build-arg USE_LATEST_SGLANG=1"
-          else
-            SOURCE_ARG="--build-arg BRANCH_TYPE=local"
-          fi
-
           IMAGE_TAG="${{ github.sha }}"
           if [ -n "${{ inputs.tag }}" ]; then
             IMAGE_TAG="${{ inputs.tag }}"
@@ -97,7 +89,7 @@ jobs:
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            ${SOURCE_ARG} \
+            --build-arg BRANCH_TYPE=local \
             "${ARTIFACTORY_ARG[@]}" \
             -t local/sglang-dev:${IMAGE_TAG} \
             .

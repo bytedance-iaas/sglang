@@ -16,8 +16,15 @@ on:
 
 jobs:
   publish-x86:
-    if: github.repository == 'sgl-project/sglang'
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     environment: "prod"
+    env:
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      BUILDKIT_NO_CLIENT_TOKEN: "true"
+      GITHUB_ARTIFACTORY: ${{ vars.GITHUB_ARTIFACTORY }}
     strategy:
       matrix:
         variant:
@@ -43,8 +50,11 @@ jobs:
           large-packages: true
           swap-storage: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Select daemon-backed Buildx builder
+        run: |
+          docker buildx version
+          docker buildx use default
+          docker buildx inspect --builder default --bootstrap
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -77,8 +87,13 @@ jobs:
       - name: Build and Push AMD64 Runtime
         run: |
           version=${{ steps.version.outputs.version }}
+          ARTIFACTORY_ARG=()
+          if [ -n "${GITHUB_ARTIFACTORY}" ]; then
+            ARTIFACTORY_ARG+=(--build-arg "GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}")
+          fi
 
           docker buildx build \
+            --builder default \
             --target runtime \
             --platform linux/amd64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
@@ -88,6 +103,7 @@ jobs:
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg SGL_VERSION=${version} \
+            "${ARTIFACTORY_ARG[@]}" \
             --metadata-file /tmp/metadata-cu129-runtime.json \
             --no-cache \
             .
@@ -99,8 +115,13 @@ jobs:
       - name: Build and Push AMD64 Runtime (CUDA 13)
         run: |
           version=${{ steps.version.outputs.version }}
+          ARTIFACTORY_ARG=()
+          if [ -n "${GITHUB_ARTIFACTORY}" ]; then
+            ARTIFACTORY_ARG+=(--build-arg "GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}")
+          fi
 
           docker buildx build \
+            --builder default \
             --target runtime \
             --platform linux/amd64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
@@ -110,6 +131,7 @@ jobs:
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg SGL_VERSION=${version} \
+            "${ARTIFACTORY_ARG[@]}" \
             --metadata-file /tmp/metadata-cu130-runtime.json \
             --no-cache \
             .
@@ -126,8 +148,10 @@ jobs:
           retention-days: 1
 
   publish-arm64:
-    if: github.repository == 'sgl-project/sglang'
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     environment: "prod"
+    env:
+      GITHUB_ARTIFACTORY: ${{ vars.GITHUB_ARTIFACTORY }}
     strategy:
       matrix:
         variant:
@@ -176,6 +200,10 @@ jobs:
       - name: Build and Push ARM64 Runtime
         run: |
           version=${{ steps.version.outputs.version }}
+          ARTIFACTORY_ARG=()
+          if [ -n "${GITHUB_ARTIFACTORY}" ]; then
+            ARTIFACTORY_ARG+=(--build-arg "GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}")
+          fi
 
           docker buildx build \
             --target runtime \
@@ -187,6 +215,7 @@ jobs:
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg SGL_VERSION=${version} \
+            "${ARTIFACTORY_ARG[@]}" \
             --metadata-file /tmp/metadata-cu129-runtime.json \
             --no-cache \
             .
@@ -198,6 +227,10 @@ jobs:
       - name: Build and Push ARM64 Runtime (CUDA 13)
         run: |
           version=${{ steps.version.outputs.version }}
+          ARTIFACTORY_ARG=()
+          if [ -n "${GITHUB_ARTIFACTORY}" ]; then
+            ARTIFACTORY_ARG+=(--build-arg "GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}")
+          fi
 
           docker buildx build \
             --target runtime \
@@ -208,6 +241,7 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg SGL_VERSION=${version} \
+            "${ARTIFACTORY_ARG[@]}" \
             --metadata-file /tmp/metadata-cu130-runtime.json \
             --no-cache \
             .
@@ -226,7 +260,7 @@ jobs:
   create-manifests:
     runs-on: ubuntu-22.04
     needs: [publish-x86, publish-arm64]
-    if: github.repository == 'sgl-project/sglang'
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     environment: "prod"
     steps:
       - name: Checkout repository

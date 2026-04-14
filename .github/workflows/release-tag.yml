@@ -9,9 +9,9 @@ on:
         required: true
         type: string
       ref:
-        description: 'Branch or commit to tag (e.g., release/v0.5.7, main, or commit SHA)'
+        description: 'Branch or commit to tag (e.g., release/v0.5.7, ep_main, or commit SHA)'
         required: false
-        default: 'main'
+        default: 'ep_main'
         type: string
 
 permissions:
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   create-tag:
-    if: github.repository == 'sgl-project/sglang'
+    if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     runs-on: ubuntu-latest
     environment: 'prod'
     steps:
