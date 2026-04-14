@@ -980,9 +980,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if is_prefill_context_parallel_enabled():
-            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
+            cp_token_len = (
+                forward_batch.extend_num_tokens
+                if forward_batch.extend_num_tokens is not None
+                else len(input_ids)
+            )
+            if can_cp_split(cp_token_len, self.attn_cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
+                    cp_token_len,
                     self.attn_cp_rank,
                     self.attn_cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
