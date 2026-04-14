@@ -21,6 +21,8 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.7.post3
 ARG MOONCAKE_VERSION=0.3.9
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.byted.org/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.byted.org/extra-tools/ubuntu/GPG-KEY-system
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -68,6 +70,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     openssh-server \
     curl \
     wget \
+    gpg \
     lsof \
     locales \
     # Build essentials (needed for framework stage)
@@ -175,6 +178,8 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG DEEPEP_COMMIT
 ARG TRITON_LANG_COMMIT
 ARG GITHUB_ARTIFACTORY
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL
 
 WORKDIR /sgl-workspace
 
@@ -214,11 +219,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi \
-    && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+    && python3 -m pip install -e "./python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+
+# Install IAAS internal packages and sources.
+RUN set -eux; \
+    http_proxy='' https_proxy='' python3 -m pip install https://eic-sdk-release.tos-cn-beijing.ivolces.com/python/eic-1.5.2-py3-none-any.whl; \
+    http_proxy='' https_proxy='' python3 -m pip install boto3; \
+    curl -fsSL ${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL} | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} jammy main" > /etc/apt/sources.list.d/volctools.list; \
+    apt-get update && apt-get install -y --no-install-recommends onion-ai-data; \
+    rm -rf /var/lib/apt/lists/*
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2

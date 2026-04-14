@@ -19,9 +19,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sync-upstream-tags:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync missing upstream version tags into fork
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.repository }}" != "bytedance-iaas/sglang" ]; then
+            echo "Skipping upstream tag sync outside fork repository"
+            exit 0
+          fi
+
+          git remote add upstream https://github.com/sgl-project/sglang.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/sgl-project/sglang.git
+
+          normalize_tags() {
+            awk '{print $2}' | sed 's#refs/tags/##; s/\^{}//' | sort -u
+          }
+
+          upstream_tags="$(git ls-remote --tags upstream 'v*' | normalize_tags)"
+          origin_tags="$(git ls-remote --tags origin 'v*' | normalize_tags)"
+          missing_tags="$(comm -23 <(printf '%s\n' "${upstream_tags}") <(printf '%s\n' "${origin_tags}"))"
+
+          if [ -z "${missing_tags}" ]; then
+            echo "No missing upstream tags to sync"
+            exit 0
+          fi
+
+          echo "Syncing missing tags:"
+          printf '%s\n' "${missing_tags}"
+
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
+            git push origin "refs/tags/${tag}:refs/tags/${tag}"
+          done <<< "${missing_tags}"
+
   build-dev:
-    if: ${{ github.repository == 'sgl-project/sglang' }}
+    needs: [sync-upstream-tags]
+    environment: "prod"
     runs-on: ${{ matrix.runner }}
+    env:
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      BYTED_INTERNAL_EXTRA_TOOLS_APT_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+      BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+      HTTP_PROXY: http://100.68.160.245:3128
+      HTTPS_PROXY: http://100.68.160.245:3128
+      ALL_PROXY: http://100.68.160.245:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
     strategy:
       matrix:
         include:
@@ -31,23 +86,11 @@ jobs:
             grace_blackwell: 0
             arch_tag: x86
             version: 12.9.1
-          - runner: arm-docker-build-node
-            platform: linux/arm64
-            build_type: all
-            grace_blackwell: 1
-            arch_tag: arm64
-            version: 12.9.1
           - runner: x64-docker-build-node
             platform: linux/amd64
             build_type: all
             grace_blackwell: 0
             arch_tag: x86-cu13
-            version: 13.0.1
-          - runner: arm-docker-build-node
-            platform: linux/arm64
-            build_type: all
-            grace_blackwell: 1
-            arch_tag: arm64-cu13
             version: 13.0.1
     steps:
       - name: Delete huge unnecessary tools folder
@@ -57,6 +100,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      - name: Fetch version tags
+        run: git fetch --force --tags origin
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -75,14 +121,19 @@ jobs:
           docker system prune -af --filter "until=72h"
           docker volume prune -af
 
-      - name: Set up Docker Buildx
+      - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
 
       - name: Build and Push Dev Image
         run: |
@@ -93,117 +144,77 @@ jobs:
             SOURCE_ARG="--build-arg BRANCH_TYPE=local"
           fi
 
+          IMAGE_NAME="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+          LOCAL_IMAGE="local/sglang-dev:${{ github.run_id }}-${{ matrix.arch_tag }}"
+          INTERNAL_ARGS="\
+            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} \
+            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}"
+
+          CUDA_SUFFIX=""
+          if [ "${{ matrix.version }}" = "13.0.1" ]; then
+            CUDA_SUFFIX="--cuda-suffix cu130"
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode nightly ${CUDA_SUFFIX})
+          else
+            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode manual ${CUDA_SUFFIX})
+          fi
+
           docker buildx build \
             --platform ${{ matrix.platform }} \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
+            --load \
+            -t "${LOCAL_IMAGE}" \
             --target framework \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.version }} \
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
+            --build-arg HTTP_PROXY=${HTTP_PROXY} \
+            --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
+            --build-arg ALL_PROXY=${ALL_PROXY} \
+            --build-arg NO_PROXY=${NO_PROXY} \
             ${SOURCE_ARG} \
+            ${INTERNAL_ARGS} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --metadata-file /tmp/metadata.json \
             --no-cache \
             .
 
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest.txt
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ matrix.arch_tag }}
-          path: /tmp/digest.txt
-          retention-days: 1
+          docker image inspect "${LOCAL_IMAGE}" >/dev/null
+          FINAL_IMAGE="${IMAGE_NAME}:${VOLCENGINE_TAG}"
+          echo "Built local image ${LOCAL_IMAGE}"
+          echo "Pushing ${FINAL_IMAGE}"
+          docker tag "${LOCAL_IMAGE}" "${FINAL_IMAGE}"
+          docker push "${FINAL_IMAGE}"
 
   create-manifests:
     runs-on: ubuntu-22.04
     needs: [build-dev]
-    if: ${{ github.repository == 'sgl-project/sglang' }}
+    environment: "prod"
+    env:
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
     strategy:
       matrix:
         variant:
           - base: dev
             x86: x86
-            arm64: arm64
           - base: dev-cu13
             x86: x86-cu13
-            arm64: arm64-cu13
     steps:
-      - uses: docker/setup-buildx-action@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Download x86 digest
-        uses: actions/download-artifact@v4
-        with:
-          name: digest-${{ matrix.variant.x86 }}
-          path: /tmp/digests/x86
-
-      - name: Download arm64 digest
-        uses: actions/download-artifact@v4
-        with:
-          name: digest-${{ matrix.variant.arm64 }}
-          path: /tmp/digests/arm64
-
-      - name: Create multi-arch manifest
+      - name: Login to Volcengine CR if configured
         run: |
-          X86_DIGEST=$(cat /tmp/digests/x86/digest.txt)
-          ARM64_DIGEST=$(cat /tmp/digests/arm64/digest.txt)
-
-          SUFFIX=""
-          if [ -n "${{ inputs.tag }}" ]; then
-            SUFFIX="-${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            SUFFIX="-pr-${{ inputs.pr_number }}"
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ] || [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "Volcengine CR not configured; skipping secondary registry publish"
+            exit 0
           fi
 
-          TAG="${{ matrix.variant.base }}${SUFFIX}"
-
-          # For nightly (no suffix), also stamp a dated tag
-          EXTRA_TAG=""
-          if [ -z "${SUFFIX}" ]; then
-            SHORT_SHA="${{ github.sha }}"
-            EXTRA_TAG="-t lmsysorg/sglang:nightly-${TAG}-$(date +%Y%m%d)-${SHORT_SHA:0:8}"
-          fi
-
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:${TAG} \
-            ${EXTRA_TAG} \
-            lmsysorg/sglang@${X86_DIGEST} \
-            lmsysorg/sglang@${ARM64_DIGEST}
-
-          echo "✓ Published lmsysorg/sglang:${TAG}"
-
-      - name: Cleanup Old Nightly Builds
-        if: ${{ !inputs.tag && !inputs.pr_number }}
-        run: |
-          TOKEN=$(curl -s -H "Content-Type: application/json" \
-            -X POST -d '{"username": "${{ secrets.DOCKERHUB_USERNAME }}", "password": "${{ secrets.DOCKERHUB_TOKEN }}"}' \
-            https://hub.docker.com/v2/users/login/ | jq -r .token)
-
-          TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" \
-            "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
-
-          TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
-            '.results[] | select(.name | test("^nightly-${{ matrix.variant.base }}-[0-9]")) | "\(.last_updated)|\(.name)"' \
-            | sort -r | cut -d'|' -f2)
-
-          TAG_COUNT=$(echo "$TAGS" | wc -l)
-          if [ "$TAG_COUNT" -gt 14 ]; then
-            echo "Found $TAG_COUNT nightly builds, keeping only the 14 most recent"
-            TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +15)
-            for tag in $TAGS_TO_DELETE; do
-              echo "Deleting tag: $tag"
-              curl -X DELETE -H "Authorization: JWT $TOKEN" \
-                "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/$tag/"
-            done
-          else
-            echo "Only $TAG_COUNT nightly builds found, no cleanup needed"
-          fi
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
