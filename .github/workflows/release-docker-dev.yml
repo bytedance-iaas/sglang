@@ -19,50 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  sync-upstream-tags:
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Sync missing upstream version tags into fork
-        run: |
-          set -euo pipefail
-
-          if [ "${{ github.repository }}" != "bytedance-iaas/sglang" ]; then
-            echo "Skipping upstream tag sync outside fork repository"
-            exit 0
-          fi
-
-          git remote add upstream https://github.com/sgl-project/sglang.git 2>/dev/null || \
-            git remote set-url upstream https://github.com/sgl-project/sglang.git
-
-          normalize_tags() {
-            awk '{print $2}' | sed 's#refs/tags/##; s/\^{}//' | sort -u
-          }
-
-          upstream_tags="$(git ls-remote --tags upstream 'v*' | normalize_tags)"
-          origin_tags="$(git ls-remote --tags origin 'v*' | normalize_tags)"
-          missing_tags="$(comm -23 <(printf '%s\n' "${upstream_tags}") <(printf '%s\n' "${origin_tags}"))"
-
-          if [ -z "${missing_tags}" ]; then
-            echo "No missing upstream tags to sync"
-            exit 0
-          fi
-
-          echo "Syncing missing tags:"
-          printf '%s\n' "${missing_tags}"
-
-          while IFS= read -r tag; do
-            [ -n "${tag}" ] || continue
-            git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
-            git push origin "refs/tags/${tag}:refs/tags/${tag}"
-          done <<< "${missing_tags}"
-
   build-dev:
-    needs: [sync-upstream-tags]
     environment: "prod"
     runs-on: ${{ matrix.runner }}
     env:
