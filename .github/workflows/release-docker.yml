@@ -14,6 +14,13 @@ on:
         description: "Version to build (without v prefix, e.g., 0.5.7)"
         required: true
 
+env:
+  VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+  VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+  VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+  VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+  VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+
 jobs:
   publish-x86:
     if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
@@ -64,6 +71,16 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to Volcengine CR if configured
+        run: |
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ] || [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "Volcengine CR not configured; skipping secondary registry publish"
+            exit 0
+          fi
+
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
 
       - name: Get version from tag
         id: version
@@ -326,3 +343,31 @@ jobs:
             -t lmsysorg/sglang:latest-cu130 \
             lmsysorg/sglang@${CU130_AMD64_FW} \
             lmsysorg/sglang@${CU130_ARM64_FW}
+
+          if [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [ -n "${VOLCENGINE_CR_NAMESPACE}" ] && [ -n "${VOLCENGINE_CR_USERNAME}" ] && [ -n "${VOLCENGINE_CR_PASSWORD}" ]; then
+            VOLCENGINE_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+
+            docker buildx imagetools create \
+              -t "${VOLCENGINE_IMAGE}:v${version}" \
+              lmsysorg/sglang@${CU129_AMD64_FW} \
+              lmsysorg/sglang@${CU129_ARM64_FW}
+
+            docker buildx imagetools create \
+              -t "${VOLCENGINE_IMAGE}:latest" \
+              lmsysorg/sglang@${CU129_AMD64_FW} \
+              lmsysorg/sglang@${CU129_ARM64_FW}
+
+            docker buildx imagetools create \
+              -t "${VOLCENGINE_IMAGE}:v${version}-cu130" \
+              lmsysorg/sglang@${CU130_AMD64_FW} \
+              lmsysorg/sglang@${CU130_ARM64_FW}
+
+            docker buildx imagetools create \
+              -t "${VOLCENGINE_IMAGE}:latest-cu130" \
+              lmsysorg/sglang@${CU130_AMD64_FW} \
+              lmsysorg/sglang@${CU130_ARM64_FW}
+
+            echo "✓ Published ${VOLCENGINE_IMAGE} release tags"
+          else
+            echo "Volcengine CR not configured; skipped release tag mirror"
+          fi

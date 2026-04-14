@@ -11,6 +11,11 @@ on:
         description: "Optional local image tag suffix"
         required: false
         default: ""
+      push_to_volcengine:
+        description: "Push the built image to Volcengine CR if credentials are configured"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: build-docker-dev-manual-${{ inputs.tag || inputs.pr_number || github.ref_name }}
@@ -22,6 +27,11 @@ permissions:
 env:
   RUNNER_PROXY: http://100.68.160.245:3128
   RUNNER_NO_PROXY: localhost,127.0.0.1,::1
+  VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+  VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+  VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+  VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+  VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
 
 jobs:
   build-dev-x64:
@@ -103,6 +113,30 @@ jobs:
             IMAGE_TAG="pr-${{ inputs.pr_number }}"
           fi
           docker image inspect local/sglang-dev:${IMAGE_TAG} --format 'tag={{index .RepoTags 0}} size={{.Size}}'
+
+      - name: Push image to Volcengine CR
+        if: ${{ inputs.push_to_volcengine }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ] || [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "::error::Volcengine CR push requested, but VOLCENGINE_CR_REGISTRY / VOLCENGINE_CR_NAMESPACE / VOLCENGINE_CR_USERNAME / VOLCENGINE_CR_PASSWORD are not fully configured"
+            exit 1
+          fi
+
+          IMAGE_TAG="${{ github.sha }}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            IMAGE_TAG="${{ inputs.tag }}"
+          elif [ -n "${{ inputs.pr_number }}" ]; then
+            IMAGE_TAG="pr-${{ inputs.pr_number }}"
+          fi
+
+          TARGET_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+          docker tag "local/sglang-dev:${IMAGE_TAG}" "${TARGET_IMAGE}"
+          docker push "${TARGET_IMAGE}"
+          echo "Published ${TARGET_IMAGE}"
 
       - name: Dump builder state
         if: always()

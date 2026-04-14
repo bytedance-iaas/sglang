@@ -21,6 +21,11 @@ concurrency:
 env:
   RUNNER_PROXY: http://100.68.160.245:3128
   RUNNER_NO_PROXY: localhost,127.0.0.1,::1
+  VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+  VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+  VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+  VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+  VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
 
 jobs:
   build-dev:
@@ -171,6 +176,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to Volcengine CR if configured
+        run: |
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ] || [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "Volcengine CR not configured; skipping secondary registry publish"
+            exit 0
+          fi
+
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
       - name: Download x86 digest
         uses: actions/download-artifact@v4
         with:
@@ -211,6 +226,25 @@ jobs:
             lmsysorg/sglang@${ARM64_DIGEST}
 
           echo "✓ Published lmsysorg/sglang:${TAG}"
+
+          if [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [ -n "${VOLCENGINE_CR_NAMESPACE}" ] && [ -n "${VOLCENGINE_CR_USERNAME}" ] && [ -n "${VOLCENGINE_CR_PASSWORD}" ]; then
+            VOLCENGINE_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+            VOLCENGINE_EXTRA_TAG=""
+            if [ -z "${SUFFIX}" ]; then
+              SHORT_SHA="${{ github.sha }}"
+              VOLCENGINE_EXTRA_TAG="-t ${VOLCENGINE_IMAGE}:nightly-${TAG}-$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+            fi
+
+            docker buildx imagetools create \
+              -t "${VOLCENGINE_IMAGE}:${TAG}" \
+              ${VOLCENGINE_EXTRA_TAG} \
+              lmsysorg/sglang@${X86_DIGEST} \
+              lmsysorg/sglang@${ARM64_DIGEST}
+
+            echo "✓ Published ${VOLCENGINE_IMAGE}:${TAG}"
+          else
+            echo "Volcengine CR not configured; skipped ${TAG}"
+          fi
 
       - name: Cleanup Old Nightly Builds
         if: ${{ !inputs.tag && !inputs.pr_number }}
