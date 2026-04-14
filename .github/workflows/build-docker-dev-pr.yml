@@ -8,14 +8,9 @@ on:
         required: false
         default: ""
       tag:
-        description: "Optional local image tag suffix"
+        description: "Optional tag value inserted into v<version>.byted.<tag>.<timestamp>"
         required: false
         default: ""
-      push_to_volcengine:
-        description: "Push the built image to Volcengine CR if credentials are configured"
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: build-docker-dev-manual-${{ inputs.tag || inputs.pr_number || github.ref_name }}
@@ -58,6 +53,24 @@ jobs:
           echo "RUNNER_ARCH=${RUNNER_ARCH}"
           docker version
 
+      - name: Resolve image tag
+        id: image-tag
+        run: |
+          set -euo pipefail
+
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION=$(grep -Po "(?<=__version__ = version = ')[^']+" python/sglang/_version.py)
+          TIMESTAMP=$(TZ=Asia/Shanghai date +%Y%m%d%H%M)
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=v${VERSION}.byted.${{ inputs.tag }}.${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v${VERSION}.byted.${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Pre-pull public base image
         run: |
           docker pull nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
@@ -75,12 +88,7 @@ jobs:
 
       - name: Build framework image
         run: |
-          IMAGE_TAG="${{ github.sha }}"
-          if [ -n "${{ inputs.tag }}" ]; then
-            IMAGE_TAG="${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            IMAGE_TAG="pr-${{ inputs.pr_number }}"
-          fi
+          IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
 
           ARTIFACTORY_ARG=()
           if [ -n "${GITHUB_ARTIFACTORY}" ]; then
@@ -106,30 +114,19 @@ jobs:
 
       - name: Inspect built image
         run: |
-          IMAGE_TAG="${{ github.sha }}"
-          if [ -n "${{ inputs.tag }}" ]; then
-            IMAGE_TAG="${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            IMAGE_TAG="pr-${{ inputs.pr_number }}"
-          fi
+          IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
           docker image inspect local/sglang-dev:${IMAGE_TAG} --format 'tag={{index .RepoTags 0}} size={{.Size}}'
 
       - name: Push image to Volcengine CR
-        if: ${{ inputs.push_to_volcengine }}
         run: |
           set -euo pipefail
 
           if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ] || [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
-            echo "::error::Volcengine CR push requested, but VOLCENGINE_CR_REGISTRY / VOLCENGINE_CR_NAMESPACE / VOLCENGINE_CR_USERNAME / VOLCENGINE_CR_PASSWORD are not fully configured"
+            echo "::error::VOLCENGINE_CR_REGISTRY / VOLCENGINE_CR_NAMESPACE / VOLCENGINE_CR_USERNAME / VOLCENGINE_CR_PASSWORD are not fully configured"
             exit 1
           fi
 
-          IMAGE_TAG="${{ github.sha }}"
-          if [ -n "${{ inputs.tag }}" ]; then
-            IMAGE_TAG="${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            IMAGE_TAG="pr-${{ inputs.pr_number }}"
-          fi
+          IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
 
           TARGET_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}:${IMAGE_TAG}"
 
