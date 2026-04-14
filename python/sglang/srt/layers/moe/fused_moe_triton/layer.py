@@ -734,6 +734,14 @@ class FusedMoE(torch.nn.Module):
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "w4afp8"
+            and is_transposed
+            and loaded_weight.dim() == 2
+            and ("weight_packed" in weight_name or "weight_scale" in weight_name)
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
