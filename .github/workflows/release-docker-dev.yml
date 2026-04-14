@@ -1,4 +1,4 @@
-name: Build and Push Nightly Docker Images
+name: Build and Push Development Docker Images
 
 on:
   workflow_dispatch:
@@ -7,15 +7,11 @@ on:
         description: "PR number to build from (leave empty to use current branch)"
         required: false
         default: ""
-      tag:
-        description: "Optional tag value inserted into v<version>.byted.<tag>.<timestamp>"
-        required: false
-        default: ""
   schedule:
     - cron: "0 0 * * *"
 
 concurrency:
-  group: release-docker-nightly-${{ inputs.tag || inputs.pr_number || 'nightly' }}
+  group: release-docker-dev-${{ inputs.pr_number || 'nightly' }}
   cancel-in-progress: true
 
 env:
@@ -162,10 +158,10 @@ jobs:
     strategy:
       matrix:
         variant:
-          - base: nightly
+          - base: dev
             x86: x86
             arm64: arm64
-          - base: nightly-cu13
+          - base: dev-cu13
             x86: x86-cu13
             arm64: arm64-cu13
     steps:
@@ -206,9 +202,7 @@ jobs:
           ARM64_DIGEST=$(cat /tmp/digests/arm64/digest.txt)
 
           SUFFIX=""
-          if [ -n "${{ inputs.tag }}" ]; then
-            SUFFIX="-${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
+          if [ -n "${{ inputs.pr_number }}" ]; then
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
@@ -231,22 +225,12 @@ jobs:
 
           if [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [ -n "${VOLCENGINE_CR_NAMESPACE}" ] && [ -n "${VOLCENGINE_CR_USERNAME}" ] && [ -n "${VOLCENGINE_CR_PASSWORD}" ]; then
             VOLCENGINE_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
-            VERSION=$(grep -Po "(?<=__version__ = version = ')[^']+" python/sglang/_version.py)
-            TIMESTAMP=$(TZ=Asia/Shanghai date +%Y%m%d%H%M)
-
-            if [ "${{ matrix.variant.base }}" = "nightly" ]; then
-              if [ -n "${{ inputs.tag }}" ]; then
-                VOLCENGINE_TAG="v${VERSION}.byted.${{ inputs.tag }}.${TIMESTAMP}"
-              else
-                VOLCENGINE_TAG="v${VERSION}.byted.${TIMESTAMP}"
-              fi
-            else
-              if [ -n "${{ inputs.tag }}" ]; then
-                VOLCENGINE_TAG="v${VERSION}.byted.${{ inputs.tag }}.${TIMESTAMP}-cu130"
-              else
-                VOLCENGINE_TAG="v${VERSION}.byted.${TIMESTAMP}-cu130"
-              fi
+            CUDA_SUFFIX=""
+            if [ "${{ matrix.variant.base }}" = "dev-cu13" ]; then
+              CUDA_SUFFIX="--cuda-suffix cu130"
             fi
+
+            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode nightly ${CUDA_SUFFIX})
 
             docker buildx imagetools create \
               -t "${VOLCENGINE_IMAGE}:${VOLCENGINE_TAG}" \
@@ -269,7 +253,7 @@ jobs:
             "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
 
           TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
-            '.results[] | select(.name | test("^${{ matrix.variant.base }}-[0-9]")) | "\(.last_updated)|\(.name)"' \
+            '.results[] | select(.name | test("^nightly-${{ matrix.variant.base }}-[0-9]")) | "\(.last_updated)|\(.name)"' \
             | sort -r | cut -d'|' -f2)
 
           TAG_COUNT=$(echo "$TAGS" | wc -l)

@@ -22,8 +22,40 @@ env:
   VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
 
 jobs:
+  validate-volcengine-version-tag:
+    runs-on: ubuntu-22.04
+    outputs:
+      git-tag-value: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve required git tag
+        id: tag
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_TAG="v${{ github.event.inputs.version }}"
+            if ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
+              RAW_TAG="${{ github.event.inputs.version }}"
+            fi
+          else
+            RAW_TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ "${{ github.repository }}" = "bytedance-iaas/sglang" ] && { [ -z "${RAW_TAG}" ] || ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; }; then
+            echo "::error::Version image publishing requires an existing git tag"
+            exit 1
+          fi
+
+          echo "value=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+
   publish-x86:
     if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
+    needs: [validate-volcengine-version-tag]
     environment: "prod"
     env:
       HTTP_PROXY: http://100.68.160.245:3128
@@ -164,6 +196,7 @@ jobs:
 
   publish-arm64:
     if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
+    needs: [validate-volcengine-version-tag]
     environment: "prod"
     env:
       GITHUB_ARTIFACTORY: ${{ vars.GITHUB_ARTIFACTORY }}
@@ -273,7 +306,7 @@ jobs:
 
   create-manifests:
     runs-on: ubuntu-22.04
-    needs: [publish-x86, publish-arm64]
+    needs: [validate-volcengine-version-tag, publish-x86, publish-arm64]
     if: ${{ github.repository == 'sgl-project/sglang' || github.repository == 'bytedance-iaas/sglang' }}
     environment: "prod"
     steps:
@@ -346,24 +379,16 @@ jobs:
 
           if [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [ -n "${VOLCENGINE_CR_NAMESPACE}" ] && [ -n "${VOLCENGINE_CR_USERNAME}" ] && [ -n "${VOLCENGINE_CR_PASSWORD}" ]; then
             VOLCENGINE_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+            VOLCENGINE_TAG_CU129=$(python3 scripts/ci/get_volcengine_image_tag.py --mode version --tag-value "${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}")
+            VOLCENGINE_TAG_CU130=$(python3 scripts/ci/get_volcengine_image_tag.py --mode version --tag-value "${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}" --cuda-suffix cu130)
 
             docker buildx imagetools create \
-              -t "${VOLCENGINE_IMAGE}:v${version}" \
+              -t "${VOLCENGINE_IMAGE}:${VOLCENGINE_TAG_CU129}" \
               lmsysorg/sglang@${CU129_AMD64_FW} \
               lmsysorg/sglang@${CU129_ARM64_FW}
 
             docker buildx imagetools create \
-              -t "${VOLCENGINE_IMAGE}:latest" \
-              lmsysorg/sglang@${CU129_AMD64_FW} \
-              lmsysorg/sglang@${CU129_ARM64_FW}
-
-            docker buildx imagetools create \
-              -t "${VOLCENGINE_IMAGE}:v${version}-cu130" \
-              lmsysorg/sglang@${CU130_AMD64_FW} \
-              lmsysorg/sglang@${CU130_ARM64_FW}
-
-            docker buildx imagetools create \
-              -t "${VOLCENGINE_IMAGE}:latest-cu130" \
+              -t "${VOLCENGINE_IMAGE}:${VOLCENGINE_TAG_CU130}" \
               lmsysorg/sglang@${CU130_AMD64_FW} \
               lmsysorg/sglang@${CU130_ARM64_FW}
 
