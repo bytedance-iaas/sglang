@@ -276,6 +276,32 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
 
+    def describe_bootstrap_room(self, room: int) -> str:
+        room_infos = self.transfer_infos.get(room, {})
+        required_counts = sorted(
+            {
+                transfer_info.required_dst_info_num
+                for transfer_info in room_infos.values()
+            }
+        )
+        arrived_sessions = sorted(room_infos.keys())
+        arrived_tp_ranks = []
+        missing_kvargs_sessions = []
+        for session_id in arrived_sessions:
+            register_info = self.decode_kv_args_table.get(session_id)
+            if register_info is None:
+                missing_kvargs_sessions.append(session_id)
+            else:
+                arrived_tp_ranks.append(register_info.dst_tp_rank)
+
+        return (
+            f"room={room} status={self.request_status.get(room)} "
+            f"transfer_infos={len(room_infos)} required_dst_info_num={required_counts} "
+            f"arrived_tp_ranks={sorted(arrived_tp_ranks)} "
+            f"missing_kvargs_sessions={missing_kvargs_sessions} "
+            f"arrived_sessions={arrived_sessions}"
+        )
+
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------
@@ -1398,13 +1424,19 @@ class MooncakeKVManager(CommonKVManager):
                     self.decode_kv_args_table[mooncake_session_id] = (
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    register_info = self.decode_kv_args_table[mooncake_session_id]
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
+                    logger.info(
+                        "PD_BOOTSTRAP_KVARGS_REGISTER session=%s endpoint=%s dst_port=%s dst_tp_rank=%s dst_attn_tp_size=%s",
+                        mooncake_session_id,
+                        register_info.endpoint,
+                        register_info.dst_port,
+                        register_info.dst_tp_rank,
+                        register_info.dst_attn_tp_size,
                     )
                     continue
                 else:
@@ -1412,13 +1444,29 @@ class MooncakeKVManager(CommonKVManager):
                     room = int(room)
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    duplicate_session = mooncake_session_id in self.transfer_infos[room]
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    logger.info(
+                        "PD_BOOTSTRAP_METADATA_RECV room=%s session=%s duplicate_session=%s current_transfer_infos=%s required_dst_info_num=%s is_dummy=%s kv_indices=%s aux_index=%s state_indices=%s arrived_tp_ranks=%s",
+                        room,
+                        mooncake_session_id,
+                        duplicate_session,
+                        len(self.transfer_infos[room]),
+                        required_dst_info_num,
+                        transfer_info.is_dummy,
+                        len(transfer_info.dst_kv_indices),
+                        transfer_info.dst_aux_index,
+                        len(transfer_info.dst_state_indices),
+                        self.describe_bootstrap_room(room),
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
+                        logger.info(
+                            "PD_BOOTSTRAP_ROOM_READY %s",
+                            self.describe_bootstrap_room(room),
+                        )
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -1644,6 +1692,7 @@ class MooncakeKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.conclude_state = None
         self.init_time = time.time()
+        self._last_bootstrap_progress_bucket = -1
 
     def send(
         self,
@@ -1694,11 +1743,26 @@ class MooncakeKVSender(CommonKVSender):
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
+                    progress_bucket = int(elapsed // 60)
+                    if elapsed >= 30 and progress_bucket > self._last_bootstrap_progress_bucket:
+                        self._last_bootstrap_progress_bucket = progress_bucket
+                        logger.info(
+                            "PD_BOOTSTRAP_WAIT room=%s elapsed=%.1fs %s",
+                            self.bootstrap_room,
+                            elapsed,
+                            self.kv_mgr.describe_bootstrap_room(self.bootstrap_room),
+                        )
                     if elapsed >= self.kv_mgr.bootstrap_timeout:
                         logger.warning_once(
                             "Some requests timed out when bootstrapping, "
                             "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
                             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                        )
+                        logger.error(
+                            "PD_BOOTSTRAP_TIMEOUT room=%s elapsed=%.1fs %s",
+                            self.bootstrap_room,
+                            elapsed,
+                            self.kv_mgr.describe_bootstrap_room(self.bootstrap_room),
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
@@ -1816,6 +1880,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
         prefill_dp_rank: int,
     ):
         super().init(prefill_dp_rank)
+        logger.info(
+            "PD_DECODE_RECEIVER_INIT room=%s session=%s bootstrap_addr=%s prefill_dp_rank=%s required_dst_info_num=%s bootstrap_targets=%s",
+            self.bootstrap_room,
+            self.session_id,
+            self.bootstrap_addr,
+            prefill_dp_rank,
+            self.required_dst_info_num,
+            0 if self.bootstrap_infos is None else len(self.bootstrap_infos),
+        )
 
     def send_metadata(
         self,
@@ -1823,6 +1896,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        logger.info(
+            "PD_DECODE_SEND_METADATA_START room=%s session=%s bootstrap_addr=%s kv_indices=%s aux_index=%s state_indices=%s required_dst_info_num=%s bootstrap_targets=%s",
+            self.bootstrap_room,
+            self.session_id,
+            self.bootstrap_addr,
+            len(kv_indices),
+            aux_index,
+            0 if state_indices is None else len(state_indices),
+            self.required_dst_info_num,
+            0 if self.bootstrap_infos is None else len(self.bootstrap_infos),
+        )
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -1865,6 +1949,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     ]
                 )
         self.init_time = time.time()
+        logger.info(
+            "PD_DECODE_SEND_METADATA_END room=%s session=%s init_time=%.6f bootstrap_targets=%s",
+            self.bootstrap_room,
+            self.session_id,
+            self.init_time,
+            0 if self.bootstrap_infos is None else len(self.bootstrap_infos),
+        )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

@@ -453,6 +453,14 @@ class DecodePreallocQueue:
         )
 
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
+        logger.info(
+            "PD_DECODE_RECEIVER_CREATED tp_rank=%s rid=%s room=%s bootstrap_addr=%s receiver=%s",
+            self.tp_rank,
+            req.rid,
+            req.bootstrap_room,
+            _bootstrap_addr(req),
+            kv_receiver.__class__.__name__,
+        )
         self.queue.append(decode_req)
         return decode_req
 
@@ -534,6 +542,13 @@ class DecodePreallocQueue:
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
+                logger.info(
+                    "PD_DECODE_HANDSHAKE_READY tp_rank=%s rid=%s room=%s session=%s",
+                    self.tp_rank,
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    getattr(decode_req.kv_receiver, "session_id", "NA"),
+                )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -635,6 +650,14 @@ class DecodePreallocQueue:
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
+            logger.info(
+                "PD_DECODE_RECEIVER_INIT_RESOLVED tp_rank=%s rid=%s room=%s bootstrap_addr=%s prefill_dp_rank=%s",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                _bootstrap_addr(decode_req.req),
+                prefill_dp_rank,
+            )
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
@@ -771,6 +794,19 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            logger.info(
+                "PD_DECODE_SEND_METADATA_REQUEST tp_rank=%s rid=%s room=%s session=%s metadata_buffer_index=%s kv_indices=%s page_indices=%s state_indices=%s prealloc_queue_len=%s transfer_queue_len=%s",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                getattr(decode_req.kv_receiver, "session_id", "NA"),
+                decode_req.metadata_buffer_index,
+                len(kv_indices),
+                len(page_indices),
+                0 if state_indices is None else len(state_indices),
+                len(self.queue),
+                len(self.transfer_queue.queue),
+            )
             decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
@@ -784,6 +820,14 @@ class DecodePreallocQueue:
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            logger.info(
+                "PD_DECODE_SEND_METADATA_ENQUEUED tp_rank=%s rid=%s room=%s session=%s transfer_queue_len=%s",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                getattr(decode_req.kv_receiver, "session_id", "NA"),
+                len(self.transfer_queue.queue) + 1,
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -1106,6 +1150,14 @@ class DecodeTransferQueue:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
+                        logger.info(
+                            "PD_DECODE_TRANSFER_SUCCESS tp_rank=%s rid=%s room=%s transfer_queue_remaining=%s running_batch=%s",
+                            self.tp_rank,
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                            len(self.queue) - len(indices_to_remove),
+                            len(self.scheduler.running_batch.reqs),
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,

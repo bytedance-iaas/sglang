@@ -331,7 +331,25 @@ class PrefillBootstrapQueue:
             assert req.metadata_buffer_index is not None
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            logger.info(
+                "PD_PREFILL_SENDER_INIT tp_rank=%s pp_rank=%s rid=%s room=%s num_kv_indices=%s num_pages=%s metadata_buffer_index=%s bootstrap_queue_len=%s",
+                self.tp_rank,
+                self.pp_rank,
+                req.rid,
+                req.bootstrap_room,
+                num_kv_indices,
+                num_pages,
+                req.metadata_buffer_index,
+                len(self.queue),
+            )
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            logger.info(
+                "PD_PREFILL_SENDER_INIT_DONE tp_rank=%s pp_rank=%s rid=%s room=%s",
+                self.tp_rank,
+                self.pp_rank,
+                req.rid,
+                req.bootstrap_room,
+            )
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
