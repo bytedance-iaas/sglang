@@ -48,6 +48,34 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestPdDecodeCapacityValidation(unittest.TestCase):
+    def test_decode_rejects_invalid_bootstrap_capacity_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            context_length=200000,
+            max_total_tokens=200000,
+            num_reserved_decode_tokens=2000,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            server_args._handle_pd_disaggregation()
+
+        self.assertIn("--max-total-tokens", str(context.exception))
+        self.assertIn("--num-reserved-decode-tokens", str(context.exception))
+
+    def test_decode_allows_valid_bootstrap_capacity_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            context_length=200000,
+            max_total_tokens=262144,
+            num_reserved_decode_tokens=2000,
+        )
+
+        server_args._handle_pd_disaggregation()
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

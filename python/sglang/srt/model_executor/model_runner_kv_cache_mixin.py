@@ -835,6 +835,21 @@ class ModelRunnerKVCacheMixin:
             )
             capacity = tensor.item()
 
+        if self.server_args.disaggregation_mode == "decode":
+            required_bootstrap_tokens = (
+                self.model_config.context_len
+                + self.server_args.num_reserved_decode_tokens
+            )
+            if capacity < required_bootstrap_tokens:
+                raise ValueError(
+                    "Effective PD decode token capacity is too small for bootstrap: "
+                    f"capacity={capacity}, context_length={self.model_config.context_len}, "
+                    f"num_reserved_decode_tokens={self.server_args.num_reserved_decode_tokens}. "
+                    "Increase --max-total-tokens or reduce --context-length / "
+                    "--num-reserved-decode-tokens so decode can always reserve KV "
+                    "space to send bootstrap metadata."
+                )
+
         return capacity
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
