@@ -26,6 +26,14 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=90, suite="stage-b-test-1-gpu-large")
 
 
+def _has_hf_cache_entry(repo_id: str, repo_type: str = "model") -> bool:
+    cache_root = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if not cache_root:
+        return False
+    prefix = "datasets--" if repo_type == "dataset" else "models--"
+    return os.path.isdir(os.path.join(cache_root, prefix + repo_id.replace("/", "--")))
+
+
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
@@ -41,6 +49,15 @@ class ReasoningTokenUsageMixin:
     def setUpClass(cls):
         for k, v in cls.extra_env_vars.items():
             os.environ[k] = v
+
+        if "--speculative-draft-model-path" in cls.extra_server_args:
+            draft_model = cls.extra_server_args[
+                cls.extra_server_args.index("--speculative-draft-model-path") + 1
+            ]
+            if not _has_hf_cache_entry(draft_model):
+                raise unittest.SkipTest(
+                    f"Speculative draft model cache missing: {draft_model}"
+                )
 
         assert cls.model
         cls.base_url = DEFAULT_URL_FOR_TEST

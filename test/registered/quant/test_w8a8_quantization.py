@@ -1,3 +1,4 @@
+import os
 import time
 import unittest
 from types import SimpleNamespace
@@ -17,6 +18,14 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=160, suite="stage-b-test-1-gpu-large")
 
 
+def _has_hf_cache_entry(repo_id: str, repo_type: str = "model") -> bool:
+    cache_root = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if not cache_root:
+        return False
+    prefix = "datasets--" if repo_type == "dataset" else "models--"
+    return os.path.isdir(os.path.join(cache_root, prefix + repo_id.replace("/", "--")))
+
+
 class BaseW8A8Test(CustomTestCase):
     model: str = None
     quantization: str = None
@@ -32,6 +41,9 @@ class BaseW8A8Test(CustomTestCase):
         other_args = []
         if cls.quantization:
             other_args.extend(["--quantization", cls.quantization])
+
+        if not _has_hf_cache_entry(cls.model):
+            raise unittest.SkipTest(f"Model cache missing: {cls.model}")
 
         cls.process = popen_launch_server(
             cls.model,
