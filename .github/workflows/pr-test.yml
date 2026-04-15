@@ -370,8 +370,16 @@ jobs:
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
-    # Default PR UT no longer auto-runs stage-b partitions.
-    if: false
+    # Only wait for the stage-b lanes that remain in the default PR UT path.
+    if: |
+      always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      !inputs.target_stage &&
+      inputs.test_parallel_dispatch != true &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
@@ -386,7 +394,6 @@ jobs:
           stage-name: stage-b
           jobs: |
             [
-              {"prefix": "stage-b-test-1-gpu-small", "expected_count": 8},
               {"prefix": "stage-b-test-1-gpu-large", "expected_count": 14},
               {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4}
             ]
@@ -717,7 +724,7 @@ jobs:
         (inputs.target_stage == 'stage-b-test-1-gpu-large') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -772,7 +779,7 @@ jobs:
         (inputs.target_stage == 'stage-b-test-2-gpu-large') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -913,7 +920,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-4-gpu-h100') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
