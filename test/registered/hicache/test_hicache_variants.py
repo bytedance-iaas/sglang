@@ -10,7 +10,9 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
+from sglang.srt.model_loader.ci_weight_validation import validate_cache_lightweight
 from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import find_local_repo_dir
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -24,6 +26,23 @@ from sglang.test.test_utils import (
 )
 
 _is_hip = is_hip()
+
+
+def _has_complete_local_cache(repo: str) -> bool:
+    try:
+        snapshot_dir = find_local_repo_dir(repo, revision=None)
+    except Exception:
+        return False
+
+    if not snapshot_dir:
+        return False
+
+    return validate_cache_lightweight(snapshot_dir, requires_hf_quant_config=False)
+
+
+_HAS_EAGLE_CACHE = _has_complete_local_cache(
+    DEFAULT_TARGET_MODEL_EAGLE3
+) and _has_complete_local_cache(DEFAULT_DRAFT_MODEL_EAGLE3)
 
 
 class HiCacheBaseServer(CustomTestCase):
@@ -83,7 +102,10 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     mgsm_en_score_threshold = 0.8
 
 
-@unittest.skipIf(is_hip(), "Disabled for AMD-aiter")
+@unittest.skipIf(
+    _is_hip or not _HAS_EAGLE_CACHE,
+    "Disabled for AMD-aiter or incomplete local EAGLE cache",
+)
 class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     """HiCache with EAGLE speculative decoding tests"""
 
