@@ -11,8 +11,7 @@ import unittest
 
 from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.model_loader.ci_weight_validation import validate_cache_lightweight
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.srt.utils import find_local_repo_dir
+from sglang.srt.utils import find_local_repo_dir, is_hip, kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
