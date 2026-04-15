@@ -461,7 +461,8 @@ class DecodePreallocQueue:
         self, decode_req: DecodeRequest, prefill_dp_rank: int
     ) -> None:
         decode_req.kv_receiver.init(prefill_dp_rank)
-        if decode_req.kv_receiver.conclude_state != KVPoll.Failed:
+        conclude_state = getattr(decode_req.kv_receiver, "conclude_state", None)
+        if conclude_state != KVPoll.Failed:
             decode_req.bootstrap_ready = True
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
