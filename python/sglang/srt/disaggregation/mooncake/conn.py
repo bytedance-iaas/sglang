@@ -186,6 +186,7 @@ class AuxDataCodec:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    ABORT_HEADER = b"ABORT"
 
     def __init__(
         self,
@@ -1393,6 +1394,19 @@ class MooncakeKVManager(CommonKVManager):
                             stg_session,
                         )
                     continue
+                if room == MooncakeKVManager.ABORT_HEADER.decode("ascii"):
+                    abort_room = int(waiting_req_bytes[1].decode("ascii"))
+                    mooncake_session_id = waiting_req_bytes[2].decode("ascii")
+                    failure_reason = waiting_req_bytes[3].decode("utf-8")
+                    logger.info(
+                        "PD_BOOTSTRAP_ABORT_RECV room=%s session=%s reason=%s",
+                        abort_room,
+                        mooncake_session_id,
+                        failure_reason,
+                    )
+                    self.record_failure(abort_room, failure_reason)
+                    self.update_status(abort_room, KVPoll.Failed)
+                    continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
@@ -1864,7 +1878,24 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         self.init_time = time.time()
+
+    def _notify_prefill_abort(self, failure_reason: str) -> None:
+        if self.bootstrap_infos is None:
+            return
+
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            with lock:
+                sock.send_multipart(
+                    [
+                        MooncakeKVManager.ABORT_HEADER,
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        failure_reason.encode("utf-8"),
+                    ]
+                )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
@@ -1916,10 +1947,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
     def abort(self):
+        failure_reason = "Aborted by AbortReq."
         self.kv_mgr.record_failure(
             self.bootstrap_room,
-            "Aborted by AbortReq.",
+            failure_reason,
         )
+        self._notify_prefill_abort(failure_reason)
         # Explicitly set the status to failure since this request has been aborted
         self.conclude_state = KVPoll.Failed
 

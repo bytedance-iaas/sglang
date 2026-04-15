@@ -1060,6 +1060,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

@@ -230,6 +230,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 class DecodeRequest:
     req: Req
     kv_receiver: CommonKVReceiver
+    bootstrap_ready: bool = False
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
@@ -411,13 +412,13 @@ class DecodePreallocQueue:
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
-                decode_req.kv_receiver.init(0)
+                self._mark_receiver_initialized(decode_req, 0)
                 return
 
             # Fast path: cache-only lookup, no network calls
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                self._mark_receiver_initialized(decode_req, prefill_dp_rank)
                 return
 
             self.pending_reqs.append(decode_req)
@@ -455,6 +456,13 @@ class DecodePreallocQueue:
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
         self.queue.append(decode_req)
         return decode_req
+
+    def _mark_receiver_initialized(
+        self, decode_req: DecodeRequest, prefill_dp_rank: int
+    ) -> None:
+        decode_req.kv_receiver.init(prefill_dp_rank)
+        if decode_req.kv_receiver.conclude_state != KVPoll.Failed:
+            decode_req.bootstrap_ready = True
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -518,9 +526,6 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
-            return
-
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
@@ -531,9 +536,11 @@ class DecodePreallocQueue:
 
             if poll == KVPoll.Bootstrapping:
                 pass
-            elif poll == KVPoll.WaitingForInput:
-                decode_req.waiting_for_input = True
-                decode_req.req.time_stats.set_bootstrap_done_time()
+            elif poll in (KVPoll.WaitingForInput, KVPoll.Transferring, KVPoll.Success):
+                # WaitingForInput means different things on the decode and prefill
+                # control planes. A request still sitting in decode prealloc queue
+                # must not treat it as "metadata has already been sent".
+                pass
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -635,7 +642,15 @@ class DecodePreallocQueue:
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+            logger.info(
+                "PD_DECODE_RECEIVER_INIT_RESOLVED tp_rank=%s rid=%s room=%s bootstrap_addr=%s prefill_dp_rank=%s",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                _bootstrap_addr(decode_req.req),
+                prefill_dp_rank,
+            )
+            self._mark_receiver_initialized(decode_req, prefill_dp_rank)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -676,7 +691,7 @@ class DecodePreallocQueue:
             if i in indices_to_remove:
                 continue
 
-            if not decode_req.waiting_for_input:
+            if not decode_req.bootstrap_ready:
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
@@ -773,6 +788,15 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
+            )
+            decode_req.waiting_for_input = True
+            decode_req.req.time_stats.set_bootstrap_done_time()
+            logger.info(
+                "PD_DECODE_HANDSHAKE_READY tp_rank=%s rid=%s room=%s session=%s",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                getattr(decode_req.kv_receiver, "session_id", "NA"),
             )
             if (
                 self.transfer_queue.enable_staging
