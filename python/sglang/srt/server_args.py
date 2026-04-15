@@ -3250,6 +3250,21 @@ class ServerArgs:
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
+            if (
+                self.max_total_tokens is not None
+                and self.context_length is not None
+                and self.max_total_tokens
+                < self.context_length + self.num_reserved_decode_tokens
+            ):
+                raise ValueError(
+                    "Invalid PD decode configuration: "
+                    f"--max-total-tokens ({self.max_total_tokens}) must be >= "
+                    f"--context-length ({self.context_length}) + "
+                    f"--num-reserved-decode-tokens ({self.num_reserved_decode_tokens}). "
+                    "Otherwise decode cannot reserve enough KV capacity to send "
+                    "bootstrap metadata for a fully truncated request."
+                )
+
         elif self.disaggregation_mode == "prefill":
             assert (
                 self.disaggregation_transfer_backend != "fake"

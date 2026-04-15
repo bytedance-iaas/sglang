@@ -1014,6 +1014,7 @@ class NixlKVReceiver(CommonKVReceiver):
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

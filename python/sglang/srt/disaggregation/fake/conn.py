@@ -85,6 +85,8 @@ class FakeKVReceiver(BaseKVReceiver):
     ):
         self.bootstrap_done = False
         self.has_sent_metadata = False
+        self.conclude_state = None
+        self.require_staging = False
 
     def poll(self) -> KVPoll:
         if not self.bootstrap_done:

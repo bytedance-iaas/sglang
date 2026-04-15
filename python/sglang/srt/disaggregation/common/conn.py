@@ -547,7 +547,6 @@ class CommonKVReceiver(BaseKVReceiver):
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
