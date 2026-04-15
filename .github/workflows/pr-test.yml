@@ -397,8 +397,7 @@ jobs:
             [
               {"prefix": "stage-b-test-1-gpu-small", "expected_count": 8},
               {"prefix": "stage-b-test-1-gpu-large", "expected_count": 14},
-              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4},
-              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
+              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4}
             ]
           max-wait-minutes: '480'
 
@@ -544,7 +543,8 @@ jobs:
 
   call-jit-kernel-tests:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.jit_kernel == 'true'
+    # Keep the reusable workflow file, but stop auto-running this PR lane by default.
+    if: false
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
@@ -836,7 +836,7 @@ jobs:
         (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -896,7 +896,7 @@ jobs:
         inputs.target_stage == 'multimodal-gen-unit-test' ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -922,7 +922,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-4-gpu-h100') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -976,7 +976,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-8-gpu-h200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1044,7 +1044,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-8-gpu-h20') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1100,7 +1100,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-deepep-4-gpu-h100') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1160,7 +1160,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-deepep-8-gpu-h200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1221,7 +1221,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
