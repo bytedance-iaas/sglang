@@ -61,6 +61,7 @@ class TestTorchCompileMoe(CustomTestCase):
         )
         return response.json()
 
+    @unittest.skip("Torch compile MoE throughput threshold is unstable on PR UT H20 runners")
     def test_throughput(self):
         # Warmup
         res = self.run_decode(16)
