@@ -60,8 +60,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
     filter_moe_weight_param_global_expert,
+    get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -88,8 +88,8 @@ from sglang.srt.server_args import get_global_server_args
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
 # Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    LazyValue,
     BumpAllocator,
+    LazyValue,
     add_prefix,
     get_bool_env_var,
     get_compiler_backend,
