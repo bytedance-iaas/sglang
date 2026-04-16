@@ -54,6 +54,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -76,6 +77,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
+    LazyValue,
     add_prefix,
     get_compiler_backend,
     is_non_idle_and_non_empty,
