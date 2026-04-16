@@ -60,6 +60,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -88,6 +89,7 @@ from sglang.srt.server_args import get_global_server_args
 # Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
 from sglang.srt.utils import (
     BumpAllocator,
+    LazyValue,
     add_prefix,
     get_bool_env_var,
     get_compiler_backend,
@@ -683,6 +685,16 @@ class MiniMaxM2MoE(nn.Module):
         # MiniMax doesn't have shared experts like DeepSeek, so no need to add them
         state.hidden_states_mlp_output = final_hidden_states
 
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
+
 
 class MiniMaxM2Attention(nn.Module):
     """MiniMax Attention implementation with QK normalization and partial RoPE."""
@@ -1171,6 +1183,19 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
+
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: layer.block_sparse_moe.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.block_sparse_moe, MiniMaxM2MoE)
+                }
+            )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
