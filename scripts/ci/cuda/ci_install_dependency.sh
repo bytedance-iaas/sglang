@@ -117,8 +117,14 @@ APT_GET_OPTS=(
 CI_APT_PACKAGES=(
     python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
     libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
-    ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    ffmpeg
 )
+
+if [[ ",${OPTIONAL_DEPS}," == *",diffusion,"* ]]; then
+    CI_APT_PACKAGES+=(
+        libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    )
+fi
 all_ci_apt_packages_installed() {
     local pkg
     for pkg in "${CI_APT_PACKAGES[@]}"; do
