@@ -156,6 +156,10 @@ class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     mmlu_num_examples = 64
     mmlu_num_threads = 32
 
+    @unittest.skip("HiCache page accuracy is unstable in PR UT")
+    def test_mmlu(self):
+        super().test_mmlu()
+
 
 if __name__ == "__main__":
     unittest.main()

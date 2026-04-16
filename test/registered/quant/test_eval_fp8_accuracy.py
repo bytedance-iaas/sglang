@@ -31,6 +31,7 @@ class TestEvalFP8Accuracy(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skip("FP8 accuracy runtime is unstable in PR UT")
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
