@@ -114,40 +114,55 @@ APT_GET_OPTS=(
     -o Acquire::https::Timeout=30
     -o Acquire::ForceIPv4=true
 )
-apt-get "${APT_GET_OPTS[@]}" update || true
 CI_APT_PACKAGES=(
     python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
     libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
     ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 )
-apt_install_attempt=1
-apt_install_max_attempts=3
-apt_install_succeeded=0
-while [ "${apt_install_attempt}" -le "${apt_install_max_attempts}" ]; do
-    if apt-get "${APT_GET_OPTS[@]}" install -y --no-install-recommends --fix-missing "${CI_APT_PACKAGES[@]}"; then
-        apt_install_succeeded=1
-        break
-    fi
-    if [ "${apt_install_attempt}" -ge "${apt_install_max_attempts}" ]; then
-        break
-    fi
-    echo "Warning: apt-get install attempt ${apt_install_attempt}/${apt_install_max_attempts} failed, retrying after refreshing apt metadata..."
-    apt-get "${APT_GET_OPTS[@]}" update || true
-    sleep $((apt_install_attempt * 5))
-    apt_install_attempt=$((apt_install_attempt + 1))
-done
-if [ "${apt_install_succeeded}" -ne 1 ]; then
-    echo "Warning: apt-get install failed, checking if required packages are available..."
+all_ci_apt_packages_installed() {
+    local pkg
     for pkg in "${CI_APT_PACKAGES[@]}"; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-            echo "ERROR: Required package $pkg is not installed and apt-get failed"
-            exit 1
+            return 1
         fi
     done
-    echo "All required packages are already installed, continuing..."
-fi
+    return 0
+}
 
-mark_step_done "Install apt packages"
+if all_ci_apt_packages_installed; then
+    echo "All required apt packages already installed, skipping apt-get update/install"
+    mark_step_done "Install apt packages"
+else
+    apt-get "${APT_GET_OPTS[@]}" update || true
+    apt_install_attempt=1
+    apt_install_max_attempts=3
+    apt_install_succeeded=0
+    while [ "${apt_install_attempt}" -le "${apt_install_max_attempts}" ]; do
+        if apt-get "${APT_GET_OPTS[@]}" install -y --no-install-recommends --fix-missing "${CI_APT_PACKAGES[@]}"; then
+            apt_install_succeeded=1
+            break
+        fi
+        if [ "${apt_install_attempt}" -ge "${apt_install_max_attempts}" ]; then
+            break
+        fi
+        echo "Warning: apt-get install attempt ${apt_install_attempt}/${apt_install_max_attempts} failed, retrying after refreshing apt metadata..."
+        apt-get "${APT_GET_OPTS[@]}" update || true
+        sleep $((apt_install_attempt * 5))
+        apt_install_attempt=$((apt_install_attempt + 1))
+    done
+    if [ "${apt_install_succeeded}" -ne 1 ]; then
+        echo "Warning: apt-get install failed, checking if required packages are available..."
+        for pkg in "${CI_APT_PACKAGES[@]}"; do
+            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                echo "ERROR: Required package $pkg is not installed and apt-get failed"
+                exit 1
+            fi
+        done
+        echo "All required packages are already installed, continuing..."
+    fi
+
+    mark_step_done "Install apt packages"
+fi
 
 # ------------------------------------------------------------------------------
 # Python package site hygiene & install protoc
