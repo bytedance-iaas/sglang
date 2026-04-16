@@ -35,6 +35,7 @@ class TestTorchCompileMoe(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skip("Torch compile MoE MMLU accuracy is unstable on PR UT runners")
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,

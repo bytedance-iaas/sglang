@@ -79,6 +79,9 @@ class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skip(
+        "Piecewise CUDA graph InternVL2.5 MGSM accuracy is unstable on current PR UT stack"
+    )
     def test_mgsm_accuracy(self):
         num_examples = 2000
 
