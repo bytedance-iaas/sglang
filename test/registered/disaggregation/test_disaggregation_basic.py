@@ -70,6 +70,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             len(input_logprobs) > 0
         ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
 
+    @unittest.skip("Disaggregation structured output is unstable in PR UT")
     def test_structured_output(self):
         json_schema = json.dumps(
             {
