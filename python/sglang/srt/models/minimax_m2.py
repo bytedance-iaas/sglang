@@ -76,8 +76,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    LazyValue,
     BumpAllocator,
+    LazyValue,
     add_prefix,
     get_compiler_backend,
     is_non_idle_and_non_empty,
@@ -591,7 +591,6 @@ class MiniMaxM2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
-
 
 
 class MiniMaxM2Attention(nn.Module):
