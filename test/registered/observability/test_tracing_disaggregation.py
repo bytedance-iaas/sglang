@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 register_cuda_ci(est_time=45, suite="stage-b-test-2-gpu-large")
 
 
+@unittest.skip(
+    "Disaggregation tracing is unstable in PR UT due to load-balancer port conflicts"
+)
 class TestTraceDisaggregation(CustomTestCase):
     """Test tracing in PD disaggregation mode."""
 
