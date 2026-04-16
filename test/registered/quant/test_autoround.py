@@ -33,6 +33,10 @@ class TestAutoRound(CustomTestCase):
         device = "auto"
         for model in DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST:
             with self.subTest(model=model):
+                if model == "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc":
+                    self.skipTest(
+                        "AutoRound MMLU accuracy is unstable on current PR UT runners"
+                    )
                 print(f"\n[INFO] Launching server for model: {model}")
                 process = popen_launch_server(
                     model,
