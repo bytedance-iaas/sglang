@@ -581,6 +581,7 @@ class MiniMaxM2MoE(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
 
+
 class MiniMaxM2Attention(nn.Module):
     """MiniMax Attention implementation with QK normalization and partial RoPE."""
 
