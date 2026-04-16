@@ -358,7 +358,8 @@ class SchedulerOutputProcessorMixin:
         stride = self.draft_worker.speculative_num_draft_tokens
 
         for i, req in enumerate(batch.reqs):
-            req.kv_committed_len += accept_lens[i]
+            # -1 because prepare_for_decode pre-claimed the bonus slot.
+            req.kv_committed_len += accept_lens[i] - 1
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
