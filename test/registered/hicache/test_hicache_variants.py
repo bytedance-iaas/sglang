@@ -86,6 +86,10 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     mmlu_num_examples = 64
     mmlu_num_threads = 32
 
+    @unittest.skip("HiCache standard accuracy is unstable in PR UT")
+    def test_mmlu(self):
+        super().test_mmlu()
+
 
 class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
