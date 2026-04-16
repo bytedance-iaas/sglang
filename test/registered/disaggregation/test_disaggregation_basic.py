@@ -227,6 +227,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
 
         self.assertGreater(metrics["score"], 0.74)
 
+
 @unittest.skip("Disaggregation simulated retract is unstable in PR UT")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
