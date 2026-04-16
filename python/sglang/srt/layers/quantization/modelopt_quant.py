@@ -1994,6 +1994,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM is currently the most performant and tested FP4 MoE
             # backend, so use it as the default.
             moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+        elif moe_runner_backend.is_asym_gemm():
+            moe_runner_backend = MoeRunnerBackend.ASYM_GEMM
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
