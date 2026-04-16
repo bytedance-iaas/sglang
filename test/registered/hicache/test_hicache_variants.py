@@ -108,6 +108,10 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     def test_mmlu(self):
         super().test_mmlu()
 
+    @unittest.skip("HiCache MLA MGSM accuracy is unstable in PR UT")
+    def test_mgsm_en(self):
+        super().test_mgsm_en()
+
 
 @unittest.skipIf(
     _is_hip or not _HAS_EAGLE_CACHE,

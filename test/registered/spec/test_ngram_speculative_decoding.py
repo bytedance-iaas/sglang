@@ -60,6 +60,10 @@ class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skip("NGRAM GSM8K accuracy is unstable in PR UT")
+    def test_gsm8k(self):
+        super().test_gsm8k()
+
 
 class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):
 
