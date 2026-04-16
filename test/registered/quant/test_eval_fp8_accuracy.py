@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=250, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -31,7 +31,6 @@ class TestEvalFP8Accuracy(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    @unittest.skip("FP8 accuracy runtime is unstable in PR UT")
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
