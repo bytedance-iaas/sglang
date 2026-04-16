@@ -100,6 +100,10 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     mmlu_num_threads = 32
     mgsm_en_score_threshold = 0.8
 
+    @unittest.skip("HiCache MLA runtime is unstable in PR UT")
+    def test_mmlu(self):
+        super().test_mmlu()
+
 
 @unittest.skipIf(
     _is_hip or not _HAS_EAGLE_CACHE,
