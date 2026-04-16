@@ -584,6 +584,7 @@ class MiniMaxM2MoE(nn.Module):
 
 
 
+
 class MiniMaxM2Attention(nn.Module):
     """MiniMax Attention implementation with QK normalization and partial RoPE."""
 
