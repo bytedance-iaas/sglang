@@ -108,13 +108,35 @@ mark_step_done "Kill existing processes"
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
 # Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
-apt-get update || true
+APT_GET_OPTS=(
+    -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+    -o Acquire::ForceIPv4=true
+)
+apt-get "${APT_GET_OPTS[@]}" update || true
 CI_APT_PACKAGES=(
     python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
     libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
     ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 )
-apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
+apt_install_attempt=1
+apt_install_max_attempts=3
+apt_install_succeeded=0
+while [ "${apt_install_attempt}" -le "${apt_install_max_attempts}" ]; do
+    if apt-get "${APT_GET_OPTS[@]}" install -y --no-install-recommends --fix-missing "${CI_APT_PACKAGES[@]}"; then
+        apt_install_succeeded=1
+        break
+    fi
+    if [ "${apt_install_attempt}" -ge "${apt_install_max_attempts}" ]; then
+        break
+    fi
+    echo "Warning: apt-get install attempt ${apt_install_attempt}/${apt_install_max_attempts} failed, retrying after refreshing apt metadata..."
+    apt-get "${APT_GET_OPTS[@]}" update || true
+    sleep $((apt_install_attempt * 5))
+    apt_install_attempt=$((apt_install_attempt + 1))
+done
+if [ "${apt_install_succeeded}" -ne 1 ]; then
     echo "Warning: apt-get install failed, checking if required packages are available..."
     for pkg in "${CI_APT_PACKAGES[@]}"; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
@@ -123,7 +145,7 @@ apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
         fi
     done
     echo "All required packages are already installed, continuing..."
-}
+fi
 
 mark_step_done "Install apt packages"
 
