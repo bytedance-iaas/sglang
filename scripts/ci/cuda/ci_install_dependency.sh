@@ -133,7 +133,6 @@ if all_ci_apt_packages_installed; then
     echo "All required apt packages already installed, skipping apt-get update/install"
     mark_step_done "Install apt packages"
 else
-    apt-get "${APT_GET_OPTS[@]}" update || true
     apt_install_attempt=1
     apt_install_max_attempts=3
     apt_install_succeeded=0
@@ -145,7 +144,7 @@ else
         if [ "${apt_install_attempt}" -ge "${apt_install_max_attempts}" ]; then
             break
         fi
-        echo "Warning: apt-get install attempt ${apt_install_attempt}/${apt_install_max_attempts} failed, retrying after refreshing apt metadata..."
+        echo "Warning: apt-get install attempt ${apt_install_attempt}/${apt_install_max_attempts} failed, refreshing apt metadata before retry..."
         apt-get "${APT_GET_OPTS[@]}" update || true
         sleep $((apt_install_attempt * 5))
         apt_install_attempt=$((apt_install_attempt + 1))
