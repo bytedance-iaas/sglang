@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -44,6 +45,13 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    @unittest.skipIf(
+        is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+        "Multi-tokenizer MMLU threshold is unstable on current CUDA PR UT H100 runners",
+    )
+    def test_mmlu(self):
+        super().test_mmlu()
 
     @unittest.skip("Multi-tokenizer TTFT threshold is unstable in PR UT")
     def test_multi_tokenizer_ttft(self):
