@@ -284,8 +284,13 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
   using FragC = typename ScalarType<scalar_t>::FragC;
   using FragS = typename ScalarType<scalar_t>::FragS;
   using FragZP = typename ScalarType<scalar_t>::FragZP;
+  const device::marlin_moe::tma::LocalTensorMapDesc* tensor_map_b_desc_ptr =
+      has_tensor_map_b_desc ? &tensor_map_b_desc : nullptr;
+  const device::marlin_moe::tma::LocalTensorMapDesc* tensor_map_s_desc_ptr =
+      has_tensor_map_s_desc ? &tensor_map_s_desc : nullptr;
 
-  extern __shared__ int4 sh[];
+  extern __shared__ __align__(128) int4 sh[];
+  constexpr int kBTmaStageAlignmentBytes = 128;
   static constexpr auto w_type = host::ScalarType::from_id(w_type_id);
   static constexpr auto s_type = host::ScalarType::from_id(s_type_id);
   if constexpr (w_type == host::kFE2M1f) {
@@ -316,98 +321,280 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
   const int zp_expert_stride =
       is_zp_float ? prob_n * prob_k / group_size / 8 : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
+  int a_gl_stride = prob_k / 8;
+  constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
+  constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8;
+  int a_gl_rd_delta_i = a_gl_stride * (threads / a_gl_rd_delta_o);
+  constexpr int a_sh_wr_delta = a_sh_stride * (threads / a_gl_rd_delta_o);
+  constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
+  constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
+  constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
+  constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
 
-  const int64_t expert_id = static_cast<int64_t>(blockIdx.y);
-  const int num_tokens_cur_expert = masked_m_ptr[expert_id];
-  const int logical_tokens_upper =
-      num_tokens_cur_expert > 0 ? (expected_m > 0 ? min(expected_m, prob_m) : prob_m) : 0;
-  const int num_tokens_past_padded =
-      ((logical_tokens_upper + moe_block_size - 1) / moe_block_size) * moe_block_size;
-  int parallel = num_tokens_past_padded / moe_block_size;
-  if (parallel <= 0) {
-    return;
+  int b_gl_stride = 16 * prob_n / (pack_factor * 4);
+  constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
+  constexpr int b_thread_vecs = w_type.size_bits() == 4 ? 1 : 2;
+  constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
+  int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
+  int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride_threads);
+  constexpr int b_sh_wr_delta = threads * b_thread_vecs;
+  constexpr int b_sh_rd_delta = threads * b_thread_vecs;
+  constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
+  constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
+  static_assert(
+      (2 * moe_block_size * sizeof(int4)) % kBTmaStageAlignmentBytes == 0,
+      "sh_new offset must preserve 128B alignment for direct B-TMA staging");
+  static_assert(
+      (b_sh_stage * sizeof(int4)) % kBTmaStageAlignmentBytes == 0,
+      "Each sh_b_stage pipe must start on a 128B-aligned boundary");
+
+  int a_gl_rd_row = threadIdx.x / a_gl_rd_delta_o;
+  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % (16 / (m_block_size_8 ? 2 : 1))) +
+                (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
+  a_sh_rd += 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
+
+  auto transform_a = [&](int i) {
+    int row = i / a_gl_rd_delta_o;
+    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+  };
+  int a_sh_wr_trans[a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < a_sh_wr_iters; i++)
+    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
+  int a_sh_rd_trans[b_sh_wr_iters][thread_m_blocks];
+#pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; i++) {
+#pragma unroll
+    for (int j = 0; j < thread_m_blocks; j++)
+      a_sh_rd_trans[i][j] = transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
   }
 
-  int k_tiles = prob_k / 16 / thread_k_blocks;
-  int n_tiles = prob_n / 16 / thread_n_blocks;
-  int iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
+  // Tile counts are expert-independent; compute once.
+  const int k_tiles = prob_k / 16 / thread_k_blocks;
+  const int n_tiles = prob_n / 16 / thread_n_blocks;
 
-  if constexpr (!has_act_order && group_blocks != -1) {
-    if (group_blocks >= thread_k_blocks) {
-      // Ensure that the number of tiles in each stripe is a multiple of the
-      // groupsize; this avoids an annoying special case where a stripe starts
-      // in the middle of group.
-      iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
+  // Base b_gl_rd offset: only depends on threadIdx.x and slice position,
+  // so we precompute the thread-local part and add slice offsets per expert.
+  const int b_gl_rd_base = b_gl_stride * (threadIdx.x / b_sh_stride_threads) +
+                           (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
+
+  // The direct path always processes contiguous token ranges inside each expert,
+  // so block-local token ids are simply `block_token_start + row`. Keep the
+  // historical shared-memory offset to avoid perturbing the rest of the layout.
+  int4* sh_new = sh + 2 * moe_block_size;
+
+  // === Mutable per-expert state (declared here so lambdas can capture by reference) ===
+  int64_t expert_id;
+  int num_tokens_cur_expert;
+  int parallel;
+  int iters;
+  int slice_row, slice_col_par, slice_col;
+  int slice_iters;
+  int slice_count;
+  int slice_idx;
+  int par_id;
+  int block_id;
+  int64_t B_expert_off;
+  int64_t a_expert_off;
+  int32_t block_num_valid_tokens;
+  int32_t block_token_start;
+  bool block_full;
+  int32_t locks_off;
+  int a_gl_rd_col;
+  int b_gl_rd;
+  int s_gl_rd;
+  int zp_gl_rd;
+  int bias_gl_rd;
+  int slice_k_start, slice_k_finish, slice_k_start_shared_fetch, slice_n_offset;
+  bool should_load_a;
+  int max_num_stage_groups;
+  bool is_first_matmul_in_slice;
+  int sh_first_group_id;
+  int sh_num_groups;
+
+  // === TMA block (expert-invariant constexprs + runtime declarations) ===
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+  constexpr int kBTmaSwizzleBytes = 128;
+  constexpr int kBTmaLandingInner = b_sh_stride * 4;
+  constexpr int kBTmaLandingOuter = thread_k_blocks;
+  constexpr size_t kBTmaPipeStateBytes = stages * (sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t));
+  constexpr size_t kBTmaBarrierBytes = sizeof(device::marlin_moe::tma::Barrier) * stages * 2 + kBTmaPipeStateBytes;
+  constexpr bool kHasBTmaBarrierSpace = kBTmaBarrierBytes <= 2 * moe_block_size * sizeof(int4);
+  device::marlin_moe::tma::Barrier* b_tma_barriers = nullptr;
+  device::marlin_moe::tma::Barrier* b_tma_empty_barriers = nullptr;
+  bool* b_tma_pipe_valid = nullptr;
+  uint32_t* b_tma_wait_phase = nullptr;
+  uint32_t* b_tma_empty_wait_phase = nullptr;
+  bool use_b_tma =
+      !has_act_order && thread_m_blocks == 1 && kHasBTmaBarrierSpace && tensor_map_b_desc_ptr != nullptr;
+  constexpr bool kHasScaleTma = !has_act_order && group_blocks != -1;
+  constexpr int kScaleTmaDivisor =
+      (group_blocks > 0 ? group_blocks : 1) * (w_type == host::kFE2M1f ? 2 : 1);
+  constexpr int kScaleTmaOuter =
+      kHasScaleTma
+          ? (group_blocks >= thread_k_blocks ? 1 : (thread_k_blocks / kScaleTmaDivisor))
+          : 0;
+  bool use_s_tma = use_b_tma && kHasScaleTma && tensor_map_s_desc_ptr != nullptr;
+  if constexpr (kHasBTmaBarrierSpace) {
+    b_tma_barriers = reinterpret_cast<device::marlin_moe::tma::Barrier*>(sh);
+    b_tma_empty_barriers = b_tma_barriers + stages;
+    b_tma_pipe_valid = reinterpret_cast<bool*>(b_tma_empty_barriers + stages);
+    b_tma_wait_phase = reinterpret_cast<uint32_t*>(b_tma_pipe_valid + stages);
+    b_tma_empty_wait_phase = b_tma_wait_phase + stages;
+    if (threadIdx.x == 0) {
+      if (use_b_tma) {
+        device::marlin_moe::tma::prefetch_tma_descriptor(tensor_map_b_desc_ptr);
+      }
+      if (use_s_tma) {
+        device::marlin_moe::tma::prefetch_tma_descriptor(tensor_map_s_desc_ptr);
+      }
+    }
+  }
+#else
+  constexpr bool kHasBTmaBarrierSpace = false;
+  const bool use_b_tma = false;
+  const bool use_s_tma = false;
+#endif
+
+  // === Expert-invariant computations ===
+  // Scale sizes/strides without act_order
+  int s_gl_stride = prob_n / 8;
+  constexpr int s_sh_stride = 16 * thread_n_blocks / 8;
+  constexpr int s_tb_groups = !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
+                                  ? thread_k_blocks / group_blocks / (w_type == host::kFE2M1f ? 2 : 1)
+                                  : 1;
+  constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
+  int s_gl_rd_delta = s_gl_stride;
+  // Scale size/strides with act_order
+  constexpr int tb_k = 16 * thread_k_blocks;
+  constexpr int g_idx_stage = has_act_order ? (tb_k * sizeof(int)) / 16 : 0;
+  constexpr int act_s_max_num_groups = 32;
+  int act_s_col_stride = 1;
+  int act_s_col_warp_stride = act_s_col_stride * 8;
+  int tb_n_warps = thread_n_blocks / 4;
+  int act_s_col_tb_stride = act_s_col_warp_stride * tb_n_warps;
+
+  // Zero-points sizes/strides
+  int zp_gl_stride = is_zp_float ? prob_n / 8 : (prob_n / pack_factor) / 4;
+  constexpr int zp_sh_stride = is_zp_float ? 16 * thread_n_blocks / 8 : ((16 * thread_n_blocks) / pack_factor) / 4;
+  constexpr int zp_tb_groups = s_tb_groups;
+  constexpr int zp_sh_stage = has_zp ? zp_tb_groups * zp_sh_stride : 0;
+  int zp_gl_rd_delta = zp_gl_stride;
+
+  // Expert-invariant thread-local offsets for shared memory reads/writes
+  const auto b_sh_wr = threadIdx.x * b_thread_vecs;
+  const auto b_sh_rd = threadIdx.x * b_thread_vecs;
+  const auto s_sh_wr = threadIdx.x;
+  const bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
+  const auto zp_sh_wr = threadIdx.x;
+  const bool zp_sh_wr_pred = threadIdx.x < zp_sh_stride;
+  constexpr int k_iter_size = tb_k / b_sh_wr_iters;
+
+  // Scale shared-memory read index (expert-invariant, threadIdx-only)
+  int s_sh_rd;
+  if constexpr (group_blocks != -1 && w_type == host::kFE2M1f) {
+    auto warp_id = threadIdx.x / 32;
+    int n_warps = thread_n_blocks / 4;
+    int warp_row = warp_id / n_warps;
+    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
+    s_sh_rd = s_sh_rd * 2 + (warp_row / group_blocks) % 2;
+  } else if constexpr (group_blocks != -1)
+    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
+  else if constexpr (group_blocks == -1 && (m_block_size_8 || (has_zp && !dequant_skip_flop)))
+    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
+  else
+    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
+
+  int bias_sh_rd;
+  if constexpr (m_block_size_8) {
+    bias_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
+  } else {
+    bias_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
+  }
+  const int bias_sh_wr = threadIdx.x;
+
+  // Zero-point shared-memory read index (expert-invariant)
+  constexpr int num_col_threads = 8;
+  constexpr int num_row_threads = 4;
+  constexpr int num_ints_per_thread = 8 / pack_factor;
+  int zp_sh_rd;
+  if constexpr (has_zp) {
+    if constexpr (is_zp_float) {
+      if constexpr (group_blocks != -1) {
+        zp_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
+      }
+    } else {
+      zp_sh_rd = num_ints_per_thread * num_col_threads * ((threadIdx.x / 32) % (thread_n_blocks / 4)) +
+                 num_ints_per_thread * ((threadIdx.x % 32) / num_row_threads);
     }
   }
 
-  int slice_row = (iters * blockIdx.x) % k_tiles;
-  int slice_col_par = (iters * blockIdx.x) / k_tiles;
-  int slice_col = slice_col_par;
-  int slice_iters;      // number of threadblock tiles in the current slice
-  int slice_count = 0;  // total number of active threadblocks in the current slice
-  int slice_idx;        // index of threadblock in current slice; numbered bottom to
-                        // top
+  // Shared memory storage for global fetch pipelines.
+  constexpr int sh_red_size = (2 * thread_n_blocks + 1) * 16 * thread_m_blocks;
+  constexpr int sh_b_size = stages * b_sh_stage;
+  int4* sh_b = sh_new;
+  int4* sh_red = sh_new;
 
-  int par_id = 0;
-  int block_id = -1;
-  int64_t B_expert_off = expert_id * static_cast<int64_t>(prob_n) * prob_k / (pack_factor * 4);
+  constexpr int sh_size_b_red_min = (sh_red_size < sh_b_size ? sh_red_size : sh_b_size);
+  constexpr int sh_size_b_red_max = (sh_red_size > sh_b_size ? sh_red_size : sh_b_size);
+  constexpr int sh_bias_size = (thread_n_blocks * 16 / 8);
+  constexpr int sh_b_red_bias_size =
+      sh_size_b_red_max > (sh_size_b_red_min + sh_bias_size) ? sh_size_b_red_max : (sh_size_b_red_min + sh_bias_size);
 
-  int4* sh_block_sorted_ids_int4 = sh;
-  int4* sh_rd_block_sorted_ids_int4 = sh_block_sorted_ids_int4 + moe_block_size / 4;
-  int4* sh_block_topk_weights_int4 = sh_rd_block_sorted_ids_int4 + moe_block_size / 4;
-  // sh_block_topk_weights_int4 only need (moe_block_size / 4);
-  // but we pad to align to 256 bytes
-  int4* sh_new = sh_block_topk_weights_int4 + moe_block_size / 2 + moe_block_size;
-  int32_t* sh_block_sorted_ids = reinterpret_cast<int*>(sh_block_sorted_ids_int4);
-  int32_t* sh_rd_block_sorted_ids = reinterpret_cast<int*>(sh_rd_block_sorted_ids_int4);
-  scalar_t2* sh_block_topk_weights = reinterpret_cast<scalar_t2*>(sh_block_topk_weights_int4);
+  int4* sh_bias = sh_new + sh_size_b_red_min;
+  int4* sh_g_idx = sh_new + sh_b_red_bias_size;
+  int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
+  constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
+  int4* sh_s = sh_zp + (stages * zp_sh_stage);
+  // shared memory reused by reduction should be smaller than
+  // shared memory used by weight.
+  static_assert(thread_m_blocks * 16 * thread_n_blocks * 16 / 8 <= stages * b_sh_stage);
+  int4* sh_a = sh_s + sh_s_size;
+  constexpr int shm_size_used = moe_block_size + stages * (g_idx_stage + zp_sh_stage) + sh_s_size + sh_b_red_bias_size;
 
-  int32_t block_num_valid_tokens = 0;
-  int32_t locks_off = 0;
+  // all remaining shared memory is used to cache A (input)
+  // sh_a_max_row is at least ` stages * 16 * thread_m_blocks `
+  int sh_a_max_row = ((max_shared_mem - 1024) / 16 - shm_size_used) / (thread_k_blocks * 2);
 
-  // We can easily implement parallel problem execution by just remapping
-  // indices and advancing global pointers
-  if (slice_col_par >= n_tiles) {
-    slice_col = slice_col_par % n_tiles;
-    par_id = slice_col_par / n_tiles;
-  }
-  if (parallel * n_tiles >= gridDim.x) {
-    // when parallel * n_tiles >= sms
-    // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
-  } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
-  }
-  locks_off += static_cast<int32_t>(expert_id) * gridDim.x;
+  // === Register arrays (double buffered) ===
+  FragA frag_a[2][thread_m_blocks];
+  I4 frag_b_quant[2][b_thread_vecs];
+  FragC frag_c[thread_m_blocks][4][2];
+  FragS frag_s[2][4];  // No act-order
+  FragS frag_bias[2][4];
+  FragS act_frag_s[2][4][4];             // For act-order
+  int frag_qzp[2][num_ints_per_thread];  // Zero-points
+  FragZP frag_zp;                        // Zero-points in fp16
+  FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
 
-  // read moe block data given block_id
-  // block_sorted_ids / block_num_valid_tokens / block_topk_weights
+  // B pointer array (multiple pointers to break dependencies)
+  const int4* B_ptr[b_sh_wr_iters];
+
+  bool is_same_group[stages];
+  int same_group_id[stages];
+
+  // === All lambdas (capture per-expert mutable state by reference) ===
+
+  // Zero accumulators.
+  auto zero_accums = [&]() {
+#pragma unroll
+    for (int i = 0; i < thread_m_blocks * 4 * 2 * 4; i++)
+      reinterpret_cast<float*>(frag_c)[i] = 0;
+  };
+
+  // Read per-block token metadata. Tokens are contiguous within each expert so
+  // we only need the block start and valid-token count.
   auto read_moe_block_data = [&](int block_id) {
-    int token_start = block_id * moe_block_size;
-    block_num_valid_tokens = num_tokens_cur_expert - token_start;
+    block_token_start = block_id * moe_block_size;
+    block_num_valid_tokens = num_tokens_cur_expert - block_token_start;
     if (block_num_valid_tokens < 0) {
       block_num_valid_tokens = 0;
     }
     if (block_num_valid_tokens > moe_block_size) {
       block_num_valid_tokens = moe_block_size;
     }
-
-    __syncthreads();
-    int tid4 = threadIdx.x / 4;
-    if (threadIdx.x % 4 == 0 && threadIdx.x < block_num_valid_tokens) {
-      int4 sorted_token_ids_int4;
-      int* sorted_token_ids = reinterpret_cast<int*>(&sorted_token_ids_int4);
-
-#pragma unroll
-      for (int i = 0; i < 4; i++) {
-        int idx = tid4 * 4 + i;
-        sorted_token_ids[i] = token_start + idx;
-        sh_rd_block_sorted_ids[idx] = sorted_token_ids[i];
-      }
-      sh_block_sorted_ids_int4[tid4] = sorted_token_ids_int4;
-    }
-    __syncthreads();
+    block_full = block_num_valid_tokens == moe_block_size;
   };
 
   // when move to next moe block, find the next block_id and expert_id
@@ -460,9 +647,9 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
       for (int i = 0; i < m_per_thread; i++) {
         int row = threads / threads_per_m * i + threadIdx.x / threads_per_m;
         if (row < block_num_valid_tokens) {
-          int64_t sorted_row = sh_block_sorted_ids[row];
+          int64_t sorted_row = static_cast<int64_t>(block_token_start + row);
           int col = slice_col * 16 * thread_n_blocks / 8 + threadIdx.x % threads_per_m;
-          C[expert_id * static_cast<int64_t>(prob_m) * (prob_n / 8) + sorted_row * prob_n / 8 + col] = {0, 0, 0, 0};
+          C[expert_id * static_cast<int64_t>(c_expert_stride) + sorted_row * prob_n / 8 + col] = {0, 0, 0, 0};
         }
       }
       // After write zero to output, write a negative value to lock.
@@ -479,248 +666,6 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
       update_next_moe_block_data();
     }
   };
-
-  update_next_moe_block_data();
-  init_slice(true);
-
-  // A sizes/strides
-
-  // stride of the A matrix in global memory
-  int a_gl_stride = prob_k / 8;
-  int64_t a_expert_off = expert_id * static_cast<int64_t>(a_expert_stride);
-  // stride of an A matrix tile in shared memory
-  constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
-  // delta between subsequent A tiles in global memory
-  constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8;
-  // between subsequent accesses within a tile
-  int a_gl_rd_delta_i = a_gl_stride * (threads / a_gl_rd_delta_o);
-  // between shared memory writes
-  constexpr int a_sh_wr_delta = a_sh_stride * (threads / a_gl_rd_delta_o);
-  // between shared memory tile reads
-  constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
-  // within a shared memory tile
-  constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
-  // overall size of a tile
-  constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
-  // number of shared write iterations for a tile
-  constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
-
-  // B sizes/strides
-  int b_gl_stride = 16 * prob_n / (pack_factor * 4);
-  constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
-  constexpr int b_thread_vecs = w_type.size_bits() == 4 ? 1 : 2;
-  constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
-
-  int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
-  int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride_threads);
-  constexpr int b_sh_wr_delta = threads * b_thread_vecs;
-  constexpr int b_sh_rd_delta = threads * b_thread_vecs;
-  constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
-  constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
-
-  // Scale sizes/strides without act_order
-  int s_gl_stride = prob_n / 8;
-  constexpr int s_sh_stride = 16 * thread_n_blocks / 8;
-  constexpr int s_tb_groups = !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
-                                  ? thread_k_blocks / group_blocks / (w_type == host::kFE2M1f ? 2 : 1)
-                                  : 1;
-  constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
-  int s_gl_rd_delta = s_gl_stride;
-
-  // Scale size/strides with act_order
-  constexpr int tb_k = 16 * thread_k_blocks;
-  constexpr int g_idx_stage = has_act_order ? (tb_k * sizeof(int)) / 16 : 0;
-  // constexpr int act_s_row_stride      = 1;
-  // int           act_s_col_stride      = act_s_row_stride * num_groups;
-  constexpr int act_s_max_num_groups = 32;
-  int act_s_col_stride = 1;
-  int act_s_col_warp_stride = act_s_col_stride * 8;
-  int tb_n_warps = thread_n_blocks / 4;
-  int act_s_col_tb_stride = act_s_col_warp_stride * tb_n_warps;
-
-  // Zero-points sizes/strides
-  int zp_gl_stride = is_zp_float ? prob_n / 8 : (prob_n / pack_factor) / 4;
-  constexpr int zp_sh_stride = is_zp_float ? 16 * thread_n_blocks / 8 : ((16 * thread_n_blocks) / pack_factor) / 4;
-  constexpr int zp_tb_groups = s_tb_groups;
-  constexpr int zp_sh_stage = has_zp ? zp_tb_groups * zp_sh_stride : 0;
-  int zp_gl_rd_delta = zp_gl_stride;
-
-  // Global A read index of current thread.
-  int a_gl_rd_row = threadIdx.x / a_gl_rd_delta_o;
-  int a_gl_rd_col = a_gl_rd_delta_o * slice_row + threadIdx.x % a_gl_rd_delta_o;
-
-  // Shared write index of current thread.
-  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
-  // Shared read index.
-  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % (16 / (m_block_size_8 ? 2 : 1))) +
-                (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
-  a_sh_rd += 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
-
-  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
-  b_gl_rd += b_sh_stride * slice_col;
-  b_gl_rd += b_gl_rd_delta_o * slice_row;
-  auto b_sh_wr = threadIdx.x * b_thread_vecs;
-  auto b_sh_rd = threadIdx.x * b_thread_vecs;
-
-  // For act_order
-  constexpr int k_iter_size = tb_k / b_sh_wr_iters;
-  int slice_k_start = tb_k * slice_row;
-  int slice_k_finish = slice_k_start + tb_k * slice_iters;
-  int slice_k_start_shared_fetch = slice_k_start;
-  int slice_n_offset = act_s_col_tb_stride * slice_col;
-
-  // No act_order
-  int s_gl_rd;
-  if constexpr (!has_act_order) {
-    if constexpr (group_blocks == -1) {
-      s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
-    } else {
-      s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) / (w_type == host::kFE2M1f ? 2 : 1) +
-                s_sh_stride * slice_col + threadIdx.x;
-    }
-  }
-  auto s_sh_wr = threadIdx.x;
-  bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
-
-  // Zero-points
-  int zp_gl_rd;
-  if constexpr (has_zp) {
-    if constexpr (group_blocks == -1) {
-      zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
-    } else {
-      zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + zp_sh_stride * slice_col + threadIdx.x;
-    }
-  }
-  auto zp_sh_wr = threadIdx.x;
-  bool zp_sh_wr_pred = threadIdx.x < zp_sh_stride;
-
-  // We use a different scale layout for grouped and column-wise quantization as
-  // we scale a `half2` tile in column-major layout in the former and in
-  // row-major in the latter case.
-  int s_sh_rd;
-  if constexpr (group_blocks != -1 && w_type == host::kFE2M1f) {
-    auto warp_id = threadIdx.x / 32;
-    int n_warps = thread_n_blocks / 4;
-    int warp_row = warp_id / n_warps;
-
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-    s_sh_rd = s_sh_rd * 2 + (warp_row / group_blocks) % 2;
-
-  } else if constexpr (group_blocks != -1)
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-  else if constexpr (group_blocks == -1 && (m_block_size_8 || (has_zp && !dequant_skip_flop)))
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
-  else
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
-
-  int bias_sh_rd;
-  if constexpr (m_block_size_8) {
-    bias_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
-  } else {
-    bias_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
-  }
-
-  int bias_sh_wr = threadIdx.x;
-  int bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
-
-  // Zero-points have the same read layout as the scales
-  // (without column-wise case)
-  constexpr int num_col_threads = 8;
-  constexpr int num_row_threads = 4;
-  constexpr int num_ints_per_thread = 8 / pack_factor;
-  int zp_sh_rd;
-  if constexpr (has_zp) {
-    if constexpr (is_zp_float) {
-      if constexpr (group_blocks != -1) {
-        zp_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-      }
-    } else {
-      zp_sh_rd = num_ints_per_thread * num_col_threads * ((threadIdx.x / 32) % (thread_n_blocks / 4)) +
-                 num_ints_per_thread * ((threadIdx.x % 32) / num_row_threads);
-    }
-  }
-
-  // To ensure that writing and reading A tiles to/from shared memory, the
-  // latter in fragment format, is fully bank conflict free, we need to use a
-  // rather fancy XOR-based layout. The key here is that neither reads nor
-  // writes of the 16-byte `int4` blocks of 8 consecutive threads involve the
-  // same shared memory banks. Further, it seems (based on NSight-Compute) that
-  // each warp must also write a consecutive memory segment?
-  auto transform_a = [&](int i) {
-    int row = i / a_gl_rd_delta_o;
-    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
-  };
-  // Since the computation of this remapping is non-trivial and, due to our main
-  // loop unrolls, all shared memory accesses are static, we simply precompute
-  // both transformed reads and writes.
-  int a_sh_wr_trans[a_sh_wr_iters];
-#pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
-  int a_sh_rd_trans[b_sh_wr_iters][thread_m_blocks];
-#pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++) {
-#pragma unroll
-    for (int j = 0; j < thread_m_blocks; j++)
-      a_sh_rd_trans[i][j] = transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
-  }
-
-  // Since B-accesses have non-constant stride they have to be computed at
-  // runtime; we break dependencies between subsequent accesses with a tile by
-  // maintining multiple pointers (we have enough registers), a tiny
-  // optimization.
-  const int4* B_ptr[b_sh_wr_iters];
-#pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++)
-    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
-
-  // Shared memory storage for global fetch pipelines.
-  constexpr int sh_red_size = (2 * thread_n_blocks + 1) * 16 * thread_m_blocks;
-  constexpr int sh_b_size = stages * b_sh_stage;
-  int4* sh_b = sh_new;
-  int4* sh_red = sh_new;
-
-  constexpr int sh_size_b_red_min = (sh_red_size < sh_b_size ? sh_red_size : sh_b_size);
-  constexpr int sh_size_b_red_max = (sh_red_size > sh_b_size ? sh_red_size : sh_b_size);
-  constexpr int sh_bias_size = (thread_n_blocks * 16 / 8);
-  constexpr int sh_b_red_bias_size =
-      sh_size_b_red_max > (sh_size_b_red_min + sh_bias_size) ? sh_size_b_red_max : (sh_size_b_red_min + sh_bias_size);
-
-  int4* sh_bias = sh_new + sh_size_b_red_min;
-  int4* sh_g_idx = sh_new + sh_b_red_bias_size;
-  int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
-  constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
-  int4* sh_s = sh_zp + (stages * zp_sh_stage);
-  // shared memory reused by reduction should be smaller than
-  // shared memory used by weight.
-  static_assert(thread_m_blocks * 16 * thread_n_blocks * 16 / 8 <= stages * b_sh_stage);
-  int4* sh_a = sh_s + sh_s_size;
-  constexpr int shm_size_used = moe_block_size + stages * (g_idx_stage + zp_sh_stage) + sh_s_size + sh_b_red_bias_size;
-
-  // all remaining shared memory is used to cache A (input)
-  // sh_a_max_row is at least ` stages * 16 * thread_m_blocks `
-  int sh_a_max_row = ((max_shared_mem - 1024) / 16 - shm_size_used) / (thread_k_blocks * 2);
-
-  // Register storage for double buffer of shared memory reads.
-  FragA frag_a[2][thread_m_blocks];
-  I4 frag_b_quant[2][b_thread_vecs];
-  FragC frag_c[thread_m_blocks][4][2];
-  FragS frag_s[2][4];  // No act-order
-  FragS frag_bias[2][4];
-  FragS act_frag_s[2][4][4];             // For act-order
-  int frag_qzp[2][num_ints_per_thread];  // Zero-points
-  FragZP frag_zp;                        // Zero-points in fp16
-  FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
-
-  // Zero accumulators.
-  auto zero_accums = [&]() {
-#pragma unroll
-    for (int i = 0; i < thread_m_blocks * 4 * 2 * 4; i++)
-      reinterpret_cast<float*>(frag_c)[i] = 0;
-  };
-
-  int sh_first_group_id = -1;
-  int sh_num_groups = -1;
 
   auto fetch_act_order_scales_to_shared = [&](bool is_async, int first_group_id, int last_group_id) {
     sh_first_group_id = first_group_id;
@@ -756,32 +701,110 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
 
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
-  bool should_load_a = true;
-  int max_num_stage_groups = ((sh_a_max_row - moe_block_size) / moe_block_size + 1) / stages;
-  max_num_stage_groups = max(max_num_stage_groups, 1);
+  auto advance_b_ptrs = [&]() {
+#pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++) {
+      B_ptr[i] += b_gl_rd_delta_o;
+    }
+  };
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true, int pipe_a = 0) {
     if (pred) {
+      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+      if constexpr (!has_act_order && thread_m_blocks == 1 && kHasBTmaBarrierSpace) {
+        if (threadIdx.x == 0 && use_b_tma) {
+          const int4* b_expected_ptr = B_ptr[0] + B_expert_off;
+          const uint64_t flat_int4_index = static_cast<uint64_t>(b_expected_ptr - B);
+          const uint32_t b_outer_idx = static_cast<uint32_t>(flat_int4_index / b_gl_stride);
+          const uint32_t b_inner_idx = static_cast<uint32_t>((flat_int4_index % b_gl_stride) * 4);
+          bool issue_s_tma = false;
+          uint32_t s_inner_idx = 0;
+          uint32_t s_outer_idx = 0;
+          uint32_t s_tma_bytes = 0;
+          if constexpr (kHasScaleTma) {
+            if (use_s_tma) {
+              if constexpr (group_blocks >= thread_k_blocks) {
+                if (pipe % (group_blocks / thread_k_blocks) == 0) {
+                  const int4* s_expected_ptr = scales_ptr + s_gl_rd;
+                  const uint64_t s_flat_int4_index = static_cast<uint64_t>(s_expected_ptr - scales_ptr);
+                  s_outer_idx = static_cast<uint32_t>(s_flat_int4_index / s_gl_stride);
+                  s_inner_idx = static_cast<uint32_t>((s_flat_int4_index % s_gl_stride) * 4);
+                  issue_s_tma = true;
+                  s_tma_bytes = s_sh_stride * sizeof(int4);
+                }
+              } else {
+                const int4* s_expected_ptr = scales_ptr + s_gl_rd;
+                const uint64_t s_flat_int4_index = static_cast<uint64_t>(s_expected_ptr - scales_ptr);
+                s_outer_idx = static_cast<uint32_t>(s_flat_int4_index / s_gl_stride);
+                s_inner_idx = static_cast<uint32_t>((s_flat_int4_index % s_gl_stride) * 4);
+                issue_s_tma = true;
+                s_tma_bytes = s_sh_stage * sizeof(int4);
+              }
+            }
+          }
+          b_tma_pipe_valid[pipe] = true;
+          b_tma_empty_barriers[pipe].wait(b_tma_empty_wait_phase[pipe]);
+          b_tma_empty_wait_phase[pipe] ^= 1;
+          b_tma_barriers[pipe].arrive_and_expect_tx(
+              kBTmaLandingInner * kBTmaLandingOuter * sizeof(int32_t) + s_tma_bytes);
+          device::marlin_moe::tma::tma_copy_2d<
+              kBTmaLandingInner,
+              kBTmaLandingOuter,
+              kBTmaSwizzleBytes,
+              int32_t>(
+              tensor_map_b_desc_ptr,
+              &b_tma_barriers[pipe],
+              reinterpret_cast<int32_t*>(sh_b_stage),
+              b_inner_idx,
+              b_outer_idx);
+          if constexpr (kHasScaleTma) {
+            if (issue_s_tma) {
+              int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+              device::marlin_moe::tma::tma_copy_2d<
+                  s_sh_stride * 4,
+                  kScaleTmaOuter,
+                  0,
+                  int32_t>(
+                  tensor_map_s_desc_ptr,
+                  &b_tma_barriers[pipe],
+                  reinterpret_cast<int32_t*>(sh_s_stage),
+                  s_inner_idx,
+                  s_outer_idx);
+            }
+          }
+        }
+      }
+#endif
       if (should_load_a) {
         int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe_a;
 #pragma unroll
         for (int i = 0; i < a_sh_wr_iters; i++) {
           int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
-          int64_t sorted_row = 0;
-          if (!m_block_size_8 || row < 8) sorted_row = sh_rd_block_sorted_ids[row];
+          int64_t sorted_row = static_cast<int64_t>(block_token_start + row);
           int64_t true_idx = a_expert_off + sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
-          cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx], row < block_num_valid_tokens);
+          if (block_full) {
+            cp_async4(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx]);
+          } else {
+            cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx], row < block_num_valid_tokens);
+          }
         }
       }
-
-      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-#pragma unroll
-      for (int i = 0; i < b_sh_wr_iters; i++) {
-#pragma unroll
-        for (int j = 0; j < b_thread_vecs; j++) {
-          cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j], B_ptr[i] + j + B_expert_off);
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+      if constexpr (!has_act_order && thread_m_blocks == 1 && kHasBTmaBarrierSpace) {
+        if (use_b_tma) {
+          advance_b_ptrs();
         }
-
-        B_ptr[i] += b_gl_rd_delta_o;
+      }
+#endif
+      if (!use_b_tma) {
+#pragma unroll
+        for (int i = 0; i < b_sh_wr_iters; i++) {
+#pragma unroll
+          for (int j = 0; j < b_thread_vecs; j++) {
+            cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j], B_ptr[i] + j + B_expert_off);
+          }
+        }
+        advance_b_ptrs();
       }
 
       if constexpr (has_act_order) {
@@ -799,23 +822,30 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
         }
       } else {
         if constexpr (group_blocks != -1) {
-          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-
-          if constexpr (group_blocks >= thread_k_blocks) {
-            // Only fetch scales if this tile starts a new group
-            if (pipe % (group_blocks / thread_k_blocks) == 0) {
-              if (s_sh_wr_pred) {
-                cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+          if (!use_s_tma) {
+            int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+            if constexpr (group_blocks >= thread_k_blocks) {
+              // Only fetch scales if this tile starts a new group
+              if (pipe % (group_blocks / thread_k_blocks) == 0) {
+                if (s_sh_wr_pred) {
+                  cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+                }
+                s_gl_rd += s_gl_rd_delta;
               }
+            } else {
+              for (int i = 0; i < s_tb_groups; i++) {
+                if (s_sh_wr_pred) {
+                  cp_async4(&sh_s_stage[i * s_sh_stride + s_sh_wr], &scales_ptr[s_gl_rd]);
+                }
+                s_gl_rd += s_gl_rd_delta;
+              }
+            }
+          } else if constexpr (group_blocks >= thread_k_blocks) {
+            if (pipe % (group_blocks / thread_k_blocks) == 0) {
               s_gl_rd += s_gl_rd_delta;
             }
           } else {
-            for (int i = 0; i < s_tb_groups; i++) {
-              if (s_sh_wr_pred) {
-                cp_async4(&sh_s_stage[i * s_sh_stride + s_sh_wr], &scales_ptr[s_gl_rd]);
-              }
-              s_gl_rd += s_gl_rd_delta;
-            }
+            s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
         }
 
@@ -858,33 +888,57 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
     }
   };
 
-  // Wait until the next thread tile has been loaded to shared memory.
-  auto wait_for_stage = [&]() {
+  auto wait_for_cp_async_stage = [&]() {
     // We only have `stages - 2` active fetches since we are double buffering
     // and can only issue the next fetch when it is guaranteed that the previous
     // shared memory load is fully complete (as it may otherwise be
     // overwritten).
     cp_async_wait<stages - 2>();
+  };
+
+  auto wait_for_b_stage = [&](int pipe_wait) {
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+    if constexpr (!has_act_order && thread_m_blocks == 1 && kHasBTmaBarrierSpace) {
+      if (threadIdx.x == 0 && use_b_tma && b_tma_pipe_valid[pipe_wait]) {
+        b_tma_barriers[pipe_wait].wait(b_tma_wait_phase[pipe_wait]);
+        b_tma_wait_phase[pipe_wait] ^= 1;
+      }
+    }
+#endif
+  };
+
+  auto release_b_stage = [&](int pipe_release) {
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+    if constexpr (!has_act_order && thread_m_blocks == 1 && kHasBTmaBarrierSpace) {
+      __syncthreads();
+      if (threadIdx.x == 0 && use_b_tma && b_tma_pipe_valid[pipe_release]) {
+        b_tma_empty_barriers[pipe_release].arrive();
+        b_tma_pipe_valid[pipe_release] = false;
+      }
+    }
+#endif
+  };
+
+  // Wait until the next thread tile has been loaded to shared memory.
+  auto wait_for_stage = [&](int pipe_wait) {
+    wait_for_b_stage(pipe_wait);
+    wait_for_cp_async_stage();
     __syncthreads();
   };
 
   // Load the next sub-tile from the current location in the shared memory pipe
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe, int pipe_a = 0) {
-    int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe_a;
-#pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++)
-      ldsm<m_block_size_8 ? 2 : 4, scalar_t>(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-
 #pragma unroll
     for (int i = 0; i < b_thread_vecs; i++) {
       frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(&sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd + i]);
     }
+    int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe_a;
+#pragma unroll
+    for (int i = 0; i < thread_m_blocks; i++)
+      ldsm<m_block_size_8 ? 2 : 4, scalar_t>(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
   };
-
-  bool is_same_group[stages];
-  int same_group_id[stages];
 
   auto init_same_group = [&](int pipe) {
     if constexpr (!has_act_order) {
@@ -1107,7 +1161,6 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
   };
 
   // Execute the actual tensor core matmul of a sub-tile.
-  bool is_first_matmul_in_slice = true;
   auto matmul = [&](int k) {
     int k2 = k % 2;
     const bool is_new_zp = ((group_blocks != -1) && (group_blocks < thread_k_blocks || k == 0)) ||
@@ -1278,7 +1331,7 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
     }
 
     int c_gl_stride = prob_n / 8;
-    int64_t c_expert_off = expert_id * static_cast<int64_t>(prob_m) * c_gl_stride;
+    int64_t c_expert_off = expert_id * static_cast<int64_t>(c_expert_stride);
     int c_gl_wr_delta_o = 8 * c_gl_stride;
     int c_gl_wr_delta_i = 4 * (active_threads / 32);
     int c_gl_wr;
@@ -1301,8 +1354,8 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
           c_idx = c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i;
         else
           c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
-        if (c_idx / c_gl_stride < block_num_valid_tokens) {
-          int64_t sorted_row = sh_block_sorted_ids[c_idx / c_gl_stride];
+        if (block_full || c_idx / c_gl_stride < block_num_valid_tokens) {
+          int64_t sorted_row = static_cast<int64_t>(block_token_start + c_idx / c_gl_stride);
           int64_t true_idx = c_expert_off + sorted_row * c_gl_stride + c_idx % c_gl_stride;
           sh_red[c_sh_wr + c_sh_wr_delta * i] = C[true_idx];
         }
@@ -1340,8 +1393,8 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
           c_idx = c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i;
         else
           c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
-        if (c_idx / c_gl_stride < block_num_valid_tokens) {
-          int64_t sorted_row = sh_block_sorted_ids[c_idx / c_gl_stride];
+        if (block_full || c_idx / c_gl_stride < block_num_valid_tokens) {
+          int64_t sorted_row = static_cast<int64_t>(block_token_start + c_idx / c_gl_stride);
           int64_t true_idx = c_expert_off + sorted_row * c_gl_stride + c_idx % c_gl_stride;
           C[true_idx] = c;
         }
@@ -1376,7 +1429,7 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
         if constexpr (m_block_size_8) {
           if (k % 2) continue;
         } else {
-          if (k / 8 * 16 + (threadIdx.x % 32) / 4 >= block_num_valid_tokens) continue;
+          if (!block_full && k / 8 * 16 + (threadIdx.x % 32) / 4 >= block_num_valid_tokens) continue;
         }
 
         sh_red[threadIdx.x] = C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
@@ -1396,7 +1449,7 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
         if constexpr (m_block_size_8) {
           if (k % 2) continue;
         } else {
-          if (k / 8 * 16 + (threadIdx.x % 32) / 4 >= block_num_valid_tokens) continue;
+          if (!block_full && k / 8 * 16 + (threadIdx.x % 32) / 4 >= block_num_valid_tokens) continue;
         }
 
         C_tmp[c_cur_offset + active_threads * k + threadIdx.x] = frag_c_ptr[k];
@@ -1409,7 +1462,7 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
   // in fragment layout.
   auto write_result = [&](bool last) {
     int c_gl_stride = prob_n / 8;
-    int64_t c_expert_off = expert_id * static_cast<int64_t>(prob_m) * c_gl_stride;
+    int64_t c_expert_off = expert_id * static_cast<int64_t>(c_expert_stride);
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
     constexpr int c_sh_rd_delta = c_sh_stride * (threads / (2 * thread_n_blocks));
@@ -1517,20 +1570,15 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
 #pragma unroll
     for (int i = 0; i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
       int row = c_gl_wr / c_gl_stride;
-      if (row < block_num_valid_tokens) {
-        int64_t sorted_row = sh_block_sorted_ids[row];
+      if (block_full || row < block_num_valid_tokens) {
+        int64_t sorted_row = static_cast<int64_t>(block_token_start + row);
         int64_t true_idx = c_expert_off + sorted_row * c_gl_stride + c_gl_wr % c_gl_stride;
         if (use_atomic_add && slice_count > 1) {
           scalar_t2* C_half2 = reinterpret_cast<scalar_t2*>(&C[true_idx]);
           scalar_t2* sh_red_half2 = reinterpret_cast<scalar_t2*>(&sh_red[c_sh_rd]);
 #pragma unroll
           for (int a = 0; a < 4; a++) {
-            scalar_t2 res = sh_red_half2[a];
-            if (use_atomic_add && slice_count > 1) {
-              atomicAdd(&C_half2[a], res);
-            } else {
-              C_half2[a] = res;
-            };
+            atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
         } else {
           C[true_idx] = sh_red[c_sh_rd];
@@ -1544,7 +1592,22 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
 
   // Start global fetch and register load pipelines.
   auto start_pipes = [&]() {
-
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+    if constexpr (!has_act_order && thread_m_blocks == 1 && kHasBTmaBarrierSpace) {
+      if (threadIdx.x == 0 && use_b_tma) {
+#pragma unroll
+        for (int i = 0; i < stages; ++i) {
+          b_tma_barriers[i].init(1);
+          b_tma_empty_barriers[i].init(1);
+          b_tma_pipe_valid[i] = false;
+          b_tma_wait_phase[i] = 0;
+          b_tma_empty_wait_phase[i] = 1;
+        }
+        cutlass::arch::fence_barrier_init();
+      }
+    }
+    __syncthreads();
+#endif
 #pragma unroll
     for (int i = 0; i < stages - 1; i++) {
       if (has_act_order && i == 0) {
@@ -1567,7 +1630,7 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
     }
 
     zero_accums();
-    wait_for_stage();
+    wait_for_stage(0);
     init_same_group(0);
     fetch_to_registers(0, 0);
     fetch_scales_to_registers(0, 0);
@@ -1577,18 +1640,121 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
       slice_k_start_shared_fetch += tb_k * (stages - 1);
     }
   };
-  if (slice_iters) {
-    start_pipes();
-  }
+  // === Expert loop ===
+  const int32_t active_expert_count =
+      active_expert_count_ptr != nullptr ? max(active_expert_count_ptr[0], 0) : gridDim.y;
+  for (int32_t expert_slot = static_cast<int32_t>(blockIdx.y); expert_slot < active_expert_count;
+       expert_slot += static_cast<int32_t>(gridDim.y)) {
+    int32_t expert_idx = expert_slot;
+    if (active_expert_ids_ptr != nullptr) {
+      expert_idx = active_expert_ids_ptr[expert_slot];
+      if (expert_idx < 0) {
+        continue;
+      }
+    }
+    expert_id = static_cast<int64_t>(expert_idx);
+    num_tokens_cur_expert = masked_m_ptr[expert_id];
+    const int logical_tokens_upper =
+        num_tokens_cur_expert > 0
+            ? min(num_tokens_cur_expert, (expected_m > 0 ? min(expected_m, prob_m) : prob_m))
+            : 0;
+    const int num_tokens_past_padded =
+        ((logical_tokens_upper + moe_block_size - 1) / moe_block_size) * moe_block_size;
+    parallel = num_tokens_past_padded / moe_block_size;
+    if (parallel <= 0) {
+      continue;
+    }
 
-  // Main loop.
-  while (slice_iters) {
-    // We unroll over both the global fetch and the register load pipeline to
-    // ensure all shared memory accesses are static. Note that both pipelines
-    // have even length meaning that the next iteration will always start at
-    // index 0.
+    // --- Per-expert slice state reset ---
+    iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
+    if constexpr (!has_act_order && group_blocks != -1) {
+      if (group_blocks >= thread_k_blocks) {
+        iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
+      }
+    }
 
-    for (int stage_group_id = 0; stage_group_id < max_num_stage_groups; stage_group_id++) {
+    slice_row = (iters * blockIdx.x) % k_tiles;
+    slice_col_par = (iters * blockIdx.x) / k_tiles;
+    slice_col = slice_col_par;
+    slice_count = 0;
+    par_id = 0;
+    block_id = -1;
+    B_expert_off = expert_id * static_cast<int64_t>(prob_n) * prob_k / (pack_factor * 4);
+    block_num_valid_tokens = 0;
+    block_token_start = 0;
+    block_full = false;
+    locks_off = 0;
+
+    // Remap for parallel execution
+    if (slice_col_par >= n_tiles) {
+      slice_col = slice_col_par % n_tiles;
+      par_id = slice_col_par / n_tiles;
+    }
+    if (parallel * n_tiles >= gridDim.x) {
+      locks_off = blockIdx.x;
+    } else {
+      locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    }
+    locks_off += static_cast<int32_t>(expert_id) * gridDim.x;
+
+    update_next_moe_block_data();
+    init_slice(true);
+
+    a_expert_off = expert_id * static_cast<int64_t>(a_expert_stride);
+    a_gl_rd_col = a_gl_rd_delta_o * slice_row + threadIdx.x % a_gl_rd_delta_o;
+    b_gl_rd = b_gl_rd_base + b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
+
+    // act_order
+    slice_k_start = tb_k * slice_row;
+    slice_k_finish = slice_k_start + tb_k * slice_iters;
+    slice_k_start_shared_fetch = slice_k_start;
+    slice_n_offset = act_s_col_tb_stride * slice_col;
+
+    // scales
+    if constexpr (!has_act_order) {
+      if constexpr (group_blocks == -1) {
+        s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
+      } else {
+        s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) / (w_type == host::kFE2M1f ? 2 : 1) +
+                  s_sh_stride * slice_col + threadIdx.x;
+      }
+    }
+
+    // zero-points
+    if constexpr (has_zp) {
+      if constexpr (group_blocks == -1) {
+        zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+      } else {
+        zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + zp_sh_stride * slice_col + threadIdx.x;
+      }
+    }
+
+    bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
+
+    // B_ptr
+#pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+
+    should_load_a = true;
+    max_num_stage_groups = ((sh_a_max_row - moe_block_size) / moe_block_size + 1) / stages;
+    max_num_stage_groups = max(max_num_stage_groups, 1);
+    is_first_matmul_in_slice = true;
+    sh_first_group_id = -1;
+    sh_num_groups = -1;
+
+    if (slice_iters) {
+      start_pipes();
+    }
+
+    // Main loop.
+    while (slice_iters) {
+      // We unroll over both the global fetch and the register load pipeline to
+      // ensure all shared memory accesses are static. Note that both pipelines
+      // have even length meaning that the next iteration will always start at
+      // index 0.
+
+      for (int stage_group_id = 0; stage_group_id < max_num_stage_groups; stage_group_id++) {
 #pragma unroll
       for (int pipe = 0; pipe < stages;) {
 #pragma unroll
@@ -1599,12 +1765,13 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
           fetch_scales_to_registers(k + 1, pipe);
           fetch_zp_to_registers(k + 1, pipe);
           if (k == b_sh_wr_iters - 2) {
+            release_b_stage(pipe % stages);
             int idx = (pipe >= 1 && stage_group_id == max_num_stage_groups - 1)
                           ? (pipe - 1)
                           : (pipe + (stage_group_id + 1) * stages - 1);
             fetch_to_shared((pipe + stages - 1) % stages, pipe, slice_iters >= stages, idx);
             pipe++;
-            wait_for_stage();
+            wait_for_stage(pipe % stages);
             init_same_group(pipe % stages);
           }
           matmul(k);
@@ -1741,14 +1908,11 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
       // `old_slice_row > 0`:
       //    when the last slice is not starting from k_index == 0
       //    (only happen when it is the first slice of a threadblock)
-      // `prob_k > thread_k_blocks * 16 * stages * max_num_stage_groups`:
-      //    when the required shared memory size is larger than
-      //    the remaining shared memory
-      if (slice_col == 0 || old_slice_row || prob_k > thread_k_blocks * 16 * stages * max_num_stage_groups) {
-        should_load_a = true;
-      } else {
-        should_load_a = false;
-      }
+      // Note: we no longer check shared memory capacity here because:
+      // 1. When sh_a has enough space, A is cached across k-iterations automatically
+      // 2. When sh_a is limited (blocks_per_sm > 1), the above two conditions already
+      //    cover the cases where A must be reloaded
+      should_load_a = (slice_col == 0 || old_slice_row);
 
       if (slice_iters) {
         a_gl_rd_col = (threadIdx.x % a_gl_rd_delta_o);
@@ -1775,6 +1939,7 @@ __global__ void MarlinDirect(MARLIN_DIRECT_KERNEL_PARAMS) {
         start_pipes();
       }
     }
+  }
   }
 }
 
