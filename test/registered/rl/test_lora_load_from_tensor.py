@@ -8,7 +8,7 @@ from safetensors.torch import load_file
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=90, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
@@ -200,6 +200,10 @@ class TestLoRALoadFromTensor(CustomTestCase):
             "Output after applying LoRA does not match expected result",
         )
 
+    @unittest.skipIf(
+        is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+        "HF LoRA logprob path requires a newer torchao than the current CUDA PR UT image",
+    )
     def test_lora_logp_diff_with_huggingface(self):
         """
         Test comparing SGLang and HuggingFace LoRA logprobs when loading LoRA from tensors.
