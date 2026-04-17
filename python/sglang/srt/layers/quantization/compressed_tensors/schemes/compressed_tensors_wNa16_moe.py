@@ -40,12 +40,25 @@ __all__ = [
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _LOW_LATENCY_PROFILE_LOG = get_bool_env_var("SGLANG_DEEPEP_LOW_LATENCY_PROFILE_LOG")
+_DEEPEP_LL_GRAPH_DEBUG = get_bool_env_var("SGLANG_DEEPEP_LL_GRAPH_DEBUG")
 
 logger = logging.getLogger(__name__)
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     pass
+
+
+def _get_deepep_ll_direct_workspace_size(
+    num_experts: int,
+    device: torch.device,
+) -> int:
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    # Direct Marlin uses one lock stripe array per expert, and the kernel may
+    # advance the per-expert lock offset by one extra slot while reducing the
+    # last slice. Keep one extra lock per expert on top of the max blocks-per-sm
+    # budget used by the kernel config search.
+    return max((sms * 4 + 1) * max(num_experts, 1), 128)
 
 if _is_cuda:
     import triton
@@ -54,155 +67,100 @@ if _is_cuda:
 if _is_cuda:
 
     @triton.jit
-    def _compact_deepep_ll_hidden_states_kernel(
-        input_ptr,
-        output_ptr,
-        prefix_ptr,
+    def _build_active_expert_ids_kernel(
         masked_m_ptr,
-        stride_input_expert,
-        stride_input_token,
-        stride_input_hidden,
-        stride_output_token,
-        stride_output_hidden,
-        hidden_size,
-        BLOCK_H: tl.constexpr,
-    ):
-        block_h = tl.program_id(0)
-        token_id = tl.program_id(1)
-        expert_id = tl.program_id(2)
-
-        token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
-        if token_id >= token_num_cur_expert:
-            return
-
-        dst_token = tl.load(prefix_ptr + expert_id) + token_id
-        offsets_h = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
-        mask_h = offsets_h < hidden_size
-
-        input_ptr = (
-            input_ptr
-            + expert_id * stride_input_expert
-            + token_id * stride_input_token
-            + offsets_h * stride_input_hidden
-        )
-        output_ptr = (
-            output_ptr + dst_token * stride_output_token + offsets_h * stride_output_hidden
-        )
-
-        data = tl.load(input_ptr, mask=mask_h, other=0.0)
-        tl.store(output_ptr, data, mask=mask_h)
-
-    @triton.jit
-    def _expand_deepep_ll_hidden_states_kernel(
-        input_ptr,
-        output_ptr,
-        prefix_ptr,
-        masked_m_ptr,
-        stride_input_token,
-        stride_input_hidden,
-        stride_output_expert,
-        stride_output_token,
-        stride_output_hidden,
-        hidden_size,
-        BLOCK_H: tl.constexpr,
-    ):
-        block_h = tl.program_id(0)
-        token_id = tl.program_id(1)
-        expert_id = tl.program_id(2)
-
-        token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
-        offsets_h = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
-        mask_h = offsets_h < hidden_size
-        dst_ptr = (
-            output_ptr
-            + expert_id * stride_output_expert
-            + token_id * stride_output_token
-            + offsets_h * stride_output_hidden
-        )
-
-        if token_id < token_num_cur_expert:
-            src_token = tl.load(prefix_ptr + expert_id) + token_id
-            src_ptr = (
-                input_ptr
-                + src_token * stride_input_token
-                + offsets_h * stride_input_hidden
-            )
-            data = tl.load(src_ptr, mask=mask_h, other=0.0)
-        else:
-            data = tl.zeros((BLOCK_H,), dtype=dst_ptr.dtype.element_ty)
-
-        tl.store(dst_ptr, data, mask=mask_h)
-
-    @triton.jit
-    def _build_deepep_ll_prefix_sum_kernel(
-        masked_m_ptr,
-        prefix_ptr,
+        active_expert_ids_ptr,
+        active_expert_counter_ptr,
         num_experts,
+        active_expert_capacity,
+        BLOCK_E: tl.constexpr,
     ):
-        expert_id = tl.program_id(0)
-        if expert_id > num_experts:
-            return
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_E + tl.arange(0, BLOCK_E)
+        mask = offs < num_experts
+        token_count = tl.load(masked_m_ptr + offs, mask=mask, other=0)
+        active = mask & (token_count > 0)
+        slots = tl.atomic_add(
+            active_expert_counter_ptr + tl.zeros([BLOCK_E], dtype=tl.int32),
+            1,
+            mask=active,
+        )
+        store_mask = active & (slots < active_expert_capacity)
+        tl.store(active_expert_ids_ptr + slots, offs, mask=store_mask)
 
-        running = tl.zeros((), dtype=tl.int32)
-        idx = 0
-        while idx < expert_id:
-            running += tl.load(masked_m_ptr + idx)
-            idx += 1
-        tl.store(prefix_ptr + expert_id, running)
 
-    @triton.jit
-    def _build_deepep_ll_marlin_layout_kernel(
-        aligned_prefix_ptr,
-        prefix_ptr,
-        masked_m_ptr,
-        sorted_token_ids_ptr,
-        expert_ids_ptr,
-        size_m,
-        BLOCK_M: tl.constexpr,
-    ):
-        local_block_id = tl.program_id(0)
-        expert_id = tl.program_id(1)
+def _masked_silu_and_mul_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    token_upper_hint: Optional[int] = None,
+):
+    from sglang.jit_kernel.masked_silu_and_mul import masked_silu_and_mul
 
-        aligned_start = tl.load(aligned_prefix_ptr + expert_id)
-        aligned_end = tl.load(aligned_prefix_ptr + expert_id + 1)
-        aligned_count = aligned_end - aligned_start
-        block_offset = local_block_id * BLOCK_M
-        if block_offset >= aligned_count:
-            return
+    return masked_silu_and_mul(
+        input, output, masked_m,
+        token_upper_hint=token_upper_hint,
+        use_fp32_accum=True,
+    )
 
-        real_start = tl.load(prefix_ptr + expert_id)
-        real_count = tl.load(masked_m_ptr + expert_id)
-        block_start = aligned_start + block_offset
-        lanes = tl.arange(0, BLOCK_M)
-        token_offsets = block_offset + lanes
-        token_ids = tl.where(token_offsets < real_count, real_start + token_offsets, size_m)
-        tl.store(sorted_token_ids_ptr + block_start + lanes, token_ids)
-        tl.store(expert_ids_ptr + (block_start // BLOCK_M), expert_id)
 
-    @triton.jit
-    def _build_deepep_ll_aligned_prefix_kernel(
-        aligned_prefix_ptr,
-        num_tokens_post_padded_ptr,
-        masked_m_ptr,
+def _build_active_expert_ids_fwd(
+    masked_m: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+    active_expert_counter: torch.Tensor,
+):
+    assert masked_m.is_cuda
+    assert active_expert_ids.is_cuda
+    assert active_expert_counter.is_cuda
+    assert masked_m.ndim == 1
+    assert active_expert_ids.ndim == 1
+    assert active_expert_counter.numel() == 1
+
+    active_expert_ids.fill_(-1)
+    active_expert_counter.zero_()
+    num_experts = int(masked_m.numel())
+    capacity = int(active_expert_ids.numel())
+    if num_experts == 0 or capacity == 0:
+        return active_expert_ids
+
+    block_e = 256
+    grid = (triton.cdiv(num_experts, block_e),)
+    _build_active_expert_ids_kernel[grid](
+        masked_m,
+        active_expert_ids,
+        active_expert_counter,
         num_experts,
-        BLOCK_M: tl.constexpr,
-    ):
-        expert_id = tl.program_id(0)
-        if expert_id >= num_experts:
-            return
+        capacity,
+        BLOCK_E=block_e,
+        num_warps=4,
+    )
+    return active_expert_ids
 
-        running = tl.zeros((), dtype=tl.int32)
-        idx = 0
-        while idx <= expert_id:
-            count = tl.load(masked_m_ptr + idx)
-            running += ((count + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
-            idx += 1
 
-        if expert_id == 0:
-            tl.store(aligned_prefix_ptr, 0)
-        tl.store(aligned_prefix_ptr + expert_id + 1, running)
-        if expert_id == num_experts - 1:
-            tl.store(num_tokens_post_padded_ptr, running)
+def _select_deepep_ll_graph_launch_experts(
+    active_tokens: int,
+    num_experts: int,
+) -> int:
+    # CUDA graph replay requires a fixed launch shape. Keep small batches tight,
+    # but avoid over-compressing y-dimension parallelism once batch size reaches
+    # the 8/16/32+ range.
+    if active_tokens <= 1:
+        return 1
+    if active_tokens <= 2:
+        return min(num_experts, 2)
+    if active_tokens <= 4:
+        return min(num_experts, 4)
+    if active_tokens <= 8:
+        return min(num_experts, 8)
+    if active_tokens <= 16:
+        return min(num_experts, 16)
+    if active_tokens <= 32:
+        return min(num_experts, 24)
+    if active_tokens <= 64:
+        return min(num_experts, 32)
+    if active_tokens <= 128:
+        return min(num_experts, 40)
+    return num_experts
 
 
 def _select_deepep_ll_direct_block_size(
@@ -210,11 +168,16 @@ def _select_deepep_ll_direct_block_size(
     *,
     capture_active: bool,
     expected_m: Optional[int] = None,
+    token_upper_hint: Optional[int] = None,
+    total_tokens_hint: Optional[int] = None,
+    active_experts_hint: Optional[int] = None,
+    is_w13_stage: bool = False,
 ) -> tuple[int, int, int]:
     def _select_three_tier_block(
         token_upper: int,
         active_experts: int,
         total_tokens: int,
+        is_w13_stage: bool,
     ) -> int:
         # Three-tier policy for LL decode:
         # - 8: tiny sparse cases, best latency on current H100 traces
@@ -229,11 +192,12 @@ def _select_deepep_ll_direct_block_size(
 
         padded_16 = ((total_tokens + 15) // 16) * 16
         padded_32 = ((total_tokens + 31) // 32) * 32
-        # Stay on 16 unless 32 meaningfully reduces block count or the upper bound
-        # is already close to 32 and enough experts are active.
-        if padded_32 + max(active_experts, 2) < padded_16 or (
-            token_upper >= 24 and active_experts >= 2
-        ):
+        prefer_32 = padded_32 + max(active_experts, 2) < padded_16
+        if is_w13_stage:
+            prefer_32 = prefer_32 or (token_upper >= 28 and active_experts >= 2)
+        else:
+            prefer_32 = prefer_32 or (token_upper >= 20 and active_experts >= 2)
+        if prefer_32:
             return 32
         return 16
 
@@ -246,6 +210,7 @@ def _select_deepep_ll_direct_block_size(
                 token_upper,
                 int(masked_m.numel()),
                 token_upper * max(int(masked_m.numel()), 1),
+                is_w13_stage,
             ),
             int(masked_m.numel()),
             token_upper,
@@ -253,6 +218,24 @@ def _select_deepep_ll_direct_block_size(
 
     if masked_m.numel() == 0:
         return 8, 0, 0
+
+    if (
+        token_upper_hint is not None
+        and total_tokens_hint is not None
+        and active_experts_hint is not None
+    ):
+        token_upper = max(int(token_upper_hint), 1)
+        active_experts = max(int(active_experts_hint), 0)
+        total_tokens = max(int(total_tokens_hint), 0)
+        if active_experts == 0 or total_tokens == 0:
+            return 8, 0, 0
+        return (
+            _select_three_tier_block(
+                token_upper, active_experts, total_tokens, is_w13_stage
+            ),
+            active_experts,
+            token_upper,
+        )
 
     masked_m_host = masked_m.detach().cpu() if masked_m.is_cuda else masked_m
     if masked_m_host.dtype != torch.int32:
@@ -266,7 +249,9 @@ def _select_deepep_ll_direct_block_size(
     token_upper = int(active.max().item())
     total_tokens = int(active.sum().item())
     return (
-        _select_three_tier_block(token_upper, active_experts, total_tokens),
+        _select_three_tier_block(
+            token_upper, active_experts, total_tokens, is_w13_stage
+        ),
         active_experts,
         token_upper,
     )
@@ -609,293 +594,248 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer._deepep_local_expert_mapping = mapping
         return mapping
 
-    def _fused_marlin_deepep_ll(
+    def _get_deepep_ll_direct_impl(self):
+        try:
+            from sglang.jit_kernel.deepep_moe_wna16_marlin_direct import (
+                deepep_moe_wna16_marlin_direct_gemm,
+            )
+
+            return deepep_moe_wna16_marlin_direct_gemm, True
+        except Exception:
+            from sglang.jit_kernel.deepep_moe_wna16_marlin import (
+                deepep_moe_wna16_marlin,
+            )
+
+            return deepep_moe_wna16_marlin, False
+
+    def _get_deepep_ll_direct_runtime(
         self,
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        masked_m: torch.Tensor,
-    ) -> torch.Tensor:
-        from sgl_kernel import silu_and_mul
-        from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+        *,
+        num_experts: int,
+        logical_m: int,
+        size_k: int,
+        size_n: int,
+    ) -> dict:
+        runtime_cache = getattr(layer, "_deepep_ll_direct_runtime_cache", None)
+        if runtime_cache is None:
+            runtime_cache = {}
+            layer._deepep_ll_direct_runtime_cache = runtime_cache
 
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            get_scalar_type,
-        )
-        from sglang.srt.layers.quantization.marlin_utils import (
-            should_use_atomic_add_reduce,
-        )
-
-        assert hidden_states.ndim == 2
-        assert prefix_sum.ndim == 1
-        assert masked_m.ndim == 1
-
-        m, k = hidden_states.shape
-        if m == 0:
-            return hidden_states
-
-        e = layer.w13_weight_packed.shape[0]
-        n = layer.w2_weight_packed.shape[1] * 16
-        topk = 1
-        capture_active = (
-            hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
-        )
-        profile_enabled = _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda and not capture_active
-
-        for block_size_m in [8, 16, 32, 48, 64]:
-            if m * topk / e / block_size_m < 0.9:
-                break
-
-        device = hidden_states.device
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        max_blocks_per_expert = triton.cdiv(m, block_size_m)
-        max_active_experts_upper_bound = min(e, m)
-        max_num_m_blocks = max(1, max_active_experts_upper_bound * max_blocks_per_expert)
-        max_num_tokens_padded = max_num_m_blocks * block_size_m
-        workspace_size = (max(2 * n, k) // 64) * max(1, max_num_m_blocks)
-        workspace_size = min(workspace_size, sms * 4)
-        workspace_size = max(workspace_size, 128)
-        intermediate13_size = m * max(2 * n, k)
         runtime_key = (
-            device.index,
+            hidden_states.device.index,
             str(hidden_states.dtype),
-            e,
-            m,
-            n,
-            k,
-            block_size_m,
+            num_experts,
+            size_k,
+            size_n,
         )
-        if capture_active:
-            marlin_runtime_map = getattr(layer, "_deepep_ll_marlin_runtime_map", None)
-            if marlin_runtime_map is None:
-                marlin_runtime_map = {}
-                layer._deepep_ll_marlin_runtime_map = marlin_runtime_map
-            marlin_runtime = marlin_runtime_map.get(runtime_key)
-        else:
-            marlin_runtime = getattr(layer, "_deepep_ll_marlin_runtime", None)
-        if (
-            marlin_runtime is None
-            or marlin_runtime["device"] != device
-            or marlin_runtime["dtype"] != hidden_states.dtype
-            or marlin_runtime["buffer_tokens"] < m
-            or marlin_runtime["block_size_m"] != block_size_m
-            or marlin_runtime["workspace"].numel() < workspace_size
-            or marlin_runtime["intermediate_cache2"].shape[1] != n
-            or marlin_runtime["intermediate_cache13"].numel() < intermediate13_size
-            or marlin_runtime["sorted_token_ids"].numel() < max_num_tokens_padded
-            or marlin_runtime["expert_ids"].numel() < max_num_m_blocks
-        ):
-            workspace = torch.zeros(
-                workspace_size, dtype=torch.int, device=device, requires_grad=False
+        runtime = runtime_cache.get(runtime_key)
+        workspace_size = _get_deepep_ll_direct_workspace_size(
+            num_experts, hidden_states.device
+        )
+        needs_grow = (
+            runtime is None
+            or runtime["logical_m_capacity"] < logical_m
+            or runtime["workspace_size"] < workspace_size
+        )
+        if needs_grow:
+            workspace_size = _get_deepep_ll_direct_workspace_size(
+                num_experts, hidden_states.device
             )
-            intermediate_cache2 = torch.empty(
-                (m, n),
-                device=device,
-                dtype=hidden_states.dtype,
-            )
-            intermediate_cache13 = torch.empty(
-                (intermediate13_size,),
-                device=device,
-                dtype=hidden_states.dtype,
-            )
-            sorted_token_ids = torch.empty(
-                (max_num_tokens_padded,), dtype=torch.int32, device=device
-            )
-            expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
-            num_tokens_post_padded = torch.empty((1,), dtype=torch.int32, device=device)
-            topk_weights = torch.ones((m, 1), dtype=hidden_states.dtype, device=device)
-            masked_m_int = torch.empty((e,), dtype=torch.int32, device=device)
-            aligned_prefix = torch.empty((e + 1,), dtype=torch.int32, device=device)
-            marlin_runtime = {
-                "device": device,
-                "dtype": hidden_states.dtype,
-                "buffer_tokens": m,
-                "block_size_m": block_size_m,
-                "workspace": workspace,
-                "intermediate_cache2": intermediate_cache2,
-                "intermediate_cache13": intermediate_cache13,
-                "sorted_token_ids": sorted_token_ids,
-                "expert_ids": expert_ids,
-                "num_tokens_post_padded": num_tokens_post_padded,
-                "topk_weights": topk_weights,
-                "masked_m_int": masked_m_int,
-                "aligned_prefix": aligned_prefix,
+            runtime = {
+                "logical_m_capacity": logical_m,
+                "workspace_size": workspace_size,
+                "tmp1": torch.empty(
+                    (num_experts, logical_m, 2 * size_n),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                ),
+                "tmp2": torch.empty(
+                    (num_experts, logical_m, size_n),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                ),
+                "w13_workspace": torch.zeros(
+                    workspace_size,
+                    dtype=torch.int,
+                    device=hidden_states.device,
+                    requires_grad=False,
+                ),
+                "w13_c_tmp": torch.empty(
+                    0,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ),
+                "w2_workspace": torch.zeros(
+                    workspace_size,
+                    dtype=torch.int,
+                    device=hidden_states.device,
+                    requires_grad=False,
+                ),
+                "w2_c_tmp": torch.empty(
+                    0,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ),
+                "active_expert_ids": torch.empty(
+                    (num_experts,),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                "active_expert_counter": torch.empty(
+                    (1,),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
             }
-            if capture_active:
-                marlin_runtime_map[runtime_key] = marlin_runtime
-            else:
-                layer._deepep_ll_marlin_runtime = marlin_runtime
-            if _LOW_LATENCY_PROFILE_LOG and capture_active:
+            runtime_cache[runtime_key] = runtime
+            if _DEEPEP_LL_GRAPH_DEBUG:
                 logger.warning(
-                    "DEEPEP_LL_DEBUG_RUNTIME_CREATE rank=%s layer_id=%s key=%s m=%s block_m=%s hidden_shape=%s workspace_ptr=%s cache13_ptr=%s cache2_ptr=%s sorted_ptr=%s expert_ptr=%s",
+                    "SGLANG_DEEPEP_LL_GRAPH_DEBUG_RUNTIME_CREATE rank=%s layer_id=%s key=%s logical_m_capacity=%s workspace_size=%s tmp1_ptr=%s tmp2_ptr=%s w13_ws_ptr=%s w13_c_tmp_ptr=%s w2_ws_ptr=%s w2_c_tmp_ptr=%s active_ids_ptr=%s active_counter_ptr=%s",
                     getattr(layer, "moe_ep_rank", -1),
                     id(layer),
                     runtime_key,
-                    m,
-                    block_size_m,
-                    tuple(hidden_states.shape),
-                    marlin_runtime["workspace"].data_ptr(),
-                    marlin_runtime["intermediate_cache13"].data_ptr(),
-                    marlin_runtime["intermediate_cache2"].data_ptr(),
-                    marlin_runtime["sorted_token_ids"].data_ptr(),
-                    marlin_runtime["expert_ids"].data_ptr(),
+                    runtime["logical_m_capacity"],
+                    runtime["workspace_size"],
+                    runtime["tmp1"].data_ptr(),
+                    runtime["tmp2"].data_ptr(),
+                    runtime["w13_workspace"].data_ptr(),
+                    runtime["w13_c_tmp"].data_ptr(),
+                    runtime["w2_workspace"].data_ptr(),
+                    runtime["w2_c_tmp"].data_ptr(),
+                    runtime["active_expert_ids"].data_ptr(),
+                    runtime["active_expert_counter"].data_ptr(),
                 )
-        elif _LOW_LATENCY_PROFILE_LOG and capture_active:
+        elif _DEEPEP_LL_GRAPH_DEBUG:
             logger.warning(
-                "DEEPEP_LL_DEBUG_RUNTIME_REUSE rank=%s layer_id=%s key=%s m=%s block_m=%s hidden_shape=%s workspace_ptr=%s cache13_ptr=%s cache2_ptr=%s sorted_ptr=%s expert_ptr=%s",
+                "SGLANG_DEEPEP_LL_GRAPH_DEBUG_RUNTIME_REUSE rank=%s layer_id=%s key=%s logical_m_capacity=%s workspace_size=%s request_logical_m=%s tmp1_ptr=%s tmp2_ptr=%s w13_ws_ptr=%s w13_c_tmp_ptr=%s w2_ws_ptr=%s w2_c_tmp_ptr=%s active_ids_ptr=%s active_counter_ptr=%s",
                 getattr(layer, "moe_ep_rank", -1),
                 id(layer),
                 runtime_key,
-                m,
-                block_size_m,
-                tuple(hidden_states.shape),
-                marlin_runtime["workspace"].data_ptr(),
-                marlin_runtime["intermediate_cache13"].data_ptr(),
-                marlin_runtime["intermediate_cache2"].data_ptr(),
-                marlin_runtime["sorted_token_ids"].data_ptr(),
-                marlin_runtime["expert_ids"].data_ptr(),
+                runtime["logical_m_capacity"],
+                runtime["workspace_size"],
+                logical_m,
+                runtime["tmp1"].data_ptr(),
+                runtime["tmp2"].data_ptr(),
+                runtime["w13_workspace"].data_ptr(),
+                runtime["w13_c_tmp"].data_ptr(),
+                runtime["w2_workspace"].data_ptr(),
+                runtime["w2_c_tmp"].data_ptr(),
+                runtime["active_expert_ids"].data_ptr(),
+                runtime["active_expert_counter"].data_ptr(),
             )
+        return runtime
 
-        workspace = marlin_runtime["workspace"]
-        sorted_token_ids = marlin_runtime["sorted_token_ids"]
-        expert_ids = marlin_runtime["expert_ids"]
-        num_tokens_post_padded = marlin_runtime["num_tokens_post_padded"]
-        topk_weights = marlin_runtime["topk_weights"][:m]
-        masked_m_int = marlin_runtime["masked_m_int"]
-        aligned_prefix = marlin_runtime["aligned_prefix"]
-
-        if masked_m.dtype == torch.int32:
-            masked_m_int.copy_(masked_m)
-        else:
-            masked_m_int.copy_(masked_m.to(dtype=torch.int32))
-        _build_deepep_ll_aligned_prefix_kernel[(e,)](
-            aligned_prefix,
-            num_tokens_post_padded,
-            masked_m_int,
-            e,
-            BLOCK_M=block_size_m,
-        )
-
-        layout_grid = (max_blocks_per_expert, e)
-        _build_deepep_ll_marlin_layout_kernel[layout_grid](
-            aligned_prefix,
-            prefix_sum,
-            masked_m_int,
-            sorted_token_ids,
-            expert_ids,
-            m,
-            BLOCK_M=block_size_m,
-        )
-
-        scalar_type = get_scalar_type(self.num_bits, False)
-        use_atomic_add_w13 = should_use_atomic_add_reduce(
-            m,
-            2 * n,
-            k,
-            hidden_states.device,
-            hidden_states.dtype,
-        )
-        use_atomic_add_w2 = should_use_atomic_add_reduce(
-            m,
-            k,
-            n,
-            hidden_states.device,
-            hidden_states.dtype,
-        )
-
-        intermediate_cache2 = marlin_runtime["intermediate_cache2"][:m]
-        intermediate_cache13 = marlin_runtime["intermediate_cache13"]
-        intermediate_cache1 = intermediate_cache13[: m * 2 * n].view(-1, 2 * n)
-        intermediate_cache3 = intermediate_cache13[: m * k].view(-1, k)
-        if profile_enabled:
-            w13_start = torch.cuda.Event(enable_timing=True)
-            w13_end = torch.cuda.Event(enable_timing=True)
-            silu_start = torch.cuda.Event(enable_timing=True)
-            silu_end = torch.cuda.Event(enable_timing=True)
-            w2_start = torch.cuda.Event(enable_timing=True)
-            w2_end = torch.cuda.Event(enable_timing=True)
-            w13_start.record()
-
-        intermediate_cache1 = moe_wna16_marlin_gemm(
+    def _run_deepep_ll_stageb_direct(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        masked_m: torch.Tensor,
+        active_expert_ids: Optional[torch.Tensor],
+        active_expert_count: Optional[torch.Tensor],
+        launch_experts: int,
+        *,
+        direct_expected_m: int,
+        w13_block_size_m: int,
+        w2_block_size_m: int,
+        logical_m: int,
+        direct_gemm,
+        scalar_type,
+        stage_profile: Optional[dict] = None,
+    ) -> torch.Tensor:
+        size_k = hidden_states.shape[2]
+        size_n = layer.w2_weight_packed.shape[1] * 16
+        runtime = self._get_deepep_ll_direct_runtime(
+            layer,
             hidden_states,
-            intermediate_cache1,
+            num_experts=hidden_states.shape[0],
+            logical_m=logical_m,
+            size_k=size_k,
+            size_n=size_n,
+        )
+        tmp1 = runtime["tmp1"][:, :logical_m, :]
+        tmp2 = runtime["tmp2"][:, :logical_m, :]
+
+        if stage_profile is not None:
+            stage_profile["w13_start"] = torch.cuda.Event(enable_timing=True)
+            stage_profile["w13_end"] = torch.cuda.Event(enable_timing=True)
+            stage_profile["act_start"] = torch.cuda.Event(enable_timing=True)
+            stage_profile["act_end"] = torch.cuda.Event(enable_timing=True)
+            stage_profile["w2_start"] = torch.cuda.Event(enable_timing=True)
+            stage_profile["w2_end"] = torch.cuda.Event(enable_timing=True)
+            stage_profile["w13_start"].record()
+        tmp1 = direct_gemm(
+            hidden_states[:, :logical_m, :],
+            tmp1,
             layer.w13_weight_packed,
             None,
             layer.w13_weight_scale,
             None,
             None,
             layer.w13_weight_g_idx,
-            layer.w13_g_idx_sort_indices,
-            workspace,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_weights,
-            block_size_m,
-            1,
-            False,
-            False,
+            active_expert_ids,
+            active_expert_count,
+            launch_experts,
+            runtime["w13_workspace"],
+            runtime["w13_c_tmp"],
+            masked_m,
+            direct_expected_m,
+            w13_block_size_m,
             scalar_type,
-            m,
-            2 * n,
-            k,
-            self.is_k_full,
-            use_atomic_add_w13,
+            logical_m,
+            2 * size_n,
+            size_k,
             True,
-            False,
+            is_k_full=self.is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=False,
+            is_zp_float=False,
         )
-        if profile_enabled:
-            w13_end.record()
-            silu_start.record()
-        silu_and_mul(intermediate_cache1.view(-1, 2 * n), intermediate_cache2)
-        if profile_enabled:
-            silu_end.record()
-            w2_start.record()
 
-        output = moe_wna16_marlin_gemm(
-            intermediate_cache2,
-            intermediate_cache3,
+        if stage_profile is not None:
+            stage_profile["w13_end"].record()
+            stage_profile["act_start"].record()
+        _masked_silu_and_mul_fwd(
+            tmp1,
+            tmp2,
+            masked_m,
+            token_upper_hint=logical_m,
+        )
+        if stage_profile is not None:
+            stage_profile["act_end"].record()
+            stage_profile["w2_start"].record()
+
+        direct_gemm(
+            tmp2,
+            hidden_states[:, :logical_m, :],
             layer.w2_weight_packed,
             None,
             layer.w2_weight_scale,
             None,
             None,
             layer.w2_weight_g_idx,
-            layer.w2_g_idx_sort_indices,
-            workspace,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_weights,
-            block_size_m,
-            1,
-            False,
-            False,
+            active_expert_ids,
+            active_expert_count,
+            launch_experts,
+            runtime["w2_workspace"],
+            runtime["w2_c_tmp"],
+            masked_m,
+            direct_expected_m,
+            w2_block_size_m,
             scalar_type,
-            m,
-            k,
-            n,
-            self.is_k_full,
-            use_atomic_add_w2,
-            True,
+            logical_m,
+            size_k,
+            size_n,
             False,
+            is_k_full=self.is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=False,
+            is_zp_float=False,
         )
-        if profile_enabled:
-            w2_end.record()
-            w2_end.synchronize()
-            logger.warning(
-                "DEEPEP_LL_PROFILE_MARLIN rank=%s m=%s e=%s block_m=%s w13_ms=%.3f silu_ms=%.3f w2_ms=%.3f use_atomic_add_w13=%s use_atomic_add_w2=%s",
-                getattr(layer, "moe_ep_rank", -1),
-                m,
-                e,
-                block_size_m,
-                w13_start.elapsed_time(w13_end),
-                silu_start.elapsed_time(silu_end),
-                w2_start.elapsed_time(w2_end),
-                use_atomic_add_w13,
-                use_atomic_add_w2,
-            )
-        return output
+        if stage_profile is not None:
+            stage_profile["w2_end"].record()
+        return hidden_states
 
     def _fused_marlin_deepep_ll_direct(
         self,
@@ -905,36 +845,40 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         *,
         expected_m: Optional[int],
         capture_active: bool,
+        active_tokens_hint: int,
+        token_upper_hint: int,
+        active_experts_hint: int,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             get_scalar_type,
         )
-        # Prefer Stage-B direct_gemm if available
-        try:
-            from sglang.jit_kernel.deepep_moe_wna16_marlin_direct import (
-                deepep_moe_wna16_marlin_direct_gemm as _direct_gemm,
-            )
-            use_direct = True
-        except Exception:
-            from sglang.jit_kernel.deepep_moe_wna16_marlin import (
-                deepep_moe_wna16_marlin as _direct_gemm,
-            )
-            use_direct = False
+        direct_gemm, use_direct = self._get_deepep_ll_direct_impl()
 
         assert hidden_states.ndim == 3
         assert masked_m.ndim == 1
 
         num_experts = hidden_states.shape[0]
-        active_tokens = (
-            int(masked_m.sum().item()) if not capture_active else int(expected_m or 1)
-        )
-        if not capture_active and active_tokens == 0:
+        active_tokens = max(int(active_tokens_hint), 0)
+        if active_tokens == 0:
             return torch.zeros_like(hidden_states)
 
-        block_size_m, active_experts, token_upper = _select_deepep_ll_direct_block_size(
+        w13_block_size_m, active_experts, token_upper = _select_deepep_ll_direct_block_size(
             masked_m,
             capture_active=capture_active,
             expected_m=expected_m,
+            token_upper_hint=token_upper_hint,
+            total_tokens_hint=active_tokens_hint,
+            active_experts_hint=active_experts_hint,
+            is_w13_stage=True,
+        )
+        w2_block_size_m, _, _ = _select_deepep_ll_direct_block_size(
+            masked_m,
+            capture_active=capture_active,
+            expected_m=expected_m,
+            token_upper_hint=token_upper_hint,
+            total_tokens_hint=active_tokens_hint,
+            active_experts_hint=active_experts_hint,
+            is_w13_stage=False,
         )
         if capture_active:
             direct_expected_m = token_upper if expected_m is None else int(expected_m)
@@ -942,116 +886,73 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             direct_expected_m = token_upper
 
         profile_enabled = _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda
+        stage_profile = {} if profile_enabled and use_direct else None
         if profile_enabled:
             marlin_start = torch.cuda.Event(enable_timing=True)
             marlin_end = torch.cuda.Event(enable_timing=True)
             marlin_start.record()
 
         if use_direct:
-            # Stage-B direct_gemm path
             size_m = hidden_states.shape[1]
-            size_k = hidden_states.shape[2]
-            size_n = layer.w2_weight_packed.shape[1] * 16
             logical_m = max(min(direct_expected_m, size_m), 1)
-            runtime_cache = getattr(layer, "_deepep_ll_direct_runtime_cache", None)
-            if runtime_cache is None:
-                runtime_cache = {}
-                layer._deepep_ll_direct_runtime_cache = runtime_cache
-            runtime_key = (
-                hidden_states.device.index,
-                str(hidden_states.dtype),
-                num_experts,
-                logical_m,
-                size_k,
-                size_n,
-                block_size_m,
-            )
-            runtime = runtime_cache.get(runtime_key)
-            if runtime is None:
-                runtime = {
-                    "tmp1": torch.empty(
-                        (num_experts, logical_m, 2 * size_n),
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                    ),
-                    "tmp2": torch.empty(
-                        (num_experts, logical_m, size_n),
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                    ),
-                    "output_small": torch.empty(
-                        (num_experts, logical_m, size_k),
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                    ),
-                    "w13_runtime": {},
-                    "w2_runtime": {},
-                }
-                runtime_cache[runtime_key] = runtime
-            runtime["tmp1"].zero_()
-            #runtime["tmp2"].zero_()
-            runtime["output_small"].zero_()
-            # W13
-            tmp1 = _direct_gemm(
-                hidden_states[:, :logical_m, :],
-                runtime["tmp1"],
-                layer.w13_weight_packed,
-                None,
-                layer.w13_weight_scale,
-                None,
-                None,
-                None,
+            active_expert_ids = None
+            active_expert_count = None
+            launch_experts = num_experts
+            if active_tokens < num_experts and masked_m.is_cuda:
+                runtime = self._get_deepep_ll_direct_runtime(
+                    layer,
+                    hidden_states,
+                    num_experts=num_experts,
+                    logical_m=logical_m,
+                    size_k=hidden_states.shape[2],
+                    size_n=layer.w2_weight_packed.shape[1] * 16,
+                )
+                active_expert_count = runtime["active_expert_counter"]
+                if capture_active:
+                    launch_experts = _select_deepep_ll_graph_launch_experts(
+                        active_tokens,
+                        num_experts,
+                    )
+                    active_expert_ids = runtime["active_expert_ids"]
+                    _build_active_expert_ids_fwd(
+                        masked_m,
+                        active_expert_ids,
+                        active_expert_count,
+                    )
+                else:
+                    active_expert_ids = torch.nonzero(
+                        masked_m > 0, as_tuple=False
+                    ).flatten()
+                    if active_expert_ids.numel() > 0:
+                        active_expert_ids = active_expert_ids.to(
+                            device=masked_m.device, dtype=torch.int32
+                        ).contiguous()
+                        launch_experts = int(active_expert_ids.numel())
+                        active_expert_count.fill_(launch_experts)
+                    else:
+                        active_expert_ids = None
+                        active_expert_count = None
+            output = self._run_deepep_ll_stageb_direct(
+                layer,
+                hidden_states,
                 masked_m,
-                direct_expected_m,
-                block_size_m,
-                get_scalar_type(self.num_bits, False),
-                logical_m,
-                2 * size_n,
-                size_k,
-                is_k_full=self.is_k_full,
-                use_atomic_add=False,
-                use_fp32_reduce=False,
-                is_zp_float=False,
-                runtime_cache=runtime["w13_runtime"],
+                active_expert_ids,
+                active_expert_count,
+                launch_experts,
+                direct_expected_m=direct_expected_m,
+                w13_block_size_m=w13_block_size_m,
+                w2_block_size_m=w2_block_size_m,
+                logical_m=logical_m,
+                direct_gemm=direct_gemm,
+                scalar_type=get_scalar_type(self.num_bits, False),
+                stage_profile=stage_profile,
             )
-            # SiLU+Mul
-            from sgl_kernel import silu_and_mul
-
-            tmp2 = runtime["tmp2"]
-            silu_and_mul(tmp1, tmp2)
-            # W2
-            output = _direct_gemm(
-                tmp2,
-                runtime["output_small"],
-                layer.w2_weight_packed,
-                None,
-                layer.w2_weight_scale,
-                None,
-                None,
-                None,
-                masked_m,
-                direct_expected_m,
-                block_size_m,
-                get_scalar_type(self.num_bits, False),
-                logical_m,
-                hidden_states.shape[2],
-                size_n,
-                is_k_full=self.is_k_full,
-                use_atomic_add=False,
-                use_fp32_reduce=False,
-                is_zp_float=False,
-                runtime_cache=runtime["w2_runtime"],
-            )
-            full_output = hidden_states
-            full_output[:, :logical_m, :].copy_(output)
-            output = full_output
         else:
-            # Stage-A batched wrapper fallback
             runtime_cache = getattr(layer, "_deepep_ll_direct_marlin_runtime", None)
             if runtime_cache is None:
                 runtime_cache = {}
                 layer._deepep_ll_direct_marlin_runtime = runtime_cache
-            output = _direct_gemm(
+            output = direct_gemm(
                 hidden_states,
                 masked_m,
                 layer.w13_weight_packed,
@@ -1064,7 +965,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 layer.w2_g_idx_sort_indices,
                 self.num_bits,
                 self.is_k_full,
-                block_size_m,
+                w13_block_size_m,
                 runtime_cache,
             )
 
@@ -1072,19 +973,49 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             marlin_end.record()
             marlin_end.synchronize()
             logger.warning(
-                "DEEPEP_LL_PROFILE_MARLIN_DIRECT rank=%s active_tokens=%s active_experts=%s token_upper=%s num_experts=%s block_m=%s marlin_ms=%.3f",
+                "DEEPEP_LL_PROFILE_MARLIN_DIRECT rank=%s active_tokens=%s active_experts=%s launch_experts=%s token_upper=%s num_experts=%s w13_block_m=%s w2_block_m=%s marlin_ms=%.3f",
                 getattr(layer, "moe_ep_rank", -1),
                 active_tokens,
                 active_experts,
+                launch_experts if use_direct else num_experts,
                 token_upper,
                 num_experts,
-                block_size_m,
+                w13_block_size_m,
+                w2_block_size_m,
                 marlin_start.elapsed_time(marlin_end),
             )
+            if stage_profile:
+                logger.warning(
+                    "DEEPEP_LL_PROFILE_MARLIN_DIRECT_STAGE rank=%s active_tokens=%s w13_block_m=%s w2_block_m=%s w13_ms=%.3f act_ms=%.3f w2_ms=%.3f",
+                    getattr(layer, "moe_ep_rank", -1),
+                    active_tokens,
+                    w13_block_size_m,
+                    w2_block_size_m,
+                    stage_profile["w13_start"].elapsed_time(stage_profile["w13_end"]),
+                    stage_profile["act_start"].elapsed_time(stage_profile["act_end"]),
+                    stage_profile["w2_start"].elapsed_time(stage_profile["w2_end"]),
+                )
         return output
 
-    def _get_deepep_ll_max_active_tokens(self, dispatch_topk_ids: torch.Tensor) -> int:
-        return max(int(dispatch_topk_ids.numel()), 1)
+    def _prepare_deepep_ll_direct_run(
+        self,
+        hidden_states: torch.Tensor,
+        dispatch_topk_ids: torch.Tensor,
+    ) -> Optional[tuple[bool, int, int, int]]:
+        if not _is_cuda:
+            raise NotImplementedError("DeepEP low latency W4A16 sparse path requires CUDA.")
+
+        num_local_experts, padded_m, _ = hidden_states.shape
+        active_tokens = int(dispatch_topk_ids.numel())
+        if num_local_experts == 0 or padded_m == 0 or active_tokens == 0:
+            return None
+
+        capture_active = (
+            hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+        )
+        token_upper_bound = min(padded_m, active_tokens)
+        active_experts_hint = min(num_local_experts, active_tokens)
+        return capture_active, active_tokens, token_upper_bound, active_experts_hint
 
     def apply_weights(
         self,
@@ -1184,220 +1115,42 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         ), "W4A16 DeepEP low latency currently requires BF16 dispatch."
         assert hidden_states.ndim == 3, "DeepEP low latency expects [E, M, K] inputs."
 
-        num_local_experts, padded_m, hidden_size = hidden_states.shape
-        if num_local_experts == 0 or padded_m == 0:
+        prepared = self._prepare_deepep_ll_direct_run(hidden_states, dispatch_topk_ids)
+        if prepared is None:
             return torch.zeros_like(hidden_states)
-
-        capture_active = (
-            hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
-        )
-        if not capture_active and int(masked_m.max().item()) == 0:
-            return torch.zeros_like(hidden_states)
-        max_active_tokens = int(dispatch_topk_ids.numel())
-        if max_active_tokens == 0:
-            return torch.zeros_like(hidden_states)
-        active_tokens = max_active_tokens
+        capture_active, active_tokens, token_upper_bound, active_experts_hint = prepared
         profile_enabled = _LOW_LATENCY_PROFILE_LOG and hidden_states.is_cuda and not capture_active
-        if not capture_active:
-            active_tokens = int(masked_m.sum().item())
-            if active_tokens == 0:
-                return torch.zeros_like(hidden_states)
-            token_upper_bound = min(padded_m, max(int(masked_m.max().item()), 1))
-        else:
-            active_tokens = max_active_tokens
-            token_upper_bound = min(padded_m, max_active_tokens)
-        has_act_order = (
-            layer.w13_weight_g_idx.numel() > 0 or layer.w2_weight_g_idx.numel() > 0
-        )
 
-        if _is_cuda and not has_act_order:
-            if profile_enabled:
-                total_start = torch.cuda.Event(enable_timing=True)
-                total_end = torch.cuda.Event(enable_timing=True)
-                total_start.record()
-            output = self._fused_marlin_deepep_ll_direct(
-                layer,
-                hidden_states,
-                masked_m,
-                expected_m=expected_m,
-                capture_active=capture_active,
-            )
-            if profile_enabled:
-                total_end.record()
-                total_end.synchronize()
-                logger.warning(
-                    "DEEPEP_LL_PROFILE_COMPUTE rank=%s capture=%s active_tokens=%s token_upper=%s hidden_shape=%s compact_ms=%.3f marlin_ms=%.3f expand_ms=%.3f total_ms=%.3f",
-                    getattr(layer, "moe_ep_rank", -1),
-                    capture_active,
-                    active_tokens,
-                    token_upper_bound,
-                    tuple(hidden_states.shape),
-                    0.0,
-                    total_start.elapsed_time(total_end),
-                    0.0,
-                    total_start.elapsed_time(total_end),
-                )
-            return output
-
-        if _is_cuda:
-            if not capture_active:
-                # token_upper_bound 已在上文非 capture 分支中计算
-                prefix_sum = torch.empty(
-                    (num_local_experts + 1,),
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )
-                compact_hidden_states = torch.empty(
-                    (active_tokens, hidden_size),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-                expanded_output = hidden_states
-            else:
-                layout_key = (
-                    hidden_states.device.index,
-                    str(hidden_states.dtype),
-                    num_local_experts,
-                    padded_m,
-                    hidden_size,
-                    max_active_tokens,
-                )
-                layout_cache = getattr(layer, "_deepep_ll_marlin_layout_map", None)
-                if layout_cache is None:
-                    layout_cache = {}
-                    layer._deepep_ll_marlin_layout_map = layout_cache
-                cached_layout = layout_cache.get(layout_key)
-                if (
-                    cached_layout is None
-                    or cached_layout["device"] != hidden_states.device
-                    or cached_layout["num_local_experts"] != num_local_experts
-                    or cached_layout["padded_m"] != padded_m
-                    or cached_layout["max_active_tokens"] != max_active_tokens
-                ):
-                    compact_hidden_states = torch.empty(
-                        (max_active_tokens, hidden_size),
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                    )
-                    prefix_sum = torch.empty(
-                        (num_local_experts + 1,),
-                        dtype=torch.int32,
-                        device=hidden_states.device,
-                    )
-                    cached_layout = {
-                        "device": hidden_states.device,
-                        "num_local_experts": num_local_experts,
-                        "padded_m": padded_m,
-                        "max_active_tokens": max_active_tokens,
-                        "compact_hidden_states": compact_hidden_states,
-                        "prefix_sum": prefix_sum,
-                    }
-                    layout_cache[layout_key] = cached_layout
-                    if _LOW_LATENCY_PROFILE_LOG:
-                        logger.warning(
-                            "DEEPEP_LL_DEBUG_LAYOUT_CREATE rank=%s layer_id=%s key=%s graph_max_active=%s experts=%s padded_m=%s hidden_size=%s compact_ptr=%s prefix_ptr=%s",
-                            getattr(layer, "moe_ep_rank", -1),
-                            id(layer),
-                            layout_key,
-                            max_active_tokens,
-                            num_local_experts,
-                            padded_m,
-                            hidden_size,
-                            compact_hidden_states.data_ptr(),
-                            prefix_sum.data_ptr(),
-                        )
-                elif _LOW_LATENCY_PROFILE_LOG:
-                    logger.warning(
-                        "DEEPEP_LL_DEBUG_LAYOUT_REUSE rank=%s layer_id=%s key=%s graph_max_active=%s experts=%s padded_m=%s hidden_size=%s compact_ptr=%s prefix_ptr=%s",
-                        getattr(layer, "moe_ep_rank", -1),
-                        id(layer),
-                        layout_key,
-                        max_active_tokens,
-                        num_local_experts,
-                        padded_m,
-                        hidden_size,
-                        cached_layout["compact_hidden_states"].data_ptr(),
-                        cached_layout["prefix_sum"].data_ptr(),
-                    )
-
-                prefix_sum = cached_layout["prefix_sum"]
-                compact_hidden_states = cached_layout["compact_hidden_states"]
-                expanded_output = hidden_states
-                # token_upper_bound 已在上文 capture 分支中计算
-
-            _build_deepep_ll_prefix_sum_kernel[(num_local_experts + 1,)](
-                masked_m,
-                prefix_sum,
-                num_local_experts,
-            )
-
-            if profile_enabled:
-                total_start = torch.cuda.Event(enable_timing=True)
-                compact_end = torch.cuda.Event(enable_timing=True)
-                marlin_end = torch.cuda.Event(enable_timing=True)
-                expand_end = torch.cuda.Event(enable_timing=True)
-                total_start.record()
-            grid = (
-                triton.cdiv(hidden_size, 256),
-                token_upper_bound,
-                num_local_experts,
-            )
-            _compact_deepep_ll_hidden_states_kernel[grid](
-                hidden_states,
-                compact_hidden_states,
-                prefix_sum,
-                masked_m,
-                *hidden_states.stride(),
-                *compact_hidden_states.stride(),
-                hidden_size,
-                BLOCK_H=256,
-            )
-            if profile_enabled:
-                compact_end.record()
-        else:
-            raise NotImplementedError("DeepEP low latency W4A16 sparse path requires CUDA.")
-
-        flat_output = self._fused_marlin_deepep_ll(
+        if profile_enabled:
+            total_start = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
+        output = self._fused_marlin_deepep_ll_direct(
             layer,
-            compact_hidden_states,
-            prefix_sum,
+            hidden_states,
             masked_m,
+            expected_m=expected_m,
+            capture_active=capture_active,
+            active_tokens_hint=active_tokens,
+            token_upper_hint=token_upper_bound,
+            active_experts_hint=active_experts_hint,
         )
         if profile_enabled:
-            marlin_end.record()
-        if _is_cuda:
-            grid = (
-                triton.cdiv(hidden_size, 256),
+            total_end.record()
+            total_end.synchronize()
+            logger.warning(
+                "DEEPEP_LL_PROFILE_COMPUTE rank=%s capture=%s active_tokens=%s token_upper=%s hidden_shape=%s compact_ms=%.3f marlin_ms=%.3f expand_ms=%.3f total_ms=%.3f",
+                getattr(layer, "moe_ep_rank", -1),
+                capture_active,
+                active_tokens,
                 token_upper_bound,
-                num_local_experts,
+                tuple(hidden_states.shape),
+                0.0,
+                total_start.elapsed_time(total_end),
+                0.0,
+                total_start.elapsed_time(total_end),
             )
-            _expand_deepep_ll_hidden_states_kernel[grid](
-                flat_output,
-                expanded_output,
-                prefix_sum,
-                masked_m,
-                *flat_output.stride(),
-                *expanded_output.stride(),
-                hidden_size,
-                BLOCK_H=256,
-            )
-            if profile_enabled:
-                expand_end.record()
-                expand_end.synchronize()
-                logger.warning(
-                    "DEEPEP_LL_PROFILE_COMPUTE rank=%s capture=%s active_tokens=%s token_upper=%s hidden_shape=%s compact_ms=%.3f marlin_ms=%.3f expand_ms=%.3f total_ms=%.3f",
-                    getattr(layer, "moe_ep_rank", -1),
-                    capture_active,
-                    active_tokens,
-                    token_upper_bound,
-                    tuple(hidden_states.shape),
-                    total_start.elapsed_time(compact_end),
-                    compact_end.elapsed_time(marlin_end),
-                    marlin_end.elapsed_time(expand_end),
-                    total_start.elapsed_time(expand_end),
-                )
-            return expanded_output
-        raise NotImplementedError("DeepEP low latency W4A16 sparse path requires CUDA.")
+        return output
 
 
 class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
@@ -1411,8 +1164,6 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_triton_converted", False):
             return
-
-        num_experts = layer.w13_weight_packed.shape[0]
 
         # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
         w13 = layer.w13_weight_packed.data
