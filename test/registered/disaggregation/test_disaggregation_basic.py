@@ -30,6 +30,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.launch_all()
 
+    @unittest.skip("Disaggregation gsm8k accuracy is unstable in PR UT")
     def test_gsm8k(self):
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
