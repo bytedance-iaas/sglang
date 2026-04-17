@@ -21,16 +21,23 @@
 
 #pragma once
 
+#include <limits>
+
 #include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/scalar_type.hpp>
 
 #include "kernel.h"
 #include "kernel_direct.h"
+#include "marlin_tma_utils.h"
 #include "marlin_template.h"
 #include "marlin_direct_template.h"
 
 namespace device::marlin_moe {
+
+namespace detail {
+
+}  // namespace detail
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 __global__ void MarlinDirectDefault(MARLIN_DIRECT_KERNEL_PARAMS){};
@@ -752,6 +759,286 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
+// Like determine_exec_config but queries the *direct* kernel for register
+// usage so that blocks_per_sm is accurate for the direct path.
+template <typename scalar_t>
+exec_config_t determine_direct_exec_config(
+    const host::ScalarType& q_type,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    int thread_m_blocks,
+    bool m_block_size_8,
+    int num_bits,
+    int group_size,
+    bool is_k_full,
+    bool has_zp,
+    bool is_zp_float,
+    int max_shared_mem) {
+  exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
+  thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
+  int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
+                                                : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
+
+  int count = 0;
+  constexpr int device_max_reg_size = 255 * 1024;
+  for (int i = 0; i < thread_configs_size; i++) {
+    thread_config_t th_config = thread_configs[i];
+
+    if (!is_valid_config(
+            th_config,
+            m_block_size_8,
+            thread_m_blocks,
+            prob_m,
+            prob_n,
+            prob_k,
+            num_bits,
+            group_size,
+            false,
+            is_k_full,
+            has_zp,
+            is_zp_float,
+            max_shared_mem)) {
+      continue;
+    }
+
+    int cache_size = get_kernel_cache_size(
+        th_config,
+        m_block_size_8,
+        thread_m_blocks,
+        prob_m,
+        prob_n,
+        prob_k,
+        num_bits,
+        group_size,
+        false,
+        is_k_full,
+        has_zp,
+        is_zp_float);
+
+    int group_blocks = group_size == -1 ? -1 : (group_size / 16);
+
+    auto kernel = get_marlin_direct_kernel<scalar_t>(
+        q_type,
+        thread_m_blocks,
+        th_config.thread_n / 16,
+        th_config.thread_k / 16,
+        m_block_size_8,
+        has_zp,
+        group_blocks,
+        th_config.num_threads,
+        is_zp_float);
+
+    if (kernel == MarlinDirectDefault) continue;
+
+    if (thread_m_blocks > 1) {
+      exec_cfg = {1, th_config};
+      break;
+    } else {
+      cudaFuncAttributes attr;
+      cudaFuncGetAttributes(&attr, kernel);
+      int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+      int allow_count = min(device_max_reg_size / reg_size, max_shared_mem / (cache_size + 1024));
+      allow_count = max(min(allow_count, 4), 1);
+      if (allow_count > count) {
+        count = allow_count;
+        exec_cfg = {count, th_config};
+      };
+    }
+  }
+
+  return exec_cfg;
+}
+
+
+inline int direct_config_split_block_excess(
+    thread_config_t const& th_config,
+    int blocks_per_sm,
+    int logical_m,
+    int prob_n,
+    int moe_block_size,
+    int sms) {
+  if (blocks_per_sm <= 1 || logical_m <= 0) {
+    return 0;
+  }
+  const int thread_n_blocks = th_config.thread_n / 16;
+  const int n_tiles = prob_n / 16 / thread_n_blocks;
+  const int parallel = div_ceil(logical_m, moe_block_size);
+  const int max_no_split_blocks = max(parallel * n_tiles, 1);
+  return max(sms * blocks_per_sm - max_no_split_blocks, 0);
+}
+
+inline bool direct_config_has_high_lock_risk(
+    thread_config_t const& th_config,
+    int blocks_per_sm,
+    int logical_m,
+    int prob_n,
+    int moe_block_size,
+    int sms) {
+  return direct_config_split_block_excess(th_config, blocks_per_sm, logical_m, prob_n, moe_block_size, sms) > 0;
+}
+
+inline int pick_direct_blocks_per_sm_with_lock_avoidance(
+    thread_config_t const& th_config,
+    int allow_count,
+    int logical_m,
+    int prob_n,
+    int moe_block_size,
+    int sms) {
+  int best_chosen = 1;
+  int best_split_excess = std::numeric_limits<int>::max();
+  for (int chosen = 1; chosen <= allow_count; ++chosen) {
+    const int split_excess =
+        direct_config_split_block_excess(th_config, chosen, logical_m, prob_n, moe_block_size, sms);
+    const bool better_zero_split = split_excess == 0 && (best_split_excess != 0 || chosen > best_chosen);
+    const bool better_split_case = split_excess > 0 && best_split_excess > 0 && chosen < best_chosen;
+    if (split_excess < best_split_excess || better_zero_split || better_split_case) {
+      best_split_excess = split_excess;
+      best_chosen = chosen;
+    }
+  }
+  return best_chosen;
+}
+
+inline int limit_direct_blocks_per_sm_for_lock_avoidance(
+    int blocks_per_sm,
+    int logical_m,
+    int prob_n,
+    int thread_n,
+    int moe_block_size,
+    int sms) {
+  if (blocks_per_sm <= 1 || logical_m > 32) {
+    return blocks_per_sm;
+  }
+
+  const int parallel = div_ceil(logical_m, moe_block_size);
+  const int n_tiles = prob_n / thread_n;
+  const int max_no_split_blocks = max(parallel * n_tiles, 1);
+  int limited = div_ceil(max_no_split_blocks, sms);
+  limited = max(limited, 1);
+  return min(blocks_per_sm, limited);
+}
+
+template <typename scalar_t>
+bool try_determine_small_m_direct_exec_config(
+    const host::ScalarType& q_type,
+    int logical_m,
+    int prob_n,
+    int prob_k,
+    bool is_w13_stage,
+    int thread_m_blocks,
+    bool m_block_size_8,
+    int num_bits,
+    int group_size,
+    bool is_k_full,
+    bool has_zp,
+    bool is_zp_float,
+    int max_shared_mem,
+    int sms,
+    exec_config_t* exec_cfg_out) {
+  if (thread_m_blocks != 1 || logical_m > 32) {
+    return false;
+  }
+
+  const thread_config_t preferred_configs[2] = {
+      is_w13_stage ? thread_config_t{128, 128, 256} : thread_config_t{64, 128, 128},
+      is_w13_stage ? thread_config_t{64, 128, 128} : thread_config_t{128, 128, 256},
+  };
+  const int group_blocks = group_size == -1 ? -1 : (group_size / 16);
+  constexpr int device_max_reg_size = 255 * 1024;
+  exec_config_t best_cfg = exec_config_t{0, thread_config_t{-1, -1, -1}};
+  int best_split_excess = std::numeric_limits<int>::max();
+  bool found_cfg = false;
+  const thread_config_t* candidate_configs = preferred_configs;
+  int candidate_count = sizeof(preferred_configs) / sizeof(thread_config_t);
+  if (logical_m > 16) {
+    candidate_configs = small_batch_thread_configs;
+    candidate_count = sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
+  }
+
+  for (int cfg_idx = 0; cfg_idx < candidate_count; ++cfg_idx) {
+    const auto& th_config = candidate_configs[cfg_idx];
+    if (!is_valid_config(
+            th_config,
+            m_block_size_8,
+            thread_m_blocks,
+            logical_m,
+            prob_n,
+            prob_k,
+            num_bits,
+            group_size,
+            false,
+            is_k_full,
+            has_zp,
+            is_zp_float,
+            max_shared_mem)) {
+      continue;
+    }
+
+    auto kernel = get_marlin_direct_kernel<scalar_t>(
+        q_type,
+        thread_m_blocks,
+        th_config.thread_n / 16,
+        th_config.thread_k / 16,
+        m_block_size_8,
+        has_zp,
+        group_blocks,
+        th_config.num_threads,
+        is_zp_float);
+    if (kernel == MarlinDirectDefault) {
+      continue;
+    }
+
+    int cache_size = get_kernel_cache_size(
+        th_config,
+        m_block_size_8,
+        thread_m_blocks,
+        logical_m,
+        prob_n,
+        prob_k,
+        num_bits,
+        group_size,
+        false,
+        is_k_full,
+        has_zp,
+        is_zp_float);
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, kernel);
+    int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+    int allow_count = min(device_max_reg_size / reg_size, max_shared_mem / (cache_size + 1024));
+    allow_count = max(min(allow_count, 4), 1);
+    int chosen_count = pick_direct_blocks_per_sm_with_lock_avoidance(
+        th_config,
+        allow_count,
+        logical_m,
+        prob_n,
+        m_block_size_8 ? 8 : 16,
+        sms);
+    int split_excess = direct_config_split_block_excess(
+        th_config,
+        chosen_count,
+        logical_m,
+        prob_n,
+        m_block_size_8 ? 8 : 16,
+        sms);
+
+    if (!found_cfg || split_excess < best_split_excess ||
+        (split_excess == best_split_excess && chosen_count > best_cfg.blocks_per_sm)) {
+      best_cfg = {chosen_count, th_config};
+      best_split_excess = split_excess;
+      found_cfg = true;
+      if (split_excess == 0 && logical_m <= 16) {
+        break;
+      }
+    }
+  }
+
+  if (found_cfg) {
+    *exec_cfg_out = best_cfg;
+    return true;
+  }
+  return false;
+}
 template <typename scalar_t>
 void marlin_mm(
     const void* A,
@@ -1021,13 +1308,18 @@ void marlin_direct_mm(
     void* zp,
     void* g_idx,
     void* masked_m,
+    void* active_expert_ids,
+    void* active_expert_count,
+    int launch_num_experts,
     int expected_m,
     int a_expert_stride,
+    int c_expert_stride,
     int num_experts,
     int moe_block_size,
     int prob_m,
     int prob_n,
     int prob_k,
+    bool is_w13_stage,
     void* workspace,
     host::ScalarType const& q_type,
     bool has_bias,
@@ -1085,6 +1377,10 @@ void marlin_direct_mm(
   const int4* zp_ptr = (const int4*)zp;
   const int* g_idx_ptr = (const int*)g_idx;
   const int32_t* masked_m_ptr = (const int32_t*)masked_m;
+  const int32_t* active_expert_ids_ptr =
+      active_expert_ids == nullptr ? nullptr : (const int32_t*)active_expert_ids;
+  const int32_t* active_expert_count_ptr =
+      active_expert_count == nullptr ? nullptr : (const int32_t*)active_expert_count;
   int* locks = (int*)workspace;
 
   int max_shared_mem = 0;
@@ -1099,31 +1395,177 @@ void marlin_direct_mm(
     host::RuntimeCheck(prob_n % thread_n == 0, "prob_n = ", prob_n, " is not divisible by thread_n = ", thread_n);
     host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
   } else {
-    exec_cfg = determine_exec_config<scalar_t>(
-        q_type,
-        logical_m,
-        prob_n,
-        prob_k,
-        thread_m_blocks,
-        m_block_size_8,
-        num_bits,
-        group_size,
-        false,
-        is_k_full,
-        has_zp,
-        is_zp_float,
-        max_shared_mem);
+    if (!try_determine_small_m_direct_exec_config<scalar_t>(
+            q_type,
+            logical_m,
+            prob_n,
+            prob_k,
+            is_w13_stage,
+            thread_m_blocks,
+            m_block_size_8,
+            num_bits,
+            group_size,
+            is_k_full,
+            has_zp,
+            is_zp_float,
+            max_shared_mem,
+            sms,
+            &exec_cfg)) {
+      exec_cfg = determine_direct_exec_config<scalar_t>(
+          q_type,
+          logical_m,
+          prob_n,
+          prob_k,
+          thread_m_blocks,
+          m_block_size_8,
+          num_bits,
+          group_size,
+          is_k_full,
+          has_zp,
+          is_zp_float,
+          max_shared_mem);
+    }
     thread_tfg = exec_cfg.tb_cfg;
   }
 
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+  int n_tiles = prob_n / 16 / thread_n_blocks;
+  const int y_launch_blocks =
+      active_expert_ids_ptr == nullptr ? num_experts : max(min(launch_num_experts, num_experts), 1);
+  if (thread_m_blocks == 1) {
+    exec_cfg.blocks_per_sm = limit_direct_blocks_per_sm_for_lock_avoidance(
+        exec_cfg.blocks_per_sm,
+        logical_m,
+        prob_n,
+        thread_n,
+        moe_block_size,
+        sms);
+  }
+
   int blocks = sms * exec_cfg.blocks_per_sm;
   if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
-  int thread_k_blocks = thread_k / 16;
-  int thread_n_blocks = thread_n / 16;
+  bool tensor_map_b_ready = false;
+  bool tensor_map_s_ready = false;
+  device::marlin_moe::tma::LocalTensorMapDesc tensor_map_b_desc{};
+  device::marlin_moe::tma::LocalTensorMapDesc tensor_map_s_desc{};
+#if SGLANG_MARLIN_MOE_HAS_LOCAL_TMA
+  const int pack_factor = 32 / num_bits;
+  const int b_sh_stride = ((thread_n * 16 / pack_factor) / 4);
+  const int b_tma_landing_inner = b_sh_stride * 4;
+  const int b_tma_landing_outer = thread_k_blocks;
+  const size_t b_tma_barrier_bytes = sizeof(device::marlin_moe::tma::Barrier) * device::marlin::pipe_stages;
+  const bool b_tma_has_barrier_space =
+      b_tma_barrier_bytes <= 2 * static_cast<size_t>(moe_block_size) * sizeof(int4);
+  const int scale_tma_group_blocks = num_groups > 1 ? group_size / 16 : -1;
+  if (thread_m_blocks == 1 && !has_act_order) {
+    const DLDataType b_tensor_map_dtype = {.code = DLDataTypeCode::kDLInt, .bits = 32, .lanes = 1};
+    const int b_gmem_inner_dim = prob_n * 16 / pack_factor;
+    const int b_gmem_outer_dim = num_experts * (prob_k / 16);
+    const int b_gmem_outer_stride = b_gmem_inner_dim;
+    const int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
+    const int b_smem_inner_dim = b_sh_stride * 4;
+    const int b_smem_outer_dim = thread_k_blocks;
+    const int b_inner_tile = b_smem_inner_dim;
+    const int b_outer_tile = b_smem_outer_dim;
+    const int expert_outer_dim = prob_k / 16;
+    host::RuntimeCheck(
+        b_inner_tile <= b_gmem_inner_dim,
+        "B-TMA inner tile exceeds gmem inner dim: b_inner_tile=",
+        b_inner_tile,
+        ", b_gmem_inner_dim=",
+        b_gmem_inner_dim,
+        ", prob_n=",
+        prob_n);
+    host::RuntimeCheck(
+        b_outer_tile <= expert_outer_dim,
+        "B-TMA outer tile exceeds expert outer dim: b_outer_tile=",
+        b_outer_tile,
+        ", expert_outer_dim=",
+        expert_outer_dim,
+        ", thread_k=",
+        thread_k,
+        ", prob_k=",
+        prob_k);
+    tensor_map_b_ready = device::marlin_moe::tma::make_tensor_map_2d_desc(
+        &tensor_map_b_desc,
+        B,
+        b_tensor_map_dtype,
+        b_gmem_inner_dim,
+        b_gmem_outer_dim,
+        b_smem_inner_dim,
+        b_smem_outer_dim,
+        b_gmem_outer_stride,
+        0);
+    host::RuntimeCheck(
+        tensor_map_b_ready,
+        "B-TMA descriptor encode failed: prob_n=",
+        prob_n,
+        ", prob_k=",
+        prob_k,
+        ", thread_n=",
+        thread_n,
+        ", thread_k=",
+        thread_k);
+    if (scale_tma_group_blocks != -1) {
+      const DLDataType s_tensor_map_dtype = {.code = DLDataTypeCode::kDLInt, .bits = 32, .lanes = 1};
+      const int s_gl_stride = prob_n / 8;
+      const int scales_expert_stride = prob_n * prob_k / group_size / (q_type == host::kFE2M1f ? 16 : 8);
+      const int s_outer_dim_per_expert = scales_expert_stride / s_gl_stride;
+      const int s_sh_stride = (16 * thread_n_blocks) / 8;
+      const int s_tb_groups = scale_tma_group_blocks >= thread_k_blocks
+                                  ? 1
+                                  : thread_k_blocks / scale_tma_group_blocks / (q_type == host::kFE2M1f ? 2 : 1);
+      const int s_gmem_inner_dim = s_gl_stride * 4;
+      const int s_gmem_outer_dim = num_experts * s_outer_dim_per_expert;
+      const int s_gmem_outer_stride = s_gmem_inner_dim;
+      const int s_smem_inner_dim = s_sh_stride * 4;
+      const int s_smem_outer_dim = s_tb_groups;
+      host::RuntimeCheck(
+          s_smem_outer_dim <= s_outer_dim_per_expert,
+          "S-TMA outer tile exceeds expert outer dim: s_smem_outer_dim=",
+          s_smem_outer_dim,
+          ", s_outer_dim_per_expert=",
+          s_outer_dim_per_expert,
+          ", num_groups=",
+          num_groups,
+          ", group_size=",
+          group_size);
+      tensor_map_s_ready = device::marlin_moe::tma::make_tensor_map_2d_desc(
+          &tensor_map_s_desc,
+          s,
+          s_tensor_map_dtype,
+          s_gmem_inner_dim,
+          s_gmem_outer_dim,
+          s_smem_inner_dim,
+          s_smem_outer_dim,
+          s_gmem_outer_stride,
+          0);
+      host::RuntimeCheck(
+          tensor_map_s_ready,
+          "S-TMA descriptor encode failed: prob_n=",
+          prob_n,
+          ", prob_k=",
+          prob_k,
+          ", thread_n=",
+          thread_n,
+          ", thread_k=",
+          thread_k,
+          ", num_groups=",
+          num_groups);
+    }
+  }
+#endif
+
+  const int parallel = div_ceil(logical_m, moe_block_size);
+  const int max_no_split_blocks = max(parallel * n_tiles, 1);
+  if (thread_m_blocks == 1 && logical_m <= 32) {
+    blocks = min(blocks, max_no_split_blocks);
+  }
 
   host::RuntimeCheck(
       is_valid_config(
@@ -1177,7 +1619,7 @@ void marlin_direct_mm(
   }
 
   host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem));
-  dim3 grid(blocks, num_experts);
+  dim3 grid(blocks, y_launch_blocks);
   kernel<<<grid, num_threads, max_shared_mem, stream>>>(
       A_ptr,
       B_ptr,
@@ -1189,8 +1631,15 @@ void marlin_direct_mm(
       zp_ptr,
       g_idx_ptr,
       masked_m_ptr,
+      active_expert_ids_ptr,
+      active_expert_count_ptr,
+      tensor_map_b_desc,
+      tensor_map_b_ready,
+      tensor_map_s_desc,
+      tensor_map_s_ready,
       expected_m,
       a_expert_stride,
+      c_expert_stride,
       num_groups,
       prob_m,
       prob_n,
@@ -1200,6 +1649,7 @@ void marlin_direct_mm(
       use_atomic_add,
       use_fp32_reduce,
       max_shared_mem);
+  host::RuntimeDeviceCheck(cudaPeekAtLastError());
 }
 
 #endif
@@ -1712,6 +2162,9 @@ void deepep_moe_wna16_marlin_direct_gemm(
     tvm::ffi::TensorView global_scale,
     tvm::ffi::TensorView b_zeros,
     tvm::ffi::TensorView g_idx,
+    tvm::ffi::TensorView active_expert_ids,
+    tvm::ffi::TensorView active_expert_count,
+    int64_t launch_num_experts,
     tvm::ffi::TensorView workspace,
     tvm::ffi::TensorView masked_m,
     int64_t expected_m,
@@ -1722,6 +2175,7 @@ void deepep_moe_wna16_marlin_direct_gemm(
     int64_t size_m,
     int64_t size_n,
     int64_t size_k,
+    bool is_w13_stage,
     bool has_bias,
     bool is_k_full,
     bool has_zp,
@@ -1738,6 +2192,16 @@ void deepep_moe_wna16_marlin_direct_gemm(
   RuntimeCheck(a.dim() == 3, "a rank = ", a.dim(), " is not 3");
   RuntimeCheck(c.dim() == 3, "c rank = ", c.dim(), " is not 3");
   RuntimeCheck(masked_m.dim() == 1, "masked_m rank = ", masked_m.dim(), " is not 1");
+  RuntimeCheck(
+      active_expert_ids.dim() == 1,
+      "active_expert_ids rank = ",
+      active_expert_ids.dim(),
+      " is not 1");
+  RuntimeCheck(
+      active_expert_count.dim() == 1,
+      "active_expert_count rank = ",
+      active_expert_count.dim(),
+      " is not 1");
   RuntimeCheck(expected_m == -1 || expected_m > 0, "expected_m must be -1 or positive");
   RuntimeCheck(a.size(0) == num_experts, "a.size(0) mismatch");
   RuntimeCheck(c.size(0) == num_experts, "c.size(0) mismatch");
@@ -1764,20 +2228,26 @@ void deepep_moe_wna16_marlin_direct_gemm(
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
   device.verify(a.device());
-  TensorMatcher({-1, -1, -1}).with_dtype<scalar_t>().with_device(device).verify(c);
+  device.verify(c.device());
   device.verify(b_q_weight.device());
   device.verify(b_scales.device());
   device.verify(workspace.device());
   device.verify(masked_m.device());
+  device.verify(active_expert_ids.device());
+  device.verify(active_expert_count.device());
   device.verify(c_tmp.device());
   RuntimeCheck(
       a.stride(2) == 1 && a.stride(1) == size_k,
       "a must be contiguous within each expert tile");
-  RuntimeCheck(c.is_contiguous(), "c is not contiguous");
+  RuntimeCheck(
+      c.stride(2) == 1 && c.stride(1) == size_n,
+      "c must be contiguous within each expert tile");
   RuntimeCheck(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
   RuntimeCheck(b_scales.is_contiguous(), "b_scales is not contiguous");
   RuntimeCheck(workspace.is_contiguous(), "workspace is not contiguous");
   RuntimeCheck(masked_m.is_contiguous(), "masked_m is not contiguous");
+  RuntimeCheck(active_expert_ids.is_contiguous(), "active_expert_ids is not contiguous");
+  RuntimeCheck(active_expert_count.is_contiguous(), "active_expert_count is not contiguous");
   RuntimeCheck(c_tmp.is_contiguous(), "c_tmp is not contiguous");
 
   if (has_bias) {
@@ -1798,6 +2268,15 @@ void deepep_moe_wna16_marlin_direct_gemm(
     RuntimeCheck(g_idx.is_contiguous(), "g_idx is not contiguous");
   }
 
+  if (active_expert_ids.size(0) > 0) {
+    RuntimeCheck(
+        active_expert_ids.size(0) <= num_experts,
+        "active_expert_ids.size(0) exceeds num_experts");
+  }
+  if (active_expert_count.size(0) > 0) {
+    RuntimeCheck(active_expert_count.size(0) == 1, "active_expert_count.size(0) must be 1");
+  }
+
   int thread_k = -1;
   int thread_n = -1;
   int sms = -1;
@@ -1805,12 +2284,24 @@ void deepep_moe_wna16_marlin_direct_gemm(
   int dev = dl_device.device_id;
   cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  int64_t min_direct_workspace_size =
+      static_cast<int64_t>(num_experts) * (static_cast<int64_t>(sms) * 4 + 1);
+  RuntimeCheck(
+      workspace.size(0) >= min_direct_workspace_size,
+      "workspace.numel = ",
+      workspace.size(0),
+      " is below min_direct_workspace_size = ",
+      min_direct_workspace_size);
 
   constexpr int scalar_per_int4 = sizeof(int4) / sizeof(scalar_t);
   RuntimeCheck(
       a.stride(0) % scalar_per_int4 == 0,
       "a.stride(0) must align with int4 packing");
   int a_expert_stride = static_cast<int>(a.stride(0) / scalar_per_int4);
+  RuntimeCheck(
+      c.stride(0) % scalar_per_int4 == 0,
+      "c.stride(0) must align with int4 packing");
+  int c_expert_stride = static_cast<int>(c.stride(0) / scalar_per_int4);
 
   if (size_m == 0 || num_experts == 0) return;
 
@@ -1825,13 +2316,18 @@ void deepep_moe_wna16_marlin_direct_gemm(
       b_zeros.data_ptr(),
       g_idx.data_ptr(),
       masked_m.data_ptr(),
+      active_expert_ids.size(0) == 0 ? nullptr : active_expert_ids.data_ptr(),
+      active_expert_count.size(0) == 0 ? nullptr : active_expert_count.data_ptr(),
+      static_cast<int>(launch_num_experts),
       static_cast<int>(expected_m),
       a_expert_stride,
+      c_expert_stride,
       static_cast<int>(num_experts),
       static_cast<int>(moe_block_size),
       static_cast<int>(size_m),
       static_cast<int>(size_n),
       static_cast<int>(size_k),
+      is_w13_stage,
       workspace.data_ptr(),
       b_q_type,
       has_bias,
