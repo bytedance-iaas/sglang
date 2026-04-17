@@ -35,6 +35,7 @@ jobs:
       ALL_PROXY: http://100.68.162.211:3128
       NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: x64-docker-build-node
