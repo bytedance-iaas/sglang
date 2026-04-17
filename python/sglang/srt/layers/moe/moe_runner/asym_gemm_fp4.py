@@ -183,9 +183,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             runner_input.experts,
             runner_input.list_size,
         )
-        torch.cuda.synchronize()
-        print(f"[FP4-DEBUG] gateup_output: min={gateup_output.min().item()}, max={gateup_output.max().item()}, "
-              f"nan={torch.isnan(gateup_output).any().item()}, inf={torch.isinf(gateup_output).any().item()}")
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -198,13 +195,10 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         )
         silu_and_mul(gateup_output.view(-1, w13_n), down_in_bf16)
         del gateup_output
-        print(f"[FP4-DEBUG] down_in_bf16: min={down_in_bf16.min().item()}, max={down_in_bf16.max().item()}, "
-              f"nan={torch.isnan(down_in_bf16).any().item()}, inf={torch.isinf(down_in_bf16).any().item()}")
 
         # Re-quantize activations to NVFP4 for the down-projection GEMM.
         down_in_fp4, down_in_scale = _quantize_bf16_to_nvfp4_e4m3(down_in_bf16)
         del down_in_bf16
-        print(f"[FP4-DEBUG] down_in_fp4 shape={down_in_fp4.shape}, down_in_scale shape={down_in_scale.shape}")
 
         down_output = torch.empty(
             (all_tokens, K),
@@ -219,9 +213,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             runner_input.experts,
             runner_input.list_size,
         )
-        torch.cuda.synchronize()
-        print(f"[FP4-DEBUG] down_output: min={down_output.min().item()}, max={down_output.max().item()}, "
-              f"nan={torch.isnan(down_output).any().item()}, inf={torch.isinf(down_output).any().item()}")
 
         return down_output
 
