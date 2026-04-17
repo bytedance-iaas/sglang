@@ -23,7 +23,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=400, suite="stage-b-test-2-gpu-large")
 
 
-@unittest.skip("Disaggregation accuracy suite is unstable in PR UT")
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
