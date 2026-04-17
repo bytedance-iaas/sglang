@@ -43,6 +43,28 @@ mark_step_done() {
     _CI_MARK_PREV=${now}
 }
 
+retry_eval() {
+    local label="$1"
+    local cmd="$2"
+    local max_attempts="${3:-3}"
+    local attempt=1
+
+    while [ "${attempt}" -le "${max_attempts}" ]; do
+        echo "Attempt ${attempt}/${max_attempts}: ${label}"
+        if eval "${cmd}"; then
+            return 0
+        fi
+        if [ "${attempt}" -ge "${max_attempts}" ]; then
+            break
+        fi
+        sleep $((attempt * 5))
+        attempt=$((attempt + 1))
+    done
+
+    echo "ERROR: ${label} failed after ${max_attempts} attempts"
+    return 1
+}
+
 mark_step_done "Configuration"
 
 # ------------------------------------------------------------------------------
@@ -266,7 +288,11 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 source "$(dirname "$0")/cache_nvidia_wheels.sh"
-$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+MAIN_INSTALL_CMD="$PIP_CMD install -e \"python[${EXTRAS}]\" $PIP_INSTALL_SUFFIX"
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    MAIN_INSTALL_CMD="$MAIN_INSTALL_CMD --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}"
+fi
+retry_eval "Install main package" "$MAIN_INSTALL_CMD"
 
 mark_step_done "Install main package"
 
@@ -374,7 +400,9 @@ if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
     TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     echo "Reinstalling torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${TORCH_CUDA_VER} index to match torch..."
-    $PIP_CMD install "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    retry_eval \
+        "Reinstall torchaudio/torchvision from ${TORCH_CUDA_VER} index" \
+        "$PIP_CMD install \"torchaudio==${TORCHAUDIO_VER}\" \"torchvision==${TORCHVISION_VER}\" --index-url https://download.pytorch.org/whl/${TORCH_CUDA_VER} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX"
 fi
 
 # Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
