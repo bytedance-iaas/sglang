@@ -2781,7 +2781,9 @@ class Scheduler(
             kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
             if kv_mgr is not None and getattr(kv_mgr, "is_support_async", False):
                 eligible_reqs = [
-                    req for req in batch.reqs if req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+                    req
+                    for req in batch.reqs
+                    if req.bootstrap_host != FAKE_BOOTSTRAP_HOST
                 ]
                 if eligible_reqs and all(
                     req.start_send_idx == 0 and req.is_chunked <= 0

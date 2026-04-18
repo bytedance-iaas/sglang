@@ -276,10 +276,10 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
 
-
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------
+
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
