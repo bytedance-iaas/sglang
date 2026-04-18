@@ -2461,6 +2461,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+
         if lora_ids is not None:
             self.lora_manager.prepare_lora_batch(forward_batch)
 

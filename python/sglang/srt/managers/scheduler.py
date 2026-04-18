@@ -2835,8 +2835,14 @@ class Scheduler(
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
+
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
+
+                    # batch.spec_info = EagleDraftInput(
+                    #     future_indices=future_indices,
+                    #     verify_done=batch_result.next_draft_input.verify_done,
+                    # )
 
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
