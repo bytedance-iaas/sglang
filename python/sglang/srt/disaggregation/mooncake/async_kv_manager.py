@@ -36,17 +36,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
 
 
-_async_context = threading.local() 
-
-
-def set_layer_ready_callback(callback: Optional[Callable[[int], None]]) -> None:
-    _async_context.layer_ready_callback = callback
-
-
-def get_layer_ready_callback() -> Optional[Callable[[int], None]]:
-    return getattr(_async_context, "layer_ready_callback", None)
-
-
 @dataclasses.dataclass
 class TransferKVChunkSet:
     rooms: Tuple[int] = dataclasses.field(default_factory=tuple)
@@ -998,7 +987,10 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         return True
 
     def transfer_worker(
-        self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
+        self,
+        queue: FastQueue,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        staging_buffer=None,
     ):
         while True:
             try:
