@@ -195,11 +195,6 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        self._transfer_debug = os.getenv("SGLANG_KV_TRANSFER_DEBUG", "0") == "1"
-        self._transfer_debug_max_rooms = int(
-            os.getenv("SGLANG_KV_TRANSFER_DEBUG_MAX_ROOMS", "8")
-        )
-        self._room_transfer_debug_info: dict[int, dict[str, object]] = {}
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -284,105 +279,6 @@ class MooncakeKVManager(CommonKVManager):
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------
-
-    def _should_debug_room(self, room: int) -> bool:
-        return self._transfer_debug and (
-            room in self._room_transfer_debug_info
-            or len(self._room_transfer_debug_info) < self._transfer_debug_max_rooms
-        )
-
-    def _get_room_transfer_debug_info(self, room: int) -> dict[str, object]:
-        return self._room_transfer_debug_info.setdefault(room, {})
-
-    def _record_transfer_call(
-        self,
-        room: Optional[int],
-        tag: str,
-        transfer_blocks: list[tuple[int, int, int]],
-        duration_ms: float,
-        status: int,
-        layer_id: Optional[int] = None,
-        mooncake_session_id: Optional[str] = None,
-        bytes_sent: Optional[int] = None,
-        block_count: Optional[int] = None,
-    ) -> None:
-        if room is None or not self._should_debug_room(room):
-            return
-        info = self._get_room_transfer_debug_info(room)
-        now = time.time()
-        call_count = int(info.get("call_count", 0)) + 1
-        if bytes_sent is None:
-            bytes_sent = int(sum(length for _, _, length in transfer_blocks))
-        if block_count is None:
-            block_count = len(transfer_blocks)
-        start_ts = now - duration_ms / 1000.0
-        info["call_count"] = call_count
-        info["total_bytes"] = int(info.get("total_bytes", 0)) + bytes_sent
-        info["total_blocks"] = int(info.get("total_blocks", 0)) + block_count
-        info["sum_call_ms"] = float(info.get("sum_call_ms", 0.0)) + duration_ms
-        info["max_call_ms"] = max(float(info.get("max_call_ms", 0.0)), duration_ms)
-        info["last_call_tag"] = tag
-        info["last_call_status"] = status
-        info["last_call_ms"] = duration_ms
-        info["last_call_bytes"] = bytes_sent
-        info["last_call_blocks"] = block_count
-        if "first_transfer_start_ts" not in info:
-            info["first_transfer_start_ts"] = start_ts
-        info["last_transfer_end_ts"] = now
-        if layer_id is not None and "first_layer_transfer_ms" not in info:
-            info["first_layer_transfer_ms"] = duration_ms
-            info["first_layer_id"] = layer_id
-            info["first_layer_tag"] = tag
-        if status != 0:
-            info["failed_call_count"] = int(info.get("failed_call_count", 0)) + 1
-        if call_count <= 4 or status != 0:
-            logger.info(
-                "kv transfer debug room=%s call=%s tag=%s layer=%s blocks=%s bytes=%s duration_ms=%.3f status=%s session=%s",
-                room,
-                call_count,
-                tag,
-                layer_id if layer_id is not None else "na",
-                block_count,
-                bytes_sent,
-                duration_ms,
-                status,
-                mooncake_session_id if mooncake_session_id is not None else "na",
-            )
-
-    def log_room_transfer_summary(self, room: int, stage: str) -> None:
-        if not self._should_debug_room(room):
-            return
-        info = self._room_transfer_debug_info.get(room)
-        if not info:
-            return
-        first_start_ts = info.get("first_transfer_start_ts")
-        last_end_ts = info.get("last_transfer_end_ts")
-        wall_ms = (
-            (float(last_end_ts) - float(first_start_ts)) * 1000.0
-            if first_start_ts is not None and last_end_ts is not None
-            else None
-        )
-        logger.info(
-            "kv transfer debug room=%s summary stage=%s calls=%s blocks=%s bytes=%s sum_call_ms=%.3f wall_ms=%s max_call_ms=%.3f first_layer_id=%s first_layer_tag=%s first_layer_ms=%s failed_calls=%s",
-            room,
-            stage,
-            int(info.get("call_count", 0)),
-            int(info.get("total_blocks", 0)),
-            int(info.get("total_bytes", 0)),
-            float(info.get("sum_call_ms", 0.0)),
-            f"{wall_ms:.3f}" if wall_ms is not None else "na",
-            float(info.get("max_call_ms", 0.0)),
-            info.get("first_layer_id", "na"),
-            info.get("first_layer_tag", "na"),
-            f'{float(info["first_layer_transfer_ms"]):.3f}'
-            if info.get("first_layer_transfer_ms") is not None
-            else "na",
-            int(info.get("failed_call_count", 0)),
-        )
-
-    def cleanup_room_transfer_debug(self, room: int) -> None:
-        self._room_transfer_debug_info.pop(room, None)
-
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
@@ -495,7 +391,6 @@ class MooncakeKVManager(CommonKVManager):
         executor,
         queue,
         prefill_unique_rank,
-        room: Optional[int] = None,
     ):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
@@ -541,7 +436,6 @@ class MooncakeKVManager(CommonKVManager):
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
                 executor,
-                room=room,
             )
         elif ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
@@ -672,32 +566,14 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
-    def _transfer_data(
-        self,
-        mooncake_session_id,
-        transfer_blocks,
-        room: Optional[int] = None,
-        tag: str = "generic",
-        layer_id: Optional[int] = None,
-    ):
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
 
-        start = time.time()
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        status = self.engine.batch_transfer_sync(
+        return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
-        self._record_transfer_call(
-            room=room,
-            tag=tag,
-            transfer_blocks=transfer_blocks,
-            duration_ms=(time.time() - start) * 1000.0,
-            status=status,
-            layer_id=layer_id,
-            mooncake_session_id=mooncake_session_id,
-        )
-        return status
 
     def _send_kvcache_generic(
         self,
@@ -708,7 +584,6 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
-        room: Optional[int] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -775,40 +650,26 @@ class MooncakeKVManager(CommonKVManager):
             return transfer_blocks
 
         # Worker function for processing a single layer
-        def process_layer(
-            layer_idx: int, src_ptr: int, dst_ptr: int, item_len: int
-        ) -> int:
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(
-                mooncake_session_id,
-                transfer_blocks,
-                room=room,
-                tag="sync_kv_layer",
-                layer_id=layer_idx,
-            )
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(
-                mooncake_session_id,
-                transfer_blocks,
-                room=room,
-                tag="sync_kv_batch",
-            )
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
                     process_layer,
-                    layer_idx,
                     src_ptr,
                     dst_ptr,
                     item_len,
                 )
-                for layer_idx, (src_ptr, dst_ptr, item_len) in enumerate(layers_params)
+                for (src_ptr, dst_ptr, item_len) in layers_params
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -829,7 +690,6 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
-        room: Optional[int] = None,
     ):
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
@@ -839,7 +699,6 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
-            room=room,
         )
 
     def send_kvcache_hisparse(
@@ -895,7 +754,6 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
-        room: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -973,7 +831,7 @@ class MooncakeKVManager(CommonKVManager):
             tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
         )
 
-        def process_layer_tp_aware(layer_idx, src_layer_ptr, dst_layer_ptr):
+        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
             src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
@@ -986,36 +844,18 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            start = time.time()
-            status = self.engine.batch_transfer_sync(
+            return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
-            self._record_transfer_call(
-                room=room,
-                tag="sync_kv_slice_layer",
-                transfer_blocks=[],
-                duration_ms=(time.time() - start) * 1000.0,
-                status=status,
-                layer_id=layer_idx,
-                mooncake_session_id=mooncake_session_id,
-                bytes_sent=heads_bytes_per_token_to_send * total_slices,
-                block_count=total_slices,
-            )
-            return status
 
         futures = []
         for i in range(layers_current_pp_stage):
             futures.append(
-                executor.submit(process_layer_tp_aware, i, src_k_ptrs[i], dst_k_ptrs[i])
+                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
             )
         for i in range(layers_current_pp_stage):
             futures.append(
-                executor.submit(
-                    process_layer_tp_aware,
-                    layers_current_pp_stage + i,
-                    src_v_ptrs[i],
-                    dst_v_ptrs[i],
-                )
+                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
         for future in concurrent.futures.as_completed(futures):
@@ -1032,13 +872,12 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
-        room: Optional[int] = None,
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
             self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
         ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get():
-            return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs, room=room)
+            return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         transfer_blocks = []
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
@@ -1050,19 +889,13 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
-        return self._transfer_data(
-            req.mooncake_session_id,
-            transfer_blocks,
-            room=room,
-            tag="sync_aux",
-        )
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def send_aux_tcp(
         self,
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
-        room: Optional[int] = None,
     ):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
@@ -1133,7 +966,6 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_data_ptrs: list[int],
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
-        room: Optional[int] = None,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
@@ -1152,14 +984,12 @@ class MooncakeKVManager(CommonKVManager):
                     target_rank_registration_info.dst_state_dim_per_tensor,
                     target_rank_registration_info.dst_tp_rank,
                     target_rank_registration_info.dst_attn_tp_size,
-                    room=room,
                 )
             else:
                 return self._send_mamba_state(
                     req,
                     prefill_state_indices,
                     dst_state_data_ptrs,
-                    room=room,
                 )
         elif state_type in ["swa", "nsa"]:
             # SWA and NSA hybrid models do not support different TP sizes yet
@@ -1189,7 +1019,6 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_data_indices=prefill_state_indices,
                 dst_data_indices=dst_state_indices,
                 executor=executor,
-                room=room,
             )
         else:
             return 0
@@ -1199,7 +1028,6 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_mamba_index: list[int],
         dst_state_data_ptrs: list[int],
-        room: Optional[int] = None,
     ):
         """Transfer Mamba states."""
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
@@ -1214,12 +1042,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr = dst_state_ptr + length * int(req.dst_state_indices[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
-        return self._transfer_data(
-            req.mooncake_session_id,
-            transfer_blocks,
-            room=room,
-            tag="sync_mamba_state",
-        )
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def _send_mamba_state_slice(
         self,
@@ -1230,7 +1053,6 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_dim_per_tensor: list[int],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
-        room: Optional[int] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1255,9 +1077,7 @@ class MooncakeKVManager(CommonKVManager):
 
         # If no dimension info available, fall back to regular transfer
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
-            return self._send_mamba_state(
-                req, prefill_mamba_index, dst_state_data_ptrs, room=room
-            )
+            return self._send_mamba_state(req, prefill_mamba_index, dst_state_data_ptrs)
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
@@ -1308,12 +1128,7 @@ class MooncakeKVManager(CommonKVManager):
 
             transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
-        return self._transfer_data(
-            req.mooncake_session_id,
-            transfer_blocks,
-            room=room,
-            tag="sync_mamba_state_slice",
-        )
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
@@ -1431,7 +1246,6 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 queue,
                                 prefill_unique_rank,
-                                room=kv_chunk.room,
                             )
                             if deferred:
                                 staging_deferred = True
@@ -1447,7 +1261,6 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
-                                room=kv_chunk.room,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -1464,7 +1277,6 @@ class MooncakeKVManager(CommonKVManager):
                                 f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self.log_room_transfer_summary(kv_chunk.room, "sync_failed")
                             self.sync_status_to_decode_endpoint(
                                 req.endpoint,
                                 req.dst_port,
@@ -1482,7 +1294,6 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_state_data_ptrs,
                                     executor,
                                     target_rank_registration_info,
-                                    room=kv_chunk.room,
                                 )
 
                             # Only the last chunk we need to send the aux data
@@ -1490,7 +1301,6 @@ class MooncakeKVManager(CommonKVManager):
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
-                                room=kv_chunk.room,
                             )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
@@ -1501,7 +1311,6 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
-                                self.log_room_transfer_summary(req.room, "sync_complete")
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -1515,7 +1324,6 @@ class MooncakeKVManager(CommonKVManager):
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
-                            self.log_room_transfer_summary(req.room, "sync_dummy_complete")
 
                 if staging_deferred:
                     continue
@@ -1526,8 +1334,6 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
-                    if self.check_status(kv_chunk.room) in (KVPoll.Success, KVPoll.Failed):
-                        self.cleanup_room_transfer_debug(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free

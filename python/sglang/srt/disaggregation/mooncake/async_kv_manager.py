@@ -209,8 +209,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         prefill_kv_blocks: npt.NDArray[np.int64],
         dst_kv_blocks: npt.NDArray[np.int64],
         item_len: int,
-        room_id: Optional[int] = None,
-        layer_id: Optional[int] = None,
     ) -> int:
         prefill_kv_blocks_tmp, dst_kv_blocks_tmp = cached_group_concurrent_contiguous(
             prefill_kv_blocks, dst_kv_blocks
@@ -225,13 +223,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             dst_addr = dst_ptr + int(decode_index[0]) * item_len
             length = item_len * len(prefill_index)
             transfer_blocks.append((src_addr, dst_addr, length))
-        return self._transfer_data(
-            session_id,
-            transfer_blocks,
-            room=room_id,
-            tag="async_kv_layer",
-            layer_id=layer_id,
-        )
+        return self._transfer_data(session_id, transfer_blocks)
 
     def _put_kv_cache_internal(self, async_info: AsyncInfo):
         kv_chunk_info = async_info.kv_chunk_info
@@ -309,14 +301,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             dst_ptr = dst_ptrs[layer_id]
                             item_len = self.kv_args.kv_item_lens[layer_id]
                             status = self.submit_layer(
-                                session_id,
-                                src_ptr,
-                                dst_ptr,
-                                kv_indice,
-                                dst,
-                                item_len,
-                                room_id=room_id,
-                                layer_id=layer_id,
+                                session_id, src_ptr, dst_ptr, kv_indice, dst, item_len
                             )
                             if status != 0:
                                 logger.warning(
@@ -371,11 +356,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 dst_state_idx
                             )
                             status = self._transfer_data(
-                                session_id,
-                                [(src_addr, dst_addr, item_len)],
-                                room=room_id,
-                                tag="async_state_layer",
-                                layer_id=layer_id,
+                                session_id, [(src_addr, dst_addr, item_len)]
                             )
 
                         with self._lock:
@@ -798,7 +779,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             self._tensor_ntensors_total,
                         )
                     if self._should_debug_room(rid):
-                        self.log_room_transfer_summary(rid, "async_flush_done")
                         debug_info = self._get_room_debug_info(rid)
                         finish_ts = time.time()
                         debug_info["flush_finish_ts"] = finish_ts
@@ -827,7 +807,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             for k in keys_to_remove:
                                 self._mamba_layer_ready_events.pop(k, None)
                     self._cleanup_room_debug_info(rid)
-                    self.cleanup_room_transfer_debug(rid)
             self._req_begin_count.pop(rid, None)
 
     def prepare_batch(self, sch: "Scheduler", batch: "ScheduleBatch"):
