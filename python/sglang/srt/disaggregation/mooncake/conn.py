@@ -59,8 +59,6 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
-    enqueue_ts: float
-    shard_idx: int
 
 
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -351,24 +349,6 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id if mooncake_session_id is not None else "na",
             )
 
-    def _record_queue_wait(
-        self,
-        room: int,
-        shard_idx: int,
-        queue_wait_ms: float,
-        executor_max_workers: int,
-    ) -> None:
-        if not self._should_debug_room(room):
-            return
-        info = self._get_room_transfer_debug_info(room)
-        info["queue_shard_idx"] = shard_idx
-        info["executor_max_workers"] = executor_max_workers
-        info["queue_wait_sample_count"] = int(info.get("queue_wait_sample_count", 0)) + 1
-        info["queue_wait_sum_ms"] = float(info.get("queue_wait_sum_ms", 0.0)) + queue_wait_ms
-        info["queue_wait_max_ms"] = max(
-            float(info.get("queue_wait_max_ms", 0.0)), queue_wait_ms
-        )
-
     def log_room_transfer_summary(self, room: int, stage: str) -> None:
         if not self._should_debug_room(room):
             return
@@ -383,7 +363,7 @@ class MooncakeKVManager(CommonKVManager):
             else None
         )
         logger.info(
-            "kv transfer debug room=%s summary stage=%s calls=%s blocks=%s bytes=%s sum_call_ms=%.3f wall_ms=%s max_call_ms=%.3f first_layer_id=%s first_layer_tag=%s first_layer_ms=%s failed_calls=%s queue_shard=%s executor_workers=%s queue_wait_samples=%s queue_wait_sum_ms=%.3f queue_wait_max_ms=%.3f",
+            "kv transfer debug room=%s summary stage=%s calls=%s blocks=%s bytes=%s sum_call_ms=%.3f wall_ms=%s max_call_ms=%.3f first_layer_id=%s first_layer_tag=%s first_layer_ms=%s failed_calls=%s",
             room,
             stage,
             int(info.get("call_count", 0)),
@@ -398,11 +378,6 @@ class MooncakeKVManager(CommonKVManager):
             if info.get("first_layer_transfer_ms") is not None
             else "na",
             int(info.get("failed_call_count", 0)),
-            info.get("queue_shard_idx", "na"),
-            info.get("executor_max_workers", "na"),
-            int(info.get("queue_wait_sample_count", 0)),
-            float(info.get("queue_wait_sum_ms", 0.0)),
-            float(info.get("queue_wait_max_ms", 0.0)),
         )
 
     def cleanup_room_transfer_debug(self, room: int) -> None:
@@ -1363,13 +1338,6 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                queue_wait_ms = max(0.0, (time.time() - kv_chunk.enqueue_ts) * 1000.0)
-                self._record_queue_wait(
-                    room=kv_chunk.room,
-                    shard_idx=kv_chunk.shard_idx,
-                    queue_wait_ms=queue_wait_ms,
-                    executor_max_workers=getattr(executor, "_max_workers", -1),
-                )
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1818,8 +1786,6 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
-                enqueue_ts=time.time(),
-                shard_idx=shard_idx,
             )
         )
 
