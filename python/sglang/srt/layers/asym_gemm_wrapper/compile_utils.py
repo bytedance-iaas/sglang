@@ -408,17 +408,6 @@ class _GroupedContFp4WarmupExecutor(_BaseWarmupExecutor):
         lhs_q, lhs_s = self.lhs_q[:m], self.lhs_s[:m]
         rhs_q, rhs_s = self.rhs_q, self.rhs_s
         out = self.out[:m]
-        logger.info(
-            "m_grouped_fp4_asym_gemm_nt_contiguous param dtypes: "
-            "lhs_q=%s (shape=%s), lhs_s=%s (shape=%s), "
-            "rhs_q=%s (shape=%s), rhs_s=%s (shape=%s), "
-            "out=%s (shape=%s), offsets=%s (shape=%s), "
-            "experts=%s (shape=%s), list_size=%s (shape=%s)",
-            lhs_q.dtype, lhs_q.shape, lhs_s.dtype, lhs_s.shape,
-            rhs_q.dtype, rhs_q.shape, rhs_s.dtype, rhs_s.shape,
-            out.dtype, out.shape, self.offsets.dtype, self.offsets.shape,
-            self.experts.dtype, self.experts.shape, self.list_size.dtype, self.list_size.shape,
-        )
         asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
             (lhs_q, lhs_s),
             (rhs_q, rhs_s),

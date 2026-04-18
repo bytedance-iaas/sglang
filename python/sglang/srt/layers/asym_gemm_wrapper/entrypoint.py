@@ -100,7 +100,6 @@ def grouped_gemm_nt_fp4fp4bf16_masked(
     max_block_n: int = 256,
     recipe: Optional[Tuple[int, int, int]] = None,
 ):
-    print("~~~~~~~~~~~~~~~~~~~~~~~ 1")
     num_groups, _, k_packed = lhs[0].shape
     _, n, _ = rhs[0].shape
     k = k_packed * 2
@@ -112,7 +111,6 @@ def grouped_gemm_nt_fp4fp4bf16_masked(
         with configure_asym_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-            print("~~~~~~~~~~~~~~~~~~~~~~~ 3")
             return asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
                 lhs,
                 rhs,
@@ -136,14 +134,12 @@ def grouped_gemm_nt_fp4fp4bf16_contig(
     recipe: Optional[Tuple[int, int, int]] = None,
 ):
 
-    print("~~~~~~~~~~~~~~~~~~~~~~~ 2")
     m, k_packed = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
     k = k_packed * 2
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_FP4_CONTIG
 
     with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        print("~~~~~~~~~~~~~~~~~~~~~~~ 4")
         asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
             lhs,
             rhs,

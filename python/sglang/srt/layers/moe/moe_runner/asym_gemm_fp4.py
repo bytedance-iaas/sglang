@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -28,11 +29,24 @@ _is_cuda = is_cuda()
 if not (_is_npu or _is_hip) and _is_cuda:
     from sgl_kernel import silu_and_mul
 
+logger = logging.getLogger(__name__)
+
+# Set SGLANG_FP4_GEMM_DEBUG=1 to force-enable kernel I/O logging for this module.
+import os as _os
+if _os.environ.get("SGLANG_FP4_GEMM_DEBUG", "0") == "1":
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("[%(name)s][%(levelname)s] %(message)s"))
+        logger.addHandler(_h)
+del _os
 
 # NVFP4 micro-scale group size along the K dimension.
 _NVFP4_GROUP_SIZE = 16
 # E2M1 dynamic range (max |x|) for computing E4M3 scale: sf = amax / 6.0.
 _E2M1_MAX = 6.0
+# float8_e4m3fn max representable value; values above this overflow to NaN (0x7F).
+_E4M3FN_MAX = 448.0
 
 
 @dataclass
@@ -101,7 +115,7 @@ def _quantize_bf16_to_nvfp4_e4m3(
     x_groups = x2d.to(torch.float32).view(m, sf_k, group_size)
     amax = x_groups.abs().amax(dim=-1).clamp_min_(1e-4)
     # NVFP4 canonical scale = amax / E2M1_MAX, stored as E4M3.
-    sf_e4m3 = (amax / _E2M1_MAX).to(torch.float8_e4m3fn)
+    sf_e4m3 = (amax / _E2M1_MAX).clamp(max=_E4M3FN_MAX).to(torch.float8_e4m3fn)
     sf_decoded = sf_e4m3.to(torch.float32).clamp_min_(1e-12)
 
     # Quantize values to E2M1. Use the nearest representable magnitude with
@@ -128,6 +142,28 @@ def _quantize_bf16_to_nvfp4_e4m3(
     packed = packed.view(*leading, k // 2)
     sf_e4m3 = sf_e4m3.view(*leading, sf_k)
     return packed, sf_e4m3
+
+
+def _tensor_stats(t: torch.Tensor) -> str:
+    """Return a compact stats string for a tensor (shape, dtype, nan, min, max)."""
+    if t.numel() == 0:
+        return f"shape={tuple(t.shape)} dtype={t.dtype} (empty)"
+    f32 = t.to(torch.float32)
+    has_nan = f32.isnan().any().item()
+    return (
+        f"shape={tuple(t.shape)} dtype={t.dtype} "
+        f"nan={has_nan} min={f32.min().item():.4g} max={f32.max().item():.4g}"
+    )
+
+
+def _scale_stats(s: torch.Tensor) -> str:
+    """Return stats for an E4M3 scale tensor, including NaN-byte count."""
+    nan_count = s.view(torch.uint8).eq(0x7F).sum().item()
+    f32 = s.to(torch.float32)
+    return (
+        f"shape={tuple(s.shape)} dtype={s.dtype} "
+        f"nan_bytes={nan_count} min={f32.min().item():.4g} max={f32.max().item():.4g}"
+    )
 
 
 class AsymGemmFp4RunnerCore(MoeRunnerCore):
@@ -163,7 +199,8 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
-
+        m_indices = runner_input.m_indices
+        
         # N is the packed-major output dim of the gateup weights.
         # w13_weight is (E, 2*N, K//2); the gate-up output has 2*N bf16 columns
         # which silu_and_mul reduces to N.
@@ -175,6 +212,26 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[contig][gateup] act      : %s", _tensor_stats(hidden_states)
+            )
+            logger.debug(
+                "[contig][gateup] act_scale: %s", _scale_stats(hidden_states_scale)
+            )
+            logger.debug(
+                "[contig][gateup] w13      : device=%s shape=%s",
+                quant_info.w13_weight.device, tuple(quant_info.w13_weight.shape),
+            )
+            logger.debug(
+                "[contig][gateup] w13_scale: %s", _scale_stats(quant_info.w13_scale)
+            )
+            logger.debug(
+                "[contig][gateup] offsets=%s experts=%s list_size=%s",
+                runner_input.offsets.tolist(),
+                runner_input.experts.tolist(),
+                runner_input.list_size.tolist(),
+            )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_contig(
             (hidden_states, hidden_states_scale),
             (quant_info.w13_weight, quant_info.w13_scale),
@@ -183,7 +240,10 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             runner_input.experts,
             runner_input.list_size,
         )
-
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[contig][gateup] output   : %s", _tensor_stats(gateup_output)
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -205,6 +265,20 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[contig][down]   act      : %s", _tensor_stats(down_in_fp4)
+            )
+            logger.debug(
+                "[contig][down]   act_scale: %s", _scale_stats(down_in_scale)
+            )
+            logger.debug(
+                "[contig][down]   w2       : device=%s shape=%s",
+                quant_info.w2_weight.device, tuple(quant_info.w2_weight.shape),
+            )
+            logger.debug(
+                "[contig][down]   w2_scale : %s", _scale_stats(quant_info.w2_scale)
+            )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_contig(
             (down_in_fp4, down_in_scale),
             (quant_info.w2_weight, quant_info.w2_scale),
@@ -213,7 +287,10 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             runner_input.experts,
             runner_input.list_size,
         )
-
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[contig][down]   output   : %s", _tensor_stats(down_output)
+            )
         return down_output
 
     def _run_masked_gemm(
@@ -236,10 +313,33 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
 
         num_groups, m, k_packed = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.empty(
+        # Zero-init so uncomputed rows (outside offsets range) are 0, not garbage.
+        # silu(0)=0 → zero FP4 codes → no NaN propagation through the down GEMM.
+        gateup_output = torch.zeros(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[masked][gateup] act      : %s", _tensor_stats(hidden_states)
+            )
+            logger.debug(
+                "[masked][gateup] act_scale: %s", _scale_stats(hidden_states_scale)
+            )
+            logger.debug(
+                "[masked][gateup] w13      : device=%s shape=%s",
+                w13_weight.device, tuple(w13_weight.shape),
+            )
+            logger.debug(
+                "[masked][gateup] w13_scale: %s", _scale_stats(w13_scale)
+            )
+            logger.debug(
+                "[masked][gateup] masked_m=%s expected_m=%d offsets=%s experts=%s list_size=%s",
+                masked_m.tolist(), expected_m,
+                runner_input.offsets.tolist(),
+                runner_input.experts.tolist(),
+                runner_input.list_size.tolist(),
+            )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
@@ -250,6 +350,10 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             runner_input.experts,
             runner_input.list_size,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[masked][gateup] output   : %s", _tensor_stats(gateup_output)
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -280,6 +384,20 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n2), device=hidden_states_device, dtype=torch.bfloat16
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[masked][down]   act      : %s", _tensor_stats(down_in_fp4)
+            )
+            logger.debug(
+                "[masked][down]   act_scale: %s", _scale_stats(down_in_scale)
+            )
+            logger.debug(
+                "[masked][down]   w2       : device=%s shape=%s",
+                w2_weight.device, tuple(w2_weight.shape),
+            )
+            logger.debug(
+                "[masked][down]   w2_scale : %s", _scale_stats(w2_scale)
+            )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_masked(
             (down_in_fp4, down_in_scale),
             (w2_weight, w2_scale),
@@ -290,6 +408,10 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             runner_input.experts,
             runner_input.list_size,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[masked][down]   output   : %s", _tensor_stats(down_output)
+            )
 
         return down_output
 
