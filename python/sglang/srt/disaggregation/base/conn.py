@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import dataclasses
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
@@ -12,31 +13,48 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
+@dataclasses.dataclass
 class KVArgs:
-    engine_rank: int
-    kv_data_ptrs: List[int]
-    kv_data_lens: List[int]
-    kv_item_lens: List[int]
-    aux_data_ptrs: List[int]
-    aux_data_lens: List[int]
-    aux_item_lens: List[int]
-    state_data_ptrs: List[int]
-    state_data_lens: List[int]
-    state_item_lens: List[int]
-    state_type: str  # "none", "mamba", "swa"
-    # for mamba state different tp slice transfer
-    state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
-    ib_device: str
-    ib_traffic_class: str
-    gpu_id: int
-    kv_head_num: int
-    total_kv_head_num: int
-    page_size: int
-    # for pp prefill
-    pp_rank: int
-    prefill_start_layer: int
-    # for system dp
-    system_dp_rank: int
+    """Argument bag shared across disaggregation backends.
+
+    Historically this object was a plain class that callers mutated by setting
+    attributes after construction. Keeping this as a dataclass preserves that
+    usage pattern while making fields explicit (better IDE support + fewer
+    `getattr()` fallbacks).
+    """
+
+    engine_rank: int = 0
+
+    kv_data_ptrs: List[int] = dataclasses.field(default_factory=list)
+    kv_data_lens: List[int] = dataclasses.field(default_factory=list)
+    kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+
+    aux_data_ptrs: List[int] = dataclasses.field(default_factory=list)
+    aux_data_lens: List[int] = dataclasses.field(default_factory=list)
+    aux_item_lens: List[int] = dataclasses.field(default_factory=list)
+
+    state_data_ptrs: List[int] = dataclasses.field(default_factory=list)
+    state_data_lens: List[int] = dataclasses.field(default_factory=list)
+    state_item_lens: List[int] = dataclasses.field(default_factory=list)
+    state_type: str = "none"  # "none", "mamba", "swa", ...
+
+    # For Mamba state different TP slice transfer.
+    state_dim_per_tensor: List[int] = dataclasses.field(default_factory=list)
+
+    ib_device: str = ""
+    ib_traffic_class: str = ""
+    gpu_id: int = 0
+
+    kv_head_num: int = 0
+    total_kv_head_num: int = 0
+    page_size: int = 0
+
+    # For PP prefill.
+    pp_rank: int = 0
+    prefill_start_layer: int = 0
+
+    # For system DP.
+    system_dp_rank: int = 0
 
 
 class KVPoll:
