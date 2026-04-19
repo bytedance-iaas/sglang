@@ -8,8 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from functools import reduce
-from typing import Callable, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -56,9 +55,15 @@ class AsyncInfo:
 
 
 class StreamAsyncSubmitter:
-    def __init__(self, submit_func):
+    """Single-worker async submitter with counters.
+
+    The worker thread runs as a daemon and never exits. We use monotonically
+    increasing counters to let the caller wait until submitted work has finished.
+    """
+
+    def __init__(self, submit_func: Callable[[], None]):
         self._submit_func = submit_func
-        self._queue: queue.Queue[int] = queue.Queue()
+        self._queue: queue.SimpleQueue[None] = queue.SimpleQueue()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._submitted = 0
@@ -78,7 +83,7 @@ class StreamAsyncSubmitter:
     def step_async(self):
         with self._cond:
             self._submitted += 1
-            self._queue.put(self._submitted)
+            self._queue.put(None)
             return self._submitted
 
     def get_step_count(self):
@@ -98,9 +103,22 @@ class StreamAsyncSubmitter:
 def cached_group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
 ):
+    # NOTE: despite the name, this function is not memoized; it only normalizes
+    # dtypes before calling the grouping helper.
     src = np.asarray(src_indices, dtype=np.int32)
     dst = np.asarray(dst_indices, dtype=np.int32)
     return group_concurrent_contiguous(src, dst)
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default) == "1"
+
+
+def _env_int(name: str, default: str) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except Exception:
+        return int(default)
 
 
 class MooncakeAsyncKVManager(MooncakeKVManager):
@@ -134,20 +152,20 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             else self._kv_tensor_ntensors // 2
         )
         self._kv_per_layer_event_sync = (
-            os.getenv("SGLANG_ASYNC_KV_GQA_PER_LAYER_EVENT_SYNC", "1") == "1"
+            _env_flag("SGLANG_ASYNC_KV_GQA_PER_LAYER_EVENT_SYNC", "1")
         )
         self._mamba_per_layer_event_sync = (
-            os.getenv("SGLANG_ASYNC_KV_MAMBA_PER_LAYER_EVENT_SYNC", "1") == "1"
+            _env_flag("SGLANG_ASYNC_KV_MAMBA_PER_LAYER_EVENT_SYNC", "1")
         )
         self._mamba_per_layer_cuda_sync = (
-            os.getenv("SGLANG_ASYNC_KV_MAMBA_PER_LAYER_CUDA_SYNC", "0") == "1"
+            _env_flag("SGLANG_ASYNC_KV_MAMBA_PER_LAYER_CUDA_SYNC", "0")
         )
-        self._async_kv_missing_wait_ms = int(
-            os.getenv("SGLANG_ASYNC_KV_MISSING_WAIT_MS", "20")
-        )
+        self._async_kv_missing_wait_ms = _env_int("SGLANG_ASYNC_KV_MISSING_WAIT_MS", "20")
         self._mamba_per_layer_cuda_sync_warned = False
         self._mamba_per_layer_event_sync_warned = False
-        self._mamba_layer_ready_events: Dict[Tuple[int, int], object] = {}
+        # (room_id, tensor_id) -> CUDA event recorded when layer becomes ready.
+        self._layer_ready_events: Dict[Tuple[int, int], Any] = {}
+        self._kv_per_layer_event_sync_warned = False
 
     @property
     def is_support_async(self):
@@ -162,6 +180,122 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             self._put_kv_cache_internal(info)
         except Exception:
             logger.exception("Unhandled exception in _put_kvcache_func worker thread.")
+
+    def _try_sync_ready_event(self, *, room_id: int, tensor_id: int, reason: str) -> None:
+        """Best-effort synchronize and drop a readiness CUDA event."""
+
+        event_key = (int(room_id), int(tensor_id))
+        with self._lock:
+            event = self._layer_ready_events.pop(event_key, None)
+        if event is None:
+            return
+
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                event.synchronize()
+        except Exception:
+            logger.warning(
+                "Failed to synchronize CUDA event (%s): room=%s tensor=%s",
+                reason,
+                room_id,
+                tensor_id,
+                exc_info=True,
+            )
+
+    def _try_record_ready_event_for_rooms(
+        self, *, rooms: Tuple[int, ...], tensor_id: int, reason: str
+    ) -> None:
+        """Best-effort record a CUDA event and store it for each room."""
+
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+            event = torch.cuda.Event(enable_timing=False, blocking=False, interprocess=False)
+            event.record()
+            with self._lock:
+                for rid in rooms:
+                    self._layer_ready_events[(int(rid), int(tensor_id))] = event
+
+            if reason == "kv" and self._kv_per_layer_event_sync and not self._kv_per_layer_event_sync_warned:
+                self._kv_per_layer_event_sync_warned = True
+                logger.info("async kv kv per-layer event sync enabled")
+            if (
+                reason == "mamba_state"
+                and self._mamba_per_layer_event_sync
+                and not self._mamba_per_layer_event_sync_warned
+            ):
+                self._mamba_per_layer_event_sync_warned = True
+                logger.info("async kv mamba per-layer event sync enabled")
+        except Exception:
+            # Best-effort feature; do not crash the critical path.
+            logger.debug(
+                "Failed to record CUDA event (%s): tensor=%s",
+                reason,
+                tensor_id,
+                exc_info=True,
+            )
+
+    def _maybe_start_next_kv_chunk(self) -> None:
+        begin_count = self._async_submitter.get_step_count()
+        with self._queue_lock:
+            self._current_kv_chunk_infos = (
+                self._waiting_rooms.pop() if self._waiting_rooms else None
+            )
+            waiting_len = len(self._waiting_rooms)
+
+        if self._current_kv_chunk_infos:
+            for idx, rid in enumerate(self._current_kv_chunk_infos.rooms):
+                if rid not in self._req_begin_count:
+                    self._req_begin_count[rid] = deque()
+                self._req_begin_count[rid].appendleft(begin_count)
+                self._room_to_kv_chunk_info[rid] = (self._current_kv_chunk_infos, idx)
+        else:
+            logger.warning(
+                "async kv layer0: no waiting rooms, waiting_len=%s",
+                waiting_len,
+            )
+
+    def _filter_current_kv_chunk_infos(self) -> None:
+        """Drop rooms that are no longer eligible from current chunk info."""
+
+        if not self._current_kv_chunk_infos or not self._current_kv_chunk_infos.rooms:
+            return
+
+        rooms = self._current_kv_chunk_infos.rooms
+        keep_indices = []
+        for idx, rid in enumerate(rooms):
+            if rid in self.transfer_infos and self.request_status.get(rid) != KVPoll.Success:
+                keep_indices.append(idx)
+        if not keep_indices or len(keep_indices) == len(rooms):
+            return
+
+        filtered_rooms = tuple(rooms[i] for i in keep_indices)
+        filtered_prefill_kv = tuple(
+            self._current_kv_chunk_infos.prefill_kv_indices[i] for i in keep_indices
+        )
+        filtered_index_slices = tuple(
+            self._current_kv_chunk_infos.index_slices[i] for i in keep_indices
+        )
+        filtered_state_indices = tuple(
+            self._current_kv_chunk_infos.prefill_state_indices[i] for i in keep_indices
+        )
+        self._current_kv_chunk_infos = TransferKVChunkSet(
+            rooms=filtered_rooms,
+            prefill_kv_indices=filtered_prefill_kv,
+            index_slices=filtered_index_slices,
+            prefill_state_indices=filtered_state_indices,
+        )
+
+        with self._lock:
+            for rid in rooms:
+                if rid not in filtered_rooms:
+                    self._room_to_kv_chunk_info.pop(rid, None)
+            for idx, rid in enumerate(filtered_rooms):
+                self._room_to_kv_chunk_info[rid] = (self._current_kv_chunk_infos, idx)
 
     def get_info_with_risk(self, room: int) -> TransferInfo:
         if room not in self.transfer_infos:
@@ -233,24 +367,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                         is_state_tensor = layer_id >= self._kv_tensor_ntensors
                         if not is_state_tensor:
                             if self._kv_per_layer_event_sync:
-                                event_key = (int(room_id), int(layer_id))
-                                with self._lock:
-                                    event = self._mamba_layer_ready_events.pop(
-                                        event_key, None
-                                    )
-                                if event is not None:
-                                    try:
-                                        import torch
-
-                                        if torch.cuda.is_available():
-                                            event.synchronize()
-                                    except Exception:
-                                        logger.warning(
-                                            "Failed to synchronize CUDA event: room=%s layer=%s",
-                                            room_id,
-                                            layer_id,
-                                            exc_info=True,
-                                        )
+                                self._try_sync_ready_event(
+                                    room_id=int(room_id),
+                                    tensor_id=int(layer_id),
+                                    reason="kv",
+                                )
                             dst = transfer_info.dst_kv_indices[index_slice]
                             if len(dst) < len(kv_indice):
                                 logger.warning(
@@ -284,7 +405,10 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             )
                             if status != 0:
                                 logger.warning(
-                                    f"async kv layer transfer failed: layer={layer_id} room={room_id} status={status}"
+                                    "async kv layer transfer failed: tensor=%s room=%s status=%s",
+                                    layer_id,
+                                    room_id,
+                                    status,
                                 )
                         else:
                             state_tensor_id = layer_id - self._kv_tensor_ntensors
@@ -296,19 +420,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 getattr(self.kv_args, "state_type", "none") == "mamba"
                                 and self._mamba_per_layer_event_sync
                             ):
-                                event_key = (int(room_id), int(layer_id))
-                                with self._lock:
-                                    event = self._mamba_layer_ready_events.pop(
-                                        event_key, None
-                                    )
-                                if event is not None:
-                                    try:
-                                        import torch
-
-                                        if torch.cuda.is_available():
-                                            event.synchronize()
-                                    except Exception:
-                                        pass
+                                self._try_sync_ready_event(
+                                    room_id=int(room_id),
+                                    tensor_id=int(layer_id),
+                                    reason="mamba_state",
+                                )
                             dst_state_idx = int(transfer_info.dst_state_indices[0])
                             src_state_ptrs = getattr(self.kv_args, "state_data_ptrs", [])
                             src_state_item_lens = getattr(self.kv_args, "state_item_lens", [])
@@ -347,24 +463,15 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             self._req_bids[room_id].appendleft(status)
 
     def mark_layer_ready(self, layer_id: int):
+        """Enqueue a tensor ID for async transfer.
+
+        Special case: `layer_id == -1` indicates a "begin" marker to pop the
+        next prepared chunk from `_waiting_rooms`.
+        """
+
         tensor_id = layer_id
         if tensor_id == -1 or (tensor_id >= 0 and self._current_kv_chunk_infos is None):
-            begin_count = self._async_submitter.get_step_count()
-            with self._queue_lock:
-                self._current_kv_chunk_infos = (
-                    self._waiting_rooms.pop() if self._waiting_rooms else None
-                )
-                waiting_len = len(self._waiting_rooms)
-            if self._current_kv_chunk_infos:
-                for idx, rid in enumerate(self._current_kv_chunk_infos.rooms):
-                    if rid not in self._req_begin_count:
-                        self._req_begin_count[rid] = deque()
-                    self._req_begin_count[rid].appendleft(begin_count)
-                    self._room_to_kv_chunk_info[rid] = (self._current_kv_chunk_infos, idx)
-            else:
-                logger.warning(
-                    f"async kv layer0: no waiting rooms, waiting_len={waiting_len}"
-                )
+            self._maybe_start_next_kv_chunk()
             if tensor_id == -1:
                 return
         if tensor_id < 0 or tensor_id >= self._tensor_ntensors_total:
@@ -381,46 +488,10 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             return
 
         if self._current_kv_chunk_infos:
-            rooms = self._current_kv_chunk_infos.rooms
-            if rooms:
-                keep_indices = []
-                for idx, rid in enumerate(rooms):
-                    if (
-                        rid in self.transfer_infos
-                        and self.request_status.get(rid) != KVPoll.Success
-                    ):
-                        keep_indices.append(idx)
-                if not keep_indices:
-                    return
-                if len(keep_indices) != len(rooms):
-                    filtered_rooms = tuple(rooms[i] for i in keep_indices)
-                    filtered_prefill_kv = tuple(
-                        self._current_kv_chunk_infos.prefill_kv_indices[i]
-                        for i in keep_indices
-                    )
-                    filtered_index_slices = tuple(
-                        self._current_kv_chunk_infos.index_slices[i]
-                        for i in keep_indices
-                    )
-                    filtered_state_indices = tuple(
-                        self._current_kv_chunk_infos.prefill_state_indices[i]
-                        for i in keep_indices
-                    )
-                    self._current_kv_chunk_infos = TransferKVChunkSet(
-                        rooms=filtered_rooms,
-                        prefill_kv_indices=filtered_prefill_kv,
-                        index_slices=filtered_index_slices,
-                        prefill_state_indices=filtered_state_indices,
-                    )
-                    with self._lock:
-                        for rid in rooms:
-                            if rid not in filtered_rooms:
-                                self._room_to_kv_chunk_info.pop(rid, None)
-                        for idx, rid in enumerate(filtered_rooms):
-                            self._room_to_kv_chunk_info[rid] = (
-                                self._current_kv_chunk_infos,
-                                idx,
-                            )
+            self._filter_current_kv_chunk_infos()
+        if not self._current_kv_chunk_infos or not self._current_kv_chunk_infos.rooms:
+            return
+
             if tensor_id < self._kv_tensor_ntensors:
                 kind = "kv"
             else:
@@ -448,50 +519,22 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 and getattr(self.kv_args, "state_type", "none") == "mamba"
                 and self._mamba_per_layer_event_sync
             ):
-                try:
-                    import torch
-
-                    if torch.cuda.is_available():
-                        event = torch.cuda.Event(
-                            enable_timing=False, blocking=False, interprocess=False
-                        )
-                        event.record()
-                        with self._lock:
-                            for rid in self._current_kv_chunk_infos.rooms:
-                                self._mamba_layer_ready_events[(int(rid), int(tensor_id))] = event
-                        if not self._mamba_per_layer_event_sync_warned:
-                            self._mamba_per_layer_event_sync_warned = True
-                            logger.info("async kv mamba per-layer event sync enabled")
-                except Exception:
-                    pass
+                self._try_record_ready_event_for_rooms(
+                    rooms=self._current_kv_chunk_infos.rooms,
+                    tensor_id=int(tensor_id),
+                    reason="mamba_state",
+                )
             if kind == "kv" and self._kv_per_layer_event_sync:
-                try:
-                    import torch
+                self._try_record_ready_event_for_rooms(
+                    rooms=self._current_kv_chunk_infos.rooms,
+                    tensor_id=int(tensor_id),
+                    reason="kv",
+                )
 
-                    if torch.cuda.is_available():
-                        event = torch.cuda.Event(
-                            enable_timing=False, blocking=False, interprocess=False
-                        )
-                        event.record()
-                        with self._lock:
-                            for rid in self._current_kv_chunk_infos.rooms:
-                                self._mamba_layer_ready_events[(int(rid), int(tensor_id))] = event
-                except Exception:
-                    pass
-            kv_role = None
-            kv_layer = None
-            if kind == "kv" and not self.is_mla_backend and self._kv_cache_nlayers > 0:
-                if tensor_id < self._kv_cache_nlayers:
-                    kv_role = "k"
-                    kv_layer = int(tensor_id)
-                else:
-                    kv_role = "v"
-                    kv_layer = int(tensor_id - self._kv_cache_nlayers)
-            send_layers = [tensor_id]
             with self._queue_lock:
                 self._notify_queue.appendleft(
                     AsyncInfo(
-                        layer_ids=tuple(send_layers),
+                        layer_ids=(int(tensor_id),),
                         kv_chunk_info=self._current_kv_chunk_infos,
                     )
                 )
@@ -659,13 +702,13 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     with self._lock:
                         self._req_tensor_seen.pop(rid, None)
                     self._room_to_kv_chunk_info.pop(rid, None)
-                    if self._mamba_layer_ready_events:
+                    if self._layer_ready_events:
                         with self._lock:
                             keys_to_remove = [
-                                k for k in self._mamba_layer_ready_events.keys() if k[0] == rid
+                                k for k in self._layer_ready_events.keys() if k[0] == rid
                             ]
                             for k in keys_to_remove:
-                                self._mamba_layer_ready_events.pop(k, None)
+                                self._layer_ready_events.pop(k, None)
             self._req_begin_count.pop(rid, None)
 
     def prepare_batch(self, sch: "Scheduler", batch: "ScheduleBatch"):
@@ -789,7 +832,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                worker_start = time.time()
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -929,4 +971,4 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             except Exception as e:
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
-                )
+                ) from e
