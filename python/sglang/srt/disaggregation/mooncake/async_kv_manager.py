@@ -3,10 +3,10 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import logging
+import os
 import queue
 import threading
 import time
-import os
 from collections import deque
 from functools import reduce
 from typing import Callable, Dict, Optional, Tuple, TYPE_CHECKING
@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.utils import (
     kv_to_page_indices,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_mamba_pool_state_tensor_counts
 
 logger = logging.getLogger(__name__)
 
@@ -159,14 +160,8 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     return
                 info = self._notify_queue.pop()
             self._put_kv_cache_internal(info)
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            logger.info(f"Error in put_kvcache_thread: {e}")
-            import os
-
-            os._exit(1)
+        except Exception:
+            logger.exception("Unhandled exception in _put_kvcache_func worker thread.")
 
     def get_info_with_risk(self, room: int) -> TransferInfo:
         if room not in self.transfer_infos:
@@ -250,7 +245,12 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                         if torch.cuda.is_available():
                                             event.synchronize()
                                     except Exception:
-                                        pass
+                                        logger.warning(
+                                            "Failed to synchronize CUDA event: room=%s layer=%s",
+                                            room_id,
+                                            layer_id,
+                                            exc_info=True,
+                                        )
                             dst = transfer_info.dst_kv_indices[index_slice]
                             if len(dst) < len(kv_indice):
                                 logger.warning(
@@ -682,20 +682,10 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             and self._mamba_num_layers_debug == 0
         ):
             mamba_pool = getattr(getattr(sch, "req_to_token_pool", None), "mamba_pool", None)
-            if mamba_pool is not None:
-                self._mamba_num_layers_debug = int(getattr(mamba_pool, "num_mamba_layers", 0))
-                mamba_cache = getattr(mamba_pool, "mamba_cache", None)
-                state_tensors = []
-                if mamba_cache is not None:
-                    for field in vars(mamba_cache):
-                        if field in ("intermediate_ssm", "intermediate_conv_window"):
-                            continue
-                        value = getattr(mamba_cache, field)
-                        if isinstance(value, list):
-                            state_tensors.extend(value)
-                        else:
-                            state_tensors.append(value)
-                self._mamba_state_tensors_per_layer_debug = len(state_tensors)
+            (
+                self._mamba_num_layers_debug,
+                self._mamba_state_tensors_per_layer_debug,
+            ) = get_mamba_pool_state_tensor_counts(mamba_pool)
         for req in batch.reqs:
             if req.is_chunked > 0:
                 skip_chunked += 1

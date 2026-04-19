@@ -78,6 +78,46 @@ import orjson
 import psutil
 import pybase64
 import requests
+
+
+def get_mamba_pool_state_tensor_counts(mamba_pool: Any) -> tuple[int, int]:
+    """Get basic mamba cache layout from a `mamba_pool`-like object.
+
+    This helper centralizes the reflection logic used by both the attention backend
+    and the PD disaggregation async KV manager.
+
+    Returns:
+        (num_mamba_layers, state_tensors_per_layer)
+    """
+
+    if mamba_pool is None:
+        return 0, 0
+
+    num_layers = int(getattr(mamba_pool, "num_mamba_layers", 0) or 0)
+    if num_layers <= 0:
+        return 0, 0
+
+    mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+    if mamba_cache is None:
+        return num_layers, 0
+
+    state_tensors: list[Any] = []
+    try:
+        fields = vars(mamba_cache)
+    except TypeError:
+        fields = {}
+
+    for field in fields:
+        # Skip ephemeral fields that do not represent persistent per-layer states.
+        if field in ("intermediate_ssm", "intermediate_conv_window"):
+            continue
+        value = getattr(mamba_cache, field)
+        if isinstance(value, list):
+            state_tensors.extend(value)
+        else:
+            state_tensors.append(value)
+
+    return num_layers, len(state_tensors)
 import torch
 import torch.distributed as dist
 import triton

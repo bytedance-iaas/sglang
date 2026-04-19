@@ -22,7 +22,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import get_mamba_pool_state_tensor_counts, is_cpu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -736,24 +736,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         mamba_pool = getattr(self.linear_attn_backend.req_to_token_pool, "mamba_pool", None)
-        self._mamba_num_layers = (
-            int(getattr(mamba_pool, "num_mamba_layers", 0)) if mamba_pool is not None else 0
-        )
-        if self._mamba_num_layers > 0:
-            mamba_cache = getattr(mamba_pool, "mamba_cache", None)
-            state_tensors = []
-            if mamba_cache is not None:
-                for field in vars(mamba_cache):
-                    if field in ("intermediate_ssm", "intermediate_conv_window"):
-                        continue
-                    value = getattr(mamba_cache, field)
-                    if isinstance(value, list):
-                        state_tensors.extend(value)
-                    else:
-                        state_tensors.append(value)
-            self._mamba_state_tensors_per_layer = len(state_tensors)
-        else:
-            self._mamba_state_tensors_per_layer = 0
+        (
+            self._mamba_num_layers,
+            self._mamba_state_tensors_per_layer,
+        ) = get_mamba_pool_state_tensor_counts(mamba_pool)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
