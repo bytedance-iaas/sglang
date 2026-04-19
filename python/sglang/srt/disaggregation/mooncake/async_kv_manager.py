@@ -27,8 +27,8 @@ from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     kv_to_page_indices,
 )
+from sglang.srt.mem_cache.memory_pool import get_mamba_pool_state_tensor_counts
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_mamba_pool_state_tensor_counts
 
 logger = logging.getLogger(__name__)
 
