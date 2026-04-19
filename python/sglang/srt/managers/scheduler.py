@@ -1941,7 +1941,13 @@ class Scheduler(
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
         # Process each request in the batch
-        for tokenized_req in recv_req:
+        for i, tokenized_req in enumerate(recv_req):
+            if (
+                tokenized_req.http_worker_ipc is None
+                and recv_req.http_worker_ipcs is not None
+                and i < len(recv_req.http_worker_ipcs)
+            ):
+                tokenized_req.http_worker_ipc = recv_req.http_worker_ipcs[i]
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
@@ -2162,7 +2168,13 @@ class Scheduler(
         )
 
         # Process each request in the batch
-        for tokenized_req in recv_req:
+        for i, tokenized_req in enumerate(recv_req):
+            if (
+                tokenized_req.http_worker_ipc is None
+                and recv_req.http_worker_ipcs is not None
+                and i < len(recv_req.http_worker_ipcs)
+            ):
+                tokenized_req.http_worker_ipc = recv_req.http_worker_ipcs[i]
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
@@ -3582,6 +3594,17 @@ class SenderWrapper:
         ):
             # handle communicator reqs for multi-http worker case
             output.http_worker_ipc = recv_obj.http_worker_ipc
+        elif (
+            isinstance(recv_obj, BaseBatchReq)
+            and isinstance(output, BaseBatchReq)
+            and recv_obj.http_worker_ipcs is not None
+            and (
+                output.http_worker_ipcs is None
+                or all(ipc is None for ipc in output.http_worker_ipcs)
+            )
+        ):
+            # handle batched communicator reqs for multi-http worker case
+            output.http_worker_ipcs = recv_obj.http_worker_ipcs
 
         self.socket.send_pyobj(output)
 

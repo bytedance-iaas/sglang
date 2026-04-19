@@ -56,6 +56,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _batch_request_len(req: BaseBatchReq) -> int:
+    if req.rids is not None:
+        return len(req.rids)
+    batch = getattr(req, "batch", None)
+    if batch is not None:
+        return len(batch)
+    return 0
+
+
+def _attach_worker_ipc(req: Union[BaseReq, BaseBatchReq], ipc_name: str):
+    if isinstance(req, BaseReq):
+        req.http_worker_ipc = ipc_name
+    elif isinstance(req, BaseBatchReq):
+        req.http_worker_ipcs = [ipc_name] * _batch_request_len(req)
+        for item in getattr(req, "batch", []):
+            if isinstance(item, BaseReq):
+                item.http_worker_ipc = ipc_name
+    else:
+        raise ValueError(f"Unknown req type: {type(req)}")
+
+
 class SocketMapping:
     def __init__(self):
         self._zmq_context = zmq.Context()
@@ -405,13 +426,7 @@ class TokenizerWorker(TokenizerManager):
         )
 
     def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
-
-        if isinstance(req, BaseReq):
-            req.http_worker_ipc = self.tokenizer_ipc_name
-        elif isinstance(req, BaseBatchReq):
-            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
-        else:
-            raise ValueError(f"Unknown req type: {type(req)}")
+        _attach_worker_ipc(req, self.tokenizer_ipc_name)
 
 
 async def print_exception_wrapper(func):
@@ -503,6 +518,6 @@ class SenderWrapper:
         self.send_to_scheduler = send_to_scheduler
 
     def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+        if isinstance(obj, (BaseReq, BaseBatchReq)):
+            _attach_worker_ipc(obj, self.port_args.tokenizer_ipc_name)
         self.send_to_scheduler.send_pyobj(obj)
