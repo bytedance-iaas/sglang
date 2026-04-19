@@ -82,12 +82,19 @@ class AsymGemmFp4MoeQuantInfo(MoeQuantInfo):
     Weights are packed FP4 (uint8, two E2M1 values per byte). Scales are
     per-group E4M3 bytes with group_size=16 along K. The AsymGEMM kernel
     internally re-packs the scales into its TMA-aligned uint32 layout.
+
+    w13_weight_scale_2 / w2_weight_scale_2 are per-expert global float32
+    post-GEMM correction factors (ModelOpt two-level quantization).  They
+    are applied row-wise after each grouped GEMM to restore the correct
+    magnitude.  None means no correction (legacy checkpoints).
     """
 
     w13_weight: torch.Tensor  # (num_experts, 2*N, K//2) uint8 (packed FP4)
     w2_weight: torch.Tensor   # (num_experts, K,   N//2) uint8 (packed FP4)
     w13_scale: torch.Tensor   # (num_experts, 2*N, K/16) float8_e4m3fn
     w2_scale: torch.Tensor    # (num_experts, K,   N/16) float8_e4m3fn
+    w13_weight_scale_2: Optional[torch.Tensor] = None  # (num_local_experts,) float32
+    w2_weight_scale_2: Optional[torch.Tensor] = None   # (num_local_experts,) float32
 
 
 def _quantize_bf16_to_nvfp4_e4m3(
@@ -207,7 +214,11 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         w13_n = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
 
-        gateup_output = torch.empty(
+        # Zero-init so padding rows (outside the kernel's offset range) are 0
+        # rather than uninitialized garbage.  Uninitialized padding can produce
+        # NaN scales after silu_and_mul+quantize, which the block-scale TMA
+        # loads may then expose into real-token output tiles.
+        gateup_output = torch.zeros(
             (all_tokens, w13_n),
             device=hidden_states_device,
             dtype=torch.bfloat16,
@@ -244,6 +255,19 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[contig][gateup] output   : %s", _tensor_stats(gateup_output)
             )
+
+        # Apply per-expert global post-GEMM scale (ModelOpt two-level quant).
+        if quant_info.w13_weight_scale_2 is not None:
+            total_real = int(runner_input.list_size.sum().item())
+            per_expert_scale = quant_info.w13_weight_scale_2[runner_input.experts]
+            per_token_scale = per_expert_scale.repeat_interleave(runner_input.list_size)
+            gateup_output[:total_real] *= per_token_scale.to(gateup_output.dtype).unsqueeze(1)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[contig][gateup] w13_scale_2 applied: per_expert_scale=%s",
+                    per_expert_scale.tolist(),
+                )
+
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -260,7 +284,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         down_in_fp4, down_in_scale = _quantize_bf16_to_nvfp4_e4m3(down_in_bf16)
         del down_in_bf16
 
-        down_output = torch.empty(
+        down_output = torch.zeros(
             (all_tokens, K),
             device=hidden_states_device,
             dtype=torch.bfloat16,
@@ -291,6 +315,19 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[contig][down]   output   : %s", _tensor_stats(down_output)
             )
+
+        # Apply per-expert global post-GEMM scale for the down projection.
+        if quant_info.w2_weight_scale_2 is not None:
+            total_real = int(runner_input.list_size.sum().item())
+            per_expert_scale = quant_info.w2_weight_scale_2[runner_input.experts]
+            per_token_scale = per_expert_scale.repeat_interleave(runner_input.list_size)
+            down_output[:total_real] *= per_token_scale.to(down_output.dtype).unsqueeze(1)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[contig][down]   w2_scale_2 applied: per_expert_scale=%s",
+                    per_expert_scale.tolist(),
+                )
+
         return down_output
 
     def _run_masked_gemm(
@@ -354,6 +391,14 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[masked][gateup] output   : %s", _tensor_stats(gateup_output)
             )
+
+        # Apply per-expert global post-GEMM scale (ModelOpt two-level quant).
+        # gateup_output shape: (num_groups, m, n) — group g corresponds to
+        # experts[g].  Scale is broadcast over the m and n dims.
+        if quant_info.w13_weight_scale_2 is not None:
+            scales = quant_info.w13_weight_scale_2[runner_input.experts]  # (G,)
+            gateup_output *= scales.to(gateup_output.dtype)[:, None, None]
+
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -412,6 +457,11 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[masked][down]   output   : %s", _tensor_stats(down_output)
             )
+
+        # Apply per-expert global post-GEMM scale for the down projection.
+        if quant_info.w2_weight_scale_2 is not None:
+            scales = quant_info.w2_weight_scale_2[runner_input.experts]  # (G,)
+            down_output *= scales.to(down_output.dtype)[:, None, None]
 
         return down_output
 

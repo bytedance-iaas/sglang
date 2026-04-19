@@ -1712,6 +1712,35 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_mb + w2_mb,
             )
 
+            # ModelOpt stores NVFP4 block scales in UE8M0 format (byte b = 2^(b-127))
+            # packed into float8_e4m3fn tensors.  The AsymGEMM kernel is called with
+            # disable_ue8m0_cast=True (because activation scales are already E4M3fn),
+            # so weight scales must be pre-converted from UE8M0 → E4M3fn here.
+            from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SCALE_UE8M0
+            if ASYMGEMM_SCALE_UE8M0:
+                def _ue8m0_to_e4m3fn(t: torch.Tensor) -> torch.Tensor:
+                    """Convert UE8M0 block-scale bytes to float8_e4m3fn.
+
+                    UE8M0: byte b → 2^(b − 127).  The result is clamped to 448
+                    (float8_e4m3fn max) before conversion to avoid NaN overflow.
+                    """
+                    f32 = t.view(torch.uint8).to(torch.float32)
+                    return (2.0 ** (f32 - 127.0)).clamp(max=448.0).to(torch.float8_e4m3fn)
+
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    _ue8m0_to_e4m3fn(layer.w13_weight_scale), requires_grad=False
+                )
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    _ue8m0_to_e4m3fn(layer.w2_weight_scale), requires_grad=False
+                )
+                logger.debug(
+                    "ModelOptFp4FusedMoEMethod: converted weight scales UE8M0→E4M3fn — "
+                    "layer_id=%s, w13_scale shape=%s, w2_scale shape=%s",
+                    layer_id,
+                    tuple(layer.w13_weight_scale.shape),
+                    tuple(layer.w2_weight_scale.shape),
+                )
+
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1954,11 +1983,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 AsymGemmFp4MoeQuantInfo,
             )
 
+            # Extract per-expert global post-GEMM correction scales
+            # (ModelOpt two-level quantization: block scale × global scale).
+            # For gated layers w13_weight_scale_2 may be (E, 2); take column 0
+            # (w1 and w3 share the same global scale in practice).
+            _w13_ws2 = layer.w13_weight_scale_2
+            if _w13_ws2.dim() > 1:
+                _w13_ws2 = _w13_ws2[:, 0]
+            _w13_ws2 = _w13_ws2.to(torch.float32)
+            _w2_ws2 = layer.w2_weight_scale_2.to(torch.float32)
+
             quant_info = AsymGemmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale
+                w2_scale=layer.w2_weight_scale,
+                w13_weight_scale_2=_w13_ws2,
+                w2_weight_scale_2=_w2_ws2,
             )
             return self.runner.run(dispatch_output, quant_info)
 
