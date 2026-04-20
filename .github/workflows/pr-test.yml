@@ -583,10 +583,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -690,10 +689,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -748,10 +746,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -803,10 +800,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -856,10 +852,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -943,10 +938,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -997,10 +991,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1067,10 +1060,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1117,10 +1109,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1177,10 +1168,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1243,10 +1233,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
