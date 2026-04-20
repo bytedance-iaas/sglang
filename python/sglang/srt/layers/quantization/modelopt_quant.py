@@ -1744,6 +1744,40 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
 
+        # asym_gemm path: bake per-expert global weight scales (weight_scale_2) into the
+        # per-block E4M3fn scales so the GEMM output is already in BF16 magnitude without
+        # any post-multiply.  ModelOpt uses two-level NVFP4 quantization: the checkpoint
+        # block scales are normalized by weight_scale_2, and the true scale per group is
+        # block_scale * weight_scale_2.  Since our activations are quantized fresh
+        # (without a global input scale), we only need to correct for the weight side.
+        if get_moe_runner_backend().is_asym_gemm():
+            layer_id = getattr(layer, "layer_id", "?")
+            dev = layer.w13_weight_scale.device
+            w13_ws2 = w13_weight_scale_2.to(device=dev, dtype=torch.float32)  # (E,)
+            w13_sf_f32 = layer.w13_weight_scale.to(torch.float32)             # (E, 2N, K//16)
+            w13_sf_new = (w13_sf_f32 * w13_ws2[:, None, None]).clamp(max=448.0).to(torch.float8_e4m3fn)
+            copy_or_rebind_param(layer, "w13_weight_scale", w13_sf_new)
+
+            w2_ws2 = layer.w2_weight_scale_2.to(device=dev, dtype=torch.float32)  # (E,)
+            w2_sf_f32 = layer.w2_weight_scale.to(torch.float32)                   # (E, K, N//16)
+            w2_sf_new = (w2_sf_f32 * w2_ws2[:, None, None]).clamp(max=448.0).to(torch.float8_e4m3fn)
+            copy_or_rebind_param(layer, "w2_weight_scale", w2_sf_new)
+
+            logger.warning(
+                "[FP4-asym-scale-bake] layer=%s "
+                "w13_weight_scale_2: min=%.4g max=%.4g | "
+                "w13_scale_before max=%.4g after max=%.4g | "
+                "w2_weight_scale_2: min=%.4g max=%.4g | "
+                "w2_scale_before max=%.4g after max=%.4g",
+                layer_id,
+                w13_ws2.min().item(), w13_ws2.max().item(),
+                w13_sf_f32.max().item(),
+                layer.w13_weight_scale.to(torch.float32).max().item(),
+                w2_ws2.min().item(), w2_ws2.max().item(),
+                w2_sf_f32.max().item(),
+                layer.w2_weight_scale.to(torch.float32).max().item(),
+            )
+
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
