@@ -198,13 +198,11 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
-        hidden_states_shape = running_state["hidden_states_shape"]
 
         # N is the packed-major output dim of the gateup weights.
         # w13_weight is (E, 2*N, K//2); the gate-up output has 2*N bf16 columns
         # which silu_and_mul reduces to N.
         w13_n = quant_info.w13_weight.size(1)
-        K = hidden_states_shape[1]
 
         # Zero-init so padding rows (outside the kernel's offset range) are 0
         # rather than uninitialized garbage.  Uninitialized padding can produce
@@ -263,8 +261,9 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         down_in_fp4, down_in_scale = _quantize_bf16_to_nvfp4_e4m3(down_in_bf16)
         del down_in_bf16
 
+        n_down = quant_info.w2_weight.size(1)
         down_output = torch.zeros(
-            (all_tokens, K),
+            (all_tokens, n_down),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
