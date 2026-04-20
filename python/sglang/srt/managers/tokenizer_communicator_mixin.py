@@ -85,6 +85,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    send_msgpack,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -120,7 +121,10 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            self._sender.send_pyobj(obj)
+            if hasattr(self._sender, "send_msgpack_obj"):
+                self._sender.send_msgpack_obj(obj)
+            else:
+                send_msgpack(self._sender, obj)
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -140,7 +144,10 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                self._sender.send_pyobj(obj)
+                if hasattr(self._sender, "send_msgpack_obj"):
+                    self._sender.send_msgpack_obj(obj)
+                else:
+                    send_msgpack(self._sender, obj)
 
         await self._result_event.wait()
         result_values = copy.deepcopy(self._result_values)
@@ -1092,7 +1099,7 @@ class TokenizerCommunicatorMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
+        self._send_to_scheduler_msg(obj)
 
         try:
             return await future
@@ -1104,7 +1111,7 @@ class TokenizerCommunicatorMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await self.send_to_scheduler.send_pyobj(obj)
+        await self._async_send_to_scheduler_msg(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

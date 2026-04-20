@@ -35,8 +35,13 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
+    TokenizedEmbeddingReqInputIPC,
     TokenizedGenerateReqInput,
+    TokenizedGenerateReqInputIPC,
     WatchLoadUpdateReq,
+    _unwrap_t2s_msg,
+    recv_msgpack_t2s,
+    send_msgpack,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -180,15 +185,23 @@ class DataParallelController:
         if server_args.enable_metrics:
             start_cpu_monitor_thread("data_parallel_controller")
 
+    def _send_to_worker(self, worker, obj):
+        if isinstance(obj, TokenizedGenerateReqInput):
+            send_msgpack(worker, TokenizedGenerateReqInputIPC.from_tokenized(obj))
+        elif isinstance(obj, TokenizedEmbeddingReqInput):
+            send_msgpack(worker, TokenizedEmbeddingReqInputIPC.from_tokenized(obj))
+        else:
+            send_msgpack(worker, obj)
+
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if self.status[i]:
-                worker.send_pyobj(obj)
+                self._send_to_worker(worker, obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+            self._send_to_worker(worker, obj)
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
@@ -526,7 +539,7 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            self._send_to_worker(self.workers[req.routed_dp_rank], req)
             return True
         return False
 
@@ -537,7 +550,7 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                self._send_to_worker(self.workers[self.round_robin_counter], req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -565,26 +578,28 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        self._send_to_worker(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        self._send_to_worker(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
-        self.workers[target_worker].send_pyobj(req)
+        self._send_to_worker(self.workers[target_worker], req)
 
     def event_loop(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = _unwrap_t2s_msg(
+                        recv_msgpack_t2s(self.recv_from_tokenizer, zmq.NOBLOCK)
+                    )
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)

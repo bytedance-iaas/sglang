@@ -74,6 +74,8 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
+    recv_msgpack_rpc_res,
+    send_msgpack,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1078,8 +1080,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
+        send_msgpack(self.send_to_rpc, obj)
+        recv_req = recv_msgpack_rpc_res(self.send_to_rpc)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 

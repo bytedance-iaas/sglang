@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     async_recv_msgpack_d2t,
     recv_msgpack_s2d,
+    recv_msgpack_t2s,
     send_msgpack,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
@@ -378,8 +379,8 @@ class MultiTokenizerRouter:
 
     async def router_worker_obj(self):
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            data = await self.receive_from_worker.recv()
+            await self.send_to_scheduler.send(data)
 
     async def handle_loop(self):
         # special reqs will recv from scheduler, need to route to right worker
@@ -390,10 +391,10 @@ class MultiTokenizerRouter:
 
     async def _distribute_result_to_workers(self, recv_obj):
         # Distribute result to each worker
-        if isinstance(recv_obj, BaseReq):
-            ipc_names = [recv_obj.http_worker_ipc]
-        elif hasattr(recv_obj, "http_worker_ipcs"):
+        if hasattr(recv_obj, "http_worker_ipcs") and recv_obj.http_worker_ipcs is not None:
             ipc_names = recv_obj.http_worker_ipcs
+        elif hasattr(recv_obj, "http_worker_ipc"):
+            ipc_names = [recv_obj.http_worker_ipc]
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
 
@@ -433,11 +434,10 @@ class TokenizerWorker(TokenizerManager):
         )
 
     def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
-
-        if isinstance(req, BaseReq):
-            req.http_worker_ipc = self.tokenizer_ipc_name
-        elif isinstance(req, BaseBatchReq):
+        if isinstance(req, BaseBatchReq) or hasattr(req, "http_worker_ipcs"):
             req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
+        elif isinstance(req, BaseReq) or hasattr(req, "http_worker_ipc"):
+            req.http_worker_ipc = self.tokenizer_ipc_name
         else:
             raise ValueError(f"Unknown req type: {type(req)}")
 
@@ -539,7 +539,12 @@ class SenderWrapper:
         self.port_args = port_args
         self.send_to_scheduler = send_to_scheduler
 
-    def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
+    def send(self, data):
+        """Sync send of raw bytes; used by send_msgpack(wrapper, obj)."""
+        return self.send_to_scheduler.send(data)
+
+    def send_msgpack_obj(self, obj):
+        """Send a msgspec.Struct, injecting http_worker_ipc for response routing."""
+        if hasattr(obj, "http_worker_ipc") and obj.http_worker_ipc is None:
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)
+        send_msgpack(self.send_to_scheduler, obj)

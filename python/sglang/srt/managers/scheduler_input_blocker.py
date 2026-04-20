@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Any, List, Optional
 
-from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
+from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType, send_msgpack
 from sglang.srt.utils.poll_based_barrier import PollBasedBarrier
 
 logger = logging.getLogger(__name__)
@@ -99,8 +99,14 @@ class _State(Enum):
 
 @contextmanager
 def input_blocker_guard_region(send_to_scheduler):
-    send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.BLOCK))
+    if hasattr(send_to_scheduler, "send_msgpack_obj"):
+        send_to_scheduler.send_msgpack_obj(BlockReqInput(BlockReqType.BLOCK))
+    else:
+        send_msgpack(send_to_scheduler, BlockReqInput(BlockReqType.BLOCK))
     try:
         yield
     finally:
-        send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.UNBLOCK))
+        if hasattr(send_to_scheduler, "send_msgpack_obj"):
+            send_to_scheduler.send_msgpack_obj(BlockReqInput(BlockReqType.UNBLOCK))
+        else:
+            send_msgpack(send_to_scheduler, BlockReqInput(BlockReqType.UNBLOCK))

@@ -87,7 +87,6 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
-    BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
@@ -144,6 +143,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    _unwrap_t2s_msg,
+    recv_msgpack_rpc_req,
+    recv_msgpack_t2s,
     send_msgpack,
 )
 from sglang.srt.managers.mm_utils import (
@@ -505,7 +507,7 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer, use_msgpack=True)
             self.send_to_detokenizer = SenderWrapper(
                 send_to_detokenizer, use_msgpack=True
             )
@@ -1507,7 +1509,9 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = _unwrap_t2s_msg(
+                            recv_msgpack_t2s(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        )
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1516,7 +1520,7 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        recv_rpc = recv_msgpack_rpc_req(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
@@ -1672,7 +1676,7 @@ class Scheduler(
                     self.send_to_tokenizer.send_output(output, recv_req)
                 else:
                     if self.recv_from_rpc is not None:
-                        self.recv_from_rpc.send_pyobj(output)
+                        send_msgpack(self.recv_from_rpc, output)
 
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
@@ -3592,15 +3596,18 @@ class SenderWrapper:
         if self.socket is None:
             return
 
+        if (
+            recv_obj is not None
+            and hasattr(recv_obj, "http_worker_ipc")
+            and recv_obj.http_worker_ipc is not None
+            and hasattr(output, "http_worker_ipc")
+            and output.http_worker_ipc is None
+        ):
+            output.http_worker_ipc = recv_obj.http_worker_ipc
+
         if self.use_msgpack:
             send_msgpack(self.socket, output)
         else:
-            if (
-                isinstance(recv_obj, BaseReq)
-                and recv_obj.http_worker_ipc is not None
-                and output.http_worker_ipc is None
-            ):
-                output.http_worker_ipc = recv_obj.http_worker_ipc
             self.socket.send_pyobj(output)
 
 
