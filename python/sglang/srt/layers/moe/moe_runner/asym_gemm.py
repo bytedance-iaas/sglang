@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 import triton
 import triton.language as tl
 
@@ -857,6 +860,8 @@ def _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned(
 
     _BLOCK_M = 128  # must match get_mk_alignment_for_contiguous_layout() in layout.hpp
 
+    logger.warning("[ALIGNED-FP4] pre-permute called")  # one-time diagnostic
+
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
@@ -923,6 +928,17 @@ def _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned(
     # 7. Quantize the padded bf16 buffer to NVFP4.
     sorted_fp4, sorted_scale = _quantize_bf16_to_nvfp4_e4m3(padded_hidden)
     del padded_hidden
+
+    # Diagnostic: log sizes so we can confirm padding is happening
+    if not getattr(_pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned, "_logged", False):
+        _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned._logged = True
+        num_active = int((counts > 0).sum().item())
+        active_counts = counts[counts > 0][:8].tolist()
+        logger.warning(
+            "[ALIGNED-FP4] all_tokens=%d padded_total=%d num_active=%d "
+            "sample_unpadded_counts=%s",
+            all_tokens, padded_total, num_active, active_counts,
+        )
 
     # 8. Build offsets/experts/list_size from the aligned seg_indptr.
     #    Each (start, end) pair is now 128-aligned, matching block_m=128.
