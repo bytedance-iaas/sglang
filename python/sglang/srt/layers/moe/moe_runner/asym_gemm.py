@@ -31,40 +31,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.offloader import get_offloader
 
-# Cached hot-path function references (populated on first use to avoid circular imports)
-_hp = {}  # hot-path cache dict
-
-def _hp_get(name):
-    """Get a cached hot-path function reference. Populated lazily on first use."""
-    v = _hp.get(name)
-    if v is not None:
-        return v
-    if name == 'preprocess':
-        from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
-        _hp[name] = moe_ep_deepgemm_preprocess
-    elif name == 'post_reorder':
-        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
-        _hp[name] = post_reorder_triton_kernel
-    elif name == 'silu_masked':
-        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
-        _hp[name] = silu_and_mul_masked_post_quant_fwd
-    elif name == 'quant_8bit':
-        from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
-        _hp[name] = sglang_per_token_group_quant_8bit
-    elif name == 'quant_fp8':
-        from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-        _hp[name] = sglang_per_token_group_quant_fp8
-    elif name == 'tma_align':
-        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
-        _hp[name] = tma_align_input_scale
-    elif name == 'combine_input':
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-        _hp[name] = StandardCombineInput
-    elif name == 'seg_indptr':
-        from sglang.srt.layers.moe.ep_moe.kernels import compute_seg_indptr_triton_kernel
-        _hp[name] = compute_seg_indptr_triton_kernel
-    return _hp[name]
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
@@ -175,149 +141,6 @@ def build_offsets_experts_from_masked_m(
     )
 
 
-@triton.jit
-def _build_offsets_experts_kernel(
-    masked_m_ptr,
-    offsets_ptr,
-    experts_ptr,
-    list_size_ptr,
-    max_m: int,
-    block_m: int,
-):
-    g = tl.program_id(0)
-    v = tl.load(masked_m_ptr + g)
-    if v > 0:
-        slot = tl.atomic_add(list_size_ptr, 1)
-        start = g * max_m
-        end = start + ((v + block_m - 1) // block_m) * block_m
-        tl.store(offsets_ptr + slot * 2, start)
-        tl.store(offsets_ptr + slot * 2 + 1, end)
-        tl.store(experts_ptr + slot, g)
-
-
-def build_offsets_experts_from_seg_indptr(
-    seg_indptr: torch.Tensor, num_groups: int
-):
-    """
-    Build offsets and experts for contiguous m-grouped GEMM from segment index pointer.
-
-    Args:
-        seg_indptr: (num_groups + 1,) cumulative token counts per expert
-        num_groups: number of expert groups
-
-    Returns:
-        offsets:   flat int32 tensor of size 2*num_groups
-        experts:   int32 tensor of size num_groups+1
-        list_size: num_active + 1
-    """
-    offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=seg_indptr.device)
-    experts = torch.full(
-        (num_groups + 1,), -1, dtype=torch.int32, device=seg_indptr.device
-    )
-    list_size = torch.zeros(1, 1, dtype=torch.int32, device=seg_indptr.device)
-
-    _build_offsets_experts_contig_kernel[(num_groups,)](
-        seg_indptr, offsets, experts, list_size
-    )
-    list_size.add_(1)
-    return offsets, experts, list_size
-
-
-@triton.jit
-def _build_offsets_experts_contig_kernel(
-    seg_indptr_ptr,
-    offsets_ptr,
-    experts_ptr,
-    list_size_ptr,
-):
-    g = tl.program_id(0)
-    start = tl.load(seg_indptr_ptr + g)
-    end = tl.load(seg_indptr_ptr + g + 1)
-    if end > start:
-        slot = tl.atomic_add(list_size_ptr, 1)
-        tl.store(offsets_ptr + slot * 2, start.to(tl.int32))
-        tl.store(offsets_ptr + slot * 2 + 1, end.to(tl.int32))
-        tl.store(experts_ptr + slot, g)
-
-
-def build_offsets_experts_direct(
-    sorted_expert_ids: torch.Tensor, num_groups: int, all_tokens: int
-):
-    """Build offsets/experts/list_size directly from sorted expert IDs via binary search.
-    Fuses compute_seg_indptr + build_offsets into a single kernel launch."""
-    offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=sorted_expert_ids.device)
-    experts = torch.full(
-        (num_groups + 1,), -1, dtype=torch.int32, device=sorted_expert_ids.device
-    )
-    list_size = torch.zeros(1, 1, dtype=torch.int32, device=sorted_expert_ids.device)
-
-    _build_offsets_direct_kernel[(num_groups,)](
-        sorted_expert_ids, offsets, experts, list_size, all_tokens,
-    )
-    list_size.add_(1)
-    return offsets, experts, list_size
-
-
-@triton.jit
-def _build_offsets_direct_kernel(
-    sorted_ids_ptr,
-    offsets_ptr,
-    experts_ptr,
-    list_size_ptr,
-    all_tokens,
-):
-    """Binary search for start/end of each expert in sorted IDs, then build offsets."""
-    g = tl.program_id(0)
-
-    # Binary search for start: first index where sorted_ids >= g
-    lo = 0
-    hi = all_tokens
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if tl.load(sorted_ids_ptr + mid) < g:
-            lo = mid + 1
-        else:
-            hi = mid
-    start = lo
-
-    # Binary search for end: first index where sorted_ids >= g+1
-    lo2 = start
-    hi2 = all_tokens
-    while lo2 < hi2:
-        mid2 = (lo2 + hi2) // 2
-        if tl.load(sorted_ids_ptr + mid2) < g + 1:
-            lo2 = mid2 + 1
-        else:
-            hi2 = mid2
-    end = lo2
-
-    if end > start:
-        slot = tl.atomic_add(list_size_ptr, 1)
-        tl.store(offsets_ptr + slot * 2, start.to(tl.int32))
-        tl.store(offsets_ptr + slot * 2 + 1, end.to(tl.int32))
-        tl.store(experts_ptr + slot, g)
-
-
-def _invert_permutation(sorted_indices: torch.Tensor, n: int) -> torch.Tensor:
-    """Build inverse permutation: src2dst[sorted_indices[i]] = i, using a single Triton kernel."""
-    src2dst = torch.empty(n, device=sorted_indices.device, dtype=torch.int32)
-    BLOCK = 1024
-    grid = ((n + BLOCK - 1) // BLOCK,)
-    _invert_permutation_kernel[grid](sorted_indices, src2dst, n, BLOCK=BLOCK)
-    return src2dst
-
-
-@triton.jit
-def _invert_permutation_kernel(
-    sorted_indices_ptr, src2dst_ptr, n, BLOCK: tl.constexpr
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    idx = tl.load(sorted_indices_ptr + offs, mask=mask)
-    tl.store(src2dst_ptr + idx, offs.to(tl.int32), mask=mask)
-
-
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -326,9 +149,9 @@ class AsymGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    offsets: Optional[torch.Tensor] = None
-    experts: Optional[torch.Tensor] = None
-    list_size: Optional[torch.Tensor] = None
+    offsets: Optional[int] = None
+    experts: Optional[int] = None
+    list_size: int = 0
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -405,12 +228,18 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
+        m_indices = runner_input.m_indices
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -428,7 +257,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
         if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
-            hidden_states_scale = _hp_get("tma_align")(hidden_states_scale)
+            hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
@@ -442,17 +271,25 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        # Fuse silu_and_mul + FP8 quantization into a single kernel
-        down_input_fp8, down_input_scale = _hp_get("quant_fp8")(
-            gateup_output.view(-1, N),
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
+        del gateup_output
+
+        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+            down_input,
             scale_block_size,
             column_major_scales=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
             scale_tma_aligned=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
             scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
-            fuse_silu_and_mul=True,
-            enable_v2=True,
         )
-        del gateup_output
+        del down_input
 
         down_output = torch.empty(
             (all_tokens, K),
@@ -460,7 +297,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
         if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
-            down_input_scale = _hp_get("tma_align")(down_input_scale)
+            down_input_scale = tma_align_input_scale(down_input_scale)
 
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
@@ -479,6 +316,14 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        from sglang.srt.layers import asym_gemm_wrapper
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_post_quant_fwd,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_8bit,
+        )
+
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -491,7 +336,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
 
         hidden_states_device = running_state["hidden_states_device"]
 
-        # GroupGemm-0: scale conversion
+        # GroupGemm-0
         if asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
@@ -528,7 +373,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         # Act
         scale_block_size = 128
         if _MASKED_GEMM_FAST_ACT:
-            down_input, down_input_scale = _hp_get('quant_8bit')(
+            down_input, down_input_scale = sglang_per_token_group_quant_8bit(
                 x=gateup_output,
                 dst_dtype=torch.float8_e4m3fn,
                 group_size=scale_block_size,
@@ -558,7 +403,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.float32,
             )
-            _hp_get('silu_masked')(
+            silu_and_mul_masked_post_quant_fwd(
                 gateup_output,
                 down_input,
                 down_input_scale,
@@ -634,12 +479,13 @@ def pre_permute_standard_to_asym_gemm(
         return _pre_permute_standard_to_asym_gemm_bf16(
             dispatch_output, quant_info, runner_config, running_state
         )
+    
     if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
-        return _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned(
+        return _pre_permute_standard_to_asym_gemm_fp4(
             dispatch_output, quant_info, runner_config, running_state
         )
 
-    return _pre_permute_standard_to_asym_gemm_fp8_contiguous(
+    return _pre_permute_standard_to_asym_gemm_fp8(
         dispatch_output, quant_info, runner_config, running_state
     )
 
@@ -650,6 +496,8 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AsymGemmRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
+
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
@@ -661,16 +509,18 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
 
+    topk_weights, topk_ids = topk_weights, topk_ids
+
     # PreReorder
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
-        _hp_get('preprocess')(
-                topk_ids,
-                runner_config.num_local_experts,
-                hidden_states,
-                runner_config.top_k,
-                quant_info.block_shape,
-            )
+        moe_ep_deepgemm_preprocess(
+            topk_ids,
+            runner_config.num_local_experts,
+            hidden_states,
+            runner_config.top_k,
+            quant_info.block_shape,
         )
+    )
 
     dispose_tensor(hidden_states_ref)
 
@@ -927,15 +777,22 @@ def _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned(
     sorted_fp4, sorted_scale = _quantize_bf16_to_nvfp4_e4m3(padded_hidden)
     del padded_hidden
 
-    # Diagnostic: log sizes so we can confirm padding is happening
+    # Diagnostic: log pre-quantization hidden state magnitude and padding stats
     if not getattr(_pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned, "_logged", False):
         _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned._logged = True
         num_active = int((counts > 0).sum().item())
         active_counts = counts[counts > 0][:8].tolist()
+        # Log real-token hidden states (first 640 at most) to see actual BF16 magnitude
+        real_mask = padded_positions < padded_total  # all are valid, but positions are for real tokens
+        real_hs_f32 = hidden_states_ref.to(torch.float32)  # (num_tokens, K) pre-quantize
+        hs_rms = real_hs_f32.pow(2).mean().sqrt().item()
+        hs_max = real_hs_f32.abs().max().item()
         logger.warning(
             "[ALIGNED-FP4] all_tokens=%d padded_total=%d num_active=%d "
-            "sample_unpadded_counts=%s",
+            "sample_unpadded_counts=%s | "
+            "hidden_states (pre-quant, %d tokens): rms=%.4g max=%.4g",
             all_tokens, padded_total, num_active, active_counts,
+            num_tokens, hs_rms, hs_max,
         )
 
     # 8. Build offsets/experts/list_size from the aligned seg_indptr.
@@ -1173,7 +1030,10 @@ def post_permute_asym_gemm_to_standard(
     quant_info: AsymGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
     hidden_states_device = running_state["hidden_states_device"]
@@ -1184,16 +1044,16 @@ def post_permute_asym_gemm_to_standard(
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
-    _hp_get('post_reorder')[(hidden_states_shape[0],)](
-            runner_output.hidden_states,
-            output,
-            src2dst,
-            topk_ids,
-            topk_weights,
-            runner_config.top_k,
-            hidden_states_shape[1],
-            BLOCK_SIZE=512,
-        )
+    post_reorder_triton_kernel[(hidden_states_shape[0],)](
+        runner_output.hidden_states,
+        output,
+        src2dst,
+        topk_ids,
+        topk_weights,
+        runner_config.top_k,
+        hidden_states_shape[1],
+        BLOCK_SIZE=512,
+    )
 
     dispose_tensor(runner_output.hidden_states)
 
@@ -1215,7 +1075,7 @@ def post_permute_asym_gemm_to_standard(
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
 
-    return _hp_get('combine_input')(
+    return StandardCombineInput(
         hidden_states=output,
     )
 

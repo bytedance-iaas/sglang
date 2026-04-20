@@ -198,6 +198,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
+        hidden_states_shape = running_state["hidden_states_shape"]
 
         # N is the packed-major output dim of the gateup weights.
         # w13_weight is (E, 2*N, K//2); the gate-up output has 2*N bf16 columns
@@ -366,11 +367,11 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
                 "[masked][gateup] w13_scale: %s", _scale_stats(w13_scale)
             )
             logger.debug(
-                "[masked][gateup] masked_m=%s expected_m=%d offsets=%s experts=%s list_size=%s",
+                "[masked][gateup] masked_m=%s expected_m=%d offsets=%s experts=%s list_size=%d",
                 masked_m.tolist(), expected_m,
                 runner_input.offsets.tolist(),
                 runner_input.experts.tolist(),
-                runner_input.list_size.tolist(),
+                runner_input.list_size,
             )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_masked(
             (hidden_states, hidden_states_scale),
