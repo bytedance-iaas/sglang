@@ -125,37 +125,11 @@ def cached_group_concurrent_contiguous(
 
 """Async-KV tuning via env vars.
 
-All flags are parsed as booleans with truthy values in:
-`{"1", "true", "yes", "y", "on"}` (case-insensitive).
+Env vars:
 
-Env vars (backward compatible aliases):
-
-- `SGLANG_ASYNC_KV_KV_PER_LAYER_EVENT_SYNC` (alias: `SGLANG_ASYNC_KV_GQA_PER_LAYER_EVENT_SYNC`):
-  Record a CUDA event per KV tensor and synchronize before transfer.
-  Helps correctness when kernels are asynchronous, but may reduce overlap.
-- `SGLANG_ASYNC_KV_MAMBA_PER_LAYER_EVENT_SYNC`:
-  Record/synchronize a CUDA event per Mamba state tensor.
-- `SGLANG_ASYNC_KV_MAMBA_PER_LAYER_CUDA_SYNC`:
-  Force a global `torch.cuda.synchronize()` per Mamba state tensor as a fallback when
-  per-layer event sync is disabled.
-- `SGLANG_ASYNC_KV_MISSING_WAIT_MS`:
-  During the final flush, wait this long for late tensor callbacks before treating
-  tensors as missing.
+- `SGLANG_ASYNC_KV_MISSING_WAIT_MS`: During the final flush, wait this long for late
+  tensor callbacks before treating tensors as missing.
 """
-
-
-_ENV_TRUE = {"1", "true", "yes", "y", "on"}
-
-
-def _env_flag(name: str, default: str) -> bool:
-    return os.getenv(name, default).strip().lower() in _ENV_TRUE
-
-
-def _env_flag_alias(names: Tuple[str, ...], default: str) -> bool:
-    for n in names:
-        if n in os.environ:
-            return _env_flag(n, default)
-    return _env_flag(names[0], default)
 
 
 def _env_int(name: str, default: str) -> int:
@@ -197,25 +171,9 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             if self.is_mla_backend
             else self._kv_tensor_ntensors // 2
         )
-        self._kv_per_layer_event_sync = _env_flag_alias(
-            (
-                "SGLANG_ASYNC_KV_KV_PER_LAYER_EVENT_SYNC",
-                "SGLANG_ASYNC_KV_GQA_PER_LAYER_EVENT_SYNC",
-            ),
-            "1",
-        )
-        self._mamba_per_layer_event_sync = (
-            _env_flag("SGLANG_ASYNC_KV_MAMBA_PER_LAYER_EVENT_SYNC", "1")
-        )
-        self._mamba_per_layer_cuda_sync = (
-            _env_flag("SGLANG_ASYNC_KV_MAMBA_PER_LAYER_CUDA_SYNC", "0")
-        )
         self._async_kv_missing_wait_ms = _env_int("SGLANG_ASYNC_KV_MISSING_WAIT_MS", "20")
-        self._mamba_per_layer_cuda_sync_warned = False
-        self._mamba_per_layer_event_sync_warned = False
         # (room_id, tensor_id) -> CUDA event recorded when layer becomes ready.
         self._layer_ready_events: Dict[Tuple[int, int], Any] = {}
-        self._kv_per_layer_event_sync_warned = False
 
     @property
     def is_support_async(self):
@@ -269,17 +227,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             with self._lock:
                 for rid in rooms:
                     self._layer_ready_events[(int(rid), int(tensor_id))] = event
-
-            if reason == "kv" and self._kv_per_layer_event_sync and not self._kv_per_layer_event_sync_warned:
-                self._kv_per_layer_event_sync_warned = True
-                logger.info("async kv kv per-layer event sync enabled")
-            if (
-                reason == "mamba_state"
-                and self._mamba_per_layer_event_sync
-                and not self._mamba_per_layer_event_sync_warned
-            ):
-                self._mamba_per_layer_event_sync_warned = True
-                logger.info("async kv mamba per-layer event sync enabled")
         except Exception:
             # Best-effort feature; do not crash the critical path.
             logger.debug(
@@ -419,15 +366,14 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 layer_id,
                             )
                             continue
-
+                        
                         is_state_tensor = layer_id >= self._kv_tensor_ntensors
                         if not is_state_tensor:
-                            if self._kv_per_layer_event_sync:
-                                self._try_sync_ready_event(
-                                    room_id=int(room_id),
-                                    tensor_id=int(layer_id),
-                                    reason="kv",
-                                )
+                            self._try_sync_ready_event(
+                                room_id=int(room_id),
+                                tensor_id=int(layer_id),
+                                reason="kv",
+                            )
                             dst = transfer_info.dst_kv_indices[index_slice]
                             if len(dst) < len(kv_indice):
                                 logger.warning(
@@ -472,10 +418,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 continue
                             if not transfer_info.dst_state_indices:
                                 continue
-                            if (
-                                self.kv_args.state_type == "mamba"
-                                and self._mamba_per_layer_event_sync
-                            ):
+                            if self.kv_args.state_type == "mamba":
                                 self._try_sync_ready_event(
                                     room_id=int(room_id),
                                     tensor_id=int(layer_id),
@@ -561,47 +504,16 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             return
 
         if tensor_id < self._kv_tensor_ntensors:
-            kind = "kv"
-        else:
-            kind = "state"
-        if (
-            kind == "state"
-            and self.kv_args.state_type == "mamba"
-            and not self._mamba_per_layer_event_sync
-            and self._mamba_per_layer_cuda_sync
-        ):
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    if not self._mamba_per_layer_cuda_sync_warned:
-                        self._mamba_per_layer_cuda_sync_warned = True
-                        logger.warning(
-                            "async kv mamba per-layer cuda sync enabled; may reduce overlap"
-                        )
-            except Exception:
-                logger.debug(
-                    "async kv mamba cuda synchronize failed: room_count=%s tensor=%s",
-                    len(current.rooms),
-                    tensor_id,
-                    exc_info=True,
-                )
-        if (
-            kind == "state"
-            and self.kv_args.state_type == "mamba"
-            and self._mamba_per_layer_event_sync
-        ):
-            self._try_record_ready_event_for_rooms(
-                rooms=current.rooms,
-                tensor_id=int(tensor_id),
-                reason="mamba_state",
-            )
-        if kind == "kv" and self._kv_per_layer_event_sync:
             self._try_record_ready_event_for_rooms(
                 rooms=current.rooms,
                 tensor_id=int(tensor_id),
                 reason="kv",
+            )
+        elif self.kv_args.state_type == "mamba":
+            self._try_record_ready_event_for_rooms(
+                rooms=current.rooms,
+                tensor_id=int(tensor_id),
+                reason="mamba_state",
             )
 
         with self._queue_lock:
