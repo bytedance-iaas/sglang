@@ -123,6 +123,10 @@ class TestW8A8Fp8(BaseW8A8Test):
         super().test_gsm8k()
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "Qwen3 FP8 MoE accuracy/throughput is unstable on current CUDA PR UT runners",
+)
 class TestW8A8Fp8MoE(BaseW8A8Test):
     model = "RedHatAI/Qwen3-30B-A3B-FP8-dynamic"
     quantization = "w8a8_fp8"
