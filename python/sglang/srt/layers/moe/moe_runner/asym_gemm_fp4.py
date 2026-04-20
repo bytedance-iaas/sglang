@@ -257,16 +257,17 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             )
 
         # Apply per-expert global post-GEMM scale (ModelOpt two-level quant).
+        # list_size is (1,1) holding num_active+1; offsets stores [s0,e0,s1,e1,...].
         if quant_info.w13_weight_scale_2 is not None:
-            total_real = int(runner_input.list_size.sum().item())
-            per_expert_scale = quant_info.w13_weight_scale_2[runner_input.experts]
-            per_token_scale = per_expert_scale.repeat_interleave(runner_input.list_size)
-            gateup_output[:total_real] *= per_token_scale.to(gateup_output.dtype).unsqueeze(1)
+            num_active = int(runner_input.list_size.item()) - 1
+            for j in range(num_active):
+                s = int(runner_input.offsets[2 * j].item())
+                e = int(runner_input.offsets[2 * j + 1].item())
+                expert_id = int(runner_input.experts[j].item())
+                scale = quant_info.w13_weight_scale_2[expert_id].to(gateup_output.dtype)
+                gateup_output[s:e] *= scale
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[contig][gateup] w13_scale_2 applied: per_expert_scale=%s",
-                    per_expert_scale.tolist(),
-                )
+                logger.debug("[contig][gateup] w13_scale_2 applied to %d expert segments", num_active)
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -318,15 +319,15 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
 
         # Apply per-expert global post-GEMM scale for the down projection.
         if quant_info.w2_weight_scale_2 is not None:
-            total_real = int(runner_input.list_size.sum().item())
-            per_expert_scale = quant_info.w2_weight_scale_2[runner_input.experts]
-            per_token_scale = per_expert_scale.repeat_interleave(runner_input.list_size)
-            down_output[:total_real] *= per_token_scale.to(down_output.dtype).unsqueeze(1)
+            num_active = int(runner_input.list_size.item()) - 1
+            for j in range(num_active):
+                s = int(runner_input.offsets[2 * j].item())
+                e = int(runner_input.offsets[2 * j + 1].item())
+                expert_id = int(runner_input.experts[j].item())
+                scale = quant_info.w2_weight_scale_2[expert_id].to(down_output.dtype)
+                down_output[s:e] *= scale
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[contig][down]   w2_scale_2 applied: per_expert_scale=%s",
-                    per_expert_scale.tolist(),
-                )
+                logger.debug("[contig][down]   w2_scale_2 applied to %d expert segments", num_active)
 
         return down_output
 
@@ -393,11 +394,14 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             )
 
         # Apply per-expert global post-GEMM scale (ModelOpt two-level quant).
-        # gateup_output shape: (num_groups, m, n) — group g corresponds to
-        # experts[g].  Scale is broadcast over the m and n dims.
+        # gateup_output shape: (num_groups, m, n) — slot g → experts[g].
+        # experts has a -1 terminator; only slots 0..num_active-1 are real.
         if quant_info.w13_weight_scale_2 is not None:
-            scales = quant_info.w13_weight_scale_2[runner_input.experts]  # (G,)
-            gateup_output *= scales.to(gateup_output.dtype)[:, None, None]
+            num_active = int(runner_input.list_size.item()) - 1
+            for j in range(num_active):
+                expert_id = int(runner_input.experts[j].item())
+                scale = quant_info.w13_weight_scale_2[expert_id].to(gateup_output.dtype)
+                gateup_output[j] *= scale
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -460,8 +464,11 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
 
         # Apply per-expert global post-GEMM scale for the down projection.
         if quant_info.w2_weight_scale_2 is not None:
-            scales = quant_info.w2_weight_scale_2[runner_input.experts]  # (G,)
-            down_output *= scales.to(down_output.dtype)[:, None, None]
+            num_active = int(runner_input.list_size.item()) - 1
+            for j in range(num_active):
+                expert_id = int(runner_input.experts[j].item())
+                scale = quant_info.w2_weight_scale_2[expert_id].to(down_output.dtype)
+                down_output[j] *= scale
 
         return down_output
 
