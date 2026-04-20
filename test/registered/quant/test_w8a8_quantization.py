@@ -24,7 +24,21 @@ def _has_hf_cache_entry(repo_id: str, repo_type: str = "model") -> bool:
     if not cache_root:
         return False
     prefix = "datasets--" if repo_type == "dataset" else "models--"
-    return os.path.isdir(os.path.join(cache_root, prefix + repo_id.replace("/", "--")))
+    repo_cache = os.path.join(cache_root, prefix + repo_id.replace("/", "--"))
+    if not os.path.isdir(repo_cache):
+        return False
+    if repo_type != "model":
+        return True
+
+    snapshot_root = os.path.join(repo_cache, "snapshots")
+    if not os.path.isdir(snapshot_root):
+        return False
+
+    weight_suffixes = (".safetensors", ".bin", ".pt")
+    for root, _, files in os.walk(snapshot_root):
+        if any(filename.endswith(weight_suffixes) for filename in files):
+            return True
+    return False
 
 
 class BaseW8A8Test(CustomTestCase):
