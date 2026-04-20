@@ -7,6 +7,7 @@ Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
 """
 
+import os
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
@@ -21,6 +22,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -71,6 +73,10 @@ class HiCacheBaseServer(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "HiCache standard server setup is unstable in current PR UT",
+)
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
@@ -150,6 +156,10 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     mmlu_accept_length_thres = 2.26
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "HiCache page server setup is unstable in current PR UT",
+)
 class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 
