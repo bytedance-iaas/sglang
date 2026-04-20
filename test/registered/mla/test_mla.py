@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -8,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -16,6 +18,10 @@ register_cuda_ci(est_time=194, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "MLA MGSM accuracy is unstable on current CUDA PR UT H100 runners",
+)
 class TestMLA(CustomTestCase, MGSMEnMixin):
     mgsm_en_score_threshold = 0.8
 
