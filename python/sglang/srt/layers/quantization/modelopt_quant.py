@@ -1983,23 +1983,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 AsymGemmFp4MoeQuantInfo,
             )
 
-            # Extract per-expert global post-GEMM correction scales
-            # (ModelOpt two-level quantization: block scale × global scale).
-            # For gated layers w13_weight_scale_2 may be (E, 2); take column 0
-            # (w1 and w3 share the same global scale in practice).
-            _w13_ws2 = layer.w13_weight_scale_2
-            if _w13_ws2.dim() > 1:
-                _w13_ws2 = _w13_ws2[:, 0]
-            _w13_ws2 = _w13_ws2.to(torch.float32)
-            _w2_ws2 = layer.w2_weight_scale_2.to(torch.float32)
-
             quant_info = AsymGemmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                w13_weight_scale_2=_w13_ws2,
-                w2_weight_scale_2=_w2_ws2,
             )
             return self.runner.run(dispatch_output, quant_info)
 

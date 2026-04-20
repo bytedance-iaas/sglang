@@ -82,19 +82,12 @@ class AsymGemmFp4MoeQuantInfo(MoeQuantInfo):
     Weights are packed FP4 (uint8, two E2M1 values per byte). Scales are
     per-group E4M3 bytes with group_size=16 along K. The AsymGEMM kernel
     internally re-packs the scales into its TMA-aligned uint32 layout.
-
-    w13_weight_scale_2 / w2_weight_scale_2 are per-expert global float32
-    post-GEMM correction factors (ModelOpt two-level quantization).  They
-    are applied row-wise after each grouped GEMM to restore the correct
-    magnitude.  None means no correction (legacy checkpoints).
     """
 
     w13_weight: torch.Tensor  # (num_experts, 2*N, K//2) uint8 (packed FP4)
     w2_weight: torch.Tensor   # (num_experts, K,   N//2) uint8 (packed FP4)
     w13_scale: torch.Tensor   # (num_experts, 2*N, K/16) float8_e4m3fn
     w2_scale: torch.Tensor    # (num_experts, K,   N/16) float8_e4m3fn
-    w13_weight_scale_2: Optional[torch.Tensor] = None  # (num_local_experts,) float32
-    w2_weight_scale_2: Optional[torch.Tensor] = None   # (num_local_experts,) float32
 
 
 def _quantize_bf16_to_nvfp4_e4m3(
@@ -206,8 +199,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
-        m_indices = runner_input.m_indices
-        
+
         # N is the packed-major output dim of the gateup weights.
         # w13_weight is (E, 2*N, K//2); the gate-up output has 2*N bf16 columns
         # which silu_and_mul reduces to N.
@@ -255,45 +247,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[contig][gateup] output   : %s", _tensor_stats(gateup_output)
             )
-
-        # Apply per-expert global post-GEMM scale (ModelOpt two-level quant).
-        # list_size is (1,1) holding num_active+1; offsets stores [s0,e0,s1,e1,...].
-        if quant_info.w13_weight_scale_2 is not None:
-            num_active = int(runner_input.list_size.item()) - 1
-            _ws2 = quant_info.w13_weight_scale_2
-            # One-time diagnostic (printed on first call only via _diag_printed flag)
-            if not getattr(AsymGemmFp4RunnerCore, "_diag_w13_printed", False):
-                AsymGemmFp4RunnerCore._diag_w13_printed = True
-                _active_ids = [int(runner_input.experts[j].item()) for j in range(min(num_active, 8))]
-                _scales_sample = [float(_ws2[eid].item()) for eid in _active_ids]
-                logger.warning(
-                    "[DIAG][contig][gateup] w13_weight_scale_2: shape=%s dtype=%s "
-                    "min=%.4g max=%.4g; first %d expert ids=%s scales=%s",
-                    tuple(_ws2.shape), _ws2.dtype,
-                    float(_ws2.min().item()), float(_ws2.max().item()),
-                    len(_active_ids), _active_ids, _scales_sample,
-                )
-                logger.warning(
-                    "[DIAG][contig][gateup] output BEFORE scale_2: min=%.4g max=%.4g",
-                    float(gateup_output.to(torch.float32).min().item()),
-                    float(gateup_output.to(torch.float32).max().item()),
-                )
-            for j in range(num_active):
-                s = int(runner_input.offsets[2 * j].item())
-                e = int(runner_input.offsets[2 * j + 1].item())
-                expert_id = int(runner_input.experts[j].item())
-                scale = _ws2[expert_id].to(gateup_output.dtype)
-                gateup_output[s:e] *= scale
-            if not getattr(AsymGemmFp4RunnerCore, "_diag_w13_after_printed", False):
-                AsymGemmFp4RunnerCore._diag_w13_after_printed = True
-                logger.warning(
-                    "[DIAG][contig][gateup] output AFTER scale_2: min=%.4g max=%.4g",
-                    float(gateup_output.to(torch.float32).min().item()),
-                    float(gateup_output.to(torch.float32).max().item()),
-                )
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[contig][gateup] w13_scale_2 applied to %d expert segments", num_active)
-
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -341,43 +294,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[contig][down]   output   : %s", _tensor_stats(down_output)
             )
-
-        # Apply per-expert global post-GEMM scale for the down projection.
-        if quant_info.w2_weight_scale_2 is not None:
-            num_active = int(runner_input.list_size.item()) - 1
-            _ws2 = quant_info.w2_weight_scale_2
-            if not getattr(AsymGemmFp4RunnerCore, "_diag_w2_printed", False):
-                AsymGemmFp4RunnerCore._diag_w2_printed = True
-                _active_ids = [int(runner_input.experts[j].item()) for j in range(min(num_active, 8))]
-                _scales_sample = [float(_ws2[eid].item()) for eid in _active_ids]
-                logger.warning(
-                    "[DIAG][contig][down] w2_weight_scale_2: shape=%s dtype=%s "
-                    "min=%.4g max=%.4g; first %d expert ids=%s scales=%s",
-                    tuple(_ws2.shape), _ws2.dtype,
-                    float(_ws2.min().item()), float(_ws2.max().item()),
-                    len(_active_ids), _active_ids, _scales_sample,
-                )
-                logger.warning(
-                    "[DIAG][contig][down] output BEFORE scale_2: min=%.4g max=%.4g",
-                    float(down_output.to(torch.float32).min().item()),
-                    float(down_output.to(torch.float32).max().item()),
-                )
-            for j in range(num_active):
-                s = int(runner_input.offsets[2 * j].item())
-                e = int(runner_input.offsets[2 * j + 1].item())
-                expert_id = int(runner_input.experts[j].item())
-                scale = _ws2[expert_id].to(down_output.dtype)
-                down_output[s:e] *= scale
-            if not getattr(AsymGemmFp4RunnerCore, "_diag_w2_after_printed", False):
-                AsymGemmFp4RunnerCore._diag_w2_after_printed = True
-                logger.warning(
-                    "[DIAG][contig][down] output AFTER scale_2: min=%.4g max=%.4g",
-                    float(down_output.to(torch.float32).min().item()),
-                    float(down_output.to(torch.float32).max().item()),
-                )
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[contig][down]   w2_scale_2 applied to %d expert segments", num_active)
-
         return down_output
 
     def _run_masked_gemm(
@@ -441,17 +357,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[masked][gateup] output   : %s", _tensor_stats(gateup_output)
             )
-
-        # Apply per-expert global post-GEMM scale (ModelOpt two-level quant).
-        # gateup_output shape: (num_groups, m, n) — slot g → experts[g].
-        # experts has a -1 terminator; only slots 0..num_active-1 are real.
-        if quant_info.w13_weight_scale_2 is not None:
-            num_active = int(runner_input.list_size.item()) - 1
-            for j in range(num_active):
-                expert_id = int(runner_input.experts[j].item())
-                scale = quant_info.w13_weight_scale_2[expert_id].to(gateup_output.dtype)
-                gateup_output[j] *= scale
-
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -510,14 +415,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             logger.debug(
                 "[masked][down]   output   : %s", _tensor_stats(down_output)
             )
-
-        # Apply per-expert global post-GEMM scale for the down projection.
-        if quant_info.w2_weight_scale_2 is not None:
-            num_active = int(runner_input.list_size.item()) - 1
-            for j in range(num_active):
-                expert_id = int(runner_input.experts[j].item())
-                scale = quant_info.w2_weight_scale_2[expert_id].to(down_output.dtype)
-                down_output[j] *= scale
 
         return down_output
 
