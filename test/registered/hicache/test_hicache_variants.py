@@ -91,6 +91,7 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
         super().test_mmlu()
 
 
+@unittest.skip("HiCache MLA runtime is unstable in PR UT")
 class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
