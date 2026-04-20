@@ -30,6 +30,9 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.offloader import get_offloader
+from sglang.srt.layers.quantization.fp8_utils import (
+    FP8_E4M3_MAX,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -824,7 +827,7 @@ def _pre_permute_standard_to_asym_gemm_fp4(
     quant_info,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> "AsymGemmFp4RunnerInput":
+) -> AsymGemmFp4RunnerInput:
     """Masked pre-permute for NVFP4 — mirrors _pre_permute_standard_to_asym_gemm_fp8.
 
     Reorders tokens into a padded masked layout (num_experts, m_max, K) as BF16,
@@ -897,11 +900,11 @@ def _pre_permute_standard_to_asym_gemm_fp4(
     gateup_fp4, gateup_scale = _quantize_bf16_to_nvfp4_e4m3(gateup_input)
     del gateup_input
 
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m,
-        gateup_fp4.shape[0],
-        gateup_fp4.shape[1],
-    )
+    #offsets, experts, list_size = build_offsets_experts_from_masked_m(
+    #    masked_m,
+    #    gateup_fp4.shape[0],
+    #    gateup_fp4.shape[1],
+    #)
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -916,9 +919,6 @@ def _pre_permute_standard_to_asym_gemm_fp4(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        offsets=offsets,
-        experts=experts,
-        list_size=list_size,
     )
 
 

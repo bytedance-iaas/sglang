@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
     is_blackwell_supported,
+    FP8_E4M3_MAX,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -1594,17 +1595,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
 
-        if _is_asym_gemm:
-            logger.debug(
-                "ModelOptNvFp4FusedMoEMethod: asym_gemm mode — "
-                "w13_weight device=%s pin_memory=%s, "
-                "w2_weight device=%s pin_memory=%s",
-                w13_weight.device,
-                w13_weight.is_pinned(),
-                w2_weight.device,
-                w2_weight.is_pinned(),
-            )
-
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
                 layer.num_local_experts,
@@ -1752,18 +1742,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # (without a global input scale), we only need to correct for the weight side.
         if get_moe_runner_backend().is_asym_gemm():
             layer_id = getattr(layer, "layer_id", "?")
-            dev = layer.w13_weight_scale.device
-            w13_ws2 = w13_weight_scale_2.to(device=dev, dtype=torch.float32)  # (E,)
+            scale_device = layer.w13_weight_scale.device
+            w13_ws2 = w13_weight_scale_2.to(device=scale_device, dtype=torch.float32)  # (E,)
             w13_sf_f32 = layer.w13_weight_scale.to(torch.float32)             # (E, 2N, K//16)
-            w13_sf_new = (w13_sf_f32 * w13_ws2[:, None, None]).clamp(max=448.0).to(torch.float8_e4m3fn)
+            w13_sf_new = (w13_sf_f32 * w13_ws2[:, None, None]).clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
             copy_or_rebind_param(layer, "w13_weight_scale", w13_sf_new)
 
-            w2_ws2 = layer.w2_weight_scale_2.to(device=dev, dtype=torch.float32)  # (E,)
+            w2_ws2 = layer.w2_weight_scale_2.to(device=scale_device, dtype=torch.float32)  # (E,)
             w2_sf_f32 = layer.w2_weight_scale.to(torch.float32)                   # (E, K, N//16)
-            w2_sf_new = (w2_sf_f32 * w2_ws2[:, None, None]).clamp(max=448.0).to(torch.float8_e4m3fn)
+            w2_sf_new = (w2_sf_f32 * w2_ws2[:, None, None]).clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
             copy_or_rebind_param(layer, "w2_weight_scale", w2_sf_new)
 
-            logger.warning(
+            logger.debug(
                 "[FP4-asym-scale-bake] layer=%s "
                 "w13_weight_scale_2: min=%.4g max=%.4g | "
                 "w13_scale_before max=%.4g after max=%.4g | "

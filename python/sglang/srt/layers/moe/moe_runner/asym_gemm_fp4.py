@@ -21,6 +21,9 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.layers.quantization.fp8_utils import (
+    FP8_E4M3_MAX,
+)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -45,8 +48,6 @@ del _os
 _NVFP4_GROUP_SIZE = 16
 # E2M1 dynamic range (max |x|) for computing E4M3 scale: sf = amax / 6.0.
 _E2M1_MAX = 6.0
-# float8_e4m3fn max representable value; values above this overflow to NaN (0x7F).
-_E4M3FN_MAX = 448.0
 
 
 @dataclass
@@ -57,9 +58,9 @@ class AsymGemmFp4RunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    offsets: Optional[torch.Tensor] = None
-    experts: Optional[torch.Tensor] = None
-    list_size: Optional[torch.Tensor] = None
+    #offsets: Optional[torch.Tensor] = None
+    #experts: Optional[torch.Tensor] = None
+    #list_size: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -115,7 +116,7 @@ def _quantize_bf16_to_nvfp4_e4m3(
     x_groups = x2d.to(torch.float32).view(m, sf_k, group_size)
     amax = x_groups.abs().amax(dim=-1).clamp_min_(1e-4)
     # NVFP4 canonical scale = amax / E2M1_MAX, stored as E4M3.
-    sf_e4m3 = (amax / _E2M1_MAX).clamp(max=_E4M3FN_MAX).to(torch.float8_e4m3fn)
+    sf_e4m3 = (amax / _E2M1_MAX).clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     sf_decoded = sf_e4m3.to(torch.float32).clamp_min_(1e-12)
 
     # Quantize values to E2M1. Use the nearest representable magnitude with
@@ -240,9 +241,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             (hidden_states, hidden_states_scale),
             (w13_weight, quant_info.w13_scale),
             gateup_output,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         if not getattr(AsymGemmFp4RunnerCore, "_diag_logged", False):
             AsymGemmFp4RunnerCore._diag_logged = True
@@ -302,9 +300,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             (down_in_fp4, down_in_scale),
             (w2_weight, quant_info.w2_scale),
             down_output,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         if not getattr(AsymGemmFp4RunnerCore, "_diag2_logged", False):
             AsymGemmFp4RunnerCore._diag2_logged = True
@@ -351,37 +346,12 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         gateup_output = torch.zeros(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[masked][gateup] act      : %s", _tensor_stats(hidden_states)
-            )
-            logger.debug(
-                "[masked][gateup] act_scale: %s", _scale_stats(hidden_states_scale)
-            )
-            logger.debug(
-                "[masked][gateup] w13      : device=%s shape=%s",
-                w13_weight.device, tuple(w13_weight.shape),
-            )
-            logger.debug(
-                "[masked][gateup] w13_scale: %s", _scale_stats(w13_scale)
-            )
-            logger.debug(
-                "[masked][gateup] masked_m=%s expected_m=%d offsets=%s experts=%s list_size=%d",
-                masked_m.tolist(), expected_m,
-                runner_input.offsets.tolist(),
-                runner_input.experts.tolist(),
-                runner_input.list_size,
-            )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -417,29 +387,12 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n2), device=hidden_states_device, dtype=torch.bfloat16
         )
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[masked][down]   act      : %s", _tensor_stats(down_in_fp4)
-            )
-            logger.debug(
-                "[masked][down]   act_scale: %s", _scale_stats(down_in_scale)
-            )
-            logger.debug(
-                "[masked][down]   w2       : device=%s shape=%s",
-                w2_weight.device, tuple(w2_weight.shape),
-            )
-            logger.debug(
-                "[masked][down]   w2_scale : %s", _scale_stats(w2_scale)
-            )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_masked(
             (down_in_fp4, down_in_scale),
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

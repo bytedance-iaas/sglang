@@ -264,6 +264,10 @@ def _empty_block_fp8(size):
 
 
 _BLOCK_SIZE = 128
+# NVFP4 recipe: (granularity_m=1, granularity_n=1, granularity_k=16)
+# Must match what production callers pass so the warmup kernel uses correct
+# memory access patterns.
+_FP4_WARMUP_RECIPE = (1, 16, 16)
 
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
@@ -399,48 +403,42 @@ class _GroupedContFp4WarmupExecutor(_BaseWarmupExecutor):
         self.lhs_q, self.lhs_s = _empty_packed_fp4((max_m, k))
         self.rhs_q, self.rhs_s = _empty_packed_fp4((num_groups, n, k))
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
-        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
-        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
-        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
 
     def execute(self, m):
-        self.offsets[1] = m
-        lhs_q, lhs_s = self.lhs_q[:m], self.lhs_s[:m]
-        rhs_q, rhs_s = self.rhs_q, self.rhs_s
-        out = self.out[:m]
         asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
-            (lhs_q, lhs_s),
-            (rhs_q, rhs_s),
-            out,
-            self.offsets,
-            self.experts,
-            self.list_size,
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
             disable_ue8m0_cast=True,
         )
 
 
 class _GroupedMaskedFp4WarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.max_m = max_m
         self.lhs_q, self.lhs_s = _empty_packed_fp4((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_packed_fp4((num_groups, n, k))
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
-        self.offsets = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
-        self.experts = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
-        self.list_size = torch.tensor([[2]], device="cuda", dtype=torch.int32)
 
     def execute(self, m):
+        num_groups = self.lhs_q.shape[0]
+        masked_m = torch.zeros(
+            (num_groups,), dtype=torch.int32, device=self.lhs_q.device
+        )
+        print(f"------ warmup execute: m={m}, masked_m={masked_m}, num_groups={num_groups} {self.out.shape=} {self.lhs_q.shape=} {self.lhs_s.shape=} {self.rhs_q.shape=} {self.rhs_s.shape=} ------")
+        '''
         asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,
-            self.offsets,
-            self.experts,
-            self.list_size,
+            masked_m,
             m,
+            recipe=_FP4_WARMUP_RECIPE,
             disable_ue8m0_cast=True,
         )
+        '''
 
 
 @contextmanager
