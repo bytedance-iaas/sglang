@@ -202,12 +202,6 @@ class PrefillBootstrapQueue:
             kv_args.state_type = "none"
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        if envs.SGLANG_MOONCAKE_ASYNC_KV.get():
-            from sglang.srt.disaggregation.mooncake.async_kv_manager import (
-                MooncakeAsyncKVManager,
-            )
-
-            kv_manager_class = MooncakeAsyncKVManager
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,

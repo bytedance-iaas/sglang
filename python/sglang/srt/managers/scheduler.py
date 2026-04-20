@@ -2779,19 +2779,8 @@ class Scheduler(
             and self.disagg_prefill_bootstrap_queue is not None
         ):
             kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-            if kv_mgr is not None and getattr(kv_mgr, "is_support_async", False):
-                eligible_reqs = [
-                    req
-                    for req in batch.reqs
-                    if req.bootstrap_host != FAKE_BOOTSTRAP_HOST
-                ]
-                if eligible_reqs and all(
-                    req.start_send_idx == 0 and req.is_chunked <= 0
-                    for req in eligible_reqs
-                ):
-                    kv_mgr.prepare_batch(self, batch)
-                    batch.async_kv_prepared = True
-                    layer_ready_callback = kv_mgr.mark_layer_ready
+            if kv_mgr is not None:
+                layer_ready_callback = kv_mgr.maybe_prepare_async_kv(self, batch)
 
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
