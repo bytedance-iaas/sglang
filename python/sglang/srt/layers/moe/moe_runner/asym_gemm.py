@@ -156,7 +156,7 @@ def build_offsets_experts_from_masked_m(
 
     offsets = []
     experts = []
-    print(f"######## build offsets and experts: {masked_m=} {num_groups=} {max_m=} {block_m}")
+    print(f"######## build_offsets_experts_from_masked_m:  {masked_m=} {num_groups=} {max_m=} {block_m}")
     for g in range(num_groups):
         v = masked_m[g].item()
         if v > 0:
@@ -210,6 +210,7 @@ def build_offsets_experts_from_seg_indptr(
         experts:   int32 tensor of size num_groups+1
         list_size: num_active + 1
     """
+    print(f"######## build_offsets_experts_from_seg_indptr: {seg_indptr=} {num_groups=}")
     offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=seg_indptr.device)
     experts = torch.full(
         (num_groups + 1,), -1, dtype=torch.int32, device=seg_indptr.device
@@ -220,6 +221,7 @@ def build_offsets_experts_from_seg_indptr(
         seg_indptr, offsets, experts, list_size
     )
     list_size.add_(1)
+    print(f"########## finished: {offsets=} {experts=} {list_size=}")
     return offsets, experts, list_size
 
 
@@ -245,6 +247,7 @@ def build_offsets_experts_direct(
 ):
     """Build offsets/experts/list_size directly from sorted expert IDs via binary search.
     Fuses compute_seg_indptr + build_offsets into a single kernel launch."""
+    print(f"######## build_offsets_experts_direct: {sorted_expert_ids=} {num_groups=} {all_tokens=}")
     offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=sorted_expert_ids.device)
     experts = torch.full(
         (num_groups + 1,), -1, dtype=torch.int32, device=sorted_expert_ids.device
@@ -255,6 +258,7 @@ def build_offsets_experts_direct(
         sorted_expert_ids, offsets, experts, list_size, all_tokens,
     )
     list_size.add_(1)
+    print(f"########## finished: {offsets=} {experts=} {list_size=}")
     return offsets, experts, list_size
 
 

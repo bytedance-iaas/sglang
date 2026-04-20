@@ -203,6 +203,8 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         # w13_weight is (E, 2*N, K//2); the gate-up output has 2*N bf16 columns
         # which silu_and_mul reduces to N.
         w13_n = quant_info.w13_weight.size(1)
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
 
         # Zero-init so padding rows (outside the kernel's offset range) are 0
         # rather than uninitialized garbage.  Uninitialized padding can produce
@@ -222,7 +224,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             )
             logger.debug(
                 "[contig][gateup] w13      : device=%s shape=%s",
-                quant_info.w13_weight.device, tuple(quant_info.w13_weight.shape),
+                w13_weight.device, tuple(w13_weight.shape),
             )
             logger.debug(
                 "[contig][gateup] w13_scale: %s", _scale_stats(quant_info.w13_scale)
@@ -235,12 +237,26 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_contig(
             (hidden_states, hidden_states_scale),
-            (quant_info.w13_weight, quant_info.w13_scale),
+            (w13_weight, quant_info.w13_scale),
             gateup_output,
             runner_input.offsets,
             runner_input.experts,
             runner_input.list_size,
         )
+        if not getattr(AsymGemmFp4RunnerCore, "_diag_logged", False):
+            AsymGemmFp4RunnerCore._diag_logged = True
+            w13_scale_f32 = quant_info.w13_scale.to(torch.float32)
+            w13_zero_frac = (w13_scale_f32 == 0).float().mean().item()
+            logger.warning(
+                "[FP4-diag] act: %s | act_scale: %s | w13_scale: %s | w13_zero_frac=%.1f%%",
+                _tensor_stats(hidden_states),
+                _scale_stats(hidden_states_scale),
+                _scale_stats(quant_info.w13_scale),
+                w13_zero_frac * 100,
+            )
+            logger.warning(
+                "[FP4-diag] gateup_output: %s", _tensor_stats(gateup_output)
+            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[contig][gateup] output   : %s", _tensor_stats(gateup_output)
@@ -261,7 +277,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         down_in_fp4, down_in_scale = _quantize_bf16_to_nvfp4_e4m3(down_in_bf16)
         del down_in_bf16
 
-        n_down = quant_info.w2_weight.size(1)
+        n_down = w2_weight.size(1)
         down_output = torch.zeros(
             (all_tokens, n_down),
             device=hidden_states_device,
@@ -276,19 +292,33 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             )
             logger.debug(
                 "[contig][down]   w2       : device=%s shape=%s",
-                quant_info.w2_weight.device, tuple(quant_info.w2_weight.shape),
+                w2_weight.device, tuple(w2_weight.shape),
             )
             logger.debug(
                 "[contig][down]   w2_scale : %s", _scale_stats(quant_info.w2_scale)
             )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_contig(
             (down_in_fp4, down_in_scale),
-            (quant_info.w2_weight, quant_info.w2_scale),
+            (w2_weight, quant_info.w2_scale),
             down_output,
             runner_input.offsets,
             runner_input.experts,
             runner_input.list_size,
         )
+        if not getattr(AsymGemmFp4RunnerCore, "_diag2_logged", False):
+            AsymGemmFp4RunnerCore._diag2_logged = True
+            w2_scale_f32 = quant_info.w2_scale.to(torch.float32)
+            w2_zero_frac = (w2_scale_f32 == 0).float().mean().item()
+            logger.warning(
+                "[FP4-diag] down_in_fp4: %s | down_in_scale: %s | w2_scale: %s | w2_zero_frac=%.1f%%",
+                _tensor_stats(down_in_fp4),
+                _scale_stats(down_in_scale),
+                _scale_stats(quant_info.w2_scale),
+                w2_zero_frac * 100,
+            )
+            logger.warning(
+                "[FP4-diag] down_output: %s", _tensor_stats(down_output)
+            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[contig][down]   output   : %s", _tensor_stats(down_output)
