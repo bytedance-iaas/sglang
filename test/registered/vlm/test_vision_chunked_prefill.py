@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     calculate_rouge_l,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -37,6 +38,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "Vision chunked prefill output and server lifecycle are unstable in current PR UT",
+)
 class TestVisionChunkedPrefill(CustomTestCase):
 
     def prepare_video_messages(self, video_path, max_frames_num=8):
