@@ -1712,34 +1712,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_mb + w2_mb,
             )
 
-            # ModelOpt stores NVFP4 block scales in UE8M0 format (byte b = 2^(b-127))
-            # packed into float8_e4m3fn tensors.  The AsymGEMM kernel is called with
-            # disable_ue8m0_cast=True (because activation scales are already E4M3fn),
-            # so weight scales must be pre-converted from UE8M0 → E4M3fn here.
-            from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SCALE_UE8M0
-            if ASYMGEMM_SCALE_UE8M0:
-                def _ue8m0_to_e4m3fn(t: torch.Tensor) -> torch.Tensor:
-                    """Convert UE8M0 block-scale bytes to float8_e4m3fn.
-
-                    UE8M0: byte b → 2^(b − 127).  The result is clamped to 448
-                    (float8_e4m3fn max) before conversion to avoid NaN overflow.
-                    """
-                    f32 = t.view(torch.uint8).to(torch.float32)
-                    return (2.0 ** (f32 - 127.0)).clamp(max=448.0).to(torch.float8_e4m3fn)
-
-                layer.w13_weight_scale = torch.nn.Parameter(
-                    _ue8m0_to_e4m3fn(layer.w13_weight_scale), requires_grad=False
-                )
-                layer.w2_weight_scale = torch.nn.Parameter(
-                    _ue8m0_to_e4m3fn(layer.w2_weight_scale), requires_grad=False
-                )
-                logger.debug(
-                    "ModelOptFp4FusedMoEMethod: converted weight scales UE8M0→E4M3fn — "
-                    "layer_id=%s, w13_scale shape=%s, w2_scale shape=%s",
-                    layer_id,
-                    tuple(layer.w13_weight_scale.shape),
-                    tuple(layer.w2_weight_scale.shape),
-                )
+            # ModelOpt NVFP4 block scales are stored as float8_e4m3fn values directly.
+            # The AsymGEMM kernel is called with disable_ue8m0_cast=True, which tells
+            # it to use the E4M3fn bytes as-is as scale factors (compatible with the
+            # hardware's float_ue4m3_t / UE4M3 scale format for NVFP4 MMA).
+            # No conversion is needed here.
+            logger.debug(
+                "ModelOptFp4FusedMoEMethod: weight scales are E4M3fn, passing as-is — "
+                "layer_id=%s, w13_scale shape=%s, w2_scale shape=%s",
+                layer_id,
+                tuple(layer.w13_weight_scale.shape),
+                tuple(layer.w2_weight_scale.shape),
+            )
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
