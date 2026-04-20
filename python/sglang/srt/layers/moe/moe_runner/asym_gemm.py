@@ -210,7 +210,6 @@ def build_offsets_experts_from_seg_indptr(
         experts:   int32 tensor of size num_groups+1
         list_size: num_active + 1
     """
-    print(f"######## build_offsets_experts_from_seg_indptr: {seg_indptr=} {num_groups=}")
     offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=seg_indptr.device)
     experts = torch.full(
         (num_groups + 1,), -1, dtype=torch.int32, device=seg_indptr.device
@@ -221,7 +220,6 @@ def build_offsets_experts_from_seg_indptr(
         seg_indptr, offsets, experts, list_size
     )
     list_size.add_(1)
-    print(f"########## finished: {offsets=} {experts=} {list_size=}")
     return offsets, experts, list_size
 
 
@@ -247,7 +245,6 @@ def build_offsets_experts_direct(
 ):
     """Build offsets/experts/list_size directly from sorted expert IDs via binary search.
     Fuses compute_seg_indptr + build_offsets into a single kernel launch."""
-    print(f"######## build_offsets_experts_direct: {sorted_expert_ids=} {num_groups=} {all_tokens=}")
     offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=sorted_expert_ids.device)
     experts = torch.full(
         (num_groups + 1,), -1, dtype=torch.int32, device=sorted_expert_ids.device
@@ -258,7 +255,6 @@ def build_offsets_experts_direct(
         sorted_expert_ids, offsets, experts, list_size, all_tokens,
     )
     list_size.add_(1)
-    print(f"########## finished: {offsets=} {experts=} {list_size=}")
     return offsets, experts, list_size
 
 
@@ -864,8 +860,6 @@ def _pre_permute_standard_to_asym_gemm_fp4_contiguous_aligned(
 
     _BLOCK_M = 128  # must match get_mk_alignment_for_contiguous_layout() in layout.hpp
 
-    logger.warning("[ALIGNED-FP4] pre-permute called")  # one-time diagnostic
-
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
@@ -1202,6 +1196,21 @@ def post_permute_asym_gemm_to_standard(
         )
 
     dispose_tensor(runner_output.hidden_states)
+
+    if not getattr(post_permute_asym_gemm_to_standard, "_diag_logged", False):
+        post_permute_asym_gemm_to_standard._diag_logged = True
+        f32 = output.to(torch.float32)
+        out_nan = f32.isnan().any().item()
+        out_min = f32.min().item()
+        out_max = f32.max().item()
+        tw_sum = topk_weights.to(torch.float32).sum(dim=-1)
+        tw_min = tw_sum.min().item()
+        tw_max = tw_sum.max().item()
+        logger.warning(
+            "[FP4-diag] post_reorder out: shape=%s nan=%s min=%.4g max=%.4g "
+            "| topk_weight_sum: min=%.4g max=%.4g",
+            tuple(output.shape), out_nan, out_min, out_max, tw_min, tw_max,
+        )
 
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
