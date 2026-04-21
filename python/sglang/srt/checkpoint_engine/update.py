@@ -318,7 +318,7 @@ def main():
             and os.path.exists(
                 os.path.join(args.checkpoint_path, "model.safetensors.index.json")
             )
-            and not args.checkpoint_path.startswith("/dev/shm/")
+            and not args.checkpoint_path.startswith("/dev/shm")
         ):
             named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
             checkpoint_files = []
