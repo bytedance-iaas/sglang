@@ -377,7 +377,7 @@ $PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy s
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
-    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    retry_eval "Clone lmms-eval" "rm -rf lmms-eval && git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git" 5
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 fi
 $PIP_CMD uninstall xformers || true
@@ -431,7 +431,7 @@ $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.
 
 # Install human-eval
 pip install "setuptools==70.0.0"
-git clone https://github.com/merrymercy/human-eval.git
+retry_eval "Clone human-eval" "rm -rf human-eval && git clone https://github.com/merrymercy/human-eval.git" 5
 cd human-eval
 pip install -e . --no-build-isolation
 
