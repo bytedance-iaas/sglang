@@ -28,9 +28,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-    offsets: torch.Tensor,
-    experts: torch.Tensor,
-    list_size: torch.Tensor,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
@@ -47,14 +44,11 @@ def grouped_gemm_nt_f8f8bf16_masked(
         with configure_asym_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-                  
             return asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
                 lhs,
                 rhs,
                 out,
-                offsets,
-                experts,
-                list_size, 
+                masked_m,
                 expected_m,
                 disable_ue8m0_cast=False,
             )
@@ -93,9 +87,6 @@ def grouped_gemm_nt_fp4fp4bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-    offsets: torch.Tensor,
-    experts: torch.Tensor,
-    list_size: torch.Tensor,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
     recipe: Optional[Tuple[int, int, int]] = None,
@@ -115,9 +106,7 @@ def grouped_gemm_nt_fp4fp4bf16_masked(
                 lhs,
                 rhs,
                 out,
-                offsets,
-                experts,
-                list_size,
+                masked_m,
                 expected_m,
                 recipe=recipe if recipe is not None else _FP4_RECIPE,
                 disable_ue8m0_cast=True,
@@ -159,9 +148,6 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
     num_groups: int,
-    offsets: torch.Tensor,
-    experts: torch.Tensor,
-    list_size: torch.Tensor,
 ):
     num_groups, m_max, k = lhs.shape
     _, n, _ = rhs.shape
@@ -174,9 +160,7 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
             lhs,
             rhs,
             out,
-            offsets,
-            experts,
-            list_size,
+            masked_m,
             expected_m,
             compiled_dims="nk",
         )

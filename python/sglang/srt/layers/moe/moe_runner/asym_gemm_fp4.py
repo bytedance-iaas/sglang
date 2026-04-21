@@ -246,9 +246,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -286,9 +283,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
 
         return down_output
