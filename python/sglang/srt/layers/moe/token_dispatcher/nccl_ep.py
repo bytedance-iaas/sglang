@@ -55,6 +55,21 @@ NcclEPLLCombineInput = DeepEPLLCombineInput
 NcclEPNormalDispatchOutput = DeepEPNormalDispatchOutput
 NcclEPNormalCombineInput = DeepEPNormalCombineInput
 
+import sys
+import pdb
+class ForkedPdb(pdb.Pdb):
+    """A Pdb subclass that may be used
+    from a forked multiprocessing child
+
+    """
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open('/dev/stdin')
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
+
 
 def _torch_dtype_to_nccl(dtype: torch.dtype) -> int:
     _map = {
@@ -121,6 +136,25 @@ class NcclEPBuffer:
     _rank: Optional[int] = None
 
     @classmethod
+    def _warmup_comm(cls):
+        """Run a tiny all-reduce to ensure the NCCL comm is fully ready."""
+        if cls._lib is None or cls._comm is None:
+            return
+        stream = torch.cuda.current_stream()
+        stream_ptr = ctypes.c_void_p(stream.cuda_stream)
+        warmup = torch.zeros(1, dtype=torch.float32, device="cuda")
+        cls._lib.ncclAllReduce(
+            ctypes.c_void_p(warmup.data_ptr()),
+            ctypes.c_void_p(warmup.data_ptr()),
+            warmup.numel(),
+            ncclDataTypeEnum.ncclFloat32,
+            0,
+            cls._comm,
+            stream_ptr,
+        )
+        stream.synchronize()
+
+    @classmethod
     def get_nccl_ep_buffer(
         cls,
         group: dist.ProcessGroup,
@@ -147,6 +181,14 @@ class NcclEPBuffer:
         cls._world_size = dist.get_world_size(group)
         cls._rank = dist.get_rank(group)
 
+        if num_experts <= 0:
+            raise ValueError(f"Invalid num_experts for NCCL-EP: {num_experts}")
+        if num_max_dispatch_tokens_per_rank <= 0:
+            raise ValueError(
+                "SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK must be > 0 "
+                f"(got {num_max_dispatch_tokens_per_rank})"
+            )
+
         nccl_ep_so = os.environ.get("NCCL_EP_SO", None)
         cls._lib = NCCLLibrary(nccl_ep_so)
 
@@ -162,7 +204,8 @@ class NcclEPBuffer:
         # High-Throughput mode uses DeepEP.
         cls._algorithm = ncclEpAlgorithm_t.NCCL_EP_ALGO_LOW_LATENCY
 
-        token_size_bytes = hidden_size * torch.finfo(params_dtype).bits // 8
+        # LL path always dispatches BF16 activations to NCCL-EP.
+        token_size_bytes = hidden_size * torch.finfo(torch.bfloat16).bits // 8
 
         config = ncclEpGroupConfig_t()
         config.version = 1
@@ -174,10 +217,23 @@ class NcclEPBuffer:
         config.num_qp_per_rank = 0
         config.num_channels = 0
 
+        # A tiny collective warms up communicator state before EP group creation.
+        # cls._warmup_comm()
+
         stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        cls._ep_group = cls._lib.ncclEpCreateGroup(
-            cls._comm, config, stream
-        )
+        try:
+            # if cls._rank == 0:
+            #     ForkedPdb().set_trace()
+            # import time
+            # time.sleep(1000)
+            cls._ep_group = cls._lib.ncclEpCreateGroup(cls._comm, config, stream)
+        except RuntimeError as e:
+            raise RuntimeError(
+                "Failed to create NCCL-EP group with config "
+                f"(algorithm={config.algorithm}, num_experts={config.num_experts}, "
+                f"max_tokens_per_rank={config.max_tokens_per_rank}, "
+                f"token_size_bytes={config.token_size_bytes}): {e}"
+            ) from e
 
         logger.info(
             f"NCCL-EP group created (world_size={cls._world_size}, rank={cls._rank}, "
@@ -280,6 +336,63 @@ class _NcclEPDispatcherImplLowLatency(_NcclEPDispatcherImplBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.device_module = torch.get_device_module()
+        self._handle_cache = {}
+        self._active_handle_key = None
+        self._active_topk_handle = None
+        self._active_topk_tensor = None
+        self._warned_fp8_dispatch = False
+        # ncclEpCreateGroup cannot be lazily called during CUDA graph capture.
+        # Create the EP group eagerly during dispatcher initialization.
+        self._get_buffer()
+
+    def _release_active_handle_state(self, lib: "NCCLLibrary", ep_group) -> None:
+        self.handle = None
+        self._active_handle_key = None
+        self._active_topk_handle = None
+        self._active_topk_tensor = None
+
+    def _get_or_create_cached_handle(
+        self,
+        lib: "NCCLLibrary",
+        ep_group,
+        topk_ids: torch.Tensor,
+        stream_ptr: ctypes.c_void_p,
+        use_fp8: bool,
+    ):
+        cache_key = (
+            int(topk_ids.shape[0]),
+            int(topk_ids.shape[1]),
+            topk_ids.device.index,
+        )
+        cached = self._handle_cache.get(cache_key)
+        if cached is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "NCCL-EP low-latency handle cache miss during CUDA graph capture. "
+                    "The shape should be warmed up eagerly before capture. "
+                    f"Missing shape={tuple(topk_ids.shape)}"
+                )
+
+            static_topk_ids = torch.empty_like(
+                topk_ids, dtype=torch.int64, device=topk_ids.device
+            )
+            topk_handle = _create_ep_tensor(
+                lib,
+                ep_group,
+                static_topk_ids,
+                ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_IDX,
+            )
+            handle = lib.ncclEpCreateHandle(
+                ep_group, topk_handle, None, stream_ptr, use_fp8=use_fp8
+            )
+            cached = {
+                "handle": handle,
+                "topk_handle": topk_handle,
+                "topk_tensor": static_topk_ids,
+            }
+            self._handle_cache[cache_key] = cached
+
+        return cache_key, cached
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput, static_scale: torch.Tensor = None):
         buf = self._get_buffer()
@@ -332,22 +445,34 @@ class _NcclEPDispatcherImplLowLatency(_NcclEPDispatcherImplBase):
 
     def _dispatch_core(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor):
         use_fp8 = not envs.SGLANG_NCCL_EP_BF16_DISPATCH.get()
+        if use_fp8 and not self._warned_fp8_dispatch:
+            logger.warning(
+                "NCCL-EP low-latency FP8 dispatch is enabled, but the NCCL-EP "
+                "integration documents LL BF16->FP8 conversion as unsupported. "
+                "This path may cause accuracy issues. Note that some FP8 MoE "
+                "runners require dispatch outputs with scales, so forcing "
+                "SGLANG_NCCL_EP_BF16_DISPATCH=1 can break model startup."
+            )
+            self._warned_fp8_dispatch = True
         buf = self._get_buffer()
         lib = buf._lib
         ep_group = buf._ep_group
         stream_ptr = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        dispatch_succeeded = False
+
+        assert self.handle is None
+        assert self._active_topk_handle is None
 
         handles_to_destroy = []
         try:
-            topk_handle = _create_ep_tensor(
-                lib, ep_group, topk_ids,
-                ncclEpTensorTag_t.NCCL_EP_TENSOR_TAG_TOPK_IDX,
+            cache_key, cached = self._get_or_create_cached_handle(
+                lib, ep_group, topk_ids, stream_ptr, use_fp8
             )
-            handles_to_destroy.append(topk_handle)
-
-            self.handle = lib.ncclEpCreateHandle(
-                ep_group, topk_handle, None, stream_ptr, use_fp8=use_fp8
-            )
+            cached["topk_tensor"].copy_(topk_ids)
+            self.handle = cached["handle"]
+            self._active_handle_key = cache_key
+            self._active_topk_handle = cached["topk_handle"]
+            self._active_topk_tensor = cached["topk_tensor"]
 
             # LL dispatch: input must always be BF16; the C kernel handles
             # BF16->FP8 conversion internally and writes FP8 output + scales.
@@ -423,8 +548,11 @@ class _NcclEPDispatcherImplLowLatency(_NcclEPDispatcherImplBase):
                 dispatch_config,
                 stream_ptr,
             )
+            dispatch_succeeded = True
         finally:
             _destroy_tensor_handles(lib, ep_group, handles_to_destroy)
+            if not dispatch_succeeded:
+                self._release_active_handle_state(lib, ep_group)
 
         if use_fp8:
             return (out_hidden, out_scale), num_tokens_per_expert, use_fp8
@@ -440,7 +568,6 @@ class _NcclEPDispatcherImplLowLatency(_NcclEPDispatcherImplBase):
         return (combined,)
 
     def combine_b(self, combined):
-        self.handle = None
         return combined
 
     def _combine_core(
@@ -495,9 +622,7 @@ class _NcclEPDispatcherImplLowLatency(_NcclEPDispatcherImplBase):
             )
         finally:
             _destroy_tensor_handles(lib, ep_group, handles_to_destroy)
-
-        lib.ncclEpHandleDestroy(self.handle)
-        self.handle = None
+            self._release_active_handle_state(lib, ep_group)
 
         return out_hidden
 
@@ -559,6 +684,7 @@ class NcclEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
         static_scale: torch.Tensor = None,
     ) -> DispatchOutput:
+        # print(f"Dispatching with deepep_mode={self.deepep_mode}")
         self.dispatch_a(hidden_states=hidden_states, topk_output=topk_output, static_scale=static_scale)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
