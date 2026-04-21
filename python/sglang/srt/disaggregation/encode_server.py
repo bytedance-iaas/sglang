@@ -33,7 +33,12 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqInput,
+    ProfileReqType,
+    sock_recv,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
@@ -1364,7 +1369,8 @@ async def run_encoder(
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
-        request = await encoder.schedule_socket.recv_pyobj()
+        request = sock_recv(encoder.schedule_socket)
+
         if isinstance(request, ProfileReq):
             if request.type == ProfileReqType.START_PROFILE:
                 if encoder.profiler is None:

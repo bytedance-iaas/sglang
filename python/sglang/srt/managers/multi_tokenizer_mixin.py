@@ -43,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -299,7 +301,7 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
@@ -350,14 +352,14 @@ class MultiTokenizerRouter:
 
     async def router_worker_obj(self):
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            recv_obj = sock_recv(self.receive_from_worker)
+            sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         # special reqs will recv from scheduler, need to route to right worker
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
