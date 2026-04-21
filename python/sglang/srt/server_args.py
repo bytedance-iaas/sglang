@@ -183,6 +183,7 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
+    "asym_gemm",
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
@@ -2725,6 +2726,14 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+
+        if self.moe_runner_backend == "asym_gemm":
+            self.disable_cuda_graph = True
+            self.disable_piecewise_cuda_graph = True
+            logger.info(
+                "CUDA graph is disabled for asym_gemm MoE runner backend "
+                "(asym_gemm kernels are incompatible with CUDA graph capture)."
+            )
 
         # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
         # Exception: GptOssForCausalLM wraps the entire MoE block in its own

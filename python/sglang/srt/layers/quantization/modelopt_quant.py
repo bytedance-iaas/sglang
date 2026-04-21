@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
     is_blackwell_supported,
+    FP8_E4M3_MAX,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -1576,6 +1577,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
+        _is_asym_gemm = get_moe_runner_backend().is_asym_gemm()
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
@@ -1584,6 +1586,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             input_dim=1,
             output_dim=2,
@@ -1599,6 +1603,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device="cpu" if _is_asym_gemm else None,
+                pin_memory=_is_asym_gemm,
             ),
             input_dim=1,
             output_dim=2,
@@ -1689,6 +1695,43 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
 
+        # asym_gemm path: keep original FP4 weights (uint8) on CPU pinned memory
+        # and scales on GPU as-is.  device_loading_context's finally block restores
+        # the weights back to CPU automatically.  Dequantization to BF16 happens
+        # inside AsymGemmFp4RunnerCore on each forward pass.
+        if get_moe_runner_backend().is_asym_gemm():
+            layer_id = getattr(layer, "layer_id", "?")
+            w13_mb = layer.w13_weight.nbytes / 1024**2
+            w2_mb = layer.w2_weight.nbytes / 1024**2
+            logger.debug(
+                "ModelOptFp4FusedMoEMethod: offloaded MoE weights to CPU pinned memory — "
+                "layer_id=%s, "
+                "w13_weight shape=%s dtype=%s %.1f MiB, "
+                "w2_weight shape=%s dtype=%s %.1f MiB, "
+                "total %.1f MiB",
+                layer_id,
+                tuple(layer.w13_weight.shape),
+                layer.w13_weight.dtype,
+                w13_mb,
+                tuple(layer.w2_weight.shape),
+                layer.w2_weight.dtype,
+                w2_mb,
+                w13_mb + w2_mb,
+            )
+
+            # ModelOpt NVFP4 block scales are stored as float8_e4m3fn values directly.
+            # The AsymGEMM kernel is called with disable_ue8m0_cast=True, which tells
+            # it to use the E4M3fn bytes as-is as scale factors (compatible with the
+            # hardware's float_ue4m3_t / UE4M3 scale format for NVFP4 MMA).
+            # No conversion is needed here.
+            logger.debug(
+                "ModelOptFp4FusedMoEMethod: weight scales are E4M3fn, passing as-is — "
+                "layer_id=%s, w13_scale shape=%s, w2_scale shape=%s",
+                layer_id,
+                tuple(layer.w13_weight_scale.shape),
+                tuple(layer.w2_weight_scale.shape),
+            )
+
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1707,6 +1750,40 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
+
+        # asym_gemm path: bake per-expert global weight scales (weight_scale_2) into the
+        # per-block E4M3fn scales so the GEMM output is already in BF16 magnitude without
+        # any post-multiply.  ModelOpt uses two-level NVFP4 quantization: the checkpoint
+        # block scales are normalized by weight_scale_2, and the true scale per group is
+        # block_scale * weight_scale_2.  Since our activations are quantized fresh
+        # (without a global input scale), we only need to correct for the weight side.
+        if get_moe_runner_backend().is_asym_gemm():
+            layer_id = getattr(layer, "layer_id", "?")
+            scale_device = layer.w13_weight_scale.device
+            w13_ws2 = w13_weight_scale_2.to(device=scale_device, dtype=torch.float32)  # (E,)
+            w13_sf_f32 = layer.w13_weight_scale.to(torch.float32)             # (E, 2N, K//16)
+            w13_sf_new = (w13_sf_f32 * w13_ws2[:, None, None]).clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            copy_or_rebind_param(layer, "w13_weight_scale", w13_sf_new)
+
+            w2_ws2 = layer.w2_weight_scale_2.to(device=scale_device, dtype=torch.float32)  # (E,)
+            w2_sf_f32 = layer.w2_weight_scale.to(torch.float32)                   # (E, K, N//16)
+            w2_sf_new = (w2_sf_f32 * w2_ws2[:, None, None]).clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            copy_or_rebind_param(layer, "w2_weight_scale", w2_sf_new)
+
+            logger.debug(
+                "[FP4-asym-scale-bake] layer=%s "
+                "w13_weight_scale_2: min=%.4g max=%.4g | "
+                "w13_scale_before max=%.4g after max=%.4g | "
+                "w2_weight_scale_2: min=%.4g max=%.4g | "
+                "w2_scale_before max=%.4g after max=%.4g",
+                layer_id,
+                w13_ws2.min().item(), w13_ws2.max().item(),
+                w13_sf_f32.max().item(),
+                layer.w13_weight_scale.to(torch.float32).max().item(),
+                w2_ws2.min().item(), w2_ws2.max().item(),
+                w2_sf_f32.max().item(),
+                layer.w2_weight_scale.to(torch.float32).max().item(),
+            )
 
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
@@ -1900,7 +1977,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        if get_moe_runner_backend().is_asym_gemm():
+            self.runner = MoeRunner(MoeRunnerBackend.ASYM_GEMM, moe_runner_config)
+        elif get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
@@ -1921,6 +2000,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
+
+        # asym_gemm path: activations are pre-quantized to FP4 in the
+        # pre-permute step; both GEMMs use grouped_gemm_nt_fp4_fp4_bf16.
+        if get_moe_runner_backend().is_asym_gemm():
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+                AsymGemmFp4MoeQuantInfo,
+            )
+
+            quant_info = AsymGemmFp4MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm

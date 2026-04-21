@@ -595,7 +595,7 @@ def post_reorder_triton_kernel(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
         for idx in range(topk):
             expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id > 0:
+            if expert_id >= 0:
                 dst_idx_int32 = tl.load(src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
