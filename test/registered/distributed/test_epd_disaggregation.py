@@ -813,6 +813,10 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
         self.assertGreater(mmmu_accuracy, 0.40)
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "Qwen2.5-VL processor is incompatible with the current PR UT transformers stack",
+)
 class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
     """
     Test EPD disaggregation with multiple encode servers for load balancing.
