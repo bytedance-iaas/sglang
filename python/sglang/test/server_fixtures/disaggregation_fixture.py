@@ -58,7 +58,9 @@ class PDDisaggregationServerBase(CustomTestCase):
     def setUpClass(cls):
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
-        port_seed = f"{os.getenv('POD_NAME', 'local-runner')}:{cls.__module__}:{cls.__name__}"
+        port_seed = (
+            f"{os.getenv('POD_NAME', 'local-runner')}:{cls.__module__}:{cls.__name__}"
+        )
         base_port = str(
             _pick_disaggregation_base_port(
                 cls.base_host,

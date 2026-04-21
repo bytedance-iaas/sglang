@@ -58,10 +58,7 @@ def find_all_hf_snapshots():
             break
 
     if hub_dir is None:
-        print(
-            "HF hub directory not found in candidates: "
-            + ", ".join(candidate_dirs)
-        )
+        print("HF hub directory not found in candidates: " + ", ".join(candidate_dirs))
         return []
 
     snapshots = []
