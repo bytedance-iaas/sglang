@@ -313,9 +313,13 @@ def main():
     else:
         if args.checkpoint_path:
             ps.init_process_group()
-        if args.checkpoint_path and os.path.exists(
-            os.path.join(args.checkpoint_path, "model.safetensors.index.json")
-        ) and not args.checkpoint_path.startswith("/dev/shm/"):  # noqa: S108
+        if (
+            args.checkpoint_path
+            and os.path.exists(
+                os.path.join(args.checkpoint_path, "model.safetensors.index.json")
+            )
+            and not args.checkpoint_path.startswith("/dev/shm/")
+        ):
             named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
             checkpoint_files = []
         else:
