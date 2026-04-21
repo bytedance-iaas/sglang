@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 
 
@@ -35,6 +36,8 @@ def set_mla_kv_buffer_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -45,7 +48,10 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
@@ -80,7 +86,7 @@ def set_mla_kv_buffer_kernel(
 
         src = tl.where(is_nope, src_nope, src_rope)
 
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
 
 def set_mla_kv_buffer_triton(
@@ -107,6 +113,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=get_dcp_rank(),
+        DCP_WORLD_SIZE=get_dcp_world_size(),
     )
 
 

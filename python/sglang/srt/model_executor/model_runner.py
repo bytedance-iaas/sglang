@@ -73,7 +73,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_world_size,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -133,6 +136,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    update_dcp_forward_extend_info,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -2838,6 +2842,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if not skip_attn_backend_init:
+            # prepare kv cache buffer for dcp to gather kv cache
+            if get_dcp_world_size() > 1:
+                update_dcp_forward_extend_info(
+                    forward_batch, self.kv_cache_dtype, self.device
+                )
             self.attn_backend.init_forward_metadata(forward_batch)
 
         return (
