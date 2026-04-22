@@ -1,3 +1,4 @@
+import logging
 from typing import Union
 
 import msgspec
@@ -113,18 +114,20 @@ from .pickle_struct import (
     WatchLoadUpdateReq,
 )
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
-    LoadLoRAAdapterFromTensorsReqOutput
-) = LoRAUpdateOutput
-
-
-PICKLE_MAGIC_NUMBER = b"0xSG01"
-MSGPACK_MAGIC_NUMBER = b"0xSG02"
-
 if envs.SGLANG_IPC_USE_MSGPACK.get():
     from .msgpack_struct import FreezeGCReq
 else:
     from .pickle_struct import FreezeGCReq
+
+
+logger = logging.getLogger(__name__)
+
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+    LoadLoRAAdapterFromTensorsReqOutput
+) = LoRAUpdateOutput
+
+PICKLE_MAGIC_NUMBER = b"0xSG01"
+MSGPACK_MAGIC_NUMBER = b"0xSG02"
 
 
 def sock_send(
@@ -132,66 +135,110 @@ def sock_send(
 ):
     # if the msgpack magic number is not used, fallback to pickle
     if not envs.SGLANG_IPC_USE_MSGPACK.get():
+        logger.debug(
+            f"Sending pickle object of type {type(obj)} since SGLANG_IPC_USE_MSGPACK is disabled"
+        )
         socket.send_pyobj(obj, flags=flags)
         return
 
     if isinstance(obj, msgspec.Struct):
         from .msgpack_struct import serialize
 
-        socket.send_multipart([MSGPACK_MAGIC_NUMBER, serialize(obj)], flags=flags)
+        magic_number = MSGPACK_MAGIC_NUMBER
+        logger.debug(
+            f"Sending msgpack object of type {type(obj)} with magic number {magic_number}"
+        )
+        socket.send_multipart([magic_number, serialize(obj)], flags=flags)
     else:
         from .pickle_struct import serialize
 
-        socket.send_multipart([PICKLE_MAGIC_NUMBER, serialize(obj)], flags=flags)
+        magic_number = PICKLE_MAGIC_NUMBER
+        logger.debug(
+            f"Sending pickle object of type {type(obj)} with magic number {magic_number}"
+        )
+        socket.send_multipart([magic_number, serialize(obj)], flags=flags)
 
 
 def sock_recv(socket: Socket, flags=0) -> Union[BaseReq, BaseBatchReq, msgspec.Struct]:
     if not envs.SGLANG_IPC_USE_MSGPACK.get():
-        return socket.recv_pyobj(flags=flags)
+        obj = socket.recv_pyobj(flags=flags)
+        logger.debug(
+            f"Receiving pickle object of type {type(obj)} since SGLANG_IPC_USE_MSGPACK is disabled"
+        )
+        return obj
 
     magic_number, data = socket.recv_multipart(flags=flags)
     if magic_number == MSGPACK_MAGIC_NUMBER:
         from .msgpack_struct import deserialize
 
-        return deserialize(data)
+        obj = deserialize(data)
+        logger.debug(
+            f"Received msgpack object of type {type(obj)} with magic number {magic_number}"
+        )
+        return obj
     else:
         from .pickle_struct import deserialize
 
-        return deserialize(data)
+        obj = deserialize(data)
+        logger.debug(f"Received pickle object of type {type(obj)}")
+        return obj
 
 
 async def sock_send_async(
     socket: AsyncSocket, obj: Union[BaseReq, BaseBatchReq, msgspec.Struct], flags=0
 ):
     if not envs.SGLANG_IPC_USE_MSGPACK.get():
+        logger.debug(
+            f"Async sending pickle object of type {type(obj)} since SGLANG_IPC_USE_MSGPACK is disabled"
+        )
         await socket.send_pyobj(obj, flags=flags)
         return
 
     if isinstance(obj, msgspec.Struct):
         from .msgpack_struct import serialize
 
-        await socket.send_multipart([MSGPACK_MAGIC_NUMBER, serialize(obj)], flags=flags)
+        magic_number = MSGPACK_MAGIC_NUMBER
+        logger.debug(
+            f"Async sending msgpack object of type {type(obj)} with magic number {magic_number}"
+        )
+        await socket.send_multipart([magic_number, serialize(obj)], flags=flags)
     else:
         from .pickle_struct import serialize
 
-        await socket.send_multipart([PICKLE_MAGIC_NUMBER, serialize(obj)], flags=flags)
+        magic_number = PICKLE_MAGIC_NUMBER
+        logger.debug(
+            f"Async sending pickle object of type {type(obj)} with magic number {magic_number}"
+        )
+        await socket.send_multipart([magic_number, serialize(obj)], flags=flags)
 
 
 async def sock_recv_async(
     socket: AsyncSocket, flags=0
 ) -> Union[BaseReq, BaseBatchReq, msgspec.Struct]:
     if not envs.SGLANG_IPC_USE_MSGPACK.get():
-        return await socket.recv_pyobj(flags=flags)
+        obj = await socket.recv_pyobj(flags=flags)
+        logger.debug(
+            f"Async receiving pickle object of type {type(obj)} since SGLANG_IPC_USE_MSGPACK is disabled"
+        )
+        return obj
 
     magic_number, data = await socket.recv_multipart(flags=flags)
     if magic_number == MSGPACK_MAGIC_NUMBER:
         from .msgpack_struct import deserialize
 
-        return deserialize(data)
+        obj = await socket.recv_multipart(flags=flags)
+        logger.debug(
+            f"Async receiving msgpack object of type {type(obj)} with magic number {magic_number}"
+        )
+        return obj
     else:
         from .pickle_struct import deserialize
 
-        return deserialize(data)
+        obj = await socket.recv_multipart(flags=flags)
+        logger.debug(
+            f"Async receiving pickle object of type {type(obj)} with magic number {magic_number}"
+        )
+        return obj
 
 
 __all__ = [
