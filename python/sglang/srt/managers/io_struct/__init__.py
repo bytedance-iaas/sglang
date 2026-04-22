@@ -121,7 +121,7 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 PICKLE_MAGIC_NUMBER = b"0xSG01"
 MSGPACK_MAGIC_NUMBER = b"0xSG02"
 
-if envs.SGLANG_IPC_USE_MSGPACK:
+if envs.SGLANG_IPC_USE_MSGPACK.get():
     from .msgpack_struct import FreezeGCReq
 else:
     from .pickle_struct import FreezeGCReq
@@ -131,7 +131,7 @@ def sock_send(
     socket: Socket, obj: Union[BaseReq, BaseBatchReq, msgspec.Struct], flags=0
 ):
     # if the msgpack magic number is not used, fallback to pickle
-    if not envs.SGLANG_IPC_USE_MSGPACK:
+    if not envs.SGLANG_IPC_USE_MSGPACK.get():
         socket.send_pyobj(obj, flags=flags)
         return
 
@@ -146,7 +146,7 @@ def sock_send(
 
 
 def sock_recv(socket: Socket, flags=0) -> Union[BaseReq, BaseBatchReq, msgspec.Struct]:
-    if not envs.SGLANG_IPC_USE_MSGPACK:
+    if not envs.SGLANG_IPC_USE_MSGPACK.get():
         return socket.recv_pyobj(flags=flags)
 
     magic_number, data = socket.recv_multipart(flags=flags)
@@ -163,7 +163,7 @@ def sock_recv(socket: Socket, flags=0) -> Union[BaseReq, BaseBatchReq, msgspec.S
 async def sock_send_async(
     socket: AsyncSocket, obj: Union[BaseReq, BaseBatchReq, msgspec.Struct], flags=0
 ):
-    if not envs.SGLANG_IPC_USE_MSGPACK:
+    if not envs.SGLANG_IPC_USE_MSGPACK.get():
         await socket.send_pyobj(obj, flags=flags)
         return
 
@@ -180,7 +180,7 @@ async def sock_send_async(
 async def sock_recv_async(
     socket: AsyncSocket, flags=0
 ) -> Union[BaseReq, BaseBatchReq, msgspec.Struct]:
-    if not envs.SGLANG_IPC_USE_MSGPACK:
+    if not envs.SGLANG_IPC_USE_MSGPACK.get():
         return await socket.recv_pyobj(flags=flags)
 
     magic_number, data = await socket.recv_multipart(flags=flags)
