@@ -42,8 +42,6 @@ from .pickle_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
-    FlushCacheReqInput,
-    FlushCacheReqOutput,
     Function,
     GenerateReqInput,
     GetInternalStateReq,
@@ -115,9 +113,17 @@ from .pickle_struct import (
 )
 
 if envs.SGLANG_IPC_USE_MSGPACK.get():
-    from .msgpack_struct import FreezeGCReq
+    from .msgpack_struct import (
+        FlushCacheReqInput,
+        FlushCacheReqOutput,
+        FreezeGCReq,
+    )
 else:
-    from .pickle_struct import FreezeGCReq
+    from .pickle_struct import (
+        FlushCacheReqInput,
+        FlushCacheReqOutput,
+        FreezeGCReq,
+    )
 
 
 logger = logging.getLogger(__name__)

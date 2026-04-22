@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Optional, Union
 
 import msgspec
 
@@ -7,7 +7,16 @@ class FreezeGCReq(msgspec.Struct, tag=True):
     pass
 
 
-_unified_struct = Union[FreezeGCReq]
+class FlushCacheReqInput(msgspec.Struct, tag=True):
+    timeout_s: Optional[float] = None
+
+
+class FlushCacheReqOutput(msgspec.Struct, tag=True):
+    success: bool
+    message: str = ""
+
+
+_unified_struct = Union[FreezeGCReq, FlushCacheReqInput, FlushCacheReqOutput]
 
 _msgpack_encoder = msgspec.msgpack.Encoder()
 _msgpack_decoder = msgspec.msgpack.Decoder(_unified_struct)

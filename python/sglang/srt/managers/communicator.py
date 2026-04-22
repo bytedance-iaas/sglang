@@ -7,6 +7,8 @@ from typing import Deque, Generic, List, Optional, TypeVar
 
 import zmq
 
+from sglang.srt.managers.io_struct import sock_send
+
 T = TypeVar("T")
 
 
@@ -41,7 +43,7 @@ class FanOutCommunicator(Generic[T]):
             assert self._result_values is None
 
         if obj is not None:
-            self._sender.send_pyobj(obj)
+            sock_send(self._sender, obj)
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -61,7 +63,7 @@ class FanOutCommunicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj is not None:
-                self._sender.send_pyobj(obj)
+                sock_send(self._sender, obj)
 
         # Capture local refs before await -- after event fires, the first
         # awakened coroutine clears shared state; later awaiters use local refs.
