@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -282,13 +283,14 @@ class EICHiRadixCache(RadixCache):
 
         return len(host_indices)
 
-    def inc_hit_count(self, node: TreeNode):
-        if node.backuped or self.cache_controller.write_policy == "write_back":
+    def inc_hit_count(self, node: TreeNode, chunked: bool = False):
+        if self.cache_controller.write_policy == "write_back" or chunked:
             return
         node.hit_count += 1
-        if node.hit_count >= self.write_through_threshold:
-            self.write_backup(node)
-            node.hit_count = 0
+        if not node.backuped:
+            if node.hit_count >= self.write_through_threshold:
+                self.write_backup(node)
+                node.hit_count = 0
 
     def get_tp_result(self, flag):
         if isinstance(flag, bool):
@@ -594,11 +596,10 @@ class EICHiRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
-        mem_quota: Optional[int] = None,
+        params: InitLoadBackParams,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -676,13 +677,11 @@ class EICHiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child
@@ -716,7 +715,14 @@ class EICHiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+    ):
         if priority is None:
             priority = 0
         node.last_access_time = time.monotonic()
@@ -741,9 +747,9 @@ class EICHiRadixCache(RadixCache):
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_leaf_status(node.parent)
-                    self.inc_hit_count(node)
+                    self.inc_hit_count(node, chunked)
                 else:
-                    self.inc_hit_count(node)
+                    self.inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -756,9 +762,9 @@ class EICHiRadixCache(RadixCache):
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_leaf_status(new_node.parent)
-                    self.inc_hit_count(new_node)
+                    self.inc_hit_count(new_node, chunked)
                 else:
-                    self.inc_hit_count(new_node)
+                    self.inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
                 node = new_node
 
@@ -779,7 +785,7 @@ class EICHiRadixCache(RadixCache):
             self._update_leaf_status(new_node)
 
             if self.cache_controller.write_policy != "write_back":
-                self.inc_hit_count(new_node)
+                self.inc_hit_count(new_node, chunked)
         return total_prefix_length
 
     def _collect_leaves_device(self):
