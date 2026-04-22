@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     WatchLoadUpdateReq,
     sock_recv_async,
     sock_send,
+    sock_send_async,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1483,7 +1484,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                sock_send(self.send_to_scheduler, obj)
+                await sock_send_async(self.send_to_scheduler, obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1497,7 +1498,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            sock_send(self.send_to_scheduler, obj)
+            await sock_send_async(self.send_to_scheduler, obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
