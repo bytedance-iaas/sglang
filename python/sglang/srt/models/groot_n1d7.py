@@ -26,20 +26,23 @@ Flat single-file layout matches SGLang's alpamayo_r1.py convention.
 
 from __future__ import annotations
 
-import os
-from contextlib import nullcontext
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from diffusers.models.attention import Attention, FeedForward
+from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import (
     SinusoidalPositionalEmbedding,
     TimestepEmbedding,
     Timesteps,
 )
+
+from sglang.srt.layers.attention.masked_flash_attn import MaskedFlashAttention
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 # ==============================================================================
@@ -162,35 +165,6 @@ class MultiEmbodimentActionEncoder(nn.Module):
 # ==============================================================================
 
 
-def _is_spark_sm121() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return (major, minor) == (12, 1)
-
-
-def _should_force_math_sdpa() -> bool:
-    override = os.environ.get("GR00T_DIT_SDPA_MODE")
-    if override == "math":
-        return True
-    if override == "default":
-        return False
-    return _is_spark_sm121()
-
-
-def _sdpa_context():
-    # Spark (sm121) hits a flaky mem-efficient SDPA dispatch; force math backend
-    # there; elsewhere this is a no-op.
-    if not _should_force_math_sdpa():
-        return nullcontext()
-    return torch.backends.cuda.sdp_kernel(
-        enable_flash=False,
-        enable_math=True,
-        enable_mem_efficient=False,
-        enable_cudnn=False,
-    )
-
-
 class TimestepEncoder(nn.Module):
     def __init__(self, embedding_dim: int, compute_dtype: torch.dtype = torch.float32):
         super().__init__()
@@ -289,14 +263,13 @@ class BasicTransformerBlock(nn.Module):
                 dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps
             )
 
-        self.attn1 = Attention(
+        self.attn1 = MaskedFlashAttention(
             query_dim=dim,
+            kv_dim=cross_attention_dim if cross_attention_dim is not None else dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
             dropout=dropout,
-            bias=attention_bias,
-            cross_attention_dim=cross_attention_dim,
-            upcast_attention=upcast_attention,
+            attention_bias=attention_bias,
             out_bias=attention_out_bias,
         )
 
@@ -318,6 +291,7 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
+        forward_batch: Optional["ForwardBatch"] = None,
     ) -> torch.Tensor:
         if self.norm_type == "ada_norm":
             norm_hidden_states = self.norm1(hidden_states, temb)
@@ -327,16 +301,16 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-        with _sdpa_context():
-            attn_output = self.attn1(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=(
-                    encoder_attention_mask
-                    if encoder_hidden_states is not None
-                    else attention_mask
-                ),
-            )
+        attn_output = self.attn1(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=(
+                encoder_attention_mask
+                if encoder_hidden_states is not None
+                else attention_mask
+            ),
+            forward_batch=forward_batch,
+        )
         if self.final_dropout is not None:
             attn_output = self.final_dropout(attn_output)
 
@@ -438,6 +412,7 @@ class DiT(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        forward_batch: Optional["ForwardBatch"] = None,
     ):
         temb = self.timestep_encoder(timestep)
         hidden_states = hidden_states.contiguous()
@@ -452,6 +427,7 @@ class DiT(nn.Module):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    forward_batch=forward_batch,
                 )
             else:
                 hidden_states = block(
@@ -460,6 +436,7 @@ class DiT(nn.Module):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
+                    forward_batch=forward_batch,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -490,6 +467,7 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        forward_batch: Optional["ForwardBatch"] = None,
     ):
         assert image_mask is not None, "Image mask is required"
         assert (
@@ -512,6 +490,7 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    forward_batch=forward_batch,
                 )
             else:
                 if idx % (2 * self.attend_text_every_n_blocks) == 0:
@@ -524,6 +503,7 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=curr_enc_attn_mask,
                     temb=temb,
+                    forward_batch=forward_batch,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -595,11 +575,12 @@ class SelfAttentionTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         return_all_hidden_states: bool = False,
+        forward_batch: Optional["ForwardBatch"] = None,
     ):
         hidden_states = hidden_states.contiguous()
         all_hidden_states = [hidden_states]
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states)
+            hidden_states = block(hidden_states, forward_batch=forward_batch)
             all_hidden_states.append(hidden_states)
         if return_all_hidden_states:
             return hidden_states, all_hidden_states
@@ -689,9 +670,16 @@ class Gr00tN1d7ActionHead(nn.Module):
                 config.max_seq_len, self.input_embedding_dim
             )
 
-    def _process_vl(self, vl_embeds: torch.Tensor) -> torch.Tensor:
+    def _process_vl(
+        self,
+        vl_embeds: torch.Tensor,
+        forward_batch: Optional["ForwardBatch"] = None,
+    ) -> torch.Tensor:
         vl = self.vlln(vl_embeds)
-        vl = self.vl_self_attention(vl)
+        if isinstance(self.vl_self_attention, SelfAttentionTransformer):
+            vl = self.vl_self_attention(vl, forward_batch=forward_batch)
+        else:
+            vl = self.vl_self_attention(vl)
         return vl
 
     @torch.no_grad()
@@ -703,10 +691,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         image_mask: torch.Tensor,       # [B, S] bool
         state: torch.Tensor,            # [B, state_history_length, max_state_dim]
         embodiment_id: torch.Tensor,    # [B] long
+        forward_batch: Optional["ForwardBatch"] = None,
     ) -> torch.Tensor:
         """Runs 4 Euler integration steps of the flow-matching ODE to decode
         an action trajectory.  Returns [B, action_horizon, action_dim]."""
-        vl = self._process_vl(vl_embeds)
+        vl = self._process_vl(vl_embeds, forward_batch=forward_batch)
 
         B = vl.shape[0]
         assert state.shape[1] == self.config.state_history_length, (
@@ -740,12 +729,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=ts,
                     image_mask=image_mask,
                     backbone_attention_mask=vl_attn_mask,
+                    forward_batch=forward_batch,
                 )
             else:
                 mo = self.model(
                     hidden_states=sa,
                     encoder_hidden_states=vl,
                     timestep=ts,
+                    forward_batch=forward_batch,
                 )
             pred = self.action_decoder(mo, embodiment_id)
             pred_velocity = pred[:, -self.action_horizon:]
@@ -1065,6 +1056,7 @@ class Gr00tN1d7(nn.Module):
             image_mask=img,
             state=state,
             embodiment_id=embod_tensor,
+            forward_batch=forward_batch,
         )  # (1, action_horizon, action_dim)
 
         # Build per-request list aligned with forward_batch.history_trajs

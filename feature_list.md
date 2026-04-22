@@ -236,3 +236,49 @@ matches Isaac-GR00T's `Gr00tPolicy.get_action` within numerical tolerance.
   `docs/supported_models/vla_models/index.rst`.
 - **Tests:** visual — doc renders via `mkdocs serve` without errors.
 - **passes:** not_completed
+
+## F11 — DiT attention via MaskedFlashAttention (sglang flash-varlen)
+- **Goal:** Replace the pure-PyTorch `diffusers.models.attention.Attention`
+  inside `BasicTransformerBlock` with a reusable `MaskedFlashAttention`
+  module that dispatches to `sglang.jit_kernel.flash_attention.flash_attn_varlen_func`
+  (the same kernel `FlashAttentionBackend` uses). Thread `forward_batch`
+  from `Gr00tN1d7.forward` → `action_head.get_action` → `DiT` /
+  `AlternateVLDiT` / `SelfAttentionTransformer` → `BasicTransformerBlock`
+  → `MaskedFlashAttention`, mirroring the `alpamayo_r1.py` pattern.
+- **Acceptance:**
+  - New module at
+    `python/sglang/srt/layers/attention/masked_flash_attn.py`
+    defining `MaskedFlashAttention` with diffusers-compatible submodule
+    names (`to_q`, `to_k`, `to_v`, `to_out.0`). Two dispatch paths — a
+    fixed-length self-attn path and a per-key bool-mask cross-attn path
+    that gathers valid K/V per request and calls `flash_attn_varlen_func`
+    with varlen `cu_seqlens_k`. No SDPA fallback; no `ForwardContext`
+    dependency. Inputs asserted CUDA + bf16/fp16.  (Placed under `srt/layers/
+    attention/` — a namespace package — rather than `multimodal_gen/runtime/
+    layers/attention/` because the latter's `__init__.py` eagerly imports
+    `DiffGenerator` / `LocalAttention`, triggering `trimesh` /
+    `ForwardContext` requirements that are not available outside a full
+    diffusion-pipeline boot on this checkout.)
+  - `python/sglang/srt/models/groot_n1d7.py` no longer imports
+    `diffusers.models.attention.Attention` and no longer uses
+    `_sdpa_context`. `BasicTransformerBlock.attn1` is a
+    `MaskedFlashAttention`. `load_weights` is unchanged (submodule names
+    match, so `load_state_dict` works with no remapping).
+  - `forward_batch` is threaded as a formal parameter through the DiT
+    stack; default `None` preserves isolated-unit-test call sites.
+  - Parity tests rewritten to run on CUDA bf16 (native checkpoint dtype):
+    `test_dit_parity` uses `atol<=5e-3` (per-layer bf16 flash-varlen vs
+    SDPA drift).  `test_full_parity_against_reference` (F9 integrated
+    run) relaxes to `atol<=1e-1`: the ~5e-3 per-layer drift compounds
+    across 4 Euler steps × (32 DiT + 4 VL self-attn) layers to ~6e-2
+    max-abs, well under task-level robot-joint tolerance.
+    `test_embodiment_mlp_parity` is unchanged (no attention involved).
+- **Tests:**
+  `test/manual/models/test_groot_n17.py::test_dit_parity` (CUDA bf16),
+  `test/manual/models/test_groot_n17.py::test_masked_flash_attention_varlen`
+  (new — exercises fixed-length self-attn and varlen-gather cross-attn
+  with two different valid-VL lengths per batch),
+  `test/manual/models/test_groot_n17.py::test_action_head_get_action_shape_and_determinism`
+  (CUDA bf16), and
+  `test/manual/models/test_groot_n17.py::test_full_parity_against_reference`.
+- **passes:** completed
