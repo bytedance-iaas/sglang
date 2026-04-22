@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    enable_nextn_moe_sparse_fully_dp
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -311,7 +312,11 @@ class Fp8LinearMethod(LinearMethodBase):
         output_partition_sizes: List[int],
         skip_block_quant_check: bool = False,
     ):
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = (
+            1
+            if enable_nextn_moe_sparse_fully_dp()
+            else get_tensor_model_parallel_world_size()
+        )
         block_n, block_k = (
             self.quant_config.weight_block_size[0],
             self.quant_config.weight_block_size[1],
