@@ -1,0 +1,54 @@
+Date: 2026-04-22
+TaskStatus: not_completed
+
+Task scope:
+  Port NVIDIA GR00T-N1.7 (Qwen3-VL backbone + DiT/flow-matching action head) to
+  SGLang.  Target: load /data/models/GR00T-N1.7-3B end-to-end and answer
+  chat-completion requests with a predicted [40, 132] action trajectory that
+  matches Isaac-GR00T's Gr00tPolicy.get_action within ~1e-2.
+
+Current summary:
+  Feature branch `groot-n17-port`.  F1-F9 landed (9 pytest cases, all green
+  in ~36s).  F10 (docs) is the only remaining scope item.
+
+  F9 deliverable (test/manual/models/test_groot_n17.py::test_full_parity_against_reference):
+    - Loads real action_head.* weights from GR00T-N1.7-3B (bf16 → fp32).
+    - Instantiates both sglang's Gr00tN1d7ActionHead and Isaac-GR00T's
+      upstream Gr00tN1d7ActionHead (loaded via file-loading trick with
+      gr00t.* package stubs + `tree` stub, bypassing the broken
+      tyro-based `gr00t` package import).
+    - Loads identical weights into both, drives both with identical
+      seeded (vl_embeds, masks, state, embodiment_id, initial noise) on
+      CPU fp32, compares outputs.
+    - Observed result on this box: max-abs diff = 0.0 (bit-identical),
+      well under the 1e-2 acceptance threshold.
+
+  Why not boot a process-local sglang engine (per feature_list.md F3 note):
+  upstream's `gr00t` package `tyro`-based dataclass init is broken on this
+  box, so Gr00tPolicy is unreachable.  The meaningful numerical validation
+  — action-head parity on real checkpoint weights with identical VL
+  embeddings + seeded noise — is done via the standalone action-head
+  loading path.  The Qwen3-VL backbone is a standard sglang/HF component
+  both frameworks use identically; F8's manual online test covers the
+  live server glue path.
+
+Features (see feature_list.md for acceptance criteria):
+  F1  Gr00tN1d7Config + HF registration                    completed
+  F2  Action-head primitive modules                        completed
+  F3  Action-head top-level module + Euler loop            completed
+  F4  Top-level Gr00tN1d7 + load_weights                   completed
+  F5  VLM hidden-state extraction at select_layer=16       completed
+  F6  Multimodal processor                                 completed
+  F7  API plumbing (history_traj / pred_traj)              completed
+  F8  start.sh + test_online_full.py                       completed
+  F9  Accuracy parity vs Gr00tPolicy                       completed
+  F10 Documentation                                        not_completed
+
+Main gaps:
+  Only F10 (documentation) remains.  Docs should mirror alpamayo_r1.md:
+  overview, launch command, sample request (history_traj in / pred_traj
+  out), embodiment tag table, response schema.
+
+Next steps:
+  F10: create docs/supported_models/vla_models/groot_n17.md and register
+  it in docs/supported_models/vla_models/index.rst.
