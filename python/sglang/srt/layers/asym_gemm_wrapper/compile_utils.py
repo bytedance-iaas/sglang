@@ -267,7 +267,7 @@ _BLOCK_SIZE = 128
 # NVFP4 recipe: (granularity_m=1, granularity_n=1, granularity_k=16)
 # Must match what production callers pass so the warmup kernel uses correct
 # memory access patterns.
-_FP4_WARMUP_RECIPE = (1, 16, 16)
+_FP4_WARMUP_RECIPE = (1, 1, 16)
 
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
@@ -423,12 +423,15 @@ class _GroupedMaskedFp4WarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
+        import random
         num_groups = self.lhs_q.shape[0]
-        masked_m = torch.zeros(
-            (num_groups,), dtype=torch.int32, device=self.lhs_q.device
-        )
-        print(f"------ warmup execute: m={m}, masked_m={masked_m}, num_groups={num_groups} {self.out.shape=} {self.lhs_q.shape=} {self.lhs_s.shape=} {self.rhs_q.shape=} {self.rhs_s.shape=} ------")
-        '''
+        masked_m_list = []
+        for _ in range(num_groups):
+            v = max(1, int(m * random.uniform(0.7, 1.3)))
+            masked_m_list.append(min(v, self.max_m))
+        masked_m_cpu = torch.tensor(masked_m_list, dtype=torch.int32, device="cpu")
+        masked_m = masked_m_cpu.to(device="cuda")
+
         asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
@@ -438,7 +441,6 @@ class _GroupedMaskedFp4WarmupExecutor(_BaseWarmupExecutor):
             recipe=_FP4_WARMUP_RECIPE,
             disable_ue8m0_cast=True,
         )
-        '''
 
 
 @contextmanager

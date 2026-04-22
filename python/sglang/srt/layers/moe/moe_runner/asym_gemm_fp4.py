@@ -353,6 +353,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
         )
+        torch.cuda.synchronize()  # surface async CUDA errors at the kernel call site
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[masked][gateup] output   : %s", _tensor_stats(gateup_output)
