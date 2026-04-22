@@ -59,6 +59,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -372,6 +373,7 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or enable_nextn_moe_sparse_fully_dp()
             ):
                 return ScatterMode.SCATTERED
             # NSA CP doesn't support MOE_FULL yet; fall back to FULL
