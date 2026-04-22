@@ -38,6 +38,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ProfileReqType,
     sock_recv_async,
+    sock_send,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
@@ -1454,7 +1455,7 @@ async def handle_encode_request(request: dict):
         # broadcast request
         request.update({"enter_time": time.time()})
         for socket in send_sockets:
-            socket.send_pyobj(request)
+            sock_send(socket, request)
         if encoder.mm_global_cache is not None:
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                 await encoder.encode_with_global_cache(
@@ -1608,7 +1609,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
             profile_stages=obj.profile_stages,
         )
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     if encoder.profiler is None:
         encoder.profiler = EncoderProfiler(encoder.rank)
     ok, msg = encoder.profiler.start(req)
@@ -1633,7 +1634,7 @@ async def stop_profile_async():
         )
     req = ProfileReq(ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     ok, msg = encoder.profiler.stop()
     if ok:
         return Response(content="Stop profiling.\n", status_code=200)
