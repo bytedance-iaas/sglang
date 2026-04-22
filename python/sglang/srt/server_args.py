@@ -6583,6 +6583,11 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
+        
+        assert self.speculative_moe_tp_size in {
+            1,
+            None,
+        }, "speculative_moe_tp_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         if not is_runai_obj_uri(self.served_model_name):
