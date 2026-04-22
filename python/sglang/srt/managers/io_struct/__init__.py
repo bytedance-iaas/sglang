@@ -226,7 +226,7 @@ async def sock_recv_async(
     if magic_number == MSGPACK_MAGIC_NUMBER:
         from .msgpack_struct import deserialize
 
-        obj = await socket.recv_multipart(flags=flags)
+        obj = deserialize(data)
         logger.debug(
             f"Async receiving msgpack object of type {type(obj)} with magic number {magic_number}"
         )
@@ -234,7 +234,7 @@ async def sock_recv_async(
     else:
         from .pickle_struct import deserialize
 
-        obj = await socket.recv_multipart(flags=flags)
+        obj = deserialize(data)
         logger.debug(
             f"Async receiving pickle object of type {type(obj)} with magic number {magic_number}"
         )
