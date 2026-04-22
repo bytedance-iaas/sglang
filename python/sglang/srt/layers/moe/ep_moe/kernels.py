@@ -1382,6 +1382,77 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
     )
     return output
 
+
+@triton.jit
+def _fp8_per_token_quant_to_per_tensor_quant_kernel(
+    x_ptr,
+    x_scale_ptr,
+    x_scale_stride0,
+    x_scale_stride1,
+    x_scale_stride2,
+    masked_m_ptr,
+    output_scale_ptr,
+    output_ptr,
+    max_tokens,
+    k,
+    K_SCALE_BLOCK_SIZE: tl.constexpr,
+    K_BLOCK_SIZE: tl.constexpr,
+):
+    hidden_dim_block_id = tl.program_id(0)
+    token_id = tl.program_id(1)
+    expert_id = tl.program_id(2)
+    pid_m_dim = tl.num_programs(1)
+
+    last_effective_id = tl.load(masked_m_ptr + expert_id)
+    output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
+
+    x_ptrs = x_ptr + expert_id * max_tokens * k + hidden_dim_block_id * K_BLOCK_SIZE
+    x_scale_ptrs = (
+        x_scale_ptr
+        + expert_id * x_scale_stride0
+        + hidden_dim_block_id * K_BLOCK_SIZE // K_SCALE_BLOCK_SIZE * x_scale_stride2
+    )
+    output_ptrs = (
+        output_ptr + expert_id * max_tokens * k + hidden_dim_block_id * K_BLOCK_SIZE
+    )
+
+    for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
+        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
+        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
+        hidden = hidden * scale_fp32 * output_scale_val_inv
+        tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
+
+
+def fp8_per_token_to_per_tensor_quant_triton(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    output_scale: torch.Tensor,
+    output: torch.Tensor,
+):
+    K_SCALE_BLOCK_SIZE = 128
+    assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
+    assert x.is_contiguous()
+    assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
+    assert output_scale.numel() == 1
+
+    K_BLOCK_SIZE = 1024
+    assert x.size(2) % K_BLOCK_SIZE == 0
+    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
+        x,
+        x_scale,
+        *x_scale.stride(),
+        masked_m,
+        output_scale,
+        output,
+        x.size(1),
+        x.size(2),
+        K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
+        K_BLOCK_SIZE=K_BLOCK_SIZE,
+        num_warps=8,
+    )
+
 @triton.jit
 def _silu_mul_and_static_tensor_quant_kernel(
     input_ptr,
