@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from datetime import datetime
 
 
 def get_sglang_version() -> str:
@@ -34,9 +34,17 @@ def get_sglang_version() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate Volcengine CR image tags for fork workflows.")
-    parser.add_argument("--mode", choices=["manual", "nightly", "version"], required=True)
-    parser.add_argument("--tag-value", default="", help="Required for version mode; inserted after .byted.")
+    parser = argparse.ArgumentParser(
+        description="Generate Volcengine CR image tags for fork workflows."
+    )
+    parser.add_argument(
+        "--mode", choices=["manual", "nightly", "version"], required=True
+    )
+    parser.add_argument(
+        "--tag-value",
+        default="",
+        help="Required for version mode; inserted after .byted.",
+    )
     parser.add_argument("--cuda-suffix", choices=["", "cu130"], default="")
     args = parser.parse_args()
 

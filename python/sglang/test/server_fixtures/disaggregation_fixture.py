@@ -1,8 +1,10 @@
 import logging
 import os
 import shlex
+import socket
 import time
 import warnings
+import zlib
 from urllib.parse import urlparse
 
 from sglang.srt.environ import envs
@@ -20,12 +22,52 @@ from sglang.utils import wait_for_http_ready
 logger = logging.getLogger(__name__)
 
 
+def _ports_available(host: str, ports: list[int]) -> bool:
+    sockets = []
+    try:
+        for port in ports:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind((host, port))
+            sockets.append(sock)
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def _pick_disaggregation_base_port(host: str, default_port: int, seed: str) -> int:
+    # Reserve a 1k-wide block so subclasses can safely derive +100/+200/+300/+500 ports.
+    block_size = 1000
+    max_blocks = 40
+    required_offsets = (0, 100, 200, 300, 500)
+    initial_block = zlib.crc32(seed.encode()) % max_blocks
+
+    for step in range(max_blocks):
+        base_port = default_port + ((initial_block + step) % max_blocks) * block_size
+        ports = [base_port + offset for offset in required_offsets]
+        if _ports_available(host, ports):
+            return base_port
+
+    return default_port
+
+
 class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
+        port_seed = (
+            f"{os.getenv('POD_NAME', 'local-runner')}:{cls.__module__}:{cls.__name__}"
+        )
+        base_port = str(
+            _pick_disaggregation_base_port(
+                cls.base_host,
+                int(parsed_url.port),
+                port_seed,
+            )
+        )
         cls.lb_port = base_port
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"

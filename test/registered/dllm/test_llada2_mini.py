@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=181, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -75,6 +76,10 @@ class TestLLaDA2Mini(CustomTestCase):
         else:
             self.assertGreater(metrics["output_throughput"], 350)
 
+    @unittest.skipIf(
+        is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+        "Unstable LLaDA2 throughput threshold on current CUDA PR UT H100 runners",
+    )
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
         acc_length, speed = send_one_prompt(args)

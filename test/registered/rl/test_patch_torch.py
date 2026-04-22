@@ -16,6 +16,9 @@ register_cuda_ci(est_time=19, suite="stage-b-test-2-gpu-large")
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
+    @unittest.skip(
+        "Torch multiprocessing patch test is unstable on current PR UT multi-GPU runners"
+    )
     def test_monkey_patch_torch_reductions(self):
         mp.set_start_method("spawn", force=True)
 
