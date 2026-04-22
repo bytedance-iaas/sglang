@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import multiprocessing as mp
-import os
 import unittest
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -28,31 +27,20 @@ from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, has_hf_cache_entry
 
 register_cuda_ci(est_time=75, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestLoRAOverlapLoading(CustomTestCase):
-    def _has_hf_cache_entry(self, repo_id: str, repo_type: str = "model") -> bool:
-        cache_root = os.environ.get("HF_HOME") or os.environ.get(
-            "HUGGINGFACE_HUB_CACHE"
-        )
-        if not cache_root:
-            return False
-        prefix = "datasets--" if repo_type == "dataset" else "models--"
-        return os.path.isdir(
-            os.path.join(cache_root, prefix + repo_id.replace("/", "--"))
-        )
-
     def test_ci_lora_models_batch_splitting(self):
         missing = []
         for model in CI_MULTI_LORA_MODELS:
-            if not self._has_hf_cache_entry(model.base):
+            if not has_hf_cache_entry(model.base):
                 missing.append(model.base)
             for adaptor in model.adaptors:
-                if not self._has_hf_cache_entry(adaptor.name):
+                if not has_hf_cache_entry(adaptor.name):
                     missing.append(adaptor.name)
         if missing:
             self.skipTest(

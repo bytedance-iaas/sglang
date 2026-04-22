@@ -35,7 +35,7 @@ from huggingface_hub import snapshot_download
 import sglang as sgl
 from sglang.srt.lora.utils import auto_detect_lora_target_modules
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, has_hf_cache_entry
 
 register_cuda_ci(
     est_time=40,
@@ -51,14 +51,6 @@ PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"
 
 KL_THRESHOLD = 5e-3
-
-
-def _has_hf_cache_entry(repo_id: str, repo_type: str = "model") -> bool:
-    cache_root = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    if not cache_root:
-        return False
-    prefix = "datasets--" if repo_type == "dataset" else "models--"
-    return os.path.isdir(os.path.join(cache_root, prefix + repo_id.replace("/", "--")))
 
 
 def kl_v2(a, b):
@@ -133,7 +125,7 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
         self.assertEqual(detected, expected)
 
     def test_lora_qwen3_8b_logprob_accuracy(self):
-        if not _has_hf_cache_entry(LORA_HF_REPO, repo_type="dataset"):
+        if not has_hf_cache_entry(LORA_HF_REPO, repo_type="dataset"):
             self.skipTest(f"LoRA dataset cache missing: {LORA_HF_REPO}")
 
         adapter_path = snapshot_download(

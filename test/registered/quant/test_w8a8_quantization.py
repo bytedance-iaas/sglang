@@ -12,33 +12,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    has_hf_cache_entry,
     is_in_ci,
     popen_launch_server,
 )
 
 register_cuda_ci(est_time=160, suite="stage-b-test-1-gpu-large")
-
-
-def _has_hf_cache_entry(repo_id: str, repo_type: str = "model") -> bool:
-    cache_root = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    if not cache_root:
-        return False
-    prefix = "datasets--" if repo_type == "dataset" else "models--"
-    repo_cache = os.path.join(cache_root, prefix + repo_id.replace("/", "--"))
-    if not os.path.isdir(repo_cache):
-        return False
-    if repo_type != "model":
-        return True
-
-    snapshot_root = os.path.join(repo_cache, "snapshots")
-    if not os.path.isdir(snapshot_root):
-        return False
-
-    weight_suffixes = (".safetensors", ".bin", ".pt")
-    for root, _, files in os.walk(snapshot_root):
-        if any(filename.endswith(weight_suffixes) for filename in files):
-            return True
-    return False
 
 
 class BaseW8A8Test(CustomTestCase):
@@ -57,7 +36,7 @@ class BaseW8A8Test(CustomTestCase):
         if cls.quantization:
             other_args.extend(["--quantization", cls.quantization])
 
-        if not _has_hf_cache_entry(cls.model):
+        if not has_hf_cache_entry(cls.model, require_weight=True):
             raise unittest.SkipTest(f"Model cache missing: {cls.model}")
 
         cls.process = popen_launch_server(
