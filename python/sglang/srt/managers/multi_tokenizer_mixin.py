@@ -44,7 +44,8 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     sock_recv,
-    sock_send,
+    sock_recv_async,
+    sock_send_async,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -352,14 +353,14 @@ class MultiTokenizerRouter:
 
     async def router_worker_obj(self):
         while True:
-            recv_obj = sock_recv(self.receive_from_worker)
-            sock_send(self.send_to_scheduler, recv_obj)
+            recv_obj = await sock_recv_async(self.receive_from_worker)
+            await sock_send_async(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         # special reqs will recv from scheduler, need to route to right worker
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = sock_recv(self.recv_from_detokenizer)
+            recv_obj = await sock_recv_async(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):

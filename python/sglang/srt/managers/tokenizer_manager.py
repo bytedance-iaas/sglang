@@ -70,7 +70,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
-    sock_recv,
+    sock_recv_async,
     sock_send,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
@@ -1614,7 +1614,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = sock_recv(self.recv_from_detokenizer)
+                recv_obj = await sock_recv_async(self.recv_from_detokenizer)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()

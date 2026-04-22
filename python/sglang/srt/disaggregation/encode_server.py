@@ -37,7 +37,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqInput,
     ProfileReqType,
-    sock_recv,
+    sock_recv_async,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
@@ -1369,7 +1369,7 @@ async def run_encoder(
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
-        request = sock_recv(encoder.schedule_socket)
+        request = await sock_recv_async(encoder.schedule_socket)
 
         if isinstance(request, ProfileReq):
             if request.type == ProfileReqType.START_PROFILE:

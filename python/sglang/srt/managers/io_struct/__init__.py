@@ -1,4 +1,8 @@
+from typing import Union
+
+import msgspec
 from zmq import Socket
+from zmq.asyncio import Socket as AsyncSocket
 
 from sglang.srt.environ import envs
 
@@ -146,6 +150,40 @@ def sock_recv(socket: Socket, flags=0) -> Union[BaseReq, BaseBatchReq, msgspec.S
         return socket.recv_pyobj(flags=flags)
 
     magic_number, data = socket.recv_multipart(flags=flags)
+    if magic_number == MSGPACK_MAGIC_NUMBER:
+        from .msgpack_struct import deserialize
+
+        return deserialize(data)
+    else:
+        from .pickle_struct import deserialize
+
+        return deserialize(data)
+
+
+async def sock_send_async(
+    socket: AsyncSocket, obj: Union[BaseReq, BaseBatchReq, msgspec.Struct], flags=0
+):
+    if not envs.SGLANG_IPC_USE_MSGPACK:
+        await socket.send_pyobj(obj, flags=flags)
+        return
+
+    if isinstance(obj, msgspec.Struct):
+        from .msgpack_struct import serialize
+
+        await socket.send_multipart([MSGPACK_MAGIC_NUMBER, serialize(obj)], flags=flags)
+    else:
+        from .pickle_struct import serialize
+
+        await socket.send_multipart([PICKLE_MAGIC_NUMBER, serialize(obj)], flags=flags)
+
+
+async def sock_recv_async(
+    socket: AsyncSocket, flags=0
+) -> Union[BaseReq, BaseBatchReq, msgspec.Struct]:
+    if not envs.SGLANG_IPC_USE_MSGPACK:
+        return await socket.recv_pyobj(flags=flags)
+
+    magic_number, data = await socket.recv_multipart(flags=flags)
     if magic_number == MSGPACK_MAGIC_NUMBER:
         from .msgpack_struct import deserialize
 
