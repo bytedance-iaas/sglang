@@ -237,13 +237,18 @@ class DeepEPMoE(FusedMoE):
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            combine_out_buffer = self.dispatcher.get_next_low_latency_combine_buffer()
             if (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config.get_name() == "modelopt_fp4"
             ):
-                output = self.forward_flashinfer_cutedsl(dispatch_output)
+                output = self.forward_flashinfer_cutedsl(
+                    dispatch_output, out=combine_out_buffer
+                )
             elif self.use_w4afp8:
-                output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+                output = self.forward_cutlass_w4afp8_masked(
+                    dispatch_output, out=combine_out_buffer
+                )
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -312,6 +317,7 @@ class DeepEPMoE(FusedMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLDispatchOutput,
+        out: Optional[torch.Tensor] = None,
     ):
         hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
         assert self.quant_method is not None
@@ -322,6 +328,7 @@ class DeepEPMoE(FusedMoE):
             x=(hidden_states, hidden_states_scale),
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
+            out=out,
         )
         return output
 
@@ -339,6 +346,7 @@ class DeepEPMoE(FusedMoE):
     def forward_cutlass_w4afp8_masked(
         self,
         dispatch_output: DeepEPLLDispatchOutput,
+        out: Optional[torch.Tensor] = None,
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
@@ -348,6 +356,7 @@ class DeepEPMoE(FusedMoE):
         return self.quant_method.apply_deepep_ll(
             layer=self,
             dispatch_output=dispatch_output,
+            out=out,
         )
 
     def forward_npu(

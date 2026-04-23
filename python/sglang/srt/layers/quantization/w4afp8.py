@@ -330,6 +330,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
@@ -357,6 +358,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            out=out,
         )
 
         return output

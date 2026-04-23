@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
     get_moe_runner_backend,
+    is_sbo_enabled,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -183,6 +184,7 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
+                    single_batch_overlap=is_sbo_enabled(),
                 ),
                 num_rdma_bytes,
             )
@@ -226,6 +228,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
+            single_batch_overlap=is_sbo_enabled(),
         )
         return cls._buffer
 
@@ -694,12 +697,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             overlap_args_dict = {}
 
+        zero_copy = False
+        combine_buffer = buffer.get_next_low_latency_combine_buffer(self.handle)
+        if (
+            hidden_states.shape == combine_buffer.shape
+            and hidden_states.stride() == combine_buffer.stride()
+            and hidden_states.data_ptr() == combine_buffer.data_ptr()
+        ):
+            zero_copy = True
+
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
                 topk_weights=topk_weights,
                 handle=self.handle,
+                zero_copy=zero_copy,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
@@ -707,6 +720,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
+
+    def get_next_low_latency_combine_buffer(self) -> torch.Tensor:
+        return self._get_buffer().get_next_low_latency_combine_buffer(self.handle)
 
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
@@ -870,3 +886,14 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+    def get_next_low_latency_combine_buffer(self) -> Optional[torch.Tensor]:
+        if not self.deepep_mode.enable_low_latency():
+            return None
+        if self._stage != _Stage.AFTER_DISPATCH_B:
+            return None
+
+        impl = self._get_impl()
+        if not isinstance(impl, _DeepEPDispatcherImplLowLatency):
+            return None
+        return impl.get_next_low_latency_combine_buffer()

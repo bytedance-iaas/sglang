@@ -2043,6 +2043,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -2083,5 +2084,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if down_gemm_overlap_args is not None
                 else {}
             ),
+            out=out,
         )
         return out

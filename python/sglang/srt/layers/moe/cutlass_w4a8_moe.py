@@ -431,6 +431,7 @@ def cutlass_w4a8_moe_deepep_ll(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -503,7 +504,13 @@ def cutlass_w4a8_moe_deepep_ll(
     gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
     per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
-    c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
+    if out is None:
+        c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
+    else:
+        assert out.shape == (num_experts, m, k)
+        assert out.dtype == torch.bfloat16
+        assert out.device == device
+        c2 = out
 
     cutlass_w4a8_moe_mm(
         c1,
@@ -527,6 +534,8 @@ def cutlass_w4a8_moe_deepep_ll(
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale
     )
+    if out is not None and out.stride()[1] != k:
+        c_strides2 = torch.full_like(c_strides2, out.stride()[1])
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,
