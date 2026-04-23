@@ -18,7 +18,6 @@ Only the `triton` attention backend is supported for GR00T-N1.7. `fa3` has flaky
 The `--tokenizer-path` is optional. If omitted, SGLang will automatically download the tokenizer from `nvidia/Cosmos-Reason2-2B`:
 
 ```shell
-FLASHINFER_DISABLE_VERSION_CHECK=1 \
 python3 -m sglang.launch_server \
     --model-path nvidia/GR00T-N1.7-3B \
     --tokenizer-path nvidia/Cosmos-Reason2-2B \
@@ -55,7 +54,7 @@ The sglang server itself does NOT need Isaac-GR00T. The dependency is purely cli
 
 ### Inference Script
 
-The full tutorial script below (also shipped at `test_online_full.py` in the repo root) loads a DROID demonstration via `LeRobotEpisodeLoader`, drives the running sglang server frame-by-frame, converts normalized predictions back into physical joint commands via Isaac's `policy.processor.decode_action`, and reports physical-space MSE / MAE against the episode's ground-truth actions. Copy it into a file and run with `python3 test_online_full.py` once `./start.sh` is serving on `localhost:30000`.
+The full tutorial script below (also shipped at `test_online_full.py` in the repo root) loads a DROID demonstration via `LeRobotEpisodeLoader`, drives the running sglang server frame-by-frame, converts normalized predictions back into physical joint commands via Isaac's `policy.processor.decode_action`, and reports physical-space MSE / MAE against the episode's ground-truth actions. Copy it into a file and run with `python3 test_online_full.py` once the sglang server launched above is serving on `localhost:30000`.
 
 ```python
 """GR00T-N1.7 on SGLang — end-to-end tutorial / online smoke test.
@@ -84,9 +83,9 @@ step hits sglang instead of a local `Gr00tPolicy`:
 --------------------------------------------------------------------------------
 PREREQUISITES
 --------------------------------------------------------------------------------
-1. A running sglang server that loaded GR00T-N1.7-3B:
-
-     ./start.sh      # in one terminal (expects the model at /data/models/GR00T-N1.7-3B)
+1. A running sglang server that loaded GR00T-N1.7-3B (see the "Launch Server"
+   section of the docs for the exact flags; triton backend + --disable-cuda-graph
+   are required).
 
 2. NVIDIA's Isaac-GR00T package installed in the current Python env.
    It is only needed CLIENT-SIDE, for LeRobot dataset loading and
@@ -99,7 +98,7 @@ PREREQUISITES
    Or run this script through Isaac's uv env:
 
      cd /path/to/Isaac-GR00T
-     uv run python /path/to/sglang-groot/test_online_full.py
+     uv run test_online_full.py
 
 3. A LeRobot-format demonstration episode.  The demo bundled with
    Isaac-GR00T lives at
@@ -110,9 +109,6 @@ PREREQUISITES
 --------------------------------------------------------------------------------
 USAGE
 --------------------------------------------------------------------------------
-  ./start.sh                                # terminal 1 — start the server
-  python3 test_online_full.py               # terminal 2 — run this tutorial
-
   # with overrides:
   python3 test_online_full.py \
       --traj-id 1 --action-horizon 8 --steps 200
@@ -169,7 +165,7 @@ except ImportError as exc:
         "or invoke this script through Isaac's uv env:\n"
         "\n"
         "    cd /path/to/Isaac-GR00T\n"
-        "    uv run python /path/to/sglang-groot/test_online_full.py\n"
+        "    uv run python test_online_full.py\n"
         "\n"
         f"Underlying ImportError: {exc}\n"
         "================================================================================\n"
