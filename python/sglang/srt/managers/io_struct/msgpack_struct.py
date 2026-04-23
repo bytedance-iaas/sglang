@@ -108,6 +108,19 @@ class BatchTokenIDOutput(msgspec.Struct, tag=True):
     rids: Optional[List[str]] = None
     http_worker_ipcs: Optional[List[str]] = None
 
+    # From SpeculativeDecodingMetricsMixin dataclass
+    # Verify count: number of verification forward passes
+    spec_verify_ct: List[int]
+
+    # Accepted tokens: Number of accepted tokens during speculative decoding
+    spec_accepted_tokens: List[int]
+
+    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
+    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+    # Empty list [] when speculative decoding is disabled.
+    spec_acceptance_histogram: List[List[int]]
+
     # From BatchTokenIDOutput dataclass
     # The finish reason
     finished_reasons: List[Dict[str, Any]]
@@ -174,6 +187,13 @@ class BatchTokenIDOutput(msgspec.Struct, tag=True):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+
+class BatchStrOutput(msgspec.Struct, tag=True):
+
+    # From BaseBatchReq dataclass
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[str]] = None
+
     # From SpeculativeDecodingMetricsMixin dataclass
     # Verify count: number of verification forward passes
     spec_verify_ct: List[int]
@@ -186,6 +206,100 @@ class BatchTokenIDOutput(msgspec.Struct, tag=True):
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
+
+    # From BatchStrOutput dataclass
+    # The finish reason
+    finished_reasons: List[Dict[str, Any]]
+    # The output decoded strings
+    output_strs: List[str]
+    # The token ids
+    output_ids: Optional[List[int]]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    reasoning_tokens: List[int]
+    cached_tokens: List[int]
+
+    # Logprobs
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
+    input_token_ids_logprobs_val: List[List]
+    input_token_ids_logprobs_idx: List[List]
+    output_token_ids_logprobs_val: List[List]
+    output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
+
+    # Hidden states
+    output_hidden_states: List[List[float]]
+
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
+
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadsReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # DP rank of the scheduler that processed each request
+    dp_ranks: Optional[List[int]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+
+class BatchEmbeddingOutput(msgspec.Struct, tag=True):
+
+    # From BaseBatchReq dataclass
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[str]] = None
+
+    # From BatchEmbeddingOutput dataclass
+    # The finish reason
+    finished_reasons: List[Dict[str, Any]]
+    # The output embedding
+    embeddings: Union[List[List[float]], List[Dict[int, float]]]
+    # Token counts
+    prompt_tokens: List[int]
+    cached_tokens: List[int]
+    # Placeholder token info
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # Optional pooled hidden states (pre-head transformer output).
+    # Sent as a single stacked tensor to minimize pickle overhead.
+    pooled_hidden_states: Optional[
+        Union[List[Optional[torch.Tensor]], torch.Tensor]
+    ] = None
 
 
 class SchedulerReqTimeStatsIPC(msgspec.Struct, tag=True):
@@ -307,6 +421,8 @@ _unified_struct = Union[
     FlushCacheReqInput,
     FlushCacheReqOutput,
     BatchTokenIDOutput,
+    BatchStrOutput,
+    BatchEmbeddingOutput,
     GetLoadsReqOutput,
     MemoryMetrics,
     SpeculativeMetrics,

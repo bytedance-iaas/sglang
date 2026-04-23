@@ -17,8 +17,6 @@ from .pickle_struct import (
     BackupDramReq,
     BaseBatchReq,
     BaseReq,
-    BatchEmbeddingOutput,
-    BatchStrOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
@@ -107,6 +105,8 @@ from .pickle_struct import (
 
 if envs.SGLANG_IPC_USE_MSGPACK.get():
     from .msgpack_struct import (
+        BatchEmbeddingOutput,
+        BatchStrOutput,
         BatchTokenIDOutput,
         DisaggregationMetrics,
         FlushCacheReqInput,
@@ -120,6 +120,8 @@ if envs.SGLANG_IPC_USE_MSGPACK.get():
     )
 else:
     from .pickle_struct import (
+        BatchEmbeddingOutput,
+        BatchStrOutput,
         BatchTokenIDOutput,
         DisaggregationMetrics,
         FlushCacheReqInput,
