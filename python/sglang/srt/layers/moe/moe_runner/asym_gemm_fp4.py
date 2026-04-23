@@ -168,22 +168,16 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         # w13_weight is (E, 2*N, K//2); the gate-up output has 2*N bf16 columns
         # which silu_and_mul reduces to N.
         w13_n = quant_info.w13_weight.size(1)
-        w13_weight = quant_info.w13_weight
-        w2_weight = quant_info.w2_weight
+        K = hidden_states_shape[1]
 
-        # Zero-init so padding rows (outside the kernel's offset range) are 0
-        # rather than uninitialized garbage.  Uninitialized padding can produce
-        # NaN scales after silu_and_mul+quantize, which the block-scale TMA
-        # loads may then expose into real-token output tiles.
-        gateup_output = torch.zeros(
+        gateup_output = torch.empty(
             (all_tokens, w13_n),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_contig(
             (hidden_states, hidden_states_scale),
-            (w13_weight, quant_info.w13_scale),
+            (quant_info.w13_weight, quant_info.w13_scale),
             gateup_output,
             runner_input.offsets,
             runner_input.experts,
@@ -206,20 +200,20 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         down_in_fp4, down_in_scale = _quantize_bf16_to_nvfp4_e4m3(down_in_bf16)
         del down_in_bf16
 
-        n_down = w2_weight.size(1)
-        down_output = torch.zeros(
-            (all_tokens, n_down),
+        down_output = torch.empty(
+            (all_tokens, K),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
         asym_gemm_wrapper.grouped_gemm_nt_fp4fp4bf16_contig(
             (down_in_fp4, down_in_scale),
-            (w2_weight, quant_info.w2_scale),
+            (quant_info.w2_weight, quant_info.w2_scale),
             down_output,
             runner_input.offsets,
             runner_input.experts,
             runner_input.list_size,
         )
+
         return down_output
 
     def _run_masked_gemm(
@@ -242,9 +236,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
 
         num_groups, m, k_packed = hidden_states.shape
         n = w13_weight.size(1)
-        # Zero-init so uncomputed rows (outside offsets range) are 0, not garbage.
-        # silu(0)=0 → zero FP4 codes → no NaN propagation through the down GEMM.
-        gateup_output = torch.zeros(
+        gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
@@ -254,9 +246,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -294,9 +283,6 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
 
         return down_output
