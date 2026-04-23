@@ -197,6 +197,8 @@ ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG INSTALL_FLASHINFER_JIT_CACHE
+ARG BUILD_SGL_KERNEL_FROM_SOURCE=0
+ARG SGL_KERNEL_NVCC_THREADS=128
 ARG FLASHINFER_VERSION
 ARG GRACE_BLACKWELL
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH
@@ -222,7 +224,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -rf /tmp/local_src
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    python3 -m pip install --upgrade pip setuptools wheel html5lib six uv scikit-build-core ninja \
     && cd sglang \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -231,7 +233,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+    && if [ "$BUILD_SGL_KERNEL_FROM_SOURCE" = "1" ]; then \
+        echo "Building sgl-kernel from source" \
+    &&  cd /sgl-workspace/sglang/sgl-kernel \
+    &&  CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
+        CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${SGL_KERNEL_NVCC_THREADS}" \
+        python3 -m uv build --wheel -Cbuild-dir=build . --no-build-isolation \
+    &&  python3 -m pip install dist/*whl --force-reinstall --no-deps \
+    &&  cd /sgl-workspace/sglang \
+    elif [ "$CUDA_VERSION" = "12.6.1" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \

@@ -11,6 +11,10 @@ on:
         description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
+      sgl_kernel_nvcc_threads:
+        description: "NVCC threads for sgl-kernel source build"
+        required: false
+        default: "128"
   schedule:
     - cron: "0 0 * * *"
 
@@ -98,8 +102,14 @@ jobs:
           # Nightly (schedule) installs latest release; manual dispatch builds from checked-out source
           if [ "${{ github.event_name }}" = "schedule" ]; then
             SOURCE_ARG="--build-arg USE_LATEST_SGLANG=1"
+            SGL_KERNEL_NVCC_THREADS="128"
           else
             SOURCE_ARG="--build-arg BRANCH_TYPE=local"
+            SGL_KERNEL_NVCC_THREADS="${{ inputs.sgl_kernel_nvcc_threads }}"
+          fi
+
+          if [ -z "${SGL_KERNEL_NVCC_THREADS}" ]; then
+            SGL_KERNEL_NVCC_THREADS="128"
           fi
 
           IMAGE_NAME="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
@@ -134,6 +144,8 @@ jobs:
             --build-arg ALL_PROXY=${ALL_PROXY} \
             --build-arg NO_PROXY=${NO_PROXY} \
             ${SOURCE_ARG} \
+            --build-arg BUILD_SGL_KERNEL_FROM_SOURCE=1 \
+            --build-arg SGL_KERNEL_NVCC_THREADS=${SGL_KERNEL_NVCC_THREADS} \
             ${INTERNAL_ARGS} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --no-cache \
