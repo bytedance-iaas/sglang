@@ -8,51 +8,58 @@ Task scope:
   matches Isaac-GR00T's Gr00tPolicy.get_action within numerical tolerance.
 
 Current summary:
-  Feature branch `groot-n17-port`.  F1-F9, F11, F12 landed previously.  F13
-  landed 2026-04-23: stripped all `F1`/.../`F13` feature-tracker mentions
-  from groot runtime / test / launcher / parity-script files.  The ledger
-  ownership stays in feature_list.md + claude-progress.txt; code files no
-  longer carry planning vocabulary.  Only F10 (documentation) remains.
+  Feature branch `groot-n17-port`.  F1-F13 landed.  F14 landed 2026-04-23:
+  test_online_full.py is now the single canonical end-to-end tutorial
+  script.  It uses Isaac-GR00T's LeRobotEpisodeLoader for dataset
+  loading, emits a clear install-guidance warning when the `gr00t`
+  package isn't importable (pointing users at
+  https://github.com/NVIDIA/Isaac-GR00T.git), and supersedes the
+  duplicate scripts/groot_parity/open_loop_eval_sglang.py which has
+  been removed.  Only F10 (documentation) remains.
 
-  F13 deliverable (comment-only scrub):
-    - python/sglang/srt/models/groot_n1d7.py: removed [F2 part 2],
-      [F3], [F4] header tags; rewrote the top-level wrapper comment
-      block (was "forward path is stubbed in F4 and filled in later
-      features (F5 wires ...; F7 threads ...; F9 validates ...)")
-      into a plain "the forward path wires VL layer-16 extraction
-      into the action head and threads proprio_state /
-      embodiment_id through ForwardBatch"; dropped "F5 (plan Task
-      4.3 Option B):" prefix on the hook-install comment.
-    - test/manual/models/test_groot_n17.py: dropped "F3:", "F4:",
-      "F6:", "F7:", "F11 smoke:" docstring prefixes and inline
-      "F11:" / "F6 processor" comment tags.  Test names and code
-      unchanged.
-    - test_online_full.py: removed "(F8)" tag from the module
-      docstring.
-    - start.sh: removed "per the plan's F8 recipe" phrasing from the
-      launch-flag rationale comment.
-    - scripts/groot_parity/open_loop_eval_sglang.py: removed "(see
-      F7)" parenthetical on the serving_chat history_traj comment.
-    - feature_list.md / claude-progress.txt: this F13 entry +
-      summary refresh.  CLAUDE.md / MEMORY.md are deliberately
-      untouched — they are the ledger itself.
+  Note on numbering: the user labeled this task "AS F13" but F13 was
+  already taken by the 2026-04-23 feature-marker scrub commit.  Used
+  F14 to avoid collision.
 
-  Linter codes (`F401` unused-import, `F811`, etc.) were preserved
-  throughout; only feature-tracker markers in the `F1..F13` range
-  were removed.  Unrelated occurrences (BERTScore F1, VSCode F5
-  shortcut in the docker dev guide, etc.) were left alone.
+  F14 deliverable (script merge):
+    - test_online_full.py (rewrite):
+      * Loads trajectory via LeRobotEpisodeLoader instead of the old
+        hand-rolled parquet + decord video wrangling.
+      * Uses Isaac-GR00T's Gr00tPolicy(strict=False) solely for its
+        modality_configs + state_action_processor (normalize/un-
+        normalize statistics); inference itself goes to sglang.
+      * Wraps Isaac imports in try/except ImportError that writes a
+        clear stderr warning with `git clone
+        https://github.com/NVIDIA/Isaac-GR00T.git` + `pip install -e .`
+        instructions and a `uv run` fallback, then exits 1.  Users on
+        a default sglang install see the actionable warning instead
+        of a raw ModuleNotFoundError traceback.
+      * CLI args: --traj-id, --dataset, --embodiment-tag,
+        --action-horizon, --steps, --sglang-url.
+      * Prints per-step latency + aggregate physical-space MSE/MAE
+        vs episode ground truth; cites the Isaac Gr00tPolicy
+        reference (MSE=0.003289, MAE=0.037619 on DROID traj 1) for
+        calibration.
+    - scripts/groot_parity/open_loop_eval_sglang.py: removed (merged
+      into test_online_full.py).  The now-empty
+      scripts/groot_parity/ directory is also gone.
+    - feature_list.md / claude-progress.txt: this F14 entry +
+      summary refresh.
 
   Prior landmarks (unchanged):
+    F13 (2026-04-23): scrubbed all `F1`..`F13` feature-tracker
+    markers from groot runtime / test / launcher / parity-script
+    files.  Ledger ownership stays in feature_list.md +
+    claude-progress.txt only.
     F12 (2026-04-23): dropped Isaac-GR00T source path dep from
     test_groot_n17.py so the pytest suite runs on a default sglang
-    install; equivalent port-verification signal lives in
-    test_online_full.py's open-loop DROID MSE.
-    F11: MaskedFlashAttention (srt/layers/attention/masked_flash_attn.py)
-    with forward_batch threading through DiT / AlternateVLDiT /
-    SelfAttentionTransformer.
+    install.
+    F11: MaskedFlashAttention with forward_batch threading through
+    the DiT / AlternateVLDiT / SelfAttentionTransformer stack.
     F9 parity (Isaac action head @ bf16, max-abs ~5.9e-2 ≤ 1e-1)
-    was validated pre-F12; equivalent signal going forward comes
-    from test_online_full.py's DROID physical-space MSE.
+    was validated pre-F12; equivalent signal comes from
+    test_online_full.py's DROID physical-space MSE (now powered by
+    LeRobotEpisodeLoader).
 
 Features (see feature_list.md for acceptance criteria):
   F1  Gr00tN1d7Config + HF registration                    completed
@@ -68,6 +75,7 @@ Features (see feature_list.md for acceptance criteria):
   F11 DiT attention via MaskedFlashAttention               completed
   F12 Drop Isaac-GR00T path dep from manual test           completed
   F13 Scrub feature-list markers from groot code           completed
+  F14 Single e2e tutorial script via LeRobotEpisodeLoader  completed
 
 Main gaps:
   Only F10 (documentation) remains.  Docs should mirror alpamayo_r1.md:

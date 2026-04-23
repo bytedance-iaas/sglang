@@ -341,3 +341,45 @@ matches Isaac-GR00T's `Gr00tPolicy.get_action` within numerical tolerance.
   still shows 7/7 pass on CUDA; the scrub is comment-only so no
   behaviour change is expected.
 - **passes:** completed
+
+## F14 — Single end-to-end tutorial script using LeRobotEpisodeLoader
+- **Goal:** `test_online_full.py` becomes the one canonical script that
+  shows a user how to exercise sglang + GR00T-N1.7 end-to-end.  It must
+  (a) load dataset frames via Isaac-GR00T's `LeRobotEpisodeLoader`
+  rather than hand-rolled parquet + decord path wrangling, and (b) emit
+  a clear install-guidance warning if the `gr00t` package isn't
+  importable, since that package is not part of a default sglang install.
+  The previous stand-alone parity script
+  `scripts/groot_parity/open_loop_eval_sglang.py` folds into this one
+  file; keeping two near-duplicate scripts is noise.
+- **Acceptance:**
+  - `test_online_full.py` imports
+    `gr00t.data.dataset.lerobot_episode_loader.LeRobotEpisodeLoader`,
+    `gr00t.data.dataset.sharded_single_step_dataset.extract_step_data`,
+    `gr00t.data.embodiment_tags.EmbodimentTag`,
+    `gr00t.policy.gr00t_policy.Gr00tPolicy`.  Loader replaces the old
+    pandas/decord parquet + video pathing.
+  - Isaac-GR00T is imported inside a `try/except ImportError` that
+    writes a clear warning to stderr (including the canonical
+    `git clone https://github.com/NVIDIA/Isaac-GR00T.git` / `pip install -e .`
+    remediation and the `uv run` fallback) and exits with code 1.
+    Running the script in a Python env without `gr00t` installed must
+    produce that warning, not an uncaught `ModuleNotFoundError`
+    traceback.
+  - `scripts/groot_parity/open_loop_eval_sglang.py` is removed (the
+    empty directory goes with it).
+  - CLI surface: `--traj-id`, `--dataset`, `--embodiment-tag`,
+    `--action-horizon`, `--steps`, `--sglang-url`.  Defaults point at
+    the DROID demo under `/data/dongmao_dev/Isaac-GR00T/demo_data/droid_sample`
+    for continuity with previous workflow.
+  - `python3 test_online_full.py --help` exits 0 when `gr00t` IS
+    installed, and exits 1 with the warning when it is not.
+- **Tests:** manual — invoke via:
+    1. `./start.sh` to start the sglang server.
+    2. `python3 test_online_full.py` (or `uv run python3 test_online_full.py`
+       from the Isaac checkout) prints per-step inference latency and
+       an aggregate `MSE = ...` / `MAE = ...` for trajectory 1.  On
+       this box the reference Gr00tPolicy reports MSE=0.003289 /
+       MAE=0.037619; the sglang-driven run lands in the same ballpark.
+  `test/manual/models/test_groot_n17.py` unaffected (7/7 still pass).
+- **passes:** completed
