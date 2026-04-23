@@ -1,4 +1,4 @@
-"""GR00T-N1.7 manual online smoke test (F8) — DROID closed-loop replay
+"""GR00T-N1.7 manual online smoke test — DROID closed-loop replay
 with normalization parity against Isaac-GR00T's standalone_inference_script.py.
 
 Hard-coded against `/data/dongmao_dev/Isaac-GR00T/demo_data/droid_sample`:

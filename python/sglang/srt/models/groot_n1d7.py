@@ -17,9 +17,9 @@ One-file port of Isaac-GR00T's `gr00t_n1d7` stack:
 - Embodiment-conditioned MLP primitives
   (from Isaac-GR00T/gr00t/model/modules/embodiment_conditioned_mlp.py)
 - DiT + AlternateVLDiT + SelfAttentionTransformer
-  (from Isaac-GR00T/gr00t/model/modules/dit.py)  [F2 part 2]
-- Gr00tN1d7ActionHead with flow-matching Euler loop                [F3]
-- Top-level Gr00tN1d7 model wrapper with load_weights              [F4]
+  (from Isaac-GR00T/gr00t/model/modules/dit.py)
+- Gr00tN1d7ActionHead with flow-matching Euler loop
+- Top-level Gr00tN1d7 model wrapper with load_weights
 
 Flat single-file layout matches SGLang's alpamayo_r1.py convention.
 """
@@ -750,9 +750,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 #
 # Composes a Qwen3-VL backbone (truncated to `select_layer = 16` LM layers,
 # matching Isaac-GR00T's qwen3_backbone.py) with Gr00tN1d7ActionHead.  The
-# forward path is stubbed in F4 and filled in later features (F5 wires VL
-# layer-16 extraction; F7 threads proprio_state / embodiment_id through
-# ForwardBatch; F9 validates end-to-end numerical parity).
+# forward path wires VL layer-16 extraction into the action head and threads
+# proprio_state / embodiment_id through ForwardBatch.
 # ==============================================================================
 
 
@@ -917,7 +916,7 @@ class Gr00tN1d7(nn.Module):
 
         self.action_head = Gr00tN1d7ActionHead(config)
 
-        # F5 (plan Task 4.3 Option B): expose the truncated backbone's
+        # Expose the truncated backbone's
         # post-norm hidden states to `self.action_head`.  sglang's
         # `LogitsProcessorOutput.hidden_states` is only populated when a
         # request sets `capture_hidden_mode` (EAGLE's path); GR00T needs the

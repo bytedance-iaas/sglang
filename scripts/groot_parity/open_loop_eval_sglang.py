@@ -98,7 +98,7 @@ def _sglang_predict(
         "model": "/data/models/GR00T-N1.7-3B/",
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 1,
-        # serving_chat accepts `history_traj` as a top-level field (see F7).
+        # serving_chat accepts `history_traj` as a top-level field.
         "history_traj": history_traj,
     }
 

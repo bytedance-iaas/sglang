@@ -314,3 +314,30 @@ matches Isaac-GR00T's `Gr00tPolicy.get_action` within numerical tolerance.
 - **Tests:** `python -m pytest test/manual/models/test_groot_n17.py -x -q`
   collects exactly these 7 tests and passes on CUDA.
 - **passes:** completed
+
+## F13 — Scrub feature-list markers from groot code and comments
+- **Goal:** Remove all `F1`/`F2`/.../`F13` feature-tracker mentions from
+  groot runtime / test / launcher / parity-script files.  The ledger
+  ownership stays in `feature_list.md` and `claude-progress.txt`; the
+  code itself shouldn't carry task-tracker cross-references that grow
+  stale and leak planning vocabulary into production files.
+- **Acceptance:**
+  - `grep -nE "\bF([1-9]|1[0-3])\b"` against the groot source set
+    (`python/sglang/srt/models/groot_n1d7.py`,
+    `python/sglang/srt/multimodal/processors/groot_n1d7.py`,
+    `python/sglang/srt/configs/groot_n1d7.py`,
+    `test/manual/models/test_groot_n17.py`, `test_online_full.py`,
+    `start.sh`, `scripts/groot_parity/open_loop_eval_sglang.py`)
+    returns zero matches.  Linter directives such as `# noqa: F401`
+    are intentionally preserved (Pyflakes codes, not feature markers).
+  - No semantic regression: comments that carried real documentation
+    beyond the `Fn` tag are rewritten to keep the content (e.g. the
+    Gr00tN1d7 top-level wrapper comment block is paraphrased without
+    the "F5 wires ...; F7 threads ...; F9 validates ..." ticket
+    chronology).
+  - `feature_list.md` / `claude-progress.txt` / `CLAUDE.md` /
+    `MEMORY.md` are deliberately excluded — they are the ledger itself.
+- **Tests:** `python -m pytest test/manual/models/test_groot_n17.py -x -q`
+  still shows 7/7 pass on CUDA; the scrub is comment-only so no
+  behaviour change is expected.
+- **passes:** completed

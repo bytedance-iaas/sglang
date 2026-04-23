@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-# The F6 processor test imports sglang's qwen_vl processor which pulls in
+# The processor test imports sglang's qwen_vl processor which pulls in
 # flashinfer eagerly; skip the version check so this suite runs on boxes
 # where flashinfer / flashinfer-jit-cache are mismatched.  Must be set
 # before any sglang import.
@@ -12,7 +12,7 @@ import torch
 
 GR00T_WEIGHTS = Path("/data/models/GR00T-N1.7-3B")
 
-# F11: DiT attention runs through MaskedFlashAttention, which requires CUDA +
+# DiT attention runs through MaskedFlashAttention, which requires CUDA +
 # bf16/fp16.  Tests that touch the DiT are gated on CUDA and run in bf16
 # (native checkpoint dtype).
 _requires_cuda = pytest.mark.skipif(
@@ -47,7 +47,7 @@ def test_config_loads():
 @_requires_cuda
 @torch.no_grad()
 def test_masked_flash_attention_varlen():
-    """F11 smoke: MaskedFlashAttention handles both fixed-length self-attn
+    """Smoke test: MaskedFlashAttention handles both fixed-length self-attn
     and per-key bool-mask cross-attn (varlen gather) end-to-end on CUDA bf16.
     Compares against an inline SDPA-bf16 reference built from the same
     weights."""
@@ -118,12 +118,13 @@ def test_masked_flash_attention_varlen():
 @_requires_cuda
 @torch.no_grad()
 def test_action_head_get_action_shape_and_determinism():
-    """F3: verify the composition (state enc + action enc + AlternateVLDiT +
+    """Verify the composition (state enc + action enc + AlternateVLDiT +
     action dec + Euler loop) runs on CUDA bf16, produces the right shape,
     and is deterministic under a fixed torch seed.  End-to-end numerical
     parity against the published reference is covered by
     `test_online_full.py`'s open-loop MSE vs DROID ground-truth actions;
-    load-from-checkpoint correctness is covered in F4.
+    load-from-checkpoint correctness is covered by
+    `test_load_weights_routing`.
     """
 
     from sglang.srt.configs.groot_n1d7 import Gr00tN1d7Config
@@ -228,7 +229,7 @@ def test_action_head_get_action_shape_and_determinism():
 
 
 def test_load_weights_routing():
-    """F4: Gr00tN1d7.load_weights splits tensors by prefix and dispatches to
+    """Gr00tN1d7.load_weights splits tensors by prefix and dispatches to
     backbone.load_weights and action_head.load_state_dict.  We stand up a
     mock backbone so the test doesn't need sglang's distributed init."""
 
@@ -264,7 +265,7 @@ def test_load_weights_routing():
 
 
 def test_processor_shapes():
-    """F6: exercise the F6 processor's core stateless contract — state-key
+    """Exercise the processor's core stateless contract — state-key
     ordering, proprio flattening/padding, and embodiment-tag → id mapping.
 
     We bypass the full `Gr00tN1d7Processor.__init__` because the base
@@ -349,7 +350,7 @@ def test_processor_shapes():
 
 
 def test_f7_plumbing_contract():
-    """F7: verify the shared VLA contract (`history_traj` in, `pred_traj`
+    """Verify the shared VLA contract (`history_traj` in, `pred_traj`
     out) is wired end-to-end at the data-structure layer without spinning
     up a server.
 
@@ -419,8 +420,8 @@ def test_f7_plumbing_contract():
 
 @_requires_cuda
 def test_gr00t_forward_emits_pred_traj_via_history_traj():
-    """F5+F7 integration: exercise Gr00tN1d7.forward's action-head branch
-    by short-circuiting the real Qwen3-VL backbone.  Verifies that when
+    """Integration: exercise Gr00tN1d7.forward's action-head branch by
+    short-circuiting the real Qwen3-VL backbone.  Verifies that when
     forward_batch.history_trajs carries the processor-stashed tensor + id,
     the action head runs and its output lands on
     `LogitsProcessorOutput.customized_info["pred_traj"]`.
@@ -437,7 +438,7 @@ def test_gr00t_forward_emits_pred_traj_via_history_traj():
     head = Gr00tN1d7ActionHead(cfg).to(device=device, dtype=dtype).eval()
 
     # Fake a VLM hidden state + masks + history_traj dict that mirrors what
-    # F6 processor would stash.
+    # the processor would stash.
     B, T = 1, 16
     D = cfg.backbone_embedding_dim
     vl_embeds = torch.randn(B, T, D, device=device, dtype=dtype)

@@ -8,44 +8,51 @@ Task scope:
   matches Isaac-GR00T's Gr00tPolicy.get_action within numerical tolerance.
 
 Current summary:
-  Feature branch `groot-n17-port`.  F1-F9 + F11 landed previously.  F12
-  landed 2026-04-23: `test/manual/models/test_groot_n17.py` no longer
-  depends on the `/data/dongmao_dev/Isaac-GR00T` source checkout, so the
-  pytest suite runs cleanly on a default sglang install with just
-  `/data/models/GR00T-N1.7-3B` weights present.  Only F10 (documentation)
-  remains.
+  Feature branch `groot-n17-port`.  F1-F9, F11, F12 landed previously.  F13
+  landed 2026-04-23: stripped all `F1`/.../`F13` feature-tracker mentions
+  from groot runtime / test / launcher / parity-script files.  The ledger
+  ownership stays in feature_list.md + claude-progress.txt; code files no
+  longer carry planning vocabulary.  Only F10 (documentation) remains.
 
-  F12 deliverable:
-    - test/manual/models/test_groot_n17.py:
-      Removed 3 Isaac-source-dependent tests (`test_embodiment_mlp_parity`,
-      `test_dit_parity`, `test_full_parity_against_reference`) and the
-      helpers that loaded Isaac files into sys.modules
-      (`_load_isaac_file`, `_load_isaac_action_head_class`,
-      `_load_action_head_weights_bf16`, `_install_torchao_diffusers_stub`)
-      along with the `ISAAC_GR00T` path constant.  File shrank from ~898
-      lines to ~491 lines.  The remaining 7 tests cover every port
-      surface (config, MaskedFlashAttention varlen, action-head shape +
-      determinism, weight-routing split, processor stateless contract,
-      F7 VLA plumbing, F5+F7 model-forward → pred_traj).  Open-loop MSE
-      vs DROID GT is the canonical port-verification signal and lives in
-      test_online_full.py.
-    - feature_list.md:
-      Added F12 block (goal, acceptance, passes: completed).  F2 and F9
-      descriptions left untouched per CLAUDE.md §8; their completion
-      state is preserved (tests did pass when authored) and F12's
-      description explains that their verification migrated to
-      test_online_full.py.
-    - claude-progress.txt:
-      This update.
+  F13 deliverable (comment-only scrub):
+    - python/sglang/srt/models/groot_n1d7.py: removed [F2 part 2],
+      [F3], [F4] header tags; rewrote the top-level wrapper comment
+      block (was "forward path is stubbed in F4 and filled in later
+      features (F5 wires ...; F7 threads ...; F9 validates ...)")
+      into a plain "the forward path wires VL layer-16 extraction
+      into the action head and threads proprio_state /
+      embodiment_id through ForwardBatch"; dropped "F5 (plan Task
+      4.3 Option B):" prefix on the hook-install comment.
+    - test/manual/models/test_groot_n17.py: dropped "F3:", "F4:",
+      "F6:", "F7:", "F11 smoke:" docstring prefixes and inline
+      "F11:" / "F6 processor" comment tags.  Test names and code
+      unchanged.
+    - test_online_full.py: removed "(F8)" tag from the module
+      docstring.
+    - start.sh: removed "per the plan's F8 recipe" phrasing from the
+      launch-flag rationale comment.
+    - scripts/groot_parity/open_loop_eval_sglang.py: removed "(see
+      F7)" parenthetical on the serving_chat history_traj comment.
+    - feature_list.md / claude-progress.txt: this F13 entry +
+      summary refresh.  CLAUDE.md / MEMORY.md are deliberately
+      untouched — they are the ledger itself.
+
+  Linter codes (`F401` unused-import, `F811`, etc.) were preserved
+  throughout; only feature-tracker markers in the `F1..F13` range
+  were removed.  Unrelated occurrences (BERTScore F1, VSCode F5
+  shortcut in the docker dev guide, etc.) were left alone.
 
   Prior landmarks (unchanged):
-    F9 parity (Isaac action head @ bf16, max-abs ~5.9e-2 ≤ 1e-1) was
-    validated pre-F12; see 2026-04-22 run of the now-removed
-    test_full_parity_against_reference.  Equivalent signal going forward
-    comes from test_online_full.py's DROID physical-space MSE.
-    F11 delivered MaskedFlashAttention (srt/layers/attention/
-    masked_flash_attn.py) threading forward_batch through DiT /
-    AlternateVLDiT / SelfAttentionTransformer.
+    F12 (2026-04-23): dropped Isaac-GR00T source path dep from
+    test_groot_n17.py so the pytest suite runs on a default sglang
+    install; equivalent port-verification signal lives in
+    test_online_full.py's open-loop DROID MSE.
+    F11: MaskedFlashAttention (srt/layers/attention/masked_flash_attn.py)
+    with forward_batch threading through DiT / AlternateVLDiT /
+    SelfAttentionTransformer.
+    F9 parity (Isaac action head @ bf16, max-abs ~5.9e-2 ≤ 1e-1)
+    was validated pre-F12; equivalent signal going forward comes
+    from test_online_full.py's DROID physical-space MSE.
 
 Features (see feature_list.md for acceptance criteria):
   F1  Gr00tN1d7Config + HF registration                    completed
@@ -60,6 +67,7 @@ Features (see feature_list.md for acceptance criteria):
   F10 Documentation                                        not_completed
   F11 DiT attention via MaskedFlashAttention               completed
   F12 Drop Isaac-GR00T path dep from manual test           completed
+  F13 Scrub feature-list markers from groot code           completed
 
 Main gaps:
   Only F10 (documentation) remains.  Docs should mirror alpamayo_r1.md:
