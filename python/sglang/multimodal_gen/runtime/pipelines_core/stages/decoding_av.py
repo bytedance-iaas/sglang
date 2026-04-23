@@ -42,7 +42,10 @@ class LTX2AVDecodingStage(DecodingStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        original_param = next(self.vae.parameters(), None)
+        vae_parameters = getattr(self.vae, "parameters", None)
+        original_param = (
+            next(vae_parameters(), None) if callable(vae_parameters) else None
+        )
         if original_param is not None:
             original_dtype = original_param.dtype
         else:
