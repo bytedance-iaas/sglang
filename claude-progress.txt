@@ -8,14 +8,17 @@ Task scope:
   matches Isaac-GR00T's Gr00tPolicy.get_action within numerical tolerance.
 
 Current summary:
-  Feature branch `groot-n17-port`.  F1-F13 landed.  F14 landed 2026-04-23:
-  test_online_full.py is now the single canonical end-to-end tutorial
-  script.  It uses Isaac-GR00T's LeRobotEpisodeLoader for dataset
-  loading, emits a clear install-guidance warning when the `gr00t`
-  package isn't importable (pointing users at
-  https://github.com/NVIDIA/Isaac-GR00T.git), and supersedes the
-  duplicate scripts/groot_parity/open_loop_eval_sglang.py which has
-  been removed.  Only F10 (documentation) remains.
+  Feature branch `groot-n17-port`.  All 14 features landed.  F10
+  (documentation) closed 2026-04-23 with
+  docs/supported_models/vla_models/groot_n17.md + new vla_models
+  index.rst, wired into the top-level supported_models/index.rst.
+  F14 (2026-04-23) also landed: test_online_full.py is now the single
+  canonical end-to-end tutorial script.  It uses Isaac-GR00T's
+  LeRobotEpisodeLoader for dataset loading, emits a clear install-
+  guidance warning when the `gr00t` package isn't importable (pointing
+  users at https://github.com/NVIDIA/Isaac-GR00T.git), and supersedes
+  the duplicate scripts/groot_parity/open_loop_eval_sglang.py which
+  has been removed.
 
   Note on numbering: the user labeled this task "AS F13" but F13 was
   already taken by the 2026-04-23 feature-marker scrub commit.  Used
@@ -71,17 +74,18 @@ Features (see feature_list.md for acceptance criteria):
   F7  API plumbing (history_traj / pred_traj)              completed
   F8  start.sh + test_online_full.py                       completed
   F9  Accuracy parity vs Gr00tPolicy                       completed
-  F10 Documentation                                        not_completed
+  F10 Documentation                                        completed
   F11 DiT attention via MaskedFlashAttention               completed
   F12 Drop Isaac-GR00T path dep from manual test           completed
   F13 Scrub feature-list markers from groot code           completed
   F14 Single e2e tutorial script via LeRobotEpisodeLoader  completed
 
 Main gaps:
-  Only F10 (documentation) remains.  Docs should mirror alpamayo_r1.md:
-  overview, launch command, sample request (history_traj in / pred_traj
-  out), embodiment tag table, response schema.
+  None — all 14 ledgered features are complete.  Port is ready for
+  review.
 
 Next steps:
-  F10: create docs/supported_models/vla_models/groot_n17.md and register
-  it in docs/supported_models/vla_models/index.rst.
+  - Run the F14 end-to-end tutorial
+    (`./start.sh` + `python3 test_online_full.py`) against the DROID
+    demo to regression-check the physical-space MSE/MAE.
+  - Open PR when the sibling sglang CI posture is ready.

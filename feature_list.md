@@ -235,7 +235,7 @@ matches Isaac-GR00T's `Gr00tPolicy.get_action` within numerical tolerance.
 - **Acceptance:** New file exists and is listed in
   `docs/supported_models/vla_models/index.rst`.
 - **Tests:** visual — doc renders via `mkdocs serve` without errors.
-- **passes:** not_completed
+- **passes:** completed
 
 ## F11 — DiT attention via MaskedFlashAttention (sglang flash-varlen)
 - **Goal:** Replace the pure-PyTorch `diffusers.models.attention.Attention`
