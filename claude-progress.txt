@@ -1,4 +1,4 @@
-Date: 2026-04-22
+Date: 2026-04-23
 TaskStatus: completed
 
 Task scope:
@@ -8,44 +8,44 @@ Task scope:
   matches Isaac-GR00T's Gr00tPolicy.get_action within numerical tolerance.
 
 Current summary:
-  Feature branch `groot-n17-port`.  F1-F9 landed previously.  F11
-  (MaskedFlashAttention / DiT attention via sglang flash-varlen) landed
-  2026-04-22; all 10 pytest cases green in ~37s on CUDA bf16.  Only F10
-  (documentation) remains.
+  Feature branch `groot-n17-port`.  F1-F9 + F11 landed previously.  F12
+  landed 2026-04-23: `test/manual/models/test_groot_n17.py` no longer
+  depends on the `/data/dongmao_dev/Isaac-GR00T` source checkout, so the
+  pytest suite runs cleanly on a default sglang install with just
+  `/data/models/GR00T-N1.7-3B` weights present.  Only F10 (documentation)
+  remains.
 
-  F11 deliverable (new module + port migration):
-    - python/sglang/srt/layers/attention/masked_flash_attn.py:
-      MaskedFlashAttention (diffusers-named to_q/to_k/to_v/to_out
-      projections) with two dispatch paths — fixed-length self-attn and
-      per-key bool-mask cross-attn (varlen K/V gather + flash_attn_varlen_func).
-      No SDPA fallback; no ForwardContext dependency.  CUDA bf16/fp16 only.
-      Placed under srt/layers/attention/ (namespace package, no __init__.py
-      side-effects) rather than multimodal_gen/runtime/layers/attention/
-      because the latter's __init__.py eagerly imports DiffGenerator and
-      LocalAttention, pulling in trimesh + ForwardContext that are not
-      available outside a full diffusion-pipeline boot.
-    - python/sglang/srt/models/groot_n1d7.py:
-      BasicTransformerBlock.attn1 is now MaskedFlashAttention; diffusers
-      Attention + _sdpa_context are fully removed.  forward_batch is
-      threaded through DiT / AlternateVLDiT / SelfAttentionTransformer /
-      Gr00tN1d7ActionHead._process_vl / Gr00tN1d7ActionHead.get_action /
-      Gr00tN1d7.forward, mirroring alpamayo_r1.py.  load_weights is
-      unchanged (submodule names match diffusers exactly).
+  F12 deliverable:
     - test/manual/models/test_groot_n17.py:
-      test_dit_parity + test_action_head_get_action_shape_and_determinism +
-      test_gr00t_forward_emits_pred_traj_via_history_traj +
-      test_full_parity_against_reference now run on CUDA bf16 (native
-      checkpoint dtype).  Tolerances: per-layer 5e-3 (flash-varlen vs SDPA
-      bf16 reduction-order drift); integrated F9 1e-1 (4 Euler steps × 32
-      DiT + 4 VL-SA layers × per-layer drift compounds to ~6e-2 max-abs,
-      well under task-level robot-joint tolerance).  New
-      test_masked_flash_attention_varlen covers the varlen K/V gather
-      path end-to-end.
+      Removed 3 Isaac-source-dependent tests (`test_embodiment_mlp_parity`,
+      `test_dit_parity`, `test_full_parity_against_reference`) and the
+      helpers that loaded Isaac files into sys.modules
+      (`_load_isaac_file`, `_load_isaac_action_head_class`,
+      `_load_action_head_weights_bf16`, `_install_torchao_diffusers_stub`)
+      along with the `ISAAC_GR00T` path constant.  File shrank from ~898
+      lines to ~491 lines.  The remaining 7 tests cover every port
+      surface (config, MaskedFlashAttention varlen, action-head shape +
+      determinism, weight-routing split, processor stateless contract,
+      F7 VLA plumbing, F5+F7 model-forward → pred_traj).  Open-loop MSE
+      vs DROID GT is the canonical port-verification signal and lives in
+      test_online_full.py.
+    - feature_list.md:
+      Added F12 block (goal, acceptance, passes: completed).  F2 and F9
+      descriptions left untouched per CLAUDE.md §8; their completion
+      state is preserved (tests did pass when authored) and F12's
+      description explains that their verification migrated to
+      test_online_full.py.
+    - claude-progress.txt:
+      This update.
 
-  F9 deliverable (prior):
-    End-to-end parity vs Isaac-GR00T reference Gr00tN1d7ActionHead on real
-    /data/models/GR00T-N1.7-3B action_head.* weights.  On CUDA bf16:
-    max-abs diff = ~5.9e-2 (well under the updated 1e-1 tolerance).
+  Prior landmarks (unchanged):
+    F9 parity (Isaac action head @ bf16, max-abs ~5.9e-2 ≤ 1e-1) was
+    validated pre-F12; see 2026-04-22 run of the now-removed
+    test_full_parity_against_reference.  Equivalent signal going forward
+    comes from test_online_full.py's DROID physical-space MSE.
+    F11 delivered MaskedFlashAttention (srt/layers/attention/
+    masked_flash_attn.py) threading forward_batch through DiT /
+    AlternateVLDiT / SelfAttentionTransformer.
 
 Features (see feature_list.md for acceptance criteria):
   F1  Gr00tN1d7Config + HF registration                    completed
@@ -59,6 +59,7 @@ Features (see feature_list.md for acceptance criteria):
   F9  Accuracy parity vs Gr00tPolicy                       completed
   F10 Documentation                                        not_completed
   F11 DiT attention via MaskedFlashAttention               completed
+  F12 Drop Isaac-GR00T path dep from manual test           completed
 
 Main gaps:
   Only F10 (documentation) remains.  Docs should mirror alpamayo_r1.md:

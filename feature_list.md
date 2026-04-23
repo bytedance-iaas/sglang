@@ -282,3 +282,35 @@ matches Isaac-GR00T's `Gr00tPolicy.get_action` within numerical tolerance.
   (CUDA bf16), and
   `test/manual/models/test_groot_n17.py::test_full_parity_against_reference`.
 - **passes:** completed
+
+## F12 — Drop Isaac-GR00T path dependency from manual test file
+- **Goal:** `test/manual/models/test_groot_n17.py` must be the only groot-
+  related pytest file and must run on a default sglang install that does
+  NOT have `/data/dongmao_dev/Isaac-GR00T` checked out.  Open-loop MSE vs
+  DROID ground-truth (already delivered via `test_online_full.py`) is the
+  canonical port-verification signal; bit-exact parity against an Isaac
+  source checkout is redundant and blocks anyone without the upstream
+  repo on disk.
+- **Acceptance:**
+  - `grep -rn 'Isaac-GR00T\|ISAAC_GR00T\|isaac_gr00t\|/data/dongmao_dev/Isaac'
+    test/manual/models/test_groot_n17.py` returns zero matches.
+  - The file imports nothing from `/data/dongmao_dev/Isaac-GR00T`; no
+    `ISAAC_GR00T` path constant; no `_load_isaac_*` or
+    `_install_torchao_diffusers_stub` helpers.
+  - The following F2/F9 tests, which required loading Isaac source
+    files to build a reference, are removed:
+    `test_embodiment_mlp_parity`, `test_dit_parity`,
+    `test_full_parity_against_reference`.  F2 and F9's historical
+    `passes: completed` state is preserved per CLAUDE.md §8 (the tests
+    did pass when authored); their verification is now covered by the
+    open-loop MSE in `test_online_full.py` and by the lower-level
+    non-Isaac tests below.
+  - The remaining 7 tests stay and still cover every port surface:
+    `test_config_loads` (F1), `test_masked_flash_attention_varlen` (F11),
+    `test_action_head_get_action_shape_and_determinism` (F3),
+    `test_load_weights_routing` (F4), `test_processor_shapes` (F6),
+    `test_f7_plumbing_contract` (F7),
+    `test_gr00t_forward_emits_pred_traj_via_history_traj` (F5+F7).
+- **Tests:** `python -m pytest test/manual/models/test_groot_n17.py -x -q`
+  collects exactly these 7 tests and passes on CUDA.
+- **passes:** completed

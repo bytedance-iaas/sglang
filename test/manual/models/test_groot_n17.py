@@ -1,79 +1,24 @@
-import importlib.util
 import os
-import sys
 from pathlib import Path
 
-# Bypass the flashinfer/flashinfer-jit-cache version mismatch on this box —
-# the F6 processor test imports sglang's qwen_vl processor which pulls in
-# flashinfer eagerly.  Must be set before any sglang import.
+# The F6 processor test imports sglang's qwen_vl processor which pulls in
+# flashinfer eagerly; skip the version check so this suite runs on boxes
+# where flashinfer / flashinfer-jit-cache are mismatched.  Must be set
+# before any sglang import.
 os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
 import pytest
 import torch
 
 GR00T_WEIGHTS = Path("/data/models/GR00T-N1.7-3B")
-ISAAC_GR00T = Path("/data/dongmao_dev/Isaac-GR00T")
 
 # F11: DiT attention runs through MaskedFlashAttention, which requires CUDA +
-# bf16/fp16.  Parity tests that touch the DiT are gated on CUDA and run in
-# bf16 (native checkpoint dtype).  Tolerances are relaxed vs the legacy
-# fp32-SDPA path because flash-varlen and diffusers SDPA accumulate in
-# different orders.
+# bf16/fp16.  Tests that touch the DiT are gated on CUDA and run in bf16
+# (native checkpoint dtype).
 _requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="MaskedFlashAttention requires CUDA",
 )
-
-
-def _install_torchao_diffusers_stub():
-    """Work around a broken `diffusers + torchao` pin on this box.
-
-    `diffusers.quantizers.torchao.torchao_quantizer` runs
-    `_update_torch_safe_globals()` at import time.  Its try block hits
-    `ModuleNotFoundError: torchao.dtypes.floatx.float8_layout`, but its
-    `except (ImportError, ModuleNotFoundError)` handler calls
-    `logger.warning(...)` — and `logger` was never imported into that
-    module.  Upstream Isaac-GR00T's `dit.py` does
-    `from diffusers import ConfigMixin, ModelMixin`, which pulls in
-    `diffusers.models.modeling_utils` → `diffusers.quantizers.auto` →
-    `diffusers.quantizers.torchao.torchao_quantizer`, triggering the chain.
-
-    Fix: pre-register a stub for
-    `diffusers.quantizers.torchao.torchao_quantizer` (and its package) in
-    `sys.modules`.  When `diffusers.quantizers.auto` runs
-    `from .torchao import TorchAoHfQuantizer`, Python finds our stub and
-    never executes the broken module.
-    """
-    import types
-
-    if "diffusers.quantizers.torchao.torchao_quantizer" in sys.modules:
-        return
-    pkg = types.ModuleType("diffusers.quantizers.torchao")
-    stub = types.ModuleType("diffusers.quantizers.torchao.torchao_quantizer")
-
-    class _StubTorchAoHfQuantizer:  # noqa: D401 — placeholder
-        pass
-
-    stub.TorchAoHfQuantizer = _StubTorchAoHfQuantizer
-    pkg.TorchAoHfQuantizer = _StubTorchAoHfQuantizer
-    sys.modules["diffusers.quantizers.torchao"] = pkg
-    sys.modules["diffusers.quantizers.torchao.torchao_quantizer"] = stub
-
-
-def _load_isaac_file(rel_path: str, module_alias: str):
-    """Load a single file from the Isaac-GR00T checkout as a standalone module.
-
-    We bypass the `gr00t` package import (it has a `tyro`-based config layer
-    with a dataclass-ordering bug that blocks the normal import chain).  Since
-    the reference modules we need (`embodiment_conditioned_mlp.py`, `dit.py`)
-    only depend on torch + diffusers, loading them as standalone files works.
-    """
-    _install_torchao_diffusers_stub()
-    spec = importlib.util.spec_from_file_location(module_alias, ISAAC_GR00T / rel_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_alias] = mod
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def test_config_loads():
@@ -99,142 +44,6 @@ def test_config_loads():
     assert cfg.vl_self_attention_cfg["num_layers"] == 4
 
 
-@torch.no_grad()
-def test_embodiment_mlp_parity():
-    ref = _load_isaac_file(
-        "gr00t/model/modules/embodiment_conditioned_mlp.py",
-        "isaac_embodiment_conditioned_mlp",
-    )
-    from sglang.srt.models.groot_n1d7 import (
-        CategorySpecificLinear,
-        CategorySpecificMLP,
-        MultiEmbodimentActionEncoder,
-    )
-
-    torch.manual_seed(0)
-    ref_layer = ref.CategorySpecificLinear(num_categories=4, input_dim=8, hidden_dim=16)
-    ours = CategorySpecificLinear(num_categories=4, input_dim=8, hidden_dim=16)
-    ours.load_state_dict(ref_layer.state_dict())
-    x = torch.randn(2, 3, 8)
-    cat = torch.tensor([1, 3])
-    assert torch.allclose(ref_layer(x, cat), ours(x, cat), atol=1e-5)
-
-    ref_mlp = ref.CategorySpecificMLP(4, 8, 16, 5)
-    ours_mlp = CategorySpecificMLP(4, 8, 16, 5)
-    ours_mlp.load_state_dict(ref_mlp.state_dict())
-    assert torch.allclose(ref_mlp(x, cat), ours_mlp(x, cat), atol=1e-5)
-
-    ref_enc = ref.MultiEmbodimentActionEncoder(
-        action_dim=8, hidden_size=16, num_embodiments=4
-    )
-    ours_enc = MultiEmbodimentActionEncoder(
-        action_dim=8, hidden_size=16, num_embodiments=4
-    )
-    ours_enc.load_state_dict(ref_enc.state_dict())
-    t = torch.tensor([5, 10])
-    assert torch.allclose(ref_enc(x, t, cat), ours_enc(x, t, cat), atol=1e-5)
-
-
-@_requires_cuda
-@torch.no_grad()
-def test_dit_parity():
-    """F2 / F11: sglang's DiT stack (now using MaskedFlashAttention) matches
-    upstream Isaac-GR00T's diffusers-SDPA DiT stack on CUDA bf16 within
-    5e-3.  Tolerance is relaxed vs the legacy CPU fp32 run because
-    flash-varlen and SDPA accumulate in different orders."""
-    ref_mod = _load_isaac_file("gr00t/model/modules/dit.py", "isaac_dit")
-    from sglang.srt.models.groot_n1d7 import (
-        AlternateVLDiT,
-        DiT,
-        SelfAttentionTransformer,
-        TimestepEncoder,
-    )
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-
-    common = dict(
-        num_attention_heads=4,
-        attention_head_dim=16,
-        num_layers=4,
-        dropout=0.0,
-        norm_type="ada_norm",
-        norm_elementwise_affine=False,
-        cross_attention_dim=32,
-        interleave_self_attention=True,
-        positional_embeddings=None,
-        final_dropout=True,
-        activation_fn="gelu-approximate",
-        attention_bias=True,
-        upcast_attention=False,
-        output_dim=64,
-    )
-
-    torch.manual_seed(0)
-    ref = ref_mod.AlternateVLDiT(**common, attend_text_every_n_blocks=2)
-    ours = AlternateVLDiT(**common, attend_text_every_n_blocks=2)
-    ours.load_state_dict(ref.state_dict())
-    ref = ref.to(device=device, dtype=dtype).eval()
-    ours = ours.to(device=device, dtype=dtype).eval()
-
-    B, T, S = 2, 9, 12
-    D = common["num_attention_heads"] * common["attention_head_dim"]  # 64
-    h = torch.randn(B, T, D, device=device, dtype=dtype)
-    enc = torch.randn(B, S, common["cross_attention_dim"], device=device, dtype=dtype)
-    ts = torch.tensor([100, 400], device=device)
-    img_mask = torch.zeros(B, S, dtype=torch.bool, device=device)
-    img_mask[:, :4] = True
-    attn_mask = torch.ones(B, S, dtype=torch.bool, device=device)
-    out_ref = ref(
-        h, enc, ts, image_mask=img_mask, backbone_attention_mask=attn_mask
-    )
-    out_ours = ours(
-        h, enc, ts, image_mask=img_mask, backbone_attention_mask=attn_mask
-    )
-    assert torch.allclose(out_ref, out_ours, atol=5e-3)
-
-    # Also exercise plain DiT (non-Alternate) path and SelfAttentionTransformer
-    # so the whole ported stack is covered.
-    torch.manual_seed(0)
-    ref_dit = ref_mod.DiT(**common)
-    ours_dit = DiT(**common)
-    ours_dit.load_state_dict(ref_dit.state_dict())
-    ref_dit = ref_dit.to(device=device, dtype=dtype).eval()
-    ours_dit = ours_dit.to(device=device, dtype=dtype).eval()
-    out_ref = ref_dit(h, enc, ts)
-    out_ours = ours_dit(h, enc, ts)
-    assert torch.allclose(out_ref, out_ours, atol=5e-3)
-
-    sa_kwargs = dict(
-        num_attention_heads=4,
-        attention_head_dim=16,
-        num_layers=2,
-        dropout=0.0,
-        positional_embeddings=None,
-        final_dropout=True,
-        activation_fn="gelu-approximate",
-        attention_bias=True,
-        upcast_attention=False,
-    )
-    torch.manual_seed(0)
-    ref_sa = ref_mod.SelfAttentionTransformer(**sa_kwargs)
-    ours_sa = SelfAttentionTransformer(**sa_kwargs)
-    ours_sa.load_state_dict(ref_sa.state_dict())
-    ref_sa = ref_sa.to(device=device, dtype=dtype).eval()
-    ours_sa = ours_sa.to(device=device, dtype=dtype).eval()
-    h_sa = torch.randn(B, T, D, device=device, dtype=dtype)
-    assert torch.allclose(ref_sa(h_sa), ours_sa(h_sa), atol=5e-3)
-
-    # TimestepEncoder alone — still CPU fp32; no attention here.
-    ref_te = ref_mod.TimestepEncoder(embedding_dim=D)
-    ours_te = TimestepEncoder(embedding_dim=D)
-    ours_te.load_state_dict(ref_te.state_dict())
-    ref_te.eval()
-    ours_te.eval()
-    ts_long = torch.tensor([7, 250], dtype=torch.long)
-    assert torch.allclose(ref_te(ts_long), ours_te(ts_long), atol=1e-5)
-
-
 @_requires_cuda
 @torch.no_grad()
 def test_masked_flash_attention_varlen():
@@ -242,7 +51,6 @@ def test_masked_flash_attention_varlen():
     and per-key bool-mask cross-attn (varlen gather) end-to-end on CUDA bf16.
     Compares against an inline SDPA-bf16 reference built from the same
     weights."""
-    _install_torchao_diffusers_stub()
     from sglang.srt.layers.attention.masked_flash_attn import MaskedFlashAttention
 
     device = torch.device("cuda")
@@ -313,8 +121,10 @@ def test_action_head_get_action_shape_and_determinism():
     """F3: verify the composition (state enc + action enc + AlternateVLDiT +
     action dec + Euler loop) runs on CUDA bf16, produces the right shape,
     and is deterministic under a fixed torch seed.  End-to-end numerical
-    parity against upstream Gr00tPolicy.get_action is covered in F9;
-    load-from-checkpoint correctness in F4."""
+    parity against the published reference is covered by
+    `test_online_full.py`'s open-loop MSE vs DROID ground-truth actions;
+    load-from-checkpoint correctness is covered in F4.
+    """
 
     from sglang.srt.configs.groot_n1d7 import Gr00tN1d7Config
     from sglang.srt.models.groot_n1d7 import Gr00tN1d7ActionHead
@@ -461,7 +271,7 @@ def test_processor_shapes():
     `BaseMultimodalProcessor` init requires a fully-populated `ServerArgs`
     (mm_process_config, tokenizer_worker_num, ProcessPool forking, ...)
     that isn't meaningful to stand up in a unit test; the end-to-end
-    processor-in-server path is validated by F9's parity test.
+    processor-in-server path is validated by the manual online test.
     """
     from sglang.srt.multimodal.processors.groot_n1d7 import (
         EMBODIMENT_TAG_TO_PROJECTOR_INDEX,
@@ -591,7 +401,8 @@ def test_f7_plumbing_contract():
     assert shard.history_traj == {"embodiment": "real_g1_relative_eef_relative_joints"}
 
     # 3. TokenizedGenerateReqInput carries the field (signature check
-    # only — the real tokenizer_manager kwarg path is exercised in F9).
+    # only — the real tokenizer_manager kwarg path is exercised by the
+    # online test).
     import dataclasses
     assert any(
         f.name == "history_traj"
@@ -607,24 +418,16 @@ def test_f7_plumbing_contract():
 
 
 @_requires_cuda
-def test_gr00t_forward_emits_pred_traj_via_history_traj(monkeypatch):
+def test_gr00t_forward_emits_pred_traj_via_history_traj():
     """F5+F7 integration: exercise Gr00tN1d7.forward's action-head branch
     by short-circuiting the real Qwen3-VL backbone.  Verifies that when
     forward_batch.history_trajs carries the processor-stashed tensor + id,
     the action head runs and its output lands on
     `LogitsProcessorOutput.customized_info["pred_traj"]`.
     """
-    import types
-
-    _install_torchao_diffusers_stub()
-
-    # Heavy: build a full Gr00tN1d7 would spin up distributed init.  Instead
-    # use the ActionHead directly and verify the customized_info path
-    # semantically.  This mirrors what Gr00tN1d7.forward does after the
-    # hook fires.
     from sglang.srt.configs.groot_n1d7 import Gr00tN1d7Config
-    from sglang.srt.models.groot_n1d7 import Gr00tN1d7ActionHead
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.models.groot_n1d7 import Gr00tN1d7ActionHead
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -686,212 +489,3 @@ def test_gr00t_forward_emits_pred_traj_via_history_traj(monkeypatch):
     assert pred[1] is None
     assert len(pred[0]) == cfg.action_horizon == 40
     assert len(pred[0][0]) == cfg.max_action_dim == 132
-
-
-# ------------------------------------------------------------------
-# F9 — Accuracy parity vs Isaac-GR00T reference action head
-# ------------------------------------------------------------------
-
-def _load_isaac_action_head_class():
-    """Load Isaac-GR00T's upstream `Gr00tN1d7ActionHead` via file-loading
-    with package stubs, bypassing `gr00t`'s broken `tyro`-based config init
-    and its `dm-tree` dep.  The approach is the same "bypass the package,
-    exec the files directly" trick F2's DiT/MLP parity tests already rely
-    on — we just add the missing intermediate package namespaces so
-    `from gr00t.model.modules.dit import ...` inside
-    `gr00t_n1d7.py` resolves to our already-file-loaded modules.
-    """
-    import importlib.machinery
-    import types
-
-    _install_torchao_diffusers_stub()
-
-    if "tree" not in sys.modules:
-        tree_stub = types.ModuleType("tree")
-        tree_stub.__spec__ = importlib.machinery.ModuleSpec("tree", loader=None)
-        tree_stub.map_structure = lambda f, x: x
-        sys.modules["tree"] = tree_stub
-
-    for pkg in (
-        "gr00t",
-        "gr00t.configs",
-        "gr00t.configs.model",
-        "gr00t.model",
-        "gr00t.model.modules",
-        "gr00t.model.gr00t_n1d7",
-    ):
-        if pkg not in sys.modules:
-            m = types.ModuleType(pkg)
-            m.__path__ = []
-            m.__spec__ = importlib.machinery.ModuleSpec(
-                pkg, loader=None, is_package=True
-            )
-            sys.modules[pkg] = m
-
-    from sglang.srt.configs.groot_n1d7 import Gr00tN1d7Config as _SglangCfg
-
-    cfg_stub = types.ModuleType("gr00t.configs.model.gr00t_n1d7")
-    cfg_stub.Gr00tN1d7Config = _SglangCfg
-    sys.modules["gr00t.configs.model.gr00t_n1d7"] = cfg_stub
-
-    _load_isaac_file(
-        "gr00t/model/modules/embodiment_conditioned_mlp.py",
-        "gr00t.model.modules.embodiment_conditioned_mlp",
-    )
-    _load_isaac_file(
-        "gr00t/model/modules/dit.py",
-        "gr00t.model.modules.dit",
-    )
-    isaac_mod = _load_isaac_file(
-        "gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
-        "isaac_gr00t_n1d7_model",
-    )
-    return isaac_mod.Gr00tN1d7ActionHead
-
-
-def _load_action_head_weights_bf16(weights_dir: Path) -> dict:
-    """Load only the `action_head.*` tensors from the GR00T-N1.7-3B
-    checkpoint and strip the prefix.  Weights are stored as bf16 upstream;
-    we keep them in bf16 (no cast) so both sglang's MaskedFlashAttention
-    path and upstream's diffusers-SDPA path run in the deployment dtype."""
-    import json
-
-    from safetensors import safe_open
-
-    index_path = weights_dir / "model.safetensors.index.json"
-    with open(index_path) as f:
-        index = json.load(f)
-    weight_map = index["weight_map"]
-
-    keys_by_file: dict[str, list[str]] = {}
-    for k, filename in weight_map.items():
-        if k.startswith("action_head."):
-            keys_by_file.setdefault(filename, []).append(k)
-
-    state: dict[str, torch.Tensor] = {}
-    for filename, keys in keys_by_file.items():
-        with safe_open(weights_dir / filename, framework="pt") as f:
-            for k in keys:
-                t = f.get_tensor(k)  # native bf16
-                # strip the `action_head.` prefix
-                state[k[len("action_head.") :]] = t
-    return state
-
-
-@_requires_cuda
-@torch.no_grad()
-def test_full_parity_against_reference():
-    """F9 / F11: load real /data/models/GR00T-N1.7-3B `action_head.*` weights
-    into both sglang's `Gr00tN1d7ActionHead` (now MaskedFlashAttention-
-    backed) and Isaac-GR00T's upstream `Gr00tN1d7ActionHead` (diffusers-
-    SDPA), run both on CUDA bf16 with matched seeded noise, assert
-    max-abs diff ≤ 1e-1.
-
-    Why 1e-1 (relaxed from the pre-F11 1e-2): both sides now run in bf16.
-    Per-layer attention drift between flash-varlen-bf16 and SDPA-bf16 is
-    ~5e-3 (see `test_dit_parity`), and integrated through 4 Euler steps ×
-    (32 DiT layers + 4 VL self-attn layers) that compounds to ~6e-2 max-
-    abs on the final action trajectory.  This drift is below task-level
-    tolerance for robot joint commands and is stable across runs.
-
-    Why not a process-local sglang engine: upstream's `gr00t` package
-    `tyro`-based dataclass init is broken on this box, so `Gr00tPolicy` is
-    unreachable through its public import surface.  The action head is
-    where all the GR00T-specific numerical logic lives — the Qwen3-VL
-    backbone is a standard sglang/HF component both frameworks use
-    identically — so parity of the action head on the real checkpoint
-    against identical VL embeddings / state / embodiment / seeded noise is
-    the meaningful validation.
-
-    F1/F8 cover config loading + server launch; F2/F3 cover per-module
-    byte-level parity with random weights; this test closes the loop by
-    running the real checkpoint through both stacks end-to-end.
-    """
-    if not (GR00T_WEIGHTS / "model.safetensors.index.json").exists():
-        pytest.skip(f"GR00T-N1.7-3B weights not present at {GR00T_WEIGHTS}")
-
-    from transformers.feature_extraction_utils import BatchFeature
-
-    from sglang.srt.configs.groot_n1d7 import Gr00tN1d7Config
-    from sglang.srt.models.groot_n1d7 import Gr00tN1d7ActionHead
-
-    IsaacHead = _load_isaac_action_head_class()
-    cfg = Gr00tN1d7Config.from_pretrained(str(GR00T_WEIGHTS))
-
-    head_state = _load_action_head_weights_bf16(GR00T_WEIGHTS)
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-
-    torch.manual_seed(0)
-    ours = Gr00tN1d7ActionHead(cfg).to(device=device, dtype=dtype).eval()
-    torch.manual_seed(0)
-    theirs = IsaacHead(cfg).to(device=device, dtype=dtype).eval()
-
-    missing_o, unexpected_o = ours.load_state_dict(head_state, strict=False)
-    missing_t, unexpected_t = theirs.load_state_dict(head_state, strict=False)
-    # Both implementations have a handful of non-persistent buffers
-    # (e.g. `freqs` on `SinusoidalPositionalEmbedding`) that aren't stored in
-    # the checkpoint — that's fine.
-    def _real_missing(missing):
-        return [m for m in missing if not m.endswith("freqs")]
-    assert not _real_missing(missing_o), f"sglang missing: {missing_o[:5]}"
-    assert not unexpected_o, f"sglang unexpected: {unexpected_o[:5]}"
-    assert not _real_missing(missing_t), f"isaac missing: {missing_t[:5]}"
-    assert not unexpected_t, f"isaac unexpected: {unexpected_t[:5]}"
-
-    # Canonical observation: fake a short VL sequence with a small image
-    # prefix + text suffix.
-    B, S = 1, 32
-    gen = torch.Generator().manual_seed(42)
-    # Generator is CPU-only; sample in fp32 then cast/move.
-    vl_embeds = torch.randn(
-        B, S, cfg.backbone_embedding_dim, generator=gen
-    ).to(device=device, dtype=dtype)
-    vl_attn_mask = torch.ones(B, S, dtype=torch.bool, device=device)
-    image_mask = torch.zeros(B, S, dtype=torch.bool, device=device)
-    image_mask[:, :8] = True
-    state = torch.randn(
-        B, cfg.state_history_length, cfg.max_state_dim, generator=gen,
-    ).to(device=device, dtype=dtype)
-    # 25 = EMBODIMENT_TAG_TO_PROJECTOR_INDEX["real_g1_relative_eef_relative_joints"]
-    embodiment_id = torch.tensor([25], dtype=torch.long, device=device)
-
-    # Seed the global RNG right before each `get_action` call — both
-    # implementations issue one `torch.randn(B, action_horizon, action_dim)`
-    # at the start of their Euler loop, so a matched seed gives matched
-    # initial noise and identical intermediate states.
-    torch.manual_seed(1234)
-    out_ours = ours.get_action(
-        vl_embeds=vl_embeds,
-        vl_attn_mask=vl_attn_mask,
-        image_mask=image_mask,
-        state=state,
-        embodiment_id=embodiment_id,
-    )
-
-    torch.manual_seed(1234)
-    backbone_output = BatchFeature(
-        data={
-            "backbone_features": vl_embeds.clone(),
-            "backbone_attention_mask": vl_attn_mask.clone(),
-            "image_mask": image_mask.clone(),
-        }
-    )
-    action_input = BatchFeature(
-        data={
-            "state": state.clone(),
-            "embodiment_id": embodiment_id.clone(),
-        }
-    )
-    out_theirs = theirs.get_action(backbone_output, action_input)["action_pred"]
-
-    assert out_ours.shape == (B, cfg.action_horizon, cfg.max_action_dim)
-    assert out_theirs.shape == out_ours.shape
-
-    max_abs = (out_ours - out_theirs).abs().max().item()
-    assert max_abs < 1e-1, (
-        f"GR00T action-head parity failed: max-abs diff {max_abs:.3e} > 1e-1. "
-        f"ours[0,0,:4]={out_ours[0,0,:4].tolist()} "
-        f"theirs[0,0,:4]={out_theirs[0,0,:4].tolist()}"
-    )
