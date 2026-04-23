@@ -68,6 +68,7 @@ import argparse
 import base64
 import io
 import logging
+import os
 import sys
 import time
 
@@ -116,7 +117,11 @@ except ImportError as exc:
     sys.exit(1)
 
 
-MODEL_PATH = "/data/models/GR00T-N1.7-3B"
+_LOCAL_MODEL_PATH = "/data/models/GR00T-N1.7-3B"
+_HF_MODEL_ID = "nvidia/GR00T-N1.7-3B"
+# Prefer the local mirror when present; fall back to the HuggingFace repo id
+# so users without a local copy get a zero-config download.
+MODEL_PATH = _LOCAL_MODEL_PATH if os.path.isdir(_LOCAL_MODEL_PATH) else _HF_MODEL_ID
 DEFAULT_DATASET = "/data/dongmao_dev/Isaac-GR00T/demo_data/droid_sample"
 DEFAULT_EMBODIMENT = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"
 DEFAULT_SGLANG_URL = "http://127.0.0.1:30000/v1/chat/completions"
