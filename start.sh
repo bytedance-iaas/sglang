@@ -12,4 +12,5 @@ python3 -m sglang.launch_server \
     --tp 1 \
     --attention-backend triton \
     --disable-cuda-graph \
+    --disable-radix-cache \
     --skip-server-warmup

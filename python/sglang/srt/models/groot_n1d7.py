@@ -994,10 +994,46 @@ class Gr00tN1d7(nn.Module):
             customized_info → meta_info → SglExt.pred_traj transport
             delivers it to the HTTP response.
         """
+        # Build image_mask BEFORE calling self.backbone(...): the backbone's
+        # mm-embed routine clamps `input_ids` in-place to `[0, vocab_size-1]`
+        # (sglang `mm_utils.embed_mm_inputs_with_split`) and consumes
+        # `forward_batch.mm_inputs`, so anything we'd derive after the call
+        # has already lost the per-item pad_value markers.  sglang's
+        # `MultiModalityDataPaddingPatternMultimodalTokens` writes a hashed
+        # pad_value into image-token positions; we recover the mask via
+        # `isin(input_ids, [item.pad_value for item in image_items])`.
+        from sglang.srt.managers.schedule_batch import Modality
+
+        image_pad_values: List[int] = []
+        for mm_in in getattr(forward_batch, "mm_inputs", None) or []:
+            if mm_in is None:
+                continue
+            for item in mm_in.mm_items:
+                if item.modality == Modality.IMAGE and item.pad_value is not None:
+                    image_pad_values.append(int(item.pad_value))
+        if image_pad_values:
+            pv = torch.tensor(
+                image_pad_values, device=input_ids.device, dtype=input_ids.dtype
+            )
+            image_mask = torch.isin(input_ids, pv)
+        else:
+            image_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        backbone_attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
         ret = self.backbone(input_ids, positions, forward_batch, **kwargs)
 
         backbone_hidden = self._layer16_cache
         if backbone_hidden is None:
+            return ret
+
+        # The action head only runs once per request — during prefill (extend),
+        # which is when `input_ids` carries the prompt + images.  On decode
+        # steps `input_ids` is just the newly-generated token, no image tokens,
+        # so AlternateVLDiT's image-attn cross-block would see an all-False
+        # mask and crash MaskedFlashAttention.  pred_traj reaches the response
+        # via `customized_info` set during prefill.
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        if forward_mode is not None and forward_mode.is_decode():
             return ret
 
         history_trajs = getattr(forward_batch, "history_trajs", None)
@@ -1008,17 +1044,6 @@ class Gr00tN1d7(nn.Module):
             for ht in history_trajs
         ):
             return ret
-
-        # image_mask: bool tensor where input_ids match Cosmos-Reason2-2B's
-        # image placeholder token (151655 for this config).
-        image_token_id = getattr(self.backbone.config, "image_token_id", None)
-        if image_token_id is not None:
-            image_mask = input_ids == int(image_token_id)
-        else:
-            image_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        # backbone_attention_mask: packed sglang sequences have no
-        # intra-request padding.
-        backbone_attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
         vl_embeds = (
             backbone_hidden.unsqueeze(0)
