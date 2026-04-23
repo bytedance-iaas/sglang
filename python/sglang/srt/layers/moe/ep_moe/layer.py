@@ -218,8 +218,14 @@ class DeepEPMoE(FusedMoE):
     ):
 
         if self.deprecate_flag:
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+            combine_out_buffer = None
+            if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+                combine_out_buffer = self.dispatcher.get_next_low_latency_combine_buffer()
             return super().run_moe_core(
                 dispatch_output,
+                out=combine_out_buffer,
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

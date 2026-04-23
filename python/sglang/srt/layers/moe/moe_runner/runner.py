@@ -4,6 +4,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
 from sglang.srt.layers.moe.moe_runner.base import (
     FusedOpPool,
     MoeRunnerConfig,
@@ -86,7 +88,11 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: MoeQuantInfo,
+        lora_info=None,
+        out_buffer: Optional[torch.Tensor] = None,
     ) -> CombineInput:
         if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
@@ -103,6 +109,8 @@ class MoeRunner:
             running_state["down_gemm_overlap_args"] = self.down_gemm_overlap_args
         if self.meta_overlap_args is not None:
             running_state["meta_overlap_args"] = self.meta_overlap_args
+        if out_buffer is not None:
+            running_state["out_buffer"] = out_buffer
 
         runner_input = self.pre_permute_func(
             dispatch_output, quant_info, self.config, running_state

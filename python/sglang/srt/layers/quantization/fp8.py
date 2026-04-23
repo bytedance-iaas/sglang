@@ -1491,6 +1491,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
+        out: Optional[torch.Tensor] = None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1688,7 +1689,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 "Unsupported runner backend: %s" % self.runner.runner_backend
             )
 
-        return self.runner.run(dispatch_output, quant_info)
+        return self.runner.run(dispatch_output, quant_info, out_buffer=out)
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):

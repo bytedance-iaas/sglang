@@ -321,9 +321,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
-        down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        out_buffer = running_state.get("out_buffer", None)
+        if out_buffer is not None:
+            assert out_buffer.shape == (num_groups, m, n) and out_buffer.dtype == torch.bfloat16, (
+                f"out_buffer shape/dtype mismatch: expected ({num_groups}, {m}, {n}) bfloat16, "
+                f"got {out_buffer.shape} {out_buffer.dtype}"
+            )
+            down_output = out_buffer
+        else:
+            down_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
         if down_gemm_overlap_args is None:

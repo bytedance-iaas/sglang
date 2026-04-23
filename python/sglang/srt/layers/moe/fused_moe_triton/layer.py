@@ -1028,8 +1028,18 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+        out: Optional[torch.Tensor] = None,
+    ) -> CombineInput:
         # TODO: consider using symmetric memory
+        if out is not None:
+            return self.quant_method.apply(
+                layer=self,
+                dispatch_output=dispatch_output,
+                out=out,
+            )
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
