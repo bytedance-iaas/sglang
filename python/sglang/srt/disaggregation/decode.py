@@ -73,6 +73,16 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
+def _maybe_get_local_transfer_kv_indices(
+    allocator: BaseTokenToKVPoolAllocator,
+    kv_indices: torch.Tensor,
+) -> torch.Tensor:
+    filter_local_indices = getattr(allocator, "filter_local_indices", None)
+    if filter_local_indices is None:
+        return kv_indices
+    return filter_local_indices(kv_indices)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -751,7 +761,10 @@ class DecodePreallocQueue:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
                 ][:origin_input_len]
-                kv_indices = kv_indices_full.cpu().numpy()
+                kv_indices = _maybe_get_local_transfer_kv_indices(
+                    self.token_to_kv_pool_allocator,
+                    kv_indices_full,
+                ).cpu().numpy()
                 page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models

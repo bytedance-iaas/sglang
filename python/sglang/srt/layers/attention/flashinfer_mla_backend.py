@@ -19,10 +19,10 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import (
+from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
+    update_kv_lens_and_indices,
 )
-from sglang.srt.layers.attention.utils import update_kv_lens_and_indices
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args

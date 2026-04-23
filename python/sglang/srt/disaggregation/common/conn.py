@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size, get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
     attn_tp_size: int
+    dcp_size: int
     attn_cp_size: int
     dp_size: int
     pp_size: int
@@ -58,6 +59,7 @@ class PrefillServerInfo:
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
+    target_dcp_ranks: Optional[List[int]] = None
     target_cp_ranks: Optional[List[int]] = None
     target_pp_ranks: Optional[List[int]] = None
     required_dst_info_num: Optional[int] = None
@@ -65,6 +67,7 @@ class PrefillServerInfo:
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
+        self.dcp_size = int(self.dcp_size)
         self.attn_cp_size = int(self.attn_cp_size)
         self.dp_size = int(self.dp_size)
         self.pp_size = int(self.pp_size)
@@ -103,6 +106,8 @@ class CommonKVManager(BaseKVManager):
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.dcp_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
         self.attn_cp_size = get_attention_cp_size()
         self.attn_cp_rank = get_attention_cp_rank()
         self.attn_dp_size = get_attention_dp_size()
@@ -201,7 +206,13 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            url = (
+                f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}"
+                f"&prefill_cp_rank={-1}"
+                f"&target_dcp_rank={-1}"
+                f"&target_tp_rank={-1}"
+                f"&target_pp_rank={-1}"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -249,6 +260,12 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        if self.dcp_size != info.dcp_size:
+            raise RuntimeError(
+                "PD disaggregation with DCP requires matching prefill/decode dcp_size. "
+                f"Got decode dcp_size={self.dcp_size}, prefill dcp_size={info.dcp_size}."
+            )
+
         # TP rank mapping
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
@@ -290,6 +307,10 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
 
+        # DCP rank mapping. Each DCP rank owns a disjoint local KV shard, so the
+        # decode rank must bootstrap against the matching prefill DCP rank.
+        target_dcp_ranks = [self.dcp_rank]
+
         # CP rank mapping — decode cp size should be equal to 1
         assert self.attn_cp_size == 1, (
             f"Decode cp size ({self.attn_cp_size}) should be equal to 1",
@@ -320,6 +341,7 @@ class CommonKVManager(BaseKVManager):
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
+        info.target_dcp_ranks = target_dcp_ranks
         info.target_cp_ranks = target_cp_ranks
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
@@ -339,6 +361,8 @@ class CommonKVManager(BaseKVManager):
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
+            "dcp_size": self.dcp_size,
+            "dcp_rank": self.dcp_rank,
             "attn_cp_size": self.attn_cp_size,
             "attn_cp_rank": self.attn_cp_rank,
             "attn_dp_size": self.attn_dp_size,
@@ -545,6 +569,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
+        self.target_dcp_ranks = self.prefill_info.target_dcp_ranks
         self.target_cp_ranks = self.prefill_info.target_cp_ranks
         self.target_pp_ranks = self.prefill_info.target_pp_ranks
         self.required_dst_info_num = self.prefill_info.required_dst_info_num
@@ -570,63 +595,90 @@ class CommonKVReceiver(BaseKVReceiver):
         all_bootstrap_infos = []
         # NOTE: key distinguished by bootstrap_addr, prefill_dp_rank, prefill_cp_rank, and target_tp_rank
         for target_cp_rank in self.target_cp_ranks:
-            bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
+            for target_dcp_rank in self.target_dcp_ranks:
+                bootstrap_key = (
+                    f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_"
+                    f"{target_dcp_rank}_{self.target_tp_rank}"
+                )
 
-            if bootstrap_key not in self.kv_mgr.connection_pool:
-                bootstrap_infos = []
-                for target_tp_rank in self.target_tp_ranks:
-                    # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
-                    for target_pp_rank in reversed(self.target_pp_ranks):
-                        bootstrap_info = self._get_bootstrap_info_from_server(
-                            self.prefill_dp_rank,
-                            target_cp_rank,
-                            target_tp_rank,
-                            target_pp_rank,
-                        )
-                        if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
-                                # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
-                                bootstrap_info["is_dummy"] = not bool(
-                                    target_tp_rank == self.target_tp_rank
-                                    or self.target_tp_rank is None
+                if bootstrap_key not in self.kv_mgr.connection_pool:
+                    bootstrap_infos = []
+                    for target_tp_rank in self.target_tp_ranks:
+                        # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
+                        for target_pp_rank in reversed(self.target_pp_ranks):
+                            bootstrap_info = self._get_bootstrap_info_from_server(
+                                self.prefill_dp_rank,
+                                target_cp_rank,
+                                target_dcp_rank,
+                                target_tp_rank,
+                                target_pp_rank,
+                            )
+                            if bootstrap_info is not None:
+                                if self.kv_mgr.is_mla_backend:
+                                    # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
+                                    bootstrap_info["is_dummy"] = not bool(
+                                        target_tp_rank == self.target_tp_rank
+                                        or self.target_tp_rank is None
+                                    )
+                                else:
+                                    # For non-MLA: all target_tp_ranks are selected real ranks
+                                    bootstrap_info["is_dummy"] = False
+                                logger.debug(
+                                    "Fetched bootstrap info: %s for DP %s CP %s DCP %s TP %s PP %s",
+                                    bootstrap_info,
+                                    self.prefill_dp_rank,
+                                    target_cp_rank,
+                                    target_dcp_rank,
+                                    target_tp_rank,
+                                    target_pp_rank,
                                 )
+                                bootstrap_infos.append(bootstrap_info)
                             else:
-                                # For non-MLA: all target_tp_ranks are selected real ranks
-                                bootstrap_info["is_dummy"] = False
-                            logger.debug(
-                                f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
-                            )
-                            bootstrap_infos.append(bootstrap_info)
-                        else:
-                            self.kv_mgr.record_failure(
-                                self.bootstrap_room,
-                                f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
-                            )
-                            self.conclude_state = KVPoll.Failed
-                            self.kv_mgr.update_status(
-                                self.bootstrap_room, KVPoll.Failed
-                            )
-                            return
+                                self.kv_mgr.record_failure(
+                                    self.bootstrap_room,
+                                    "Could not fetch bootstrap info for: "
+                                    f"prefill_dp_rank: {self.prefill_dp_rank} "
+                                    f"prefill_cp_rank: {target_cp_rank} "
+                                    f"target_dcp_rank: {target_dcp_rank} "
+                                    f"target_tp_rank: {target_tp_rank} and "
+                                    f"target_pp_rank {target_pp_rank}",
+                                )
+                                self.conclude_state = KVPoll.Failed
+                                self.kv_mgr.update_status(
+                                    self.bootstrap_room, KVPoll.Failed
+                                )
+                                return
 
-                self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
+                    self.bootstrap_infos = bootstrap_infos
+                    self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
-            else:
-                self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
+                    # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
+                    self._register_kv_args()
+                else:
+                    self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
-            assert len(self.bootstrap_infos) > 0
-            all_bootstrap_infos.extend(self.bootstrap_infos)
+                assert len(self.bootstrap_infos) > 0
+                all_bootstrap_infos.extend(self.bootstrap_infos)
 
         self.bootstrap_infos = all_bootstrap_infos
 
     def _get_bootstrap_info_from_server(
-        self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
+        self,
+        prefill_dp_rank,
+        prefill_cp_rank,
+        target_dcp_rank,
+        target_tp_rank,
+        target_pp_rank,
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
+            url = (
+                f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}"
+                f"&prefill_cp_rank={prefill_cp_rank}"
+                f"&target_dcp_rank={target_dcp_rank}"
+                f"&target_tp_rank={target_tp_rank}"
+                f"&target_pp_rank={target_pp_rank}"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -716,6 +768,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self._setup_routes()
         self.pp_size = None
         self.attn_tp_size = None
+        self.dcp_size = None
         self.attn_cp_size = None
         self.dp_size = None
         self.page_size = None
@@ -740,12 +793,19 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def _is_ready(self) -> bool:
         if (
             self.attn_tp_size is None
+            or self.dcp_size is None
             or self.attn_cp_size is None
             or self.pp_size is None
             or self.dp_size is None
         ):
             return False
-        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+        expected = (
+            self.dp_size
+            * self.attn_cp_size
+            * self.attn_tp_size
+            * self.dcp_size
+            * self.pp_size
+        )
         logger.debug(
             f"Expected {expected} prefill servers to be registered, {self._registered_count} registered so far"
         )
@@ -775,6 +835,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         data = await request.json()
         attn_tp_size = data["attn_tp_size"]
         attn_tp_rank = data["attn_tp_rank"]
+        dcp_size = data["dcp_size"]
+        dcp_rank = data["dcp_rank"]
         attn_cp_size = data["attn_cp_size"]
         attn_cp_rank = data["attn_cp_rank"]
         attn_dp_size = data["attn_dp_size"]
@@ -793,6 +855,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.attn_cp_size is None:
             self.attn_cp_size = attn_cp_size
+
+        if self.dcp_size is None:
+            self.dcp_size = dcp_size
 
         if self.dp_size is None:
             self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
@@ -822,17 +887,24 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             dp_group_table = self.prefill_port_table.setdefault(dp_group, {})
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
+            dcp_group_table = tp_group_table.setdefault(dcp_rank, {})
 
-            tp_group_table[pp_rank] = PrefillRankInfo(
+            dcp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
             )
 
             self._registered_count += 1
 
-        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+        expected = (
+            self.dp_size
+            * self.attn_cp_size
+            * self.attn_tp_size
+            * self.dcp_size
+            * self.pp_size
+        )
         logger.debug(
-            f"Register prefill bootstrap: DP{dp_group} CP{attn_cp_rank} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+            f"Register prefill bootstrap: DP{dp_group} CP{attn_cp_rank} DCP{dcp_rank} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             f" ({self._registered_count}/{expected} registered)"
         )
 
@@ -841,11 +913,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     async def _handle_route_get(self, request: web.Request):
         prefill_dp_rank = request.query.get("prefill_dp_rank")
         prefill_cp_rank = request.query.get("prefill_cp_rank")
+        target_dcp_rank = request.query.get("target_dcp_rank")
         target_tp_rank = request.query.get("target_tp_rank")
         target_pp_rank = request.query.get("target_pp_rank")
         if (
             not prefill_dp_rank
             or not prefill_cp_rank
+            or not target_dcp_rank
             or not target_tp_rank
             or not target_pp_rank
         ):
@@ -854,6 +928,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if (
             int(prefill_dp_rank) == -1
             and int(prefill_cp_rank) == -1
+            and int(target_dcp_rank) == -1
             and int(target_tp_rank) == -1
             and int(target_pp_rank) == -1
         ):
@@ -865,6 +940,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 )
             info = PrefillServerInfo(
                 attn_tp_size=self.attn_tp_size,
+                dcp_size=self.dcp_size,
                 attn_cp_size=self.attn_cp_size,
                 dp_size=self.dp_size,
                 pp_size=self.pp_size,
@@ -890,11 +966,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             async with self.lock:
                 bootstrap_info = self.prefill_port_table[int(prefill_dp_rank)][
                     int(prefill_cp_rank)
-                ][int(target_tp_rank)][int(target_pp_rank)]
+                ][int(target_tp_rank)][int(target_dcp_rank)][int(target_pp_rank)]
         except KeyError:
             return web.Response(
                 text=f"Bootstrap info not found for dp_rank={prefill_dp_rank} cp_rank={prefill_cp_rank} "
-                f"tp_rank={target_tp_rank} pp_rank={target_pp_rank}",
+                f"dcp_rank={target_dcp_rank} tp_rank={target_tp_rank} pp_rank={target_pp_rank}",
                 status=404,
             )
 

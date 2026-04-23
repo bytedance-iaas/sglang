@@ -4,9 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.utils import is_cuda
 
@@ -55,6 +52,46 @@ def create_flashinfer_kv_indices_triton(
             + offset,
             mask=mask,
         )
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+
+@triton.jit
+def create_flashinfer_kv_indices_for_dcp_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    dcp_page_kernel_lens_ptr,
+    kv_indptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+    # find the req pool idx, this is for batch to token
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    kv_indices_offset = tl.load(kv_indptr + pid)
+    kv_start = 0
+    kv_end = 0
+    if kv_start_idx:
+        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
+        kv_end = kv_start
+    kv_end += tl.load(dcp_page_kernel_lens_ptr + pid).to(tl.int32)
+    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    for i in range(num_loop):
+        # index into req_to_token_ptr needs to be int64
+        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = offset < kv_end - kv_start
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offset * dcp_size
+            + dcp_rank,
+            mask=mask,
+        )
+        data = data / dcp_size
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
@@ -1397,8 +1434,7 @@ def fused_qk_rope_reshape_and_cache(
     if zeros_out is not None:
         return q_out.view(-1, qh * d), k_out, key_cache, value_cache, zeros_out
     return q_out.view(-1, qh * d), k_out, key_cache, value_cache
-
-
+# Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.12.0/vllm/attention/ops/common.py
 @triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
@@ -1411,9 +1447,6 @@ def _correct_attn_cp_out_kernel(
     lses_stride_N,
     lses_stride_B,
     lses_stride_H,
-    new_outputs_stride_H,
-    new_outputs_stride_B,
-    new_outputs_stride_D,
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
@@ -1429,69 +1462,59 @@ def _correct_attn_cp_out_kernel(
         lses_ptr (triton.PointerType):
             Pointer to input tensor of shape [ N, B, H ]
         new_output_ptr (triton.PointerType):
-            Pointer to output tensor of shape [ H, B, D ]
+            Pointer to output tensor of shape [ B, H, D ]
         vlse_ptr (triton.PointerType):
             Pointer to output tensor of shape [ B, H ]
     """
     batch_idx = tl.program_id(axis=0).to(tl.int64)
     head_idx = tl.program_id(axis=1).to(tl.int64)
-
-    # Use int32 for offsets where possible to reduce register pressure
-    b_i32 = batch_idx.to(tl.int32)
-    h_i32 = head_idx.to(tl.int32)
-
-    # Vectorized load of LSE values: shape = [N]
+    d_offsets = tl.arange(0, HEAD_DIM)
     num_n_offsets = tl.arange(0, N_ROUNDED)
+
+    # shape = [N]
     lse_offsets = (
-        num_n_offsets * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
+        num_n_offsets * lses_stride_N
+        + batch_idx * lses_stride_B
+        + head_idx * lses_stride_H
     )
 
-    # Compute final LSE using online softmax algorithm (more numerically stable)
+    # calc final lse
     lse = tl.load(lses_ptr + lse_offsets)
-
-    # Replace NaN and inf with -inf for numerical stability
-    neg_inf = float("-inf")
-    lse = tl.where((lse != lse) | (lse == float("inf")), neg_inf, lse)
-
-    # Online softmax: find max, subtract, exp, sum, log
+    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
     lse_max = tl.max(lse, axis=0)
-    lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
-    lse = lse - lse_max
+    lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
+    lse -= lse_max
     lse_exp = tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    final_lse = tl.log2(lse_acc) + lse_max
+    lse = tl.log2(lse_acc)
+    lse += lse_max
 
-    # Compute correction factor
-    lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
-    local_lse = tl.load(lses_ptr + lse_offset)
-    lse_diff = local_lse - final_lse
-    lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
-        neg_inf,
-        lse_diff,
-    )
-    factor = tl.exp2(lse_diff)
+    lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
+    tl.store(vlse_ptr + lse_offsets, lse)
 
-    # Store final LSE
-    tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
-
-    # Load output with vectorized access: shape = [D]
-    d_offsets = tl.arange(0, HEAD_DIM)
+    # shape = [D]
     output_offsets = (
         batch_idx * outputs_stride_B
         + head_idx * outputs_stride_H
         + d_offsets * outputs_stride_D
     )
 
-    new_output_offsets = (
-        head_idx * new_outputs_stride_H
-        + batch_idx * new_outputs_stride_B
-        + d_offsets * new_outputs_stride_D
+    # correct output
+    lse_offset = (
+        lse_idx * lses_stride_N + batch_idx * lses_stride_B + head_idx * lses_stride_H
     )
-    # Apply correction and store
+    lse_tmp = tl.load(lses_ptr + lse_offset)
+    lse_finally = lse_tmp - lse
+    lse_finally = tl.where(
+        (lse_finally != lse_finally) | (lse_finally == float("inf")),
+        -float("inf"),
+        lse_finally,
+    )
+    factor = tl.exp2(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
-    tl.store(new_output_ptr + new_output_offsets, output)
+
+    tl.store(new_output_ptr + output_offsets, output)
 
 
 class CPTritonContext:
@@ -1512,7 +1535,6 @@ def correct_attn_out(
     lses: torch.Tensor,
     cp_rank: int,
     ctx: Optional[CPTritonContext],
-    new_output: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -1550,7 +1572,6 @@ def correct_attn_out(
     # have the same B/H stride layout as a slice of `lses`.
     o_sB, o_sH, o_sD = out.stride()
     l_sN, l_sB, l_sH = lses.stride()
-    no_sH, no_sB, no_sD = new_output.stride()
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
     lse = torch.empty_strided(
@@ -1562,7 +1583,7 @@ def correct_attn_out(
 
     regular_args = (
         out,
-        new_output,
+        out,
         lses,
         lse,
         o_sB,
@@ -1571,44 +1592,50 @@ def correct_attn_out(
         l_sN,
         l_sB,
         l_sH,
-        no_sH,
-        no_sB,
-        no_sD,
         cp_rank,
     )
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
-    return new_output, lse
+    return out, lse
 
 
 def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
+    return_lse: bool = False,
     ctx: Optional[CPTritonContext] = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
     """
-    if cp_group.world_size == 1:
-        return cp_attn_out
-
     if ctx is None:
         ctx = CPTritonContext()
 
-    with use_symmetric_memory(cp_group):
-        # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
-        new_output = cp_attn_out.new_empty(cp_attn_out.transpose(0, 1).shape)
-        cp_attn_lse = cp_attn_lse.clone()
+    if cp_group.world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
+        return cp_attn_out
+
+    assert cp_attn_lse.is_contiguous()
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(
-        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
-    )
-    out = cp_group.reduce_scatter_along_dim(out, dim=0)
+    out, lse = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
+    assert out.is_contiguous()
+    # All-reduce seems faster than `reduce_scatter_along_dim` as it avoids
+    # the extra `contiguous()` call.
+    out = cp_group.all_reduce(out)
+    cp_num_heads = lse.shape[1] // cp_group.world_size
+    cp_rank = cp_group.rank_in_group
+    out = out[
+        :, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1), :
+    ].contiguous()
+    if return_lse:
+        lse = lse[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1)].contiguous()
+        return out, lse
     return out
 
 

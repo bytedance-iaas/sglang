@@ -1116,12 +1116,14 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
-    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
-        dcp_size = int(os.getenv("SGLANG_DCP_WORLD_SIZE", "1") or "1")
-        # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
-        # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
-        if dcp_size > 1:
-            os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
+    if (
+        ("NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem)
+        and server_args.dcp_size > 1
+    ):
+        # NCCL_GRAPH_MIXING_SUPPORT=0 can avoid the unnecessary EVENT_WAIT and EVENT_RECORD in cuda graph.
+        # This is helpful for improving DCP performance because it reduces bubbles.
+        # https://discuss.pytorch.org/t/unexplained-gaps-in-execution-before-nccl-operations-when-using-cuda-graphs/197818/15
+        os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 

@@ -63,6 +63,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _maybe_get_local_transfer_kv_indices(allocator, kv_indices: torch.Tensor) -> torch.Tensor:
+    filter_local_indices = getattr(allocator, "filter_local_indices", None)
+    if filter_local_indices is None:
+        return kv_indices
+    return filter_local_indices(kv_indices)
+
+
 def release_req_to_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -139,7 +146,7 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
-        kv_args.engine_rank = self.tp_rank
+        kv_args.engine_rank = self.tp_rank % self.scheduler.attn_tp_size
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
@@ -770,9 +777,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
         )
+        kv_indices = _maybe_get_local_transfer_kv_indices(
+            self.token_to_kv_pool_allocator,
+            kv_indices,
+        ).cpu().numpy()
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:

@@ -148,6 +148,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
+    dcp_kv_mask: Optional[torch.Tensor]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
 
     @classmethod
@@ -162,6 +163,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         dtype: torch.dtype,
         dp_size: int,
         pp_size: int,
+        dcp_size: int,
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
         seq_len_fill_value: int,
@@ -204,6 +206,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 }
             else:
                 pp_proxy_tensors = None
+
+            if dcp_size > 1:
+                dcp_kv_mask = torch.zeros((max_num_token,), dtype=torch.bool)
+            else:
+                dcp_kv_mask = None
 
             if is_encoder_decoder:
                 encoder_lens = torch.full(
@@ -259,6 +266,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
+            dcp_kv_mask=dcp_kv_mask,
             ngram_embedding_info=ngram_embedding_info,
         )
 
@@ -354,6 +362,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
+
+        if self.dcp_kv_mask is not None and forward_batch.dcp_kv_mask is not None:
+            dsts.append(self.dcp_kv_mask[:raw_num_token])
+            srcs.append(forward_batch.dcp_kv_mask)
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
@@ -549,6 +561,7 @@ class CudaGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
+        self.dcp_size = model_runner.server_args.dcp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
@@ -647,6 +660,7 @@ class CudaGraphRunner:
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
+            dcp_size=self.dcp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
@@ -933,6 +947,11 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
+        if self.dcp_size > 1:
+            dcp_kv_mask = buffers.dcp_kv_mask[:num_tokens]
+        else:
+            dcp_kv_mask = None
+
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -1030,6 +1049,7 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph

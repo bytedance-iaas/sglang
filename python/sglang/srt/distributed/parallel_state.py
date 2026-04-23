@@ -782,6 +782,38 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def reduce_scatter_along_dim(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+
+        with self.use_symmetric_memory(self):
+            input_tensor = input_.movedim(0, dim).contiguous()
+        assert input_tensor.shape[0] % world_size == 0
+
+        chunk_size = input_tensor.shape[0] // world_size
+        output_shape = (chunk_size,) + input_tensor.shape[1:]
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
+
+        # Perform reduce-scatter operation
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
+
+        # Reshape before returning
+        return output_tensor.movedim(0, dim).contiguous()
+
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
@@ -1559,6 +1591,14 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
+_DCP: Optional[GroupCoordinator] = None
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
+    return _DCP
+
+
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
@@ -1776,6 +1816,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    decode_context_parallel_size: Optional[int] = None,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
@@ -1945,7 +1986,11 @@ def initialize_model_parallel(
             group_name="attention_tp",
         )
     # build decode context parallel groups
-    decode_context_model_parallel_size = get_dcp_size_from_env()
+    decode_context_model_parallel_size = (
+        get_dcp_size_from_env()
+        if decode_context_parallel_size is None
+        else decode_context_parallel_size
+    )
     if decode_context_model_parallel_size > 1:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2141,6 +2186,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -2150,10 +2196,11 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size,
-            expert_model_parallel_size,
-            pipeline_model_parallel_size,
-            backend,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            decode_context_parallel_size=decode_context_parallel_size,
+            backend=backend,
         )
         return
 
@@ -2171,8 +2218,8 @@ def ensure_model_parallel_initialized(
 
     dcp_world_size = get_dcp_group().world_size
     assert (
-        dcp_world_size == get_dcp_size_from_env()
-    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+        dcp_world_size == decode_context_parallel_size
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
 
 
 def model_parallel_is_initialized():
@@ -2303,28 +2350,27 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP
+    global _TP, _DCP, _PP, _MOE_EP, _MOE_TP, _MOE_DP, _ATTN_CP, _ATTN_TP, _PDMUX_PREFILL_TP_GROUP
     if _TP:
         _TP.destroy()
     _TP = None
 
-    global _PP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
+
     if _PP:
         _PP.destroy()
     _PP = None
 
-    global _MOE_EP
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
 
-    global _MOE_TP
     if _MOE_TP:
         _MOE_TP.destroy()
     _MOE_TP = None
 
-    global _ATTN_CP
-    global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
@@ -2334,20 +2380,13 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
 
-    global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
-
-    global _DCP
-    if _DCP:
-        _DCP.destroy()
-    _DCP = None
 
 
 def destroy_distributed_environment():

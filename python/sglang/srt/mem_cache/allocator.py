@@ -582,7 +582,24 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.real_allocator.clear()
 
     def alloc(self, need_size: int):
-        raise NotImplementedError()
+        if need_size <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        device = self.device
+        prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+        prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+        seq_lens = torch.tensor([need_size], dtype=torch.int64, device=device)
+        seq_lens_cpu = torch.tensor([need_size], dtype=torch.int64)
+        last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+
+        return self.real_allocator.alloc_extend(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=need_size,
+        )
 
     def free(self, free_index: torch.Tensor):
         return self.real_allocator.free(free_index)
