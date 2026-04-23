@@ -19,7 +19,6 @@ from .pickle_struct import (
     BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
-    BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
@@ -35,7 +34,6 @@ from .pickle_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
-    DisaggregationMetrics,
     DumperControlReqInput,
     DumperControlReqOutput,
     EmbeddingReqInput,
@@ -47,7 +45,6 @@ from .pickle_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
-    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     HealthCheckOutput,
@@ -61,9 +58,7 @@ from .pickle_struct import (
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    LoRAMetrics,
     LoRAUpdateOutput,
-    MemoryMetrics,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     OpenSessionReqOutput,
@@ -73,7 +68,6 @@ from .pickle_struct import (
     ProfileReqInput,
     ProfileReqOutput,
     ProfileReqType,
-    QueueMetrics,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -93,7 +87,6 @@ from .pickle_struct import (
     SlowDownReqInput,
     SlowDownReqOutput,
     SpeculativeDecodingMetricsMixin,
-    SpeculativeMetrics,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     Tool,
@@ -114,15 +107,29 @@ from .pickle_struct import (
 
 if envs.SGLANG_IPC_USE_MSGPACK.get():
     from .msgpack_struct import (
+        BatchTokenIDOutput,
+        DisaggregationMetrics,
         FlushCacheReqInput,
         FlushCacheReqOutput,
         FreezeGCReq,
+        GetLoadsReqOutput,
+        LoRAMetrics,
+        MemoryMetrics,
+        QueueMetrics,
+        SpeculativeMetrics,
     )
 else:
     from .pickle_struct import (
+        BatchTokenIDOutput,
+        DisaggregationMetrics,
         FlushCacheReqInput,
         FlushCacheReqOutput,
         FreezeGCReq,
+        GetLoadsReqOutput,
+        LoRAMetrics,
+        MemoryMetrics,
+        QueueMetrics,
+        SpeculativeMetrics,
     )
 
 
