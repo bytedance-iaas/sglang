@@ -235,13 +235,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     esac \
     && if [ "$BUILD_SGL_KERNEL_FROM_SOURCE" = "1" ]; then \
         echo "Building sgl-kernel from source" \
-    &&  cd /sgl-workspace/sglang/sgl-kernel \
-    &&  CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
-        CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${SGL_KERNEL_NVCC_THREADS}" \
-        python3 -m uv build --wheel -Cbuild-dir=build . --no-build-isolation \
-    &&  python3 -m pip install dist/*whl --force-reinstall --no-deps \
-    &&  cd /sgl-workspace/sglang \
-    ; \
+        &&  cd /sgl-workspace/sglang/sgl-kernel \
+        &&  CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
+            CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${SGL_KERNEL_NVCC_THREADS}" \
+            python3 -m uv build --wheel -Cbuild-dir=build . --no-build-isolation \
+        &&  python3 -m pip install dist/*whl --force-reinstall --no-deps \
+        &&  cd /sgl-workspace/sglang ; \
     elif [ "$CUDA_VERSION" = "12.6.1" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
