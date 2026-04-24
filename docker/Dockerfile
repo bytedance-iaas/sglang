@@ -260,6 +260,48 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
+RUN python3 - <<'PY'
+import importlib
+import importlib.metadata
+import pathlib
+
+import sglang
+import sgl_kernel
+import torch
+
+expected_version = "0.4.1+ci.smoke"
+installed_version = importlib.metadata.version("sglang-kernel")
+
+print("sglang module:", pathlib.Path(sglang.__file__).resolve())
+print("sgl_kernel module:", pathlib.Path(sgl_kernel.__file__).resolve())
+print("sgl_kernel.__version__:", sgl_kernel.__version__)
+print("sglang-kernel metadata version:", installed_version)
+
+if not hasattr(torch.ops, "sgl_kernel"):
+    raise RuntimeError("torch.ops.sgl_kernel namespace is not registered")
+
+importlib.import_module("sgl_kernel.scalar_type")
+
+if sgl_kernel.__version__ != expected_version:
+    raise RuntimeError(
+        f"unexpected sgl_kernel.__version__: {sgl_kernel.__version__}"
+    )
+
+if installed_version != expected_version:
+    raise RuntimeError(
+        f"unexpected sglang-kernel metadata version: {installed_version}"
+    )
+
+missing_symbols = [
+    name for name in ("silu_and_mul", "int8_scaled_mm")
+    if not hasattr(sgl_kernel, name)
+]
+if missing_symbols:
+    raise RuntimeError(f"sgl_kernel missing expected symbols: {missing_symbols}")
+
+print("SGL_KERNEL_SMOKE_TEST_OK")
+PY
+
 # Install IAAS internal packages and sources.
 RUN set -eux; \
     http_proxy='' https_proxy='' python3 -m pip install https://eic-sdk-release.tos-cn-beijing.ivolces.com/python/eic-1.5.2-py3-none-any.whl; \
