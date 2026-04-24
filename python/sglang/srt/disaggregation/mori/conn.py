@@ -31,7 +31,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    get_dcp_compatible_token_positions,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -113,6 +116,8 @@ class KVArgsRegisterInfo:
     gpu_id: int
     decode_tp_size: int
     decode_tp_rank: int
+    decode_dcp_size: int
+    decode_dcp_rank: int
     dst_kv_item_len: int
 
     @property
@@ -130,7 +135,9 @@ class KVArgsRegisterInfo:
         gpu_id = int(payload[7].decode("ascii"))
         decode_tp_size = int(payload[8].decode("ascii"))
         decode_tp_rank = int(payload[9].decode("ascii"))
-        dst_kv_item_len = int(payload[10].decode("ascii"))
+        decode_dcp_size = int(payload[10].decode("ascii"))
+        decode_dcp_rank = int(payload[11].decode("ascii"))
+        dst_kv_item_len = int(payload[12].decode("ascii"))
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -141,6 +148,8 @@ class KVArgsRegisterInfo:
             gpu_id=gpu_id,
             decode_tp_size=decode_tp_size,
             decode_tp_rank=decode_tp_rank,
+            decode_dcp_size=decode_dcp_size,
+            decode_dcp_rank=decode_dcp_rank,
             dst_kv_item_len=dst_kv_item_len,
         )
 
@@ -171,6 +180,9 @@ class TPSliceConfig:
     src_head_slice_offset: int
     dst_head_slice_offset: int
     heads_bytes_per_token_to_send: int
+    src_token_positions: npt.NDArray[np.int64]
+    dst_token_positions: npt.NDArray[np.int64]
+    src_page_stride: int
 
 
 class MoriKVManager(CommonKVManager):
@@ -548,6 +560,15 @@ class MoriKVManager(CommonKVManager):
                 "Slice size exceeds destination token capacity for TP slice transfer"
             )
 
+        src_token_positions, dst_token_positions, src_page_stride = (
+            get_dcp_compatible_token_positions(
+                page_size=page_size,
+                prefill_dcp_size=self.dcp_size,
+                decode_dcp_size=peer_info.decode_dcp_size,
+                decode_dcp_rank=peer_info.decode_dcp_rank,
+            )
+        )
+
         return TPSliceConfig(
             page_size=page_size,
             src_item_len=src_item_len,
@@ -557,6 +578,9 @@ class MoriKVManager(CommonKVManager):
             src_head_slice_offset=src_head_slice_offset,
             dst_head_slice_offset=dst_head_slice_offset,
             heads_bytes_per_token_to_send=heads_bytes_per_token,
+            src_token_positions=src_token_positions,
+            dst_token_positions=dst_token_positions,
+            src_page_stride=src_page_stride,
         )
 
     def _issue_tp_slice_transfers(
@@ -576,13 +600,11 @@ class MoriKVManager(CommonKVManager):
 
         src_pages = kv_indices[:limit].astype(np.int64)
         dst_pages = dst_indices[:limit].astype(np.int64)
-        token_slots = np.arange(tp_cfg.page_size, dtype=np.int64)
-
-        src_page_bases = src_pages * tp_cfg.src_item_len
+        src_page_bases = src_pages * tp_cfg.src_item_len * tp_cfg.src_page_stride
         dst_page_bases = dst_pages * tp_cfg.dst_item_len
 
-        src_token_offsets = token_slots * tp_cfg.bytes_per_token_src
-        dst_token_offsets = token_slots * tp_cfg.bytes_per_token_dst
+        src_token_offsets = tp_cfg.src_token_positions * tp_cfg.bytes_per_token_src
+        dst_token_offsets = tp_cfg.dst_token_positions * tp_cfg.bytes_per_token_dst
 
         local_offsets = (
             (
@@ -649,6 +671,7 @@ class MoriKVManager(CommonKVManager):
                 )
         else:
             tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
+            dcp_mismatch = peer_info.decode_dcp_size != self.dcp_size
             (
                 src_k_descs,
                 src_v_descs,
@@ -657,7 +680,7 @@ class MoriKVManager(CommonKVManager):
                 layers_current_pp_stage,
             ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
 
-            if tp_mismatch:
+            if tp_mismatch or dcp_mismatch:
                 tp_cfg = self._build_tp_slice_config(peer_info)
                 for layer_id in range(layers_current_pp_stage):
                     statuses.extend(
@@ -1006,6 +1029,8 @@ class MoriKVReceiver(CommonKVReceiver):
         gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
         decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
+        decode_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+        decode_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
 
         for bootstrap_info in self.bootstrap_infos:
@@ -1024,6 +1049,8 @@ class MoriKVReceiver(CommonKVReceiver):
                         gpu_id,
                         decode_tp_size,
                         decode_tp_rank,
+                        decode_dcp_size,
+                        decode_dcp_rank,
                         kv_item_len,
                     ]
                 )

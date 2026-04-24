@@ -198,6 +198,23 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
+    def get_target_decode_dcp_size(self) -> int:
+        decode_kv_args_table = getattr(self, "decode_kv_args_table", None)
+        if not decode_kv_args_table:
+            return self.dcp_size
+
+        dcp_sizes = {
+            int(getattr(info, "decode_dcp_size", 1))
+            for info in decode_kv_args_table.values()
+        }
+        if not dcp_sizes:
+            return self.dcp_size
+        if len(dcp_sizes) != 1:
+            raise RuntimeError(
+                f"Expected a single decode dcp_size across peers, got {sorted(dcp_sizes)}"
+            )
+        return next(iter(dcp_sizes))
+
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
@@ -270,10 +287,14 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
-        if self.dcp_size != info.dcp_size:
+        decode_only_dcp = self.dcp_size > 1 and info.dcp_size == 1
+        if self.dcp_size != info.dcp_size and not decode_only_dcp:
             raise RuntimeError(
-                "PD disaggregation with DCP requires matching prefill/decode dcp_size. "
-                f"Got decode dcp_size={self.dcp_size}, prefill dcp_size={info.dcp_size}."
+                "PD disaggregation does not support decode-only DCP. "
+                "Prefill and decode must use the same dcp_size because DCP changes "
+                "KV sharding and page layout during transfer. "
+                f"Got decode dcp_size={self.dcp_size}, prefill dcp_size={info.dcp_size}. "
+                "Use matching --dcp-size on both sides, or set both to 1."
             )
 
         # TP rank mapping
@@ -319,7 +340,10 @@ class CommonKVManager(BaseKVManager):
 
         # DCP rank mapping. Each DCP rank owns a disjoint local KV shard, so the
         # decode rank must bootstrap against the matching prefill DCP rank.
-        target_dcp_ranks = [self.dcp_rank]
+        if decode_only_dcp:
+            target_dcp_ranks = [0]
+        else:
+            target_dcp_ranks = [self.dcp_rank]
 
         # CP rank mapping — decode cp size should be equal to 1
         assert self.attn_cp_size == 1, (
@@ -521,6 +545,17 @@ class CommonKVSender(BaseKVSender):
         self.aux_index = aux_index
         logger.debug(
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
+        )
+
+    def get_transfer_page_size(self, page_size: int) -> int:
+        from sglang.srt.disaggregation.common.utils import (
+            get_dcp_compatible_transfer_page_size,
+        )
+
+        return get_dcp_compatible_transfer_page_size(
+            page_size=page_size,
+            prefill_dcp_size=self.kv_mgr.dcp_size,
+            decode_dcp_size=self.kv_mgr.get_target_decode_dcp_size(),
         )
 
     def send(

@@ -342,7 +342,10 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            transfer_page_size = req.disagg_kv_sender.get_transfer_page_size(
+                self.token_to_kv_pool.page_size
+            )
+            num_pages = kv_to_page_num(num_kv_indices, transfer_page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -764,6 +767,7 @@ class SchedulerDisaggregationPrefillMixin:
         Send a prefilled chunk to the decode server
         """
         page_size = self.token_to_kv_pool_allocator.page_size
+        transfer_page_size = req.disagg_kv_sender.get_transfer_page_size(page_size)
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -773,7 +777,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
-            end_idx = end_idx - end_idx % page_size
+            end_idx = end_idx - end_idx % transfer_page_size
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
@@ -828,7 +832,7 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
-        page_indices = kv_to_page_indices(kv_indices, page_size)
+        page_indices = kv_to_page_indices(kv_indices, transfer_page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"

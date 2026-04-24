@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
+    get_dcp_compatible_token_positions,
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
@@ -124,6 +125,8 @@ class KVArgsRegisterInfo:
     dst_state_data_ptrs: list[int]
     dst_tp_rank: int
     dst_attn_tp_size: int
+    decode_dcp_size: int
+    decode_dcp_rank: int
     dst_kv_item_len: int
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
@@ -145,22 +148,24 @@ class KVArgsRegisterInfo:
             dst_state_data_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
-            dst_kv_item_len=int(msg[9].decode("ascii")),
+            decode_dcp_size=int(msg[9].decode("ascii")),
+            decode_dcp_rank=int(msg[10].decode("ascii")),
+            dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_state_item_lens=(
-                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
-                if len(msg) > 10 and len(msg[10]) > 0
+                list(struct.unpack(f"{len(msg[12])//4}I", msg[12]))
+                if len(msg) > 12 and len(msg[12]) > 0
                 else []
             ),
             dst_state_dim_per_tensor=(
-                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
-                if len(msg) > 11 and len(msg[11]) > 0
+                list(struct.unpack(f"{len(msg[13])//4}I", msg[13]))
+                if len(msg) > 13 and len(msg[13]) > 0
                 else []
             ),
             enable_hisparse=(
-                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
+                msg[14].decode("ascii") == "1" if len(msg) > 14 else False
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 15),
         )
 
 
@@ -753,6 +758,8 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
+        decode_dcp_size: int,
+        decode_dcp_rank: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
@@ -820,20 +827,33 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
+        src_token_positions, dst_token_positions, src_page_stride = (
+            get_dcp_compatible_token_positions(
+                page_size=page_size,
+                prefill_dcp_size=self.dcp_size,
+                decode_dcp_size=decode_dcp_size,
+                decode_dcp_rank=decode_dcp_rank,
+            )
+        )
+
         prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
         decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
-        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
         src_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
+            src_token_positions.reshape(1, -1) * bytes_per_token_on_prefill
+            + src_head_slice_offset
         )
         dst_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
+            dst_token_positions.reshape(1, -1) * bytes_per_token_on_decode
+            + dst_head_slice_offset
         )
 
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
-            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
+            src_page_base_addrs = (
+                src_layer_ptr
+                + prefill_page_indices * src_kv_item_len * src_page_stride
+            )
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
             src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
             dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
@@ -1212,9 +1232,36 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
+                        if self.is_mla_backend:
+                            if (
+                                target_rank_registration_info.decode_dcp_size
+                                != self.dcp_size
+                            ):
+                                raise RuntimeError(
+                                    "Mixed DCP PD transfer is not supported for MLA backends."
+                                )
+                            if target_rank_registration_info.enable_hisparse:
+                                ret = self.send_kvcache_hisparse(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    req.dst_kv_indices,
+                                    kv_chunk.index_slice,
+                                    executor,
+                                )
+                            else:
+                                ret = self.send_kvcache(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                )
+                        elif (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
+                            and target_rank_registration_info.decode_dcp_size
+                            == self.dcp_size
                         ):
                             if target_rank_registration_info.enable_hisparse:
                                 ret = self.send_kvcache_hisparse(
@@ -1237,6 +1284,8 @@ class MooncakeKVManager(CommonKVManager):
                             self.enable_staging
                             and staging_strategy is not None
                             and target_rank_registration_info.staging is not None
+                            and target_rank_registration_info.decode_dcp_size
+                            == self.dcp_size
                         ):
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,
@@ -1260,6 +1309,8 @@ class MooncakeKVManager(CommonKVManager):
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
                                 target_rank_registration_info.dst_attn_tp_size,
+                                target_rank_registration_info.decode_dcp_size,
+                                target_rank_registration_info.decode_dcp_rank,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
@@ -1775,6 +1826,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
+            decode_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+            decode_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
 
@@ -1802,6 +1855,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_data_ptrs,
                         dst_tp_rank,
                         dst_attn_tp_size,
+                        decode_dcp_size,
+                        decode_dcp_rank,
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,

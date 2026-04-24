@@ -19,7 +19,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    get_dcp_compatible_token_positions,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -83,6 +86,8 @@ class KVArgsRegisterInfo:
     gpu_id: int
     decode_tp_size: int
     decode_tp_rank: int
+    decode_dcp_size: int
+    decode_dcp_rank: int
     dst_kv_item_len: int
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
@@ -97,11 +102,11 @@ class KVArgsRegisterInfo:
 
         dst_state_item_lens = []
         dst_state_dim_per_tensor = []
-        if len(msg) > 12 and len(msg[12]) > 0:
-            dst_state_item_lens = list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
-        if len(msg) > 13 and len(msg[13]) > 0:
+        if len(msg) > 14 and len(msg[14]) > 0:
+            dst_state_item_lens = list(struct.unpack(f"{len(msg[14]) // 4}I", msg[14]))
+        if len(msg) > 15 and len(msg[15]) > 0:
             dst_state_dim_per_tensor = list(
-                struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
+                struct.unpack(f"{len(msg[15]) // 4}I", msg[15])
             )
 
         return cls(
@@ -116,7 +121,9 @@ class KVArgsRegisterInfo:
             gpu_id=int(msg[8].decode("ascii")),
             decode_tp_size=int(msg[9].decode("ascii")),
             decode_tp_rank=int(msg[10].decode("ascii")),
-            dst_kv_item_len=int(msg[11].decode("ascii")),
+            decode_dcp_size=int(msg[11].decode("ascii")),
+            decode_dcp_rank=int(msg[12].decode("ascii")),
+            dst_kv_item_len=int(msg[13].decode("ascii")),
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
         )
@@ -485,6 +492,8 @@ class NixlKVManager(CommonKVManager):
         prefill_tp_size: int,
         decode_tp_size: int,
         decode_tp_rank: int,
+        decode_dcp_size: int,
+        decode_dcp_rank: int,
         dst_kv_item_len: int,
     ):
         # Get configuration from kv_args
@@ -553,23 +562,32 @@ class NixlKVManager(CommonKVManager):
         dst_indices = np.asarray(dst_kv_indices, dtype=np.int64)
         bytes_per_token_prefill = src_kv_item_len // page_size
         bytes_per_token_decode = dst_kv_item_len // page_size
-        token_offsets = np.arange(page_size, dtype=np.int64)
+        src_token_positions, dst_token_positions, src_page_stride = (
+            get_dcp_compatible_token_positions(
+                page_size=page_size,
+                prefill_dcp_size=self.dcp_size,
+                decode_dcp_size=decode_dcp_size,
+                decode_dcp_rank=decode_dcp_rank,
+            )
+        )
 
         src_addrs = []
         dst_addrs = []
 
         for src_ptr, dst_ptr in src_dst_ptr_pairs:
-            src_page_bases = src_ptr + prefill_indices * src_kv_item_len
+            src_page_bases = (
+                src_ptr + prefill_indices * src_kv_item_len * src_page_stride
+            )
             dst_page_bases = dst_ptr + dst_indices * dst_kv_item_len
 
             src_all = (
                 src_page_bases[:, None]
-                + token_offsets[None, :] * bytes_per_token_prefill
+                + src_token_positions[None, :] * bytes_per_token_prefill
                 + src_head_slice_offset
             ).ravel()
             dst_all = (
                 dst_page_bases[:, None]
-                + token_offsets[None, :] * bytes_per_token_decode
+                + dst_token_positions[None, :] * bytes_per_token_decode
                 + dst_head_slice_offset
             ).ravel()
 
@@ -887,8 +905,25 @@ class NixlKVManager(CommonKVManager):
                 f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
             )
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
+            decode_dcp_size = self.decode_kv_args_table[req.agent_name].decode_dcp_size
 
-            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+            if self.is_mla_backend:
+                if decode_dcp_size != self.dcp_size:
+                    raise RuntimeError(
+                        "Mixed DCP PD transfer is not supported for MLA backends."
+                    )
+                kv_xfer_handle = self.send_kvcache(
+                    req.agent_name,
+                    kv_indices,
+                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    chunked_dst_kv_indice,
+                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    notif,
+                )
+            elif (
+                decode_tp_size == self.attn_tp_size
+                and decode_dcp_size == self.dcp_size
+            ):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
                     kv_indices,
@@ -910,6 +945,10 @@ class NixlKVManager(CommonKVManager):
                     decode_tp_rank=self.decode_kv_args_table[
                         req.agent_name
                     ].decode_tp_rank,
+                    decode_dcp_size=decode_dcp_size,
+                    decode_dcp_rank=self.decode_kv_args_table[
+                        req.agent_name
+                    ].decode_dcp_rank,
                     dst_kv_item_len=self.decode_kv_args_table[
                         req.agent_name
                     ].dst_kv_item_len,
@@ -1234,6 +1273,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                         str(self.kv_mgr.attn_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
+                        str(self.kv_mgr.dcp_size).encode("ascii"),
+                        str(self.kv_mgr.dcp_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,

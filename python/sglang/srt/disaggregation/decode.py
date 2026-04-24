@@ -590,7 +590,20 @@ class DecodePreallocQueue:
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            try:
+                info_ready = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+            except RuntimeError as exc:
+                error_msg = (
+                    f"Failed to resolve prefill parallel info from {bootstrap_addr}: {exc}"
+                )
+                logger.error(error_msg)
+                for decode_req in reqs:
+                    decode_req.kv_receiver.abort()
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                continue
+
+            if info_ready:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
