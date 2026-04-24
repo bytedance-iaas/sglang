@@ -233,6 +233,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
+    && python3 -m pip install -e "./python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$BUILD_SGL_KERNEL_FROM_SOURCE" = "1" ]; then \
         echo "Building sgl-kernel from source" \
         &&  cd /sgl-workspace/sglang/sgl-kernel \
@@ -254,7 +255,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi \
-    && python3 -m pip install -e "./python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
