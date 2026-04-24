@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.layers import asym_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -67,8 +68,6 @@ def _scatter_chunk_kernel(
     topk_ids_ptr,       # (num_tokens * topk,) int32
     topk_weights_ptr,   # (num_tokens * topk,) float32 (or bfloat16)
     g_start,            # int — first expert index of this chunk
-    g_lo,               # int — effective lower bound (max(g_start, 1) to match
-                        #        post_reorder's `expert_id > 0` guard)
     g_end,              # int — last+1 expert index of this chunk
     m,                  # int — m_max (per-group row stride)
     K,                  # int — hidden dim
@@ -78,8 +77,9 @@ def _scatter_chunk_kernel(
     """Scatter one chunk's GEMM-1 output into the final (num_tokens, K) buffer.
 
     One Triton program per source token.  For each top-k slot, if the assigned
-    expert falls in [g_lo, g_end), load the corresponding row from down_chunk,
-    weight it, and accumulate into output[src_idx].
+    expert falls in [g_start, g_end), load the corresponding row from down_chunk,
+    weight it, and accumulate into output[src_idx]. The -1 "non-local" sentinel
+    is filtered naturally because g_start >= 0.
     """
     src_idx = tl.program_id(0).to(tl.int64)
     vec = tl.arange(0, BLOCK_K)
@@ -91,7 +91,7 @@ def _scatter_chunk_kernel(
 
         for idx in range(topk):
             expert_id = tl.load(topk_ids_ptr + src_idx * topk + idx)
-            if expert_id >= g_lo and expert_id < g_end:
+            if expert_id >= g_start and expert_id < g_end:
                 # flat row in (G, m) layout: expert_id * m + row_in_expert
                 dst_flat = tl.load(src2dst_ptr + src_idx * topk + idx).to(tl.int64)
                 # translate to row in this chunk's (c, m) layout
@@ -123,9 +123,6 @@ def _scatter_chunk_to_output(
     topk = topk_ids.shape[1]
 
     g_end = g_start + c
-    # Replicate the `expert_id > 0` guard from post_reorder_triton_kernel: skip
-    # expert 0, which acts as a sentinel for "no local expert" in EP settings.
-    g_lo = max(g_start, 1)
 
     _scatter_chunk_kernel[(num_tokens,)](
         down_chunk,
@@ -134,7 +131,6 @@ def _scatter_chunk_to_output(
         topk_ids.view(-1),
         topk_weights.view(-1),
         g_start,
-        g_lo,
         g_end,
         m,
         K,
