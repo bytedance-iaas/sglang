@@ -224,7 +224,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -rf /tmp/local_src
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six uv scikit-build-core ninja \
+    python3 -m pip install --upgrade pip setuptools wheel html5lib six uv scikit-build-core ninja "cmake>=3.31,<3.32" \
     && cd sglang \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -237,6 +237,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$BUILD_SGL_KERNEL_FROM_SOURCE" = "1" ]; then \
         echo "Building sgl-kernel from source" \
         &&  cd /sgl-workspace/sglang/sgl-kernel \
+        &&  cmake --version \
         &&  CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
             CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${SGL_KERNEL_NVCC_THREADS}" \
             python3 -m uv build --wheel -Cbuild-dir=build . --no-build-isolation \
