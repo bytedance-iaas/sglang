@@ -216,6 +216,16 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
+                if "dcp_size" not in data:
+                    if self.dcp_size > 1:
+                        logger.error(
+                            "Bootstrap server %s returned legacy topology without dcp_size. "
+                            "This usually means decode was upgraded but prefill/bootstrap is still on old code. "
+                            "PD disaggregation with DCP requires both sides to run the same DCP-aware bootstrap code.",
+                            bootstrap_addr,
+                        )
+                        return False
+                    data["dcp_size"] = 1
                 info = PrefillServerInfo(**data)
             else:
                 logger.error(
