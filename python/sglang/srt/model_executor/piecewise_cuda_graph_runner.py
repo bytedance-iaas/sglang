@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import bisect
 import gc
+import inspect
 import logging
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -59,6 +61,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
+# Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
+warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -409,6 +413,48 @@ class PiecewiseCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    def _get_inner_language_model(self) -> torch.nn.Module:
+        """Return the inner language model that gets torch.compile'd (same logic as __init__)."""
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        return getattr(language_model, "model", language_model)
+
+    def _build_multimodal_warmup_kwargs(
+        self, input_embeds: torch.Tensor
+    ) -> Dict[str, Any]:
+        """Construct extra kwargs so that the warmup/capture call to the inner
+        language_model sees the exact same kwarg signature as the runtime
+        multimodal request (``general_mm_embed_routine``). Without this, dynamo
+        will recompile at runtime when an Optional[Tensor] kwarg (e.g.
+        ``input_deepstack_embeds``) flips from ``None`` to a real tensor,
+        which then triggers the PCG capture-stream assertion.
+        """
+        kwargs: Dict[str, Any] = {}
+        inner_model = self._get_inner_language_model()
+        try:
+            sig = inspect.signature(inner_model.forward)
+        except (TypeError, ValueError):
+            return kwargs
+
+        outer_model = self.model_runner.model
+        num_tokens = input_embeds.shape[0]
+        hidden_size = input_embeds.shape[-1]
+
+        # ``input_deepstack_embeds`` comes from Qwen3-VL / Qwen3.5-VL. Runtime
+        # passes a [num_tokens, hidden_size * num_deepstack_embeddings] tensor.
+        if "input_deepstack_embeds" in sig.parameters:
+            num_deepstack = getattr(outer_model, "num_deepstack_embeddings", 0) or 0
+            use_deepstack = bool(getattr(outer_model, "use_deepstack", False))
+            if use_deepstack and num_deepstack > 0:
+                kwargs["input_deepstack_embeds"] = torch.zeros(
+                    (num_tokens, hidden_size * num_deepstack),
+                    dtype=input_embeds.dtype,
+                    device=input_embeds.device,
+                )
+
+        return kwargs
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
@@ -565,6 +611,22 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+            # For multimodal models whose inner language_model takes extra
+            # Optional[Tensor] kwargs at runtime (e.g. ``input_deepstack_embeds``
+            # for Qwen3-VL / Qwen3.5-VL), we bypass the outer
+            # ConditionalGeneration.forward (which would call
+            # ``general_mm_embed_routine`` without those kwargs because the
+            # synthetic forward_batch has no mm_inputs) and directly invoke the
+            # inner language_model with the full kwarg set. This way dynamo's
+            # guard is established with the same kwarg shape as runtime and
+            # avoids a runtime recompile that would otherwise trip the PCG
+            # capture-stream assertion.
+            extra_lm_kwargs: Dict[str, Any] = {}
+            if self.is_multimodal and buffers.input_embeds is not None:
+                extra_lm_kwargs = self._build_multimodal_warmup_kwargs(
+                    buffers.input_embeds[:num_tokens]
+                )
+
             with set_forward_context(
                 forward_batch,
                 self.attention_layers,
@@ -572,12 +634,23 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
             ):
-                self.model_runner.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
+                if extra_lm_kwargs:
+                    inner_lm = self._get_inner_language_model()
+                    inner_lm.forward(
+                        None,
+                        forward_batch.positions,
+                        forward_batch,
+                        input_embeds=buffers.input_embeds[:num_tokens],
+                        **extra_lm_kwargs,
+                        **kwargs,
+                    )
+                else:
+                    self.model_runner.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
             return
 
         # run twice for warmup at the first time and cuda graph capture at the second time
@@ -679,8 +752,20 @@ class PiecewiseCudaGraphRunner:
 
         next_token_logits_buffer = None
 
+        # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
+        pcg_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.forward_mode == ForwardMode.MIXED
+            else forward_batch.forward_mode
+        )
+        pcg_global_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.global_forward_mode == ForwardMode.MIXED
+            else forward_batch.global_forward_mode
+        )
+
         static_forward_batch = ForwardBatch(
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=pcg_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
@@ -718,7 +803,7 @@ class PiecewiseCudaGraphRunner:
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=forward_batch.num_token_non_padded,
-            global_forward_mode=forward_batch.global_forward_mode,
+            global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
@@ -739,9 +824,13 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        num_tokens = len(forward_batch.input_ids)
+        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+        static_num_tokens = self.capture_num_tokens[index]
         with enable_piecewise_cuda_graph():
-            # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # Prepare static buffers first so set_forward_context can carry num_tokens
+            # into call_begin_forward (via ForwardContext.num_tokens), eliminating the
+            # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
@@ -750,7 +839,10 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                num_tokens=static_num_tokens,
             ):
+                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,
