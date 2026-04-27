@@ -87,6 +87,12 @@ on:
 jobs:
   build-wheel:
     runs-on: ${{ inputs.runner }}
+    env:
+      HTTP_PROXY: http://100.68.162.211:3128
+      HTTPS_PROXY: http://100.68.162.211:3128
+      ALL_PROXY: http://100.68.162.211:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+      BUILDKIT_NO_PROXY: 127.0.0.1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,6 +116,10 @@ jobs:
             --name sgl-kernel-builder \
             --driver docker-container \
             --driver-opt network=host \
+            --driver-opt env.HTTP_PROXY="${HTTP_PROXY}" \
+            --driver-opt env.HTTPS_PROXY="${HTTPS_PROXY}" \
+            --driver-opt env.ALL_PROXY="${ALL_PROXY}" \
+            --driver-opt env.NO_PROXY="${BUILDKIT_NO_PROXY}" \
             --config /tmp/sgl-kernel-buildkitd.toml \
             --use \
             --bootstrap
