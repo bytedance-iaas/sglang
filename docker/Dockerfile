@@ -197,8 +197,7 @@ ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG INSTALL_FLASHINFER_JIT_CACHE
-ARG BUILD_SGL_KERNEL_FROM_SOURCE=0
-ARG SGL_KERNEL_NVCC_THREADS=128
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
 ARG FLASHINFER_VERSION
 ARG GRACE_BLACKWELL
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH
@@ -224,7 +223,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -rf /tmp/local_src
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six uv scikit-build-core ninja "cmake>=3.31,<3.32" \
+    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -233,16 +232,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && python3 -m pip install -e "./python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-    && if [ "$BUILD_SGL_KERNEL_FROM_SOURCE" = "1" ]; then \
-        echo "Building sgl-kernel from source" \
-        &&  cd /sgl-workspace/sglang/sgl-kernel \
-        &&  cmake --version \
-        &&  CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} \
-            CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${SGL_KERNEL_NVCC_THREADS}" \
-            python3 -m uv build --wheel -Cbuild-dir=build . --no-build-isolation \
-        &&  python3 -m pip install dist/*whl --force-reinstall --no-deps \
-        &&  cd /sgl-workspace/sglang ; \
+    && if [ "$INSTALL_LOCAL_SGL_KERNEL_WHEEL" = "1" ]; then \
+        python3 -m pip install /sgl-workspace/sglang/.ci-artifacts/sgl-kernel/*.whl --force-reinstall --no-deps \
+    ; \
     elif [ "$CUDA_VERSION" = "12.6.1" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
@@ -256,6 +248,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi \
+    && python3 -m pip install -e "./python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
