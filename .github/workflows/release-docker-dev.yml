@@ -95,9 +95,9 @@ jobs:
 
       - name: Build and Push Dev Image
         run: |
-          # Nightly (schedule) installs latest release; manual dispatch builds from checked-out source
+          # Nightly and manual dispatch build from checked-out source
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            SOURCE_ARG="--build-arg USE_LATEST_SGLANG=1"
+            SOURCE_ARG="--build-arg BRANCH_TYPE=local"
           else
             SOURCE_ARG="--build-arg BRANCH_TYPE=local"
           fi
