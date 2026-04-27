@@ -98,6 +98,22 @@ jobs:
         with:
           python-version: ${{ inputs.python_version }}
 
+      - name: Set up sgl-kernel Buildx builder
+        run: |
+          set -euo pipefail
+          docker buildx rm sgl-kernel-builder 2>/dev/null || true
+          cat > /tmp/sgl-kernel-buildkitd.toml <<'EOF'
+          [registry."docker.io"]
+            mirrors = ["127.0.0.1:5000"]
+          EOF
+          docker buildx create \
+            --name sgl-kernel-builder \
+            --driver docker-container \
+            --driver-opt network=host \
+            --config /tmp/sgl-kernel-buildkitd.toml \
+            --use \
+            --bootstrap
+
       - name: Build wheel
         run: |
           set -euo pipefail
