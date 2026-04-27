@@ -191,6 +191,9 @@ class SchedulerRuntimeCheckerMixin:
     def _get_token_info(self: Scheduler) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
+        # In DCP mode these values are already on the same logical-token basis as
+        # self.max_total_num_tokens: available_size comes from the DCP allocator and
+        # evictable_size comes from the radix cache built with the DCP-expanded page size.
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return PoolStats(

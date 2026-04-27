@@ -19,9 +19,17 @@ import torch
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    cp_lse_ag_out_rs,
+    create_flashinfer_kv_indices_for_dcp_triton,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -134,12 +142,14 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        self.dcp_size = get_dcp_group().world_size
+        self.dcp_rank = get_dcp_group().rank_in_group
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_attention_tp_size(),
+            // get_attention_tp_size() * self.dcp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
                 get_attention_tp_size()
             ),
@@ -434,6 +444,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
@@ -447,6 +459,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, False, False
@@ -462,6 +476,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
@@ -503,6 +519,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -583,6 +601,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
@@ -663,6 +683,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
@@ -692,6 +714,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=True,
                 encoder_lens=encoder_lens,
                 spec_info=None,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
@@ -720,6 +744,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -732,6 +758,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
@@ -744,6 +772,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
@@ -756,6 +786,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -786,6 +818,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q = q.contiguous()
         if not self.forward_metadata.use_ragged:
+            assert self.dcp_size == 1, "DCP must use ragged wrapper"
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -860,19 +893,39 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
+                if self.dcp_size > 1:
+                    q = get_dcp_group().all_gather(q, dim=1)
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
+                if self.dcp_size > 1:
+                    o2, s2 = cp_lse_ag_out_rs(
+                        o2,
+                        s2,
+                        get_dcp_group(),
+                        return_lse=True,
+                    )
+                    o2 = o2.contiguous()
+                    s2 = s2.contiguous()
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
+                kwargs = {}
+                if self.dcp_size > 1:
+                    kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    **kwargs,
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -896,23 +949,41 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        if self.dcp_size > 1:
+            with use_symmetric_memory(get_dcp_group()):
+                q = q.clone(memory_format=torch.contiguous_format)
+            q = get_dcp_group().all_gather(q, dim=1)
+        else:
+            q = q.contiguous()
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                kwargs = {}
+                if self.dcp_size > 1:
+                    kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    **kwargs,
                 )
 
         # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        with use_symmetric_memory(get_dcp_group()):
+            o, s = decode_wrapper.forward_return_lse(
+                q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        if self.dcp_size > 1:
+            o = cp_lse_ag_out_rs(o, s, get_dcp_group())
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -984,6 +1055,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        dcp_size: Optional[int] = None,
+        dcp_rank: Optional[int] = None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -997,6 +1070,8 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
 
     def update_sliding_window(
@@ -1099,9 +1174,18 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        dcp_size: Optional[int] = None,
+        dcp_rank: Optional[int] = None,
     ):
+        if dcp_size is None:
+            dcp_size = 1
+            dcp_rank = 0
         if spec_info is None:
             bs = len(req_pool_indices)
+            if dcp_size > 1:
+                paged_kernel_lens = paged_kernel_lens // dcp_size + (
+                    dcp_rank < paged_kernel_lens % dcp_size
+                )
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
@@ -1113,15 +1197,28 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+            if dcp_size > 1:
+                create_flashinfer_kv_indices_for_dcp_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+            else:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -1140,7 +1237,17 @@ class FlashInferIndicesUpdaterDecode:
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
-            global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
+            if dcp_size > 1:
+                dcp_seq_lens_cpu = seq_lens_cpu // dcp_size + (
+                    dcp_rank < seq_lens_cpu % dcp_size
+                )
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    dcp_seq_lens_cpu, dim=0
+                )
+            else:
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    seq_lens_cpu, dim=0
+                )
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
@@ -1155,7 +1262,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads,
+                self.num_qo_heads * dcp_size,
                 self.num_kv_heads,
                 self.head_dim,
                 1,
@@ -1174,7 +1281,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads,
+                self.num_qo_heads * dcp_size,
                 self.num_kv_heads,
                 self.head_dim,
                 1,
@@ -1251,6 +1358,8 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        dcp_size: Optional[int] = None,
+        dcp_rank: Optional[int] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1276,6 +1385,8 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
 
     def update_sliding_window(
@@ -1386,7 +1497,18 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        dcp_size: Optional[int] = None,
+        dcp_rank: Optional[int] = None,
     ):
+        if dcp_size is not None and dcp_size > 1:
+            assert use_ragged, "dcp only supports ragged wrapper"
+            paged_kernel_lens = paged_kernel_lens // dcp_size + (
+                dcp_rank < paged_kernel_lens % dcp_size
+            )
+        else:
+            dcp_size = 1
+            dcp_rank = 0
+
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
@@ -1398,15 +1520,28 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+            if dcp_size > 1:
+                create_flashinfer_kv_indices_for_dcp_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+            else:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
@@ -1463,7 +1598,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
-            self.num_qo_heads,
+            self.num_qo_heads * dcp_size,
             self.num_kv_heads,
             self.head_dim,
             1,

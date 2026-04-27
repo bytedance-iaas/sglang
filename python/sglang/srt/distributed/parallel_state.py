@@ -1775,6 +1775,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -1945,31 +1946,30 @@ def initialize_model_parallel(
             group_name="attention_tp",
         )
     # build decode context parallel groups
-    decode_context_model_parallel_size = get_dcp_size_from_env()
-    if decode_context_model_parallel_size > 1:
+    if decode_context_parallel_size > 1:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
-                f"DCP enabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+                f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
     else:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
-                f"DCP disabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
     assert (
-        tensor_model_parallel_size % decode_context_model_parallel_size == 0
-    ), f"{tensor_model_parallel_size} must be divisible by decode_context_model_parallel_size"
-    num_decode_context_model_parallel_groups: int = (
-        world_size // decode_context_model_parallel_size
+        tensor_model_parallel_size % decode_context_parallel_size == 0
+    ), f"{tensor_model_parallel_size} must be divisible by decode_context_parallel_size"
+    num_decode_context_parallel_groups: int = (
+        world_size // decode_context_parallel_size
     )
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
     group_ranks = []
-    for i in range(num_decode_context_model_parallel_groups):
+    for i in range(num_decode_context_parallel_groups):
         ranks = list(
             range(
-                i * decode_context_model_parallel_size,
-                (i + 1) * decode_context_model_parallel_size,
+                i * decode_context_parallel_size,
+                (i + 1) * decode_context_parallel_size,
             )
         )
         group_ranks.append(ranks)
@@ -2141,6 +2141,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -2150,10 +2151,11 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size,
-            expert_model_parallel_size,
-            pipeline_model_parallel_size,
-            backend,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            decode_context_parallel_size=decode_context_parallel_size,
+            backend=backend,
         )
         return
 
@@ -2171,8 +2173,8 @@ def ensure_model_parallel_initialized(
 
     dcp_world_size = get_dcp_group().world_size
     assert (
-        dcp_world_size == get_dcp_size_from_env()
-    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+        dcp_world_size == decode_context_parallel_size
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
 
 
 def model_parallel_is_initialized():

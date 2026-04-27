@@ -137,6 +137,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
+    dcp_kv_mask: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -162,6 +163,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         dtype: torch.dtype,
         dp_size: int,
         pp_size: int,
+        dcp_size: int,
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
         seq_len_fill_value: int,
@@ -177,6 +179,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            dcp_kv_mask = (
+                torch.zeros((max_num_token,), dtype=torch.bool)
+                if dcp_size > 1
+                else None
+            )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -248,6 +255,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            dcp_kv_mask=dcp_kv_mask,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -279,6 +287,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            if self.dcp_kv_mask is not None:
+                self.dcp_kv_mask.fill_(False)
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -299,6 +309,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.out_cache_loc,
             forward_batch.positions,
         ]
+
+        if self.dcp_kv_mask is not None and forward_batch.dcp_kv_mask is not None:
+            dsts.append(self.dcp_kv_mask[:raw_num_token])
+            srcs.append(forward_batch.dcp_kv_mask)
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -549,6 +563,7 @@ class CudaGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
+        self.dcp_size = model_runner.server_args.dcp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
@@ -647,6 +662,7 @@ class CudaGraphRunner:
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
+            dcp_size=self.dcp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
@@ -933,6 +949,11 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
+        if self.dcp_size > 1:
+            dcp_kv_mask = buffers.dcp_kv_mask[:num_tokens]
+        else:
+            dcp_kv_mask = None
+
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -1030,6 +1051,7 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph

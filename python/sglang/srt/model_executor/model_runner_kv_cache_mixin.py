@@ -638,6 +638,9 @@ class ModelRunnerKVCacheMixin:
                         )
                     elif self.page_size == 1:
                         if get_dcp_world_size() > 1:
+                            # Under DCP, allocator capacity is tracked in logical-token units.
+                            # Expand max_total_num_tokens here once so later scheduler/runtime
+                            # accounting can use the same DCP-expanded capacity directly.
                             self.max_total_num_tokens *= get_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
@@ -659,6 +662,8 @@ class ModelRunnerKVCacheMixin:
                             )
                     else:
                         if get_dcp_world_size() > 1:
+                            # Same as the page_size == 1 path above: convert to DCP logical
+                            # token capacity before constructing the DCP allocator.
                             self.max_total_num_tokens *= get_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,

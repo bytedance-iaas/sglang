@@ -270,6 +270,72 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+def test_parallel_group_construction_dcp_uses_argument_not_env():
+    """Verify DCP group construction uses the function argument instead of env fallback."""
+    world_size = 8
+
+    with patch.object(parallel_state, "_WORLD", None), patch.object(
+        parallel_state, "_TP", None
+    ), patch.object(parallel_state, "_ATTN_CP", None), patch.object(
+        parallel_state, "_ATTN_TP", None
+    ), patch.object(
+        parallel_state, "_DCP", None
+    ), patch.object(
+        parallel_state, "_PP", None
+    ), patch.object(
+        parallel_state, "_MOE_DP", None
+    ), patch.object(
+        parallel_state, "_MOE_EP", None
+    ), patch.object(
+        parallel_state, "_MOE_TP", None
+    ), patch(
+        "torch.distributed.is_initialized", return_value=True
+    ), patch(
+        "torch.distributed.get_world_size", return_value=world_size
+    ), patch(
+        "torch.distributed.get_rank", return_value=0
+    ), patch(
+        "torch.distributed.get_backend", return_value="nccl"
+    ):
+        created_groups = {}
+
+        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+            group_name = kwargs.get("group_name", "unknown")
+            created_groups[group_name] = group_ranks
+
+            mock_group = Mock()
+            mock_group.device_group = Mock()
+            mock_group.world_size = len(group_ranks[0]) if group_ranks else 1
+            return mock_group
+
+        with patch.object(
+            parallel_state,
+            "init_model_parallel_group",
+            side_effect=mock_init_model_parallel_group,
+        ), patch.object(parallel_state, "get_world_group") as mock_world_group, patch.object(
+            parallel_state,
+            "get_dcp_size_from_env",
+            side_effect=AssertionError(
+                "initialize_model_parallel should not read DCP size from env"
+            ),
+        ):
+            mock_world = Mock()
+            mock_world.device_group = Mock()
+            mock_world.local_rank = 0
+            mock_world_group.return_value = mock_world
+
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=8,
+                pipeline_model_parallel_size=1,
+                decode_context_parallel_size=4,
+            )
+
+            dcp_groups = created_groups.get("dcp", [])
+            assert dcp_groups == [[0, 1, 2, 3], [4, 5, 6, 7]], dcp_groups
+
+            parallel_state.destroy_model_parallel()
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys

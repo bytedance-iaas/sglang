@@ -355,6 +355,7 @@ class Scheduler(
         self.moe_dp_size = server_args.moe_dp_size
         self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
+        self.dcp_size = server_args.dcp_size
         self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
@@ -751,8 +752,11 @@ class Scheduler(
             avail_mem = get_available_gpu_memory(
                 self.device, self.gpu_id, empty_cache=False
             )
+            # max_total_num_tokens is already DCP-expanded during KV-pool init, so the
+            # value printed here is the scheduler's logical token capacity directly.
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"{f'dcp_size={self.dcp_size}, ' if self.dcp_size > 1 else ''}"
                 f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
@@ -811,7 +815,7 @@ class Scheduler(
             disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            page_size=self.page_size,
+            page_size=self.page_size * self.dcp_size,
             is_eagle=self.spec_algorithm.is_eagle(),
             tp_cache_group=(
                 self.attn_tp_cpu_group
@@ -2505,7 +2509,7 @@ class Scheduler(
 
         # Prefill policy
         adder = PrefillAdder(
-            self.page_size,
+            self.page_size * self.dcp_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
