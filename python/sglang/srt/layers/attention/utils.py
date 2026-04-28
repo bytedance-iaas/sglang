@@ -1653,16 +1653,24 @@ def cp_lse_ag_out_rs(
     )
     if return_lse:
         # We need rank-local (out, lse) pairs aligned on the same head slice.
-        # `reduce_scatter` is enough for `out` alone, but this PR-14982 path also
-        # returns the matching `lse`, so we materialize the full corrected output
-        # with `all_reduce` and then slice both tensors by rank in the same way.
+        # `correct_attn_out` writes into `new_output` whose layout is the
+        # transpose of `cp_attn_out`: shape [H, B, D]. We therefore
+        # all-reduce in that layout and then transpose back to [B, H, D]
+        # before slicing heads, otherwise we end up slicing the batch
+        # (token) dimension by accident.
         out = cp_group.all_reduce(out)
+        out = out.transpose(0, 1).contiguous()
         cp_num_heads = lse.shape[1] // cp_group.world_size
         cp_rank = cp_group.rank_in_group
         out = out[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1), :]
         lse = lse[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1)]
         return out, lse
+    # Non-return_lse path (decode): `out` is [H, B, D] after correct_attn_out.
+    # Reduce-scatter along the head dim gives [H_local, B, D], which we then
+    # transpose back to [B, H_local, D] so downstream `view(-1, H_local*D)`
+    # produces the correct layout.
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
+    out = out.transpose(0, 1).contiguous()
     return out
 
 

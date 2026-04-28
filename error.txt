@@ -1,0 +1,290 @@
+[2026-04-27 11:25:13 TP5] Pre-allocating symmetric memory pool with 4 GiB
+[2026-04-27 11:25:14 TP0] max_total_num_tokens=1075134, dcp_size=2, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=2048, context_len=262144, available_gpu_mem=2.05 GB
+[2026-04-27 11:25:14] INFO:     Started server process [345214]
+[2026-04-27 11:25:14] INFO:     Waiting for application startup.
+[2026-04-27 11:25:14] Using default chat sampling params from model generation config: {'temperature': 0.7, 'top_k': 20, 'top_p': 0.8}
+[2026-04-27 11:25:15] INFO:     Application startup complete.
+[2026-04-27 11:25:15] INFO:     Uvicorn running on http://127.0.0.1:30000 (Press CTRL+C to quit)
+[2026-04-27 11:25:16] INFO:     127.0.0.1:40110 - "GET /model_info HTTP/1.1" 200 OK
+[2026-04-27 11:25:17 TP0] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 0.07
+[2026-04-27 11:25:17] INFO:     127.0.0.1:40116 - "POST /generate HTTP/1.1" 200 OK
+[2026-04-27 11:25:17] The server is fired up and ready to roll!
+[2026-04-27 11:29:46] Endpoint '/get_model_info' is deprecated and will be removed in a future version. Please use '/model_info' instead.
+[2026-04-27 11:29:46] INFO:     127.0.0.1:53000 - "GET /get_model_info HTTP/1.1" 200 OK
+[2026-04-27 11:29:46 TP0] Prefill batch, #new-seq: 1, #new-token: 790, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 2.94
+[2026-04-27 11:29:46] INFO:     127.0.0.1:53002 - "POST /generate HTTP/1.1" 200 OK
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=0 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=1 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=1 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=0 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=0 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=1 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=0 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[DCP-DIAG merge_state] layer=0 forward_mode=1 dcp_size=2 dcp_rank=1 q.shape=(69, 2048) o1.shape=(69, 8, 128) s1.shape=(69, 8) o2.shape=(16, 8, 128) s2.shape=(69, 8) tp_q_head_num=8 head_dim=128
+[2026-04-27 11:29:47 TP2] Scheduler hit an exception: Traceback (most recent call last):
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 3816, in run_scheduler_process
+    scheduler.run_event_loop()
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 1403, in run_event_loop
+    dispatch_event_loop(self)
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 3686, in dispatch_event_loop
+    scheduler.event_loop_overlap()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 1464, in event_loop_overlap
+    batch_result = self.run_batch(batch)
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 2826, in run_batch
+    batch_result = self.model_worker.forward_batch_generation(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/tp_worker.py", line 468, in forward_batch_generation
+    out = self.model_runner.forward(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 2920, in forward
+    output = self._forward_raw(
+             ^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 3036, in _forward_raw
+    ret, can_run_graph = self.forward_extend(
+                         ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 2857, in forward_extend
+    self.model.forward(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 997, in forward
+    hidden_states = self.model(
+                    ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen2_moe.py", line 803, in forward
+    hidden_states, residual = layer(
+                              ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 818, in forward
+    hidden_states = self.self_attn(
+                    ^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 707, in forward
+    return self.forward_core(s)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 686, in forward_core
+    attn_output = self.attn(
+                  ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/radix_attention.py", line 127, in forward
+    return forward_batch.attn_backend.forward(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/attention/base_attn_backend.py", line 115, in forward
+    return self.forward_extend(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/attention/flashinfer_backend.py", line 915, in forward_extend
+    o, _ = merge_state(o1, s1, o2, s2)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.local/lib/python3.12/site-packages/flashinfer/cascade.py", line 88, in merge_state
+    get_cascade_module().merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
+  File "python/tvm_ffi/cython/function.pxi", line 929, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_merge_state
+  File "<unknown>", line 0, in merge_state(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView)
+  File "/root/.local/lib/python3.12/site-packages/flashinfer/data/csrc/tvm_ffi_utils.h", line 253, in void check_shape(const tvm::ffi::TensorView&, const tvm::ffi::TensorView&, const char*, const char*)
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+
+RuntimeError: Check failed: a.size(i) == b.size(i) (69 vs. 16) : v_a.size(0) and v_b.size(0) mismatch
+
+[2026-04-27 11:29:47 TP3] Scheduler hit an exception: Traceback (most recent call last):
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 3816, in run_scheduler_process
+    scheduler.run_event_loop()
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 1403, in run_event_loop
+    dispatch_event_loop(self)
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 3686, in dispatch_event_loop
+    scheduler.event_loop_overlap()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 1464, in event_loop_overlap
+    batch_result = self.run_batch(batch)
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 2826, in run_batch
+    batch_result = self.model_worker.forward_batch_generation(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/tp_worker.py", line 468, in forward_batch_generation
+    out = self.model_runner.forward(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 2920, in forward
+    output = self._forward_raw(
+             ^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 3036, in _forward_raw
+    ret, can_run_graph = self.forward_extend(
+                         ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 2857, in forward_extend
+    self.model.forward(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 997, in forward
+    hidden_states = self.model(
+                    ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen2_moe.py", line 803, in forward
+    hidden_states, residual = layer(
+                              ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 818, in forward
+    hidden_states = self.self_attn(
+                    ^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 707, in forward
+    return self.forward_core(s)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 686, in forward_core
+    attn_output = self.attn(
+                  ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/radix_attention.py", line 127, in forward
+    return forward_batch.attn_backend.forward(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/attention/base_attn_backend.py", line 115, in forward
+    return self.forward_extend(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/attention/flashinfer_backend.py", line 915, in forward_extend
+    o, _ = merge_state(o1, s1, o2, s2)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.local/lib/python3.12/site-packages/flashinfer/cascade.py", line 88, in merge_state
+    get_cascade_module().merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
+  File "python/tvm_ffi/cython/function.pxi", line 929, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_merge_state
+  File "<unknown>", line 0, in merge_state(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView)
+  File "/root/.local/lib/python3.12/site-packages/flashinfer/data/csrc/tvm_ffi_utils.h", line 253, in void check_shape(const tvm::ffi::TensorView&, const tvm::ffi::TensorView&, const char*, const char*)
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+
+RuntimeError: Check failed: a.size(i) == b.size(i) (69 vs. 16) : v_a.size(0) and v_b.size(0) mismatch
+
+[2026-04-27 11:29:47] SIGQUIT received. signum=None, frame=None. It usually means one child failed.
+[2026-04-27 11:29:47 TP4] Scheduler hit an exception: Traceback (most recent call last):
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 3816, in run_scheduler_process
+    scheduler.run_event_loop()
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 1403, in run_event_loop
+    dispatch_event_loop(self)
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 3686, in dispatch_event_loop
+    scheduler.event_loop_overlap()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 1464, in event_loop_overlap
+    batch_result = self.run_batch(batch)
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/scheduler.py", line 2826, in run_batch
+    batch_result = self.model_worker.forward_batch_generation(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/managers/tp_worker.py", line 468, in forward_batch_generation
+    out = self.model_runner.forward(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 2920, in forward
+    output = self._forward_raw(
+             ^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 3036, in _forward_raw
+    ret, can_run_graph = self.forward_extend(
+                         ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/model_executor/model_runner.py", line 2857, in forward_extend
+    self.model.forward(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 997, in forward
+    hidden_states = self.model(
+                    ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen2_moe.py", line 803, in forward
+    hidden_states, residual = layer(
+                              ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 818, in forward
+    hidden_states = self.self_attn(
+                    ^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 707, in forward
+    return self.forward_core(s)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/models/qwen3_moe.py", line 686, in forward_core
+    attn_output = self.attn(
+                  ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/radix_attention.py", line 127, in forward
+    return forward_batch.attn_backend.forward(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/attention/base_attn_backend.py", line 115, in forward
+    return self.forward_extend(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang_minimax_new/python/sglang/srt/layers/attention/flashinfer_backend.py", line 915, in forward_extend
+    o, _ = merge_state(o1, s1, o2, s2)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.local/lib/python3.12/site-packages/flashinfer/cascade.py", line 88, in merge_state
+    get_cascade_module().merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
+  File "python/tvm_ffi/cython/function.pxi", line 929, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_merge_state
+  File "<unknown>", line 0, in merge_state(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView)
+  File "/root/.local/lib/python3.12/site-packages/flashinfer/data/csrc/tvm_ffi_utils.h", line 253, in void check_shape(const tvm::ffi::TensorView&, const tvm::ffi::TensorView&, const char*, const char*)
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+
+RuntimeError: Check failed: a.size(i) == b.size(i) (69 vs. 16) : v_a.size(0) and v_b.size(0) mismatch
+
+Killed
+
