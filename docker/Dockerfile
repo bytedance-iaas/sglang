@@ -198,6 +198,7 @@ ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG INSTALL_FLASHINFER_JIT_CACHE
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
 ARG FLASHINFER_VERSION
 ARG GRACE_BLACKWELL
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH
@@ -232,7 +233,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+    && if [ "$INSTALL_LOCAL_SGL_KERNEL_WHEEL" = "1" ]; then \
+        python3 -m pip install /sgl-workspace/sglang/.ci-artifacts/sgl-kernel/*.whl --force-reinstall --no-deps \
+    ; \
+    elif [ "$CUDA_VERSION" = "12.6.1" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
