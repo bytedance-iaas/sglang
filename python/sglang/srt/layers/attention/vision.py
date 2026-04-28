@@ -505,6 +505,11 @@ class VisionFlash3Attention(nn.Module):
             scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
             scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
             scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
+            attn_softmax_scale = (
+                softmax_scale if softmax_scale is not None else ori_headsize**-0.5
+            )
+        else:
+            attn_softmax_scale = softmax_scale
 
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
@@ -520,6 +525,7 @@ class VisionFlash3Attention(nn.Module):
                     q_descale=scale_q,
                     k_descale=scale_k,
                     v_descale=scale_v,
+                    softmax_scale=attn_softmax_scale,
                 )
                 ret = output[:, :, :ori_headsize]
             else:
@@ -531,6 +537,7 @@ class VisionFlash3Attention(nn.Module):
                     cu_seqlens_k=cu_seqlens[0],
                     max_seqlen_q=max_seqlen,
                     max_seqlen_k=max_seqlen,
+                    softmax_scale=attn_softmax_scale,
                 )
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
@@ -550,6 +557,7 @@ class VisionFlash3Attention(nn.Module):
                     q_descale=scale_q,
                     k_descale=scale_k,
                     v_descale=scale_v,
+                    softmax_scale=attn_softmax_scale,
                 )
                 ret = output[:, :, :ori_headsize]
             else:
@@ -561,6 +569,7 @@ class VisionFlash3Attention(nn.Module):
                     cu_seqlens_k=cu_seqlens,
                     max_seqlen_q=max_seqlen,
                     max_seqlen_k=max_seqlen,
+                    softmax_scale=attn_softmax_scale,
                 )
         return ret
 

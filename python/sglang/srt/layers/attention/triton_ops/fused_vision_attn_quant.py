@@ -1,34 +1,6 @@
-import json
-import os
-
 import torch
 import triton
 import triton.language as tl
-
-# Update the persistent config file name, add _tma suffix
-CONFIG_FILE = "/tmp/fused_vision_attn_quant_configs_tma.json"
-
-
-def load_configs():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-
-def save_configs(configs):
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(configs, f)
-    except:
-        pass
-
-
-# Global configuration cache
-_CONFIG_CACHE = load_configs()
 
 
 @triton.autotune(
@@ -197,78 +169,26 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     kp_2d = kp.view(-1, aligned_N)
     vp_2d = vp.view(-1, aligned_N)
 
-    cache_key = f"{M}_{N}"
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(aligned_N, META["BLOCK_SIZE_N"]),
+    )
 
-    # 2. Persistence cache check
-    if cache_key in _CONFIG_CACHE:
-        best_config = _CONFIG_CACHE[cache_key]
-        BLOCK_SIZE_M = best_config["BLOCK_SIZE_M"]
-        BLOCK_SIZE_N = best_config["BLOCK_SIZE_N"]
-        num_warps = best_config["num_warps"]
-        num_stages = best_config.get("num_stages", 2)
-
-        # print(f"[Triton Persistence] Hit TMA Cache for {cache_key}: {best_config}", flush=True)
-
-        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(aligned_N, BLOCK_SIZE_N))
-
-        fused_qkv_quant_pad_tma_kernel.fn[grid](
-            q_2d,
-            k_2d,
-            v_2d,
-            qp_2d,
-            kp_2d,
-            vp_2d,
-            sq,
-            sk,
-            sv,
-            M,
-            N,
-            aligned_N,
-            q_2d.stride(0),
-            q_2d.stride(1),
-            qp_2d.stride(0),
-            qp_2d.stride(1),
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    else:
-        # 3. Tuning
-        grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]),
-            triton.cdiv(aligned_N, META["BLOCK_SIZE_N"]),
-        )
-
-        fused_qkv_quant_pad_tma_kernel[grid](
-            q_2d,
-            k_2d,
-            v_2d,
-            qp_2d,
-            kp_2d,
-            vp_2d,
-            sq,
-            sk,
-            sv,
-            M,
-            N,
-            aligned_N,
-            q_2d.stride(0),
-            q_2d.stride(1),
-            qp_2d.stride(0),
-            qp_2d.stride(1),
-        )
-
-        # 4. Save the best configuration
-        best_config_obj = fused_qkv_quant_pad_tma_kernel.best_config
-        _CONFIG_CACHE[cache_key] = {
-            "BLOCK_SIZE_M": best_config_obj.kwargs["BLOCK_SIZE_M"],
-            "BLOCK_SIZE_N": best_config_obj.kwargs["BLOCK_SIZE_N"],
-            "num_warps": best_config_obj.num_warps,
-            "num_stages": best_config_obj.num_stages,
-        }
-        print(
-            f"[Triton TMA Tuning] {cache_key} tuned: {_CONFIG_CACHE[cache_key]}",
-            flush=True,
-        )
-        save_configs(_CONFIG_CACHE)
+    fused_qkv_quant_pad_tma_kernel[grid](
+        q_2d,
+        k_2d,
+        v_2d,
+        qp_2d,
+        kp_2d,
+        vp_2d,
+        sq,
+        sk,
+        sv,
+        M,
+        N,
+        aligned_N,
+        q_2d.stride(0),
+        q_2d.stride(1),
+        qp_2d.stride(0),
+        qp_2d.stride(1),
+    )
