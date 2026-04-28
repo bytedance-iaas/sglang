@@ -306,38 +306,96 @@ def _masked_fp4_quant_kernel(
         tl.store(scale_ptr + sf_off + sk, sf_e4m3, mask=sk_mask)
 
 
+@triton.jit
+def _fused_masked_silu_mul_fp4_quant_kernel(
+    gateup_ptr,   # (G*m, N) bf16 — gate in [0, N/2), up in [N/2, N)
+    packed_ptr,   # (G*m, N/4) uint8
+    scale_ptr,    # (G*m, N/2/GROUP_SIZE) float8_e4m3fn
+    masked_m_ptr, # (G,) int32
+    m,            # rows per group
+    N,            # gateup width (2 * output_dim)
+    HALF_N,       # N // 2 (output dim)
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_GRP: tl.constexpr,     # == BLOCK_K // GROUP_SIZE
+    HALF_BK: tl.constexpr,     # == BLOCK_K // 2
+):
+    pid = tl.program_id(0)
+    g = pid // m
+    row = pid % m
+    active = tl.load(masked_m_ptr + g)
+    if row >= active:
+        return
+
+    row_off = pid.to(tl.int64) * N
+    pack_off = pid.to(tl.int64) * (HALF_N // 2)
+    sf_off = pid.to(tl.int64) * (HALF_N // GROUP_SIZE)
+
+    E2M1_MAX: tl.constexpr = 6.0
+
+    for start in tl.range(0, HALF_N, BLOCK_K):
+        k = start + tl.arange(0, BLOCK_K)
+        mask = k < HALF_N
+
+        gate = tl.load(gateup_ptr + row_off + k, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gateup_ptr + row_off + HALF_N + k, mask=mask, other=0.0).to(tl.float32)
+        vals = gate * tl.sigmoid(gate) * up
+
+        vals_g = tl.reshape(vals, [NUM_GRP, GROUP_SIZE])
+        amax = tl.max(tl.abs(vals_g), axis=1)
+        amax = tl.maximum(amax, 1e-4)
+        sf_f32 = amax / E2M1_MAX
+        sf_e4m3 = sf_f32.to(tl.float8e4nv)
+        sf_dec = tl.maximum(sf_e4m3.to(tl.float32), 1e-12)
+
+        scaled = vals_g / sf_dec[:, None]
+        ax = tl.minimum(tl.abs(scaled), E2M1_MAX)
+
+        codes = tl.zeros([NUM_GRP, GROUP_SIZE], dtype=tl.uint8)
+        codes = tl.where(ax >= 0.25, codes + 1, codes)
+        codes = tl.where(ax >= 0.75, codes + 1, codes)
+        codes = tl.where(ax >= 1.25, codes + 1, codes)
+        codes = tl.where(ax >= 1.75, codes + 1, codes)
+        codes = tl.where(ax >= 2.5, codes + 1, codes)
+        codes = tl.where(ax >= 3.5, codes + 1, codes)
+        codes = tl.where(ax >= 5.0, codes + 1, codes)
+
+        neg = scaled < 0
+        sign = tl.where(neg, tl.full([NUM_GRP, GROUP_SIZE], 8, dtype=tl.uint8),
+                        tl.zeros([NUM_GRP, GROUP_SIZE], dtype=tl.uint8))
+        sign = tl.where(codes == 0, tl.zeros([NUM_GRP, GROUP_SIZE], dtype=tl.uint8), sign)
+        codes = codes | sign
+        codes_flat = tl.reshape(codes, [BLOCK_K])
+
+        codes_pairs = tl.reshape(codes_flat, [HALF_BK, 2])
+        weights = tl.where(tl.arange(0, 2) == 0, 1, 16).to(tl.int32)
+        packed = tl.sum(codes_pairs.to(tl.int32) * weights[None, :], axis=1).to(tl.uint8)
+
+        pk = start // 2 + tl.arange(0, HALF_BK)
+        pk_mask = pk < (HALF_N // 2)
+        tl.store(packed_ptr + pack_off + pk, packed, mask=pk_mask)
+
+        sk = start // GROUP_SIZE + tl.arange(0, NUM_GRP)
+        sk_mask = sk < (HALF_N // GROUP_SIZE)
+        tl.store(scale_ptr + sf_off + sk, sf_e4m3, mask=sk_mask)
+
+
 def _silu_mul_and_fp4_quant_masked(
     gateup_output: torch.Tensor,
     masked_m: torch.Tensor,
     group_size: int = _NVFP4_GROUP_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Masked SiLU-and-Mul + NVFP4 quantization, skipping inactive expert groups.
+    """Fused masked SiLU-and-Mul + NVFP4 quantization in a single kernel.
 
-    Processes only rows where masked_m[g] > 0, avoiding memory traffic for the
-    vast majority of padding rows (critical for decode where ~10 of 512 groups
-    are active).
+    Reads the gateup BF16 output once, applies SiLU*Up, quantizes to FP4,
+    and writes packed uint8 + E4M3 scales — no intermediate BF16 buffer.
+    Skips inactive expert groups (masked_m[g] == 0).
     """
     num_groups, m, n = gateup_output.shape
     half_n = n // 2
     k_packed = half_n // 2
     sf_k = half_n // group_size
     device = gateup_output.device
-
-    down_in_bf16 = torch.empty(
-        (num_groups * m, half_n),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-
-    _masked_silu_and_mul_kernel[(num_groups * m,)](
-        gateup_output.view(-1, n),
-        down_in_bf16,
-        masked_m,
-        m,
-        n,
-        half_n,
-        BLOCK_K=1024,
-    )
 
     packed_out = torch.empty(
         (num_groups, m, k_packed),
@@ -354,12 +412,13 @@ def _silu_mul_and_fp4_quant_masked(
     assert block_k % group_size == 0
     assert block_k % 2 == 0
 
-    _masked_fp4_quant_kernel[(num_groups * m,)](
-        down_in_bf16,
+    _fused_masked_silu_mul_fp4_quant_kernel[(num_groups * m,)](
+        gateup_output.view(-1, n),
         packed_out.view(-1, k_packed),
         scale_out.view(-1, sf_k),
         masked_m,
         m,
+        n,
         half_n,
         GROUP_SIZE=group_size,
         BLOCK_K=block_k,
