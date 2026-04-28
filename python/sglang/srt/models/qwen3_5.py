@@ -1061,6 +1061,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and input_deepstack_embeds.numel() > 0
                 and layer_idx < 3
             ):
+                print("deepstack") 
                 sep = self.hidden_size * layer_idx
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
