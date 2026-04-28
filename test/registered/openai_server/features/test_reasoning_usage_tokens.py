@@ -20,6 +20,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    has_hf_cache_entry,
     popen_launch_server,
 )
 
@@ -41,6 +42,15 @@ class ReasoningTokenUsageMixin:
     def setUpClass(cls):
         for k, v in cls.extra_env_vars.items():
             os.environ[k] = v
+
+        if "--speculative-draft-model-path" in cls.extra_server_args:
+            draft_model = cls.extra_server_args[
+                cls.extra_server_args.index("--speculative-draft-model-path") + 1
+            ]
+            if not has_hf_cache_entry(draft_model):
+                raise unittest.SkipTest(
+                    f"Speculative draft model cache missing: {draft_model}"
+                )
 
         assert cls.model
         cls.base_url = DEFAULT_URL_FOR_TEST

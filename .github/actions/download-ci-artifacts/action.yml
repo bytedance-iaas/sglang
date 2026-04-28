@@ -1,0 +1,53 @@
+name: Download CI Artifacts
+description: Download current-run artifacts without depending on actions/download-artifact.
+
+inputs:
+  path:
+    description: Directory to place downloaded artifact files.
+    required: true
+  pattern:
+    description: Artifact name pattern.
+    required: true
+  github-token:
+    description: GitHub token for API calls.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download artifacts
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_PATTERN: ${{ inputs.pattern }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+      run: |
+        set -euo pipefail
+
+        tmp_dir="$(mktemp -d)"
+        cleanup() {
+          rm -rf "$tmp_dir"
+        }
+        trap cleanup EXIT
+
+        mkdir -p "$INPUT_PATH"
+        gh run download "$GITHUB_RUN_ID" \
+          --repo "$GITHUB_REPOSITORY" \
+          --pattern "$INPUT_PATTERN" \
+          --dir "$tmp_dir"
+
+        found=0
+        while IFS= read -r file; do
+          found=1
+          mv -f "$file" "$INPUT_PATH/"
+        done < <(find "$tmp_dir" -type f)
+
+        if [[ "$found" -ne 1 ]]; then
+          echo "::error::No files were downloaded for artifact pattern '$INPUT_PATTERN'"
+          exit 1
+        fi
+
+        find "$INPUT_PATH" -maxdepth 1 -type f -printf 'Downloaded artifact file: %f\n'

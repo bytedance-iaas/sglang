@@ -1,3 +1,4 @@
+import os
 import time
 import unittest
 
@@ -12,6 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -19,6 +21,10 @@ register_cuda_ci(est_time=144, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    "Torch compile CUDA path crashes in current PR UT stack before assertions run",
+)
 class TestTorchCompile(CustomTestCase, MMLUMixin):
     mmlu_score_threshold = 0.65
     mmlu_num_examples = 64

@@ -549,6 +549,36 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
+def has_hf_cache_entry(
+    repo_id: str, repo_type: str = "model", require_weight: bool = False
+) -> bool:
+    """Return whether a Hugging Face repo exists in the configured local cache."""
+    cache_roots = [
+        os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        os.environ.get("HF_HUB_CACHE"),
+        os.environ.get("HF_HOME"),
+    ]
+    prefix = "datasets--" if repo_type == "dataset" else "models--"
+
+    for cache_root in dict.fromkeys(root for root in cache_roots if root):
+        repo_cache = os.path.join(cache_root, prefix + repo_id.replace("/", "--"))
+        if not os.path.isdir(repo_cache):
+            continue
+        if repo_type != "model" or not require_weight:
+            return True
+
+        snapshot_root = os.path.join(repo_cache, "snapshots")
+        if not os.path.isdir(snapshot_root):
+            return False
+        weight_suffixes = (".safetensors", ".bin", ".pt")
+        for root, _, files in os.walk(snapshot_root):
+            if any(filename.endswith(weight_suffixes) for filename in files):
+                return True
+        return False
+
+    return False
+
+
 def popen_with_error_check(command: list[str]):
     process = subprocess.Popen(command, stdout=None, stderr=None)
 

@@ -43,6 +43,28 @@ mark_step_done() {
     _CI_MARK_PREV=${now}
 }
 
+retry_eval() {
+    local label="$1"
+    local cmd="$2"
+    local max_attempts="${3:-3}"
+    local attempt=1
+
+    while [ "${attempt}" -le "${max_attempts}" ]; do
+        echo "Attempt ${attempt}/${max_attempts}: ${label}"
+        if eval "${cmd}"; then
+            return 0
+        fi
+        if [ "${attempt}" -ge "${max_attempts}" ]; then
+            break
+        fi
+        sleep $((attempt * 5))
+        attempt=$((attempt + 1))
+    done
+
+    echo "ERROR: ${label} failed after ${max_attempts} attempts"
+    return 1
+}
+
 mark_step_done "Configuration"
 
 # ------------------------------------------------------------------------------
@@ -108,24 +130,66 @@ mark_step_done "Kill existing processes"
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
 # Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
-apt-get update || true
+APT_GET_OPTS=(
+    -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+    -o Acquire::ForceIPv4=true
+)
 CI_APT_PACKAGES=(
     python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
     libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
-    ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    ffmpeg
 )
-apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-    echo "Warning: apt-get install failed, checking if required packages are available..."
+
+if [[ ",${OPTIONAL_DEPS}," == *",diffusion,"* ]]; then
+    CI_APT_PACKAGES+=(
+        libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    )
+fi
+all_ci_apt_packages_installed() {
+    local pkg
     for pkg in "${CI_APT_PACKAGES[@]}"; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-            echo "ERROR: Required package $pkg is not installed and apt-get failed"
-            exit 1
+            return 1
         fi
     done
-    echo "All required packages are already installed, continuing..."
+    return 0
 }
 
-mark_step_done "Install apt packages"
+if all_ci_apt_packages_installed; then
+    echo "All required apt packages already installed, skipping apt-get update/install"
+    mark_step_done "Install apt packages"
+else
+    apt_install_attempt=1
+    apt_install_max_attempts=3
+    apt_install_succeeded=0
+    while [ "${apt_install_attempt}" -le "${apt_install_max_attempts}" ]; do
+        if apt-get "${APT_GET_OPTS[@]}" install -y --no-install-recommends --fix-missing "${CI_APT_PACKAGES[@]}"; then
+            apt_install_succeeded=1
+            break
+        fi
+        if [ "${apt_install_attempt}" -ge "${apt_install_max_attempts}" ]; then
+            break
+        fi
+        echo "Warning: apt-get install attempt ${apt_install_attempt}/${apt_install_max_attempts} failed, refreshing apt metadata before retry..."
+        apt-get "${APT_GET_OPTS[@]}" update || true
+        sleep $((apt_install_attempt * 5))
+        apt_install_attempt=$((apt_install_attempt + 1))
+    done
+    if [ "${apt_install_succeeded}" -ne 1 ]; then
+        echo "Warning: apt-get install failed, checking if required packages are available..."
+        for pkg in "${CI_APT_PACKAGES[@]}"; do
+            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                echo "ERROR: Required package $pkg is not installed and apt-get failed"
+                exit 1
+            fi
+        done
+        echo "All required packages are already installed, continuing..."
+    fi
+
+    mark_step_done "Install apt packages"
+fi
 
 # ------------------------------------------------------------------------------
 # Python package site hygiene & install protoc
@@ -224,7 +288,11 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 source "$(dirname "$0")/cache_nvidia_wheels.sh"
-$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+MAIN_INSTALL_CMD="$PIP_CMD install -e \"python[${EXTRAS}]\" $PIP_INSTALL_SUFFIX"
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    MAIN_INSTALL_CMD="$MAIN_INSTALL_CMD --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}"
+fi
+retry_eval "Install main package" "$MAIN_INSTALL_CMD"
 
 mark_step_done "Install main package"
 
@@ -309,7 +377,7 @@ $PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy s
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
-    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    retry_eval "Clone lmms-eval" "rm -rf lmms-eval && git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git" 5
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 fi
 $PIP_CMD uninstall xformers || true
@@ -332,7 +400,9 @@ if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
     TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     echo "Reinstalling torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${TORCH_CUDA_VER} index to match torch..."
-    $PIP_CMD install "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    retry_eval \
+        "Reinstall torchaudio/torchvision from ${TORCH_CUDA_VER} index" \
+        "$PIP_CMD install \"torchaudio==${TORCHAUDIO_VER}\" \"torchvision==${TORCHVISION_VER}\" --index-url https://download.pytorch.org/whl/${TORCH_CUDA_VER} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX"
 fi
 
 # Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
@@ -361,7 +431,7 @@ $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.
 
 # Install human-eval
 pip install "setuptools==70.0.0"
-git clone https://github.com/merrymercy/human-eval.git
+retry_eval "Clone human-eval" "rm -rf human-eval && git clone https://github.com/merrymercy/human-eval.git" 5
 cd human-eval
 pip install -e . --no-build-isolation
 

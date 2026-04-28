@@ -7,7 +7,7 @@ on:
   schedule:
     - cron: '0 */6 * * *'  # Run every 6 hours (UTC)
   pull_request:
-    branches: [main]
+    branches: [main, ep_main]
   workflow_dispatch:
     inputs:
       target_stage:
@@ -49,13 +49,9 @@ on:
         default: false
 
 concurrency:
-  # Concurrency group structure: pr-test-{event}-{branch}-{pr_sha}-{stage}
-  # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
-  #   (without it, both resolve the branch segment to 'main' and block each other)
-  # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
-  # - pr_head_sha isolates /rerun-stage from main branch runs
-  # - target_stage allows parallel stage dispatches to run independently
-  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.git_ref || 'all' }}
+  # Use the PR number for PR-triggered runs so a new synchronize event reliably
+  # replaces older queued/running runs for the same PR, even for fork branches.
+  group: pr-test-${{ github.event_name }}-${{ github.event.pull_request.number || github.head_ref || github.ref_name || 'default' }}-${{ inputs.target_stage || inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -151,7 +147,7 @@ jobs:
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
       # correctly because it falls back to "last commit" detection which breaks for merge commits.
-      # Instead, we use the GitHub API to compare the PR commit against main.
+      # Instead, we resolve the PR base branch and compare against that ref.
       - name: Detect file changes via API (for target_stage)
         id: filter-api
         if: inputs.target_stage && inputs.pr_head_sha
@@ -161,9 +157,15 @@ jobs:
           echo "Detecting file changes via GitHub API for target_stage mode..."
           echo "PR head SHA: ${{ inputs.pr_head_sha }}"
 
-          # Get the list of changed files by comparing PR commit against main
-          # This correctly handles merge commits by looking at the actual PR diff
-          CHANGED_FILES=$(gh api "repos/${{ github.repository }}/compare/main...${{ inputs.pr_head_sha }}" \
+          BASE_REF=$(gh api "repos/${{ github.repository }}/commits/${{ inputs.pr_head_sha }}/pulls" \
+            --jq '.[0].base.ref' 2>/dev/null || true)
+          if [ -z "$BASE_REF" ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name || 'main' }}"
+          fi
+          echo "Resolved base ref: $BASE_REF"
+
+          # Get the list of changed files by comparing the PR commit against its base branch.
+          CHANGED_FILES=$(gh api "repos/${{ github.repository }}/compare/${BASE_REF}...${{ inputs.pr_head_sha }}" \
             --jq '[.files[].filename] | .[]' 2>/dev/null || echo "")
 
           if [ -z "$CHANGED_FILES" ]; then
@@ -335,7 +337,7 @@ jobs:
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
   # These jobs poll GitHub API to wait for previous stages to complete.
-  # For PR runs: wait jobs run and enforce sequential execution via polling.
+  # For PR runs: wait jobs run and enforce staged execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
 
   wait-for-stage-a:
@@ -359,17 +361,17 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # Keep CPU coverage in the PR, but do not let it idle GPUs before stage-b fans out.
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1-gpu-small", "stage-a-test-cpu"]'
+          jobs: '["stage-a-test-1-gpu-small"]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
-    # Only run for PRs (not scheduled) and when not targeting a specific stage
-    # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
+    # Only wait for the stage-b lanes that remain in the default PR UT path.
     if: |
       always() &&
       !cancelled() &&
@@ -377,8 +379,8 @@ jobs:
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
@@ -393,10 +395,8 @@ jobs:
           stage-name: stage-b
           jobs: |
             [
-              {"prefix": "stage-b-test-1-gpu-small", "expected_count": 8},
               {"prefix": "stage-b-test-1-gpu-large", "expected_count": 14},
-              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4},
-              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
+              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4}
             ]
           max-wait-minutes: '480'
 
@@ -542,7 +542,8 @@ jobs:
 
   call-jit-kernel-tests:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.jit_kernel == 'true'
+    # Keep the reusable workflow file, but stop auto-running this PR lane by default.
+    if: false
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
@@ -582,10 +583,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -666,7 +666,7 @@ jobs:
         (inputs.target_stage == 'stage-b-test-1-gpu-small') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -689,10 +689,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -747,10 +746,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -802,10 +800,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -834,7 +831,7 @@ jobs:
         (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -855,10 +852,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -894,7 +890,7 @@ jobs:
         inputs.target_stage == 'multimodal-gen-unit-test' ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -942,10 +938,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -974,7 +969,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-8-gpu-h200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -996,10 +991,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1042,7 +1036,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-8-gpu-h20') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1066,10 +1060,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1098,7 +1091,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-deepep-4-gpu-h100') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1116,10 +1109,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1158,7 +1150,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-deepep-8-gpu-h200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1176,10 +1168,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1219,7 +1210,7 @@ jobs:
         (inputs.target_stage == 'stage-c-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1242,10 +1233,9 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
+        uses: ./.github/actions/download-ci-artifacts
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies

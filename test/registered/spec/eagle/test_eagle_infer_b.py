@@ -22,7 +22,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
-register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 
 class TestEAGLEServerBasic(EagleServerBase):
