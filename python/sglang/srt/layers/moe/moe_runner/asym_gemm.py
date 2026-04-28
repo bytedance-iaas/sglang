@@ -309,12 +309,16 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         super().__init__(config)
         assert self.config.activation == "silu"
         assert self.config.is_gated
-        # Internal BF16 runner core for dtype-based dispatch
+        # Internal BF16 / FP4 runner cores for dtype-based dispatch
         from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
             AsymGemmBf16RunnerCore,
         )
+        from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+            AsymGemmFp4RunnerCore,
+        )
 
         self._bf16_core = AsymGemmBf16RunnerCore(config)
+        self._fp4_core = AsymGemmFp4RunnerCore(config)
 
     def run(
         self,
@@ -325,10 +329,15 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
             AsymGemmBf16MoeQuantInfo,
         )
+        from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+            AsymGemmFp4MoeQuantInfo,
+        )
 
-        # Dtype-based dispatch: route to BF16 runner core if quant_info is BF16
+        # Dtype-based dispatch: route to BF16 / FP4 runner core by quant_info type
         if isinstance(quant_info, AsymGemmBf16MoeQuantInfo):
             return self._bf16_core.run(runner_input, quant_info, running_state)
+        if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
+            return self._fp4_core.run(runner_input, quant_info, running_state)
 
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(
@@ -713,10 +722,17 @@ def pre_permute_standard_to_asym_gemm(
     from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
         AsymGemmBf16MoeQuantInfo,
     )
+    from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+        AsymGemmFp4MoeQuantInfo,
+    )
 
     # Dtype-based dispatch
     if isinstance(quant_info, AsymGemmBf16MoeQuantInfo):
         return _pre_permute_standard_to_asym_gemm_bf16(
+            dispatch_output, quant_info, runner_config, running_state
+        )
+    if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
+        return _pre_permute_standard_to_asym_gemm_fp4(
             dispatch_output, quant_info, runner_config, running_state
         )
 
@@ -866,6 +882,176 @@ def _pre_permute_standard_to_asym_gemm_bf16(
     )
 
 
+def _fill_gateup_input_fp4(
+    hidden_states_fp4: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gateup_input: torch.Tensor,
+    gateup_input_scale: torch.Tensor,
+    src2dst: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+):
+    """Scatter pre-quantized FP4 tokens + E4M3 scales into the padded buffer."""
+
+    @triton.jit
+    def _fill_gateup_input_fp4_kernel(
+        input_ptr,
+        scale_ptr,
+        gateup_input_ptr,
+        gateup_input_scale_ptr,
+        src2dst_ptr,
+        topk_ids_ptr,
+        topk,
+        packed_size,
+        scale_size,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        src_idx_int32 = tl.program_id(0)
+        src_idx = src_idx_int32.to(tl.int64)
+        src2dst_ptr = src2dst_ptr + src_idx * topk
+        topk_ids_ptr = topk_ids_ptr + src_idx * topk
+        src_ptr = input_ptr + src_idx * packed_size
+        scale_src_ptr = scale_ptr + src_idx * scale_size
+
+        vec = tl.arange(0, BLOCK_SIZE)
+        for idx in range(topk):
+            expert_id = tl.load(topk_ids_ptr + idx)
+            if expert_id >= 0:
+                dst_idx_int32 = tl.load(src2dst_ptr + idx)
+                dst_idx = dst_idx_int32.to(tl.int64)
+                dst_ptr = gateup_input_ptr + dst_idx * packed_size
+                for start_offset in tl.range(0, packed_size, BLOCK_SIZE):
+                    offset = start_offset + vec
+                    mask = offset < packed_size
+                    in_data = tl.load(src_ptr + offset, mask=mask)
+                    tl.store(dst_ptr + offset, in_data, mask=mask)
+                scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
+                for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
+                    offset = start_offset + vec
+                    mask = offset < scale_size
+                    in_scale = tl.load(scale_src_ptr + offset, mask=mask)
+                    tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
+
+    _fill_gateup_input_fp4_kernel[(hidden_states_fp4.shape[0],)](
+        hidden_states_fp4,
+        hidden_states_scale,
+        gateup_input,
+        gateup_input_scale,
+        src2dst,
+        topk_ids,
+        top_k,
+        hidden_states_fp4.size(1),
+        hidden_states_scale.size(1),
+        BLOCK_SIZE=1024,
+    )
+
+
+def _pre_permute_standard_to_asym_gemm_fp4(
+    dispatch_output: StandardDispatchOutput,
+    quant_info,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    """Masked pre-permute for NVFP4: quantize tokens to FP4 first, then scatter
+    the packed FP4 + E4M3 scales into the padded (num_experts, m_max, K//2) buffer."""
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        compute_masked_m_triton_kernel,
+        compute_seg_indptr_triton_kernel,
+        deepgemm_compute_src2dst_triton_kernel,
+    )
+    from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+        AsymGemmFp4RunnerInput,
+        _quantize_bf16_to_nvfp4_e4m3,
+    )
+
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
+    topk_weights, topk_ids, _ = topk_output
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_dtype = hidden_states.dtype
+    hidden_states_device = hidden_states.device
+    hidden_states_ref = hidden_states
+
+    num_local_experts = runner_config.num_local_experts
+    top_k = runner_config.top_k
+
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.zeros(
+        num_local_experts + 1, device=topk_ids.device, dtype=torch.int64
+    )
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+    masked_m = torch.empty(
+        num_local_experts, device=topk_ids.device, dtype=torch.int32
+    )
+
+    compute_seg_indptr_triton_kernel[(num_local_experts + 1,)](
+        reorder_topk_ids, seg_indptr, topk_ids.numel()
+    )
+    compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
+
+    m_max = (hidden_states.size(0) // 256 + 1) * 256
+    expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
+
+    K = hidden_states.size(1)
+    K_packed = K // 2
+    K_sf = K // 16
+
+    # Quantize only the actual tokens to FP4 (very small for decode)
+    hs_bf16 = hidden_states.to(torch.bfloat16) if hidden_states.dtype != torch.bfloat16 else hidden_states
+    hs_fp4, hs_scale = _quantize_bf16_to_nvfp4_e4m3(hs_bf16)
+
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),
+    )
+    deepgemm_compute_src2dst_triton_kernel[grid](
+        topk_ids,
+        reorder_ids,
+        seg_indptr,
+        src2dst,
+        m_max,
+        topk_ids.numel(),
+        BLOCK_SIZE=256,
+    )
+
+    # Scatter pre-quantized FP4 tokens into the padded buffer
+    gateup_fp4 = torch.empty(
+        (num_local_experts, m_max, K_packed),
+        device=hidden_states_device,
+        dtype=torch.uint8,
+    )
+    gateup_scale = torch.empty(
+        (num_local_experts, m_max, K_sf),
+        device=hidden_states_device,
+        dtype=torch.float8_e4m3fn,
+    )
+    _fill_gateup_input_fp4(
+        hs_fp4, hs_scale,
+        gateup_fp4, gateup_scale,
+        src2dst, topk_ids, top_k,
+    )
+
+    dispose_tensor(hidden_states_ref)
+    del hs_fp4, hs_scale
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["src2dst"] = src2dst
+
+    return AsymGemmFp4RunnerInput(
+        hidden_states=gateup_fp4,
+        hidden_states_scale=gateup_scale,
+        use_masked_gemm=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
+    )
+
+
 @register_post_permute("asym_gemm", "standard")
 def post_permute_asym_gemm_to_standard(
     runner_output: AsymGemmRunnerOutput,
@@ -922,6 +1108,11 @@ def pre_permute_deepep_ll_to_asym_gemm(
         AsymGemmBf16MoeQuantInfo,
         AsymGemmBf16RunnerInput,
     )
+    from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+        AsymGemmFp4MoeQuantInfo,
+        AsymGemmFp4RunnerInput,
+        _quantize_bf16_to_nvfp4_e4m3,
+    )
 
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
@@ -943,8 +1134,6 @@ def pre_permute_deepep_ll_to_asym_gemm(
         )
 
     if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
-        # DeepEP dispatcher may pass BF16 hidden states (no scale) or already
-        # FP4-quantized states. Quantize here only when scales are absent.
         if hidden_states_scale is None:
             hs_fp4, hs_scale = _quantize_bf16_to_nvfp4_e4m3(hidden_states)
             dispose_tensor(hidden_states)
