@@ -90,25 +90,25 @@ class ViTCudaGraphRunner:
     def dtype(self) -> torch.dtype:
         return self.vit.dtype
 
-    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int):
+    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int, sin_cos_dtype):
         if self.sin_cos_ws is None:
             max_shape = self.max_context_len or seq_len
             max_shape = max(max_shape, seq_len)
             cos_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
+                max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
             )
             sin_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
+                max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
             )
             self.sin_cos_ws = (cos_ws, sin_ws)
         else:
             if self.sin_cos_ws[0].size(0) < seq_len:
                 max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
                 cos_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
+                    max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
                 )
                 sin_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
+                    max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
                 )
                 self.sin_cos_ws = (cos_ws, sin_ws)
 
@@ -254,12 +254,17 @@ class ViTCudaGraphRunner:
         attn_head_dim = attn_module.head_size
 
         if graph_key not in self.block_output:
+            # not necessary
             self.block_output[graph_key] = torch.empty_like(
                 x_3d, device=self.device
             ).contiguous()
+            
+            # max buffer is enough
             self.block_input[graph_key] = torch.empty_like(
                 x_3d, device=self.device
             ).contiguous()
+            
+            # not necessary
             self.block_ws[graph_key] = torch.empty(
                 graph_key,
                 num_heads,
@@ -285,7 +290,8 @@ class ViTCudaGraphRunner:
         if position_embeddings is not None:
             # make sure rotary workspace
             head_dim = position_embeddings[0].shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
+            sin_cos_dtype = position_embeddings[0].dtype
+            self._ensure_sin_cos_ws(graph_key, head_dim, sin_cos_dtype)
 
             used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
             used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
@@ -298,7 +304,8 @@ class ViTCudaGraphRunner:
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             # make sure rotary workspace
             head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
+            sin_cos_dtype = rotary_pos_emb_cos.dtype
+            self._ensure_sin_cos_ws(graph_key, head_dim, sin_cos_dtype)
 
             used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
             used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
@@ -326,7 +333,8 @@ class ViTCudaGraphRunner:
         if position_embeddings is not None:
             # update rotary workspace content
             head_dim = position_embeddings[0].shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
+            sin_cos_dtype = position_embeddings[0].dtype
+            self._ensure_sin_cos_ws(graph_key, head_dim, sin_cos_dtype)
             used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
             used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
             used_cos_ws.copy_(position_embeddings[0])
@@ -334,7 +342,8 @@ class ViTCudaGraphRunner:
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             # update rotary workspace content
             head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
+            sin_cos_dtype = rotary_pos_emb_cos.dtype
+            self._ensure_sin_cos_ws(graph_key, head_dim, sin_cos_dtype)
             used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
             used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
             used_cos_ws.copy_(rotary_pos_emb_cos)

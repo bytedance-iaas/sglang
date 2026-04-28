@@ -422,6 +422,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.graph_runners = graph_runners_dict[self.device.type](self)
+        
+        self.inner_rope_compiled = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -754,8 +756,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
-            return self.forward_with_cuda_graph(x, grid_thw)
-
+            else:
+                if not self.inner_rope_compiled:
+                    self.raw_forward(x, grid_thw)
+                    self.inner_rope_compiled = True
+                return self.forward_with_cuda_graph(x, grid_thw)
+        else:
+            return self.raw_forward(x, grid_thw)
+            
+    def raw_forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
