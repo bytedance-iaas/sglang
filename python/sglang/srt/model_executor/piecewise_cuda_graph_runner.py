@@ -321,6 +321,25 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+        # Optional padding statistics for PCG tuning. Enable via
+        # --log-pcg-pad-stats to get a running report of raw vs padded token
+        # counts and pad ratios. This helps tune --piecewise-cuda-graph-tokens
+        # to match the request distribution of a real workload and avoid
+        # wasted computation on padded tokens.
+        self._log_pad_stats: bool = getattr(
+            self.model_runner.server_args, "log_pcg_pad_stats", False
+        )
+        self._pad_stats_log_interval: int = 100
+        if self._log_pad_stats:
+            self._pad_stats = {
+                "total_raw": 0,
+                "total_padded": 0,
+                "count": 0,
+                "max_ratio": 1.0,
+            }
+        else:
+            self._pad_stats = None
+
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
         buffers = self.buffers
@@ -416,6 +435,36 @@ class PiecewiseCudaGraphRunner:
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    def _maybe_record_pad_stats(self, raw_num_tokens: int, padded_num_tokens: int):
+        """Accumulate PCG padding statistics and periodically log them.
+
+        Gated by ``--log-pcg-pad-stats``. Collects ``(raw_tokens, padded_tokens)``
+        pairs across replays so operators can see how much computation is
+        wasted on padded tokens and decide whether to tune
+        ``--piecewise-cuda-graph-tokens`` to better match their real workload.
+        Executed on the Python side (outside any compiled graph), so it is
+        safe w.r.t. dynamo / cudagraph capture.
+        """
+        if not self._log_pad_stats or self._pad_stats is None:
+            return
+        stats = self._pad_stats
+        stats["total_raw"] += raw_num_tokens
+        stats["total_padded"] += padded_num_tokens
+        stats["count"] += 1
+        ratio = padded_num_tokens / max(raw_num_tokens, 1)
+        if ratio > stats["max_ratio"]:
+            stats["max_ratio"] = ratio
+        if stats["count"] % self._pad_stats_log_interval == 0:
+            avg_ratio = stats["total_padded"] / max(stats["total_raw"], 1)
+            log_info_on_rank0(
+                logger,
+                f"[PCG pad stats] count={stats['count']} "
+                f"avg_pad_ratio={avg_ratio:.3f} "
+                f"max_pad_ratio={stats['max_ratio']:.3f} "
+                f"(raw_sum={stats['total_raw']} "
+                f"padded_sum={stats['total_padded']})",
+            )
 
     def can_run(self, forward_batch: ForwardBatch):
         # Disable piecewise cuda graph for input embeddings
@@ -588,6 +637,7 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+
             with set_forward_context(
                 forward_batch,
                 self.attention_layers,
@@ -701,6 +751,8 @@ class PiecewiseCudaGraphRunner:
         )
 
         next_token_logits_buffer = None
+
+        self._maybe_record_pad_stats(num_tokens, static_num_tokens)
 
         # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
         pcg_forward_mode = (
