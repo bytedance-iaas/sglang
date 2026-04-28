@@ -27,6 +27,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.server_args import get_global_server_args
 
+VIT_MAX_TOKEN_NUM=31768
 
 class ViTCudaGraphRunner:
     """Generic ViT CUDA Graph Runner.
@@ -81,6 +82,7 @@ class ViTCudaGraphRunner:
 
         self._attn: Optional[VisionAttention] = getattr(first_blk, "attn", None)
         self._attn_backend = getattr(self._attn, "qkv_backend", None)
+        self.input_buffer = None
 
     @property
     def device(self) -> torch.device:
@@ -178,14 +180,12 @@ class ViTCudaGraphRunner:
                             self.block_input[graph_key],
                             cu_seqlens=cu_seq_len_ws,
                             position_embeddings=position_embeddings,
-                            output_ws=self.block_ws[graph_key],
                         )
                     else:
                         y = blk(
                             y,
                             cu_seqlens=cu_seq_len_ws,
                             position_embeddings=position_embeddings,
-                            output_ws=self.block_ws[graph_key],
                         )
                 elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
                     if layer_num == 0:
@@ -194,7 +194,6 @@ class ViTCudaGraphRunner:
                             cu_seqlens=cu_seq_len_ws,
                             rotary_pos_emb_cos=rotary_pos_emb_cos,
                             rotary_pos_emb_sin=rotary_pos_emb_sin,
-                            output_ws=self.block_ws[graph_key],
                         )
                     else:
                         y = blk(
@@ -202,7 +201,6 @@ class ViTCudaGraphRunner:
                             cu_seqlens=cu_seq_len_ws,
                             rotary_pos_emb_cos=rotary_pos_emb_cos,
                             rotary_pos_emb_sin=rotary_pos_emb_sin,
-                            output_ws=self.block_ws[graph_key],
                         )
 
                 # Optional deepstack support (Qwen3-VL)
@@ -254,25 +252,22 @@ class ViTCudaGraphRunner:
         attn_head_dim = attn_module.head_size
 
         if graph_key not in self.block_output:
-            # not necessary
-            self.block_output[graph_key] = torch.empty_like(
-                x_3d, device=self.device
-            ).contiguous()
+            if self.input_buffer is None:
+                preallocate_buffer_shape = [VIT_MAX_TOKEN_NUM, x_3d.shape[1], x_3d.shape[2]]
+                self.input_buffer = torch.empty(preallocate_buffer_shape, dtype = x_3d.dtype, device = self.device).contiguous()
+                
+            # only when shape > max_token_num case use new buffer
+            if x_3d.shape[0] > VIT_MAX_TOKEN_NUM:
+                self.block_input[graph_key] = torch.empty(
+                    graph_key,
+                    num_heads,
+                    attn_head_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            else:    
+                self.block_input[graph_key] = self.input_buffer[:x_3d.shape[0], :, :]
             
-            # max buffer is enough
-            self.block_input[graph_key] = torch.empty_like(
-                x_3d, device=self.device
-            ).contiguous()
-            
-            # not necessary
-            self.block_ws[graph_key] = torch.empty(
-                graph_key,
-                num_heads,
-                attn_head_dim,
-                device=self.device,
-                dtype=self.dtype,
-            )
-
         # Qwen2.5-VL
         if self._fullatt_block_indexes:
             if graph_key not in self.cu_window_len:
