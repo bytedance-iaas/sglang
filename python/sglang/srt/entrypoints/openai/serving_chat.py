@@ -52,7 +52,10 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.observability import accumulate_stream_items, otel_provider
+from sglang.srt.openai_observability import (
+    accumulate_stream_items,
+    otel_provider,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
