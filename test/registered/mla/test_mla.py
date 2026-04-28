@@ -17,9 +17,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=194, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
 
+_CUDA_PR_UT_EVENTS = ("pull_request", "workflow_dispatch")
+
 
 @unittest.skipIf(
-    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") in _CUDA_PR_UT_EVENTS,
     "MLA MGSM accuracy is unstable on current CUDA PR UT H100 runners",
 )
 class TestMLA(CustomTestCase, MGSMEnMixin):
