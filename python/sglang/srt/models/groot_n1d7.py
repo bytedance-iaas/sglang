@@ -1014,21 +1014,27 @@ class Gr00tN1d7(nn.Module):
             image_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         backbone_attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
+        # Decode still needs the backbone forward so sglang receives the
+        # standard logits/customized-info carrier, but only prefill/extend is
+        # allowed to enter the flow-matching branch below.
+        forward_mode = forward_batch.forward_mode
+        is_decode = forward_mode.is_decode()
+
         ret = self.backbone(input_ids, positions, forward_batch, **kwargs)
+
+        if is_decode:
+            return ret
 
         backbone_hidden = self._layer16_cache
         if backbone_hidden is None:
+            # Soft-fail if the layer-16 hook did not capture backbone features
+            # during prefill; without them the action head cannot run.
             return ret
 
-        # The action head only runs once per request — during prefill (extend),
-        # which is when `input_ids` carries the prompt + images.  On decode
-        # steps `input_ids` is just the newly-generated token, no image tokens,
-        # so AlternateVLDiT's image-attn cross-block would see an all-False
-        # mask and crash MaskedFlashAttention.  pred_traj reaches the response
-        # via `customized_info` set during prefill.
-        forward_mode = getattr(forward_batch, "forward_mode", None)
-        if forward_mode is not None and forward_mode.is_decode():
-            return ret
+        # The action head only runs once per request — during prefill/extend,
+        # which is when `input_ids` still carries the prompt + image tokens.
+        # On decode steps the branch above returns before we touch image-aware
+        # attention in AlternateVLDiT.
 
         history_trajs = getattr(forward_batch, "history_trajs", None)
         if not history_trajs or not any(
