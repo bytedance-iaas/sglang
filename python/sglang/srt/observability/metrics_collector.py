@@ -94,6 +94,9 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+    kv_available_tokens: int = 0
+    kv_evictable_tokens: int = 0
+    kv_used_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -279,16 +282,35 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.kv_available_tokens = Gauge(
+            name="sglang:kv_available_tokens",
+            documentation="Number of free token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_evictable_tokens = Gauge(
+            name="sglang:kv_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_used_tokens = Gauge(
+            name="sglang:kv_used_tokens",
+            documentation="Number of actively used token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         # Speculative decoding
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
-            documentation="The average acceptance length of speculative decoding.",
+            documentation="Mean acceptance length of speculative decoding (accepted drafts + bonus token per forward).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
-            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
+            documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -664,7 +686,7 @@ class SchedulerMetricsCollector:
         if self.enable_streaming_session:
             self.num_streaming_sessions = Gauge(
                 name="sglang:num_streaming_sessions",
-                documentation="The number of active streaming sessions.",
+                documentation="The number of streaming sessions.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1014,6 +1036,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
+        self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
+        self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
@@ -1126,13 +1151,11 @@ class TokenizerMetricsCollector:
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
-        collect_tokens_histogram: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Histogram
 
         self.labels = labels or {}
-        self.collect_tokens_histogram = collect_tokens_histogram
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1146,56 +1169,55 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
-        if collect_tokens_histogram:
-            default_bucket_prompt_tokens = [
-                100,
-                300,
-                500,
-                700,
-                1000,
-                1500,
-                2000,
-                3000,
-                4000,
-                5000,
-                6000,
-                7000,
-                8000,
-                9000,
-                10000,
-                12000,
-                15000,
-                20000,
-                22000,
-                25000,
-                30000,
-                35000,
-                40000,
-                66000,
-                99000,
-                132000,
-                300000,
-                600000,
-                900000,
-                1100000,
-            ]
-            self.prompt_tokens_histogram = Histogram(
-                name="sglang:prompt_tokens_histogram",
-                documentation="Histogram of prompt token length.",
-                labelnames=labels.keys(),
-                buckets=generate_buckets(
-                    server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
-                ),
-            )
-            self.generation_tokens_histogram = Histogram(
-                name="sglang:generation_tokens_histogram",
-                documentation="Histogram of generation token length.",
-                labelnames=labels.keys(),
-                buckets=generate_buckets(
-                    server_args.generation_tokens_buckets,
-                    default_bucket_prompt_tokens,
-                ),
-            )
+        default_bucket_prompt_tokens = [
+            100,
+            300,
+            500,
+            700,
+            1000,
+            1500,
+            2000,
+            3000,
+            4000,
+            5000,
+            6000,
+            7000,
+            8000,
+            9000,
+            10000,
+            12000,
+            15000,
+            20000,
+            22000,
+            25000,
+            30000,
+            35000,
+            40000,
+            66000,
+            99000,
+            132000,
+            300000,
+            600000,
+            900000,
+            1100000,
+        ]
+        self.prompt_tokens_histogram = Histogram(
+            name="sglang:prompt_tokens_histogram",
+            documentation="Histogram of prompt token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+            ),
+        )
+        self.generation_tokens_histogram = Histogram(
+            name="sglang:generation_tokens_histogram",
+            documentation="Histogram of generation token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.generation_tokens_buckets,
+                default_bucket_prompt_tokens,
+            ),
+        )
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
@@ -1388,11 +1410,10 @@ class TokenizerMetricsCollector:
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
-        if self.collect_tokens_histogram:
-            self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
-            self.generation_tokens_histogram.labels(**labels).observe(
-                float(generation_tokens)
-            )
+        self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+        self.generation_tokens_histogram.labels(**labels).observe(
+            float(generation_tokens)
+        )
         self.num_retractions.labels(**labels).observe(retraction_count)
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
