@@ -756,9 +756,17 @@ def _get_chunked_prefill_embedding_batch(
     )  # Dict[key: req_idx or 'batch', value: List[MultimodalDataItem]]
     req_items_hash_map = {}  # Dict[key: req_idx, value: mm items hash]
     new_compute_req_token_num_list = []
+    batch_miss_items = []
     pixel_values_list = []
     grid_thw_list = []
     enable_batch_compute = get_global_server_args().enable_batch_compute_mm_embeddings
+    use_encoder_dp = get_global_server_args().mm_enable_dp_encoder
+    mm_pack_policy = envs.SGLANG_MM_PACK_POLICY.get()
+    # Fast path for single-rank "all" packing: keep the original per-image items
+    # and let the model-side embedder do the only required cat.
+    use_direct_batch_all_path = enable_batch_compute and not use_encoder_dp and (
+        mm_pack_policy == "all"
+    )
 
     max_iterations = min(len(items_size) - 1, len(prefix_length))
     for i in range(max_iterations):
@@ -778,12 +786,14 @@ def _get_chunked_prefill_embedding_batch(
             all_req_embedding_list.append((i, None))
             req_items_hash_map[i] = embedding_items_hash
             if enable_batch_compute:
-                pixel_values_list.extend(
-                    [item.feature for item in embedding_items_per_req]
-                )
-                grid_thw_list.extend(
-                    [item.image_grid_thw for item in embedding_items_per_req]
-                )
+                batch_miss_items.extend(embedding_items_per_req)
+                if not use_direct_batch_all_path:
+                    pixel_values_list.extend(
+                        [item.feature for item in embedding_items_per_req]
+                    )
+                    grid_thw_list.extend(
+                        [item.image_grid_thw for item in embedding_items_per_req]
+                    )
                 token_num = 0
                 for s, e in items_offset:
                     token_num += e - s + 1
@@ -793,22 +803,27 @@ def _get_chunked_prefill_embedding_batch(
         else:
             all_req_embedding_list.append((i, embedding_per_req))
 
-    if enable_batch_compute and len(pixel_values_list) > 0 and len(grid_thw_list) > 0:
+    if enable_batch_compute and len(batch_miss_items) > 0:
         cum_token_num_list = [0] + list(np.cumsum(new_compute_req_token_num_list))
-        pixel_values = torch.cat(pixel_values_list, dim=0)
-        grid_thw = torch.cat(grid_thw_list, dim=0)
-        cache_miss_items["batch"] = [
-            MultimodalDataItem(
-                modality=modality,
-                feature=pixel_values,
-                model_specific_data={"image_grid_thw": grid_thw},
-            )
-        ]
+        if use_direct_batch_all_path:
+            cache_miss_items["batch"] = batch_miss_items
+        elif len(pixel_values_list) > 0 and len(grid_thw_list) > 0:
+            pixel_values = torch.cat(pixel_values_list, dim=0)
+            grid_thw = torch.cat(grid_thw_list, dim=0)
+            cache_miss_items["batch"] = [
+                MultimodalDataItem(
+                    modality=modality,
+                    feature=pixel_values,
+                    model_specific_data={"image_grid_thw": grid_thw},
+                )
+            ]
 
     # step2: calculate embeddings
-    use_encoder_dp = get_global_server_args().mm_enable_dp_encoder
     for req_idx, embedding_items in cache_miss_items.items():
         # step2.1: get mm items to be computed on current rank according to MMDPSchedulePolicy and MMPackPolicy
+        if use_direct_batch_all_path and req_idx == "batch":
+            cache_miss_items[req_idx] = data_embedding_func(embedding_items)
+            continue
 
         # if enable encoder DP, first apply MMDPSchedulePolicy
         if len(embedding_items) == 1:
@@ -851,7 +866,7 @@ def _get_chunked_prefill_embedding_batch(
             pixel_values_local,
             grid_thw_list_local,
             modality,
-            envs.SGLANG_MM_PACK_POLICY.get(),
+            mm_pack_policy,
         )
         # print(f"{embedding_items_list_local_rank=}")
 
