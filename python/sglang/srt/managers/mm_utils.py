@@ -714,7 +714,7 @@ def _get_chunked_prefill_embedding(
     if (
         enable_batch_compute
         and modality == Modality.IMAGE
-        and active_req_count > 1
+        #and active_req_count > 1
     ):
         batch_compute_embedding, batch_input_ids = _get_chunked_prefill_embedding_batch(
             data_embedding_func,
