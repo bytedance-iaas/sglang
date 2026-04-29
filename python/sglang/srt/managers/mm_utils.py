@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from python.sglang.srt.managers.scheduler_multimodal import (
+from sglang.srt.managers.scheduler_multimodal import (
     MMDPSchedulePolicy,
     MMDPScheduler,
     MMPackPolicy,

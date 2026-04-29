@@ -16,7 +16,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-from sglang.srt.managers.mm_utils import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
 logger = logging.getLogger(__name__)
 
