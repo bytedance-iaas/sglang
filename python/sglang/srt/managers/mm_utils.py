@@ -562,7 +562,6 @@ def _get_chunked_embedding_by_item(
             miss_items.append((idx, item, start, end))
 
     # 3. Batch encode all cache-miss items in one ViT call
-    print(len(miss_items))
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
         _move_items_to_device(miss_item_list, device)
@@ -613,17 +612,17 @@ def _get_chunked_prefill_embedding_per_req(
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
     print(f"{max_iterations=}")
-    if max_iterations > 1:
-        batch_compute_embedding = _get_chunked_prefill_embedding_batch(
-            data_embedding_func,
-            get_mm_dp_metadata_func,
-            embedding_items,
-            items_size,
-            prefix_length,
-            extend_length,
-            items_offset_list,
-        )
-        return batch_compute_embedding
+    # if max_iterations > 1:
+    #     batch_compute_embedding = _get_chunked_prefill_embedding_batch(
+    #         data_embedding_func,
+    #         get_mm_dp_metadata_func,
+    #         embedding_items,
+    #         items_size,
+    #         prefix_length,
+    #         extend_length,
+    #         items_offset_list,
+    #     )
+    #     return batch_compute_embedding
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -634,23 +633,6 @@ def _get_chunked_prefill_embedding_per_req(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        item_hashes = [item.hash for item in embedding_items_per_req]
-        embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-        embedding_per_req = embedding_cache.get(item_hashes)
-        if embedding_per_req is None:
-            embedding = data_embedding_func(embedding_items_per_req)
-            embedding_per_req = (
-                EmbeddingResult(embedding=embedding)
-                if isinstance(embedding, torch.Tensor)
-                else embedding
-            )
-            if not embedding_cache.set(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. This typically occurs when a single "
-                    "embedding exceeds the cache size limit. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
-                    "embedding size."
-                )
 
         extend_prefix_len = prefix_length[i]
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
@@ -688,14 +670,14 @@ def _get_chunked_prefill_embedding_per_req(
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
 
-        embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=embedding_per_req.embedding,
-            extend_prefix_len=extend_prefix_len,
-            extend_seq_len=extend_seq_len,
-            items_offset=items_offset,
-        )
+        # embedding_per_req_chunk, _, _ = get_embedding_chunk(
+        #     embedding=embedding_per_req.embedding,
+        #     extend_prefix_len=extend_prefix_len,
+        #     extend_seq_len=extend_seq_len,
+        #     items_offset=items_offset,
+        # )
 
-        embedding_list.append(embedding_per_req_chunk)
+        # embedding_list.append(embedding_per_req_chunk)
 
     if len(embedding_list) == 0:
         return None
