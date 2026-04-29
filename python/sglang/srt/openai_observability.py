@@ -315,7 +315,7 @@ def metric_shared_attributes(
     response_model: str, operation: str, is_streaming: bool = False
 ):
     return {
-        SpanAttributes.GEN_AI_SYSTEM: "dynamo",
+        SpanAttributes.GEN_AI_SYSTEM: "sglang",
         SpanAttributes.GEN_AI_RESPONSE_MODEL: response_model,
         "gen_ai_operation_name": operation,
         "stream": is_streaming,

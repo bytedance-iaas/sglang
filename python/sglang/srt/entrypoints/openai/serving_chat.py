@@ -661,7 +661,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         is_first_token = True
         start_time = time.time()
-        time_of_first_token = {}
+        time_of_first_token = None
         usage = {}
         complete_response = {"choices": [], "model": "", "usage": None, "error": None}
         stream_started = False
