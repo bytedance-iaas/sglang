@@ -697,7 +697,25 @@ def _get_chunked_prefill_embedding(
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     enable_batch_compute = get_global_server_args().enable_batch_compute_mm_embeddings
     modality = embedding_items[0].modality
-    if enable_batch_compute and modality == Modality.IMAGE:
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    active_req_count = 0
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+        items_offset = items_offset_list[i]
+        if items_offset is None:
+            continue
+        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
+            continue
+        active_req_count += 1
+
+    # Single-request workloads do not benefit from the batch scheduler path and
+    # should keep the original per-request implementation for identical latency.
+    if (
+        enable_batch_compute
+        and modality == Modality.IMAGE
+        and active_req_count > 1
+    ):
         batch_compute_embedding, batch_input_ids = _get_chunked_prefill_embedding_batch(
             data_embedding_func,
             get_mm_dp_metadata_func,
@@ -822,6 +840,7 @@ def _get_chunked_prefill_embedding_batch(
     for req_idx, embedding_items in cache_miss_items.items():
         # step2.1: get mm items to be computed on current rank according to MMDPSchedulePolicy and MMPackPolicy
         if use_direct_batch_all_path and req_idx == "batch":
+            _move_items_to_device(embedding_items, input_ids.device)
             cache_miss_items[req_idx] = data_embedding_func(embedding_items)
             continue
 
