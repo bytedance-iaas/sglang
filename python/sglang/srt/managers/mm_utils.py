@@ -17,8 +17,8 @@ from torch import nn
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_multimodal import (
     MMDPSchedulePolicy,
-    MMDPScheduler,
-    MMPackPolicy,
+    MMScheduler,
+    MMDPSchedulePolicy,
 )
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
@@ -562,6 +562,7 @@ def _get_chunked_embedding_by_item(
             miss_items.append((idx, item, start, end))
 
     # 3. Batch encode all cache-miss items in one ViT call
+    print(len(miss_items))
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
         _move_items_to_device(miss_item_list, device)
@@ -728,7 +729,7 @@ def _get_chunked_prefill_embedding(
         )
         return batch_compute_embedding, batch_input_ids
 
-    embedding, input_ids = _get_chunked_prefill_embedding_per_req(
+    embedding = _get_chunked_prefill_embedding_per_req(
         data_embedding_func,
         embedding_items,
         items_size,

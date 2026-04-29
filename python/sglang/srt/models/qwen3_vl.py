@@ -732,6 +732,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        import traceback
+        traceback.print_stack()
+        print("qwen3-vl forward()")
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
