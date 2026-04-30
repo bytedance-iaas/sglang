@@ -1753,6 +1753,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
+            # w13_input_scale and w2_input_scale are loaded with global experts
+            # (_sglang_require_global_experts=True); slice to this EP rank's local experts.
+            if layer.moe_ep_size > 1:
+                ep_start = layer.moe_ep_rank * layer.num_local_experts
+                ep_end = ep_start + layer.num_local_experts
+                w13_input_scale = w13_input_scale[ep_start:ep_end]
+                w2_input_scale = w2_input_scale[ep_start:ep_end]
 
         # Create shared parameters
         copy_or_rebind_param(
@@ -1907,10 +1914,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
+        elif moe_runner_backend.is_asym_gemm():
+            self.runner = MoeRunner(MoeRunnerBackend.ASYM_GEMM, moe_runner_config)
 
     def apply(
         self,
