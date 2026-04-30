@@ -38,15 +38,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    # Lazy import to avoid circular dependency with moe_runner.asym_gemm.
-    from sglang.srt.layers.moe.moe_runner.asym_gemm import (
-        build_offsets_experts_from_masked_m,
-    )
-
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m, num_groups, m
-    )
-
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
@@ -57,9 +48,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 lhs,
                 rhs,
                 out,
-                offsets,
-                experts,
-                list_size,
+                masked_m,
                 expected_m,
                 disable_ue8m0_cast=False,
             )
