@@ -765,6 +765,26 @@ def _get_chunked_prefill_embedding(
     def flush_packed_per_image_reqs():
         if not packed_per_image_reqs:
             return
+        if len(packed_per_image_reqs) == 1:
+            (
+                embedding_items_per_req,
+                items_offset,
+                extend_prefix_len,
+                extend_seq_len,
+            ) = packed_per_image_reqs[0]
+            chunk_embedding = _get_chunked_embedding_by_item(
+                data_embedding_func,
+                embedding_items_per_req,
+                items_offset,
+                extend_prefix_len,
+                extend_seq_len,
+                device,
+            )
+            if chunk_embedding is not None:
+                embedding_list.append(chunk_embedding)
+            packed_per_image_reqs.clear()
+            return
+
         chunk_embeddings = _get_chunked_embedding_by_item_packed(
             data_embedding_func,
             packed_per_image_reqs,
