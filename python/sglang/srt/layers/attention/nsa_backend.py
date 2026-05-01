@@ -1404,16 +1404,33 @@ class NativeSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                if any(forward_batch.extend_prefix_lens_cpu):
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
+                # RAGGED only fires when the KV pool stores fp8.
+                #
+                # Two sub-paths:
+                #   (a) no-prefix extend  -- k / k_rope are fresh bf16
+                #       projections from this step; cast to fp8 and feed
+                #       the native Q8KV8 SM90 sparse-prefill kernel
+                #       directly (no bf16 round-trip).
+                #   (b) extend with prefix -- prefix lives in the paged
+                #       fp8 cache (per-group scaled, 656 B/token).  The
+                #       native kernel currently assumes per-tensor
+                #       scaling, so we dequant the paged slice to bf16
+                #       and fall through to the bf16 path until the
+                #       prefix-Q8 work lands
+                no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                if no_prefix:
+                    kv_fp8 = _cat([k, k_rope], dim=-1).to(torch.float8_e4m3fn)
+                    return self._forward_flashmla_sparse_q8kv8(
+                        q_all=q_all,
+                        kv_cache=kv_fp8,
+                        page_table_1=topk_indices,
+                        sm_scale=layer.scaling,
+                        v_head_dim=layer.v_head_dim,
                     )
-                    assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
-                else:
-                    kv_cache = _cat([k, k_rope], dim=-1)
+
+                page_table_1_flattened = self.forward_metadata.page_table_1_flattened
+                assert page_table_1_flattened is not None
+                kv_cache = dequantize_k_cache_paged(kv_cache, page_table_1_flattened)
                 page_table_1 = topk_indices
 
             return self._forward_flashmla_sparse(
@@ -1698,6 +1715,83 @@ class NativeSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
 
+        return o
+
+    def _forward_flashmla_sparse_q8kv8(
+        self,
+        q_all: torch.Tensor,  # [s_q, h_q, d_qk]   bf16
+        kv_cache: torch.Tensor,  # [s_kv, d_qk]       fp8 (e4m3) -- nope|rope concat
+        v_head_dim: int,  # 512 for DSV3 MLA
+        page_table_1: torch.Tensor,  # [s_q, topk]        int32 -- token indices into kv_cache
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """No-prefix Q8KV8 sparse-prefill path.
+
+        Wraps the native SM90 FP8 kernel
+        (``flash_mla_sparse_q8kv8_fwd``).  Input ``q_all`` and
+        ``kv_cache`` are fp8 already (q is bf16 here -- we cast inside);
+        we identity-scale (per-tensor q_scale = kv_scale = 1.0) because
+        DSV3 fp8 conversion is direct e4m3 cast with no extra scaling on
+        the no-prefix path.
+
+        Steps:
+          1. Pad ``num_heads`` up to the kernel's required multiple
+             (64 on Hopper, 128 on Blackwell).
+          2. Cast q to fp8.
+          3. Reshape kv to ``[s_kv, h_kv=1, d_qk]`` and append a one-token
+             zero landing pad so the kernel's cp.async over-read on the
+             last tile loads zeros instead of OOB memory.
+          4. Call the kernel; trim the head padding off the output.
+
+        The kernel writes bf16 ``out`` and fp32 ``max_logits`` / ``lse``
+        (the latter two unused upstream and discarded).
+        """
+        from sglang.jit_kernel.flashmla_q8kv8_sparse_prefill import (
+            flash_mla_sparse_q8kv8_fwd,
+        )
+
+        s_q, num_heads, d_qk = q_all.shape
+
+        # Head-count padding -- same rule as the bf16 path.
+        required_padding = 128 if self.device_sm_major >= 10 else 64
+        need_padding = (num_heads % required_padding) != 0
+        if need_padding:
+            assert required_padding % num_heads == 0, (
+                f"num_heads {num_heads} cannot be padded to {required_padding}; "
+                "TP size may be too large for this model."
+            )
+            q_padded = q_all.new_zeros((s_q, required_padding, d_qk))
+            q_padded[:, :num_heads, :] = q_all
+            q_input_bf16 = q_padded
+        else:
+            q_input_bf16 = q_all
+
+        q_fp8 = q_input_bf16.to(torch.float8_e4m3fn)
+
+        # KV view + landing pad to absorb cp.async over-read.
+        s_kv = kv_cache.shape[0]
+        kv_padded = kv_cache.new_zeros((s_kv + 1, 1, d_qk))
+        kv_padded[:s_kv, 0, :] = kv_cache
+
+        # Per-tensor identity scales (no-prefix path: q & kv came directly
+        # from bf16 -> fp8 cast, no extra scaling needed).
+        device = q_all.device
+        ones = torch.ones((), dtype=torch.float32, device=device)
+
+        indices_input = page_table_1.unsqueeze(1).to(torch.int32)
+
+        o, _max_logits, _lse = flash_mla_sparse_q8kv8_fwd(
+            q=q_fp8,
+            kv=kv_padded,
+            indices=indices_input,
+            sm_scale=sm_scale,
+            q_scale=ones,
+            kv_scale=ones,
+            d_v=v_head_dim,
+        )
+
+        if need_padding:
+            o = o[:, :num_heads, :]
         return o
 
     def _forward_flashmla_kv(
