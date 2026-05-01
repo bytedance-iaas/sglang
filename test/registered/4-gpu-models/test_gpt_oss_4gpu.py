@@ -10,7 +10,10 @@ register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-b200")
 
 
 def is_pr_ci():
-    return is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request"
+    return is_in_ci() and os.getenv("GITHUB_EVENT_NAME") in (
+        "pull_request",
+        "workflow_dispatch",
+    )
 
 
 class TestGptOss4Gpu(BaseTestGptOss):

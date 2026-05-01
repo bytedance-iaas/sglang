@@ -1453,6 +1453,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
         num_warps=8,
     )
 
+
 @triton.jit
 def _silu_mul_and_static_tensor_quant_kernel(
     input_ptr,
@@ -1510,6 +1511,7 @@ def _silu_mul_and_static_tensor_quant_kernel(
             gate_up.to(output_ptr.dtype.element_ty),
             mask=offs_in_d < size_n,
         )
+
 
 def silu_mul_and_per_tensor_static_quant_fwd(
     input: torch.Tensor,

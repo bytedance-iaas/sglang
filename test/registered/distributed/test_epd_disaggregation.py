@@ -814,7 +814,8 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
 
 @unittest.skipIf(
-    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") == "pull_request",
+    is_in_ci()
+    and os.getenv("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"),
     "Qwen2.5-VL processor is incompatible with the current PR UT transformers stack",
 )
 class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):

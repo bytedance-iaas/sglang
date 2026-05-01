@@ -472,8 +472,8 @@ jobs:
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently) and when target_stage is set
-    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled/PR runs (they run stages independently or lack ARM runners) and when target_stage is set
+    if: ${{ !contains(fromJSON('["schedule", "pull_request"]'), github.event_name) && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true' }}
     runs-on: arm-kernel-build-node
     timeout-minutes: 240
     strategy:
