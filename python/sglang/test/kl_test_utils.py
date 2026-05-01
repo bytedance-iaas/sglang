@@ -37,9 +37,8 @@ def _build_synthetic_input_ids(tokenizer, max_prompt_tokens, num_samples):
     input_ids = []
     for i in range(num_samples):
         text = (
-            (f"Example {i}. " + seed_text + f"Question {i}: summarize fact {i % 7}. ")
-            * 256
-        )
+            f"Example {i}. " + seed_text + f"Question {i}: summarize fact {i % 7}. "
+        ) * 256
         tokens = tokenizer.encode(text)
         truncate_len = int(max_prompt_tokens * (0.75 + (i % 7) * 0.08))
         input_ids.append(tokens[:truncate_len])

@@ -1642,9 +1642,8 @@ def run_bench_one_batch_server(
 ):
     from sglang.bench_one_batch_server import run_benchmark
 
-    if (
-        getattr(bench_args, "dataset_name", "") == "random"
-        and not getattr(bench_args, "dataset_path", "")
+    if getattr(bench_args, "dataset_name", "") == "random" and not getattr(
+        bench_args, "dataset_path", ""
     ):
         bench_args.dataset_path = _ensure_synthetic_sharegpt_dataset()
 
