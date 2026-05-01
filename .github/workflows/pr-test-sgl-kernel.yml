@@ -67,6 +67,7 @@ jobs:
           pytest tests/
 
   sgl-kernel-mla-test:
+    if: ${{ !contains(fromJSON('["pull_request", "workflow_dispatch"]'), github.event_name) }}
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
