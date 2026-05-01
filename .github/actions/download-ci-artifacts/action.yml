@@ -34,7 +34,7 @@ runs:
         trap cleanup EXIT
 
         mkdir -p "$INPUT_PATH"
-        python3 "$tmp_dir" <<'PY'
+        python3 - "$tmp_dir" <<'PY'
         import fnmatch
         import io
         import json
