@@ -64,7 +64,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd sgl-kernel
-          pytest tests/
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            pytest tests/ -k "not test_moe_fused_gate_combined"
+          else
+            pytest tests/
+          fi
 
   sgl-kernel-mla-test:
     if: ${{ !contains(fromJSON('["pull_request", "workflow_dispatch"]'), github.event_name) }}
@@ -182,7 +186,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd sgl-kernel
-          pytest tests/
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            pytest tests/ -k "not test_moe_fused_gate_combined"
+          else
+            pytest tests/
+          fi
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
