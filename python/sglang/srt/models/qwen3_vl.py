@@ -915,6 +915,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
             output_indices=None,
+            grid_thw_key=(
+                tuple(map(tuple, grid_thw.tolist()))
+                if isinstance(grid_thw, torch.Tensor)
+                else tuple(map(tuple, grid_thw))
+            ),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

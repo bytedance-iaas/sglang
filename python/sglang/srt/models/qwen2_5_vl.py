@@ -548,6 +548,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=cu_window_seqlens,
             output_indices=reverse_indices,
+            grid_thw_key=(
+                tuple(map(tuple, grid_thw.tolist()))
+                if isinstance(grid_thw, torch.Tensor)
+                else tuple(map(tuple, grid_thw))
+            ),
         )
 
 

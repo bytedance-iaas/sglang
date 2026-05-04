@@ -1,11 +1,11 @@
 """
 Qwen3.5-9B MMMU 精度测试（对应 launch_server_command.sh 中的 basic/opt1~opt4 五种启动配置）。
 
-用法：
+用法（直接用文件路径跑，不要用 dotted 模块路径，因为 test/ 不是 python 包）：
     # 单独跑一个
-    python -m unittest test.registered.models.test_qwen35_vit_variants.TestQwen35Basic
+    python3 sglang/test/registered/models/test_qwen35_vit_variants.py -v TestQwen35Basic
     # 跑全部
-    python -m unittest test.registered.models.test_qwen35_vit_variants
+    python3 sglang/test/registered/models/test_qwen35_vit_variants.py -v
 
 每个测试类会：
   1) 按对应的环境变量 + server flag 拉起 sglang server
