@@ -1287,13 +1287,48 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         """
         if self.num_deepstack_embeddings == 0:
             return kwargs
-        if "input_deepstack_embeds" in kwargs:
+
+        real_deepstack_embeds = kwargs.get("input_deepstack_embeds", None)
+        static_deepstack_embeds = getattr(
+            forward_batch, "input_deepstack_embeds", None
+        )
+        if static_deepstack_embeds is not None:
+            static_deepstack_embeds.zero_()
+            if real_deepstack_embeds is not None:
+                if real_deepstack_embeds.shape[-1] != static_deepstack_embeds.shape[-1]:
+                    raise ValueError(
+                        "input_deepstack_embeds hidden size does not match the "
+                        "piecewise CUDA graph static buffer: "
+                        f"{real_deepstack_embeds.shape=} "
+                        f"{static_deepstack_embeds.shape=}"
+                    )
+                if real_deepstack_embeds.shape[0] > static_deepstack_embeds.shape[0]:
+                    raise ValueError(
+                        "input_deepstack_embeds token count exceeds the piecewise "
+                        "CUDA graph static buffer: "
+                        f"{real_deepstack_embeds.shape=} "
+                        f"{static_deepstack_embeds.shape=}"
+                    )
+                copy_len = real_deepstack_embeds.shape[0]
+                static_deepstack_embeds[:copy_len].copy_(
+                    real_deepstack_embeds.to(
+                        device=static_deepstack_embeds.device,
+                        dtype=static_deepstack_embeds.dtype,
+                    )
+                )
+            kwargs["input_deepstack_embeds"] = static_deepstack_embeds
+            return kwargs
+
+        if real_deepstack_embeds is not None:
             return kwargs
         if input_embeds is None:
             return kwargs
 
         dummy = torch.zeros(
-            (input_embeds.shape[0], input_embeds.shape[-1] * self.num_deepstack_embeddings),
+            (
+                input_embeds.shape[0],
+                input_embeds.shape[-1] * self.num_deepstack_embeddings,
+            ),
             dtype=input_embeds.dtype,
             device=input_embeds.device,
         )
