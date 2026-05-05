@@ -894,6 +894,13 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            log_info_on_rank0(
+                logger,
+                f"[PCG replay] raw_num_tokens={self.raw_num_tokens} "
+                f"static_num_tokens={len(static_forward_batch.input_ids)} "
+                f"has_mrope={static_forward_batch.mrope_positions is not None} "
+                f"has_deepstack={static_forward_batch.input_deepstack_embeds is not None}",
+            )
             # Replay
             with set_forward_context(
                 static_forward_batch,
