@@ -513,6 +513,16 @@ class PiecewiseCudaGraphRunner:
         ):
             return False
         num_tokens = len(forward_batch.input_ids)
+        if (
+            self.buffers.mrope_positions is not None
+            and forward_batch.mrope_positions is not None
+            and (
+                forward_batch.mrope_positions.ndim != 2
+                or forward_batch.mrope_positions.shape[0] != 3
+                or forward_batch.mrope_positions.shape[1] != num_tokens
+            )
+        ):
+            return False
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -716,7 +726,7 @@ class PiecewiseCudaGraphRunner:
             buffers.positions[num_tokens:static_num_tokens].zero_()
             if self.is_multimodal:
                 buffers.input_embeds[num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
+            if buffers.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
         bs = forward_batch.batch_size
@@ -772,8 +782,15 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
-        if forward_batch.mrope_positions is not None:
-            buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
+        if buffers.mrope_positions is not None:
+            if forward_batch.mrope_positions is not None:
+                buffers.mrope_positions[:, :num_tokens].copy_(
+                    forward_batch.mrope_positions
+                )
+            else:
+                buffers.mrope_positions[:, :num_tokens].copy_(
+                    forward_batch.positions.unsqueeze(0).expand(3, num_tokens)
+                )
 
         input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
@@ -789,7 +806,7 @@ class PiecewiseCudaGraphRunner:
 
         mrope_positions = (
             buffers.mrope_positions[:, :static_num_tokens]
-            if forward_batch.mrope_positions is not None
+            if buffers.mrope_positions is not None
             else None
         )
 
