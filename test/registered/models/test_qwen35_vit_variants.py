@@ -24,14 +24,15 @@ from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 # ---------------------------------------------------------------------------
 # 全局配置：所有变体共享的 server 参数（对应 sh 脚本里完全一致的那段）
 # ---------------------------------------------------------------------------
-MODEL_PATH = "/data01/models/Qwen3.5-9B/"
+# MODEL_PATH = "/data01/models/Qwen3.5-9B/"
+MODEL_PATH = "/data00/models/Qwen3-VL-8B-Instruct/"
 
 # MMMU 精度阈值下限，实际可按基线精度微调
 MMMU_ACCURACY_THRESHOLD = 0.30
 
 # 所有变体共用的 sglang.launch_server flag（不含 --model-path / --host / --port）
 COMMON_SERVER_ARGS = [
-    "--mem-fraction-static", "0.7",
+    "--mem-fraction-static", "0.6",
     "--cuda-graph-max-bs", "128",
     "--tensor-parallel-size", "1",
     "--mm-attention-backend", "fa3",
@@ -39,8 +40,8 @@ COMMON_SERVER_ARGS = [
     "128", "120", "112", "104", "96", "88", "80", "72", "64",
     "56", "48", "40", "32", "24", "16", "8", "4", "2", "1",
     "--disable-radix-cache",
-    "--context-length", "262144",
-    "--reasoning-parser", "qwen3",
+    # "--context-length", "262144",
+    # "--reasoning-parser", "qwen3",
 ]
 
 
