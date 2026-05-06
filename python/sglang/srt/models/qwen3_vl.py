@@ -70,7 +70,10 @@ from sglang.srt.models.utils import (
     compute_cu_seqlens_from_grid_numpy,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.multimodal.vit_cuda_graph_runner import (
+    VIT_CUDA_GRAPH_MAX_SEQ_LEN,
+    ViTCudaGraphRunner,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -756,13 +759,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
-            else:
+            if x.shape[0] <= VIT_CUDA_GRAPH_MAX_SEQ_LEN:
                 if not self.inner_rope_compiled:
                     self.raw_forward(x, grid_thw)
                     self.inner_rope_compiled = True
                 return self.forward_with_cuda_graph(x, grid_thw)
-        else:
-            return self.raw_forward(x, grid_thw)
+        return self.raw_forward(x, grid_thw)
             
     def raw_forward(
         self,
@@ -890,6 +892,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             output_indices=None,
         )
 
+    def _get_cuda_graph_layout_key(self, grid_thw):
+        if isinstance(grid_thw, torch.Tensor):
+            grid_rows = grid_thw.tolist()
+        elif hasattr(grid_thw, "tolist"):
+            grid_rows = grid_thw.tolist()
+        else:
+            grid_rows = grid_thw
+
+        segment_lens = []
+        for t, h, w in grid_rows:
+            segment_lens.extend([int(h) * int(w)] * int(t))
+        return tuple(segment_lens)
+
     def forward_with_cuda_graph(
         self,
         x: torch.Tensor,
@@ -915,11 +930,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
             output_indices=None,
-            grid_thw_key=(
-                tuple(map(tuple, grid_thw.tolist()))
-                if isinstance(grid_thw, torch.Tensor)
-                else tuple(map(tuple, grid_thw))
-            ),
+            graph_layout_key=self._get_cuda_graph_layout_key(grid_thw),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

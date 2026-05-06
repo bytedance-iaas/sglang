@@ -31,7 +31,8 @@ from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
-VIT_MAX_TOKEN_NUM=31768
+VIT_CUDA_GRAPH_MAX_SEQ_LEN = 32768
+
 
 class ViTCudaGraphRunner:
     """Generic ViT CUDA Graph Runner.
@@ -68,7 +69,7 @@ class ViTCudaGraphRunner:
 
         # rotary position buffers shared across graphs
         self.sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self.max_context_len = getattr(vit, "max_context_len", None)
+        self.max_graph_seq_len = VIT_CUDA_GRAPH_MAX_SEQ_LEN
 
         # Qwen2.5-VL specific viarable.
         self._fullatt_block_indexes = set(getattr(vit, "fullatt_block_indexes", ()))
@@ -90,7 +91,7 @@ class ViTCudaGraphRunner:
 
         # LFU / memory-aware eviction state
         self.graph_hits: Dict[Hashable, int] = {}
-        # 记录每个 graph_key 的 block_input 是否为独立分配（seq_len > VIT_MAX_TOKEN_NUM）
+        # Track whether block_input owns a standalone allocation.
         self.owns_block_input: Dict[Hashable, bool] = {}
         # 显存下限阈值（byte）。<=0 表示不启用 eviction
         self.min_free_bytes: int = (
@@ -105,39 +106,48 @@ class ViTCudaGraphRunner:
     def dtype(self) -> torch.dtype:
         return self.vit.dtype
 
-    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int, sin_cos_dtype):
+    def can_run_cuda_graph_seq_len(self, seq_len: int) -> bool:
+        return seq_len <= self.max_graph_seq_len
+
+    def _ensure_sin_cos_ws(
+        self, seq_len: int, head_dim: int, sin_cos_dtype
+    ) -> bool:
+        if not self.can_run_cuda_graph_seq_len(seq_len):
+            return False
+
         if self.sin_cos_ws is None:
-            max_shape = self.max_context_len or seq_len
-            max_shape = max(max_shape, seq_len)
             cos_ws = torch.empty(
-                max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
+                self.max_graph_seq_len,
+                head_dim,
+                dtype=sin_cos_dtype,
+                device=self.device,
             )
             sin_ws = torch.empty(
-                max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
+                self.max_graph_seq_len,
+                head_dim,
+                dtype=sin_cos_dtype,
+                device=self.device,
             )
             self.sin_cos_ws = (cos_ws, sin_ws)
-        else:
-            if self.sin_cos_ws[0].size(0) < seq_len:
-                max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
-                cos_ws = torch.empty(
-                    max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
-                )
-                sin_ws = torch.empty(
-                    max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
-                )
-                self.sin_cos_ws = (cos_ws, sin_ws)
+            return True
+
+        cos_ws, sin_ws = self.sin_cos_ws
+        return (
+            cos_ws.size(0) >= self.max_graph_seq_len
+            and sin_ws.size(0) >= self.max_graph_seq_len
+            and cos_ws.size(1) == head_dim
+            and sin_ws.size(1) == head_dim
+            and cos_ws.dtype == sin_cos_dtype
+            and sin_ws.dtype == sin_cos_dtype
+        )
 
     def _get_graph_key(
         self,
         x_3d: torch.Tensor,
-        grid_thw_key: Optional[Tuple] = None,
+        graph_layout_key: Optional[Tuple] = None,
     ) -> Hashable:
-        # x_3d: [S, B, H]。仅凭 seq_len 不足以唯一确定 cu_seqlens / cu_window_seqlens，
-        # 因此将上层传入的 grid_thw 内容一并纳入 key。
-        # grid_thw 完全决定了 cu_seqlens 与 cu_window_seqlens（包括 Qwen2.5-VL window 划分），
-        # 所以 (seq_len, grid_thw_tuple) 足够。
-        if grid_thw_key is not None:
-            return (x_3d.shape[0], grid_thw_key)
+        if graph_layout_key is not None:
+            return (x_3d.shape[0], graph_layout_key)
         return x_3d.shape[0]
 
     def _cuda_free_bytes(self) -> int:
@@ -158,13 +168,12 @@ class ViTCudaGraphRunner:
         self.cu_full_len_kk.pop(key, None)
         self.cu_window_len.pop(key, None)
         self.cu_window_len_kk.pop(key, None)
-        # block_input：仅当独立分配（seq_len > VIT_MAX_TOKEN_NUM）时才释放显存；
-        # 否则只 pop key，共享的 input_buffer 不动。
+        # block_input uses the shared input_buffer for fixed-size cuda graph replay.
         self.block_input.pop(key, None)
         self.owns_block_input.pop(key, None)
         self.graph_hits.pop(key, None)
 
-    def _evict_until_free(self) -> None:
+    def _evict_until_free(self, protected_key: Optional[Hashable] = None) -> None:
         """按 hit 次数最少驱逐，直到剩余显存 >= min_free_bytes 或无 graph 可驱逐。"""
         if self.min_free_bytes <= 0:
             return
@@ -172,11 +181,23 @@ class ViTCudaGraphRunner:
             free = self._cuda_free_bytes()
             if free < 0 or free >= self.min_free_bytes:
                 return
+            candidates = [
+                key for key in self.block_graphs.keys() if key != protected_key
+            ]
+            if not candidates:
+                logger.warning(
+                    "[ViTCudaGraphRunner] Only protected graph key=%s remains, "
+                    "cuda free=%.1fMB < min_free=%.1fMB",
+                    protected_key,
+                    free / 1024 / 1024,
+                    self.min_free_bytes / 1024 / 1024,
+                )
+                return
             if not self.graph_hits:
                 # 理论上不应该发生：graph 存在但计数缺失
-                victim = next(iter(self.block_graphs))
+                victim = candidates[0]
             else:
-                victim = min(self.graph_hits, key=self.graph_hits.get)
+                victim = min(candidates, key=lambda key: self.graph_hits.get(key, 0))
             logger.warning(
                 "[ViTCudaGraphRunner] Evicting graph key=%s (hits=%d), "
                 "cuda free=%.1fMB < min_free=%.1fMB",
@@ -199,7 +220,7 @@ class ViTCudaGraphRunner:
 
     def _create_graph(
         self,
-        graph_key: int,
+        graph_key: Hashable,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # (cos, sin), [S, D]
@@ -312,17 +333,22 @@ class ViTCudaGraphRunner:
         self,
         x_3d: torch.Tensor,  # [S, 1, H]
         cu_seqlens: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
+        cu_window_seqlens: Optional[torch.Tensor],
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ],  # (cos, sin), [S, D]
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-        grid_thw_key: Optional[Tuple] = None,
+        graph_layout_key: Optional[Tuple] = None,
     ) -> Hashable:
-        vit = self.vit
-        graph_key = self._get_graph_key(x_3d, grid_thw_key)
+        graph_key = self._get_graph_key(x_3d, graph_layout_key)
         seq_len = x_3d.shape[0]
+
+        if not self.can_run_cuda_graph_seq_len(seq_len):
+            raise RuntimeError(
+                "ViT CUDA graph seq_len "
+                f"{seq_len} exceeds max {self.max_graph_seq_len}."
+            )
 
         if graph_key in self.block_graphs:
             return graph_key
@@ -331,31 +357,28 @@ class ViTCudaGraphRunner:
         self._evict_until_free()
 
         # pre-allocate workspace
-        attn_module: VisionAttention = vit.blocks[0].attn
-        num_heads = attn_module.num_attention_heads_per_partition
-        attn_head_dim = attn_module.head_size
-
         if graph_key not in self.block_output:
             if self.input_buffer is None:
-                preallocate_buffer_shape = [VIT_MAX_TOKEN_NUM, x_3d.shape[1], x_3d.shape[2]]
-                self.input_buffer = torch.empty(preallocate_buffer_shape, dtype = x_3d.dtype, device = self.device).contiguous()
-                
-            # only when shape > max_token_num case use new buffer
-            if seq_len > VIT_MAX_TOKEN_NUM:
-                self.block_input[graph_key] = torch.empty(
-                    seq_len,
-                    num_heads,
-                    attn_head_dim,
+                preallocate_buffer_shape = [
+                    self.max_graph_seq_len,
+                    x_3d.shape[1],
+                    x_3d.shape[2],
+                ]
+                self.input_buffer = torch.empty(
+                    preallocate_buffer_shape,
+                    dtype=x_3d.dtype,
                     device=self.device,
-                    dtype=self.dtype,
-                )
-                self.owns_block_input[graph_key] = True
-            else:
-                self.block_input[graph_key] = self.input_buffer[:seq_len, :, :]
-                self.owns_block_input[graph_key] = False
-            
+                ).contiguous()
+
+            self.block_input[graph_key] = self.input_buffer[:seq_len, :, :]
+            self.owns_block_input[graph_key] = False
+
         # Qwen2.5-VL
         if self._fullatt_block_indexes:
+            if cu_window_seqlens is None:
+                raise RuntimeError(
+                    "cu_window_seqlens is required for Qwen2.5-VL CUDA graph."
+                )
             if graph_key not in self.cu_window_len:
                 self.cu_window_len[graph_key] = cu_window_seqlens
                 self.cu_full_len[graph_key] = cu_seqlens
@@ -372,7 +395,11 @@ class ViTCudaGraphRunner:
             # make sure rotary workspace
             head_dim = position_embeddings[0].shape[1]
             sin_cos_dtype = position_embeddings[0].dtype
-            self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype)
+            if not self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype):
+                raise RuntimeError(
+                    "ViT CUDA graph sin/cos workspace is not compatible with "
+                    f"seq_len={seq_len}, head_dim={head_dim}, dtype={sin_cos_dtype}."
+                )
 
             used_cos_ws = self.sin_cos_ws[0][:seq_len, :]
             used_sin_ws = self.sin_cos_ws[1][:seq_len, :]
@@ -386,7 +413,11 @@ class ViTCudaGraphRunner:
             # make sure rotary workspace
             head_dim = rotary_pos_emb_cos.shape[1]
             sin_cos_dtype = rotary_pos_emb_cos.dtype
-            self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype)
+            if not self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype):
+                raise RuntimeError(
+                    "ViT CUDA graph sin/cos workspace is not compatible with "
+                    f"seq_len={seq_len}, head_dim={head_dim}, dtype={sin_cos_dtype}."
+                )
 
             used_cos_ws = self.sin_cos_ws[0][:seq_len, :]
             used_sin_ws = self.sin_cos_ws[1][:seq_len, :]
@@ -401,6 +432,7 @@ class ViTCudaGraphRunner:
 
         # 新建 graph 初始 hit 计为 1，避免刚建好就被下一轮驱逐。
         self.graph_hits[graph_key] = 1
+        self._evict_until_free(protected_key=graph_key)
 
         return graph_key
 
@@ -419,7 +451,11 @@ class ViTCudaGraphRunner:
             # update rotary workspace content
             head_dim = position_embeddings[0].shape[1]
             sin_cos_dtype = position_embeddings[0].dtype
-            self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype)
+            if not self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype):
+                raise RuntimeError(
+                    "ViT CUDA graph sin/cos workspace is not compatible with "
+                    f"seq_len={seq_len}, head_dim={head_dim}, dtype={sin_cos_dtype}."
+                )
             used_cos_ws = self.sin_cos_ws[0][:seq_len, :]
             used_sin_ws = self.sin_cos_ws[1][:seq_len, :]
             used_cos_ws.copy_(position_embeddings[0])
@@ -428,7 +464,11 @@ class ViTCudaGraphRunner:
             # update rotary workspace content
             head_dim = rotary_pos_emb_cos.shape[1]
             sin_cos_dtype = rotary_pos_emb_cos.dtype
-            self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype)
+            if not self._ensure_sin_cos_ws(seq_len, head_dim, sin_cos_dtype):
+                raise RuntimeError(
+                    "ViT CUDA graph sin/cos workspace is not compatible with "
+                    f"seq_len={seq_len}, head_dim={head_dim}, dtype={sin_cos_dtype}."
+                )
             used_cos_ws = self.sin_cos_ws[0][:seq_len, :]
             used_sin_ws = self.sin_cos_ws[1][:seq_len, :]
             used_cos_ws.copy_(rotary_pos_emb_cos)
@@ -455,16 +495,16 @@ class ViTCudaGraphRunner:
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
+        cu_window_seqlens: Optional[torch.Tensor],
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
-        grid_thw_key: Optional[Tuple] = None,
+        graph_layout_key: Optional[Tuple] = None,
     ) -> torch.Tensor:
         # x: [seq_len, hidden] -> [S, B=1, H]
         x_3d = x.unsqueeze(1)
-        graph_key = self._get_graph_key(x_3d, grid_thw_key)
+        graph_key = self._get_graph_key(x_3d, graph_layout_key)
 
         if graph_key not in self.block_graphs:
             self.create_graph(
@@ -474,7 +514,7 @@ class ViTCudaGraphRunner:
                 cu_window_seqlens=cu_window_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
-                grid_thw_key=grid_thw_key,
+                graph_layout_key=graph_layout_key,
             )
 
         return self.replay(

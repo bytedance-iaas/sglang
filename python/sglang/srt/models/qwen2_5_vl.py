@@ -75,7 +75,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.multimodal.vit_cuda_graph_runner import (
+    VIT_CUDA_GRAPH_MAX_SEQ_LEN,
+    ViTCudaGraphRunner,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -402,12 +405,39 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
+    def _get_cuda_graph_layout_key(self, grid_thw, cu_window_seqlens):
+        if isinstance(grid_thw, torch.Tensor):
+            grid_rows = grid_thw.tolist()
+        elif hasattr(grid_thw, "tolist"):
+            grid_rows = grid_thw.tolist()
+        else:
+            grid_rows = grid_thw
+        full_lens = tuple(
+            int(t) * int(h) * int(w) for t, h, w in grid_rows
+        )
+
+        window_cu = (
+            cu_window_seqlens.tolist()
+            if isinstance(cu_window_seqlens, torch.Tensor)
+            else list(cu_window_seqlens)
+        )
+        unique_window_cu = []
+        for value in window_cu:
+            value = int(value)
+            if not unique_window_cu or unique_window_cu[-1] != value:
+                unique_window_cu.append(value)
+        window_lens = tuple(
+            end - start
+            for start, end in zip(unique_window_cu[:-1], unique_window_cu[1:])
+        )
+        return full_lens, window_lens
+
     def forward(
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if self.enable_cg:
+        if self.enable_cg and x.shape[0] <= VIT_CUDA_GRAPH_MAX_SEQ_LEN:
             return self.forward_with_cuda_graph(x, grid_thw)
 
         # patchify
@@ -417,9 +447,9 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        window_index, cu_window_seqlens_list = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
-            cu_window_seqlens,
+            cu_window_seqlens_list,
             device=x.device,
             dtype=torch.int32,
         )
@@ -496,9 +526,12 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        window_index, cu_window_seqlens_list = self.get_window_index(grid_thw)
+        graph_layout_key = self._get_cuda_graph_layout_key(
+            grid_thw, cu_window_seqlens_list
+        )
         cu_window_seqlens = torch.tensor(
-            cu_window_seqlens,
+            cu_window_seqlens_list,
             device=x.device,
             dtype=torch.int32,
         )
@@ -548,11 +581,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=cu_window_seqlens,
             output_indices=reverse_indices,
-            grid_thw_key=(
-                tuple(map(tuple, grid_thw.tolist()))
-                if isinstance(grid_thw, torch.Tensor)
-                else tuple(map(tuple, grid_thw))
-            ),
+            graph_layout_key=graph_layout_key,
         )
 
 
