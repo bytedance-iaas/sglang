@@ -597,6 +597,62 @@ def get_chunked_prefill_embedding_legacy(
     return torch.concat(embedding_list, dim=0), input_ids
 
 
+def _get_item_feature_dim0(item: MultimodalDataItem) -> int:
+    shape = getattr(item.feature, "shape", None)
+    if shape is None or len(shape) == 0:
+        return 1
+    return max(int(shape[0]), 1)
+
+
+def _partition_miss_items_by_feature_size(
+    miss_items: List[Tuple[int, int, MultimodalDataItem, int, int]],
+    infer_times: int,
+) -> List[List[Tuple[int, int, MultimodalDataItem, int, int]]]:
+    if not miss_items:
+        return []
+
+    if len(miss_items) <= 1:
+        return [miss_items]
+
+    num_partitions = min(max(infer_times, 1), len(miss_items))
+    if num_partitions == 1:
+        return [miss_items]
+
+    total_size = sum(_get_item_feature_dim0(item) for _, _, item, _, _ in miss_items)
+    target_size = total_size / num_partitions
+
+    partitions = []
+    cur_partition = []
+    cur_size = 0
+
+    for idx, miss_item in enumerate(miss_items):
+        _, _, item, _, _ = miss_item
+        item_size = _get_item_feature_dim0(item)
+
+        remaining_items = len(miss_items) - idx
+        remaining_partitions = num_partitions - len(partitions)
+        if cur_partition and remaining_items == remaining_partitions:
+            partitions.append(cur_partition)
+            cur_partition = []
+            cur_size = 0
+        elif cur_partition and len(partitions) < num_partitions - 1:
+            size_with_item = cur_size + item_size
+            if cur_size >= target_size or abs(target_size - cur_size) <= abs(
+                target_size - size_with_item
+            ):
+                partitions.append(cur_partition)
+                cur_partition = []
+                cur_size = 0
+
+        cur_partition.append(miss_item)
+        cur_size += item_size
+
+    if cur_partition:
+        partitions.append(cur_partition)
+
+    return partitions
+
+
 def _get_chunked_prefill_embedding(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -613,6 +669,8 @@ def _get_chunked_prefill_embedding(
     """
     embedding_list = []
     device = input_ids.device
+    vit_infer_times = max(envs.SGLANG_VIT_INFER_TIMES.get(), 1)
+
     # FIXME(Xinyuan): temporary workaround for eagle3
     # FIXME(yhyang201): check this
     max_iterations = min(len(items_size) - 1, len(prefix_length))
@@ -671,15 +729,29 @@ def _get_chunked_prefill_embedding(
     miss_embeddings = []
     if all_miss_items:
         _move_items_to_device(all_miss_items, device)
-        # vit_input_tokens = sum(
-        #     item.feature.shape[0] for item in all_miss_items
-        #     if isinstance(item.feature, torch.Tensor)
-        # )
-        # logger.info(f"ViT batch: {len(all_miss_items)} items, {vit_input_tokens} input patches, {sum(all_miss_token_counts)} output tokens")
-        all_miss_embedding = data_embedding_func(all_miss_items)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
+        # Optionally split the missed items into multiple ViT calls to bound
+        # per-call peak memory / shape.  Controlled by SGLANG_VIT_INFER_TIMES.
+        if vit_infer_times > 1 and len(all_miss_items) > 1:
+            indexed_items = [
+                (0, idx, item, 0, 0) for idx, item in enumerate(all_miss_items)
+            ]
+            partitions = _partition_miss_items_by_feature_size(
+                indexed_items, vit_infer_times
+            )
+            partition_embeddings = []
+            for partition in partitions:
+                miss_item_list = [item for _, _, item, _, _ in partition]
+                part_embedding = data_embedding_func(miss_item_list)
+                part_embedding = part_embedding.reshape(
+                    -1, part_embedding.shape[-1]
+                )
+                partition_embeddings.append(part_embedding)
+            all_miss_embedding = torch.cat(partition_embeddings, dim=0)
+        else:
+            all_miss_embedding = data_embedding_func(all_miss_items)
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
         miss_embeddings = list(
             torch.split(all_miss_embedding, all_miss_token_counts, dim=0)
         )
