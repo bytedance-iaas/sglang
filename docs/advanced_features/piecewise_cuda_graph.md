@@ -42,6 +42,7 @@ python3 -m sglang.launch_server \
 | `--piecewise-cuda-graph-max-tokens` | `None` (auto) | Maximum token count to capture. Defaults to `chunked_prefill_size` (non-MLA) or `2048` (MLA). |
 | `--piecewise-cuda-graph-tokens` | `None` (auto) | Explicit list of token lengths to capture. Auto-generated if not set. |
 | `--piecewise-cuda-graph-compiler` | `"eager"` | Compiler backend for the captured subgraphs. Choices: `eager`, `inductor`. |
+| `--log-pcg-pad-stats` | `False` | Periodically log PCG padding statistics (raw vs padded token counts, avg/max pad ratio). Useful for tuning `--piecewise-cuda-graph-tokens`. See [Performance Tuning](#performance-tuning). |
 | ~~`--enable-piecewise-cuda-graph`~~ | — | **Deprecated.** PCG is now enabled by default. Use `--enforce-piecewise-cuda-graph` to skip auto-disable conditions. |
 
 ## Bug Report
@@ -155,6 +156,88 @@ The default capture schedule is auto-generated with increasing granularity:
 | 4096+       | 512       |
 
 For the auto-generated schedule, sizes are capped at `--piecewise-cuda-graph-max-tokens`. The default cap is `chunked_prefill_size` for non-MLA models and `2048` for MLA backend models. If `--max-total-tokens` is set, the cap is further limited to not exceed it. Additionally, Llama-2 models are auto-capped at 4096 tokens as a temporary workaround.
+
+## Performance Tuning
+
+PCG's benefit is **not universal** — whether it improves throughput depends on the interplay between kernel-launch overhead, kernel execution time, and padding overhead. This section gives an empirical framework for deciding when (and how) to use PCG.
+
+### When PCG helps vs hurts
+
+PCG throughput delta ≈ `Σ(launch overhead saved)` − `Σ(pad waste)` − `Σ(replay_prepare overhead)`
+
+For the delta to be positive:
+
+| Factor | Favors PCG (speedup) | Hurts PCG (regression) |
+|---|---|---|
+| **Model architecture** | Many small ops per layer (hybrid linear / SSM, MoE with frequent dispatch/combine, models with lots of normalization/residual fusions) | Dense Transformer with a few heavy ops per layer |
+| **Token count per request** | Small prefill (≤ 256 tokens): launch overhead dominates wall time | Large prefill (> 1024 tokens): already compute-bound, launch savings are negligible |
+| **Bucket alignment** | `raw_tokens` falls very close to a captured bucket (pad ratio ≈ 1.0) | `raw_tokens` falls just above a bucket boundary (pad ratio ≥ 1.1) |
+| **GPU** | High FLOPs/launch ratio (H100, H200) | Memory-bound or older GPUs where pad wastes more time |
+
+As a rule of thumb:
+
+- **Hybrid-linear / Mamba-like / MoE models** (e.g. Qwen3.5-MoE) tend to see consistent speedup because per-layer kernel count is higher.
+- **Dense VL models** (e.g. Qwen2.5-VL, Qwen3-VL) often show **neutral or slightly negative** impact on prefill benchmarks, especially once image tokens push per-request token counts into the hundreds or thousands.
+- Even within a single model, a small prefill request may speed up by ~5% while a large one slows by ~1%, canceling out over a mixed workload.
+
+We recommend **benchmarking on your actual workload** before deciding to keep PCG enabled in production.
+
+### Observing padding overhead
+
+Padding is the single most tunable source of PCG overhead. To quantify it for your workload, enable:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path <your model> \
+    --log-pcg-pad-stats
+```
+
+Every 100 replays the server logs a line such as:
+
+```
+[PCG pad stats] count=100 avg_pad_ratio=1.045 max_pad_ratio=1.180 (raw_sum=82341 padded_sum=86031)
+```
+
+Interpreting the numbers:
+
+- `avg_pad_ratio` close to 1.02 — padding overhead is minimal; buckets are well-matched.
+- `avg_pad_ratio` ≥ 1.10 — meaningful compute is being wasted on padded tokens; consider tuning `--piecewise-cuda-graph-tokens`.
+- `max_pad_ratio` ≥ 1.30 — at least one request fell near the start of a wide bucket interval (most common around the 1024→1280 or 4096→4608 jumps).
+
+This flag is off by default and introduces no graph-break risk because the accounting happens outside any compiled graph.
+
+### Tuning `--piecewise-cuda-graph-tokens`
+
+If `avg_pad_ratio` is high, override the default schedule to match your request distribution:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path <your model> \
+    --piecewise-cuda-graph-tokens 4 8 16 32 64 96 128 160 192 224 256 \
+                                  288 320 384 448 512 640 768 896 1024
+```
+
+Guidelines:
+
+1. **Analyze first** — collect real prefill token counts (the server's `Prefill batch` log line contains `#new-token`). Build a histogram and identify the hot ranges.
+2. **Densify hot ranges** — where 80%+ of requests live, space buckets ≤ 5% apart (so `max pad ratio < 1.05`).
+3. **Drop cold ranges** — each bucket costs one warmup + one captured cudagraph (≈ a few hundred MB of GPU memory and a few seconds of startup), so don't keep buckets you'll never hit.
+4. **Watch the big jumps** — the default schedule transitions from step=64 to step=256 at 1024. If many of your requests fall in 1025–1536, inserting extra buckets (e.g. 1088, 1152, 1216, 1280) can noticeably reduce waste.
+5. **Re-measure** — re-enable `--log-pcg-pad-stats` and confirm `avg_pad_ratio` actually dropped before trusting the new schedule.
+
+### A concrete example
+
+From a Qwen3-VL benchmark with 720-px images (525 raw tokens → 576 padded bucket):
+
+| Config | `avg_pad_ratio` | Per-request latency |
+|---|---|---|
+| PCG on, default buckets | 1.097 | 278.5 ms |
+| PCG off | — | 274.6 ms |
+| PCG on, custom buckets with 528 inserted | ~1.01 | ~275 ms |
+
+Here padding ate the ~5 ms of launch overhead that PCG would otherwise save; inserting a 528 bucket recovers the savings. The same benchmark on Qwen3.5-9B (a hybrid-linear model) stayed net-positive even at `pad_ratio=1.07`, because the launch savings from the denser kernel graph dominated the pad waste.
+
+The takeaway: **treat PCG and its bucket schedule as a pair of knobs to tune together**, not as a global on/off switch.
 
 ## Compatibility
 
