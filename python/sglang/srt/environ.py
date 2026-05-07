@@ -475,6 +475,7 @@ class Envs:
     SGLANG_VIT_PACK = EnvBool(False)
     SGLANG_VIT_INFER_TIMES = EnvInt(1)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    SGLANG_VISION_ATTN_FP8 = EnvBool(False)
 
 
     # VLM Item CUDA IPC Transport
