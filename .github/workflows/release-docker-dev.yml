@@ -8,13 +8,18 @@ on:
         required: false
         default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
+        description: "Custom tag suffix"
         required: false
         default: ""
       image_repo:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
+      compile_kernel:
+        description: "Build sgl-kernel from source (Volcengine fork only)"
+        required: false
+        type: boolean
+        default: true
   schedule:
     - cron: "0 0 * * *"
 
@@ -68,6 +73,7 @@ jobs:
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
   build-and-publish:
+    if: github.repository == 'sgl-project/sglang'
     needs: prepare
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
@@ -80,9 +86,101 @@ jobs:
 
   cleanup-nightly:
     needs: build-and-publish
-    if: ${{ !inputs.tag && !inputs.pr_number }}
+    if: ${{ github.repository == 'sgl-project/sglang' && !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
       tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+    secrets: inherit
+
+  build-dev-kernel-wheel:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_tag: x86
+            cuda_version: "12.9"
+          - arch_tag: x86-cu13
+            cuda_version: "13.0"
+    uses: ./.github/workflows/release-whl-kernel.yml
+    with:
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_version: ${{ matrix.cuda_version }}
+      artifact_name: sgl-kernel-${{ matrix.arch_tag }}
+
+  build-dev:
+    needs: [build-dev-kernel-wheel]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: ""
+            artifact_name: sgl-kernel-x86
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
+            hopper_sbo: 1
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: hopper-sbo
+            artifact_name: sgl-kernel-x86
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 1
+            variant_suffix: w4a8-per-tensor-transfer
+            artifact_name: sgl-kernel-x86
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: ""
+            artifact_name: sgl-kernel-x86-cu13
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            hopper_sbo: 1
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: hopper-sbo
+            artifact_name: sgl-kernel-x86-cu13
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 1
+            variant_suffix: w4a8-per-tensor-transfer
+            artifact_name: sgl-kernel-x86-cu13
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_key: ${{ matrix.cuda_key }}
+      cuda_version: ${{ matrix.cuda_version }}
+      cuda_suffix: ${{ matrix.cuda_suffix }}
+      variant_suffix: ${{ matrix.variant_suffix }}
+      tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      use_environment: prod
+      registry_host: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      image_repo: ${{ vars.VOLCENGINE_CR_REGISTRY }}/${{ vars.VOLCENGINE_CR_NAMESPACE }}/${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }}
+        --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }}
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
     secrets: inherit
