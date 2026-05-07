@@ -89,6 +89,7 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 ]
 
 HOPPER_TMA_ALIGN_BYTE = 16
+FA3_ENABLE_FP8_SHAPE = 2400
 
 @dataclasses.dataclass
 class SingletonCache:
@@ -441,7 +442,7 @@ class VisionFlash3Attention(nn.Module):
             avg_len = q.shape[0] / num_images if num_images > 0 else q.shape[0]
 
             # Use FP8 TMA optimization for thresholds above 4800
-            use_fp8 = avg_len > 4800
+            use_fp8 = avg_len > FA3_ENABLE_FP8_SHAPE
         else:
             use_fp8 = False
 
