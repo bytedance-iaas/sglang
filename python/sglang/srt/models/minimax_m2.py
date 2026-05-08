@@ -88,8 +88,8 @@ from sglang.srt.server_args import get_global_server_args
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
 # Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    LazyValue,
     BumpAllocator,
+    LazyValue,
     add_prefix,
     get_bool_env_var,
     get_compiler_backend,
