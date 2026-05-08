@@ -24,6 +24,7 @@ _is_otel_imported = False
 otel_import_error_traceback: Optional[str] = None
 tracer = None
 meter = None
+_IS_PYDANTIC_V1 = version("pydantic") < "2.0.0"
 
 try:
     import msgspec  # type: ignore
@@ -594,7 +595,7 @@ def model_as_dict(model):
     ):
         # Fast-path chunks are msgspec Structs; convert to plain dict for accumulation.
         return msgspec.structs.asdict(model)
-    if version("pydantic") < "2.0.0":
+    if _IS_PYDANTIC_V1:
         return model.dict()
     if hasattr(model, "model_dump"):
         return model.model_dump()
@@ -627,10 +628,10 @@ def accumulate_stream_items(item, complete_response):
         if item.get("choices"):
             for choice in item.get("choices"):
                 index = choice.get("index")
-                if len(complete_response.get("choices")) <= index:
+                while len(complete_response.get("choices")) <= index:
                     complete_response["choices"].append(
                         {
-                            "index": index,
+                            "index": len(complete_response.get("choices")),
                             "message": {
                                 "content": "",
                                 "role": "",
@@ -647,6 +648,8 @@ def accumulate_stream_items(item, complete_response):
                     )
 
                 delta = choice.get("delta")
+                if not delta:
+                    continue
 
                 if delta.get("content"):
                     complete_choice["message"]["content"] += delta.get("content")
@@ -669,7 +672,7 @@ def accumulate_stream_items(item, complete_response):
 
                     for tool_call in tool_calls:
                         i = int(tool_call["index"])
-                        if len(complete_choice["message"]["tool_calls"]) <= i:
+                        while len(complete_choice["message"]["tool_calls"]) <= i:
                             complete_choice["message"]["tool_calls"].append(
                                 {"id": "", "function": {"name": "", "arguments": ""}}
                             )
@@ -784,7 +787,7 @@ class OpenTelemetryProvider:
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_FIRST_TOKEN,
-                        time_of_first_token - start_time
+                        time_of_first_token - start_time,
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_GENERATE,
