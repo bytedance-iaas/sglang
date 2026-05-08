@@ -82,7 +82,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 
-# get_bool_env_var is defined in sglang.srt.utils.common, not s_routed_experts_weights_of_layer_routed_experts_weights_of_layerglang.srt.distributed.
+# get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
 # native MiniMaxM2ForCausalLM from registering in ModelRegistry. The fallback to the
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
@@ -698,7 +698,6 @@ class MiniMaxM2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
-
 
 class MiniMaxM2Attention(nn.Module):
     """MiniMax Attention implementation with QK normalization and partial RoPE."""
