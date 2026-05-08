@@ -105,6 +105,7 @@ def _fast_sse_content(
     logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
+    complete_response: Dict[str, Any] = None,
 ) -> str:
     delta = _StreamDelta(
         role=role, content=content, reasoning_content=reasoning_content
@@ -124,6 +125,7 @@ def _fast_sse_content(
         choices=[choice],
         usage=usage,
     )
+    accumulate_stream_items(chunk, complete_response)
     return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()
 
 
@@ -834,8 +836,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    accumulate_stream_items(chunk, complete_response)
-
                     yield _fast_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
@@ -843,6 +843,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         index=index,
                         role="assistant",
                         content="",
+                        complete_response=complete_response,
                     )
                     stream_started = True
 
@@ -868,8 +869,6 @@ class OpenAIServingChat(OpenAIServingBase):
                                 completion_tokens=completion_tokens.get(index, 0),
                             ).model_dump()
 
-                        accumulate_stream_items(chunk, complete_response)
-
                         yield _fast_sse_content(
                             chunk_id=content["meta_info"]["id"],
                             created=int(time.time()),
@@ -877,6 +876,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=index,
                             reasoning_content=reasoning_text,
                             usage=usage,
+                            complete_response=complete_response,
                         )
 
                 # Handle tool calls
@@ -918,8 +918,6 @@ class OpenAIServingChat(OpenAIServingBase):
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             ).model_dump()
-
-                        accumulate_stream_items(chunk, complete_response)
                         yield _fast_sse_content(
                             chunk_id=content["meta_info"]["id"],
                             created=int(time.time()),
@@ -928,6 +926,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             content=delta,
                             logprobs=choice_logprobs,
                             usage=usage,
+                            complete_response=complete_response,
                         )
 
             # Send finish_reason chunks for each index that completed
@@ -940,7 +939,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-                accumulate_stream_items(finish_reason_chunk, complete_response)
                 yield _fast_sse_content(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -948,6 +946,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=idx,
                     finish_reason=final_finish_reason,
                     matched_stop=matched_stop,
+                    complete_response=complete_response,
                 )
 
             # Send hidden states if requested

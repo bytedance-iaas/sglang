@@ -24,6 +24,14 @@ _is_otel_imported = False
 otel_import_error_traceback: Optional[str] = None
 tracer = None
 meter = None
+
+try:
+    import msgspec  # type: ignore
+
+    _is_msgspec_available = True
+except ImportError:
+    msgspec = None  # type: ignore
+    _is_msgspec_available = False
 try:
     from opentelemetry.context import get_current
     from opentelemetry.context.context import Context
@@ -490,6 +498,9 @@ def set_completions(span, choices):
             _set_span_attribute(span, f"{prefix}.refusal", message.get("refusal"))
         else:
             _set_span_attribute(span, f"{prefix}.content", message.get("content"))
+            _set_span_attribute(
+                span, f"{prefix}.reasoning_content", message.get("reasoning_content")
+            )
 
         function_call = message.get("function_call")
         if function_call:
@@ -572,6 +583,17 @@ def should_send_prompts():
 
 
 def model_as_dict(model):
+    # Keep this helper tolerant of different model containers:
+    # - raw dicts
+    # - msgspec Structs (fast streaming chunks)
+    # - pydantic models (v1/v2)
+    if isinstance(model, dict):
+        return model
+    if _is_msgspec_available and hasattr(msgspec, "Struct") and isinstance(
+        model, msgspec.Struct
+    ):
+        # Fast-path chunks are msgspec Structs; convert to plain dict for accumulation.
+        return msgspec.structs.asdict(model)
     if version("pydantic") < "2.0.0":
         return model.dict()
     if hasattr(model, "model_dump"):
@@ -607,7 +629,14 @@ def accumulate_stream_items(item, complete_response):
                 index = choice.get("index")
                 if len(complete_response.get("choices")) <= index:
                     complete_response["choices"].append(
-                        {"index": index, "message": {"content": "", "role": ""}}
+                        {
+                            "index": index,
+                            "message": {
+                                "content": "",
+                                "role": "",
+                                "reasoning_content": "",
+                            },
+                        }
                     )
                 complete_choice = complete_response.get("choices")[index]
                 if choice.get("finish_reason"):
@@ -621,6 +650,11 @@ def accumulate_stream_items(item, complete_response):
 
                 if delta.get("content"):
                     complete_choice["message"]["content"] += delta.get("content")
+
+                if delta.get("reasoning_content"):
+                    complete_choice["message"]["reasoning_content"] += delta.get(
+                        "reasoning_content"
+                    )
 
                 if delta.get("role"):
                     complete_choice["message"]["role"] = delta.get("role")
