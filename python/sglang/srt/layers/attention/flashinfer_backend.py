@@ -26,14 +26,20 @@ from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
+    CPTritonContext,
     cp_lse_ag_out_rs,
+    correct_attn_out,
     create_flashinfer_kv_indices_for_dcp_triton,
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    enable_num_token_non_padded,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -142,6 +148,20 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_dllm_model = self.dllm_config is not None
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
+        self.total_kv_heads = model_runner.model_config.get_total_num_kv_heads()
+        self.attn_tp_size = get_attention_tp_size()
+        self.kv_head_replication = max(1, self.attn_tp_size // self.total_kv_heads)
+
+        if self.dcp_size > 1 and self.kv_head_replication < self.dcp_size:
+            raise ValueError(
+                "Unsupported DCP decode configuration for FlashInferAttention: "
+                f"dcp_size={self.dcp_size} requires each DCP group to stay within "
+                "replicated KV-head shards, but "
+                f"attn_tp_size={self.attn_tp_size}, total_kv_heads={self.total_kv_heads}, "
+                f"kv_head_replication={self.kv_head_replication}. "
+                "Current implementation assumes DCP partners share the same KV-head shard; "
+                "otherwise q all-gather and CP output merge will mix different KV shards."
+            )
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -155,6 +175,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.may_have_padded_extend_tokens = enable_num_token_non_padded(
+            model_runner.server_args
+        )
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -830,13 +853,46 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+        padded_num_tokens = q.shape[0]
+        attn_num_tokens = padded_num_tokens
+        cache_loc_for_kv = cache_loc
+        dcp_kv_mask_for_kv = forward_batch.dcp_kv_mask
+
+        # DeepEP/EP sync can pad the local token dimension for collective MLP
+        # communication, while FlashInfer ragged prefill metadata still describes
+        # only real extend tokens. Keep attention/KV writes on real tokens and
+        # pad the output back before returning to the model.
+        if (
+            self.may_have_padded_extend_tokens
+            and self.forward_metadata.use_ragged
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.num_token_non_padded_cpu is not None
+        ):
+            attn_num_tokens = forward_batch.num_token_non_padded_cpu
+
+            if attn_num_tokens < padded_num_tokens:
+                q = q[:attn_num_tokens].contiguous()
+                if k is not None and k.shape[0] == padded_num_tokens:
+                    k = k[:attn_num_tokens].contiguous()
+                if v is not None and v.shape[0] == padded_num_tokens:
+                    v = v[:attn_num_tokens].contiguous()
+                if cache_loc_for_kv is not None:
+                    cache_loc_for_kv = cache_loc_for_kv[:attn_num_tokens]
+                if dcp_kv_mask_for_kv is not None:
+                    dcp_kv_mask_for_kv = dcp_kv_mask_for_kv[:attn_num_tokens]
+
         if not self.forward_metadata.use_ragged:
             assert self.dcp_size == 1, "DCP must use ragged wrapper"
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        cache_loc_for_kv,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
                     )
 
             causal = (
@@ -921,6 +977,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         s2,
                         get_dcp_group(),
                         return_lse=True,
+                        use_log2_lse=False,
                     )
                     o2 = o2.contiguous()
                     s2 = s2.contiguous()
@@ -930,16 +987,26 @@ class FlashInferAttnBackend(AttentionBackend):
             if save_kv_cache:
                 kwargs = {}
                 if self.dcp_size > 1:
-                    kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
+                    kwargs["dcp_kv_mask"] = dcp_kv_mask_for_kv
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    cache_loc,
+                    cache_loc_for_kv,
                     k,
                     v,
                     layer.k_scale,
                     layer.v_scale,
                     **kwargs,
                 )
+
+        if attn_num_tokens < padded_num_tokens:
+            padded_o = o.new_empty(
+                (padded_num_tokens, layer.tp_q_head_num, layer.head_dim)
+            )
+            padded_o[:attn_num_tokens] = o.view(
+                attn_num_tokens, layer.tp_q_head_num, layer.head_dim
+            )
+            padded_o[attn_num_tokens:].zero_()
+            o = padded_o
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -996,7 +1063,37 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         if self.dcp_size > 1:
-            o = cp_lse_ag_out_rs(o, s, get_dcp_group())
+            dcp_group = get_dcp_group()
+            corrected_out = o.new_empty(o.transpose(0, 1).shape)
+            gathered_s = dcp_group.all_gather(s.clone(), dim=0).view(
+                (dcp_group.world_size,) + s.shape
+            )
+            corrected_out, _ = correct_attn_out(
+                o,
+                gathered_s,
+                dcp_group.rank_in_group,
+                CPTritonContext(),
+                corrected_out,
+                use_log2_lse=False,
+            )
+            corrected_out = dcp_group.all_reduce(corrected_out)
+            corrected_out = corrected_out.transpose(0, 1).contiguous()
+
+            # The gathered q tensor is laid out as DCP peer q-head blocks. After
+            # CP correction, each TP rank must take back its own local block.
+            local_q_heads = layer.tp_q_head_num
+            total_q_heads = corrected_out.shape[1]
+            if total_q_heads == local_q_heads * dcp_group.world_size:
+                local_block_idx = get_attention_tp_rank() % dcp_group.world_size
+                o = corrected_out[
+                    :,
+                    local_block_idx
+                    * local_q_heads : (local_block_idx + 1)
+                    * local_q_heads,
+                    :,
+                ].contiguous()
+            else:
+                o = corrected_out[:, :local_q_heads, :].contiguous()
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
