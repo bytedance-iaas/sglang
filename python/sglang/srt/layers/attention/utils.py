@@ -1457,6 +1457,7 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    USE_LOG2_LSE: tl.constexpr,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -1493,13 +1494,20 @@ def _correct_attn_cp_out_kernel(
     neg_inf = float("-inf")
     lse = tl.where((lse != lse) | (lse == float("inf")), neg_inf, lse)
 
-    # Online softmax: find max, subtract, exp, sum, log
+    # Online softmax: find max, subtract, exp, sum, log. FlashInfer returns
+    # natural-log LSE, while some FA paths use log2 LSE.
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
     lse = lse - lse_max
-    lse_exp = tl.exp2(lse)
+    if USE_LOG2_LSE:
+        lse_exp = tl.exp2(lse)
+    else:
+        lse_exp = tl.exp(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    final_lse = tl.log2(lse_acc) + lse_max
+    if USE_LOG2_LSE:
+        final_lse = tl.log2(lse_acc) + lse_max
+    else:
+        final_lse = tl.log(lse_acc) + lse_max
 
     # Compute correction factor
     lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
@@ -1510,7 +1518,10 @@ def _correct_attn_cp_out_kernel(
         neg_inf,
         lse_diff,
     )
-    factor = tl.exp2(lse_diff)
+    if USE_LOG2_LSE:
+        factor = tl.exp2(lse_diff)
+    else:
+        factor = tl.exp(lse_diff)
 
     # Store final LSE
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
@@ -1553,6 +1564,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: Optional[CPTritonContext],
     new_output: torch.Tensor = None,
+    use_log2_lse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -1616,7 +1628,11 @@ def correct_attn_out(
         no_sD,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
+    const_args = {
+        "HEAD_DIM": D,
+        "N_ROUNDED": N,
+        "USE_LOG2_LSE": use_log2_lse,
+    }
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
@@ -1628,6 +1644,7 @@ def cp_lse_ag_out_rs(
     cp_group: GroupCoordinator,
     ctx: Optional[CPTritonContext] = None,
     return_lse: bool = False,
+    use_log2_lse: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -1649,7 +1666,12 @@ def cp_lse_ag_out_rs(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
     out, lse = correct_attn_out(
-        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        ctx,
+        new_output,
+        use_log2_lse=use_log2_lse,
     )
     if return_lse:
         # We need rank-local (out, lse) pairs aligned on the same head slice.
