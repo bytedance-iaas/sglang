@@ -16,11 +16,14 @@
 # https://github.com/vllm-project/vllm/blob/14f91fe67c2342f2fe859dc6a5c40810df0e1c61/vllm/model_executor/models/deepseek.py
 """Inference-only Deepseek model."""
 
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -286,12 +289,22 @@ class DeepseekAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    _trace_logged = False
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if not DeepseekAttention._trace_logged:
+            logger.info(
+                f"[TRACE] LLM Attention (DeepseekAttention) | "
+                f"File: sglang/python/sglang/srt/models/deepseek.py, Line: 289 | "
+                f"hidden_states_shape={list(hidden_states.shape)}, "
+                f"num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}"
+            )
+            DeepseekAttention._trace_logged = True
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -347,6 +360,8 @@ class DeepseekDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    _trace_logged = False
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -354,6 +369,14 @@ class DeepseekDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if not DeepseekDecoderLayer._trace_logged:
+            logger.info(
+                f"[TRACE] LLM Transformer Block (DeepseekDecoderLayer) | "
+                f"File: sglang/python/sglang/srt/models/deepseek.py, Line: 350 | "
+                f"hidden_states_shape={list(hidden_states.shape)}, "
+                f"mlp_type={type(self.mlp).__name__}"
+            )
+            DeepseekDecoderLayer._trace_logged = True
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -459,6 +482,13 @@ class DeepseekForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        logger.info(
+            f"[TRACE] LLM Forward (DeepseekForCausalLM) | "
+            f"File: sglang/python/sglang/srt/models/deepseek.py, Line: 454 | "
+            f"input_ids_shape={list(input_ids.shape)}, "
+            f"num_layers={self.config.num_hidden_layers}, "
+            f"has_input_embeds={input_embeds is not None}"
+        )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

@@ -1,3 +1,4 @@
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +11,8 @@ from transformers import (
     PretrainedConfig,
     ProcessorMixin,
 )
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
@@ -434,6 +437,12 @@ class DeepseekOCRProcessor(ProcessorMixin):
         cropping: bool = True,
     ):
         """Tokenize text with <image> tags."""
+        logger.info(
+            f"[TRACE] Image Preprocessing (tokenize_with_images) | "
+            f"File: sglang/python/sglang/srt/configs/deepseek_ocr.py, Line: 430 | "
+            f"num_images={len(images)}, image_sizes={[img.size for img in images]}, "
+            f"base_size={self.base_size}, image_size={self.image_size}, ocr2_mode={self.ocr2_mode}"
+        )
 
         conversation = conversation
         assert conversation.count(self.image_token) == len(images)
