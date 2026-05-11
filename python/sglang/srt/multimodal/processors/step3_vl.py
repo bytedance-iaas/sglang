@@ -361,13 +361,8 @@ class Step3VLProcessor:
 
     def _split_images(self, images: list[Image.Image]) -> list[ImageWithPatches]:
         result = []
-        import time
-
-        s_time = time.time()
         for img in images:
             result.append(self.patcher(img))
-        e_time = time.time()
-        print("split cost {} ms".format((e_time - s_time) * 1000))
         return result
 
     def _convert_images_to_pixel_values(
