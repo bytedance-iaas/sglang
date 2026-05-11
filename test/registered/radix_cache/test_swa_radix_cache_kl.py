@@ -8,7 +8,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 MODEL = "openai/gpt-oss-20b"
 _CUDA_PR_UT_EVENTS = ("pull_request", "workflow_dispatch")
 
-register_cuda_ci(est_time=151, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=163, suite="stage-b-test-1-gpu-large")
 
 
 @unittest.skipIf(

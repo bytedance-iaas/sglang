@@ -5,8 +5,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 from sglang.test.test_utils import is_in_ci
 
-register_cuda_ci(est_time=392, suite="stage-c-test-4-gpu-h100")
-register_cuda_ci(est_time=740, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=354, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=417, suite="stage-c-test-4-gpu-b200")
 
 
 def is_pr_ci():

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=232, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=223, suite="stage-b-test-1-gpu-large")
 
 _CUDA_PR_UT_EVENTS = ("pull_request", "workflow_dispatch")
 
