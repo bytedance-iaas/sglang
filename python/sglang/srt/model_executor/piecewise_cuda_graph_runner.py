@@ -17,12 +17,11 @@ from __future__ import annotations
 
 import bisect
 import gc
-import inspect
 import logging
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import tqdm
@@ -43,6 +42,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -59,7 +59,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_npu,
+    log_info_on_rank0,
+    require_gathered_buffer,
+)
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
@@ -80,6 +85,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    input_deepstack_embeds: Optional[torch.Tensor] = None
 
 
 @contextmanager
@@ -190,6 +196,21 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        # When the layer communicator scatters/gathers across the attention TP
+        # group (e.g. with --moe-dense-tp-size 1), the model's reduce_scatter
+        # requires the token count to be divisible by attn_tp_size * attn_cp_size.
+        # Drop captures that would violate this (mirrors the filter used by
+        # the regular CUDA graph runner in get_batch_sizes_to_capture).
+        if require_gathered_buffer(self.model_runner.server_args):
+            mul_base = self.attn_tp_size
+            attn_cp_size = get_attention_cp_size()
+            if mul_base % attn_cp_size != 0:
+                mul_base *= attn_cp_size
+            filtered = [n for n in self.capture_num_tokens if n % mul_base == 0]
+            assert (
+                len(filtered) > 0
+            ), f"No piecewise CUDA graph capture sizes are multiples of {mul_base}"
+            self.capture_num_tokens = filtered
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
@@ -206,7 +227,13 @@ class PiecewiseCudaGraphRunner:
         self.max_bs = model_runner.req_to_token_pool.size
 
         self.is_multimodal = model_runner.is_multimodal
+        self.num_deepstack_embeddings = int(
+            getattr(model_runner.model, "num_deepstack_embeddings", 0) or 0
+        )
         self.mamba_track_enabled = self.is_mamba_track_enabled()
+        # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
+        # CUDA graph capture must use the same flag value as replay for those models.
+        self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # Graph inputs
         with torch.device(self.device):
@@ -238,6 +265,7 @@ class PiecewiseCudaGraphRunner:
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+            input_deepstack_embeds = None
             if (
                 self.is_multimodal
             ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
@@ -248,6 +276,15 @@ class PiecewiseCudaGraphRunner:
                     (self.max_num_tokens, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
                 )
+                if self.num_deepstack_embeddings > 0:
+                    input_deepstack_embeds = torch.zeros(
+                        (
+                            self.max_num_tokens,
+                            self.model_runner.model_config.hidden_size
+                            * self.num_deepstack_embeddings,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
                 mrope_positions = torch.zeros(
                     (3, self.max_num_tokens), dtype=torch.int64
                 )
@@ -265,6 +302,7 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            input_deepstack_embeds=input_deepstack_embeds,
         )
         self.buffers.share_buffers()
 
@@ -319,11 +357,37 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+        # Optional padding statistics for PCG tuning. Enable via
+        # --log-pcg-pad-stats to get a running report of raw vs padded token
+        # counts and pad ratios. This helps tune --piecewise-cuda-graph-tokens
+        # to match the request distribution of a real workload and avoid
+        # wasted computation on padded tokens.
+        self._log_pad_stats: bool = getattr(
+            self.model_runner.server_args, "log_pcg_pad_stats", False
+        )
+        self._pad_stats_log_interval: int = 100
+        if self._log_pad_stats:
+            self._pad_stats = {
+                "total_raw": 0,
+                "total_padded": 0,
+                "count": 0,
+                "max_ratio": 1.0,
+            }
+        else:
+            self._pad_stats = None
+
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
         buffers = self.buffers
         input_ids = buffers.input_ids[:num_tokens]
         input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        input_deepstack_embeds = (
+            buffers.input_deepstack_embeds[:num_tokens]
+            if buffers.input_deepstack_embeds is not None
+            else None
+        )
+        if input_deepstack_embeds is not None:
+            input_deepstack_embeds.zero_()
         positions = buffers.positions[:num_tokens]
         mrope_positions = (
             buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -355,6 +419,7 @@ class PiecewiseCudaGraphRunner:
                 batch_size=1,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -388,8 +453,10 @@ class PiecewiseCudaGraphRunner:
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
         # Attention backend
@@ -413,54 +480,70 @@ class PiecewiseCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
-    def _get_inner_language_model(self) -> torch.nn.Module:
-        """Return the inner language model that gets torch.compile'd (same logic as __init__)."""
-        language_model = getattr(
-            self.model_runner.model, "language_model", self.model_runner.model
-        )
-        return getattr(language_model, "model", language_model)
+    def _maybe_record_pad_stats(self, raw_num_tokens: int, padded_num_tokens: int):
+        """Accumulate PCG padding statistics and periodically log them.
 
-    def _build_multimodal_warmup_kwargs(
-        self, input_embeds: torch.Tensor
-    ) -> Dict[str, Any]:
-        """Construct extra kwargs so that the warmup/capture call to the inner
-        language_model sees the exact same kwarg signature as the runtime
-        multimodal request (``general_mm_embed_routine``). Without this, dynamo
-        will recompile at runtime when an Optional[Tensor] kwarg (e.g.
-        ``input_deepstack_embeds``) flips from ``None`` to a real tensor,
-        which then triggers the PCG capture-stream assertion.
+        Gated by ``--log-pcg-pad-stats``. Collects ``(raw_tokens, padded_tokens)``
+        pairs across replays so operators can see how much computation is
+        wasted on padded tokens and decide whether to tune
+        ``--piecewise-cuda-graph-tokens`` to better match their real workload.
+        Executed on the Python side (outside any compiled graph), so it is
+        safe w.r.t. dynamo / cudagraph capture.
         """
-        kwargs: Dict[str, Any] = {}
-        inner_model = self._get_inner_language_model()
-        try:
-            sig = inspect.signature(inner_model.forward)
-        except (TypeError, ValueError):
-            return kwargs
-
-        outer_model = self.model_runner.model
-        num_tokens = input_embeds.shape[0]
-        hidden_size = input_embeds.shape[-1]
-
-        # ``input_deepstack_embeds`` comes from Qwen3-VL / Qwen3.5-VL. Runtime
-        # passes a [num_tokens, hidden_size * num_deepstack_embeddings] tensor.
-        if "input_deepstack_embeds" in sig.parameters:
-            num_deepstack = getattr(outer_model, "num_deepstack_embeddings", 0) or 0
-            use_deepstack = bool(getattr(outer_model, "use_deepstack", False))
-            if use_deepstack and num_deepstack > 0:
-                kwargs["input_deepstack_embeds"] = torch.zeros(
-                    (num_tokens, hidden_size * num_deepstack),
-                    dtype=input_embeds.dtype,
-                    device=input_embeds.device,
-                )
-
-        return kwargs
+        if not self._log_pad_stats or self._pad_stats is None:
+            return
+        stats = self._pad_stats
+        stats["total_raw"] += raw_num_tokens
+        stats["total_padded"] += padded_num_tokens
+        stats["count"] += 1
+        ratio = padded_num_tokens / max(raw_num_tokens, 1)
+        if ratio > stats["max_ratio"]:
+            stats["max_ratio"] = ratio
+        if stats["count"] % self._pad_stats_log_interval == 0:
+            avg_ratio = stats["total_padded"] / max(stats["total_raw"], 1)
+            log_info_on_rank0(
+                logger,
+                f"[PCG pad stats] count={stats['count']} "
+                f"avg_pad_ratio={avg_ratio:.3f} "
+                f"max_pad_ratio={stats['max_ratio']:.3f} "
+                f"(raw_sum={stats['total_raw']} "
+                f"padded_sum={stats['total_padded']})",
+            )
 
     def can_run(self, forward_batch: ForwardBatch):
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
             return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
+        # Disable for token embedding overrides (dynamic per-request)
+        if forward_batch.replace_embeds is not None:
+            return False
+        if (
+            self.num_deepstack_embeddings > 0
+            and self.buffers.input_deepstack_embeds is None
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
+        if (
+            self.buffers.mrope_positions is not None
+            and forward_batch.mrope_positions is not None
+            and (
+                forward_batch.mrope_positions.ndim != 2
+                or forward_batch.mrope_positions.shape[0] != 3
+                or forward_batch.mrope_positions.shape[1] != num_tokens
+            )
+        ):
+            return False
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -512,6 +595,13 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
         input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        input_deepstack_embeds = (
+            buffers.input_deepstack_embeds[:num_tokens]
+            if buffers.input_deepstack_embeds is not None
+            else None
+        )
+        if input_deepstack_embeds is not None:
+            input_deepstack_embeds.zero_()
 
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         out_cache_loc_swa = (
@@ -554,6 +644,7 @@ class PiecewiseCudaGraphRunner:
                 batch_size=bs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -587,8 +678,10 @@ class PiecewiseCudaGraphRunner:
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -611,21 +704,6 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            # For multimodal models whose inner language_model takes extra
-            # Optional[Tensor] kwargs at runtime (e.g. ``input_deepstack_embeds``
-            # for Qwen3-VL / Qwen3.5-VL), we bypass the outer
-            # ConditionalGeneration.forward (which would call
-            # ``general_mm_embed_routine`` without those kwargs because the
-            # synthetic forward_batch has no mm_inputs) and directly invoke the
-            # inner language_model with the full kwarg set. This way dynamo's
-            # guard is established with the same kwarg shape as runtime and
-            # avoids a runtime recompile that would otherwise trip the PCG
-            # capture-stream assertion.
-            extra_lm_kwargs: Dict[str, Any] = {}
-            if self.is_multimodal and buffers.input_embeds is not None:
-                extra_lm_kwargs = self._build_multimodal_warmup_kwargs(
-                    buffers.input_embeds[:num_tokens]
-                )
 
             with set_forward_context(
                 forward_batch,
@@ -634,23 +712,12 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
             ):
-                if extra_lm_kwargs:
-                    inner_lm = self._get_inner_language_model()
-                    inner_lm.forward(
-                        None,
-                        forward_batch.positions,
-                        forward_batch,
-                        input_embeds=buffers.input_embeds[:num_tokens],
-                        **extra_lm_kwargs,
-                        **kwargs,
-                    )
-                else:
-                    self.model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
+                self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
             return
 
         # run twice for warmup at the first time and cuda graph capture at the second time
@@ -679,8 +746,8 @@ class PiecewiseCudaGraphRunner:
             buffers.input_ids[num_tokens:static_num_tokens].zero_()
             buffers.positions[num_tokens:static_num_tokens].zero_()
             if self.is_multimodal:
-                buffers.input_embeds[:, num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
+                buffers.input_embeds[num_tokens:static_num_tokens].zero_()
+            if buffers.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
         bs = forward_batch.batch_size
@@ -736,21 +803,37 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
-        if forward_batch.mrope_positions is not None:
-            buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
+        if buffers.mrope_positions is not None:
+            if forward_batch.mrope_positions is not None:
+                buffers.mrope_positions[:, :num_tokens].copy_(
+                    forward_batch.mrope_positions
+                )
+            else:
+                buffers.mrope_positions[:, :num_tokens].copy_(
+                    forward_batch.positions.unsqueeze(0).expand(3, num_tokens)
+                )
 
         input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
             buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
         )
+        input_deepstack_embeds = (
+            buffers.input_deepstack_embeds[:static_num_tokens]
+            if buffers.input_deepstack_embeds is not None
+            else None
+        )
+        if input_deepstack_embeds is not None:
+            input_deepstack_embeds.zero_()
 
         mrope_positions = (
             buffers.mrope_positions[:, :static_num_tokens]
-            if forward_batch.mrope_positions is not None
+            if buffers.mrope_positions is not None
             else None
         )
 
         next_token_logits_buffer = None
+
+        self._maybe_record_pad_stats(num_tokens, static_num_tokens)
 
         # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
         pcg_forward_mode = (
@@ -769,6 +852,7 @@ class PiecewiseCudaGraphRunner:
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -803,6 +887,7 @@ class PiecewiseCudaGraphRunner:
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
@@ -812,6 +897,10 @@ class PiecewiseCudaGraphRunner:
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
+            return_pooled_hidden_states=(
+                self.capture_return_pooled_hidden_states
+                or forward_batch.return_pooled_hidden_states
+            ),
         )
 
         if out_cache_loc_swa is not None:
@@ -824,13 +913,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        num_tokens = len(forward_batch.input_ids)
-        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
-        static_num_tokens = self.capture_num_tokens[index]
         with enable_piecewise_cuda_graph():
-            # Prepare static buffers first so set_forward_context can carry num_tokens
-            # into call_begin_forward (via ForwardContext.num_tokens), eliminating the
-            # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
@@ -839,7 +922,6 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
-                num_tokens=static_num_tokens,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -850,6 +932,18 @@ class PiecewiseCudaGraphRunner:
                     **kwargs,
                 )
                 if isinstance(output, LogitsProcessorOutput):
+                    # Preserve mm_input_embeds when speculative decoding is
+                    # enabled. The speculative draft's prefill path
+                    # (eagle_worker_v2._draft_extend_for_prefill) reads
+                    # mm_input_embeds off this LogitsProcessorOutput to reuse
+                    # the target's encoder embeddings instead of re-embedding
+                    # multimodal placeholder token ids.
+                    mm_input_embeds = None
+                    if (
+                        self.model_runner.spec_algorithm.is_speculative()
+                        and output.mm_input_embeds is not None
+                    ):
+                        mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
@@ -859,6 +953,7 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        mm_input_embeds=mm_input_embeds,
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
@@ -884,10 +979,10 @@ class PiecewiseCudaGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
