@@ -569,7 +569,7 @@ class VisionFlash3Attention(nn.Module):
             if use_fp8:
                 fa_kwargs["q_descale"] = scale_q
                 fa_kwargs["k_descale"] = scale_k
-                fa_kwargs["v_desacle"] = scale_v
+                fa_kwargs["v_descale"] = scale_v
                 fa_kwargs["softmax_scale"] = attn_softmax_scale
                 output = flash_attn_varlen_func(
                     q_quant_pad,
