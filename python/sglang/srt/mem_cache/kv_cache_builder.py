@@ -144,6 +144,7 @@ def build_kv_cache(
     ps: "ParallelState",
     tp_group: "GroupCoordinator",
     enable_hierarchical_cache: bool,
+    enable_eic_cache: bool = False,
 ) -> "KVCacheBuildResult":
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -224,7 +225,16 @@ def build_kv_cache(
     )
 
     if effective_chunked_prefill_size is not None and disable_radix_cache:
-        if not is_hybrid_swa:
+        if enable_eic_cache:
+            from sglang.srt.mem_cache.eic_chunk_cache import (
+                EICChunkCache,
+                EICSWAChunkCache,
+            )
+
+            logger.info("Using EIC chunk cache for decode-save path.")
+            ChunkCacheClass = EICSWAChunkCache if is_hybrid_swa else EICChunkCache
+            tree_cache = ChunkCacheClass(params=params, server_args=server_args)
+        elif not is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
             tree_cache = ChunkCache(params)
@@ -254,7 +264,19 @@ def build_kv_cache(
                 )
             params.tree_components = tuple(tree_components)
             tree_cache = UnifiedRadixCache(params)
-            if enable_hierarchical_cache:
+            if enable_eic_cache:
+                from sglang.srt.mem_cache.eic_hiradix_cache import (
+                    EICHiRadixCacheBuilder,
+                )
+
+                tree_cache = EICHiRadixCacheBuilder.build(
+                    params=params,
+                    server_args=server_args,
+                )
+                tp_worker.register_hicache_layer_transfer_counter(
+                    tree_cache.cache_controller.layer_done_counter
+                )
+            elif enable_hierarchical_cache:
                 tree_cache.init_hicache(server_args, params)
                 tp_worker.register_hicache_layer_transfer_counter(
                     tree_cache.cache_controller.layer_done_counter
@@ -266,6 +288,17 @@ def build_kv_cache(
                 )
 
                 tree_cache = HiMambaRadixCache(params=params, server_args=server_args)
+            elif enable_eic_cache:
+                from sglang.srt.mem_cache.eic_hiradix_cache import (
+                    EICHiRadixCacheBuilder,
+                )
+
+                # EIC has native hierarchical integration; route through its
+                # builder so prefetch results land in the radix tree.
+                tree_cache = EICHiRadixCacheBuilder.build(
+                    params=params,
+                    server_args=server_args,
+                )
             else:
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 

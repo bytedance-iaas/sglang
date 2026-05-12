@@ -2106,6 +2106,16 @@ class LazyDumpTensorsReqInput(BaseReq):
 
 
 @dataclass
+class EnableEICReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class DisableEICReqInput(BaseReq):
+    pass
+
+
+@dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
 
@@ -2121,6 +2131,12 @@ class DumperControlReqOutput(BaseReq):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+@dataclass
+class EICSwitchOutput(BaseReq):
+    success: bool
+    message: str
 
 
 def _check_all_req_types():
