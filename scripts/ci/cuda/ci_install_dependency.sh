@@ -23,7 +23,10 @@ set -euxo pipefail
 # Configuration & timing
 # ------------------------------------------------------------------------------
 # Set up environment variables
-CU_VERSION="cu129"
+# Align with upstream CUDA 13 baseline while keeping env overrides available.
+CU_VERSION="${CU_VERSION:-cu130}"
+CU_STRIP="${CU_VERSION#cu}"
+CU_MAJOR="${CU_STRIP:0:2}"
 
 # Nvidia package versions we override (torch pins older versions).
 # Used both as pip constraints during install and for post-install verification.
@@ -251,8 +254,8 @@ mark_step_done "Pip / uv toolchain & stale package cleanup"
 FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_python==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
 FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_cubin==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
 FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-FLASHINFER_JIT_REQUIRED="${FLASHINFER_PYTHON_REQUIRED}+${CU_VERSION}"
-FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
+FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
 
 UNINSTALL_CUBIN=true
 UNINSTALL_JIT_CACHE=true
@@ -264,11 +267,16 @@ else
     echo "flashinfer-cubin version mismatch (installed: ${FLASHINFER_CUBIN_INSTALLED:-none}, required: ${FLASHINFER_CUBIN_REQUIRED}), reinstalling"
 fi
 
-if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_JIT_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
-    echo "flashinfer-jit-cache==${FLASHINFER_JIT_REQUIRED} already installed, keeping it"
+if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
+    echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
     UNINSTALL_JIT_CACHE=false
 else
-    echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_JIT_REQUIRED}), will reinstall"
+    echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
+fi
+
+if [ "$UNINSTALL_JIT_CACHE" = false ] && [ "$FLASHINFER_JIT_CU_VERSION" != "$CU_VERSION" ]; then
+    echo "flashinfer-jit-cache CUDA version mismatch (installed: ${FLASHINFER_JIT_CU_VERSION:-none}, required: ${CU_VERSION}), will reinstall"
+    UNINSTALL_JIT_CACHE=true
 fi
 
 # Build uninstall list based on what needs updating
@@ -295,6 +303,16 @@ if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     MAIN_INSTALL_CMD="$MAIN_INSTALL_CMD --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}"
 fi
 retry_eval "Install main package" "$MAIN_INSTALL_CMD"
+
+# Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
+# present but libcusparseLt.so.0 missing on disk, breaking any torch import.
+# If the file is missing, force-reinstall the wheel before downstream steps.
+SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
+   && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
+    echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
+    $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+fi
 
 mark_step_done "Install main package"
 
@@ -344,6 +362,14 @@ else
     fi
 fi
 
+# Install sgl-deep-gemm with a CUDA-matched wheel/runtime.
+SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+if [ "$CU_MAJOR" = "13" ]; then
+    $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+else
+    $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
+fi
+
 mark_step_done "Install sglang-kernel"
 
 # ------------------------------------------------------------------------------
@@ -374,12 +400,21 @@ mark_step_done "Download flashinfer artifacts"
 # Install extra dependency
 # ------------------------------------------------------------------------------
 # Install other python dependencies
-if [ "$CU_VERSION" = "cu130" ]; then
-    NVRTC_SPEC="nvidia-cuda-nvrtc"
+if [ "$CU_MAJOR" = "13" ]; then
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+    MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 else
-    NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
+    MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+    MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+# Both variants own the same mooncake/ package files and bin/ scripts.
+if pip show ${MOONCAKE_STALE_PKG} >/dev/null 2>&1; then
+    $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
+    $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+fi
+$PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
@@ -394,22 +429,32 @@ mark_step_done "Install extra dependency"
 # ------------------------------------------------------------------------------
 # Fix other dependencies
 # ------------------------------------------------------------------------------
-# Fix CUDA version mismatch between torch and torchaudio.
-# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
-# This mismatch causes torchaudio's C extension to fail loading, producing:
-#   "partially initialized module 'torchaudio' has no attribute 'lib'"
-# We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
-# torchaudio/torchvision from an index matching torch's CUDA version.
+# Reinstall torch with matching CUDA version if needed.
+# Keep torch/torchaudio/torchvision on the same CUDA variant so torch.cuda works
+# reliably on the runner and downstream imports do not fail due to mixed wheels.
 TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
 echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+REINSTALL_TORCH=false
 if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-    # Pin versions to match what was installed by pyproject.toml (strip +cuXYZ suffix)
+    REINSTALL_TORCH=true
+else
+    for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
+        if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
+            REINSTALL_TORCH=true
+            break
+        fi
+    done
+fi
+if [ "${REINSTALL_TORCH}" = true ]; then
+    TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-    echo "Reinstalling torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${TORCH_CUDA_VER} index to match torch..."
+    echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
     retry_eval \
-        "Reinstall torchaudio/torchvision from ${TORCH_CUDA_VER} index" \
-        "$PIP_CMD install \"torchaudio==${TORCHAUDIO_VER}\" \"torchvision==${TORCHVISION_VER}\" --index-url https://download.pytorch.org/whl/${TORCH_CUDA_VER} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX"
+        "Reinstall torch/torchaudio/torchvision from ${CU_VERSION} index" \
+        "$PIP_CMD install \"torch==${TORCH_VER}\" \"torchaudio==${TORCHAUDIO_VER}\" \"torchvision==${TORCHVISION_VER}\" --index-url https://download.pytorch.org/whl/${CU_VERSION} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX"
 fi
 
 # Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
@@ -449,6 +494,26 @@ pip install -e . --no-build-isolation
 bash "${SCRIPT_DIR}/prepare_runner.sh"
 
 mark_step_done "Prepare runner"
+
+# ------------------------------------------------------------------------------
+# Setup LD_LIBRARY_PATH
+# ------------------------------------------------------------------------------
+# NVIDIA pip packages and torch ship .so files under site-packages that are not
+# on the default LD_LIBRARY_PATH.
+SITE_PACKAGES=$(python3 -c "import site, sys; print(site.getsitepackages()[0])")
+NVIDIA_LIBS=$(find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null | tr '\n' ':')
+TORCH_LIB="$SITE_PACKAGES/torch/lib"
+VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
+export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ "${USE_VENV:-0}" = "1" ] && [ -n "${UV_VENV:-}" ]; then
+    echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
+fi
+if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: GITHUB_ENV write failed; LD_LIBRARY_PATH will be set via BASH_ENV instead"
+fi
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+mark_step_done "Setup LD_LIBRARY_PATH"
 
 # ------------------------------------------------------------------------------
 # Verify imports
