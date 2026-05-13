@@ -268,6 +268,18 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+def _is_sm89():
+    if not is_cuda():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    if major != 8 or minor != 9:
+        return False
+    return tuple(map(int, torch.version.cuda.split(".")[:2])) >= (12, 1)
+
+
+is_sm89_supported = lru_cache(maxsize=1)(_is_sm89)
+
+
 try:
     import sgl_kernel  # noqa: F401
 
