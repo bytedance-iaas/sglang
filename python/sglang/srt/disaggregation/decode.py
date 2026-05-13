@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -799,18 +800,26 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            decode_req.kv_receiver.send_metadata(
-                page_indices, decode_req.metadata_buffer_index, state_indices
-            )
+            if getattr(self.token_to_kv_pool_allocator, "dcp_world_size", 1) > 1:
+                # DCP KV transfer needs request-position-aware token mapping.
+                # Send logical token indices; the prefill sender filters source
+                # tokens for the destination DCP rank before RDMA.
+                metadata_kv_indices = kv_indices.astype(np.int32, copy=False)
+            else:
+                metadata_kv_indices = kv_to_page_indices(kv_indices, page_size)
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
                 and decode_req.kv_receiver.require_staging
             ):
+                # Register before metadata is sent so early STAGING_REQ/CHUNK_READY
+                # messages from prefill can be handled instead of dropped.
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            decode_req.kv_receiver.send_metadata(
+                metadata_kv_indices, decode_req.metadata_buffer_index, state_indices
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1183,7 +1192,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_queue()
+            if not self.process_decode_queue():
+                continue
             if self._engine_paused:
                 continue
 
@@ -1211,7 +1221,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_queue()
+            if not self.process_decode_queue():
+                continue
             if self._engine_paused:
                 continue
 
@@ -1335,7 +1346,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(self: Scheduler) -> bool:
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
@@ -1344,7 +1355,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            return
+            return True
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -1357,6 +1368,40 @@ class SchedulerDisaggregationDecodeMixin:
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
+            local_transfer_len = len(self.disagg_decode_transfer_queue.queue)
+            min_transfer_len = torch.tensor(
+                [local_transfer_len], dtype=torch.int32, device="cpu"
+            )
+            max_transfer_len = min_transfer_len.clone()
+            dist.all_reduce(
+                min_transfer_len,
+                op=dist.ReduceOp.MIN,
+                group=self.attn_tp_cpu_group,
+            )
+            dist.all_reduce(
+                max_transfer_len,
+                op=dist.ReduceOp.MAX,
+                group=self.attn_tp_cpu_group,
+            )
+            if min_transfer_len.item() != max_transfer_len.item():
+                now = time.time()
+                last_log = getattr(self, "_dcp_transfer_queue_mismatch_last_log", 0.0)
+                if now - last_log > 5.0:
+                    logger.warning(
+                        "DCP transfer queue length mismatch: rank=%s local=%s "
+                        "min=%s max=%s prealloc=%s waiting=%s running=%s",
+                        self.tp_rank,
+                        local_transfer_len,
+                        min_transfer_len.item(),
+                        max_transfer_len.item(),
+                        len(self.disagg_decode_prealloc_queue.queue),
+                        len(self.waiting_queue),
+                        self.running_batch.batch_size(),
+                    )
+                    self._dcp_transfer_queue_mismatch_last_log = now
+                return False
+            if max_transfer_len.item() == 0:
+                return True
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -1367,3 +1412,16 @@ class SchedulerDisaggregationDecodeMixin:
                 self.waiting_queue.extend(transferred_reqs)
             else:
                 self.waiting_queue.extend(transferred_reqs)
+            post_transfer_len = torch.tensor(
+                [len(self.disagg_decode_transfer_queue.queue)],
+                dtype=torch.int32,
+                device="cpu",
+            )
+            dist.all_reduce(
+                post_transfer_len,
+                op=dist.ReduceOp.MAX,
+                group=self.attn_tp_cpu_group,
+            )
+            if post_transfer_len.item() > 0:
+                return False
+        return True

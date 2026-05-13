@@ -947,6 +947,9 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self._disagg_health_pending_since: Optional[float] = None
+        self._disagg_health_pending_signature: Optional[Tuple] = None
+        self._disagg_health_pending_last_log: float = 0.0
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -1715,13 +1718,19 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+            if is_health_check_generate_req(recv_req):
+                if self._should_fast_return_disagg_health_check(now):
+                    self.send_to_tokenizer.send_output(
+                        HealthCheckOutput(
+                            http_worker_ipc=getattr(recv_req, "http_worker_ipc", None)
+                        )
+                    )
+                    continue
+                if not self.is_fully_idle(for_health_check=True):
+                    self.return_health_check_ipcs.append(
+                        getattr(recv_req, "http_worker_ipc", None)
+                    )
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -3077,12 +3086,104 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _get_disagg_health_pending_counts(self) -> Dict[str, int]:
+        """Return DCP queues that make the scheduler busy during health checks."""
+        counts: Dict[str, int] = {}
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            counts["prefill_inflight"] = len(self.disagg_prefill_inflight_queue)
+            counts["prefill_bootstrap"] = len(self.disagg_prefill_bootstrap_queue.queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            counts["decode_prealloc"] = len(self.disagg_decode_prealloc_queue.queue)
+            counts["decode_pending"] = len(self.disagg_decode_prealloc_queue.pending_reqs)
+            counts["decode_retracted"] = len(
+                self.disagg_decode_prealloc_queue.retracted_queue
+            )
+            counts["decode_transfer"] = len(self.disagg_decode_transfer_queue.queue)
+            if self.decode_offload_manager is not None:
+                counts["decode_offload"] = len(
+                    self.decode_offload_manager.ongoing_offload
+                )
+        return counts
+
+    def _get_disagg_health_pending_signature(self, counts: Dict[str, int]) -> Tuple:
+        """Identify the specific DCP pending work tracked by the health timer."""
+        active_counts = tuple(sorted((k, v) for k, v in counts.items() if v))
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return (self.disaggregation_mode, active_counts)
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            return (self.disaggregation_mode, active_counts)
+
+        transfer_sig = []
+        for decode_req in self.disagg_decode_transfer_queue.queue[:3]:
+            req = getattr(decode_req, "req", None)
+            receiver = getattr(decode_req, "kv_receiver", None)
+            transfer_sig.append(
+                (
+                    getattr(req, "rid", None),
+                    getattr(req, "bootstrap_room", None),
+                    getattr(receiver, "session_id", None),
+                    getattr(decode_req, "metadata_buffer_index", None),
+                )
+            )
+        prealloc_sig = []
+        for decode_req in self.disagg_decode_prealloc_queue.queue[:3]:
+            req = getattr(decode_req, "req", None)
+            prealloc_sig.append(
+                (
+                    getattr(req, "rid", None),
+                    getattr(req, "bootstrap_room", None),
+                )
+            )
+        return (
+            self.disaggregation_mode,
+            active_counts,
+            tuple(prealloc_sig),
+            tuple(transfer_sig),
+        )
+
+    def _should_fast_return_disagg_health_check(self, now: float) -> bool:
+        """Avoid false negative health checks during short DCP batch transitions."""
+        counts = self._get_disagg_health_pending_counts()
+        if not any(counts.values()):
+            self._disagg_health_pending_since = None
+            self._disagg_health_pending_signature = None
+            return False
+
+        signature = self._get_disagg_health_pending_signature(counts)
+        if (
+            self._disagg_health_pending_since is None
+            or self._disagg_health_pending_signature != signature
+        ):
+            self._disagg_health_pending_since = now
+            self._disagg_health_pending_signature = signature
+
+        elapsed = now - self._disagg_health_pending_since
+        health_timeout = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+        fast_return_timeout = int(
+            os.getenv(
+                "SGLANG_DISAGG_HEALTH_PENDING_TIMEOUT",
+                str(max(60, health_timeout * 3)),
+            )
+        )
+        if elapsed <= fast_return_timeout:
+            return True
+
+        if now - self._disagg_health_pending_last_log > 30:
+            logger.warning(
+                "DCP health check pending queues exceeded fast-return timeout: "
+                "elapsed=%.1fs timeout=%ss counts=%s",
+                elapsed,
+                fast_return_timeout,
+                {k: v for k, v in counts.items() if v},
+            )
+            self._disagg_health_pending_last_log = now
+        return False
+
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
-        # Only running_batch + waiting_queue guarantee active GPU processing;
-        # disagg queues (bootstrap/prealloc/transfer) may have items without
-        # any request actually running on GPU — e.g. stuck handshake, full
-        # KV cache, or stalled transfer — so they can't carry health info.
+        # Short DCP-only transitions are handled by
+        # _should_fast_return_disagg_health_check(), while long DCP pending
+        # queues still fall through to the regular timeout path.
         # Batch running status
         idle = (
             self.running_batch.is_empty()
@@ -3096,6 +3197,9 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+
+        if for_health_check and any(self._get_disagg_health_pending_counts().values()):
+            idle = False
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch

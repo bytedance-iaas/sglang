@@ -170,6 +170,10 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+            if self.server_args.watchdog_timeout is not None:
+                self.waiting_timeout = max(
+                    self.waiting_timeout, int(self.server_args.watchdog_timeout)
+                )
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -560,7 +564,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.require_staging = (
                 self.prefill_info.attn_tp_size != 0
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
-            )
+            ) or int(getattr(self.kv_mgr.server_args, "dcp_size", 1)) > 1
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()

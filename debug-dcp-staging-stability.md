@@ -1,0 +1,376 @@
+# DCP Staging Stability Debug [OPEN]
+
+## Session
+- Session ID: `dcp-staging-stability`
+- Goal: Verify DCP-aware staging remains on the high-performance path under long pressure tests and does not deadlock or show uncontrolled performance oscillation.
+- Constraint: Collect runtime evidence before further business-logic changes.
+
+## User Symptom
+- Decode uses `TP16 + DCP2 + EP16`, `page_size=64`, staging enabled.
+- With `cuda_graph_max_bs=64`, pressure test still times out around the 70th generated-shared-prefix case.
+- Decode logs show `WaitingForInput` on some ranks and `Failed due to an unknown reason from another rank` on other ranks.
+
+## Hypotheses
+- H1: DCP staging still falls back to the per-token DCP path for some chunk, causing a delayed `WaitingForInput` timeout.
+- H2: A `CHUNK_READY` or final Success control-plane signal is lost or misordered for a segmented chunk, so decode waits even though RDMA completed.
+- H3: Decode-side staging scatter/free/watermark does not advance for a chunk, causing later prefill writes to wait or be skipped.
+- H4: Radix cache / request reuse changes token mapping or request lifecycle under shared-prefix pressure, causing one rank to fail first.
+- H5: Transfer is healthy, but decode execution under 60 concurrent long outputs causes request lifecycle timeouts unrelated to KV staging.
+
+## Evidence Plan
+- Inspect current code for any remaining DCP staging fallback and segmented `CHUNK_READY` edge cases.
+- Run long GSP pressure test with strict DCP staging guard and collect fallback/timeout/health/scatter evidence.
+- Compare runs with and without `--disable-radix-cache` if the first run still fails.
+
+## Pre-Fix Evidence
+- Config: `TP8 prefill -> TP16+DCP2 decode`, `page_size=64`, staging enabled, decode `cuda_graph_max_bs=64`.
+- User reproduction: failure around the 70th generated-shared-prefix request, with `WaitingForInput` on some ranks and `Failed due to an unknown reason from another rank` on other ranks.
+- Reproduced first stage:
+  - Passed the first 70 requests initially, then entered a stuck state.
+  - `prefill_dcp_fallback=0`, `prefill_health=0`, `router_health=0`.
+  - Decode counters: `decode_waiting=357`, `decode_transfer_failed=480`, `unregistered room=60717`.
+  - Interpretation: data-plane staging transfer did not fall back or fail; decode received many `CHUNK_READY` messages after room state was no longer registered.
+- Additional observation:
+  - Prefill reached `#inflight-req: 61` and stopped draining.
+  - Decode accumulated long-lived transfer requests, but did not report staging capacity errors.
+
+## Root Cause
+- The last staging chunk was not announced with `CHUNK_READY`; it was scattered only after all prefill ranks reported final `Success`.
+- Under high-concurrency long-output GSP pressure, many requests keep their last staging allocation occupied while waiting for final success.
+- Decode-side staging watermark cannot advance quickly enough, so prefill eventually waits behind occupied ring-buffer regions.
+- This creates a control-plane deadlock-like state: prefill cannot finish enough transfers, decode waits for input/success, and later `CHUNK_READY` messages arrive after request cleanup/failure.
+
+## Fix
+- `send_kvcache_dcp_staged()` path now sends `CHUNK_READY` for every staged chunk, including the last chunk.
+- Decode scatters/frees the last staging allocation as soon as RDMA for that chunk completes.
+- Final `Success` remains the request-level completion signal; if the last chunk was already freed, `submit_last_scatter_async()` simply marks staging scatter done.
+- DCP staging strict guard remains enabled: if staged transfer returns `-1`, DCP no longer silently falls back to the per-token path.
+
+## Post-Fix Verification
+- Command:
+  - `generated-shared-prefix`
+  - `gsp_system_prompt_len=32000`
+  - `gsp_question_len=128`
+  - `gsp_output_len=1500`
+  - `gsp_prompts_per_group=300`
+  - `max_concurrency=60`
+  - `request_rate=30`
+- Decode config:
+  - `--cuda-graph-max-bs 64`
+  - `--cuda-graph-bs 1 2 4 8 16 32 64`
+  - `--max-running-requests 64`
+  - `--disable-radix-cache`
+- Result:
+  - `Successful requests: 300`
+  - `Benchmark duration: 747.66s`
+  - `Output token throughput: 601.88 tok/s`
+  - `Peak output token throughput: 695.00 tok/s`
+  - `Peak concurrent requests: 61`
+  - `Mean TPOT: 30.09ms`, `P99 TPOT: 30.76ms`
+- Stability counters:
+  - `prefill_dcp_fallback=0`
+  - `prefill_health=0`
+  - `prefill_err=0`
+  - `router_health=0`
+  - `router_err=0`
+  - `decode_waiting=0`
+  - `decode_transfer_failed=0`
+  - `submit_chunk_failed=0`
+  - `unregistered=0`
+  - `cuda_false=0`, `cuda_true=621`
+- Decode throughput:
+  - p50 `632.92 tok/s`
+  - p10 `537.52 tok/s`
+  - p90 `649.82 tok/s`
+  - max `662.36 tok/s`
+
+## Current Assessment
+- The DCP staging control-plane deadlock is fixed for the tested 300-request, 60-concurrency GSP workload.
+- High TTFT in this workload is dominated by queueing behind long 1500-token decode outputs, not by KV transfer deadlock.
+- Production recommendation: keep `SGLANG_DISAGG_STAGING_BUFFER=1`, `--cuda-graph-max-bs 64`, `--cuda-graph-bs 1 2 4 8 16 32 64`, and `--disable-radix-cache` for this DCP PD topology.
+
+## Follow-Up: Early CHUNK_READY Replay
+- New user report: another long run timed out with `WaitingForInput` and later emitted `CHUNK_READY received for unregistered room=...`.
+- Runtime check also found the active decode process used malformed CUDA graph args: `--cuda-graph-bs 1 2 4 8 16 3264` instead of `1 2 4 8 16 32 64`.
+- Robustness fix:
+  - Keep early `CHUNK_READY` writer counts instead of treating them as dropped.
+  - On `register_decode_req()`, replay chunks whose writers already arrived and submit scatter immediately.
+  - Log wording changed from `skipping` to `pending replay`.
+- Local validation:
+  - `compileall` passed for `conn.py` and `staging_handler.py`.
+  - VS Code diagnostics are clean for both files.
+
+## Current Handoff State
+- Status remains `[OPEN]`.
+- User reports the main issue is still occasional long-pressure-test stalls.
+- Do not commit the high-performance DCP staging transfer yet.
+- Latest `conn.py` and `staging_handler.py` have been synced to the three remote containers and passed container-side `py_compile`.
+- A Chinese continuation handoff was created at `handoff-dcp-staging-current-state-zh.md`.
+- Next verification should restart services with a corrected CUDA graph argument:
+  - Expected: `--cuda-graph-bs 1 2 4 8 16 32 64`
+  - Bad observed value: `--cuda-graph-bs 1 2 4 8 16 3264`
+- Next run should first use `--disable-radix-cache` as a stability baseline, then test radix cache separately.
+
+## Follow-Up: STAGING_REQ Registration Race
+- Current local check: SSH to `115.191.51.207`, `115.191.21.96`, and `115.191.2.23` timed out from this machine, so live container process/log status could not be collected in this pass.
+- Code evidence: `DecodeTransferQueue.pop_preallocated()` sends metadata to prefill before calling `staging_handler.register_decode_req()`.
+- Code evidence: decode-side `_handle_staging_req()` drops an early `STAGING_REQ` when the room is not registered, logging `STAGING_REQ received for unregistered room=..., skipping`.
+- Interpretation: under long pressure tests, prefill can receive metadata and issue `STAGING_REQ` before decode registers the room. The request then never receives `STAGING_RSP`, so prefill cannot RDMA that chunk or send final Success, while decode eventually times out in `KVPoll.WaitingForInput`.
+- Planned minimal fix: register the staging room immediately before `send_metadata()`, after decode KV indices are allocated and before prefill can issue any staging control-plane messages.
+- Additional robustness: `CHUNK_READY` is now counted by `prefill_unique_rank` instead of raw list length, and both `STAGING_REQ` and `CHUNK_READY` are checked against the active decode session before they can allocate/scatter.
+
+## Post-Fix Verification: Registration Race
+- Fix applied locally and synced to all three containers:
+  - `decode.py`: register staging room before `send_metadata()` when staging is required.
+  - `mooncake/conn.py`: validate `STAGING_REQ`/`CHUNK_READY` session IDs and dedupe `CHUNK_READY` by `prefill_unique_rank`.
+  - `staging_handler.py`: replay early `CHUNK_READY` arrivals only for the active session.
+- Code sync evidence:
+  - Local and all three containers match:
+    - `decode.py`: `717fd70c26af4202cf21b3d833a936df9c4ae92d4c671bbc4185f7d48ba6ab7f`
+    - `mooncake/conn.py`: `f82733191fc5434c2f6e8c8b0138f94fa02e7a357360f15ed4b2d5d1bf6a9fe2`
+    - `staging_handler.py`: `1c8f22d6a160737be561abbc95add763187e29280a8059b88de18e498663d231`
+- Validation:
+  - Local `python3 -m py_compile` passed for the three changed files.
+  - VS Code diagnostics are clean for `decode.py`, `mooncake/conn.py`, `staging_handler.py`, `common/conn.py`, and `staging_buffer.py`.
+  - Container-side `py_compile` passed before service restart.
+- Remote process state after validation:
+  - Prefill: `115.191.51.207 / minimax_dcp_test`, service still running on `192.168.44.91:30000`.
+  - Decode node0: `115.191.21.96 / minimax_dcp_test`, service still running on `192.168.44.93:30001`.
+  - Decode node1: `115.191.2.23 / minimax_dcp_test2`, service still running on `192.168.44.90:30001`.
+  - Router: still running on prefill container port `8000`.
+  - Decode process args now show the corrected CUDA graph list: `--cuda-graph-bs 1 2 4 8 16 32 64`.
+- Benchmark command:
+  - `generated-shared-prefix`
+  - `gsp_system_prompt_len=32000`
+  - `gsp_question_len=128`
+  - `gsp_output_len=1500`
+  - `gsp_prompts_per_group=300`
+  - `gsp_num_groups=1`
+  - `num_prompts=300`
+  - `max_concurrency=60`
+  - `request_rate=30`
+  - `--output-details`
+- Benchmark result:
+  - `Successful requests: 300`
+  - `Benchmark duration: 746.94s`
+  - `Total input tokens: 9859443`
+  - `Total generated tokens: 450000`
+  - `Output token throughput: 602.46 tok/s`
+  - `Peak output token throughput: 696.00 tok/s`
+  - `Peak concurrent requests: 61`
+  - `Mean TPOT: 30.07ms`
+  - `Median TPOT: 30.25ms`
+  - `P99 TPOT: 30.69ms`
+- Post-run grep evidence across service logs:
+  - `WaitingForInput=0`
+  - `Decode transfer failed=0`
+  - `timed out after=0`
+  - `STAGING_REQ received for unregistered=0`
+  - `STAGING_REQ session mismatch=0`
+  - `CHUNK_READY received for unregistered=0`
+  - `CHUNK_READY session mismatch=0`
+  - `pending replay=0`
+  - `DCP decode staging too small=0`
+  - `Falling back` only appears in RDMA relaxed-ordering informational messages, not in DCP transfer fallback.
+- Assessment:
+  - The most likely remaining `WaitingForInput` root cause was the metadata-before-registration race for `STAGING_REQ`.
+  - The current high-performance DCP staging path completed the 300-request, 60-concurrency GSP long pressure test with no observed control-plane loss or decode transfer timeout.
+  - Status remains `[OPEN]` until the user decides whether to run a longer soak test or radix-cache A/B. Do not commit yet.
+
+## Follow-Up: User Command Cache-Aware Stall at ~92 Requests
+- User command:
+  - Prefill: `TP8 + EP8`, radix cache enabled, `deepep normal`, `mem_fraction_static=0.8`.
+  - Decode: `TP16 + DCP2 + EP16`, `deepep low_latency`, `max_running_requests=64`, `cuda_graph_bs=1 2 4 8 16 32 64`.
+  - Router: `--pd-disaggregation --prefill-policy cache_aware --decode-policy round_robin --prefill http://192.168.44.91:31000 None --decode http://192.168.44.93:31000`.
+- Runtime evidence from `/data01/code/dcp_staging_usercmd_20260512/`:
+  - Smoke request passed.
+  - GSP 150-request run stopped progressing around the same range as the user report.
+  - Prefill logged `7366` `DCP_STAGING_DBG staging_transfer_deferred` events with valid `offset/end`, proving `STAGING_RSP` arrived and the prefill side was waiting for decode watermarks rather than missing staging allocations.
+  - Decode node0 logged `6136` `CHUNK_READY received for unregistered`.
+  - Decode node1 logged `222770` `CHUNK_READY received for unregistered`.
+  - The same rooms/chunks repeatedly appeared as unregistered, e.g. room `4695534217384803902` chunks `2/3/4`.
+- Root-cause update:
+  - Prefill staging deferral re-enqueued the blocked chunk at the tail of the transfer queue.
+  - Later chunks from the same room could overtake the blocked chunk.
+  - The last chunk could finish first and send final `Success`.
+  - Decode then considered staging complete after last scatter and unregistered the room, because `is_done()` did not verify that earlier staging allocations were still pending.
+  - When the previously deferred chunks later transferred, their `CHUNK_READY` messages found the room already unregistered, so decode could not scatter/free them and could not advance the watermark.
+- Fix applied locally:
+  - `mooncake/conn.py`: transfer worker now tracks a per-room blocked staging chunk and requeues later chunks for that same room until the blocked chunk succeeds, preventing final `Success` from overtaking earlier deferred chunks.
+  - `staging_handler.py`: `is_done()` now also checks live `chunk_staging_infos`, preventing decode from unregistering a room while earlier staging allocations are still pending.
+  - `common/conn.py`: decode `WaitingForInput` timeout now uses at least `--watchdog-timeout`, so the user command's `--watchdog-timeout 3000` is not capped by the 300s env default.
+
+## Follow-Up: Runtime Path and DCP Collective Mismatch
+- Runtime path discovery:
+  - All three containers load code from `/sgl-workspace/sglang_minimax_new/python/sglang/...`.
+  - Earlier syncs to `/sgl-workspace/sglang` did not affect the actual running code, explaining why `timed out after 300.0s` still appeared after the first timeout patch.
+- After syncing to the real runtime path, the old failure mode changed:
+  - `CHUNK_READY received for unregistered=0`
+  - `timed out after=0`
+  - `Decode transfer failed=0`
+  - Benchmark still stalled around `91/150`.
+- Stack evidence from the stalled run:
+  - Decode TP0 was in `poll_and_all_reduce_with_staging -> dist.all_reduce`.
+  - Decode TP8 was in `prepare_mlp_sync_batch -> all_gather`.
+  - A later same-group sample showed TP1 in transfer poll all-reduce while TP0/TP2 had already entered MLP all-gather.
+- Root cause:
+  - DCP decode ranks could diverge between transfer polling collectives and decode batch collectives.
+  - Some ranks still had non-empty `disagg_decode_transfer_queue` and entered transfer `all_reduce`, while other ranks entered `maybe_prepare_mlp_sync_batch` and called `all_gather`.
+  - This collective-order mismatch deadlocked the decode workers, which then stopped sending staging watermarks and caused prefill staging deferrals.
+- Fix applied locally:
+  - `decode.py` now synchronizes transfer-queue progress across `attn_tp_cpu_group`.
+  - Before transfer polling, all ranks reduce min/max transfer queue length; if lengths differ, every rank skips decode scheduling for that loop.
+  - After transfer polling, all ranks reduce the post-poll max transfer queue length; if any rank still has pending transfers, every rank skips decode scheduling.
+  - This intentionally sacrifices some overlap while transfer requests are pending, but prevents transfer `all_reduce` and decode MLP `all_gather` from interleaving out of order.
+- Validation:
+  - Local `python3 -m py_compile python/sglang/srt/disaggregation/decode.py` passed.
+  - VS Code diagnostics for `decode.py` are clean.
+  - Synced to the real runtime path in all three containers and container-side `py_compile` passed.
+  - `kinit --keychain zhujunyu.666` was needed once after `jumpecs-lf.byted.org` returned `Permission denied (gssapi-with-mic)`.
+- User-command GSP validation under `/data01/code/dcp_staging_collective_fix2_20260512/`:
+  - `num_prompts=150`
+  - `max_concurrency=60`
+  - `request_rate=30`
+  - `gsp_system_prompt_len=32000`
+  - `gsp_question_len=128`
+  - `gsp_output_len=1500`
+  - Router kept `--prefill-policy cache_aware`, matching the user's command.
+- Result:
+  - `Successful requests: 150`
+  - `Benchmark duration: 199.52s`
+  - `Output token throughput: 1127.71 tok/s`
+  - `Peak output token throughput: 1392.00 tok/s`
+  - `Peak concurrent requests: 120`
+  - `Mean TPOT: 41.77ms`
+  - `P99 TPOT: 44.11ms`
+- Post-run grep evidence:
+  - Decode node0: `transfer_queue_len_mismatch=0`, `CHUNK_READY received for unregistered=0`, `timed out after=0`, `Decode transfer failed=0`.
+  - Decode node1: `transfer_queue_len_mismatch=0`, `CHUNK_READY received for unregistered=0`, `timed out after=0`, `Decode transfer failed=0`.
+  - Prefill: `timed out after=0`, `Decode transfer failed=0`.
+- Additional matrix validation under `/data01/code/dcp_staging_matrix_20260512/`:
+  - `small_fast`: `num_prompts=80`, `system=4096`, `question=64`, `output=256`, `max_concurrency=40`, `request_rate=40`; result `80/80`, duration `17.81s`, peak concurrent `80`, mean TPOT `29.79ms`.
+  - `user_200`: `num_prompts=200`, `system=32000`, `question=128`, `output=1200`, `max_concurrency=60`, `request_rate=30`; result `200/200`, duration `221.76s`, peak concurrent `120`, mean TPOT `42.16ms`.
+  - `long_input`: `num_prompts=96`, `system=65536`, `question=256`, `output=512`, `max_concurrency=32`, `request_rate=12`; result `96/96`, duration `92.77s`, peak concurrent `64`, mean TPOT `42.35ms`.
+  - `long_output`: `num_prompts=120`, `system=16000`, `question=128`, `output=2048`, `max_concurrency=48`, `request_rate=20`; result `120/120`, duration `218.40s`, peak concurrent `96`, mean TPOT `34.99ms`.
+  - `burst_queue`: `num_prompts=180`, `system=24000`, `question=128`, `output=800`, `max_concurrency=96`, `request_rate=80`; result `180/180`, duration `111.76s`, peak concurrent `160`, mean TPOT `39.54ms`.
+  - Matrix total: `676/676` successful requests.
+- Matrix post-run grep evidence:
+  - Prefill/router/decode0/decode1: `timed out after=0`, `Decode transfer failed=0`, `Traceback=0`, `ERROR=0`, `Exception=0`, `CHUNK_READY received for unregistered=0`, `STAGING_REQ received for unregistered=0`, `transfer_queue_len_mismatch=0`.
+  - Prefill `DCP_STAGING_DBG.*staging_transfer_deferred=29`; these are expected staging-ring backpressure waits and did not cause stalls.
+- Current assessment:
+  - The user-reported cache-aware stall around request `92` is fixed in the reproduced 150-request run and remained fixed across the 5-case matrix.
+  - Status remains `[OPEN]` because a longer soak test is still recommended before committing the high-performance DCP staging changes.
+
+## Follow-Up: DCP Health Check False Negative at Batch Boundary
+- Symptom:
+  - During user soak, `/health` intermittently logged:
+    - `Health check failed. Server couldn't get a response from detokenizer for last 20 seconds`
+  - The process did not exit, and a later `/health` returned `200 OK`.
+  - The failures appeared around the boundary where one batch had just finished and the next batch was entering DCP decode.
+- Code-path analysis:
+  - `http_server.py` generated health check sends a fake 1-token request and waits for `last_receive_tstamp` to advance within `SGLANG_HEALTH_CHECK_TIMEOUT` (default 20s).
+  - `scheduler.py::process_input_requests()` treats health requests specially only when `not is_fully_idle(for_health_check=True)`.
+  - Existing `is_fully_idle(for_health_check=True)` intentionally skipped DCP queues (`prefill inflight/bootstrap`, `decode prealloc/transfer`) because those queues alone do not always prove active GPU progress.
+  - In DCP batch-boundary windows, this can misclassify the server as idle and let the fake health request wait for detokenizer output, causing a 20s false negative.
+- Fix applied locally:
+  - `scheduler.py` now tracks DCP pending queues for health checks:
+    - prefill: `disagg_prefill_inflight_queue`, `disagg_prefill_bootstrap_queue`
+    - decode: `disagg_decode_prealloc_queue.queue`, `pending_reqs`, `retracted_queue`, `disagg_decode_transfer_queue.queue`, optional decode offload queue
+  - Short DCP pending windows return `HealthCheckOutput` immediately from scheduler, avoiding false 503 during normal batch transitions.
+  - Long DCP pending windows still fall through to the original health timeout path, preserving the ability to detect a real DCP stall.
+  - New env knob: `SGLANG_DISAGG_HEALTH_PENDING_TIMEOUT`, default `max(60, SGLANG_HEALTH_CHECK_TIMEOUT * 3)`.
+- Validation:
+  - Local `python3 -m py_compile python/sglang/srt/managers/scheduler.py` passed.
+  - VS Code diagnostics for `scheduler.py` are clean.
+- Note:
+  - This change only affects health-check request handling. It does not change normal request scheduling, DCP KV transfer, staging, or decode generation.
+
+### Validation: DCP Health Fix Matrix
+- Run directory:
+  - `/data01/code/dcp_health_fix_validation_20260513/`
+- Code deployment:
+  - Synced `python/sglang/srt/managers/scheduler.py` to `/sgl-workspace/sglang_minimax_new` on prefill, decode0, and decode1.
+  - Container-side `python3 -m py_compile python/sglang/srt/managers/scheduler.py` passed on all three nodes.
+  - Services were launched with `SGLANG_DISAGG_HEALTH_PENDING_TIMEOUT=60`.
+- Functional / correctness smoke:
+  - `accuracy_smoke.log`: 3/3 requests returned HTTP 200 and non-empty responses.
+  - `accuracy_long.log`: deterministic checks passed for math (`42`), exact marker (`HEALTH_OK`), and freezing-point answer (`0`).
+- Health validation:
+  - A 1 Hz router `/health` probe ran throughout the pressure matrix.
+  - Probe result: `718/718` returned `200`; non-200 count was `0`.
+  - Backend logs after traffic started:
+    - prefill `Health check failed=0`
+    - decode0 `Health check failed=0`
+    - decode1 `Health check failed=0`
+  - Router had 25 startup `Health check failed` lines before backend readiness detection completed; no matrix-time router `/health` failure was observed.
+- Pressure matrix:
+  - `small_fast`: `80/80`, `system=4096`, `question=64`, `output=256`, `max_concurrency=40`, `request_rate=40`, output throughput `1166.64 tok/s`.
+  - `user_200`: `200/200`, `system=32000`, `question=128`, `output=1200`, `max_concurrency=60`, `request_rate=30`, output throughput `1094.88 tok/s`.
+  - `long_input`: `96/96`, `system=65536`, `question=256`, `output=512`, `max_concurrency=32`, `request_rate=12`, output throughput `528.45 tok/s`.
+  - `long_output`: `120/120`, `system=16000`, `question=128`, `output=2048`, `max_concurrency=48`, `request_rate=20`, output throughput `1127.74 tok/s`.
+  - `burst_queue`: `180/180`, `system=24000`, `question=128`, `output=800`, `max_concurrency=96`, `request_rate=80`, peak concurrency `160`, output throughput `1288.02 tok/s`.
+  - Total pressure requests in this validation: `676/676`.
+- Error counters:
+  - prefill/decode0/decode1:
+    - `timed out after=0`
+    - `Decode transfer failed=0`
+    - `Traceback=0`
+    - `ERROR=0`
+    - `Exception=0`
+    - `CHUNK_READY received for unregistered=0`
+    - `STAGING_REQ received for unregistered=0`
+    - `transfer_queue_len_mismatch=0`
+    - `DCP health check pending queues exceeded=0`
+- Performance assessment:
+  - Throughput is consistent with the previous DCP staging validation range.
+  - The health fix is limited to the health-request path and does not show regression in normal decode throughput or request completion.
+
+### Follow-Up: Long Random Input DCP Health Pending Warning
+- User workload:
+  - `dataset-name=random`, `random-input-len=128000`, `random-output-len=1500`, `random-range-ratio=0.1`, `max-concurrency=12`, `request-rate=2`.
+- Symptom:
+  - `DCP health check pending queues exceeded fast-return timeout: elapsed=180.0s timeout=60s counts={'decode_transfer': 1}`.
+  - `/health` later returned `200 OK`.
+- Evidence:
+  - Added temporary TRAE debug collector instrumentation in `scheduler.py` and reproduced with the same random 128k/1500 distribution.
+  - Pre-fix debug logs showed `elapsed` carried over across different transfer requests:
+    - around `60s`: `rid=d4f35e651e7a4c609e1827ea0b090b41`, `origin_input_len=115868`, `live_staging_allocs=3`.
+    - around `92s`: `rid=9534a246530c48d99cd83037031fc992`, `origin_input_len=105540`, `live_staging_allocs=13`.
+  - Therefore the warning measured continuous non-empty DCP queues, not the age of the same pending request.
+- Fix:
+  - `scheduler.py` now tracks `_disagg_health_pending_signature`.
+  - `_disagg_health_pending_since` resets when the representative DCP pending work changes.
+  - Decode signature includes active queue counts plus representative prealloc/transfer request IDs, rooms, sessions, and metadata buffer indices.
+- Post-fix validation:
+  - Run directory: `/data01/code/dcp_health_transfer_fix_20260513/`.
+  - `100/100` random 128k/1500 requests succeeded.
+  - `DCP health check pending queues exceeded=0` on prefill/decode0/decode1/router.
+  - Debug collector lines: `0`, confirming no same-signature DCP pending item exceeded 60s.
+  - Router `/health`: `1347/1347` returned `200`.
+  - Direct decode `/health`: startup-only failures before decode readiness, then `652` successful `200`.
+- Extended post-fix soak:
+  - Same workload with `num-prompts=300` completed successfully.
+  - `Successful requests: 300/300`
+  - `Benchmark duration: 3816.42s`
+  - `Request throughput: 0.08 req/s`
+  - `Input token throughput: 5743.90 tok/s`
+  - `Output token throughput: 65.74 tok/s`
+  - `Peak output token throughput: 435.00 tok/s`
+  - `Peak concurrent requests: 15`
+  - Router `/health`: `3840/3840` returned `200`.
+  - Debug collector lines: `0`.
+  - Prefill/decode0/decode1 post-soak counters all remained `0` for `DCP health check pending queues exceeded`, `timed out after`, `Decode transfer failed`, `Traceback`, `ERROR`, `Exception`, `CHUNK_READY received for unregistered`, `STAGING_REQ received for unregistered`, and `transfer_queue_len_mismatch`.
+  - Router still has startup-only readiness noise (`ERROR=30`, `Health check failed=25`), but no traffic-time router health failure was observed.
+- Local validation:
+  - `python3 -m py_compile python/sglang/srt/managers/scheduler.py` passed before remote deployment.
+  - VS Code diagnostics are clean for `scheduler.py`.
+- Current assessment:
+  - The user-observed `decode_transfer: 1` warning was a health-timer attribution bug, not proof that a single DCP transfer was stuck for 180s.
+  - The signature-based timer fix prevents elapsed time from accumulating across different long-input requests while preserving warning behavior for a truly unchanged DCP pending item.
+  - Temporary debug instrumentation was removed before commit.
+  - Cleanup validation under `/data01/code/dcp_commit_validation_20260513/`:
+    - Cleaned code was synced to prefill/decode0/decode1 and passed container-side `py_compile`.
+    - New router was started after removing a stale `sglang::router` process.
+    - Random 128k/1500 `num-prompts=10` succeeded `10/10`.
+    - Router `/health` returned `66/66` `200`.
+    - Prefill/router/decode0/decode1 had `0` DCP health pending warnings, transfer queue mismatches, timeouts, decode transfer failures, tracebacks, errors, exceptions, unregistered staging messages, and temporary debug marker matches.

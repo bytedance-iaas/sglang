@@ -496,6 +496,77 @@ def gather_all_layers_to_staging(
     )
 
 
+def gather_dcp_tokens_to_staging(
+    k_buffers: list,
+    v_buffers: list,
+    token_indices_np,
+    staging_buffer: StagingBuffer,
+    src_head_start: int,
+    num_heads: int,
+    gpu_id: int,
+) -> int:
+    """Gather arbitrary DCP-selected token rows into a contiguous staging buffer."""
+    import numpy as np
+
+    num_layers = len(k_buffers)
+    head_dim = k_buffers[0].shape[-1]
+    dtype_size = k_buffers[0].element_size()
+    num_tokens = len(token_indices_np)
+    per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
+
+    if num_tokens == 0:
+        return 0
+
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+    token_idx_tensor = torch.from_numpy(token_indices_np.astype(np.int64)).to(device)
+    gather_idx = token_idx_tensor.view(-1, 1, 1).expand(
+        num_tokens, num_heads, head_dim
+    )
+
+    if not hasattr(staging_buffer, "_gather_stream"):
+        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+
+    staging_buffer._gather_stream.wait_stream(
+        torch.cuda.default_stream(torch.device(device))
+    )
+
+    staging_view = staging_buffer.buffer
+    offset = 0
+    with torch.cuda.stream(staging_buffer._gather_stream):
+        for layer_id in range(num_layers):
+            dst = (
+                staging_view[offset : offset + per_layer_bytes]
+                .view(k_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
+            gather_kv_head_slices(
+                k_buffers[layer_id],
+                gather_idx,
+                src_head_start,
+                num_heads,
+                dst,
+            )
+            offset += per_layer_bytes
+        for layer_id in range(num_layers):
+            dst = (
+                staging_view[offset : offset + per_layer_bytes]
+                .view(v_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
+            gather_kv_head_slices(
+                v_buffers[layer_id],
+                gather_idx,
+                src_head_start,
+                num_heads,
+                dst,
+            )
+            offset += per_layer_bytes
+
+    staging_buffer._gather_stream.synchronize()
+    return offset
+
+
 def _scatter_staging_to_kv_torch(
     staging_buffer_view: torch.Tensor,
     k_buffers: list,
@@ -681,6 +752,72 @@ def scatter_staging_to_kv(
         dst_tp_rank,
         total_kv_heads,
     )
+
+
+def scatter_dcp_staging_to_kv(
+    staging_buffer_view: torch.Tensor,
+    k_buffers: list,
+    v_buffers: list,
+    dst_token_idx_tensor: torch.Tensor,
+    prefill_attn_tp_size: int,
+    decode_attn_tp_size: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+) -> None:
+    """Scatter packed DCP token rows from staging into local DCP KV slots."""
+    num_layers = len(k_buffers)
+    head_dim = k_buffers[0].shape[-1]
+    dtype_size = k_buffers[0].element_size()
+    num_tokens = dst_token_idx_tensor.shape[0]
+    if num_tokens == 0:
+        return
+
+    if prefill_attn_tp_size > decode_attn_tp_size:
+        num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
+    else:
+        num_writers = 1
+
+    offset = 0
+    for writer_rank in range(num_writers):
+        _, num_heads, dst_head_start, _ = compute_head_slice_params(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            writer_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
+        per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
+
+        for layer_id in range(num_layers):
+            layer_data = (
+                staging_buffer_view[offset : offset + per_layer_bytes]
+                .view(k_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
+            scatter_kv_head_slices(
+                layer_data,
+                k_buffers[layer_id],
+                dst_token_idx_tensor,
+                dst_head_start,
+                num_heads,
+                page_size=1,
+            )
+            offset += per_layer_bytes
+        for layer_id in range(num_layers):
+            layer_data = (
+                staging_buffer_view[offset : offset + per_layer_bytes]
+                .view(v_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
+            scatter_kv_head_slices(
+                layer_data,
+                v_buffers[layer_id],
+                dst_token_idx_tensor,
+                dst_head_start,
+                num_heads,
+                page_size=1,
+            )
+            offset += per_layer_bytes
 
 
 def compute_head_slice_params(

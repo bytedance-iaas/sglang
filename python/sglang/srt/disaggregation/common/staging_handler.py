@@ -130,9 +130,40 @@ class DecodeStagingHandler:
 
     def register_decode_req(self, room: int, decode_req: "DecodeRequest") -> None:
         self._room_to_decode_req[room] = decode_req
+        self._replay_ready_chunks(room, decode_req)
 
     def unregister_decode_req(self, room: int) -> None:
         self._room_to_decode_req.pop(room, None)
+
+    def _replay_ready_chunks(self, room: int, decode_req: "DecodeRequest") -> None:
+        """Scatter chunks whose CHUNK_READY messages arrived before registration."""
+        pending = getattr(self.kv_manager, "_chunk_writer_counts", None)
+        if not pending or room not in pending:
+            return
+
+        num_writers = self.num_writers_for(decode_req)
+        session_id = decode_req.kv_receiver.session_id
+        ready_chunks = []
+        for chunk_idx, arrivals in list(pending[room].items()):
+            for writer_key, arrival in list(arrivals.items()):
+                if arrival[2] != session_id:
+                    arrivals.pop(writer_key, None)
+            matching_arrivals = [
+                arrival for arrival in arrivals.values() if arrival[2] == session_id
+            ]
+            if not matching_arrivals:
+                pending[room].pop(chunk_idx, None)
+                continue
+            if len(matching_arrivals) >= num_writers:
+                page_start, num_pages, _ = matching_arrivals[-1]
+                ready_chunks.append((chunk_idx, page_start, num_pages))
+
+        for chunk_idx, page_start, num_pages in ready_chunks:
+            if self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages):
+                pending[room].pop(chunk_idx, None)
+
+        if not pending[room]:
+            pending.pop(room, None)
 
     # ------------------------------------------------------------------
     # Scatter submission: called from decode_thread (background)
@@ -219,6 +250,10 @@ class DecodeStagingHandler:
         """Return True if staging scatter is complete for this request."""
         if not getattr(decode_req, "_staging_scatter_done", False):
             return False
+        receiver = getattr(decode_req, "kv_receiver", None)
+        chunk_infos = getattr(receiver, "chunk_staging_infos", []) if receiver else []
+        if any(info[0] >= 0 for info in chunk_infos):
+            return False
         return not getattr(decode_req, "_chunk_events", None)
 
     def advance_scatter(self, decode_req: "DecodeRequest") -> None:
@@ -287,27 +322,52 @@ class DecodeStagingHandler:
         token_start = page_start * page_size
         token_end = token_start + num_pages * page_size
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        dcp_size = int(getattr(self.kv_manager.server_args, "dcp_size", 1))
+        dcp_rank = int(self.kv_manager.kv_args.engine_rank % dcp_size)
+        if dcp_size > 1:
+            token_end = min(token_end, len(decode_req.req.origin_input_ids))
 
         with torch.cuda.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]
-            if page_size > 1:
+            if dcp_size > 1:
+                logical = kv_indices[
+                    kv_indices % dcp_size == dcp_rank
+                ].to(torch.int64)
+                page_idx_tensor = logical // dcp_size
+            elif page_size > 1:
                 page_idx_tensor = kv_indices[::page_size] // page_size
             else:
                 page_idx_tensor = kv_indices
 
-            scatter_staging_to_kv(
-                staging_view,
-                k_buffers,
-                v_buffers,
-                page_idx_tensor,
-                page_size,
-                prefill_tp,
-                self.decode_tp,
-                dst_tp_rank,
-                self.total_kv_heads,
-            )
+            if dcp_size > 1:
+                from sglang.srt.disaggregation.common.staging_buffer import (
+                    scatter_dcp_staging_to_kv,
+                )
+
+                scatter_dcp_staging_to_kv(
+                    staging_view,
+                    k_buffers,
+                    v_buffers,
+                    page_idx_tensor,
+                    prefill_tp,
+                    self.decode_tp,
+                    dst_tp_rank,
+                    self.total_kv_heads,
+                )
+            else:
+                scatter_staging_to_kv(
+                    staging_view,
+                    k_buffers,
+                    v_buffers,
+                    page_idx_tensor,
+                    page_size,
+                    prefill_tp,
+                    self.decode_tp,
+                    dst_tp_rank,
+                    self.total_kv_heads,
+                )
 
         return True
 
@@ -324,13 +384,15 @@ class DecodeStagingHandler:
             return -1
 
         seq_len = len(decode_req.req.origin_input_ids)
-        ps = self.scheduler.token_to_kv_pool_allocator.page_size
+        ps = self.kv_buffer_info["page_size"]
         total_pages = (seq_len + ps - 1) // ps
-        page_start = total_pages - last_num_pages
+        page_start = max(0, total_pages - last_num_pages)
 
         ok = self._scatter_region(
             staging_offset, page_start, last_num_pages, decode_req
         )
+        if ok:
+            chunk_infos[-1] = (-1, -1, 0, -1, 0)
         return alloc_id if ok else -1
 
     def _free_and_send_watermark(
@@ -476,12 +538,29 @@ class PrefillStagingStrategy:
         dst_staging_ptr: int,
         dst_staging_size: int,
         target_info,
+        dst_kv_indices=None,
+        index_slice=None,
     ) -> int:
         """Execute staged transfer (gather + RDMA).
 
         Returns 0 on success, -1 to signal fallback to slice path.
         """
         try:
+            if target_info.dst_dcp_size > 1:
+                return self.kv_manager.send_kvcache_dcp_staged(
+                    session_id,
+                    prefill_kv_indices,
+                    dst_staging_ptr,
+                    dst_staging_size,
+                    dst_kv_indices,
+                    index_slice,
+                    target_info.dst_tp_rank,
+                    target_info.dst_attn_tp_size,
+                    target_info.dst_kv_item_len,
+                    target_info.dst_dcp_size,
+                    target_info.dst_dcp_rank,
+                    staging_buffer=self.staging_buffer,
+                )
             return self.kv_manager.send_kvcache_staged(
                 session_id,
                 prefill_kv_indices,
@@ -562,6 +641,7 @@ def handle_staging_req(
     kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
+    dcp_size: int = 1,
 ):
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
@@ -617,6 +697,8 @@ def handle_staging_req(
         dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
 
         chunk_tokens = chunk_num_pages * page_size
+        if dcp_size > 1:
+            chunk_tokens = (chunk_tokens + dcp_size - 1) // dcp_size
         _, _, required = compute_staging_layout(
             prefill_attn_tp_size,
             attn_tp_size,
@@ -681,6 +763,7 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
+    decode_kv_args_table: dict = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -698,7 +781,15 @@ def prefetch_staging_reqs(
     for session_id, tinfo in transfer_infos[room].items():
         if tinfo.is_dummy:
             continue
-        total_pages = len(tinfo.dst_kv_indices)
+        target_info = (
+            decode_kv_args_table.get(session_id)
+            if decode_kv_args_table is not None
+            else None
+        )
+        if target_info is not None and target_info.dst_dcp_size > 1:
+            total_pages = (len(tinfo.dst_kv_indices) + page_size - 1) // page_size
+        else:
+            total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
             continue
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages

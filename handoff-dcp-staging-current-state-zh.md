@@ -1,0 +1,319 @@
+# DCP Staging 当前状态交接
+
+## 当前结论
+- 目标场景：Prefill `TP8+EP8`，Decode `TP16+DCP2+EP16`，Mooncake RDMA，`page_size=64`，MiniMax-M2.7。
+- 当前已实现 DCP-aware staging/packing 高性能传输，并补了 `STAGING_REQ` 早到导致 `WaitingForInput` 的 registration race 修复。
+- 本轮修复后已完成一轮 300 请求、60 并发 GSP 长压测，未复现 `WaitingForInput`；但该优化仍按用户要求不要 commit。
+- 高性能传输代码和本轮稳定性修复已同步到三台测试容器。
+- 当前 debug 状态仍是开放状态，主要记录在 `debug-dcp-staging-stability.md` 和 `debug-dcp-transfer-perf.md`。
+
+## 工作区状态
+- 当前未提交修改文件：
+  - `python/sglang/srt/disaggregation/common/conn.py`
+  - `python/sglang/srt/disaggregation/common/staging_buffer.py`
+  - `python/sglang/srt/disaggregation/common/staging_handler.py`
+  - `python/sglang/srt/disaggregation/decode.py`
+  - `python/sglang/srt/disaggregation/mooncake/conn.py`
+- 当前新增/未跟踪调试文档较多，包括：
+  - `debug-dcp-staging-stability.md`
+  - `debug-dcp-transfer-perf.md`
+  - `debug-pd-garbled-output.md`
+  - `debug-pd-garbled-output-zh.md`
+- 不要执行 `git commit`。
+- 不要随意 `git reset`；临时调试 instrumentation 已按用户确认清理。
+
+## 已实现的关键代码
+- `decode.py`
+  - DCP decode metadata 发送 logical token indices，而不是普通 page indices。
+  - 这是 correctness 必需项。
+- `mooncake/conn.py`
+  - 保留普通 `send_kvcache_slice()` 的 page-slice 语义。
+  - 新增/保留 DCP 专用 `send_kvcache_dcp()` 作为非 staging fallback。
+  - 新增 DCP staging/packing 路径，使用 contiguous staging buffer 做 bulk RDMA。
+  - DCP staging 返回 `-1` 时禁止静默 fallback 到 per-token DCP 路径。
+  - 所有 staging chunk，包括 last chunk，RDMA 完成后都发送 `CHUNK_READY`。
+  - `CHUNK_READY` 早到且 room 未注册时，日志改为 `pending replay`。
+- `common/staging_handler.py`
+  - Decode 侧负责 staging scatter/free/watermark。
+  - last chunk 如果提前 scatter，最终 Success 到达时可以只标记 staging done。
+  - 新增 `_replay_ready_chunks()`：`register_decode_req()` 时主动 replay 已提前到齐的 `CHUNK_READY`。
+- `common/staging_buffer.py`
+  - 增加 DCP staging scatter/pack 支持。
+- `common/conn.py`
+  - 有少量 staging 协议相关改动。
+
+## 已验证过的结果
+- 之前完成过一次稳定基线：
+  - `generated-shared-prefix`
+  - `gsp_system_prompt_len=32000`
+  - `gsp_question_len=128`
+  - `gsp_output_len=1500`
+  - `gsp_prompts_per_group=300`
+  - `max_concurrency=60`
+  - `request_rate=30`
+  - Decode 使用 `--disable-radix-cache`
+  - Decode CUDA graph 参数正确：`--cuda-graph-bs 1 2 4 8 16 32 64`
+- 该轮结果：
+  - `Successful requests: 300`
+  - `Benchmark duration: 747.66s`
+  - `Output token throughput: 601.88 tok/s`
+  - `Peak output token throughput: 695.00 tok/s`
+  - `Mean TPOT: 30.09ms`
+  - `P99 TPOT: 30.76ms`
+  - `WaitingForInput=0`
+  - `Decode transfer failed=0`
+  - `prefill fallback=0`
+  - `health timeout=0`
+  - `unregistered=0`
+  - `cuda graph: False=0`
+- 这说明某一版本下 DCP staging 能完整跑完，但还不能说明最新用户命令和所有边界都稳定。
+
+## 最新验证结果
+- 本轮修复点：
+  - `decode.py`：staging room 在 `send_metadata()` 前注册，避免 prefill 先发 `STAGING_REQ` 时 decode 端尚未注册 room 而丢消息。
+  - `mooncake/conn.py`：`STAGING_REQ`/`CHUNK_READY` 增加 active session 校验，`CHUNK_READY` 按 `prefill_unique_rank` 去重计数。
+  - `staging_handler.py`：early `CHUNK_READY` replay 只处理当前 session。
+- 本地与三台容器关键文件 hash 一致：
+  - `decode.py`: `717fd70c26af4202cf21b3d833a936df9c4ae92d4c671bbc4185f7d48ba6ab7f`
+  - `mooncake/conn.py`: `f82733191fc5434c2f6e8c8b0138f94fa02e7a357360f15ed4b2d5d1bf6a9fe2`
+  - `staging_handler.py`: `1c8f22d6a160737be561abbc95add763187e29280a8059b88de18e498663d231`
+- 本轮 GSP 长压测：
+  - `Successful requests: 300`
+  - `Benchmark duration: 746.94s`
+  - `Output token throughput: 602.46 tok/s`
+  - `Peak output token throughput: 696.00 tok/s`
+  - `Peak concurrent requests: 61`
+  - `Mean TPOT: 30.07ms`
+  - `P99 TPOT: 30.69ms`
+- 压测后日志 grep：
+  - `WaitingForInput=0`
+  - `Decode transfer failed=0`
+  - `timed out after=0`
+  - `STAGING_REQ received for unregistered=0`
+  - `STAGING_REQ session mismatch=0`
+  - `CHUNK_READY received for unregistered=0`
+  - `CHUNK_READY session mismatch=0`
+  - `pending replay=0`
+  - `DCP decode staging too small=0`
+- 当前判断：最可能的剩余卡住原因是 metadata 发送早于 staging room 注册，导致早到的 `STAGING_REQ` 被丢；本轮修复已通过目标 GSP 基线验证。
+
+## 最新仍存在的问题
+- 用户最新命令的 cache-aware 压测卡在 `91/150` 左右，已复现并定位为新的 collective 顺序死锁，而不是最初的 `CHUNK_READY unregistered`。
+- 关键栈证据：
+  - 某些 decode rank 卡在 `poll_and_all_reduce_with_staging -> dist.all_reduce`。
+  - 同组其它 decode rank 已进入 `maybe_prepare_mlp_sync_batch -> all_gather`。
+- 根因：
+  - DCP decode ranks 在 transfer queue 未全组清空时，部分 rank 仍在 transfer poll collective，部分 rank 已进入 decode batch collective，导致 collective order mismatch。
+- 已修复：
+  - `decode.py` 在 transfer poll 前后用 `attn_tp_cpu_group` 同步 transfer queue 状态。
+  - 如果全组 transfer queue 长度不一致，或者任一 rank poll 后仍有 transfer queue，所有 rank 都跳过本轮 decode batch scheduling。
+  - 这样避免 transfer `all_reduce` 与 MLP `all_gather` 交错。
+- 同时确认真实运行路径是 `/sgl-workspace/sglang_minimax_new/python/sglang/...`，之前同步到 `/sgl-workspace/sglang` 的改动不会生效。
+
+## 远端同步状态
+- 最新 `decode.py`、`common/conn.py`、`mooncake/conn.py`、`staging_handler.py`、`staging_buffer.py`、`prefill.py` 已同步到真实运行路径并在容器内 `py_compile` 通过：
+  - `115.191.51.207 / minimax_dcp_test`
+  - `115.191.21.96 / minimax_dcp_test`
+  - `115.191.2.23 / minimax_dcp_test2`
+- 同步文件：
+  - `python/sglang/srt/disaggregation/decode.py`
+  - `python/sglang/srt/disaggregation/common/conn.py`
+  - `python/sglang/srt/disaggregation/common/staging_buffer.py`
+  - `python/sglang/srt/disaggregation/mooncake/conn.py`
+  - `python/sglang/srt/disaggregation/common/staging_handler.py`
+- 当前远端服务仍在运行：
+  - Prefill: `192.168.44.91:31000`
+  - Decode node0: `192.168.44.93:31000`
+  - Decode node1: `192.168.44.90:31000`
+  - Router: prefill 容器 `8000`
+
+## 最新验证结果：用户命令
+- 运行目录：`/data01/code/dcp_staging_collective_fix2_20260512/`
+- 配置：
+  - Prefill: 用户命令的 `TP8+EP8`，staging enabled，radix cache 保持开启。
+  - Decode: 用户命令的 `TP16+DCP2+EP16`，`max_running_requests=64`，CUDA graph list 正确。
+  - Router: `--pd-disaggregation --prefill-policy cache_aware --decode-policy round_robin`。
+- 压测：
+  - `num_prompts=150`
+  - `max_concurrency=60`
+  - `request_rate=30`
+  - `gsp_system_prompt_len=32000`
+  - `gsp_question_len=128`
+  - `gsp_output_len=1500`
+- 结果：
+  - `Successful requests: 150`
+  - `Benchmark duration: 199.52s`
+  - `Output token throughput: 1127.71 tok/s`
+  - `Peak output token throughput: 1392.00 tok/s`
+  - `Mean TPOT: 41.77ms`
+  - `P99 TPOT: 44.11ms`
+- 日志计数：
+  - Decode node0：`transfer_queue_len_mismatch=0`，`CHUNK_READY received for unregistered=0`，`timed out after=0`，`Decode transfer failed=0`
+  - Decode node1：`transfer_queue_len_mismatch=0`，`CHUNK_READY received for unregistered=0`，`timed out after=0`，`Decode transfer failed=0`
+  - Prefill：`timed out after=0`，`Decode transfer failed=0`
+- 当前判断：用户命令下 92 附近卡住的问题已在 150 请求复现压测中修复；仍建议再跑更长 soak 后再 commit。
+
+## 多参数矩阵验证
+- 运行目录：`/data01/code/dcp_staging_matrix_20260512/`
+- 矩阵结果：
+  - `small_fast`：`80/80` 成功，`system=4096`，`question=64`，`output=256`，`max_concurrency=40`，`request_rate=40`。
+  - `user_200`：`200/200` 成功，`system=32000`，`question=128`，`output=1200`，`max_concurrency=60`，`request_rate=30`。
+  - `long_input`：`96/96` 成功，`system=65536`，`question=256`，`output=512`，`max_concurrency=32`，`request_rate=12`。
+  - `long_output`：`120/120` 成功，`system=16000`，`question=128`，`output=2048`，`max_concurrency=48`，`request_rate=20`。
+  - `burst_queue`：`180/180` 成功，`system=24000`，`question=128`，`output=800`，`max_concurrency=96`，`request_rate=80`。
+- 汇总：新增矩阵压测 `676/676` 成功。
+- 关键日志计数：
+  - Prefill/router/decode0/decode1：`timed out after=0`，`Decode transfer failed=0`，`Traceback=0`，`ERROR=0`，`Exception=0`。
+  - Prefill/router/decode0/decode1：`CHUNK_READY received for unregistered=0`，`STAGING_REQ received for unregistered=0`，`transfer_queue_len_mismatch=0`。
+  - Prefill：`DCP_STAGING_DBG.*staging_transfer_deferred=29`，属于 staging ring 正常背压等待，没有造成卡住。
+- 当前判断：除 150 请求复现外，多参数矩阵也未复现 92 附近卡住或 collective mismatch，修复稳定性进一步确认。
+
+## DCP Health Check 误报修复
+- 用户长压测中观察到：
+  - 批次切换附近 `/health` 偶发 `Health check failed. Server couldn't get a response from detokenizer for last 20 seconds`。
+  - 服务未退出，后续 `/health` 又恢复 `200 OK`。
+- 根因判断：
+  - 生成式 `/health` 会发 fake 1-token 请求并等待 detokenizer/tokenizer 回包。
+  - DCP 模式下上一批完成、下一批进入时，可能正在 prefill inflight/bootstrap 或 decode prealloc/transfer 队列中，还没有 detokenizer 输出。
+  - 原 `is_fully_idle(for_health_check=True)` 会跳过 DCP 队列判断，容易把 DCP 批次切换窗口误判成 idle，导致 fake health 请求等待 20s 后误报。
+- 已在本地修复 `scheduler.py`：
+  - 新增 DCP health pending 队列统计：
+    - prefill：`disagg_prefill_inflight_queue`、`disagg_prefill_bootstrap_queue`
+    - decode：`disagg_decode_prealloc_queue.queue`、`pending_reqs`、`retracted_queue`、`disagg_decode_transfer_queue.queue`、decode offload queue
+  - DCP pending 时间较短时，scheduler 对 health 请求直接返回 `HealthCheckOutput`，避免批次切换误报。
+  - DCP pending 持续过久时，仍走原有 health timeout 路径，避免真正卡死被永久判健康。
+  - 新增环境变量：`SGLANG_DISAGG_HEALTH_PENDING_TIMEOUT`，默认 `max(60, SGLANG_HEALTH_CHECK_TIMEOUT * 3)`。
+- 验证：
+  - `python3 -m py_compile python/sglang/srt/managers/scheduler.py` 通过。
+  - VS Code diagnostics clean。
+- 注意：
+  - 该修复只影响 health request 分支，不改变正常请求调度、DCP KV transfer、staging 或 decode 生成路径。
+
+## DCP Health 修复验证结果
+- 运行目录：`/data01/code/dcp_health_fix_validation_20260513/`
+- 部署：
+  - `scheduler.py` 已同步到三端 `/sgl-workspace/sglang_minimax_new`。
+  - 三端容器内 `python3 -m py_compile python/sglang/srt/managers/scheduler.py` 均通过。
+  - 服务启动时设置 `SGLANG_DISAGG_HEALTH_PENDING_TIMEOUT=60`。
+- health 验证：
+  - 压测期间对 router `/health` 做 1 Hz 探测。
+  - 结果：`718/718` 返回 `200`，非 200 为 `0`。
+  - prefill/decode0/decode1 日志中 `Health check failed=0`。
+  - router 日志中有 25 条启动阶段后端未 ready 的 `Health check failed`，都发生在矩阵压测开始前，不是批次切换误报。
+- 精度/功能 smoke：
+  - 3 个普通请求均 HTTP 200 且返回非空。
+  - 较长 deterministic 检查命中 `42`、`HEALTH_OK`、`0` 三个预期关键答案。
+- 压测矩阵：
+  - `small_fast`: `80/80`，输出吞吐 `1166.64 tok/s`。
+  - `user_200`: `200/200`，输出吞吐 `1094.88 tok/s`。
+  - `long_input`: `96/96`，输出吞吐 `528.45 tok/s`。
+  - `long_output`: `120/120`，输出吞吐 `1127.74 tok/s`。
+  - `burst_queue`: `180/180`，峰值并发 `160`，输出吞吐 `1288.02 tok/s`。
+  - 合计：`676/676` 成功。
+- 错误计数：
+  - prefill/decode0/decode1 均为：
+    - `timed out after=0`
+    - `Decode transfer failed=0`
+    - `Traceback=0`
+    - `ERROR=0`
+    - `Exception=0`
+    - `CHUNK_READY received for unregistered=0`
+    - `STAGING_REQ received for unregistered=0`
+    - `transfer_queue_len_mismatch=0`
+    - `DCP health check pending queues exceeded=0`
+- 结论：
+  - DCP 批次切换 health 误报在本次矩阵中未复现。
+  - 性能处于前次 DCP staging 验证区间内，未观察到修复引入吞吐回退。
+
+## Long Random Input Health Pending Warning
+- 用户使用 `random-input-len=128000`、`random-output-len=1500`、`max-concurrency=12`、`request-rate=2` 时，偶发：
+  - `DCP health check pending queues exceeded fast-return timeout: elapsed=180.0s timeout=60s counts={'decode_transfer': 1}`
+- 通过临时 TRAE debug collector 复现和定位：
+  - pre-fix 日志显示 `elapsed` 会跨不同请求累计。
+  - 例如约 `60s` 时队首 transfer 是 `rid=d4f35e651e7a4c609e1827ea0b090b41`，约 `92s` 时已经变为 `rid=9534a246530c48d99cd83037031fc992`。
+  - 说明 warning 的时间表示“DCP 队列持续非空时间”，不是“同一个 transfer 请求卡住时间”。
+- 已修复 `scheduler.py`：
+  - 新增 `_disagg_health_pending_signature`。
+  - 当 DCP pending 的代表性 work 改变时，重置 `_disagg_health_pending_since`。
+  - decode signature 包含队列计数、代表性 prealloc/transfer 请求的 `rid`、`bootstrap_room`、`session_id`、`metadata_buffer_index`。
+- post-fix 验证：
+  - 运行目录：`/data01/code/dcp_health_transfer_fix_20260513/`
+  - `100/100` random 128k/1500 请求成功。
+  - prefill/decode0/decode1/router 均 `DCP health check pending queues exceeded=0`。
+  - debug collector lines 为 `0`，说明没有同一 signature 的 DCP pending 超过 60s。
+  - router `/health` 为 `1347/1347` 全 200。
+  - direct decode `/health` 的失败只发生在 decode 未 ready 的启动窗口，ready 后为 200。
+- 扩展 soak：
+  - 同 workload 的 `num-prompts=300` 已完整跑完。
+  - `Successful requests: 300/300`
+  - `Benchmark duration: 3816.42s`
+  - `Request throughput: 0.08 req/s`
+  - `Input token throughput: 5743.90 tok/s`
+  - `Output token throughput: 65.74 tok/s`
+  - `Peak output token throughput: 435.00 tok/s`
+  - `Peak concurrent requests: 15`
+  - router `/health` 为 `3840/3840` 全 200。
+  - debug collector lines 为 `0`。
+  - prefill/decode0/decode1 的 `DCP health check pending queues exceeded`、`timed out after`、`Decode transfer failed`、`Traceback`、`ERROR`、`Exception`、`CHUNK_READY received for unregistered`、`STAGING_REQ received for unregistered`、`transfer_queue_len_mismatch` 均为 `0`。
+  - router 日志仍有启动阶段后端未 ready 的 `ERROR=30`、`Health check failed=25`，但压测期独立 router health 探测无失败。
+- commit 前清理验证：
+  - 临时 `TRAE_DEBUG`、`DCP_TRANSFER_PERF`、`debug-point`、`DCP_STAGING_DBG` instrumentation 已从源码清理。
+  - 清理后代码已同步到三端，并在三端容器内 `py_compile` 通过。
+  - 清理后新 router 验证：`random-input-len=128000`、`random-output-len=1500`、`num-prompts=10` 跑通 `10/10`。
+  - router `/health` 为 `66/66` 全 200。
+  - prefill/router/decode0/decode1 的 health pending、transfer mismatch、timeout、decode transfer failed、Traceback、ERROR、Exception、unregistered staging、debug marker 计数均为 `0`。
+
+## 下次继续建议
+- 第一步：如果继续验证，先确认是否复用当前仍在运行的三端服务；当前 decode 进程里 CUDA graph 参数已经正确：
+  - `--cuda-graph-bs 1 2 4 8 16 32 64`
+- 第二步：如果继续验证，建议直接跑更长 soak，例如 `num_prompts=600/1000`，或把矩阵脚本重复 3-5 轮。
+- 第三步：如果要隔离性能，再做 `--disable-radix-cache` A/B；当前 150 请求验证和 676 请求矩阵都覆盖了用户的 cache-aware 配置。
+- 第四步：继续保持：
+  - `SGLANG_DISAGG_STAGING_BUFFER=1`
+  - 保持 `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=1024`
+  - 保持 `SGLANG_DISAGG_STAGING_POOL_SIZE_MB=8192`
+- 第五步：继续观察：
+  - `WaitingForInput`
+  - `Decode transfer failed`
+  - `Falling back to per-token`
+  - `DCP decode staging too small`
+  - `CHUNK_READY received for unregistered`
+  - `transfer_queue_len_mismatch`
+  - `DCP health check pending queues exceeded fast-return timeout`
+  - `cuda graph: False`
+  - prefill `#inflight-req`
+  - decode `#transfer-req`
+- 第六步：如果仍出现卡住，需要优先抓 `py-spy dump`，确认是否又是 collective order mismatch：
+  - transfer poll: `poll_and_all_reduce_with_staging`
+  - decode batch: `maybe_prepare_mlp_sync_batch`
+  - prefill inflight: `process_disagg_prefill_inflight_queue`
+- 第七步：如果仍出现 `pending replay` 后超时，需要继续补控制面 evidence：
+  - 每个 room/chunk 的 `STAGING_REQ`
+  - `STAGING_RSP`
+  - `CHUNK_READY`
+  - `submit_chunk_scatter`
+  - `free watermark`
+  - final `Success`
+
+## 推荐启动关键参数
+- Decode：
+  - `SGLANG_DISAGG_STAGING_BUFFER=1`
+  - `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=1024`
+  - `SGLANG_DISAGG_STAGING_POOL_SIZE_MB=8192`
+  - `--cuda-graph-max-bs 64`
+  - `--cuda-graph-bs 1 2 4 8 16 32 64`
+  - `--max-running-requests 64`
+  - `--disable-radix-cache`
+  - `--page-size 64`
+- Prefill：
+  - `SGLANG_DISAGG_STAGING_BUFFER=1`
+  - `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=1024`
+  - `SGLANG_DISAGG_STAGING_POOL_SIZE_MB=8192`
+  - `--max-running-requests 64`
+  - `--disable-radix-cache`
+  - `--page-size 64`
+
+## 注意事项
+- 当前高性能 DCP staging 还不能 commit。
+- 本轮目标 GSP 基线已通过，但 debug 状态仍保持开放；是否需要更长 soak 或 radix-cache A/B 需要用户确认。
+- 如果用户只问 TTFT，高并发 `output_len=1500` 的 TTFT 主要受 decode 长输出排队影响，不能直接等同于 KV transfer 性能。
