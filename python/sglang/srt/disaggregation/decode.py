@@ -986,7 +986,13 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if getattr(self.token_to_kv_pool_allocator, "dcp_world_size", 1) > 1:
+                # DCP KV transfer needs request-position-aware token mapping.
+                # Send logical token indices; the prefill sender filters source
+                # tokens for the destination DCP rank before RDMA.
+                page_indices = kv_indices.astype(np.int32, copy=False)
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
