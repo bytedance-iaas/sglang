@@ -915,6 +915,19 @@ class Scheduler(
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
                     )
+                    if self.enable_hicache_storage and not all(
+                        hasattr(self.tree_cache, name)
+                        for name in (
+                            "prefetch_from_storage",
+                            "hicache_storage_pass_prefix_keys",
+                        )
+                    ):
+                        logger.warning(
+                            "UnifiedRadixCache storage prefetch APIs are not available; "
+                            "disabling scheduler-level HiCache storage prefetch while "
+                            "keeping hierarchical cache enabled."
+                        )
+                        self.enable_hicache_storage = False
             elif self.enable_hierarchical_cache:
                 if self.is_hybrid_ssm:
                     from sglang.srt.mem_cache.hi_mamba_radix_cache import (
