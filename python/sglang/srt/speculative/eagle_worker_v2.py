@@ -894,7 +894,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
-
     def _mamba_verify_update(
         self,
         batch: ModelWorkerBatch,
