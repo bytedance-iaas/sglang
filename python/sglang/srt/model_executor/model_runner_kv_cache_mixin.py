@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
 import torch
-import bisect
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group

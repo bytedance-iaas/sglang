@@ -1462,6 +1462,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
