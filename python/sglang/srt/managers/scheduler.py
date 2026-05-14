@@ -448,6 +448,19 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.enable_hicache_storage and not all(
+            hasattr(self.tree_cache, name)
+            for name in (
+                "prefetch_from_storage",
+                "hicache_storage_pass_prefix_keys",
+            )
+        ):
+            logger.warning(
+                "Current tree_cache implementation does not support storage "
+                "prefetch APIs; disabling scheduler-level HiCache storage "
+                "prefetch while keeping hierarchical cache enabled."
+            )
+            self.enable_hicache_storage = False
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
