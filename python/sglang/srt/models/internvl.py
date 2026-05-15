@@ -49,15 +49,6 @@ from sglang.utils import logger
 _is_cuda = is_cuda()
 
 
-def _trace_log(tag: str, extra: str = ""):
-    import inspect
-    f = inspect.currentframe().f_back
-    logger.info(
-        "[internvl35-trace][%s] %s file=%s:%d",
-        tag, extra, f.f_code.co_filename, f.f_lineno,
-    )
-
-
 class InternAttention(nn.Module):
     def __init__(
         self,
@@ -65,10 +56,8 @@ class InternAttention(nn.Module):
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
-        layer_id: int = -1,
     ):
         super().__init__()
-        self.layer_id = layer_id
         self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -100,7 +89,6 @@ class InternAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        _trace_log("4.vit_attention_forward", f"layer_id={self.layer_id}")
         out = self.attn(hidden_states, cu_seqlens=cu_seqlens, output_ws=output_ws)
         outs = self.proj_drop(out)
         return outs
@@ -246,10 +234,8 @@ class InternVisionEncoderLayer(nn.Module):
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
-        layer_id: int = -1,
     ):
         super().__init__()
-        self.layer_id = layer_id
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
@@ -258,7 +244,6 @@ class InternVisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             use_data_parallel=use_data_parallel,
             aux_stream=aux_stream,
-            layer_id=layer_id,
         )
         self.mlp = InternMLP(config, use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -287,7 +272,6 @@ class InternVisionEncoderLayer(nn.Module):
         Args:
             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
         """
-        _trace_log("3.vit_block_forward", f"layer_id={self.layer_id} input_shape={tuple(hidden_states.shape)}")
 
         hidden_states = hidden_states + self.drop_path1(
             self.attn(
@@ -336,7 +320,7 @@ class InternVisionEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [
                 InternVisionEncoderLayer(
-                    config, dpr[idx], quant_config, use_data_parallel, aux_stream, layer_id=idx,
+                    config, dpr[idx], quant_config, use_data_parallel, aux_stream
                 )
                 for idx in range(config.num_hidden_layers)
             ]
@@ -456,7 +440,6 @@ class InternVisionModel(PreTrainedModel):
         return_dict: Optional[bool] = None,
         pixel_embeds: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
-        _trace_log("2.vit_model_forward", f"pixel_values_shape={tuple(pixel_values.shape) if pixel_values is not None else None}")
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         output_hidden_states = (
             output_hidden_states
@@ -589,7 +572,6 @@ class InternVLChatModel(nn.Module):
         self.model = self.language_model.model
 
     def pixel_shuffle(self, x, scale_factor=0.5):
-        _trace_log("5.vit_to_llm_align", f"pixel_shuffle input_shape={tuple(x.size())} scale_factor={scale_factor}")
         n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
         x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
@@ -627,7 +609,6 @@ class InternVLChatModel(nn.Module):
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
         vit_embeds = self.mlp1(vit_embeds)
-        _trace_log("5.vit_to_llm_align", f"extract_feature done output_shape={tuple(vit_embeds.shape)}")
         return vit_embeds
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
@@ -637,7 +618,6 @@ class InternVLChatModel(nn.Module):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        _trace_log("9.get_image_feature", f"num_items={len(items)}")
         pixel_values = torch.cat([item.feature for item in items])
         # If already precomputed embeddings (not raw pixel values), skip vision encoder.
         # Normal pixel_values are 4D [N, C, H, W]; precomputed embeddings are 2D or 3D.
@@ -664,7 +644,6 @@ class InternVLChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        _trace_log("9.mm_model_entry", f"input_ids_shape={tuple(input_ids.shape)} positions_shape={tuple(positions.shape)}")
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

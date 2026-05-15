@@ -288,12 +288,6 @@ class MlpProjector(nn.Module):
         self.layers = modules
 
     def forward(self, x):
-        logger.info(
-            f"[TRACE] MLP Projector (Visual-Language Feature Alignment) | "
-            f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 290 | "
-            f"input_shape={list(x.shape) if isinstance(x, torch.Tensor) else 'nested'}, "
-            f"projector_type={self.projector_type}"
-        )
         if self.token_pooling:
             batch_size, wxh, channels = x.shape
             w = h = int(wxh**0.5)
@@ -469,16 +463,7 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
-    _trace_logged = False
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not Attention._trace_logged:
-            logger.info(
-                f"[TRACE] SAM ViT-B Attention | "
-                f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 466 | "
-                f"input_shape={list(x.shape)}, num_heads={self.num_heads}, use_rel_pos={self.use_rel_pos}"
-            )
-            Attention._trace_logged = True
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = (
@@ -630,16 +615,7 @@ class Block(nn.Module):
 
         self.window_size = window_size
 
-    _trace_logged = False
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not Block._trace_logged:
-            logger.info(
-                f"[TRACE] SAM ViT-B Transformer Block | "
-                f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 618 | "
-                f"input_shape={list(x.shape)}, window_size={self.window_size}"
-            )
-            Block._trace_logged = True
         shortcut = x
         x = self.norm1(x)
         # Window partition
@@ -812,11 +788,6 @@ class ImageEncoderViT(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logger.info(
-            f"[TRACE] SAM ViT-B (ImageEncoderViT) Forward | "
-            f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 790 | "
-            f"input_shape={list(x.shape)}, num_blocks={len(self.blocks)}, img_size={self.img_size}"
-        )
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + get_abs_pos_sam(self.pos_embed, x.size(1))
@@ -1385,11 +1356,6 @@ class Qwen2Decoder2Encoder(nn.Module):
         self.query_1024 = nn.Embedding(256, hidden_dimension)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logger.info(
-            f"[TRACE] Qwen2 Hybrid Attention Vision Encoder (Qwen2Decoder2Encoder) | "
-            f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 1358 | "
-            f"input_shape={list(x.shape)}"
-        )
         x = x.flatten(2).transpose(1, 2)
         bs, n_query, _ = x.shape
 
@@ -1548,11 +1514,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         return values
 
     def _encode_ocr2_features(self, images: torch.Tensor) -> torch.Tensor:
-        logger.info(
-            f"[TRACE] OCR2 Visual Feature Encoding (_encode_ocr2_features) | "
-            f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 1516 | "
-            f"input_shape={list(images.shape)}"
-        )
         features = self.sam_model(images)
         features = self.qwen2_model(features)
         features = self.projector(features)
@@ -1645,12 +1606,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         images_spatial_crop: torch.Tensor,
         has_local_crops: Optional[List[bool]] = None,
     ) -> NestedTensors:
-        logger.info(
-            f"[TRACE] Pixel Values to Embedding (_pixel_values_to_embedding) | "
-            f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 1602 | "
-            f"pixel_values_shape={list(pixel_values.shape)}, images_crop_shape={list(images_crop.shape)}, "
-            f"is_ocr2={self.is_ocr2}"
-        )
 
         # Pixel_values (global view): [n_image, batch_size, 3, height, width]
         # images_spatial_crop: [n_image, batch_size, [num_tiles_w, num_tiles_h]]
@@ -1778,12 +1733,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         inputs_embeds = self.model.get_input_embeddings(input_ids)
 
         if multimodal_embeddings is not None:
-            logger.info(
-                f"[TRACE] Multimodal Embedding Merge (get_input_embeddings) | "
-                f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 1727 | "
-                f"input_ids_shape={list(input_ids.shape)}, "
-                f"mm_embed_shape={list(multimodal_embeddings.shape) if isinstance(multimodal_embeddings, torch.Tensor) else 'nested'}"
-            )
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings, self.image_token_id
             )
@@ -1805,11 +1754,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: object,
     ):
-        logger.info(
-            f"[TRACE] DeepseekOCRForCausalLM Forward (Model Entry) | "
-            f"File: sglang/python/sglang/srt/models/deepseek_ocr.py, Line: 1750 | "
-            f"input_ids_shape={list(input_ids.shape)}, positions_shape={list(positions.shape)}"
-        )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

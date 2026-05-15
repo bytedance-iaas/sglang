@@ -1,4 +1,3 @@
-import logging
 import math
 import re
 from itertools import product
@@ -8,8 +7,8 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
-from torchvision.transforms import functional as F
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as F
 from transformers import BatchFeature, ProcessorMixin, TensorType
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
@@ -25,25 +24,12 @@ from sglang.srt.multimodal.processors.base_processor import (
 Step3Image = Union[Image.Image, torch.Tensor]
 ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
 
-logger = logging.getLogger(__name__)
-
-
-def _trace_log(tag: str, extra: str = ""):
-    import inspect
-
-    f = inspect.currentframe().f_back
-    logger.info(
-        "[internvl35-trace][%s] %s file=%s:%d",
-        tag,
-        extra,
-        f.f_code.co_filename,
-        f.f_lineno,
-    )
-
 
 class GPUToTensor(torch.nn.Module):
 
-    def forward(self, raw_image: Union[np.ndarray, Image.Image, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, raw_image: Union[np.ndarray, Image.Image, torch.Tensor]
+    ) -> torch.Tensor:
         if isinstance(raw_image, torch.Tensor):
             image_tensor = raw_image
             if image_tensor.ndim != 3:
@@ -84,8 +70,6 @@ class Step3VisionProcessor:
         mean = [0.48145466, 0.4578275, 0.40821073]
         std = [0.26862954, 0.26130258, 0.27577711]
         patch_size = patch_size if patch_size is not None else size
-        self.size = size
-        self.patch_size = patch_size
 
         self.transform = transforms.Compose(
             [
@@ -124,19 +108,6 @@ class Step3VisionProcessor:
         )
 
     def __call__(self, image, is_patch=False):
-        image_size = (
-            tuple(image.size)
-            if isinstance(image, Image.Image)
-            else tuple(image.shape)
-        )
-        _trace_log(
-            "1.image_preprocess",
-            (
-                f"to_pixel_values is_patch={is_patch} "
-                f"input_shape={image_size} "
-                f"target_size={self.patch_size if is_patch else self.size}"
-            ),
-        )
         if is_patch:
             return {"pixel_values": self.patch_transform(image).unsqueeze(0)}
         else:
@@ -149,7 +120,9 @@ class ImagePatcher:
             return img.size
         if isinstance(img, torch.Tensor):
             if img.ndim != 3:
-                raise TypeError(f"Expected CHW image tensor, got shape {tuple(img.shape)}")
+                raise TypeError(
+                    f"Expected CHW image tensor, got shape {tuple(img.shape)}"
+                )
             return int(img.shape[-1]), int(img.shape[-2])
         raise TypeError(f"Unsupported image type: {type(img)}")
 
@@ -255,7 +228,9 @@ class ImagePatcher:
             antialias=True,
         ).contiguous()
 
-    def patch_crop(self, img: Step3Image, i: int, j: int, th: int, tw: int) -> Step3Image:
+    def patch_crop(
+        self, img: Step3Image, i: int, j: int, th: int, tw: int
+    ) -> Step3Image:
         if isinstance(img, Image.Image):
             return img.crop((j, i, j + tw, i + th))
         return img[:, i : i + th, j : j + tw].contiguous()
@@ -289,14 +264,9 @@ class ImagePatcher:
         self, img: Step3Image
     ) -> tuple[Step3Image, list[Step3Image], list[bool] | None]:
         img_width, img_height = self.get_image_size(img)
-        _trace_log(
-            "1.image_preprocess",
-            f"patcher_start original_size={(img_width, img_height)}",
-        )
         new_img_width, new_img_height = self.get_image_size_for_padding(
             img_width, img_height
         )
-        did_square_pad = (new_img_width, new_img_height) != (img_width, img_height)
         if new_img_width != img_width or new_img_height != img_height:
             img = self.square_pad(img)
             img_width, img_height = self.get_image_size(img)
@@ -309,14 +279,6 @@ class ImagePatcher:
             max(new_img_height, new_img_width), min(new_img_height, new_img_width)
         )
         if window_size == 0:
-            _trace_log(
-                "1.image_preprocess",
-                (
-                    f"patcher_done square_pad={did_square_pad} "
-                    f"resized_size={(new_img_width, new_img_height)} "
-                    "window_size=0 num_patches=0"
-                ),
-            )
             return img, [], None
         else:
             new_img_width, new_img_height = self.get_image_size_for_crop(
@@ -345,15 +307,6 @@ class ImagePatcher:
             if newlines and newlines[-1] == len(patches) - 1:
                 newlines.pop()
 
-            _trace_log(
-                "1.image_preprocess",
-                (
-                    f"patcher_done square_pad={did_square_pad} "
-                    f"resized_size={(new_img_width, new_img_height)} "
-                    f"window_size={window_size} num_patches={len(patches)} "
-                    f"newline_count={len(newlines)} grid={(x_num, y_num)}"
-                ),
-            )
             return (
                 img,
                 patches,
@@ -409,6 +362,7 @@ class Step3VLProcessor:
     def _split_images(self, images: list[Image.Image]) -> list[ImageWithPatches]:
         result = []
         import time
+
         s_time = time.time()
         for img in images:
             result.append(self.patcher(img))
@@ -512,10 +466,6 @@ class Step3VLProcessor:
             image_inputs = {}
             text_inputs = self.tokenizer(text)
         else:
-            _trace_log(
-                "1.image_preprocess",
-                f"processor_start num_images={len(images)}",
-            )
             splitted_images_data = self._split_images(images)
             pixel_values_lst = []
             patch_pixel_values_lst = []
@@ -545,14 +495,6 @@ class Step3VLProcessor:
                 if patch_newline_mask is not None:
                     patch_newline_mask_lst.extend(patch_newline_mask)
 
-            _trace_log(
-                "1.image_preprocess",
-                (
-                    f"processor_split_done num_images={len(images)} "
-                    f"num_patches={num_patches} "
-                    f"has_patch_newline_mask={bool(patch_newline_mask_lst)}"
-                ),
-            )
             image_inputs = {
                 "pixel_values": torch.cat(pixel_values_lst),
                 "num_patches": num_patches,

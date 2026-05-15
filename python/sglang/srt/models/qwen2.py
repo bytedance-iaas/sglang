@@ -60,15 +60,6 @@ Qwen2Config = None
 logger = logging.getLogger(__name__)
 
 
-def _trace_log(tag: str, extra: str = ""):
-    import inspect
-    f = inspect.currentframe().f_back
-    logger.info(
-        "[internvl35-trace][%s] %s file=%s:%d",
-        tag, extra, f.f_code.co_filename, f.f_lineno,
-    )
-
-
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -354,7 +345,6 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        _trace_log("6.llm_model_forward", f"input_ids_shape={tuple(input_ids.shape) if input_ids is not None else None} positions_shape={tuple(positions.shape) if positions is not None else None} forward_mode={getattr(forward_batch, 'forward_mode', None)}")
 
         if self.pp_group.is_first_rank:
             if input_embeds is None:

@@ -36,17 +36,6 @@ from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_n
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
-
-
-def _trace_log(tag: str, extra: str = ""):
-    import inspect
-    f = inspect.currentframe().f_back
-    logger.info(
-        "[internvl35-trace][%s] %s file=%s:%d",
-        tag, extra, f.f_code.co_filename, f.f_lineno,
-    )
-
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -277,7 +266,6 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        _trace_log("8.llm_attention_forward", f"layer_id={self.attn.layer_id} hidden_states_shape={tuple(hidden_states.shape)}")
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
@@ -401,7 +389,6 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        _trace_log("7.llm_block_forward", f"layer_id={self.self_attn.attn.layer_id} hidden_states_shape={tuple(hidden_states.shape)}")
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,

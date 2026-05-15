@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """This is basically a copy from perception_models/core/vision_encoder/pe.py"""
 
-import logging
 from functools import partial
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -32,20 +31,6 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.utils import add_prefix
 
 _DEFAULT_NORM_LAYER = partial(nn.LayerNorm, eps=1e-5)
-logger = logging.getLogger(__name__)
-
-
-def _trace_log(tag: str, extra: str = ""):
-    import inspect
-
-    f = inspect.currentframe().f_back
-    logger.info(
-        "[internvl35-trace][%s] %s file=%s:%d",
-        tag,
-        extra,
-        f.f_code.co_filename,
-        f.f_lineno,
-    )
 
 
 def rotate_half(x):
@@ -215,12 +200,10 @@ class PerceptionEncoderVisionBlock(nn.Module):
         act_layer: Callable = nn.GELU,
         norm_layer: Callable = nn.LayerNorm,
         use_cls_token: bool = False,
-        layer_id: int = -1,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.layer_id = layer_id
         self.head_dim = d_model // n_head
         self.rope = PerceptionEncoderRope2D(
             dim=self.head_dim,
@@ -261,22 +244,7 @@ class PerceptionEncoderVisionBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, grid_hw: tuple[int, int]):
-        _trace_log(
-            "3.vit_block_forward",
-            (
-                f"layer_id={self.layer_id} grid_hw={grid_hw} "
-                f"hidden_states_shape={tuple(x.shape)}"
-            ),
-        )
-        attn_input = self.ln_1(x)
-        _trace_log(
-            "4.vit_attention_forward",
-            (
-                f"layer_id={self.layer_id} grid_hw={grid_hw} "
-                f"hidden_states_shape={tuple(attn_input.shape)}"
-            ),
-        )
-        x = x + self.ls_1(self.attn(attn_input, position_embeddings=grid_hw))  # hacky
+        x = x + self.ls_1(self.attn(self.ln_1(x), position_embeddings=grid_hw))  # hacky
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
         return x
 
@@ -312,7 +280,6 @@ class PerceptionEncoderVisionTransformer(nn.Module):
                     act_layer=act_layer,
                     norm_layer=norm_layer,
                     use_cls_token=use_cls_token,
-                    layer_id=i,
                     quant_config=quant_config,
                     prefix=f"{prefix}.resblocks.{i}",
                 )
@@ -450,12 +417,6 @@ class PerceptionEncoder(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor):
-        input_shape = tuple(x.shape)
-        patch_grid = (x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size)
-        _trace_log(
-            "2.vit_model_forward",
-            f"input_shape={input_shape} patch_grid={patch_grid}",
-        )
         x = self.forward_features(x)
         B, P, C = x.shape
         T = int(P**0.5)
@@ -466,12 +427,7 @@ class PerceptionEncoder(nn.Module):
         x = self.vit_downsampler2(x)
 
         B, C, T, T = x.shape
-        output = x.view(B, -1, T * T).transpose(1, 2)
-        _trace_log(
-            "2.vit_model_forward",
-            f"downsampled_grid={(T, T)} output_shape={tuple(output.shape)}",
-        )
-        return output
+        return x.view(B, -1, T * T).transpose(1, 2)
 
 
 class StepVLForConditionalGeneration(nn.Module):
@@ -521,80 +477,47 @@ class StepVLForConditionalGeneration(nn.Module):
         return torch.cat(tuple(self._flatten_embeddings(t) for t in embeddings))
 
     def _process_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
-        _trace_log(
-            "5.vit_to_llm_align",
-            f"projector_input_shape={tuple(image_features.shape)}",
-        )
         image_features, _ = self.vit_large_projector(image_features)
-        _trace_log(
-            "5.vit_to_llm_align",
-            f"projector_output_shape={tuple(image_features.shape)}",
-        )
         return image_features
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        assert len(items) == 1  # We only have images.
+
+        item = items[0]
+        pixel_values = item.feature.type(self.vision_model.dtype)
+        num_patches = item.model_specific_data.get("num_patches")
+        patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
+        if patch_pixel_values is not None:
+            patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype).to(
+                self.device
+            )
+
+        image_features = self._get_vision_model_output(pixel_values)
+        patch_image_features = (
+            self._get_vision_model_output(patch_pixel_values)
+            if patch_pixel_values is not None
+            else None
+        )
+        image_features = self._process_image_features(image_features)
+        patch_image_features = (
+            self._process_image_features(patch_image_features)
+            if patch_image_features is not None
+            else None
+        )
         merged_image_features = []
-        for item in items:
-            pixel_values = item.feature.type(self.vision_model.dtype)
-            num_patches = item.model_specific_data.get("num_patches")
-            if num_patches is None:
-                raise ValueError("Step3-VL image item is missing num_patches.")
-            if isinstance(num_patches, torch.Tensor):
-                num_patches = [int(x) for x in num_patches.flatten().tolist()]
-            elif isinstance(num_patches, (list, tuple)):
-                num_patches = [
-                    int(x.item()) if isinstance(x, torch.Tensor) else int(x)
-                    for x in num_patches
+        cur_patch_idx = 0
+        for i, num_patch in enumerate(num_patches):
+            cur_feature = []
+            if num_patch > 0:
+                patch_slice = patch_image_features[
+                    cur_patch_idx : cur_patch_idx + num_patch
                 ]
-            else:
-                num_patches = [int(num_patches)]
-
-            patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
-            _trace_log(
-                "9.get_image_feature",
-                (
-                    f"num_items={len(items)} "
-                    f"pixel_values_shape={tuple(pixel_values.shape)} "
-                    f"patch_pixel_values_shape={tuple(patch_pixel_values.shape) if patch_pixel_values is not None else None} "
-                    f"num_patches={num_patches}"
-                ),
+                cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
+            cur_feature.append(image_features[i].view(-1, image_features.shape[-1]))
+            cur_patch_idx += num_patch
+            merged_image_features.append(
+                torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
             )
-            if patch_pixel_values is not None and patch_pixel_values.shape[0] == 0:
-                patch_pixel_values = None
-            if patch_pixel_values is not None:
-                patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype).to(
-                    self.device
-                )
-
-            image_features = self._get_vision_model_output(pixel_values)
-            patch_image_features = (
-                self._get_vision_model_output(patch_pixel_values)
-                if patch_pixel_values is not None
-                else None
-            )
-            image_features = self._process_image_features(image_features)
-            patch_image_features = (
-                self._process_image_features(patch_image_features)
-                if patch_image_features is not None
-                else None
-            )
-            cur_patch_idx = 0
-            for i, num_patch in enumerate(num_patches):
-                cur_feature = []
-                if num_patch > 0:
-                    if patch_image_features is None:
-                        raise ValueError(
-                            "Step3-VL image item has num_patches > 0 but no patch_pixel_values."
-                        )
-                    patch_slice = patch_image_features[
-                        cur_patch_idx : cur_patch_idx + num_patch
-                    ]
-                    cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
-                cur_feature.append(image_features[i].view(-1, image_features.shape[-1]))
-                cur_patch_idx += num_patch
-                merged_image_features.append(
-                    torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
-                )
         return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -608,14 +531,6 @@ class StepVLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-        _trace_log(
-            "9.mm_model_entry",
-            (
-                f"input_ids_shape={tuple(input_ids.shape)} "
-                f"positions_shape={tuple(positions.shape)} "
-                f"forward_mode={getattr(forward_batch, 'forward_mode', None)}"
-            ),
-        )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

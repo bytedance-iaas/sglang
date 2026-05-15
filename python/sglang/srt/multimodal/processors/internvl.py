@@ -26,15 +26,6 @@ from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 logger = logging.getLogger(__name__)
 
 
-def _trace_log(tag: str, extra: str = ""):
-    import inspect
-    f = inspect.currentframe().f_back
-    logger.info(
-        "[internvl35-trace][%s] %s file=%s:%d",
-        tag, extra, f.f_code.co_filename, f.f_lineno,
-    )
-
-
 class InternVLProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel, InternS1ForConditionalGeneration]
     gpu_image_decode = False  # InternVL HF processor does not support tensor inputs
@@ -155,7 +146,6 @@ class InternVLProcessor(BaseMultimodalProcessor):
     def dynamic_preprocess(
         tensor, image_size=448, max_num=IMAGE_MAX_NUM, use_thumbnail=False
     ):
-        _trace_log("1.image_preprocess", f"dynamic_preprocess input_shape={tuple(tensor.shape)} max_num={max_num} image_size={image_size}")
         # Tensor: (C,H,W) float on GPU
         C, H, W = tensor.shape
         aspect_ratio = W / H
@@ -453,7 +443,6 @@ class InternVLProcessor(BaseMultimodalProcessor):
         num_patches_list: List[int] = []
         pixel_values_list: List[torch.Tensor] = []
 
-        _trace_log("1.image_preprocess", f"process_qwen_mm_data_async start: num_images={len(base_output.images)} img_max_num={img_max_num}")
         for image in base_output.images:
             if isinstance(image, Image.Image):
                 img_np = np.array(image.convert("RGB"))
