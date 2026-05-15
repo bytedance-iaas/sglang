@@ -22,7 +22,7 @@ set -euxo pipefail
 # ------------------------------------------------------------------------------
 # Configuration & timing
 # ------------------------------------------------------------------------------
-# Set up environment variables
+    # Set up environment variables
 # Align with upstream CUDA 13 baseline while keeping env overrides available.
 CU_VERSION="${CU_VERSION:-cu130}"
 CU_STRIP="${CU_VERSION#cu}"
@@ -457,20 +457,26 @@ if [ "${REINSTALL_TORCH}" = true ]; then
         "$PIP_CMD install \"torch==${TORCH_VER}\" \"torchaudio==${TORCHAUDIO_VER}\" \"torchvision==${TORCHVISION_VER}\" --index-url https://download.pytorch.org/whl/${CU_VERSION} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX"
 fi
 
-# Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
-INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
-    echo "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
-else
-    $PIP_CMD install nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
-fi
+# These legacy cu12 pins do not exist in upstream. Keep them only on cu12 to
+# avoid mixing cu12 runtime wheels into the cu13 baseline.
+if [ "$CU_MAJOR" != "13" ]; then
+    # Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
+    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
+        echo "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
+    fi
 
-# Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
-    echo "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
+    # Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
+    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
+        echo "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
+    fi
 else
-    $PIP_CMD install nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
+    echo "Skipping legacy cu12 nvshmem/cudnn pins on cu13 baseline"
 fi
 
 mark_step_done "Fix other dependencies"
@@ -482,10 +488,12 @@ $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.
 
 
 # Install human-eval
-pip install "setuptools==70.0.0"
+$PIP_CMD install "setuptools==70.0.0" wheel $PIP_INSTALL_SUFFIX
 retry_eval "Clone human-eval" "rm -rf human-eval && git clone https://github.com/merrymercy/human-eval.git" 5
-cd human-eval
-pip install -e . --no-build-isolation
+(
+    cd human-eval
+    $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
+)
 
 # ------------------------------------------------------------------------------
 # Prepare runner
