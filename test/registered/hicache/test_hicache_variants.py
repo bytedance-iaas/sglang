@@ -61,6 +61,8 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
         "--enable-hierarchical-cache",
         "--mem-fraction-static",
         0.7,
+        "--hicache-io-backend",
+        "kernel",
         "--hicache-size",
         100 if not _is_hip else 200,
     ]
@@ -76,6 +78,8 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     hicache_args = [
         "--trust-remote-code",
         "--enable-hierarchical-cache",
+        "--hicache-io-backend",
+        "kernel",
     ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
     mmlu_score_threshold = 0.5
     mmlu_num_examples = 64
@@ -91,6 +95,8 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     needs_tokenizer = True
     hicache_args = [
         "--enable-hierarchical-cache",
+        "--hicache-io-backend",
+        "kernel",
         "--hicache-ratio",
         1.2,
         "--mem-fraction-static",
@@ -122,6 +128,8 @@ class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--enable-hierarchical-cache",
+        "--hicache-io-backend",
+        "kernel",
         "--page-size",
         32,
         "--hicache-write-policy",

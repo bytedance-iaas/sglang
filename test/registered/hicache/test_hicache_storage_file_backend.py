@@ -83,6 +83,7 @@ class HiCacheStorageBaseMixin:
         }
         return {
             "--enable-hierarchical-cache": True,
+            "--hicache-io-backend": "kernel",
             "--mem-fraction-static": 0.6,
             "--hicache-ratio": 1.2,
             "--page-size": 64,
