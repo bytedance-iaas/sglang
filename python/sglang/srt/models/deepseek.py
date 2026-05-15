@@ -485,7 +485,7 @@ class DeepseekForCausalLM(nn.Module):
         logger.info(
             f"[TRACE] LLM Forward (DeepseekForCausalLM) | "
             f"File: sglang/python/sglang/srt/models/deepseek.py, Line: 454 | "
-            f"input_ids_shape={list(input_ids.shape)}, "
+            # f"input_ids_shape={list(input_ids.shape)}, "
             f"num_layers={self.config.num_hidden_layers}, "
             f"has_input_embeds={input_embeds is not None}"
         )
