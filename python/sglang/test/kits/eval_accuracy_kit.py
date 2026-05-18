@@ -114,6 +114,7 @@ class HumanEvalMixin:
 
     humaneval_score_threshold: float = _THRESHOLD_NOT_SET
     humaneval_score_threshold_amd: Optional[float] = None
+    humaneval_max_tokens: int = 512
     humaneval_num_threads: int = 1024
 
     def test_human_eval(self):
@@ -125,6 +126,7 @@ class HumanEvalMixin:
             base_url=self.base_url,
             model=self.model,
             eval_name="humaneval",
+            max_tokens=self.humaneval_max_tokens,
             num_examples=None,
             num_threads=self.humaneval_num_threads,
         )
@@ -153,6 +155,7 @@ class MGSMEnMixin:
     """
 
     mgsm_en_score_threshold: float = _THRESHOLD_NOT_SET
+    mgsm_en_max_tokens: int = 512
     mgsm_en_num_examples: Optional[int] = None
     mgsm_en_num_threads: int = 1024
 
@@ -165,6 +168,7 @@ class MGSMEnMixin:
             base_url=self.base_url,
             model=self.model,
             eval_name="mgsm_en",
+            max_tokens=self.mgsm_en_max_tokens,
             num_examples=self.mgsm_en_num_examples,
             num_threads=self.mgsm_en_num_threads,
         )

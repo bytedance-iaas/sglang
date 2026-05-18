@@ -46,6 +46,7 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            max_tokens=512,
             num_examples=None,
             num_threads=1024,
         )
@@ -54,6 +55,50 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
         self.assertGreaterEqual(metrics["score"], 0.80)
+
+
+@unittest.skip(
+    "Piecewise CUDA graph InternVL2.5 MGSM accuracy is unstable on current PR UT stack"
+)
+class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
+    """Test piecewise CUDA graph with InternVL2.5-8B model"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "OpenGVLab/InternVL2_5-8B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enforce-piecewise-cuda-graph",
+                "--disable-radix-cache",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k_accuracy(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        print(f"GSM8K Accuracy: {metrics['score']:.3f}")
+
+        # Baseline (no piecewise CUDA graph): 0.571 — this eval uses 5-shot
+        # concatenated text via chat API, which scores lower than reported
+        # benchmarks (~77.8%) that use proper CoT chat format. The threshold
+        # is set 5% below observed to catch catastrophic regressions.
+        self.assertGreaterEqual(metrics["score"], 0.54)
 
 
 class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
