@@ -117,6 +117,7 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
         1024,
     ]
     mmlu_score_threshold = 0.72
+    mmlu_max_tokens = 512
     mmlu_num_examples = 64
     mmlu_num_threads = 32
     mmlu_accept_length_thres = 2.26
