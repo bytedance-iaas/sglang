@@ -356,6 +356,9 @@ class MooncakeKVManager(CommonKVManager):
         receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is not None:
             handler.register_wm_subscriber(receiver, session_id)
+            decode_req = handler._room_to_decode_req.get(room)
+            if decode_req is not None:
+                handler._replay_ready_chunks(room, decode_req)
 
     def _is_watermark_ready(
         self, session_id: str, alloc_round: int, alloc_end: int
@@ -1879,12 +1882,14 @@ class MooncakeKVManager(CommonKVManager):
                         continue
                     num_writers = handler.num_writers_for(decode_req)
                     if writers_arrived >= num_writers:
-                        handler.submit_chunk_scatter(
+                        if handler.submit_chunk_scatter(
                             room, chunk_idx, page_start, num_pages
-                        )
-                        del self._chunk_writer_counts[room][chunk_idx]
-                        if not self._chunk_writer_counts[room]:
-                            self._chunk_writer_counts.pop(room, None)
+                        ):
+                            room_counts = self._chunk_writer_counts.get(room)
+                            if room_counts is not None:
+                                room_counts.pop(chunk_idx, None)
+                            if not self._chunk_writer_counts.get(room):
+                                self._chunk_writer_counts.pop(room, None)
                     continue
 
                 # Staging: prefill pre-requests staging allocation before forward
@@ -1910,8 +1915,18 @@ class MooncakeKVManager(CommonKVManager):
                             if self.enable_staging:
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
-                                    handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
+                                    decode_req = handler._room_to_decode_req.get(
+                                        bootstrap_room
+                                    )
+                                    if decode_req is not None:
+                                        handler._replay_ready_chunks(
+                                            bootstrap_room, decode_req
+                                        )
+                                    handler.submit_all_remaining_scatter_async(
+                                        bootstrap_room
+                                    )
+                                if not self._chunk_writer_counts.get(bootstrap_room):
+                                    self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(

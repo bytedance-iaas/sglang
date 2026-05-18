@@ -65,6 +65,12 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
+struct PDDualDispatchResult {
+    response: Response,
+    prefill_success: bool,
+    decode_success: bool,
+}
+
 impl PDRouter {
     async fn proxy_to_first_prefill_worker(
         &self,
@@ -341,7 +347,7 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
-                        let response = self
+                        let dispatch_result = self
                             .execute_dual_dispatch_internal(
                                 headers,
                                 json_request,
@@ -352,24 +358,28 @@ impl PDRouter {
                             )
                             .await;
 
+                        let response = dispatch_result.response;
                         let status = response.status();
-                        let not_error = status.is_success() || status.is_client_error();
-                        prefill.record_outcome(not_error);
-                        decode.record_outcome(not_error);
+                        prefill.record_outcome(dispatch_result.prefill_success);
+                        decode.record_outcome(dispatch_result.decode_success);
 
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
                             let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
+                            if !dispatch_result.prefill_success {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_PREFILL,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type,
+                                );
+                            }
+                            if !dispatch_result.decode_success {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_DECODE,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type,
+                                );
+                            }
                         }
 
                         response
@@ -529,6 +539,23 @@ impl PDRouter {
         }
     }
 
+    fn worker_outcome_from_status(status: StatusCode) -> bool {
+        status.is_success() || status.is_client_error()
+    }
+
+    fn worker_outcome_from_prefill_result(
+        prefill_result: &Result<reqwest::Response, reqwest::Error>,
+    ) -> bool {
+        match prefill_result {
+            Ok(response) => {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                Self::worker_outcome_from_status(status)
+            }
+            Err(_) => false,
+        }
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     async fn execute_dual_dispatch_internal(
         &self,
@@ -538,7 +565,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         _start_time: Instant,
-    ) -> Response {
+    ) -> PDDualDispatchResult {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
         let _prefill_guard =
@@ -581,11 +608,14 @@ impl PDRouter {
 
         events::RequestReceivedEvent {}.emit();
 
+        let prefill_success = Self::worker_outcome_from_prefill_result(&prefill_result);
+
         // Process decode response
         match decode_result {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let decode_success = Self::worker_outcome_from_status(status);
                 debug!("Decode response status: {}", status);
 
                 if !status.is_success() {
@@ -595,9 +625,14 @@ impl PDRouter {
                         status
                     );
 
-                    return self
+                    let response = self
                         .handle_decode_error_response(res, &context, prefill, decode)
                         .await;
+                    return PDDualDispatchResult {
+                        response,
+                        prefill_success,
+                        decode_success,
+                    };
                 }
 
                 // Process prefill response
@@ -611,7 +646,13 @@ impl PDRouter {
                         .await
                     {
                         Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
+                        Err(error_response) => {
+                            return PDDualDispatchResult {
+                                response: error_response,
+                                prefill_success,
+                                decode_success,
+                            };
+                        }
                     }
                 } else {
                     // Even if we don't need logprobs, we should check prefill status
@@ -620,7 +661,13 @@ impl PDRouter {
                         .await
                     {
                         Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
+                        Err(error_response) => {
+                            return PDDualDispatchResult {
+                                response: error_response,
+                                prefill_success,
+                                decode_success,
+                            };
+                        }
                     }
                 };
 
@@ -639,7 +686,7 @@ impl PDRouter {
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
-                    self.create_streaming_response(
+                    let response = self.create_streaming_response(
                         res.bytes_stream(),
                         status,
                         prefill_logprobs,
@@ -648,17 +695,29 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
-                    )
+                    );
+                    PDDualDispatchResult {
+                        response,
+                        prefill_success,
+                        decode_success,
+                    }
                 } else {
                     // Non-streaming response
                     if context.return_logprob {
-                        self.process_non_streaming_response(
-                            res,
-                            status,
-                            context.return_logprob,
-                            prefill_body,
-                        )
-                        .await
+                        let response = self
+                            .process_non_streaming_response(
+                                res,
+                                status,
+                                context.return_logprob,
+                                prefill_body,
+                            )
+                            .await;
+                        let decode_success = Self::worker_outcome_from_status(response.status());
+                        PDDualDispatchResult {
+                            response,
+                            prefill_success,
+                            decode_success,
+                        }
                     } else {
                         // Direct passthrough when no logprobs needed
                         let response_headers =
@@ -669,14 +728,22 @@ impl PDRouter {
                                 let mut response = Response::new(Body::from(decode_body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
-                                response
+                                PDDualDispatchResult {
+                                    response,
+                                    prefill_success,
+                                    decode_success,
+                                }
                             }
                             Err(e) => {
                                 error!("Failed to read decode response: {}", e);
-                                error::internal_error(
-                                    "read_response_failed",
-                                    "Failed to read response",
-                                )
+                                PDDualDispatchResult {
+                                    response: error::internal_error(
+                                        "read_response_failed",
+                                        "Failed to read response",
+                                    ),
+                                    prefill_success,
+                                    decode_success: false,
+                                }
                             }
                         }
                     }
@@ -688,7 +755,14 @@ impl PDRouter {
                     error = %e,
                     "Decode request failed"
                 );
-                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+                PDDualDispatchResult {
+                    response: error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    ),
+                    prefill_success,
+                    decode_success: false,
+                }
             }
         }
     }

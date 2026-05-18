@@ -950,6 +950,7 @@ class Scheduler(
         self._disagg_health_pending_since: Optional[float] = None
         self._disagg_health_pending_signature: Optional[Tuple] = None
         self._disagg_health_pending_last_log: float = 0.0
+        self._disagg_health_pending_forward_ct: int = 0
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -3147,7 +3148,34 @@ class Scheduler(
         if not any(counts.values()):
             self._disagg_health_pending_since = None
             self._disagg_health_pending_signature = None
+            self._disagg_health_pending_forward_ct = self.forward_ct
             return False
+
+        # Progress-aware reset: when the scheduler is actively running batches,
+        # token generation will piggyback the health response, so DCP queues
+        # being non-empty under sustained long-input load is backpressure, not
+        # a stall. Resetting the pending timer here prevents the elapsed
+        # counter from accumulating across distinct in-flight transfers and
+        # avoids spurious "pending queues exceeded" warnings while leaving
+        # the original signature-based detection intact for genuine stalls
+        # where forward progress has stopped.
+        current_forward_ct = self.forward_ct
+        has_active_batch = (
+            not self.running_batch.is_empty()
+            or (self.cur_batch is not None and not self.cur_batch.is_empty())
+            or (self.last_batch is not None and not self.last_batch.is_empty())
+        )
+        if has_active_batch:
+            self._disagg_health_pending_since = None
+            self._disagg_health_pending_signature = None
+            self._disagg_health_pending_forward_ct = current_forward_ct
+            return True
+
+        if self._disagg_health_pending_forward_ct != current_forward_ct:
+            self._disagg_health_pending_since = None
+            self._disagg_health_pending_signature = None
+            self._disagg_health_pending_forward_ct = current_forward_ct
+            return True
 
         signature = self._get_disagg_health_pending_signature(counts)
         if (

@@ -74,6 +74,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -1412,16 +1413,45 @@ class SchedulerDisaggregationDecodeMixin:
                 self.waiting_queue.extend(transferred_reqs)
             else:
                 self.waiting_queue.extend(transferred_reqs)
-            post_transfer_len = torch.tensor(
-                [len(self.disagg_decode_transfer_queue.queue)],
+            local_post_transfer_len = len(self.disagg_decode_transfer_queue.queue)
+            min_post_transfer_len = torch.tensor(
+                [local_post_transfer_len],
                 dtype=torch.int32,
                 device="cpu",
             )
+            max_post_transfer_len = min_post_transfer_len.clone()
             dist.all_reduce(
-                post_transfer_len,
+                min_post_transfer_len,
+                op=dist.ReduceOp.MIN,
+                group=self.attn_tp_cpu_group,
+            )
+            dist.all_reduce(
+                max_post_transfer_len,
                 op=dist.ReduceOp.MAX,
                 group=self.attn_tp_cpu_group,
             )
-            if post_transfer_len.item() > 0:
+            if min_post_transfer_len.item() != max_post_transfer_len.item():
+                now = time.time()
+                last_log = getattr(
+                    self, "_dcp_post_transfer_queue_mismatch_last_log", 0.0
+                )
+                if now - last_log > 5.0:
+                    logger.warning(
+                        "DCP post-transfer queue length mismatch: rank=%s local=%s "
+                        "min=%s max=%s prealloc=%s waiting=%s running=%s",
+                        self.tp_rank,
+                        local_post_transfer_len,
+                        min_post_transfer_len.item(),
+                        max_post_transfer_len.item(),
+                        len(self.disagg_decode_prealloc_queue.queue),
+                        len(self.waiting_queue),
+                        self.running_batch.batch_size(),
+                    )
+                    self._dcp_post_transfer_queue_mismatch_last_log = now
                 return False
+            # Post-transfer queue length is consistent across attention TP
+            # ranks. Allow continuous decode to overlap with future transfer
+            # requests even if the queue is non-empty; the pre-poll gate above
+            # plus this consistency check together preserve collective-order
+            # safety without forcing a full transfer-queue drain.
         return True

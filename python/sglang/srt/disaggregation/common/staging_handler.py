@@ -18,6 +18,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -242,6 +243,55 @@ class DecodeStagingHandler:
             decode_req._staging_scatter_done = True
         return True
 
+    def submit_all_remaining_scatter_async(self, room: int) -> bool:
+        """Submit scatter for every allocated chunk after final prefill success.
+
+        CHUNK_READY is an optimization signal for early scatter/watermark
+        progress. Once all prefill ranks report Success, all staged RDMA writes
+        for the room have completed, so any remaining allocation can be safely
+        scattered even if its CHUNK_READY notification was lost or delayed.
+        """
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "[STAGING] submit_all_remaining_scatter_async: room=%s not registered.",
+                room,
+            )
+            return False
+
+        receiver = decode_req.kv_receiver
+        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        if not chunk_infos:
+            decode_req._staging_all_remaining_submitted = True
+            decode_req._staging_scatter_done = True
+            return True
+
+        page_size = self.kv_buffer_info["page_size"]
+        chunked_prefill_size = self.kv_manager.server_args.chunked_prefill_size or 8192
+        full_chunk_pages = max(1, chunked_prefill_size // page_size)
+        submitted = 0
+
+        for chunk_idx, info in enumerate(list(chunk_infos)):
+            alloc_id, staging_offset, _, _, num_pages = info
+            if alloc_id < 0 or staging_offset < 0:
+                continue
+            page_start = chunk_idx * full_chunk_pages
+            ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
+            if not ok:
+                continue
+            event = torch.cuda.Event()
+            event.record(self.staging_allocator._scatter_stream)
+            if not hasattr(decode_req, "_chunk_events"):
+                decode_req._chunk_events = []
+            decode_req._chunk_events.append((event, alloc_id))
+            chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+            submitted += 1
+
+        decode_req._staging_all_remaining_submitted = True
+        if submitted == 0 and not getattr(decode_req, "_chunk_events", None):
+            decode_req._staging_scatter_done = True
+        return True
+
     # ------------------------------------------------------------------
     # Event check + free: called from main thread (pop_transferred)
     # ------------------------------------------------------------------
@@ -264,6 +314,8 @@ class DecodeStagingHandler:
         method only polls the recorded events and releases staging memory.
         """
         room = decode_req.req.bootstrap_room
+        self._replay_ready_chunks(room, decode_req)
+
         chunk_events = getattr(decode_req, "_chunk_events", None)
         if chunk_events:
             for i in range(len(chunk_events) - 1, -1, -1):
@@ -271,6 +323,15 @@ class DecodeStagingHandler:
                 if event.query():
                     chunk_events.pop(i)
                     self._free_and_send_watermark(alloc_id, decode_req)
+
+        if getattr(decode_req, "_staging_all_remaining_submitted", False):
+            receiver = getattr(decode_req, "kv_receiver", None)
+            chunk_infos = getattr(receiver, "chunk_staging_infos", []) if receiver else []
+            if not getattr(decode_req, "_chunk_events", None) and not any(
+                info[0] >= 0 for info in chunk_infos
+            ):
+                decode_req._staging_scatter_done = True
+                return
 
         if not getattr(decode_req, "_staging_last_scatter_submitted", False):
             return
