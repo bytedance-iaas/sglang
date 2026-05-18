@@ -46,6 +46,7 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            max_tokens=512,
             num_examples=None,
             num_threads=1024,
         )
@@ -85,6 +86,7 @@ class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            max_tokens=512,
             num_examples=None,
             num_threads=1024,
         )
