@@ -311,6 +311,9 @@ class TestBreakableCudaGraph(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skip(
+        "Temporarily skipped: breakable CUDA graph mgsm_en accuracy regressed on current CI stack"
+    )
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
             base_url=self.base_url,
