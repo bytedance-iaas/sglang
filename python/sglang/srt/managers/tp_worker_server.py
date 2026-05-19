@@ -49,11 +49,14 @@ import torch
 import zmq
 import time
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.server_args import PortArgs, ServerArgs
+
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +237,23 @@ class TpWorkerServer:
     # ------------------------------------------------------------------
 
     def run_loop(self) -> None:
-        """Blocking event loop.  Must be called from the GPU process/thread."""
+        """Blocking event loop.  Must be called from the GPU process/thread.
+
+        Dispatches based on ``SGLANG_PIPELINE_2AHEAD``: when set, defers to
+        :meth:`run_loop_pipelined` which submits forward N+1 *before* it
+        synchronizes for and replies to N — collapsing the per-step sync
+        wait into the next step's forward execution. Requires a scheduler
+        that sends N+1 without waiting for reply N (uses ``input_slot`` /
+        ``output_slot`` FutureMap contract); otherwise the worker deadlocks
+        waiting for a second request that never arrives.
+        """
+        if envs.SGLANG_RUST_DETOKENIZER.get():
+            self.run_loop_pipelined()
+            return
+        self._run_loop_sequential()
+
+    def _run_loop_sequential(self) -> None:
+        """Standard request → dispatch → reply loop (one in flight at a time)."""
         # Wait for the client's "hello" before sending the (potentially large)
         # handshake payload so no messages are lost during socket setup.
         self.socket.recv()
@@ -292,7 +311,7 @@ class TpWorkerServer:
                 # so a deployment can opt out if msgspec encoding ever shows
                 # a regression on its specific workload.
                 use_mp = (
-                    os.environ.get("SGLANG_MSGPACK_WORKER_REPLY", "1") == "1"
+                    envs.SGLANG_IPC_USE_MSGPACK.get()
                     and isinstance(result, dict)
                     and result.get("_slim_decode") is True
                 )
@@ -339,6 +358,197 @@ class TpWorkerServer:
                     logger.info(
                         "TpWorkerServer run_loop[%s %d steps] avg ms: recv_wait=%.2f "
                         "unpickle=%.2f dispatch=%.2f repickle=%.2f send=%.2f total=%.2f",
+                        label, n,
+                        a["recv"] / n * 1000,
+                        a["unpkl"] / n * 1000,
+                        a["disp"] / n * 1000,
+                        a["repkl"] / n * 1000,
+                        a["send"] / n * 1000,
+                        (a["recv"] + a["unpkl"] + a["disp"] + a["repkl"] + a["send"]) / n * 1000,
+                    )
+                    win = a["win"]
+                    for k in a:
+                        if k == "win":
+                            continue
+                        a[k] = 0 if k == "count" else 0.0
+                    a["win"] = win
+
+    def run_loop_pipelined(self) -> None:
+        """Pipelined event loop: keep one forward in flight on the GPU while
+        the CPU finalizes the previous reply.
+
+        Per-iteration shape for a hot-path message (M_DECODE_STEP /
+        M_FORWARD_GENERATION) when the scheduler is 2-ahead:
+
+            recv N+1  →  submit forward N+1 (async)  →  finish + send reply N
+
+        ``finish + send`` is the unavoidable wait for N's forward to retire,
+        but during that wait N+1's kernels are queued behind N on the same
+        CUDA stream and will start the instant N's forward completes. The
+        CPU's encode/send for N then overlaps with N+1's GPU forward, not
+        with idle silicon. Steady-state per step collapses from
+        ``forward + cpu`` to ``max(forward, cpu)``.
+
+        Deadlock-safe with 1-ahead schedulers: when ``pending`` is set we
+        first try a non-blocking recv for the next request.  If nothing is
+        queued (the scheduler is gated on reply N), we finalize ``pending``
+        immediately and then do a blocking recv — i.e. the loop degrades to
+        sequential behavior instead of hanging.  Pipelining only engages
+        when the scheduler actively sends N+1 before recv'ing reply N,
+        which it can do via the ``input_slot`` / ``output_slot`` FutureMap
+        contract already on the wire.
+        """
+        # Handshake (same as sequential loop).
+        self.socket.recv()
+        handshake = self._build_handshake()
+        self.socket.send(pickle.dumps(handshake))
+        logger.info("TpWorkerServer handshake sent (pipelined)")
+
+        HOT_METHODS = (M_DECODE_STEP, M_FORWARD_GENERATION)
+
+        # The single in-flight pending request.  When set, its forward has
+        # been submitted and D2H copies queued, but we haven't yet
+        # synchronized or sent its reply.
+        pending: Optional[dict] = None
+
+        # Reuse the same per-method timing aggregator shape as sequential.
+        _agg = {
+            M_DECODE_STEP: {"count": 0, "recv": 0.0, "unpkl": 0.0, "disp": 0.0, "repkl": 0.0, "send": 0.0, "win": 100},
+            M_FORWARD_GENERATION: {"count": 0, "recv": 0.0, "unpkl": 0.0, "disp": 0.0, "repkl": 0.0, "send": 0.0, "win": 5},
+        }
+
+        while True:
+            _t0 = time.perf_counter()
+            parts = None
+            try:
+                # If we have a pending request, the scheduler MAY have already
+                # queued the next one (2-ahead).  Probe non-blocking first.
+                # If empty, finalize ``pending`` so the scheduler unblocks,
+                # then do a blocking recv — this is the auto-fallback that
+                # prevents the 1-ahead deadlock.
+                if pending is not None:
+                    try:
+                        parts = self.socket.recv_multipart(zmq.NOBLOCK)
+                    except zmq.Again:
+                        # Scheduler is 1-ahead (gated on reply): flush.
+                        self._finish_pending_and_send(pending)
+                        pending = None
+                if parts is None:
+                    parts = self.socket.recv_multipart()
+                _t1 = time.perf_counter()
+            except zmq.ZMQError as exc:
+                logger.error("TpWorkerServer ZMQ error: %s", exc)
+                break
+
+            if len(parts) < 1:
+                continue
+
+            method = parts[0]
+            # Same msgpack-vs-pickle payload decode as the sequential path.
+            if (
+                len(parts) >= 3
+                and parts[1] == b"mp"
+                and method == M_DECODE_STEP
+            ):
+                import msgspec
+                from sglang.srt.managers.io_struct.msgpack_struct import (
+                    DecodeStepControl,
+                )
+                from sglang.srt.managers.io_struct import ipc_to_tensor
+                typed_ctrl = msgspec.msgpack.decode(parts[2], type=DecodeStepControl)
+                payload = self._decode_step_control_to_payload(typed_ctrl, ipc_to_tensor)
+            else:
+                payload = pickle.loads(parts[1]) if len(parts) > 1 else {}
+            _t2 = time.perf_counter()
+
+            try:
+                if method in HOT_METHODS:
+                    # Submit the new request's forward + D2H. Returns
+                    # immediately — the kernels are queued on the GPU.
+                    if method == M_DECODE_STEP:
+                        new_pending = self._submit_decode_step(payload)
+                    else:
+                        new_pending = self._submit_forward_generation(payload)
+                    _t3 = time.perf_counter()
+
+                    # Now finalize and send the *previous* pending. Its
+                    # forward has been running on the GPU since we
+                    # submitted it; while we wait for its D2H, the new
+                    # forward is queued and will start as soon as the
+                    # previous finishes.
+                    if pending is not None:
+                        self._finish_pending_and_send(pending)
+                    _t4 = time.perf_counter()
+                    _t5 = _t4
+
+                    pending = new_pending
+                else:
+                    # Non-hot-path: flush pending first so the scheduler
+                    # sees the in-flight reply before this method's
+                    # response. Then dispatch synchronously.
+                    if pending is not None:
+                        self._finish_pending_and_send(pending)
+                        pending = None
+                    result = self._dispatch(method, payload)
+                    _t3 = time.perf_counter()
+                    use_mp = (
+                        os.environ.get("SGLANG_MSGPACK_WORKER_REPLY", "1") == "1"
+                        and isinstance(result, dict)
+                        and result.get("_slim_decode") is True
+                    )
+                    if use_mp:
+                        import msgspec
+                        typed_obj = self._typed_slim_for_reply
+                        self._typed_slim_for_reply = None
+                        if typed_obj is None:
+                            reply = pickle.dumps(result)
+                            self.socket.send_multipart([STATUS_OK, reply])
+                        else:
+                            reply = msgspec.msgpack.encode(typed_obj)
+                            self.socket.send_multipart([STATUS_OK_MSGPACK, reply])
+                        _t4 = time.perf_counter()
+                        _t5 = _t4
+                    else:
+                        reply = pickle.dumps(result)
+                        _t4 = time.perf_counter()
+                        self.socket.send_multipart([STATUS_OK, reply])
+                        _t5 = time.perf_counter()
+            except SystemExit:
+                if pending is not None:
+                    try:
+                        self._finish_pending_and_send(pending)
+                    except Exception:
+                        pass
+                    pending = None
+                self.socket.send_multipart([STATUS_OK, pickle.dumps(None)])
+                break
+            except Exception as exc:
+                # Drop any in-flight pending: a dispatch error makes its
+                # GPU state suspect, and the scheduler will reset us via
+                # a full M_FORWARD_GENERATION anyway.
+                pending = None
+                logger.exception("TpWorkerServer error in method %r", method)
+                self.socket.send_multipart([STATUS_ERROR, pickle.dumps(str(exc))])
+                continue
+
+            # Aggregate timings. Note: in the pipelined hot path, "dispatch"
+            # measures *submit-only* time (no sync), and "repickle+send"
+            # captures the sync wait for the *previous* pending plus its
+            # reply encode+send.
+            if method in _agg:
+                a = _agg[method]
+                a["count"] += 1
+                a["recv"] += _t1 - _t0
+                a["unpkl"] += _t2 - _t1
+                a["disp"] += _t3 - _t2
+                a["repkl"] += _t4 - _t3
+                a["send"] += _t5 - _t4
+                if a["count"] >= a["win"]:
+                    n = a["count"]
+                    label = "decode" if method == M_DECODE_STEP else "full"
+                    logger.debug(
+                        "TpWorkerServer run_loop_pipelined[%s %d steps] avg ms: "
+                        "recv_wait=%.2f unpickle=%.2f submit=%.2f finish_prev=%.2f send=%.2f total=%.2f",
                         label, n,
                         a["recv"] / n * 1000,
                         a["unpkl"] / n * 1000,
@@ -551,6 +761,131 @@ class TpWorkerServer:
     # Decode fast-path helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pipelined dispatch helpers — split forward submit from D2H wait.
+    #
+    # The default `_dispatch` path is monolithic (submit + sync + send-prep
+    # in one call).  The pipelined `run_loop_pipelined` variant uses the
+    # helpers below to keep one in-flight forward queued on the GPU while
+    # the CPU finalizes the previous step's reply, so the per-step sync
+    # wait overlaps with pickle/encode/send work on the CPU.
+    #
+    # Pipelining is ONLY a win when the scheduler sends batch N+1 before
+    # it has reply N — i.e. true 2-ahead. With the standard (1-ahead)
+    # scheduler, request N+1 isn't on the wire until reply N is sent, so
+    # the worker has nothing to overlap with and these helpers behave
+    # identically to the monolithic path. The scheduler-side wire already
+    # supports the contract via `output_slot` / `input_slot` on the decode
+    # control payload (see `_apply_decode_control`).
+    # ------------------------------------------------------------------
+
+    def _submit_decode_step(self, payload: dict) -> dict:
+        """Submit a forward + D2H for M_DECODE_STEP without waiting.
+
+        Returns a pending-state dict that ``_finish_pending_and_send`` will
+        consume to synchronize, build the typed reply, encode, and send.
+        """
+        if self._decode_cache is None:
+            raise RuntimeError(
+                "decode_step received but no cached decode batch exists; "
+                "a full forward_batch_generation must precede the fast path."
+            )
+        w = self.worker
+        mr = w.model_runner
+        device = mr.device
+
+        batch = self._apply_decode_control(payload, device)
+        if not batch.forward_mode.is_idle():
+            batch._deferred_alloc = self._allocate_kv_deferred(batch, mr, device)
+        else:
+            batch._deferred_alloc = None
+        result = w.forward_batch_generation(batch)
+        result.deferred_alloc = batch._deferred_alloc
+
+        # FutureMap slot capture: hold the GPU tensor for the next step's
+        # input_slot reference. Must happen before D2H reassigns
+        # ``result.next_token_ids`` to a CPU tensor.
+        output_slot = payload.get("output_slot")
+        if output_slot is not None and result.next_token_ids is not None:
+            self._future_tokens[output_slot] = result.next_token_ids
+
+        _drop_ipc_unsafe_logits(result.logits_output, batch)
+        d2h_event = _start_d2h_to_cpu(result)
+        # Build the slim reply now — it just stores refs; the tensor data
+        # becomes valid once ``_finish_pending_and_send`` syncs.
+        slim_result = _build_slim_reply(result, batch)
+        return {
+            "method": M_DECODE_STEP,
+            "batch": batch,
+            "result": result,
+            "slim_result": slim_result,
+            "d2h_event": d2h_event,
+        }
+
+    def _submit_forward_generation(self, payload: dict) -> dict:
+        """Submit a forward + D2H for M_FORWARD_GENERATION without waiting."""
+        w = self.worker
+        batch = payload["batch"]
+        self._prepare_batch(batch)
+        result = w.forward_batch_generation(
+            batch,
+            pp_proxy_tensors=payload.get("pp_proxy_tensors"),
+            is_verify=payload.get("is_verify", False),
+            skip_attn_backend_init=payload.get("skip_attn_backend_init", False),
+        )
+        result.deferred_alloc = getattr(batch, "_deferred_alloc", None)
+        # Refresh / invalidate the cached decode batch the same way the
+        # monolithic path does.
+        if batch.forward_mode.is_decode():
+            self._decode_cache = batch
+        else:
+            self._decode_cache = None
+
+        _drop_ipc_unsafe_logits(result.logits_output, batch)
+        d2h_event = _start_d2h_to_cpu(result)
+        slim_result = _build_slim_reply(result, batch)
+        return {
+            "method": M_FORWARD_GENERATION,
+            "batch": batch,
+            "result": result,
+            "slim_result": slim_result,
+            "d2h_event": d2h_event,
+        }
+
+    def _finish_pending_and_send(self, pending: dict) -> None:
+        """Wait for the pending D2H, build the typed reply, encode, and send.
+
+        The ``event.synchronize()`` here is the unavoidable wait for the
+        forward kernels to retire on the GPU.  When called *after* a new
+        forward has been submitted (the pipelined path), that new forward
+        is already queued on the GPU and will start as soon as the previous
+        one finishes — i.e. the CPU's encode/send work overlaps with the
+        GPU's next forward, not its current sync wait.
+        """
+        result = pending["result"]
+        batch = pending["batch"]
+        d2h_event = pending["d2h_event"]
+        slim_result = pending["slim_result"]
+
+        _finish_d2h_to_cpu(result, d2h_event)
+
+        try:
+            typed_obj = _build_typed_slim_reply(result, batch)
+        except Exception:
+            typed_obj = None
+
+        use_mp = (
+            envs.SGLANG_IPC_USE_MSGPACK.get()
+            and typed_obj is not None
+        )
+        if use_mp:
+            import msgspec
+            reply = msgspec.msgpack.encode(typed_obj)
+            self.socket.send_multipart([STATUS_OK_MSGPACK, reply])
+        else:
+            reply = pickle.dumps(slim_result)
+            self.socket.send_multipart([STATUS_OK, reply])
+
     def _apply_decode_control(self, payload: dict, device: str) -> "ModelWorkerBatch":
         """Apply a delta control message to the cached decode batch.
 
@@ -656,39 +991,71 @@ class TpWorkerServer:
             output_slot = payload.get("output_slot")
             if output_slot is not None and result.next_token_ids is not None:
                 self._future_tokens[output_slot] = result.next_token_ids
+            # Order matters: null out the unused logits fields *before* D2H
+            # so we never waste a copy on a tensor we're about to drop
+            # (especially hidden_states, which can be batch * hidden_dim).
             _drop_ipc_unsafe_logits(result.logits_output, batch)
-            _move_generation_result_to_cpu(result)
+            drop_ipc_logits_time = time.perf_counter()
+
+            # Submit D2H copies (non-blocking) and record an event we'll
+            # synchronize on below.  Nothing blocks here — the forward
+            # kernels and the D2H copies are all in flight on the GPU.
+            d2h_event = _start_d2h_to_cpu(result)
+
+            # Build the slim reply dict *while* the GPU is still working.
+            # _build_slim_reply only stores references to result fields, so
+            # the dict is valid as long as we synchronize before pickling.
+            # This moves ~one Python-dict-construction worth of CPU time off
+            # the critical path and onto the sync-wait window.
             slim_result = _build_slim_reply(result, batch)
-            # Build the typed msgspec version too for the run_loop msgpack path.
+
+            # Now wait for the forward pass + D2H to complete.  This is the
+            # dominant 90% of dispatch on a healthy decode step: it is the
+            # time the GPU spends executing forward kernels, and no amount
+            # of reshuffling on the CPU can shrink it.
+            _finish_d2h_to_cpu(result, d2h_event)
+            move_result_to_cpu_time = time.perf_counter()
+
+            # Build the typed msgspec reply *after* the sync.  This path
+            # materializes tensor bytes via ``t.numpy().tobytes()``; if
+            # called before the sync it would implicitly block on the same
+            # event we just waited for — no gain, harder to reason about.
             try:
                 self._typed_slim_for_reply = _build_typed_slim_reply(result, batch)
             except Exception:
                 # If typed build fails (unforeseen field), fall back to pickle.
                 self._typed_slim_for_reply = None
-            move_result_to_cpu_time = time.perf_counter()
+            build_slim_reply_time = time.perf_counter()
             # Aggregate timings every N steps so we can see worker-side breakdown
             # without flooding the log.
             self._decode_step_count = getattr(self, "_decode_step_count", 0) + 1
             self._decode_step_control_sum = getattr(self, "_decode_step_control_sum", 0.0) + (decode_control_time - start_time)
             self._decode_step_alloc_sum = getattr(self, "_decode_step_alloc_sum", 0.0) + (allocate_kv_time - decode_control_time)
             self._decode_step_forward_sum = getattr(self, "_decode_step_forward_sum", 0.0) + (forward_batch_time - allocate_kv_time)
-            self._decode_step_move_sum = getattr(self, "_decode_step_move_sum", 0.0) + (move_result_to_cpu_time - forward_batch_time)
+            self._decode_drop_ipc_logits_sum = getattr(self, "_decode_drop_ipc_logits_sum", 0.0) + (drop_ipc_logits_time - forward_batch_time)
+            self._decode_step_move_sum = getattr(self, "_decode_step_move_sum", 0.0) + (move_result_to_cpu_time - drop_ipc_logits_time)
+            self._decode_step_build_slim_sum = getattr(self, "_decode_step_build_slim_sum", 0.0) + (build_slim_reply_time - move_result_to_cpu_time)
             if self._decode_step_count >= 100:
-                logger.info(
-                    "TpWorkerServer decode_step[%d steps] avg ms: control=%.2f alloc_kv=%.2f forward=%.2f move_to_cpu=%.2f total=%.2f",
+                logger.debug(
+                    "TpWorkerServer decode_step[%d steps] avg ms: control=%.2f alloc_kv=%.2f forward=%.2f drop_ipc_logits=%.2f move_to_cpu=%.2f build_slim=%.2f total=%.2f",
                     self._decode_step_count,
                     self._decode_step_control_sum / self._decode_step_count * 1000,
                     self._decode_step_alloc_sum / self._decode_step_count * 1000,
                     self._decode_step_forward_sum / self._decode_step_count * 1000,
+                    self._decode_drop_ipc_logits_sum / self._decode_step_count * 1000,
                     self._decode_step_move_sum / self._decode_step_count * 1000,
+                    self._decode_step_build_slim_sum / self._decode_step_count * 1000,
                     (self._decode_step_control_sum + self._decode_step_alloc_sum +
-                     self._decode_step_forward_sum + self._decode_step_move_sum) / self._decode_step_count * 1000,
+                     self._decode_step_forward_sum + self._decode_drop_ipc_logits_sum +
+                     self._decode_step_move_sum + self._decode_step_build_slim_sum) / self._decode_step_count * 1000,
                 )
                 self._decode_step_count = 0
                 self._decode_step_control_sum = 0.0
                 self._decode_step_alloc_sum = 0.0
                 self._decode_step_forward_sum = 0.0
+                self._decode_drop_ipc_logits_sum = 0.0
                 self._decode_step_move_sum = 0.0
+                self._decode_step_build_slim_sum = 0.0
             return slim_result
 
         if method == M_FORWARD_GENERATION:
@@ -710,9 +1077,15 @@ class TpWorkerServer:
                 self._decode_cache = batch
             else:
                 self._decode_cache = None
+            # Same overlap pattern as M_DECODE_STEP: drop dead logits
+            # fields, submit D2H, build the slim reply (just dict-of-refs)
+            # while the forward pass is still in flight on the GPU, then
+            # wait at the latest possible moment.  ``_build_typed_slim_reply``
+            # accesses tensor bytes so it has to run after the sync.
             _drop_ipc_unsafe_logits(result.logits_output, batch)
-            _move_generation_result_to_cpu(result)
+            d2h_event = _start_d2h_to_cpu(result)
             slim = _build_slim_reply(result, batch)
+            _finish_d2h_to_cpu(result, d2h_event)
             try:
                 self._typed_slim_for_reply = _build_typed_slim_reply(result, batch)
             except Exception:
@@ -985,71 +1358,125 @@ def _move_model_worker_batch_to_device(
 # Helper: move GPU tensors in GenerationBatchResult to CPU before pickling
 # ---------------------------------------------------------------------------
 
-def _move_generation_result_to_cpu(result: "GenerationBatchResult") -> None:
-    """In-place copy of all GPU tensors in *result* to CPU.
+def _start_d2h_to_cpu(
+    result: "GenerationBatchResult",
+) -> Optional["torch.cuda.Event"]:
+    """Submit non-blocking D2H copies for every GPU tensor in *result*.
 
-    Called by the server before pickling the result so the client can
-    deserialise it without needing GPU access.
+    Does NOT wait for the copies to finish.  Returns a CUDA Event recorded
+    right after the last D2H submission so a caller can ``event.synchronize()``
+    later.  Returns ``None`` when nothing on the GPU needed copying (in
+    which case there is nothing to wait on).
 
-    Uses non_blocking=True for all D2H copies and issues a single
-    cudaStreamSynchronize at the end, avoiding one sync per tensor.
+    Splitting submit and wait lets the dispatch handler interleave purely
+    CPU work (``_build_slim_reply``, etc.) with the unavoidable wait for
+    the forward kernels to retire — the dominant cost in ``dispatch`` is
+    that wait, not the D2H itself, so any CPU work pulled in front of the
+    sync is effectively free.
     """
+    if result is None:
+        return None
+
+    needs_sync = False
+
+    # deferred_alloc dict: small int tensors (req_pool_indices, out_cache_loc,
+    # seq_lens_minus1, …).  Mutate the existing dict in place to avoid
+    # rebuilding it every step.
+    da = result.deferred_alloc
+    if da is not None:
+        for k, v in da.items():
+            if isinstance(v, torch.Tensor) and v.is_cuda:
+                da[k] = v.to("cpu", non_blocking=True)
+                needs_sync = True
+
+    nti = result.next_token_ids
+    if isinstance(nti, torch.Tensor) and nti.is_cuda:
+        result.next_token_ids = nti.to("cpu", non_blocking=True)
+        needs_sync = True
+
+    al = result.accept_lens
+    if isinstance(al, torch.Tensor) and al.is_cuda:
+        result.accept_lens = al.to("cpu", non_blocking=True)
+        needs_sync = True
+
+    # logits_output is None for most decode steps; the loop below only
+    # touches what is actually populated.
+    lo = result.logits_output
+    if lo is not None:
+        for attr in ("next_token_logprobs", "input_token_logprobs", "hidden_states"):
+            t = getattr(lo, attr, None)
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                setattr(lo, attr, t.to("cpu", non_blocking=True))
+                needs_sync = True
+
+        for attr in (
+            "next_token_top_logprobs_val",
+            "next_token_top_logprobs_idx",
+            "next_token_token_ids_logprobs_val",
+        ):
+            lst = getattr(lo, attr, None)
+            if lst is None:
+                continue
+            mutated = False
+            new_lst = lst
+            for i, v in enumerate(lst):
+                if isinstance(v, torch.Tensor) and v.is_cuda:
+                    if not mutated:
+                        new_lst = list(lst)
+                        mutated = True
+                    new_lst[i] = v.to("cpu", non_blocking=True)
+                    needs_sync = True
+            if mutated:
+                setattr(lo, attr, new_lst)
+
+    if not needs_sync:
+        return None
+
+    # Event scoped to the work submitted up to here.  An event-based wait
+    # is more precise than ``current_stream().synchronize()`` because it
+    # ignores anything else queued on the stream after ``record()``.
+    event = torch.cuda.Event()
+    event.record()
+    return event
+
+
+def _finish_d2h_to_cpu(
+    result: "GenerationBatchResult",
+    event: Optional["torch.cuda.Event"],
+) -> None:
+    """Wait for D2H copies queued by :func:`_start_d2h_to_cpu`.
+
+    ``event.synchronize()`` is the unavoidable wait — at this point we
+    block until the forward pass kernels (and the trailing D2H copies)
+    are done.  After this returns, every tensor on *result* is on CPU
+    and safe to read or pickle.
+    """
+    if event is not None:
+        event.synchronize()
+
     if result is None:
         return
 
-    _needs_sync = False
+    # Expert collectors manage their own synchronization internally.
+    reo = result.routed_experts_output
+    if reo is not None:
+        reo.copy_to_cpu()
+    edm = result.expert_distribution_metrics
+    if edm is not None:
+        edm.copy_to_cpu()
 
-    def _cpu_nb(t):
-        nonlocal _needs_sync
-        if t is None or not torch.is_tensor(t) or not t.is_cuda:
-            return t
-        _needs_sync = True
-        return t.to("cpu", non_blocking=True)
 
-    # deferred_alloc may contain GPU tensors (req_pool_indices, out_cache_loc).
-    # Always move to CPU so the scheduler process can read them without
-    # initializing a CUDA context (and so .item() calls in update_cache_from_scheduler
-    # don't trigger per-request GPU syncs).
-    if result.deferred_alloc is not None:
-        result.deferred_alloc = {
-            k: _cpu_nb(v) for k, v in result.deferred_alloc.items()
-        }
+def _move_generation_result_to_cpu(result: "GenerationBatchResult") -> None:
+    """Compatibility wrapper: submit D2H + wait, in one call.
 
-    result.next_token_ids = _cpu_nb(result.next_token_ids)
-    result.accept_lens = _cpu_nb(result.accept_lens)
-
-    lo = result.logits_output
-    if lo is not None:
-        lo.next_token_logprobs = _cpu_nb(getattr(lo, "next_token_logprobs", None))
-        lo.input_token_logprobs = _cpu_nb(getattr(lo, "input_token_logprobs", None))
-        lo.hidden_states = _cpu_nb(getattr(lo, "hidden_states", None))
-
-        val = getattr(lo, "next_token_top_logprobs_val", None)
-        if val is not None:
-            lo.next_token_top_logprobs_val = [
-                _cpu_nb(v) if torch.is_tensor(v) else v for v in val
-            ]
-        idx = getattr(lo, "next_token_top_logprobs_idx", None)
-        if idx is not None:
-            lo.next_token_top_logprobs_idx = [
-                _cpu_nb(x) if torch.is_tensor(x) else x for x in idx
-            ]
-        val2 = getattr(lo, "next_token_token_ids_logprobs_val", None)
-        if val2 is not None:
-            lo.next_token_token_ids_logprobs_val = [
-                _cpu_nb(v) if torch.is_tensor(v) else v for v in val2
-            ]
-
-    # Single synchronize flushes all pending non-blocking copies above.
-    if _needs_sync:
-        torch.cuda.current_stream().synchronize()
-
-    # These methods manage their own synchronization internally.
-    if result.routed_experts_output is not None:
-        result.routed_experts_output.copy_to_cpu()
-
-    if result.expert_distribution_metrics is not None:
-        result.expert_distribution_metrics.copy_to_cpu()
+    The dispatch hot paths use the explicit
+    :func:`_start_d2h_to_cpu` / :func:`_finish_d2h_to_cpu` split so they
+    can build the slim reply during the GPU sync wait.  This wrapper is
+    kept for callers (e.g. ``M_FORWARD_SPLIT_PREFILL``) that have no
+    overlapable CPU work between submit and wait.
+    """
+    event = _start_d2h_to_cpu(result)
+    _finish_d2h_to_cpu(result, event)
 
 
 # ---------------------------------------------------------------------------

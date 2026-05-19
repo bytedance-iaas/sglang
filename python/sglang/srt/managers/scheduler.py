@@ -1635,7 +1635,7 @@ class Scheduler(
                 if batch.forward_mode.is_decode():
                     _t_decode_count += 1
                 if _t_count >= _t_window:
-                    logger.info(
+                    logger.debug(
                         "Scheduler event_loop[%d iters, %d decode] avg ms: "
                         "recv=%.2f sched=%.2f run=%.2f proc=%.2f total=%.2f",
                         _t_count, _t_decode_count,

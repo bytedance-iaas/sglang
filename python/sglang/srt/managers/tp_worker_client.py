@@ -491,7 +491,7 @@ class TpWorkerClientGroup(BaseTpWorker):
             hit_rate = (
                 self._decode_fast_hits / max(1, total) * 100.0
             )
-            logger.info(
+            logger.debug(
                 "TpWorkerClient[%d ops] us send=%.0f recv=%.0f min=%.0f max=%.0f "
                 "| decode_fast hits=%d misses=%d full=%d (hit_rate=%.1f%%)",
                 self._rt_count,
@@ -564,7 +564,7 @@ class TpWorkerClientGroup(BaseTpWorker):
         if self._rt_count >= self._rt_window:
             total = self._decode_fast_hits + self._decode_fast_misses + self._decode_full_calls
             hit_rate = self._decode_fast_hits / max(1, total) * 100.0
-            logger.info(
+            logger.debug(
                 "TpWorkerClient[%d ops] us send=%.0f recv=%.0f min=%.0f max=%.0f "
                 "| decode_fast hits=%d misses=%d full=%d (hit_rate=%.1f%%)",
                 self._rt_count,
