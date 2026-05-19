@@ -33,7 +33,7 @@ class TestQwen3NextMTP(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
         "--chunked-prefill-size",
         "2048",
         "--mamba-scheduler-strategy",
-        "no_buffer",
+        "extra_buffer",
         "--disable-radix-cache",
     ]
 
