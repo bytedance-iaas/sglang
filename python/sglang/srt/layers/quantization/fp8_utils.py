@@ -1247,6 +1247,63 @@ def requant_weight_ue8m0(
     return out_w, out_s
 
 
+def requant_weight_per_expert(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+):
+    """Requantize block-quantized FP8 weights to per-expert FP8.
+
+    Returns:
+        out_w: [*batch, N, K] float8_e4m3fn — requantized weights
+        out_s: [*batch] float32 — one scale per expert (outermost dim)
+    """
+    *batch_dims, n, k = weight.shape
+
+    if not batch_dims:
+        weight_dequant = block_quant_dequant(
+            weight, weight_scale_inv, weight_block_size, torch.bfloat16
+        )
+        amax = weight_dequant.float().abs().amax().clamp(min=1e-12)
+        scale = amax / 448.0
+        out_w = (weight_dequant.float() / scale).clamp(-448, 448).to(
+            torch.float8_e4m3fn
+        )
+        return out_w, scale
+
+    num_experts = weight.shape[0]
+    out_w = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    per_expert_scale = torch.empty(
+        num_experts, device=weight.device, dtype=torch.float32
+    )
+
+    for i in range(num_experts):
+        expert_dequant = block_quant_dequant(
+            weight[i], weight_scale_inv[i], weight_block_size, torch.bfloat16
+        )
+        amax = expert_dequant.float().abs().amax().clamp(min=1e-12)
+        scale = amax / 448.0
+        out_w[i] = (expert_dequant.float() / scale).clamp(-448, 448).to(
+            torch.float8_e4m3fn
+        )
+        per_expert_scale[i] = scale
+
+    return out_w, per_expert_scale
+
+
+def requant_weight_per_expert_inplace(weight, weight_scale_inv, weight_block_size):
+    """In-place variant that updates nn.Parameter objects."""
+    assert isinstance(weight, torch.nn.Parameter)
+    assert isinstance(weight_scale_inv, torch.nn.Parameter)
+
+    new_weight, new_expert_scale = requant_weight_per_expert(
+        weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
+    )
+
+    offloader.update_param(weight, new_weight)
+    weight_scale_inv.data = new_expert_scale
+
+
 def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],

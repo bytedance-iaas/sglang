@@ -139,6 +139,69 @@ def _scatter_chunk_to_output(
     )
 
 
+@triton.jit
+def _fused_silu_mul_fp8_quant_kernel(
+    gateup_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    stride_gateup_m,
+    stride_out_m,
+    HALF_N: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    gateup_row = gateup_ptr + row * stride_gateup_m
+    out_row = out_fp8_ptr + row * stride_out_m
+
+    amax = tl.zeros([BLOCK_K], dtype=tl.float32)
+    for start_k in tl.range(0, HALF_N, BLOCK_K):
+        k_offs = start_k + tl.arange(0, BLOCK_K)
+        mask = k_offs < HALF_N
+        gate = tl.load(gateup_row + k_offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gateup_row + HALF_N + k_offs, mask=mask, other=0.0).to(tl.float32)
+        act = (gate * tl.sigmoid(gate)) * up
+        amax = tl.maximum(amax, tl.where(mask, tl.abs(act), 0.0))
+
+    row_max = tl.max(amax)
+    scale = row_max / FP8_MAX
+    scale = tl.where(scale > 0, scale, 1.0)
+    tl.store(out_scale_ptr + row, scale)
+
+    for start_k in tl.range(0, HALF_N, BLOCK_K):
+        k_offs = start_k + tl.arange(0, BLOCK_K)
+        mask = k_offs < HALF_N
+        gate = tl.load(gateup_row + k_offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gateup_row + HALF_N + k_offs, mask=mask, other=0.0).to(tl.float32)
+        act = (gate * tl.sigmoid(gate)) * up
+        quantized = tl.clamp(act / scale, -FP8_MAX, FP8_MAX)
+        tl.store(out_row + k_offs, quantized.to(tl.float8e4nv), mask=mask)
+
+
+def _fused_silu_mul_fp8_quant(
+    gateup: torch.Tensor,
+) -> tuple:
+    """Fused SiLU+Mul+FP8Quant: [M, N] bf16 → [M, N//2] fp8 + [M, 1] scale."""
+    M = gateup.shape[0]
+    N = gateup.shape[1]
+    half_n = N // 2
+
+    out_fp8 = torch.empty((M, half_n), device=gateup.device, dtype=torch.float8_e4m3fn)
+    out_scale = torch.empty((M, 1), device=gateup.device, dtype=torch.float32)
+
+    _fused_silu_mul_fp8_quant_kernel[(M,)](
+        gateup,
+        out_fp8,
+        out_scale,
+        gateup.stride(0),
+        out_fp8.stride(0),
+        HALF_N=half_n,
+        FP8_MAX=448.0,
+        BLOCK_K=min(1024, triton.next_power_of_2(half_n)),
+    )
+    return out_fp8, out_scale
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -224,6 +287,29 @@ def build_offsets_experts_from_masked_m(
 
     return offsets_fixed, experts_fixed, list_size
 
+
+def _expand_expert_scale_to_tokens(
+    expert_scale: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size: int,
+    total_tokens: int,
+) -> torch.Tensor:
+    """Expand [num_experts] per-expert scales to [total_tokens, 1] per-token scales.
+
+    Uses offsets/experts from the contiguous MoE layout to map each token
+    to its serving expert's scale.
+    """
+    result = torch.empty(total_tokens, 1, dtype=torch.float32, device=expert_scale.device)
+    prev = 0
+    for i in range(list_size):
+        end = offsets[i].item()
+        eid = experts[i].item()
+        result[prev:end, 0] = expert_scale[eid]
+        prev = end
+    return result
+
+
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -305,12 +391,98 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             )
         return AsymGemmRunnerOutput(hidden_states=hidden_states)
 
+    def _run_contiguous_gemm_sm89(
+        self,
+        runner_input: AsymGemmRunnerInput,
+        quant_info: AsymGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        all_tokens = running_state["all_tokens"]
+        hidden_states_device = running_state["hidden_states_device"]
+        hidden_states_shape = running_state["hidden_states_shape"]
+
+        N = quant_info.w13_weight.size(1)
+        K = hidden_states_shape[1]
+
+        offsets = runner_input.offsets
+        experts = runner_input.experts
+        list_size_val = int(runner_input.list_size.item())
+
+        # Activations arrive with per-token-group scales from DeepEP.
+        # Dequant to BF16, then requant per-token for SM89.
+        from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+        hidden_bf16 = block_quant_dequant(
+            hidden_states, hidden_states_scale, [1, 128], torch.bfloat16
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        hidden_fp8, token_scale = sglang_per_token_group_quant_fp8(hidden_bf16, K)
+        del hidden_bf16
+
+        # ── GEMM-0: gateup projection ────────────────────────────────
+        gateup_output = torch.empty(
+            (all_tokens, N), device=hidden_states_device, dtype=torch.bfloat16,
+        )
+
+        # Fuse per-token and per-expert scales into GEMM epilogue
+        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_contig(
+            hidden_fp8,
+            quant_info.w13_weight,
+            gateup_output,
+            offsets,
+            experts,
+            list_size_val,
+            scale_a_tensor=token_scale.view(-1).contiguous(),
+            scale_b_tensor=quant_info.w13_scale,
+        )
+        del hidden_fp8
+        del token_scale
+
+        # ── Fused SiLU + Mul + FP8 Quant ─────────────────────────────
+        down_input_fp8, down_token_scale = _fused_silu_mul_fp8_quant(gateup_output)
+        del gateup_output
+
+        # ── GEMM-1: down projection ──────────────────────────────────
+        down_output = torch.empty(
+            (all_tokens, K), device=hidden_states_device, dtype=torch.bfloat16,
+        )
+
+        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_contig(
+            down_input_fp8,
+            quant_info.w2_weight,
+            down_output,
+            offsets,
+            experts,
+            list_size_val,
+            scale_a_tensor=down_token_scale.view(-1).contiguous(),
+            scale_b_tensor=quant_info.w2_scale,
+        )
+        del down_input_fp8
+        del down_token_scale
+
+        return down_output
+
     def _run_contiguous_gemm(
         self,
         runner_input: AsymGemmRunnerInput,
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+
+        if ASYMGEMM_SM89:
+            return self._run_contiguous_gemm_sm89(
+                runner_input, quant_info, running_state
+            )
+
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
@@ -393,12 +565,195 @@ class AsymGemmRunnerCore(MoeRunnerCore):
 
         return down_output
 
+    def _run_masked_gemm_sm89(
+        self,
+        runner_input: AsymGemmRunnerInput,
+        quant_info: AsymGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        masked_m = runner_input.masked_m
+        expected_m = runner_input.expected_m
+
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
+        w13_scale = quant_info.w13_scale
+        w2_scale = quant_info.w2_scale
+
+        hidden_states_device = running_state["hidden_states_device"]
+
+        num_groups, m, k = hidden_states.shape
+        n = w13_weight.size(1)
+        K = w2_weight.shape[1]
+
+        # If scales are per-token-group (from DeepEP LL), dequant and requant per-token.
+        if hidden_states_scale.shape[-1] != 1:
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            hidden_bf16 = block_quant_dequant(
+                hidden_states, hidden_states_scale, [1, 128], torch.bfloat16
+            )
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            flat = hidden_bf16.reshape(-1, k)
+            hidden_states, hidden_states_scale = sglang_per_token_group_quant_fp8(
+                flat, k
+            )
+            del flat
+            hidden_states = hidden_states.view(num_groups, m, k)
+            hidden_states_scale = hidden_states_scale.view(num_groups, m, 1)
+            del hidden_bf16
+
+        chunk_size = _MASKED_GEMM_CHUNK_SIZE
+        if chunk_size > 0:
+            src2dst = running_state.get("src2dst", None)
+            use_scatter = src2dst is not None
+
+            if use_scatter:
+                num_tokens = running_state["hidden_states_shape"][0]
+                topk_ids = running_state["topk_ids"]
+                topk_weights = running_state["topk_weights"]
+                final_output = torch.zeros(
+                    (num_tokens, K), device=hidden_states_device, dtype=torch.bfloat16
+                )
+            else:
+                down_output = torch.empty(
+                    (num_groups, m, K),
+                    device=hidden_states_device,
+                    dtype=torch.bfloat16,
+                )
+
+            gateup_chunk = torch.empty(
+                (chunk_size, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+
+            for g_start in range(0, num_groups, chunk_size):
+                g_end = min(g_start + chunk_size, num_groups)
+                c = g_end - g_start
+
+                masked_m_c = masked_m[g_start:g_end]
+                gc = gateup_chunk[:c]
+
+                sa_c = hidden_states_scale[g_start:g_end].reshape(c * m).contiguous()
+                asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
+                    hidden_states[g_start:g_end],
+                    w13_weight[g_start:g_end],
+                    gc,
+                    masked_m_c,
+                    expected_m,
+                    scale_a_tensor=sa_c,
+                    scale_b_tensor=w13_scale[g_start:g_end],
+                )
+
+                down_input_c, down_input_scale_c = _fused_silu_mul_fp8_quant(
+                    gc.reshape(c * m, n)
+                )
+                down_input_c = down_input_c.view(c, m, n // 2)
+                down_input_scale_c = down_input_scale_c.view(c, m, 1)
+
+                if use_scatter:
+                    out_c = torch.empty(
+                        (c, m, K), device=hidden_states_device, dtype=torch.bfloat16
+                    )
+                else:
+                    out_c = down_output[g_start:g_end]
+
+                down_sa_c = down_input_scale_c.reshape(c * m).contiguous()
+                asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
+                    down_input_c,
+                    w2_weight[g_start:g_end],
+                    out_c,
+                    masked_m_c,
+                    expected_m,
+                    scale_a_tensor=down_sa_c,
+                    scale_b_tensor=w2_scale[g_start:g_end],
+                )
+                del down_input_c, down_input_scale_c
+
+                if use_scatter:
+                    _scatter_chunk_to_output(
+                        out_c, final_output, src2dst,
+                        topk_ids, topk_weights, g_start, m,
+                    )
+                    del out_c
+
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            del gateup_chunk
+
+            if use_scatter:
+                running_state["is_scattered"] = True
+                return final_output
+            else:
+                return down_output
+
+        # ── Original (non-chunked) path ──────────────────────────────
+
+        # ── GEMM-0: gateup projection ────────────────────────────────
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        )
+
+        # Fuse per-token and per-expert scales into the GEMM epilogue
+        sa_flat = hidden_states_scale.view(num_groups * m).contiguous()
+        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
+            hidden_states,
+            w13_weight,
+            gateup_output,
+            masked_m,
+            expected_m,
+            scale_a_tensor=sa_flat,
+            scale_b_tensor=w13_scale,
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        # ── Fused SiLU + Mul + FP8 Quant ─────────────────────────────
+        down_input_fp8, down_input_scale = _fused_silu_mul_fp8_quant(
+            gateup_output.reshape(-1, n)
+        )
+        del gateup_output
+        down_input_fp8 = down_input_fp8.view(num_groups, m, n // 2)
+        down_input_scale = down_input_scale.view(num_groups, m, 1)
+
+        # ── GEMM-1: down projection ──────────────────────────────────
+        down_output = torch.empty(
+            (num_groups, m, K), device=hidden_states_device, dtype=torch.bfloat16
+        )
+
+        down_sa_flat = down_input_scale.view(num_groups * m).contiguous()
+        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
+            down_input_fp8,
+            w2_weight,
+            down_output,
+            masked_m,
+            expected_m,
+            scale_a_tensor=down_sa_flat,
+            scale_b_tensor=w2_scale,
+        )
+        del down_input_fp8
+        del down_input_scale
+
+        return down_output
+
     def _run_masked_gemm(
         self,
         runner_input: AsymGemmRunnerInput,
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+
+        if ASYMGEMM_SM89:
+            return self._run_masked_gemm_sm89(
+                runner_input, quant_info, running_state
+            )
+
         from sglang.srt.layers import asym_gemm_wrapper
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked_post_quant_fwd,
@@ -716,6 +1071,12 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
 
+    from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+
+    # SM89 uses per-token quantization (group_size=K) instead of per-token-group
+    K = hidden_states.shape[1]
+    act_block_shape = [1, K] if ASYMGEMM_SM89 else quant_info.block_shape
+
     # PreReorder
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
         moe_ep_deepgemm_preprocess(
@@ -723,7 +1084,7 @@ def _pre_permute_standard_to_asym_gemm_fp8(
             runner_config.num_local_experts,
             hidden_states,
             runner_config.top_k,
-            quant_info.block_shape,
+            act_block_shape,
         )
     )
 
