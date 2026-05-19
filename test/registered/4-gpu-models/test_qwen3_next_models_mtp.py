@@ -11,6 +11,32 @@ register_cuda_ci(est_time=290, stage="stage-c", runner_config="4-gpu-h100")
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 
+class TestQwen3NextMTP(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
+    model = QWEN3_NEXT_MODEL
+    gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.0025
+    other_args = [
+        "--trust-remote-code",
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--mem-fraction-static",
+        "0.8",
+        "--tp",
+        "4",
+        "--chunked-prefill-size",
+        "2048",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--disable-radix-cache",
+    ]
+
+
 class TestQwen3NextMTPTopk(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
