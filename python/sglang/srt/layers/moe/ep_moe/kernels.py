@@ -430,6 +430,176 @@ def silu_and_mul_masked_post_quant_fwd(
 
 
 @triton.jit
+def _silu_and_mul_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            gate_up,
+            mask=offs_in_d < size_n,
+        )
+
+
+def silu_and_mul_masked_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+):
+    """
+    input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
+    masked_m shape [expert_num]
+    """
+
+    assert input.is_contiguous()
+    assert output.dtype == torch.bfloat16
+    assert input.dtype == torch.bfloat16
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+    expert_num = len(masked_m)
+
+    if expert_num < 4:
+        BLOCK_NUM_PER_EXPERT = 64
+    else:
+        BLOCK_NUM_PER_EXPERT = 32
+
+    BLOCK_N = 128
+    num_warps = 4
+    NUM_STAGES = 4
+
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+
+    grid = (
+        hidden_dim_split_block_num,
+        BLOCK_NUM_PER_EXPERT,
+        expert_num,
+    )
+
+    _silu_and_mul_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        size_n,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    return output
+
+
+@triton.jit
+def silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    scale_ptr,
+    num_tokens_tensor_ptr,
+    intermediate_size,
+    fp8_max,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    num_tokens = tl.load(num_tokens_tensor_ptr)
+    numel = num_tokens * intermediate_size
+    gate_ptr = input_ptr
+    up_ptr = input_ptr + intermediate_size
+
+    start_idx = tl.program_id(0) * BLOCK_SIZE
+    step = tl.num_programs(0) * BLOCK_SIZE
+    absmax = 0.0
+
+    for id in tl.range(start_idx, numel, step, num_stages=NUM_STAGES):
+        ids = id + tl.arange(0, BLOCK_SIZE)
+        token_ids = ids // intermediate_size
+        mask = ids < numel
+
+        offs = ids + token_ids * intermediate_size
+        gate = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        gate_up = gate / (1 + tl.exp(-gate)) * up
+        absmax = tl.maximum(absmax, tl.max(tl.abs(gate_up)))
+
+    absmax = tl.maximum(absmax, 1e-10)
+    tl.atomic_max(scale_ptr, absmax / fp8_max)
+
+
+def silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+    num_tokens_tensor: torch.Tensor,
+    expected_num_tokens: int,
+    intermediate_size: int,
+):
+    grid, block_dim = _get_launch_config_1d(
+        input.device, expected_num_tokens * intermediate_size
+    )
+    scale.zero_()
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe[grid](
+        input_ptr=input,
+        scale_ptr=scale,
+        num_tokens_tensor_ptr=num_tokens_tensor,
+        intermediate_size=intermediate_size,
+        fp8_max=fp8_max,
+        BLOCK_SIZE=block_dim,
+        NUM_STAGES=3,
+    )
+    silu_mul_static_tensorwise_quant_for_cutlass_moe(
+        input, output, scale, num_tokens_tensor, expected_num_tokens, intermediate_size
+    )
+
+
+@triton.jit
 def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
     input_ptr,
     output_ptr,
