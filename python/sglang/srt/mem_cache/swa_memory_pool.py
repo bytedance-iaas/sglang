@@ -594,6 +594,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
+    def free_full(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        assert self.is_not_in_free_group
+        self.full_attn_allocator.free(free_index)
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -616,6 +626,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+
+    def clear_swa_mapping(self, full_indices: torch.Tensor):
+        if full_indices.numel() == 0:
+            return
+        self.full_to_swa_index_mapping[full_indices] = 0
 
     def backup_state(self):
         return [

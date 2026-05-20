@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -135,6 +136,74 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_swa_chunk_cache_finish_skips_evicted_prefix(self):
+        device = get_device()
+        req_to_token_pool = ReqToTokenPool(
+            size=1, max_context_len=16, device=device, enable_memory_saver=False
+        )
+        head_num = 8
+        head_dim = 128
+        num_layers = 24
+        full_attention_layer_ids = list(range(0, num_layers, 4))
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in set(full_attention_layer_ids)
+        ]
+        kv_pool = SWAKVPool(
+            size=16,
+            size_swa=16,
+            page_size=1,
+            dtype=torch.bfloat16,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=16,
+            size_swa=16,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device=device,
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        cache = SWAChunkCache(
+            CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=True,
+                sliding_window_size=4,
+            )
+        )
+
+        kv_indices = allocator.alloc(8)
+        req_to_token_pool.write((0, slice(0, 8)), kv_indices)
+        evicted_prefix = kv_indices[:4]
+        stale_swa_mapping = allocator.full_to_swa_index_mapping[
+            evicted_prefix
+        ].clone()
+        allocator.free_swa(evicted_prefix)
+
+        # Regression guard: finish-time cleanup must honor swa_evicted_seqlen
+        # even if an earlier SWA eviction left stale mapping entries.
+        allocator.full_to_swa_index_mapping[evicted_prefix] = stale_swa_mapping
+
+        req = _DummyReq()
+        req.req_pool_idx = 0
+        req._kv_committed_len = 8
+        req.swa_evicted_seqlen = 4
+
+        cache.cache_finished_req(req)
+
+        self.assertEqual(allocator.full_attn_allocator.available_size(), 16)
+        self.assertEqual(allocator.swa_attn_allocator.available_size(), 16)
+        self.assertTrue(
+            torch.all(allocator.full_to_swa_index_mapping[kv_indices] == 0)
+        )
 
     def test_swa_radix_cache_kv_events(self):
         tree, allocator, _ = _build_swa_tree(
