@@ -643,6 +643,15 @@ def _partition_miss_items_by_feature_size(
     return partitions
 
 
+def _is_vit_cuda_graph_enabled() -> bool:
+    if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        return True
+    try:
+        return bool(getattr(get_global_server_args(), "enable_vit_cuda_graph", False))
+    except Exception:
+        return False
+
+
 def _get_chunked_embedding_by_item_packed(
     data_embedding_func: DataEmbeddingFunc,
     per_image_reqs: List[
@@ -701,7 +710,12 @@ def _get_chunked_embedding_by_item_packed(
             }
         )
 
-    for partition in _partition_miss_items_by_feature_size(miss_items, infer_times):
+    if _is_vit_cuda_graph_enabled():
+        partitions = [miss_items] if miss_items else []
+    else:
+        partitions = _partition_miss_items_by_feature_size(miss_items, infer_times)
+
+    for partition in partitions:
         miss_item_list = [item for _, _, item, _, _ in partition]
         _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
