@@ -197,7 +197,9 @@ class TestSWA(unittest.TestCase):
         req._kv_committed_len = 8
         req.swa_evicted_seqlen = 4
 
+        allocator.free_group_begin()
         cache.cache_finished_req(req)
+        allocator.free_group_end()
 
         self.assertEqual(allocator.full_attn_allocator.available_size(), 16)
         self.assertEqual(allocator.swa_attn_allocator.available_size(), 16)
