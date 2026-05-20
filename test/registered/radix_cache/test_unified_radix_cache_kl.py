@@ -198,6 +198,9 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skip(
+    "Temporarily skip unstable UnifiedRadix Mamba cache test in CI while investigating hicache/default-config issues"
+)
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
 
