@@ -207,6 +207,29 @@ class TestSWA(unittest.TestCase):
             torch.all(allocator.full_to_swa_index_mapping[kv_indices] == 0)
         )
 
+    def test_swa_free_clears_mapping_by_page(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=4,
+            max_context_len=16,
+            kv_size=32,
+            kv_size_swa=32,
+        )
+        kv_indices = _swa_alloc(allocator, 8)
+        self.assertIsNotNone(kv_indices)
+
+        allocator.free_swa(kv_indices[:1])
+        available_after_first_free = allocator.swa_attn_allocator.available_size()
+
+        self.assertTrue(
+            torch.all(allocator.full_to_swa_index_mapping[kv_indices[:4]] == 0)
+        )
+
+        allocator.free_swa(kv_indices[1:4])
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), available_after_first_free
+        )
+
     def test_swa_radix_cache_kv_events(self):
         tree, allocator, _ = _build_swa_tree(
             is_eagle=False, enable_kv_cache_events=True
