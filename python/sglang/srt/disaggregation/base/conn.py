@@ -51,6 +51,7 @@ class KVArgs:
     system_dp_rank: int
     # for pp prefill
     pp_rank: int
+    prefill_pp_size: int
     prefill_start_layer: int
     # Absolute end layer (exclusive) for this prefill PP stage. Needed to
     # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
