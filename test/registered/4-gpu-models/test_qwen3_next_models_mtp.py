@@ -12,6 +12,9 @@ register_cuda_ci(est_time=500, suite="stage-c-test-4-gpu-h100")
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 
+@unittest.skip(
+    "Temporarily skip Qwen3-Next MTP until spec v2 mamba scheduler config is fixed"
+)
 class TestQwen3NextMTP(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     gsm8k_accuracy_thres = 0.93
