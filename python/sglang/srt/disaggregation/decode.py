@@ -280,6 +280,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         pp_rank: int,
+        prefill_pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -301,6 +302,9 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
+        # Default to the local decode PP size until bootstrap returns the
+        # authoritative prefill topology for this decode instance.
+        self.prefill_pp_size = prefill_pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation

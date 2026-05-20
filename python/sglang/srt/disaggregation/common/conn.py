@@ -260,6 +260,9 @@ class CommonKVManager(BaseKVManager):
             )
 
         self._resolve_rank_mapping(info)
+        # Decode starts with a local fallback value before bootstrap is ready.
+        # Once we know the real prefill topology, use it for KV pointer slicing.
+        self.kv_args.prefill_pp_size = info.pp_size
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
