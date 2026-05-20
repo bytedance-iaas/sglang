@@ -2041,6 +2041,10 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if isinstance(req.to_finish, FINISH_ABORT):
+                req.update_finish_state()
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads

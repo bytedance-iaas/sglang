@@ -133,12 +133,25 @@ class PrefillBootstrapQueue:
             )
         self.kv_manager = self._init_kv_manager()
 
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
+        if (
+            self.scheduler.tp_worker.is_hybrid_swa
+            and not self._uses_dsv4_swa_tail_prealloc()
+        ):
+            # Fallback for SWA allocators that still allocate the SWA pool at
+            # full prompt length.
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def _uses_dsv4_swa_tail_prealloc(self) -> bool:
+        return (
+            isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and self.scheduler.token_to_kv_pool_allocator.page_size > 1
+            and hasattr(
+                self.scheduler.token_to_kv_pool_allocator, "alloc_extend_swa_tail"
+            )
+        )
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -516,6 +529,16 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                if isinstance(req.to_finish, FINISH_ABORT):
+                    req.update_finish_state()
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_req_to_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    continue
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
