@@ -536,6 +536,18 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def supports_swa_tail_prealloc(
+    token_to_kv_pool,
+    token_to_kv_pool_allocator,
+    supported_pool_types,
+) -> bool:
+    return (
+        isinstance(token_to_kv_pool, supported_pool_types)
+        and token_to_kv_pool_allocator.page_size > 1
+        and hasattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+    )
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,

@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
+    supports_swa_tail_prealloc,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -334,10 +335,10 @@ class DecodePreallocQueue:
             )
 
     def _uses_swa_tail_prealloc(self) -> bool:
-        return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
-            and self.token_to_kv_pool_allocator.page_size > 1
-            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+        return supports_swa_tail_prealloc(
+            self.token_to_kv_pool,
+            self.token_to_kv_pool_allocator,
+            (SWAKVPool, DeepSeekV4TokenToKVPool),
         )
 
     def _swa_tail_len(self, seq_len: int) -> int:
