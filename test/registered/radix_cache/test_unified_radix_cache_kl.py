@@ -177,6 +177,8 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             other_args=[
                 "--tp-size",
                 "4",
+                "--hicache-io-backend",
+                "kernel",
                 "--mem-fraction-static",
                 "0.80",
                 "--page-size",
@@ -213,6 +215,8 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             other_args=[
                 "--tp-size",
                 "4",
+                "--hicache-io-backend",
+                "kernel",
                 "--chunked-prefill-size",
                 "2048",
                 "--mem-fraction-static",
