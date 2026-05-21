@@ -47,7 +47,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
@@ -77,6 +76,7 @@ from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import (
     ViTCudaGraphRunner,
+    is_vit_cuda_graph_debug_compare_enabled,
     is_vit_cuda_graph_enabled,
     make_image_grid_for_vision_tokens,
 )
@@ -739,7 +739,19 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             cu_window_seqlens=padded_cu_window,
             output_indices=reverse_indices,
         )
-        return out[:total_vision_tokens]
+        graph_out = out[:total_vision_tokens]
+        if is_vit_cuda_graph_debug_compare_enabled():
+            graph_out = graph_out.clone()
+            eager_out = self.raw_forward(pixel_values, grid_thw)
+            runner.compare_debug_outputs(
+                model_name="Qwen2.5-VL",
+                graph_key=raw_budget,
+                graph_out=graph_out,
+                eager_out=eager_out,
+                total_vision_tokens=total_vision_tokens,
+                vision_token_counts=vision_token_counts,
+            )
+        return graph_out
 
     def forward_with_cuda_graph(
         self,

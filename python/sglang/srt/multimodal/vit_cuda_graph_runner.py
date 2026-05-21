@@ -50,6 +50,17 @@ def is_vit_cuda_graph_enabled() -> bool:
         return False
 
 
+def is_vit_cuda_graph_debug_compare_enabled() -> bool:
+    if envs.SGLANG_VIT_CUDA_GRAPH_DEBUG_COMPARE.get():
+        return True
+    try:
+        return bool(
+            getattr(get_global_server_args(), "debug_vit_cuda_graph_output", False)
+        )
+    except Exception:
+        return False
+
+
 def _get_server_args():
     try:
         return get_global_server_args()
@@ -188,6 +199,8 @@ class ViTCudaGraphRunner:
         self.graph_hit_by_budget = defaultdict(int)
         self.eager_fallback_count = 0
         self.eager_fallback_reasons = defaultdict(int)
+        self.debug_compare_count = 0
+        self.debug_compare_fail_count = 0
 
     @property
     def device(self) -> torch.device:
@@ -238,6 +251,81 @@ class ViTCudaGraphRunner:
                 dict(self.graph_hit_by_budget),
                 self.eager_fallback_count,
             )
+
+    def compare_debug_outputs(
+        self,
+        *,
+        model_name: str,
+        graph_key: int,
+        graph_out: torch.Tensor,
+        eager_out: torch.Tensor,
+        total_vision_tokens: int,
+        vision_token_counts: List[int],
+    ) -> None:
+        self.debug_compare_count += 1
+        prefix = (
+            f"ViT CUDA graph debug compare #{self.debug_compare_count} "
+            f"model={model_name}, raw_budget={graph_key}, "
+            f"total_vision_tokens={total_vision_tokens}, "
+            f"per_image_vision_tokens={vision_token_counts}"
+        )
+
+        if graph_out.shape != eager_out.shape:
+            self.debug_compare_fail_count += 1
+            logger.warning(
+                "%s: shape mismatch, graph_shape=%s, eager_shape=%s, failures=%s",
+                prefix,
+                tuple(graph_out.shape),
+                tuple(eager_out.shape),
+                self.debug_compare_fail_count,
+            )
+            return
+
+        if graph_out.numel() == 0:
+            logger.info("%s: empty output, skip value comparison", prefix)
+            return
+
+        graph_fp32 = graph_out.detach().float()
+        eager_fp32 = eager_out.detach().float()
+        abs_diff = (graph_fp32 - eager_fp32).abs()
+        max_abs = float(abs_diff.max().item())
+        mean_abs = float(abs_diff.mean().item())
+        denom = eager_fp32.abs().clamp_min(1e-6)
+        max_rel = float((abs_diff / denom).max().item())
+        eager_max = float(eager_fp32.abs().max().item())
+        graph_max = float(graph_fp32.abs().max().item())
+        has_nan = bool(torch.isnan(abs_diff).any().item())
+        atol = 1e-2
+        rtol = 1e-2
+        allclose = bool(
+            torch.allclose(
+                graph_fp32,
+                eager_fp32,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+            )
+        )
+
+        log_fn = logger.info if allclose and not has_nan else logger.warning
+        if not allclose or has_nan:
+            self.debug_compare_fail_count += 1
+        log_fn(
+            "%s: allclose=%s, atol=%g, rtol=%g, max_abs=%.6g, mean_abs=%.6g, "
+            "max_rel=%.6g, graph_abs_max=%.6g, eager_abs_max=%.6g, has_nan=%s, "
+            "failures=%s",
+            prefix,
+            allclose,
+            atol,
+            rtol,
+            max_abs,
+            mean_abs,
+            max_rel,
+            graph_max,
+            eager_max,
+            has_nan,
+            self.debug_compare_fail_count,
+        )
 
     def select_budget(self, total_vision_tokens: int) -> Optional[Tuple[int, int]]:
         for vision_budget, raw_budget in zip(

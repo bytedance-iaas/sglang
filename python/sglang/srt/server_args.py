@@ -642,6 +642,7 @@ class ServerArgs:
     enable_vit_cuda_graph: bool = False
     vit_cuda_graph_token_budgets: Optional[List[int]] = None
     vit_cuda_graph_max_batch_size: int = 0
+    debug_vit_cuda_graph_output: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
@@ -3928,6 +3929,12 @@ class ServerArgs:
         if self.enable_vit_cuda_graph or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             self.enable_vit_cuda_graph = True
             envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.set("1")
+        if (
+            self.debug_vit_cuda_graph_output
+            or envs.SGLANG_VIT_CUDA_GRAPH_DEBUG_COMPARE.get()
+        ):
+            self.debug_vit_cuda_graph_output = True
+            envs.SGLANG_VIT_CUDA_GRAPH_DEBUG_COMPARE.set("1")
         if self.vit_cuda_graph_max_batch_size < 0:
             raise ValueError("--vit-cuda-graph-max-batch-size must be >= 0")
         if self.vit_cuda_graph_token_budgets is not None:
@@ -6056,6 +6063,13 @@ class ServerArgs:
             default=ServerArgs.vit_cuda_graph_max_batch_size,
             help="Maximum number of images packed into one ViT CUDA graph replay. "
             "0 lets SGLang choose a conservative automatic value.",
+        )
+        parser.add_argument(
+            "--debug-vit-cuda-graph-output",
+            action="store_true",
+            default=ServerArgs.debug_vit_cuda_graph_output,
+            help="Debug ViT CUDA graph precision by running eager ViT on each graph "
+            "replay batch and logging graph-vs-eager output differences.",
         )
         parser.add_argument(
             "--debug-cuda-graph",
