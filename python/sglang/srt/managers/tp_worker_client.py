@@ -51,6 +51,13 @@ from sglang.srt.managers.tp_worker_server import (
     M_DECODE_STEP,
     STATUS_OK_MSGPACK,
 )
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct.msgpack_struct import (
+    DecodeStepControl,
+    serialize as msgpack_serialize,
+    deserialize as msgpack_deserialize,
+)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -73,31 +80,28 @@ def _encode_decode_step_control(kwargs: dict) -> bytes:
     Raises any exception from msgspec encoding or tensor conversion; the
     caller is expected to fall back to pickle on failure.
     """
-    import msgspec
     import pickle as _pickle
-    from sglang.srt.managers.io_struct.msgpack_struct import DecodeStepControl
-    from sglang.srt.managers.io_struct import tensor_to_ipc
 
     si = kwargs.get("sampling_info")
     typed = DecodeStepControl(
-        seq_lens=tensor_to_ipc(kwargs["seq_lens"]),
-        seq_lens_cpu=tensor_to_ipc(kwargs["seq_lens_cpu"]),
-        orig_seq_lens=tensor_to_ipc(kwargs["orig_seq_lens"]),
+        seq_lens=kwargs["seq_lens"],
+        seq_lens_cpu=kwargs["seq_lens_cpu"],
+        orig_seq_lens=kwargs["orig_seq_lens"],
         seq_lens_sum=kwargs["seq_lens_sum"],
-        input_ids=tensor_to_ipc(kwargs.get("input_ids")),
-        indices_to_free=tensor_to_ipc(kwargs.get("indices_to_free")),
+        input_ids=kwargs.get("input_ids"),
+        indices_to_free=kwargs.get("indices_to_free"),
         sampling_info_pickle=(
             _pickle.dumps(si) if si is not None else None
         ),
-        mamba_track_indices=tensor_to_ipc(kwargs.get("mamba_track_indices")),
-        mamba_track_mask=tensor_to_ipc(kwargs.get("mamba_track_mask")),
-        mamba_track_seqlens=tensor_to_ipc(kwargs.get("mamba_track_seqlens")),
+        mamba_track_indices=kwargs.get("mamba_track_indices"),
+        mamba_track_mask=kwargs.get("mamba_track_mask"),
+        mamba_track_seqlens=kwargs.get("mamba_track_seqlens"),
         global_num_tokens=kwargs.get("global_num_tokens"),
         global_num_tokens_for_logprob=kwargs.get("global_num_tokens_for_logprob"),
         input_slot=kwargs.get("input_slot"),
         output_slot=kwargs.get("output_slot"),
     )
-    return msgspec.msgpack.encode(typed)
+    return msgpack_serialize(typed)
 
 
 # ---------------------------------------------------------------------------
@@ -370,22 +374,15 @@ class TpWorkerClient(BaseTpWorker):
         Rust scheduler that will drive M_DECODE_STEP doesn't need
         Rust-decodable wire for the rare paths.
         """
-        import os
-        if (
-            method == M_DECODE_STEP
-            and os.environ.get("SGLANG_MSGPACK_DECODE_CONTROL", "1") == "1"
-        ):
-            try:
-                payload = _encode_decode_step_control(kwargs)
-                # 3-frame envelope: [method, b"mp", msgpack_bytes]. Worker
-                # checks for the b"mp" middle frame to route to msgpack
-                # decode. Stays back-compat with the 2-frame pickle path.
+        if method == M_DECODE_STEP:
+            control = kwargs['control']
+            if envs.SGLANG_IPC_USE_MSGPACK.get():
+                payload = msgpack_serialize(control)
                 self._socket.send_multipart([method, b"mp", payload])
-                return
-            except Exception:
-                # Defensive: anything unrepresentable in the typed struct
-                # (rare path) falls back to pickle silently.
-                pass
+            else:
+                payload = pickle.dumps(control)
+                self._socket.send_multipart([method, payload])
+            return
         payload = pickle.dumps(kwargs)
         self._socket.send_multipart([method, payload])
 
@@ -400,11 +397,7 @@ class TpWorkerClient(BaseTpWorker):
         """
         status, result_bytes = self._socket.recv_multipart()
         if status == STATUS_OK_MSGPACK:
-            import msgspec
-            from sglang.srt.managers.io_struct.msgpack_struct import (
-                DecodeForwardReplySlim,
-            )
-            return msgspec.msgpack.decode(result_bytes, type=DecodeForwardReplySlim)
+            return msgpack_deserialize(result_bytes)
         result = pickle.loads(result_bytes)
         if status == STATUS_ERROR:
             raise RuntimeError(f"TpWorkerServer raised an error: {result}")
@@ -491,7 +484,7 @@ class TpWorkerClientGroup(BaseTpWorker):
             hit_rate = (
                 self._decode_fast_hits / max(1, total) * 100.0
             )
-            logger.debug(
+            logger.info(
                 "TpWorkerClient[%d ops] us send=%.0f recv=%.0f min=%.0f max=%.0f "
                 "| decode_fast hits=%d misses=%d full=%d (hit_rate=%.1f%%)",
                 self._rt_count,
@@ -643,31 +636,30 @@ class TpWorkerClientGroup(BaseTpWorker):
         rich-Python-object fields."""
         import pickle as _pickle
         from sglang.srt.managers.utils import GenerationBatchResult
-        from sglang.srt.managers.io_struct import ipc_to_tensor
 
         da = None
         if ipc.deferred_alloc is not None:
             d = ipc.deferred_alloc
             da = {
                 "mode": d.mode,
-                "req_pool_indices": ipc_to_tensor(d.req_pool_indices),
-                "out_cache_loc": ipc_to_tensor(d.out_cache_loc),
+                "req_pool_indices": d.req_pool_indices,
+                "out_cache_loc": d.out_cache_loc,
                 "free_pages_remaining": d.free_pages_remaining,
             }
             if d.seq_lens_minus1 is not None:
-                da["seq_lens_minus1"] = ipc_to_tensor(d.seq_lens_minus1)
+                da["seq_lens_minus1"] = d.seq_lens_minus1
             if d.prefix_lens is not None:
-                da["prefix_lens"] = ipc_to_tensor(d.prefix_lens)
+                da["prefix_lens"] = d.prefix_lens
             if d.extend_lens is not None:
-                da["extend_lens"] = ipc_to_tensor(d.extend_lens)
+                da["extend_lens"] = d.extend_lens
 
         def _unpkl(b):
             return _pickle.loads(b) if b is not None else None
 
         return GenerationBatchResult(
-            next_token_ids=ipc_to_tensor(ipc.next_token_ids),
+            next_token_ids=ipc.next_token_ids,
             deferred_alloc=da,
-            accept_lens=ipc_to_tensor(ipc.accept_lens),
+            accept_lens=ipc.accept_lens,
             can_run_cuda_graph=ipc.can_run_cuda_graph,
             num_accepted_drafts=ipc.num_accepted_drafts,
             num_accepted_drafts_per_req_cpu=ipc.num_accepted_drafts_per_req_cpu,
@@ -683,7 +675,7 @@ class TpWorkerClientGroup(BaseTpWorker):
         *,
         input_slot: Optional[int] = None,
         output_slot: Optional[int] = None,
-    ) -> dict:
+    ) -> DecodeStepControl:
         """Extract the delta fields needed for a decode_step control message.
 
         Only fields that change between consecutive decode steps are included.
@@ -700,44 +692,12 @@ class TpWorkerClientGroup(BaseTpWorker):
           this slot id so the *next* step can refer to them by slot.
         Active Python event loops never pass these; the Rust scheduler will.
         """
-        si = batch.sampling_info
-        # Include sampling_info only when penalties or grammars are active;
-        # otherwise the GPU-cached version is still valid.
-        needs_si = si is not None and (
-            getattr(getattr(si, "penalizer_orchestrator", None), "is_required", False)
-            or bool(getattr(si, "grammars", None))
-            or bool(batch.has_grammar)
-        )
-        # Skip indices_to_free unless there's something to free — saves a few
-        # bytes off the wire and avoids a no-op .to(device) on the GPU side.
-        itf = batch.indices_to_free
-        if itf is not None and torch.is_tensor(itf) and itf.numel() == 0:
-            itf = None
-        control = {
-            # When input_slot is set the worker ignores this and reads from
-            # its future-slots dict instead. Sending None here saves the
-            # pickle of a tensor that's about to be discarded.
-            "input_ids": None if input_slot is not None else batch.input_ids,
-            "seq_lens": batch.seq_lens,
-            "seq_lens_cpu": batch.seq_lens_cpu,
-            "orig_seq_lens": batch.orig_seq_lens,
-            "seq_lens_sum": batch.seq_lens_sum,
-            "indices_to_free": itf,
-            "sampling_info": si if needs_si else None,
-            # Mamba state (None for non-Mamba models — zero overhead).
-            "mamba_track_indices": batch.mamba_track_indices,
-            "mamba_track_mask": batch.mamba_track_mask,
-            "mamba_track_seqlens": batch.mamba_track_seqlens,
-            # DP-attention token counts (None for standard single-GPU).
-            "global_num_tokens": batch.global_num_tokens,
-            "global_num_tokens_for_logprob": batch.global_num_tokens_for_logprob,
-        }
-        # FutureMap fields; omitted when None so the wire stays small and
-        # the worker's payload.get(...) returns None by default.
+        control = DecodeStepControl.from_model_worker_batch(batch)
         if input_slot is not None:
-            control["input_slot"] = input_slot
+            control.input_slot = input_slot
+            control.input_ids = None  # worker reads from future slot, not payload
         if output_slot is not None:
-            control["output_slot"] = output_slot
+            control.output_slot = output_slot
         return control
 
     # ------------------------------------------------------------------
@@ -758,7 +718,7 @@ class TpWorkerClientGroup(BaseTpWorker):
             fp = self._req_pool_fingerprint(model_worker_batch)
             if self._decode_fast_valid and self._batch_composition_unchanged_fp(fp):
                 control = self._build_decode_control(model_worker_batch)
-                slim = self._fanout_forward(M_DECODE_STEP, **control)
+                slim = self._fanout_forward(M_DECODE_STEP, control=control)
                 self._last_req_pool_fp = fp
                 self._decode_fast_hits += 1
                 return self._maybe_rehydrate_decode_reply(slim)
@@ -825,7 +785,7 @@ class TpWorkerClientGroup(BaseTpWorker):
                     input_slot=input_slot,
                     output_slot=output_slot,
                 )
-                send_t0 = self._fanout_send_only(M_DECODE_STEP, **control)
+                send_t0 = self._fanout_send_only(M_DECODE_STEP, control=control)
                 return (send_t0, True, fp, "fast")
             send_t0 = self._fanout_send_only(
                 b"forward_batch_generation",

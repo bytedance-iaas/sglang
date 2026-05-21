@@ -50,6 +50,12 @@ import zmq
 import time
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct.msgpack_struct import (
+    DecodeForwardReplySlim,
+    DeferredAllocIPC,
+    serialize as msgpack_serialize,
+    deserialize as msgpack_deserialize,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -198,7 +204,7 @@ class TpWorkerServer:
         }
 
     @staticmethod
-    def _decode_step_control_to_payload(typed, ipc_to_tensor):
+    def _decode_step_control_to_payload(typed):
         """Convert a typed ``DecodeStepControl`` msgspec.Struct back to the
         dict shape ``_apply_decode_control`` expects.
 
@@ -209,22 +215,17 @@ class TpWorkerServer:
         """
         import pickle as _pickle
         out = {
-            "seq_lens": ipc_to_tensor(typed.seq_lens),
-            "seq_lens_cpu": ipc_to_tensor(typed.seq_lens_cpu),
-            "orig_seq_lens": ipc_to_tensor(typed.orig_seq_lens),
+            "seq_lens": typed.seq_lens,
+            "seq_lens_cpu": typed.seq_lens_cpu,
+            "orig_seq_lens": typed.orig_seq_lens,
             "seq_lens_sum": typed.seq_lens_sum,
-            "input_ids": ipc_to_tensor(typed.input_ids),
-            "indices_to_free": ipc_to_tensor(typed.indices_to_free),
-            "mamba_track_indices": ipc_to_tensor(typed.mamba_track_indices),
-            "mamba_track_mask": ipc_to_tensor(typed.mamba_track_mask),
-            "mamba_track_seqlens": ipc_to_tensor(typed.mamba_track_seqlens),
+            "input_ids": typed.input_ids,
+            "indices_to_free": typed.indices_to_free,
+            "mamba_track_indices": typed.mamba_track_indices,
+            "mamba_track_mask": typed.mamba_track_mask,
+            "mamba_track_seqlens": typed.mamba_track_seqlens,
             "global_num_tokens": typed.global_num_tokens,
             "global_num_tokens_for_logprob": typed.global_num_tokens_for_logprob,
-            "sampling_info": (
-                _pickle.loads(typed.sampling_info_pickle)
-                if typed.sampling_info_pickle is not None
-                else None
-            ),
         }
         if typed.input_slot is not None:
             out["input_slot"] = typed.input_slot
@@ -247,7 +248,7 @@ class TpWorkerServer:
         ``output_slot`` FutureMap contract); otherwise the worker deadlocks
         waiting for a second request that never arrives.
         """
-        if envs.SGLANG_RUST_DETOKENIZER.get():
+        if envs.SGLANG_CPU_PIPELINE_OVERLAP.get():
             self.run_loop_pipelined()
             return
         self._run_loop_sequential()
@@ -295,9 +296,8 @@ class TpWorkerServer:
                 from sglang.srt.managers.io_struct.msgpack_struct import (
                     DecodeStepControl,
                 )
-                from sglang.srt.managers.io_struct import ipc_to_tensor
-                typed_ctrl = msgspec.msgpack.decode(parts[2], type=DecodeStepControl)
-                payload = self._decode_step_control_to_payload(typed_ctrl, ipc_to_tensor)
+                typed_ctrl = msgpack_deserialize(parts[2])
+                payload = self._decode_step_control_to_payload(typed_ctrl)
             else:
                 payload: dict = pickle.loads(parts[1]) if len(parts) > 1 else {}
             _t2 = time.perf_counter()
@@ -326,7 +326,7 @@ class TpWorkerServer:
                         reply = pickle.dumps(result)
                         self.socket.send_multipart([STATUS_OK, reply])
                     else:
-                        reply = msgspec.msgpack.encode(typed_obj)
+                        reply = msgpack_serialize(typed_obj)
                         self.socket.send_multipart([STATUS_OK_MSGPACK, reply])
                     _t4 = time.perf_counter()
                     _t5 = _t4
@@ -454,9 +454,8 @@ class TpWorkerServer:
                 from sglang.srt.managers.io_struct.msgpack_struct import (
                     DecodeStepControl,
                 )
-                from sglang.srt.managers.io_struct import ipc_to_tensor
-                typed_ctrl = msgspec.msgpack.decode(parts[2], type=DecodeStepControl)
-                payload = self._decode_step_control_to_payload(typed_ctrl, ipc_to_tensor)
+                typed_ctrl = msgpack_deserialize(parts[2])
+                payload = self._decode_step_control_to_payload(typed_ctrl)
             else:
                 payload = pickle.loads(parts[1]) if len(parts) > 1 else {}
             _t2 = time.perf_counter()
@@ -497,14 +496,13 @@ class TpWorkerServer:
                         and result.get("_slim_decode") is True
                     )
                     if use_mp:
-                        import msgspec
                         typed_obj = self._typed_slim_for_reply
                         self._typed_slim_for_reply = None
                         if typed_obj is None:
                             reply = pickle.dumps(result)
                             self.socket.send_multipart([STATUS_OK, reply])
                         else:
-                            reply = msgspec.msgpack.encode(typed_obj)
+                            reply = msgpack_serialize(typed_obj)
                             self.socket.send_multipart([STATUS_OK_MSGPACK, reply])
                         _t4 = time.perf_counter()
                         _t5 = _t4
@@ -716,7 +714,15 @@ class TpWorkerServer:
                 "prefix_lens": prefix_lens_cpu,
                 "extend_lens": extend_lens_cpu,
                 "out_cache_loc": out_cache_loc,
-                "free_pages_remaining": len(allocator.free_pages),
+                # Authoritative free page count.  ``len(allocator.free_pages)``
+                # alone under-counts when ``need_sort=True``: freed pages are
+                # parked in ``release_pages`` until the next ``alloc()`` call
+                # forces ``merge_and_sort_free``.  ``available_size()`` already
+                # sums both lists, so dividing by ``page_size`` is the correct
+                # total free-page count to ship to the scheduler.
+                "free_pages_remaining": (
+                    allocator.available_size() // allocator.page_size
+                ),
             }
 
         elif batch.forward_mode.is_decode():
@@ -752,7 +758,11 @@ class TpWorkerServer:
                 "req_pool_indices": req_pool_indices_gpu,
                 "seq_lens_minus1": (seq_lens_cpu - 1),
                 "out_cache_loc": out_cache_loc,
-                "free_pages_remaining": len(allocator.free_pages),
+                # See the extend branch above: ``available_size()`` covers
+                # both ``free_pages`` and the un-merged ``release_pages`` list.
+                "free_pages_remaining": (
+                    allocator.available_size() // allocator.page_size
+                ),
             }
 
         return None
@@ -879,8 +889,7 @@ class TpWorkerServer:
             and typed_obj is not None
         )
         if use_mp:
-            import msgspec
-            reply = msgspec.msgpack.encode(typed_obj)
+            reply = msgpack_serialize(typed_obj)
             self.socket.send_multipart([STATUS_OK_MSGPACK, reply])
         else:
             reply = pickle.dumps(slim_result)
@@ -1205,11 +1214,6 @@ def _build_typed_slim_reply(result, batch):
     we haven't ported yet (multimodal, certain spec paths).
     """
     import pickle as _pickle
-    from sglang.srt.managers.io_struct.msgpack_struct import (
-        DecodeForwardReplySlim,
-        DeferredAllocIPC,
-    )
-    from sglang.srt.managers.io_struct import tensor_to_ipc
 
     da_obj = result.deferred_alloc
     da_ipc = None
@@ -1218,18 +1222,18 @@ def _build_typed_slim_reply(result, batch):
         # tensors inside it have been D2H'd by _move_generation_result_to_cpu.
         da_ipc = DeferredAllocIPC(
             mode=da_obj["mode"],
-            req_pool_indices=tensor_to_ipc(da_obj["req_pool_indices"]),
-            out_cache_loc=tensor_to_ipc(da_obj["out_cache_loc"]),
-            seq_lens_minus1=tensor_to_ipc(da_obj.get("seq_lens_minus1")),
-            prefix_lens=tensor_to_ipc(da_obj.get("prefix_lens")),
-            extend_lens=tensor_to_ipc(da_obj.get("extend_lens")),
+            req_pool_indices=da_obj["req_pool_indices"],
+            out_cache_loc=da_obj["out_cache_loc"],
+            seq_lens_minus1=da_obj.get("seq_lens_minus1"),
+            prefix_lens=da_obj.get("prefix_lens"),
+            extend_lens=da_obj.get("extend_lens"),
             free_pages_remaining=da_obj.get("free_pages_remaining", 0),
         )
 
     return DecodeForwardReplySlim(
-        next_token_ids=tensor_to_ipc(result.next_token_ids),
+        next_token_ids=result.next_token_ids,
         deferred_alloc=da_ipc,
-        accept_lens=tensor_to_ipc(result.accept_lens),
+        accept_lens=result.accept_lens,
         can_run_cuda_graph=bool(result.can_run_cuda_graph),
         num_accepted_drafts=int(result.num_accepted_drafts or 0),
         num_accepted_drafts_per_req_cpu=getattr(

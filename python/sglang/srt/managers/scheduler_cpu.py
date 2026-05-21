@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler, dispatch_event_loop
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -95,8 +96,11 @@ class CpuPageTracker:
     def __init__(self, total_pages: int, page_size: int) -> None:
         self.total_pages = total_pages
         self.page_size = page_size
-        # Start with all pages free except the reserved page 0
-        self._free_page_count: int = total_pages
+        # The GPU worker's last authoritative free-page count.  Updated by
+        # ``update_free_count`` after every batch reply.
+        self._base_free_pages: int = total_pages
+        # Indices freed locally but not yet propagated to the GPU.  Drained
+        # into ``ModelWorkerBatch.indices_to_free`` on the next batch send.
         self._pending_free: List[torch.Tensor] = []
         self._kvcache = _CpuKvCacheProxy(
             size=total_pages * page_size, page_size=page_size
@@ -108,13 +112,42 @@ class CpuPageTracker:
     # ------------------------------------------------------------------
 
     def available_size(self) -> int:
-        return self._free_page_count * self.page_size
+        """Free tokens = (GPU's last report + pages pending propagation) * page_size.
+
+        Recomputed every call so the answer is correct regardless of when
+        it's queried — including at idle, when no ``update_free_count``
+        runs and any stale incremental counter would drift.  Deduplicated
+        page count means we never double-count a page across multiple
+        ``free()`` calls (which can hit the same page from different
+        cleanup paths, e.g. radix-cache tail-free + an adjacent eviction).
+        """
+        return (self._base_free_pages + self._pending_unique_pages()) * self.page_size
 
     def get_kvcache(self) -> _CpuKvCacheProxy:
         return self._kvcache
 
     def free(self, indices: torch.Tensor) -> None:
-        """Accumulate freed slot indices to forward to the GPU worker."""
+        """Accumulate freed slot indices to forward to the GPU worker.
+
+        Does NOT bump a free-page counter — ``available_size()`` is derived
+        from ``_base_free_pages + _pending_unique_pages()`` on demand, so
+        an accurate, dedup'd count is always available without a separate
+        running total that could drift.
+
+        Filter out any index in page 0.  The GPU allocator reserves page 0
+        as the padded-dummy-output slot and never allocates from it, so a
+        freed index in that page is always a stale read — typically the
+        zero-initialized region of ``req_to_token`` accessed when
+        ``kv_committed_len`` is one ahead of the last actually-written
+        slot.  This happens in pipelined mode: ``prepare_for_decode``
+        bumps ``kv_committed_len`` for the next step before
+        ``process_batch_result`` marks the just-EOS'd reqs as finished, so
+        ``cache_finished_req`` reads past the written region and pulls in
+        a 0.  Letting that 0 reach ``indices_to_free`` adds a phantom
+        page 0 into the GPU allocator's ``release_pages``, which then
+        over-reports ``available_size()`` forever — exactly the consistent
+        +N page overshoot the leak check trips on at idle.
+        """
         if indices.numel() == 0:
             return
         # IMPORTANT: clone to detach from any parent storage. ``indices`` is
@@ -123,13 +156,26 @@ class CpuPageTracker:
         # backing storage, which adds ~500 MB per prefill batch to the IPC
         # payload. The clone allocates a tiny fresh tensor.
         cpu_indices = indices.detach().to("cpu", copy=True).contiguous().clone()
+        # Drop indices that fall in page 0 (reserved slot).  Treat as a
+        # safety net — if every caller maintained a perfect
+        # ``kv_committed_len`` invariant we wouldn't need this, but the
+        # pipelined event loop's reordering makes the off-by-one possible
+        # and the cost of the filter is negligible.
+        in_page_zero = cpu_indices < self.page_size
+        if in_page_zero.any():
+            cpu_indices = cpu_indices[~in_page_zero]
+            if cpu_indices.numel() == 0:
+                return
         self._pending_free.append(cpu_indices)
-        # Approximate count update (page-aligned unique pages)
-        freed_pages = int(torch.unique(cpu_indices // self.page_size).numel())
-        self._free_page_count += freed_pages
 
     def drain_pending_free(self) -> Optional[torch.Tensor]:
-        """Return and clear all accumulated free indices (sent with next batch)."""
+        """Return and clear all accumulated free indices (sent with next batch).
+
+        After draining, the GPU will process these as ``indices_to_free``
+        and its next reply's ``free_pages_remaining`` will include them —
+        i.e. they migrate from ``_pending_free`` (CPU-only) into
+        ``_base_free_pages`` (GPU-visible).
+        """
         if not self._pending_free:
             return None
         # Common case: a single freed-indices tensor — skip torch.cat.
@@ -141,9 +187,34 @@ class CpuPageTracker:
         self._pending_free.clear()
         return result
 
+    def _pending_unique_pages(self) -> int:
+        """Number of unique pages across all tensors in ``_pending_free``.
+
+        Matches what the GPU's allocator will record when it eventually
+        processes these indices via ``indices_to_free``: ``unique(idx //
+        page_size)``.  Same dedup as the GPU side, so the CPU's derived
+        free count never disagrees with the GPU's view once propagation
+        catches up.
+        """
+        if not self._pending_free:
+            return 0
+        all_pending = (
+            self._pending_free[0]
+            if len(self._pending_free) == 1
+            else torch.cat(self._pending_free)
+        )
+        return int(torch.unique(all_pending // self.page_size).numel())
+
     def update_free_count(self, free_pages: int) -> None:
-        """Sync free page count from GPU worker's authoritative report."""
-        self._free_page_count = free_pages
+        """Sync the GPU worker's authoritative free-page count.
+
+        ``free_pages`` is the worker's report after it processed our last
+        batch's ``indices_to_free`` and allocated for that batch — so it
+        already accounts for everything we've drained.  Anything still in
+        ``_pending_free`` (freed locally after the last drain) is layered
+        on top by ``available_size()``.
+        """
+        self._base_free_pages = free_pages
 
     # ------------------------------------------------------------------
     # Stubs: alloc_* are no-ops; real allocation happens on the GPU worker
@@ -171,7 +242,7 @@ class CpuPageTracker:
         pass
 
     def clear(self):
-        self._free_page_count = self.total_pages - 1
+        self._base_free_pages = self.total_pages - 1
         self._pending_free.clear()
 
     def merge_and_sort_free(self):
@@ -305,8 +376,7 @@ class CpuScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def run_event_loop(self) -> None:
-        import os
-        if os.environ.get("SGLANG_CPU_PIPELINE_OVERLAP", "0") == "1":
+        if envs.SGLANG_CPU_PIPELINE_OVERLAP.get():
             self.event_loop_pipelined()
         else:
             dispatch_event_loop(self)
@@ -321,7 +391,6 @@ class CpuScheduler(Scheduler):
         without the next step's output being wasted).
         """
         import time
-        from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import (
             DynamicGradMode,
             ForwardMode,

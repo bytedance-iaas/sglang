@@ -13,37 +13,27 @@ from sglang.srt.observability.req_time_stats import (
     ReqTimeStatsBase,
 )
 
-class TensorIPC(msgspec.Struct, tag=True):
-    """Compact wire-format for a CPU torch.Tensor.
-
-    Designed so a Rust scheduler / worker can decode it natively without
-    needing pickle. Encode/decode helpers live in ``tensor_to_ipc`` and
-    ``ipc_to_tensor`` (see ``managers/io_struct/__init__.py``).
-    """
-
-    # Raw little-endian byte representation of the tensor's storage.
-    data: bytes
-    # Tensor shape (use [] for a 0-d scalar tensor).
-    shape: List[int]
-    # Torch dtype name without the "torch." prefix (e.g. "int64", "int32",
-    # "float32"). Both sides use ``torch.{dtype}`` to resolve.
-    dtype: str
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 
 
 class DeferredAllocIPC(msgspec.Struct, tag=True):
     """Worker → scheduler GPU-allocated KV slot indices (CpuScheduler path)."""
 
     mode: str  # "decode" | "extend"
-    req_pool_indices: TensorIPC
-    out_cache_loc: TensorIPC
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
     # Decode-only fields.
-    seq_lens_minus1: Optional[TensorIPC] = None
+    seq_lens_minus1: Optional[torch.Tensor] = None
     # Extend-only fields.
-    prefix_lens: Optional[TensorIPC] = None
-    extend_lens: Optional[TensorIPC] = None
+    prefix_lens: Optional[torch.Tensor] = None
+    extend_lens: Optional[torch.Tensor] = None
     free_pages_remaining: int = 0
 
 
+#TODO: @rainj-me: the sampling_info is removed from DecodeStepControl
+# since it's only used for the logprob streaming path, which the Rust
+# scheduler won't support for now. We can add it back as an optional
+# field if we want to support that path in Rust in the future.
 class DecodeStepControl(msgspec.Struct, tag=True):
     """M_DECODE_STEP control message: scheduler → worker.
 
@@ -56,23 +46,38 @@ class DecodeStepControl(msgspec.Struct, tag=True):
     branches we haven't fully audited, so we ferry it as an opaque blob.
     """
 
-    seq_lens: TensorIPC
-    seq_lens_cpu: TensorIPC
-    orig_seq_lens: TensorIPC
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    orig_seq_lens: torch.Tensor
     seq_lens_sum: int
     # None when input_slot is set — worker resolves input_ids from the
     # FutureMap slot in that case.
-    input_ids: Optional[TensorIPC] = None
-    indices_to_free: Optional[TensorIPC] = None
-    sampling_info_pickle: Optional[bytes] = None
-    mamba_track_indices: Optional[TensorIPC] = None
-    mamba_track_mask: Optional[TensorIPC] = None
-    mamba_track_seqlens: Optional[TensorIPC] = None
+    input_ids: Optional[torch.Tensor] = None
+    indices_to_free: Optional[torch.Tensor] = None
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     # FutureMap pipeline contract (see TpWorkerServer._future_tokens).
     input_slot: Optional[int] = None
     output_slot: Optional[int] = None
+    
+    @staticmethod
+    def from_model_worker_batch(batch: ModelWorkerBatch) -> "DecodeStepControl":
+        return DecodeStepControl(
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            orig_seq_lens=batch.orig_seq_lens,
+            seq_lens_sum=batch.seq_lens_sum,
+            input_ids=batch.input_ids,
+            indices_to_free=batch.indices_to_free,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_seqlens=batch.mamba_track_seqlens,
+            global_num_tokens=batch.global_num_tokens,
+            global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
+        )
 
 
 class DecodeForwardReplySlim(msgspec.Struct, tag=True):
@@ -87,9 +92,9 @@ class DecodeForwardReplySlim(msgspec.Struct, tag=True):
     metrics) the Rust scheduler will skip for now.
     """
 
-    next_token_ids: TensorIPC
+    next_token_ids: torch.Tensor
     deferred_alloc: Optional[DeferredAllocIPC] = None
-    accept_lens: Optional[TensorIPC] = None
+    accept_lens: Optional[torch.Tensor] = None
     can_run_cuda_graph: bool = False
     num_accepted_drafts: int = 0
     num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
@@ -1348,6 +1353,8 @@ _unified_struct = Union[
     BlockReqInput,
     UpdateExpertBackupReq,
     BackupDramReq,
+    DecodeForwardReplySlim,
+    DecodeStepControl,
 ]
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)

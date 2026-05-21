@@ -460,6 +460,20 @@ class SchedulerOutputProcessorMixin:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
+            if req.req_pool_idx is None:
+                # The req's KV cache was already released — either by an
+                # earlier ``process_batch_result`` (the CPU-pipelined event
+                # loop sends batch K+1 before knowing K's EOS reqs are
+                # finished, so the same req can land here once with the new
+                # token and ``check_finished`` would otherwise mark it
+                # finished again and call ``release_kv_cache`` a second
+                # time, asserting on a non-mamba tree cache), or by an
+                # explicit retract. There's nothing left to do for this req
+                # in this step — its slot pool entry is gone, its KV
+                # allocations have been freed/cached, and any further token
+                # we'd append is for a forward step the scheduler will
+                # discard.
+                continue
 
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
