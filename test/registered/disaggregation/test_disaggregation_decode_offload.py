@@ -84,6 +84,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             "--page-size",
             "16",
             "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel",
             "--hicache-storage-backend",
             "file",
             "--hicache-ratio",
@@ -116,6 +118,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             "2",
             "--page-size",
             "16",
+            "--hicache-io-backend",
+            "kernel",
             "--hicache-storage-backend",
             "file",
         ]

@@ -36,6 +36,7 @@ class KVArgs:
     page_size: int
     # for pp prefill
     pp_rank: int
+    prefill_pp_size: int
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int

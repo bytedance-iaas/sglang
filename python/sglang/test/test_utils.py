@@ -201,6 +201,24 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+def has_hf_cache_entry(repo_id: str, repo_type: str = "model") -> bool:
+    """Return whether a Hugging Face repo is already available locally."""
+    if os.path.exists(repo_id):
+        return True
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            local_files_only=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
