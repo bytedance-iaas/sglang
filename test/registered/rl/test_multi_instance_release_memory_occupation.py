@@ -1,6 +1,7 @@
 import gc
 import multiprocessing
 import os
+import signal
 import traceback
 import unittest
 from multiprocessing import Process
@@ -9,15 +10,14 @@ from typing import Iterable, Tuple
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from transformers import AutoModelForCausalLM
 
-from sglang.srt.entrypoints.engine import Engine as SglangEngine
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
     CustomTestCase,
     find_available_port,
+    has_hf_cache_entry,
 )
 
 register_cuda_ci(est_time=57, stage="extra-b", runner_config="4-gpu-h100")
@@ -38,6 +38,47 @@ TEST_SUITE = dict(
 # Llama-3.2-1B bf16 is ~2GB total, ~1GB per TP rank.
 # KV cache with mem_fraction_static=0.83 is much larger.
 MIN_DELTA_MB = 200
+SUBPROCESS_RESULT_TIMEOUT = 120
+SUBPROCESS_JOIN_TIMEOUT = 120
+
+
+def _maybe_enable_hf_offline_for_subprocess(*repo_ids: str) -> None:
+    """Enable offline mode only when every required repo is already cached."""
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        return
+
+    if all(has_hf_cache_entry(repo_id) for repo_id in repo_ids):
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        print(
+            "RL_CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess "
+            f"(repos={repo_ids})",
+            flush=True,
+        )
+
+
+def _set_parent_offline_env_for_spawn(*repo_ids: str) -> dict[str, str | None]:
+    """Set offline env before spawn so child import-time HF checks stay offline."""
+    original_env = {
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE"),
+        "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE"),
+    }
+    if all(has_hf_cache_entry(repo_id) for repo_id in repo_ids):
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        print(
+            "RL_CI_OFFLINE: Enabled parent offline env before spawn "
+            f"(repos={repo_ids})",
+            flush=True,
+        )
+    return original_env
+
+
+def _restore_env_vars(original_env: dict[str, str | None]) -> None:
+    for key, value in original_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 class EngineWrapper:
@@ -68,6 +109,8 @@ class EngineWrapper:
         )
         self._engine = None
         if first_rank_in_node:
+            from sglang.srt.entrypoints.engine import Engine as SglangEngine
+
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
             self._engine = SglangEngine(**engine_kwargs)
 
@@ -126,6 +169,9 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
 
     def test_multi_instance_release_memory_occupation(self):
         master_port = find_available_port(23456)
+        original_offline_env = _set_parent_offline_env_for_spawn(
+            TEST_SUITE["model_path"], DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
+        )
 
         dp_size = TEST_SUITE["dp_size"]
         tp_size = TEST_SUITE["tp_size"]
@@ -147,12 +193,40 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
             )
             p.start()
             processes.append(p)
+        output_writer.close()
 
-        for _ in range(world_size):
-            self.assertTrue(
-                output_reader.recv(), f"Subprocess fail. Check the logs above."
+        try:
+            for _ in range(world_size):
+                self.assertTrue(
+                    output_reader.poll(SUBPROCESS_RESULT_TIMEOUT),
+                    "Timed out waiting for subprocess result.",
+                )
+                self.assertTrue(
+                    output_reader.recv(), f"Subprocess fail. Check the logs above."
+                )
+            for p in processes:
+                p.join(SUBPROCESS_JOIN_TIMEOUT)
+            alive_processes = [p for p in processes if p.is_alive()]
+            self.assertFalse(
+                alive_processes,
+                f"Subprocesses did not exit cleanly: {[p.pid for p in alive_processes]}",
             )
-        for p in processes:
+        finally:
+            output_reader.close()
+            _terminate_processes(processes)
+            _restore_env_vars(original_offline_env)
+
+
+def _terminate_processes(processes):
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    for p in processes:
+        if p.is_alive():
+            p.join(SUBPROCESS_TERMINATE_TIMEOUT)
+    for p in processes:
+        if p.is_alive():
+            os.kill(p.pid, signal.SIGKILL)
             p.join()
 
 
@@ -167,6 +241,11 @@ def _run_sglang_subprocess(
 ):
     engine = None
     try:
+        _maybe_enable_hf_offline_for_subprocess(
+            model_path, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
+        )
+        from transformers import AutoModelForCausalLM
+
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
         dist.init_process_group(
