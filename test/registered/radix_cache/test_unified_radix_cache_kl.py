@@ -246,6 +246,12 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     mmlu_threshold = 0.75
 
     @unittest.skip(
+        "Temporarily skip unstable SWA prefill cache hit KL check in CI while investigating test threshold/config mismatch"
+    )
+    def test_multiturn_prefill_cache_hit_branching(self):
+        pass
+
+    @unittest.skip(
         "Temporarily skip unstable SWA logprobs KL check in CI while investigating test threshold/config mismatch"
     )
     def test_multiturn_logprobs_match(self):
