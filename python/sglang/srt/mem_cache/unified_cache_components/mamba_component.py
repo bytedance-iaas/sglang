@@ -50,8 +50,13 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
+        if match_device_only:
+            return lambda node: node.component_data[ct].value is not None
+
         # HiCache: evicted + backuped (host_value present) is also a valid match
         return lambda node: (
             node.component_data[ct].value is not None
