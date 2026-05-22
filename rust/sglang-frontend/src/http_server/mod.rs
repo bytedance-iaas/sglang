@@ -54,6 +54,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
+        .route("/model_info", get(model_info))
+        .route("/get_model_info", get(get_model_info))
+        .route("/generate", post(generate).put(generate))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .layer(CorsLayer::permissive())
@@ -76,6 +79,128 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
             owned_by: "sglang".into(),
         }],
     })
+}
+
+// ──────────────────────────── /model_info ───────────────────────────────────
+
+async fn model_info(State(state): State<Arc<AppState>>) -> Json<ModelInfo> {
+    let cfg = &state.tm.config;
+    Json(ModelInfo {
+        model_path: cfg.model_name.clone(),
+        tokenizer_path: cfg.tokenizer_path.clone(),
+        is_generation: true,
+        preferred_sampling_params: None,
+        weight_version: None,
+        has_image_understanding: false,
+        has_audio_understanding: false,
+        model_type: None,
+        architectures: None,
+    })
+}
+
+/// Deprecated alias for `/model_info`. Kept for backwards compatibility with
+/// clients that still hit the old Python endpoint.
+async fn get_model_info(state: State<Arc<AppState>>) -> Json<ModelInfo> {
+    log::warn!(
+        "Endpoint '/get_model_info' is deprecated and will be removed in a future version. \
+         Please use '/model_info' instead."
+    );
+    model_info(state).await
+}
+
+// ─────────────────────────────── /generate ─────────────────────────────────
+
+async fn generate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GenerateRequest>,
+) -> Response {
+    // Resolve input: either text (tokenize) or pre-supplied input_ids.
+    let input_ids = match (&req.text, &req.input_ids) {
+        (Some(GenerateText::Single(s)), _) => match state.tm.tokenize(s) {
+            Ok(ids) => ids,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
+        (Some(GenerateText::Batch(v)), _) => {
+            // Take the first prompt only — batched /generate is not yet supported.
+            let s = v.first().map(String::as_str).unwrap_or("");
+            match state.tm.tokenize(s) {
+                Ok(ids) => ids,
+                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            }
+        }
+        (None, Some(GenerateTokenIds::Single(ids))) => ids.clone(),
+        (None, Some(GenerateTokenIds::Batch(v))) => v.first().cloned().unwrap_or_default(),
+        (None, None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Either `text` or `input_ids` must be provided",
+            );
+        }
+    };
+
+    let sp = sampling_params_from_dict(req.sampling_params.as_ref());
+    let prompt_tokens = input_ids.len() as u32;
+    let stream_mode = req.stream;
+    let (rid, mut rx) = state.tm.submit(input_ids, sp, stream_mode).await;
+
+    if stream_mode {
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let rid2 = rid.clone();
+        tokio::spawn(async move {
+            let mut accumulated = String::new();
+            let mut completion_tokens: u32 = 0;
+            while let Some(chunk) = rx.recv().await {
+                let (data, done) = match chunk {
+                    ResponseChunk::Delta { text } => {
+                        accumulated.push_str(&text);
+                        completion_tokens += 1;
+                        let body = GenerateResponse {
+                            text: accumulated.clone(),
+                            meta_info: GenerateMetaInfo {
+                                id: rid2.clone(),
+                                finish_reason: None,
+                                prompt_tokens,
+                                completion_tokens,
+                            },
+                        };
+                        (serde_json::to_string(&body).unwrap_or_default(), false)
+                    }
+                    ResponseChunk::Done { text, finish_reason } => {
+                        accumulated.push_str(&text);
+                        let body = GenerateResponse {
+                            text: accumulated.clone(),
+                            meta_info: GenerateMetaInfo {
+                                id: rid2.clone(),
+                                finish_reason: Some(FinishReason { kind: finish_reason }),
+                                prompt_tokens,
+                                completion_tokens,
+                            },
+                        };
+                        (serde_json::to_string(&body).unwrap_or_default(), true)
+                    }
+                    ResponseChunk::Error(e) => (format!("{{\"error\":{{\"message\":\"{e}\"}}}}"), true),
+                };
+                if sse_tx.send(Ok(Event::default().data(data))).is_err() || done {
+                    break;
+                }
+            }
+            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+        });
+
+        Sse::new(UnboundedReceiverStream::new(sse_rx)).into_response()
+    } else {
+        let (full_text, finish_reason) = collect_text(rx).await;
+        let resp = GenerateResponse {
+            text: full_text,
+            meta_info: GenerateMetaInfo {
+                id: rid,
+                finish_reason: Some(FinishReason { kind: finish_reason }),
+                prompt_tokens,
+                completion_tokens: 0, // not tracked in non-stream path; client can recount
+            },
+        };
+        Json(resp).into_response()
+    }
 }
 
 // ─────────────────────────── /v1/completions ────────────────────────────────
@@ -399,6 +524,60 @@ fn sampling_params_from_chat(req: &ChatCompletionRequest) -> SamplingParams {
     if let Some(stop) = &req.stop { sp.stop = Some(stop.as_vec()); }
     if let Some(rf) = &req.response_format {
         sp.json_schema = rf.json_schema_str();
+    }
+    sp
+}
+
+/// Build SamplingParams from the free-form `sampling_params` dict accepted by
+/// `/generate`. Unknown keys are ignored. Mirrors the subset of fields the
+/// Python SamplingParams understands that we forward over IPC.
+fn sampling_params_from_dict(
+    params: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> SamplingParams {
+    let mut sp = SamplingParams::default();
+    let Some(p) = params else { return sp };
+
+    let as_u32 = |v: &serde_json::Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
+    let as_i32 = |v: &serde_json::Value| v.as_i64().and_then(|n| i32::try_from(n).ok());
+    let as_f64 = |v: &serde_json::Value| v.as_f64();
+    let as_bool = |v: &serde_json::Value| v.as_bool();
+    let as_string_list = |v: &serde_json::Value| -> Option<Vec<String>> {
+        match v {
+            serde_json::Value::String(s) => Some(vec![s.clone()]),
+            serde_json::Value::Array(arr) => Some(
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    };
+
+    if let Some(v) = p.get("max_new_tokens").and_then(as_u32) { sp.max_new_tokens = v; }
+    if let Some(v) = p.get("temperature").and_then(as_f64) { sp.temperature = v; }
+    if let Some(v) = p.get("top_p").and_then(as_f64) { sp.top_p = v; }
+    if let Some(v) = p.get("top_k").and_then(as_i32) { sp.top_k = v; }
+    if let Some(v) = p.get("min_p").and_then(as_f64) { sp.min_p = v; }
+    if let Some(v) = p.get("frequency_penalty").and_then(as_f64) { sp.frequency_penalty = v; }
+    if let Some(v) = p.get("presence_penalty").and_then(as_f64) { sp.presence_penalty = v; }
+    if let Some(v) = p.get("repetition_penalty").and_then(as_f64) { sp.repetition_penalty = v; }
+    if let Some(v) = p.get("min_new_tokens").and_then(as_u32) { sp.min_new_tokens = v; }
+    if let Some(v) = p.get("n").and_then(as_u32) { sp.n = v; }
+    if let Some(v) = p.get("seed").and_then(|v| v.as_i64()) { sp.seed = Some(v); }
+    if let Some(v) = p.get("ignore_eos").and_then(as_bool) { sp.ignore_eos = v; }
+    if let Some(v) = p.get("skip_special_tokens").and_then(as_bool) { sp.skip_special_tokens = v; }
+    if let Some(v) = p.get("spaces_between_special_tokens").and_then(as_bool) {
+        sp.spaces_between_special_tokens = v;
+    }
+    if let Some(v) = p.get("no_stop_trim").and_then(as_bool) { sp.no_stop_trim = v; }
+    if let Some(v) = p.get("stop").and_then(as_string_list) { sp.stop = Some(v); }
+    if let Some(v) = p.get("stop_regex").and_then(as_string_list) { sp.stop_regex = Some(v); }
+    if let Some(arr) = p.get("stop_token_ids").and_then(|v| v.as_array()) {
+        let ids: Vec<i32> = arr.iter().filter_map(|x| x.as_i64().and_then(|n| i32::try_from(n).ok())).collect();
+        if !ids.is_empty() { sp.stop_token_ids = Some(ids); }
+    }
+    if let Some(v) = p.get("json_schema").and_then(|v| v.as_str()) {
+        sp.json_schema = Some(v.to_string());
     }
     sp
 }

@@ -311,6 +311,86 @@ pub struct ModelList {
     pub data: Vec<ModelCard>,
 }
 
+// ───────────────────────────── /generate ────────────────────────────────────
+
+/// Inputs accepted by the native `/generate` endpoint. Mirrors the relevant
+/// fields of Python's `GenerateReqInput`. Less-used fields are accepted but
+/// ignored to keep the Rust frontend lean — they don't affect text generation.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct GenerateRequest {
+    /// Single prompt or a batch of prompts.
+    #[serde(default)]
+    pub text: Option<GenerateText>,
+    /// Pre-tokenized prompt; one of `text` or `input_ids` must be set.
+    #[serde(default)]
+    pub input_ids: Option<GenerateTokenIds>,
+    /// Free-form sampling parameter dict (top_p, temperature, stop, …).
+    #[serde(default)]
+    pub sampling_params: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    pub stream: bool,
+    /// Optional client-supplied request id. We currently ignore it on the wire
+    /// (the tokenizer manager allocates its own) but accept it for API parity.
+    #[serde(default)]
+    pub rid: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum GenerateText {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum GenerateTokenIds {
+    Single(Vec<u32>),
+    Batch(Vec<Vec<u32>>),
+}
+
+/// Per-chunk and final response body for `/generate`.
+#[derive(Debug, Serialize, Clone)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub meta_info: GenerateMetaInfo,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct GenerateMetaInfo {
+    pub id: String,
+    pub finish_reason: Option<FinishReason>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct FinishReason {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+// ───────────────────────────── /model_info ──────────────────────────────────
+
+/// Response body for `GET /model_info` (and the deprecated alias `/get_model_info`).
+///
+/// Mirrors the Python endpoint in `entrypoints/http_server.py` so existing clients
+/// keep working against the Rust frontend.  Fields the Rust frontend can't
+/// resolve locally (model_type, architectures, multimodal capabilities) are
+/// emitted as `null` rather than omitted, matching Python's behaviour.
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    pub model_path: String,
+    pub tokenizer_path: String,
+    pub is_generation: bool,
+    pub preferred_sampling_params: Option<Value>,
+    pub weight_version: Option<String>,
+    pub has_image_understanding: bool,
+    pub has_audio_understanding: bool,
+    pub model_type: Option<String>,
+    pub architectures: Option<Vec<String>>,
+}
+
 // ─────────────────────────── structured output ──────────────────────────────
 
 #[derive(Debug, Deserialize, Clone)]
