@@ -604,47 +604,39 @@ def _get_item_feature_dim0(item: MultimodalDataItem) -> int:
     return max(int(shape[0]), 1)
 
 
-def _partition_miss_items_by_feature_size(
-    miss_items: List[Tuple[int, int, MultimodalDataItem, int, int]],
-    infer_times: int,
-) -> List[List[Tuple[int, int, MultimodalDataItem, int, int]]]:
+def _partition_miss_items_by_max_shape(
+    miss_items: List[MultimodalDataItem],
+    max_shape: int,
+) -> List[List[MultimodalDataItem]]:
+    """Greedy-pack miss items into partitions whose summed feature dim0 is
+    <= ``max_shape``. ``max_shape <= 0`` disables splitting (returns a single
+    partition). Items larger than ``max_shape`` always live alone in their own
+    partition (we cannot split a single item)."""
     if not miss_items:
         return []
+    if max_shape <= 0 or len(miss_items) <= 1:
+        return [list(miss_items)]
 
-    if len(miss_items) <= 1:
-        return [miss_items]
-
-    num_partitions = min(max(infer_times, 1), len(miss_items))
-    if num_partitions == 1:
-        return [miss_items]
-
-    total_size = sum(_get_item_feature_dim0(item) for _, _, item, _, _ in miss_items)
-    target_size = total_size / num_partitions
-
-    partitions = []
-    cur_partition = []
+    partitions: List[List[MultimodalDataItem]] = []
+    cur_partition: List[MultimodalDataItem] = []
     cur_size = 0
 
-    for idx, miss_item in enumerate(miss_items):
-        _, _, item, _, _ = miss_item
+    for item in miss_items:
         item_size = _get_item_feature_dim0(item)
-
-        remaining_items = len(miss_items) - idx
-        remaining_partitions = num_partitions - len(partitions)
-        if cur_partition and remaining_items == remaining_partitions:
+        if item_size > max_shape:
+            logger.warning(
+                "ViT pack: single item feature dim0 (%d) exceeds "
+                "SGLANG_VIT_INFER_MAX_SHAPE (%d); it will run alone in its "
+                "own ViT call and may still exceed the configured peak-memory "
+                "budget.",
+                item_size,
+                max_shape,
+            )
+        if cur_partition and cur_size + item_size > max_shape:
             partitions.append(cur_partition)
             cur_partition = []
             cur_size = 0
-        elif cur_partition and len(partitions) < num_partitions - 1:
-            size_with_item = cur_size + item_size
-            if cur_size >= target_size or abs(target_size - cur_size) <= abs(
-                target_size - size_with_item
-            ):
-                partitions.append(cur_partition)
-                cur_partition = []
-                cur_size = 0
-
-        cur_partition.append(miss_item)
+        cur_partition.append(item)
         cur_size += item_size
 
     if cur_partition:
@@ -669,7 +661,7 @@ def _get_chunked_prefill_embedding(
     """
     embedding_list = []
     device = input_ids.device
-    vit_infer_times = max(envs.SGLANG_VIT_INFER_TIMES.get(), 1)
+    vit_infer_max_shape = max(envs.SGLANG_VIT_INFER_MAX_SHAPE.get(), 0)
 
     # FIXME(Xinyuan): temporary workaround for eagle3
     # FIXME(yhyang201): check this
@@ -730,18 +722,16 @@ def _get_chunked_prefill_embedding(
     if all_miss_items:
         _move_items_to_device(all_miss_items, device)
         # Optionally split the missed items into multiple ViT calls to bound
-        # per-call peak memory / shape.  Controlled by SGLANG_VIT_INFER_TIMES.
-        if vit_infer_times > 1 and len(all_miss_items) > 1:
-            indexed_items = [
-                (0, idx, item, 0, 0) for idx, item in enumerate(all_miss_items)
-            ]
-            partitions = _partition_miss_items_by_feature_size(
-                indexed_items, vit_infer_times
-            )
+        # per-call peak memory / shape. Controlled by SGLANG_VIT_INFER_MAX_SHAPE:
+        # the upper bound on the sum of feature dim0 in a single ViT call.
+        # When 0 (default), all misses are packed into one ViT call.
+        partitions = _partition_miss_items_by_max_shape(
+            all_miss_items, vit_infer_max_shape
+        )
+        if len(partitions) > 1:
             partition_embeddings = []
             for partition in partitions:
-                miss_item_list = [item for _, _, item, _, _ in partition]
-                part_embedding = data_embedding_func(miss_item_list)
+                part_embedding = data_embedding_func(partition)
                 part_embedding = part_embedding.reshape(
                     -1, part_embedding.shape[-1]
                 )
