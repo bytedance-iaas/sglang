@@ -218,6 +218,46 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     return new_x.transpose(1, 2).contiguous().transpose(1, 2)
 
 
+@torch.compile(disable=_is_hip or _is_npu)
+def _rescale_fp8_for_ue8m0(
+    hidden_states: torch.Tensor, scale: torch.Tensor, block_size: int = 128
+):
+    """Rescale FP8 hidden_states so values are consistent with ue8m0-rounded scales.
+
+    When FP8 activations are quantized using FP32 scales but the GEMM kernel
+    dequantizes using ue8m0 (power-of-2) scales, there is a mismatch: the ue8m0
+    scale is always >= the original FP32 scale, inflating the result by ~1.7x on
+    average.  This function multiplies FP8 values by (original / ue8m0) to
+    compensate, then returns the packed ue8m0 scales.
+    """
+    fp32_scale = scale.to(torch.float32)
+    temp = fp32_scale.view(torch.int32)
+    exp = torch.bitwise_right_shift(temp, 23)
+    mant = torch.bitwise_and(temp, 0x7FFFFF)
+    is_ru = torch.logical_and(
+        torch.logical_and((mant > 0), (exp != 0xFE)),
+        ~torch.logical_and((exp == 0), (mant <= 0x400000)),
+    )
+    exp_rounded = torch.where(is_ru, exp + 1, exp)
+    ue8m0_fp32 = torch.bitwise_left_shift(exp_rounded, 23).view(torch.float32)
+
+    ratio = fp32_scale / ue8m0_fp32
+
+    orig_shape = hidden_states.shape
+    k = orig_shape[-1]
+    num_blocks = k // block_size
+    leading = orig_shape[:-1]
+    x = hidden_states.reshape(*leading, num_blocks, block_size).to(torch.float32)
+    x = x * ratio.unsqueeze(-1)
+    x = x.clamp(-448.0, 448.0)
+    rescaled = x.to(torch.float8_e4m3fn).reshape(orig_shape)
+
+    packed_scale = exp_rounded.to(torch.uint8).view(torch.int)
+    packed_scale = packed_scale.transpose(-2, -1).contiguous().transpose(-2, -1)
+
+    return rescaled, packed_scale
+
+
 def copy_list_to_gpu_no_ce(arr: List[int]):
     from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
@@ -511,7 +551,12 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
+        if asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
+            if hidden_states_scale.dtype != torch.int:
+                hidden_states, hidden_states_scale = _rescale_fp8_for_ue8m0(
+                    hidden_states, hidden_states_scale
+                )
+        else:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -781,8 +826,8 @@ class AsymGemmRunnerCore(MoeRunnerCore):
                 assert (
                     s_mn % 4 == 0 and s_k % 4 == 0
                 ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
-                hidden_states_scale = _cast_to_e8m0_with_rounding_up(
-                    hidden_states_scale
+                hidden_states, hidden_states_scale = _rescale_fp8_for_ue8m0(
+                    hidden_states, hidden_states_scale
                 )
         else:
             hidden_states_scale = asym_gemm_wrapper.get_mn_major_tma_aligned_tensor(
@@ -1085,6 +1130,8 @@ def _pre_permute_standard_to_asym_gemm_fp8(
             hidden_states,
             runner_config.top_k,
             act_block_shape,
+            scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0
+            and not ASYMGEMM_SM89,
         )
     )
 
