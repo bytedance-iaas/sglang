@@ -14,7 +14,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+# from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -86,7 +86,8 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
-    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+    #TODO: @rainj-me check if we can reorganize the domain related type.
+    def prepare_for_decode(self: EagleDraftInput, batch):
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -169,10 +170,11 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
         topk: int,
@@ -207,9 +209,10 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
-        batch: ModelWorkerBatch,
+        batch,
         predict: torch.Tensor,
         num_draft_tokens: int,
         draft_model_runner: Any,
@@ -241,10 +244,11 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch,
         target_worker: TpModelWorker,
     ):
         if not batch.forward_mode.is_idle():
@@ -310,9 +314,10 @@ class EagleVerifyInputV2Mixin:
 
         return verify_forward_batch, can_run_cuda_graph
 
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def sample(
         self: EagleVerifyInput,
-        batch: ModelWorkerBatch,
+        batch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
     ):

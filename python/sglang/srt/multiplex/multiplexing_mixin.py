@@ -75,6 +75,7 @@ class SchedulerMultiplexMixin:
 
         stream_idx = get_current_stream_idx()
 
+        #TODO: @rainj-me need to move to gpu worker's API
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 

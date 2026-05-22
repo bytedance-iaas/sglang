@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+# from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -108,7 +108,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
         )
 
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+    #TODO: @rainj-me check if we can reorganize the domain related type.
+    def prepare_for_verify(self, batch, page_size: int):
 
         if batch.forward_mode.is_idle():
             return
@@ -222,9 +223,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def verify(
         self,
-        batch: ScheduleBatch,
+        batch,
         logits_output: LogitsProcessorOutput,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
@@ -701,7 +703,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
+    #TODO: @rainj-me check if we can reorganize the domain related type.
+    def prepare_for_extend(self, batch):
 
         if batch.forward_mode.is_idle():
             return
@@ -739,9 +742,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             num_accepted_tokens_cpu=[],
         )
 
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def prepare_extend_after_decode(
         self,
-        batch: ScheduleBatch,
+        batch,
         speculative_num_steps: int,
     ):
 

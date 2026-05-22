@@ -128,7 +128,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+# from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.breakable_cuda_graph_runner import (
@@ -528,6 +528,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ElasticEPStateManager.instance().reset()
 
         if self.is_multimodal:
+            #TODO: @rainj-me check if we can reorganize the domain related type.
+            from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
         # Temporary cached values

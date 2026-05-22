@@ -31,7 +31,9 @@ import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason, Modality, ModelWorkerBatch, ScheduleBatch
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -40,6 +42,9 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -2062,6 +2067,172 @@ class DumperControlReqOutput(BaseReq):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+#TODO: @rainj-me: the sampling_info is removed from DecodeStepControl
+# since it's only used for the logprob streaming path, which the Rust
+# scheduler won't support for now. We can add it back as an optional
+# field if we want to support that path in Rust in the future.
+@dataclass
+class DecodeStepControlReq(BaseReq):
+    """M_DECODE_STEP control message: scheduler → worker.
+
+    Delta-only payload for the decode fast path. Stable fields
+    (req_pool_indices, lora_ids, forward_mode, etc.) live on the worker's
+    cached batch and are not re-sent.
+
+    Rust-decodable wire format. ``sampling_info_pickle`` is the one
+    holdout — sampling_info has nested object references and rare
+    branches we haven't fully audited, so we ferry it as an opaque blob.
+    """
+
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    orig_seq_lens: torch.Tensor
+    seq_lens_sum: int
+    # None when input_slot is set — worker resolves input_ids from the
+    # FutureMap slot in that case.
+    input_ids: Optional[torch.Tensor] = None
+    indices_to_free: Optional[torch.Tensor] = None
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
+    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_for_logprob: Optional[List[int]] = None
+    # FutureMap pipeline contract (see TpWorkerServer._future_tokens).
+    input_slot: Optional[int] = None
+    output_slot: Optional[int] = None
+    
+    @staticmethod
+    def from_model_worker_batch(batch: ModelWorkerBatch) -> "DecodeStepControlReq":
+        return DecodeStepControlReq(
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            orig_seq_lens=batch.orig_seq_lens,
+            seq_lens_sum=batch.seq_lens_sum,
+            input_ids=batch.input_ids,
+            indices_to_free=batch.indices_to_free,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_seqlens=batch.mamba_track_seqlens,
+            global_num_tokens=batch.global_num_tokens,
+            global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
+        )
+
+
+@dataclass
+class DeferredAllocIPC:
+    """Worker → scheduler GPU-allocated KV slot indices (CpuScheduler path)."""
+
+    mode: str  # "decode" | "extend"
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
+    # Decode-only fields.
+    seq_lens_minus1: Optional[torch.Tensor] = None
+    # Extend-only fields.
+    prefix_lens: Optional[torch.Tensor] = None
+    extend_lens: Optional[torch.Tensor] = None
+    free_pages_remaining: int = 0
+
+
+@dataclass
+class DecodeForwardSlimOutput(BaseReq):
+    """Slim reply for M_DECODE_STEP / M_FORWARD_GENERATION on the
+    CpuScheduler path. Reconstructed into a GenerationBatchResult on the
+    scheduler side (see ``TpWorkerClientGroup._maybe_rehydrate_decode_reply``).
+
+    Designed for native decoding from Rust — the rich-Python-object
+    fallback fields (``logits_output``, ``routed_experts_output``,
+    ``expert_distribution_metrics``) are carried as opaque pickle blobs
+    because they only show up on rare paths (logprob streaming, MoE
+    metrics) the Rust scheduler will skip for now.
+    """
+
+    next_token_ids: torch.Tensor
+    # Forward-reference: resolved on demand from the package's __init__.
+    deferred_alloc: Optional[DeferredAllocIPC] = None
+    accept_lens: Optional[torch.Tensor] = None
+    can_run_cuda_graph: bool = False
+    num_accepted_drafts: int = 0
+    num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
+    # Opaque blobs for the rare paths.
+    logits_output: Optional[torch.Tensor] = None
+    routed_experts_output: Optional[Any] = None # TODO: @rainj-me, fix the RoutedExpertsOutput type 
+    expert_distribution_metrics: Optional[Any] = None #TODO: @rainj-me, fix the ExpertDistributionMetrics type
+
+
+@dataclass
+class ForwardBatchGenerationReq(BaseReq):
+    """Full forward pass for generation (prefill / decode / mixed)."""
+
+    batch: ModelWorkerBatch = None
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
+    is_verify: bool = False
+    skip_attn_backend_init: bool = False
+
+
+@dataclass
+class ForwardBatchEmbeddingReq(BaseReq):
+    """Forward pass for embedding models."""
+
+    batch: ModelWorkerBatch = None
+
+
+@dataclass
+class ForwardBatchSplitPrefillReq(BaseReq):
+    """Split-prefill forward (multi-stage prefill with intermediate yields)."""
+
+    batch: ScheduleBatch = None
+
+
+@dataclass
+class GetMemUsageReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class GetMemUsageReqOutput(BaseReq):
+    weight_load_mem_usage: float
+    graph_mem_usage: float
+    
+
+@dataclass
+class GPUWorkerHandshakeReqInput(BaseReq):
+    pass
+
+@dataclass
+class GPUWorkerHandshakeReqOutput(BaseReq):
+    # worker info
+    max_total_num_tokens: int
+    max_prefill_tokens: int
+    max_running_requests: int
+    max_queued_requests: int
+    max_req_len: int
+    max_req_input_len: int
+    random_seed: int
+    device: str
+    req_to_token_pool_size: int
+    req_to_token_pool_max_context_len: int
+    token_to_kv_pool_size: int
+
+    is_hybrid_swa: bool = False
+    sliding_window_size: Optional[int] = None
+    
+    # tokens per layer info
+    full_max_total_num_tokens: int = 0
+    swa_max_total_num_tokens: int = 0
+
+    # "pad_input_ids_func": w.get_pad_input_ids_func(),
+    # "memory_pool": w.get_memory_pool(),
+    # model_config: Optional[Dict[str, Any]] = None
+    is_dllm: bool = False
+
+    # model runner attributes
+    lora_manager: Optional[Dict[str, Any]] = None
+    token_table: Optional[torch.Tensor] = None
+    linear_attn_model_spec: Optional[Dict[str, Any]] = None
+    hybrid_gdn_config: Optional[Dict[str, Any]] = None
+    mamba2_config: Optional[Dict[str, Any]] = None
 
 
 def _check_all_req_types():

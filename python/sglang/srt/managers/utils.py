@@ -10,7 +10,7 @@ from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import RoutedExpertsOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import Req
+# from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.server_args import ServerArgs
 
@@ -124,9 +124,9 @@ class GenerationBatchResult:
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-
+#TODO: @rainj-me check if we can reorganize the domain related type.
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req, max_req_input_len: int, allow_auto_truncate: bool
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 

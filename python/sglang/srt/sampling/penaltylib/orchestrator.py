@@ -14,19 +14,23 @@ class BatchedPenalizerOrchestrator:
     def __init__(
         self,
         vocab_size: int,
-        batch: ScheduleBatch,
         penalizers: Set[Type["_BatchedPenalizer"]],
+        batch: Optional[ScheduleBatch] = None,
+        device: Optional[str] = None,
     ):
         self.vocab_size = vocab_size
-        self._batch_ref = weakref.ref(batch)
-        self.device = batch.device
+        self._batch_ref = weakref.ref(batch) if batch is not None else lambda: None
+        device_from_batch = batch.device if batch is not None else None
+        self.device = device if device is not None else device_from_batch
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
+        self.is_required = False
 
-        is_required = False
-        for penalizer in self.penalizers.values():
-            pen_is_required = penalizer.prepare_if_required()
-            is_required |= pen_is_required
-        self.is_required = is_required
+        #TODO: @rainj-me: Temporary disable all penalizers, fix it later.
+        # is_required = False
+        # for penalizer in self.penalizers.values():
+        #     pen_is_required = penalizer.prepare_if_required()
+        #     is_required |= pen_is_required
+        # self.is_required = is_required
 
     @property
     def batch(self) -> ScheduleBatch | None:

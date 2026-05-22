@@ -490,6 +490,7 @@ class Scheduler(
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
+            #TODO: @rainj-me need to move to gpu worker's API
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
             )
@@ -1416,10 +1417,10 @@ class Scheduler(
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
-        self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
+        self.use_ngram_embedding = self.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
             self.token_table = self.tp_worker.model_runner.token_table
-            hf_config = self.tp_worker.model_config.hf_config
+            hf_config = self.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
 

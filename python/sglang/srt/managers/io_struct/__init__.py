@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 import msgspec
 from typing import Union, Optional, List
+import torch
 
 from zmq import Socket
 from zmq.asyncio import Socket as AsyncSocket
@@ -118,6 +119,16 @@ if envs.SGLANG_IPC_USE_MSGPACK.get():
         BlockReqInput,
         BackupDramReq,
         UpdateExpertBackupReq,
+        DecodeForwardSlimOutput,
+        DecodeStepControlReq,
+        ForwardBatchGenerationReq,
+        ForwardBatchEmbeddingReq,
+        ForwardBatchSplitPrefillReq,
+        GetMemUsageReqInput,
+        GetMemUsageReqOutput,
+        GPUWorkerHandshakeReqInput,
+        GPUWorkerHandshakeReqOutput,
+        DeferredAllocIPC,
     )
 else:
     from .pickle_struct import (
@@ -208,6 +219,16 @@ else:
         BlockReqInput,
         BackupDramReq,
         UpdateExpertBackupReq,
+        DecodeForwardSlimOutput,
+        DecodeStepControlReq,
+        ForwardBatchGenerationReq,
+        ForwardBatchEmbeddingReq,
+        ForwardBatchSplitPrefillReq,
+        GetMemUsageReqInput,
+        GetMemUsageReqOutput,
+        GPUWorkerHandshakeReqInput,
+        GPUWorkerHandshakeReqOutput,
+        DeferredAllocIPC,
     )
 
 import logging
@@ -490,6 +511,18 @@ __all__ = [
     "UnloadLoRAAdapterReqOutput",
     "LoadLoRAAdapterFromTensorsReqOutput",
     "MultimodalDataInputFormat",
+    "DecodeForwardSlimOutput",
+    "DecodeStepControlReq",
+    "ForwardBatchGenerationReq",
+    "ForwardBatchEmbeddingReq",
+    "ForwardBatchSplitPrefillReq",
+    "GetMemUsageReqInput",
+    "GetMemUsageReqOutput",
+    "GPUWorkerHandshakeReqInput",
+    "GPUWorkerHandshakeReqOutput",
+    "DeferredAllocIPC",
     "sock_send",
     "sock_recv",
+    "sock_send_async",
+    "sock_recv_async",
 ]

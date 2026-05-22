@@ -17,7 +17,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+# from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
@@ -663,7 +663,7 @@ def traverse_tree(
 
 
 def generate_token_bitmask(
-    reqs: List[Req],
+    reqs: List[Any],
     verify_input: EagleVerifyInput,
     retrieve_next_token_cpu: torch.Tensor,
     retrieve_next_sibling_cpu: torch.Tensor,

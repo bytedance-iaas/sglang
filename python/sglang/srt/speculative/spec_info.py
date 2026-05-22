@@ -5,7 +5,6 @@ from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -155,8 +154,9 @@ class SpecInput(ABC):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         pass
 
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def get_spec_adjusted_global_num_tokens(
-        self, forward_batch: ModelWorkerBatch
+        self, forward_batch
     ) -> Tuple[List[int], List[int]]:
         c1, c2 = self.get_spec_adjust_token_coefficient()
         global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]

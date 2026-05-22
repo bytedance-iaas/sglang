@@ -5,7 +5,9 @@ from typing import Any, Dict, List, Optional, Type, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import (
+    Modality, ModelWorkerBatch, ScheduleBatch
+)
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.observability.req_time_stats import (
@@ -13,28 +15,27 @@ from sglang.srt.observability.req_time_stats import (
     ReqTimeStatsBase,
 )
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 
 
-class DeferredAllocIPC(msgspec.Struct, tag=True):
-    """Worker → scheduler GPU-allocated KV slot indices (CpuScheduler path)."""
+from sglang.srt.sampling.penaltylib.orchestrator import BatchedPenalizerOrchestrator
+from sglang.srt.sampling.penaltylib import (
+    BatchedFrequencyPenalizer,
+    BatchedPresencePenalizer,
+    BatchedRepetitionPenalizer,
+    BatchedMinNewTokensPenalizer,
+)
 
-    mode: str  # "decode" | "extend"
-    req_pool_indices: torch.Tensor
-    out_cache_loc: torch.Tensor
-    # Decode-only fields.
-    seq_lens_minus1: Optional[torch.Tensor] = None
-    # Extend-only fields.
-    prefix_lens: Optional[torch.Tensor] = None
-    extend_lens: Optional[torch.Tensor] = None
-    free_pages_remaining: int = 0
+from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 #TODO: @rainj-me: the sampling_info is removed from DecodeStepControl
 # since it's only used for the logprob streaming path, which the Rust
 # scheduler won't support for now. We can add it back as an optional
 # field if we want to support that path in Rust in the future.
-class DecodeStepControl(msgspec.Struct, tag=True):
+class DecodeStepControlReq(msgspec.Struct, tag=True):
     """M_DECODE_STEP control message: scheduler → worker.
 
     Delta-only payload for the decode fast path. Stable fields
@@ -64,8 +65,8 @@ class DecodeStepControl(msgspec.Struct, tag=True):
     output_slot: Optional[int] = None
     
     @staticmethod
-    def from_model_worker_batch(batch: ModelWorkerBatch) -> "DecodeStepControl":
-        return DecodeStepControl(
+    def from_model_worker_batch(batch: ModelWorkerBatch) -> "DecodeStepControlReq":
+        return DecodeStepControlReq(
             seq_lens=batch.seq_lens,
             seq_lens_cpu=batch.seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
@@ -79,8 +80,21 @@ class DecodeStepControl(msgspec.Struct, tag=True):
             global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
         )
 
+class DeferredAllocIPC(msgspec.Struct, tag=True):
+    """Worker → scheduler GPU-allocated KV slot indices (CpuScheduler path)."""
 
-class DecodeForwardReplySlim(msgspec.Struct, tag=True):
+    mode: str  # "decode" | "extend"
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
+    # Decode-only fields.
+    seq_lens_minus1: Optional[torch.Tensor] = None
+    # Extend-only fields.
+    prefix_lens: Optional[torch.Tensor] = None
+    extend_lens: Optional[torch.Tensor] = None
+    free_pages_remaining: int = 0
+
+
+class DecodeForwardSlimOutput(msgspec.Struct, tag=True):
     """Slim reply for M_DECODE_STEP / M_FORWARD_GENERATION on the
     CpuScheduler path. Reconstructed into a GenerationBatchResult on the
     scheduler side (see ``TpWorkerClientGroup._maybe_rehydrate_decode_reply``).
@@ -99,10 +113,9 @@ class DecodeForwardReplySlim(msgspec.Struct, tag=True):
     num_accepted_drafts: int = 0
     num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
     # Opaque blobs for the rare paths.
-    logits_output_pickle: Optional[bytes] = None
-    routed_experts_output_pickle: Optional[bytes] = None
-    expert_distribution_metrics_pickle: Optional[bytes] = None
-    next_draft_input_pickle: Optional[bytes] = None
+    logits_output: Optional[torch.Tensor] = None
+    routed_experts_output: Optional[Any] = None #TODO: @rainj-me, fix the RoutedExpertsOutput type
+    expert_distribution_metrics: Optional[Any] = None #TODO: @rainj-me, fix the ExpertDistributionMetrics type
 
 
 class LoRAMetrics(msgspec.Struct, tag=True):
@@ -1235,6 +1248,103 @@ class BackupDramReq(msgspec.Struct, tag=True):
     buffer_size: int
 
 
+class ForwardBatchGenerationReq(msgspec.Struct, tag=True):
+    """Full forward pass for generation (prefill / decode / mixed)."""
+
+    batch: ModelWorkerBatch
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
+    is_verify: bool = False
+    skip_attn_backend_init: bool = False
+
+
+class ForwardBatchEmbeddingReq(msgspec.Struct, tag=True):
+    """Forward pass for embedding models."""
+
+    batch: ModelWorkerBatch
+
+
+
+class ForwardBatchSplitPrefillReq(msgspec.Struct, tag=True):
+    """Split-prefill forward (multi-stage prefill with intermediate yields)."""
+
+    batch: ScheduleBatch
+
+
+class GetMemUsageReqInput(msgspec.Struct, tag=True):
+    pass
+
+
+class GetMemUsageReqOutput(msgspec.Struct, tag=True):
+    weight_load_mem_usage: float
+    graph_mem_usage: float
+
+class GPUWorkerHandshakeReqInput(msgspec.Struct, tag=True):
+    pass
+
+class GPUWorkerHandshakeReqOutput(msgspec.Struct, tag=True):
+    # worker info
+    max_total_num_tokens: int
+    max_prefill_tokens: int
+    max_running_requests: int
+    max_req_len: int
+    max_req_input_len: int
+    random_seed: int
+    device: str
+    req_to_token_pool_size: int
+    req_to_token_pool_max_context_len: int
+    token_to_kv_pool_size: int
+    max_queued_requests: Optional[int] = None
+
+    is_hybrid_swa: bool = False
+    sliding_window_size: Optional[int] = None
+    
+    # tokens per layer info
+    full_max_total_num_tokens: int = 0
+    swa_max_total_num_tokens: int = 0
+
+    # "pad_input_ids_func": w.get_pad_input_ids_func(),
+    # "memory_pool": w.get_memory_pool(),
+    # model_config: Optional[Dict[str, Any]] = None
+    is_dllm: bool = False
+
+    # model runner attributes
+    lora_manager: Optional[Dict[str, Any]] = None
+    token_table: Optional[torch.Tensor] = None
+    linear_attn_model_spec: Optional[Dict[str, Any]] = None
+    hybrid_gdn_config: Optional[Dict[str, Any]] = None
+    mamba2_config: Optional[Dict[str, Any]] = None
+
+
+class BatchedPenalizerOrchestratorIPC(msgspec.Struct, tag=True):
+    vocab_size: int
+    device: str
+    penalizers: List[str] # cls name of penalizers to apply
+
+    @classmethod
+    def from_penalizer_orchestrator(cls, orchestrator: BatchedPenalizerOrchestrator
+    ) -> "BatchedPenalizerOrchestratorIPC":
+        return cls(
+            vocab_size=orchestrator.vocab_size,
+            device=orchestrator.device,
+            penalizers=[p.__name__ for p in orchestrator.penalizers],
+        )
+
+    def to_penalizer_orchestrator(self) -> BatchedPenalizerOrchestrator:
+        # Note: This requires the penalizer classes to be defined in the scope where this method is called.
+        penalizer_classes = []
+        for penalizer_name in self.penalizers:
+            penalizer_cls = globals().get(penalizer_name)
+            if penalizer_cls is None:
+                raise ValueError(f"Penalizer class {penalizer_name} not found in global scope.")
+            penalizer_classes.append(penalizer_cls)
+        return BatchedPenalizerOrchestrator(
+            vocab_size=self.vocab_size,
+            device=self.device,
+            penalizers=penalizer_classes,
+        )
+    
+
+
 def enc_hook(obj: Any) -> Any:
     if isinstance(obj, torch.Tensor):
         # encode torch tensor as Tuple(shape, dtype, data)
@@ -1243,6 +1353,8 @@ def enc_hook(obj: Any) -> Any:
         return (obj.shape, tensor_dtype, raw_data)
     elif isinstance(obj, SamplingParams):
         return SamplingParamsIPC.from_sampling_params(obj)
+    elif isinstance(obj, BatchedPenalizerOrchestrator):
+        return BatchedPenalizerOrchestratorIPC.from_penalizer_orchestrator(obj)
     else:
         # Raise a NotImplementedError for other types
         raise NotImplementedError(
@@ -1261,6 +1373,9 @@ def dec_hook(type: Type, obj: Any) -> Any:
     elif type is SamplingParams:
         obj.pop("type", None)
         return SamplingParamsIPC(**obj).to_sampling_params()
+    elif type is BatchedPenalizerOrchestrator:
+        obj.pop("type", None)
+        return BatchedPenalizerOrchestratorIPC(**obj).to_penalizer_orchestrator()
     else:
         # Raise a NotImplementedError for other types
         raise NotImplementedError(
@@ -1353,8 +1468,13 @@ _unified_struct = Union[
     BlockReqInput,
     UpdateExpertBackupReq,
     BackupDramReq,
-    DecodeForwardReplySlim,
-    DecodeStepControl,
+    DecodeForwardSlimOutput,
+    DecodeStepControlReq,
+    ForwardBatchGenerationReq,
+    ForwardBatchEmbeddingReq,
+    ForwardBatchSplitPrefillReq,
+    GPUWorkerHandshakeReqInput,
+    GPUWorkerHandshakeReqOutput,
 ]
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)

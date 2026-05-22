@@ -20,8 +20,6 @@ from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.io_struct import (sock_send, sock_recv)
-
 # -------------------------------------- config base ------------------------------------------
 
 
@@ -1038,6 +1036,7 @@ def _create_zmq_rpc_broadcast(
 ) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
+    from sglang.srt.managers.io_struct import (sock_send, sock_recv)
 
     rank = _get_rank()
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -1094,6 +1093,7 @@ class _ZmqRpcHandle:
 
     def __getattr__(self, method_name: str):
         def call(*args, **kwargs):
+            from sglang.srt.managers.io_struct import (sock_send, sock_recv)
             sock_send(self._socket, {
                 "method": method_name,
                 "args": args,

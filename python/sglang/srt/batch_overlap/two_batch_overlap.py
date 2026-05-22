@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     NixlEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+# from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -370,9 +370,10 @@ class TboCudaGraphRunnerPlugin:
 
 
 class TboDPAttentionPreparer:
+    #TODO: @rainj-me check if we can reorganize the domain related type.
     def prepare_all_gather(
         self,
-        local_batch: ScheduleBatch,
+        local_batch,
     ):
 
         deepep_mode = get_deepep_mode()

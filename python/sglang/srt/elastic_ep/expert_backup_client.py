@@ -12,7 +12,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.io_struct import (UpdateExpertBackupReq, sock_recv, sock_send)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -30,6 +29,7 @@ def extract_layer_and_expert_id(param_name):
 
 class ExpertBackupClient:
     def __init__(self, server_args: ServerArgs, model_runner):
+        from sglang.srt.managers.io_struct import (UpdateExpertBackupReq, sock_send)
         context = zmq.Context(2)
         self.server_args = server_args
         self.engine_num = server_args.nnodes
@@ -71,6 +71,7 @@ class ExpertBackupClient:
         self._receive_thread.start()
 
     def _receive_loop(self):
+        from sglang.srt.managers.io_struct import sock_recv
         cnt = 0
         while cnt < self.engine_num:
             response = sock_recv(self.recv_list[cnt])

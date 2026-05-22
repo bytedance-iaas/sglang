@@ -194,6 +194,7 @@ class SchedulerUpdateWeightsMixin:
 
         return ResumeMemoryOccupationReqOutput()
 
+    #TODO: @rainj-me need to move to gpu worker's API
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
             self.tp_worker.model_runner.check_weights(action=recv_req.action)
@@ -203,6 +204,7 @@ class SchedulerUpdateWeightsMixin:
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
+    #TODO: @rainj-me need to move to gpu worker's API
     def save_remote_model(self: Scheduler, params):
         url = params["url"]
 
@@ -215,6 +217,7 @@ class SchedulerUpdateWeightsMixin:
             ), "draft_url must be provided when draft model is enabled"
             self.draft_worker.model_runner.save_remote_model(draft_url)
 
+    #TODO: @rainj-me need to move to gpu worker's API
     def save_sharded_model(self: Scheduler, params):
         self.tp_worker.model_runner.save_sharded_model(
             path=params["path"],

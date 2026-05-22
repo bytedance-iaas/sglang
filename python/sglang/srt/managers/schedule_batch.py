@@ -91,15 +91,19 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
-if TYPE_CHECKING:
-    from typing import Any, Dict
+# ``SpecInput`` and ``SpeculativeAlgorithm`` are referenced as field
+# annotations on ``ModelWorkerBatch`` / ``ScheduleBatch`` below.  msgspec
+# decoders that wrap any struct containing ``ModelWorkerBatch`` (e.g.
+# ``ForwardBatchGenerationReq``) introspect those annotations and evaluate
+# the forward references against *this* module's globals, so they must be
+# importable at runtime — TYPE_CHECKING is not enough.
+from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+from sglang.srt.configs.model_config import ModelConfig
+# from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+# from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+# from sglang.srt.session.session_controller import Session
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
-    from sglang.srt.session.session_controller import Session
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
-    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -241,10 +245,12 @@ class MultimodalDataItem:
     format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
-    feature: Union[torch.Tensor, np.ndarray] = None
+    #TODO: @rainj-me check whether the ndarrays from processor can be directly converted to tensors and put in feature,
+    # to avoid the overhead of converting them in the model runner
+    feature: Union[torch.Tensor, Any] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
-    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+    precomputed_embeddings: Optional[Union[torch.Tensor, Any]] = None
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -590,7 +596,7 @@ class Req(ReqDllmMixin):
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
-        session: Optional[Session] = None,
+        session: Optional[Any] = None, #TODO: @rainj-me check if we can reorganize the domain related type.
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
@@ -1372,27 +1378,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
 
     # Sampling info
-    sampling_info: SamplingBatchInfo = None
+    sampling_info: Optional[SamplingBatchInfo] = None
 
     # Batched arguments to model runner
-    input_ids: torch.Tensor = None  # shape: [b], int64
-    input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    input_ids: Optional[torch.Tensor] = None  # shape: [b], int64
+    input_embeds: Optional[torch.Tensor] = None  # shape: [b, hidden_size], float32
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
-    ne_token_table: torch.Tensor = None
-    token_type_ids: torch.Tensor = None  # shape: [b], int64
-    req_pool_indices: torch.Tensor = None  # shape: [b], int64
-    seq_lens: torch.Tensor = None  # shape: [b], int64
-    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    ne_token_table: Optional[torch.Tensor] = None
+    token_type_ids: Optional[torch.Tensor] = None  # shape: [b], int64
+    req_pool_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    seq_lens: Optional[torch.Tensor] = None  # shape: [b], int64
+    seq_lens_cpu: Optional[torch.Tensor] = None  # shape: [b], int64
     # The output locations of the KV cache
-    out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    output_ids: torch.Tensor = None  # shape: [b], int64
+    out_cache_loc: Optional[torch.Tensor] = None  # shape: [b], int64
+    output_ids: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
-    mamba_track_indices: torch.Tensor = None  # shape: [b], int64
-    mamba_track_mask: torch.Tensor = None  # shape: [b], bool
-    mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1446,7 +1452,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_index: int = 0
     split_prefill_finished: bool = False
     split_forward_count: int = 1
-    split_forward_batch: ForwardBatch = None
+    split_forward_batch: Optional[Any] = None #TODO: @rainj-me check if we can reorganize the domain related type.
     seq_lens_cpu_cache: torch.Tensor = None
 
     # Stream
@@ -1483,10 +1489,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
-    prefill_stats: Optional[PrefillStats] = None
+    # TODO: @rainj-me check if we can reorganize the domain related type.
+    prefill_stats: Optional[Any] = None
 
     # HiSparse
-    hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    # TODO: @rainj-me check if we can reorganize the domain related type.
+    hisparse_coordinator: Optional[Any] = None
 
     @classmethod
     def init_new(
@@ -2744,7 +2752,7 @@ class ModelWorkerBatch:
     # The sequence length
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
-    out_cache_loc: torch.Tensor
+    out_cache_loc: Optional[torch.Tensor]
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
@@ -2770,20 +2778,23 @@ class ModelWorkerBatch:
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
 
-    # For multimodal
-    multimodal_inputs: Optional[List[MultimodalInputs]]
-
-    # For encoder-decoder
-    encoder_cached: Optional[List[bool]]
-    encoder_lens: Optional[torch.Tensor]
-    encoder_lens_cpu: Optional[List[int]]
-    encoder_out_cache_loc: Optional[torch.Tensor]
-
-    # For LoRA
-    lora_ids: Optional[List[str]]
-
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # For multimodal — list elements are per-req and are ``None`` for reqs
+    # without multimodal content.  msgspec needs the inner ``Optional`` so the
+    # mixed list decodes cleanly under the typed wire (otherwise it sees a
+    # ``None`` at position i and rejects the whole struct).
+    multimodal_inputs: Optional[List[Optional[MultimodalInputs]]] = None
+
+    # For encoder-decoder
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
+
+    # For LoRA
+    lora_ids: Optional[List[Optional[str]]] = None
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None
