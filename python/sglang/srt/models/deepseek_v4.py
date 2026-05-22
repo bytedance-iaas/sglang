@@ -42,6 +42,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator_dsa_cp import (
+    dsa_cp_gather_hidden_states,
+    dsa_cp_reduce_scatter_hidden_states,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -882,14 +886,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not get_moe_a2a_backend().is_none()
         )
         if _use_cp:
-            assert get_moe_a2a_backend().is_deepep(), (
-                "CP requires DeepEP (moe_a2a_backend == deepep). "
-                "Only DeepEP is tested with CP's per-rank token split."
-            )
-            cp_rank = get_attention_cp_rank()
-            cp_size = get_attention_cp_size()
-            input_ids = input_ids[cp_rank::cp_size].contiguous()
-            input_ids_global = input_ids
+            if get_moe_a2a_backend().is_none():
+                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+            else:
+                assert get_moe_a2a_backend().is_deepep(), (
+                    "CP requires DeepEP (moe_a2a_backend == deepep). "
+                    "Only DeepEP is tested with CP's per-rank token split."
+                )
+                cp_rank = get_attention_cp_rank()
+                cp_size = get_attention_cp_size()
+                input_ids = input_ids[cp_rank::cp_size].contiguous()
+                input_ids_global = input_ids
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
@@ -908,8 +915,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
+            use_reduce_scatter=_use_cp,
         )
-        if _use_tp_moe_gather:
+        if _use_cp and get_moe_a2a_backend().is_none():
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+        elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
@@ -1044,11 +1054,14 @@ class DeepseekV4Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if get_moe_a2a_backend().is_none():
+                cp_size = get_attention_cp_size()
+                input_ids = input_ids.reshape(-1, cp_size).T.flatten()
+                input_ids_global = input_ids
 
         # Upgrade lazy raw metadata on the main stream once before any layer
         # forks alt-streams; later per-layer calls become no-ops.
         forward_batch.attn_backend._maybe_upgrade_forward_metadata()
-
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(
