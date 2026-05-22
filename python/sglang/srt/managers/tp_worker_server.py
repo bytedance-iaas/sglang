@@ -166,10 +166,6 @@ class TpWorkerServer:
         # natural in-order semantics give us correct "store-then-read"
         # ordering between consecutive decode steps without explicit syncs.
         self._future_tokens: dict = {}
-        # When the dispatch path builds a slim reply, it also caches the typed
-        # msgspec.Struct here so run_loop's send step can encode it without
-        # repeating the conversion. None outside the per-step window.
-        self._typed_slim_for_reply = None
         # Type-based dispatcher: same shape as ``Scheduler._request_dispatcher``.
         # Maps the typed request class to the handler that knows how to run it.
         # ``DecodeStepControl`` is registered here too so the msgpack and pickle
@@ -946,14 +942,10 @@ class TpWorkerServer:
         drop_ipc_logits_time = time.perf_counter()
 
         d2h_event = _start_d2h_to_cpu(result)
-        slim_result = _build_slim_reply(result, batch)
+        slim_result = _build_typed_slim_reply(result, batch)
         _finish_d2h_to_cpu(result, d2h_event)
         move_result_to_cpu_time = time.perf_counter()
 
-        try:
-            self._typed_slim_for_reply = _build_typed_slim_reply(result, batch)
-        except Exception:
-            self._typed_slim_for_reply = None
         build_slim_reply_time = time.perf_counter()
 
         # Per-step timing aggregator.
@@ -1011,12 +1003,8 @@ class TpWorkerServer:
         # Overlap CPU slim-reply construction with the GPU forward + D2H.
         _drop_ipc_unsafe_logits(result.logits_output, batch)
         d2h_event = _start_d2h_to_cpu(result)
-        slim = _build_slim_reply(result, batch)
+        slim = _build_typed_slim_reply(result, batch)
         _finish_d2h_to_cpu(result, d2h_event)
-        try:
-            self._typed_slim_for_reply = _build_typed_slim_reply(result, batch)
-        except Exception:
-            self._typed_slim_for_reply = None
         move_result_to_cpu_time = time.perf_counter()
         logger.debug(
             "TpWorkerServer forward_batch_generation times: "
