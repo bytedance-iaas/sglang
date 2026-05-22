@@ -1047,6 +1047,7 @@ def moe_ep_deepgemm_preprocess(
     top_k: int,
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
+    scale_ue8m0: bool = False,
 ):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(
@@ -1087,7 +1088,17 @@ def moe_ep_deepgemm_preprocess(
     block_n, block_k = block_shape[0], block_shape[1]
 
     # TODO: fuse this with the preprocess
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    if scale_ue8m0:
+        hidden_states, scale = per_token_group_quant_fp8(
+            hidden_states,
+            block_k,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        scale = scale.contiguous()
+    else:
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
     gateup_input_scale = torch.empty(
         (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
@@ -1107,6 +1118,11 @@ def moe_ep_deepgemm_preprocess(
         scale.size(1),
         BLOCK_SIZE=1024,
     )
+
+    if scale_ue8m0:
+        gateup_input_scale = (
+            gateup_input_scale.transpose(-2, -1).contiguous().transpose(-2, -1)
+        )
 
     return (
         masked_m,
