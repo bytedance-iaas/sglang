@@ -532,6 +532,7 @@ class Envs:
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_VIT_PACK = EnvBool(False)
     SGLANG_VIT_INFER_MAX_SHAPE = EnvInt(0)
+    
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
 
