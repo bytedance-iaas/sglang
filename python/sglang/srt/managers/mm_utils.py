@@ -732,9 +732,7 @@ def _get_chunked_prefill_embedding(
             partition_embeddings = []
             for partition in partitions:
                 part_embedding = data_embedding_func(partition)
-                part_embedding = part_embedding.reshape(
-                    -1, part_embedding.shape[-1]
-                )
+                part_embedding = part_embedding.reshape(-1, part_embedding.shape[-1])
                 partition_embeddings.append(part_embedding)
             all_miss_embedding = torch.cat(partition_embeddings, dim=0)
         else:
