@@ -133,5 +133,21 @@ class SWAChunkCache(ChunkCache):
         ), "sliding_window_size must be set for SWAChunkCache"
         return True
 
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        kv_committed_len = req.pop_committed_kv_cache()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+
+        free_full = getattr(self.token_to_kv_pool_allocator, "free_full", None)
+        if free_full is None:
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            return
+
+        free_full(kv_indices)
+        swa_start = min(req.swa_evicted_seqlen, kv_committed_len)
+        self.token_to_kv_pool_allocator.clear_swa_mapping(kv_indices[:swa_start])
+        self.token_to_kv_pool_allocator.free_swa(kv_indices[swa_start:])
+
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

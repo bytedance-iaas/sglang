@@ -371,6 +371,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.full_free_group = []
 
         self.clear()
         self._kvcache = kvcache
@@ -596,6 +597,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+        self.full_free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.cat(self.free_group))
+        if self.full_free_group:
+            self.free_full(torch.cat(self.full_free_group))
+
+    def free_full(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+        else:
+            self.full_free_group.append(free_index)
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -617,7 +642,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        self.clear_swa_mapping(free_index)
+
+    def clear_swa_mapping(self, full_indices: torch.Tensor):
+        if full_indices.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.full_to_swa_index_mapping[full_indices] = 0
+            return
+
+        full_pages = torch.unique(full_indices // self.page_size)
+        page_offsets = torch.arange(self.page_size, device=self.device)
+        full_page_indices = (
+            full_pages[:, None] * self.page_size + page_offsets[None, :]
+        ).reshape(-1)
+        self.full_to_swa_index_mapping[full_page_indices] = 0
 
     def backup_state(self):
         return [
@@ -637,6 +676,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
+        self.full_free_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
