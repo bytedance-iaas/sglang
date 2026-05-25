@@ -55,6 +55,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -901,7 +902,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
-                hidden_states
+                hidden_states,
             )
             # hidden_states here follow TP_ATTN_FULL semantics: they are replicated
             # within an attention-TP group. Use replicate gather to avoid summing the
@@ -925,7 +926,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = nsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_attention_tp_group()),
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
