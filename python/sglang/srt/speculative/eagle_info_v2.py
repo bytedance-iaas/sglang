@@ -22,6 +22,7 @@ from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -121,6 +122,11 @@ class EagleDraftInputV2Mixin:
         page_size = batch.token_to_kv_pool_allocator.page_size
         alloc_len_per_decode = get_alloc_len_per_decode()
         double_alloc = alloc_len_per_decode + alloc_len_per_decode
+        topk = (
+            self.topk_p.shape[1]
+            if self.topk_p is not None
+            else get_global_server_args().speculative_eagle_topk
+        )
 
         cur_kv_lens = [0] * bs
         nxt_kv_lens = [0] * bs
@@ -154,15 +160,37 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 cur_kv_lens,
             )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-            )
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                topk == 1
+                and hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    num_needed_tokens + len(cur_kv_lens_cpu) * allocator.page_size,
+                )
+                # Spec V2 over-allocates logical slots across iterations. Bind
+                # HiSparse device slots only for the active draft/verify window.
+                out_cache_loc = allocator.alloc_extend_logical_only(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
+            else:
+                out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
@@ -183,6 +211,7 @@ class EagleDraftInputV2Mixin:
         batch: ScheduleBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
+        target_model_runner: ModelRunner,
         topk: int,
         num_steps: int,
     ):
@@ -190,7 +219,7 @@ class EagleDraftInputV2Mixin:
             bs = len(batch.seq_lens)
 
             # Assign cache locations
-            batch.out_cache_loc = torch.empty(
+            draft_cache_locs = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
                 device=batch.input_ids.device,
@@ -200,11 +229,36 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 req_to_token_pool.req_to_token,
                 batch.seq_lens,
-                batch.out_cache_loc,
+                draft_cache_locs,
                 req_to_token_pool.req_to_token.shape[1],
                 topk,
                 num_steps,
             )
+            self.draft_cache_locs = draft_cache_locs
+            batch.out_cache_loc = draft_cache_locs.view(bs, topk, num_steps)[
+                :, :, 0
+            ].reshape(-1)
+            hisparse_coordinator = getattr(
+                target_model_runner, "hisparse_coordinator", None
+            )
+            if (
+                topk == 1
+                and hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                tokens_per_req_cpu = torch.full(
+                    (bs,), num_steps, dtype=torch.int64, device="cpu"
+                )
+                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                    batch.req_pool_indices,
+                    tokens_per_req_cpu,
+                )
+                target_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
+                    draft_cache_locs,
+                    device_slots,
+                )
+        else:
+            self.draft_cache_locs = None
 
         # Get a forward batch
         self.num_tokens_per_req = topk
@@ -279,6 +333,25 @@ class EagleVerifyInputV2Mixin:
                 draft_token_num=self.draft_token_num,
                 device=device,
             )
+            hisparse_coordinator = getattr(
+                target_worker.model_runner, "hisparse_coordinator", None
+            )
+            if (
+                self.topk == 1
+                and hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                tokens_per_req_cpu = torch.full(
+                    (bs,), self.draft_token_num, dtype=torch.int64, device="cpu"
+                )
+                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                    batch.req_pool_indices,
+                    tokens_per_req_cpu,
+                )
+                target_worker.model_runner.token_to_kv_pool_allocator.bind_device_mapping(
+                    batch.out_cache_loc,
+                    device_slots,
+                )
 
             if get_global_server_args().enable_mamba_extra_buffer():
                 set_mamba_track_indices_from_reqs(batch)

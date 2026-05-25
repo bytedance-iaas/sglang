@@ -286,6 +286,89 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
 
+    def alloc_extend_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        backup_state: bool = False,
+    ):
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
+                f"{avail} are available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        logical_indices = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if logical_indices is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        if backup_state:
+            return logical_indices, (logical_state, logical_indices.clone())
+        return logical_indices
+
+    def bind_device_mapping(
+        self, logical_indices: torch.Tensor, device_slots: torch.Tensor
+    ):
+        if logical_indices.numel() != device_slots.numel():
+            raise RuntimeError(
+                "HiSparse draft mapping mismatch: "
+                f"{logical_indices.numel()} logical locs vs "
+                f"{device_slots.numel()} device slots."
+            )
+        self.full_to_hisparse_device_index_mapping[logical_indices] = device_slots
+
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        out = self.alloc_extend_logical_only(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            backup_state=backup_state,
+        )
+        if backup_state:
+            logical_indices, state = out
+        else:
+            logical_indices = out
+            state = None
+
+        self.bind_device_mapping(logical_indices, device_slots)
+        if backup_state:
+            return logical_indices, state
+        return logical_indices
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -483,6 +566,42 @@ class DeepSeekV4SingleKVPoolHost:
             cpu_indices=host_indices_i64,
         )
 
+    def get_contiguous_buf_infos(self):
+        """Return host C4 buffers as token-linear transfer targets."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [
+            self.kv_cache_total_dim * self.dtype.itemsize
+        ] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend="kernel"
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        from sglang.jit_kernel.deepseek_v4 import hisparse_load_to_device
+
+        if host_indices.device != device_indices.device:
+            host_indices = host_indices.to(device=device_indices.device)
+        host_indices_i64 = (
+            host_indices.to(torch.int64)
+            if host_indices.dtype != torch.int64
+            else host_indices
+        )
+        device_indices_i64 = (
+            device_indices.to(torch.int64)
+            if device_indices.dtype != torch.int64
+            else device_indices
+        )
+        hisparse_load_to_device(
+            gpu_cache=device_pool.kv_buffer[layer_id],
+            cpu_cache=self.kv_buffer[layer_id],
+            gpu_indices=device_indices_i64,
+            cpu_indices=host_indices_i64,
+        )
+
     def available_size(self):
         return len(self.free_slots)
 
@@ -607,10 +726,29 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "use alloc_extend or alloc_decode instead."
         )
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.page_size
         P = len(hisparse_indices)
@@ -666,6 +804,103 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.hisparse_kvcache._translate_loc_to_hisparse_device(
             self.get_last_loc_compressed(last_locs)
         )
+
+    def alloc_extend_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        backup_state: bool = False,
+    ):
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"DeepSeek V4 HiSparse logical alloc: need {extend_num_tokens} "
+                f"tokens but only {avail} are available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        logical_indices = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if logical_indices is None:
+            raise RuntimeError(
+                f"DeepSeek V4 HiSparse logical alloc failed for {extend_num_tokens} "
+                f"tokens. Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        if backup_state:
+            return logical_indices, (logical_state, logical_indices.clone())
+        return logical_indices
+
+    def bind_device_mapping(
+        self, logical_indices: torch.Tensor, device_slots: torch.Tensor
+    ):
+        compressed_logical_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+                logical_indices
+            )
+        )
+        compressed_mask = (logical_indices + 1) % self.compress_ratio == 0
+        compressed_device_slots = device_slots[compressed_mask]
+        if compressed_logical_indices.numel() != compressed_device_slots.numel():
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse draft mapping mismatch: "
+                f"{compressed_logical_indices.numel()} compressed locs vs "
+                f"{compressed_device_slots.numel()} device slots."
+            )
+        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
+            compressed_device_slots.to(torch.int64)
+        )
+
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        out = self.alloc_extend_logical_only(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            backup_state=backup_state,
+        )
+        if backup_state:
+            logical_indices, state = out
+        else:
+            logical_indices = out
+            state = None
+
+        self.bind_device_mapping(logical_indices, device_slots)
+        if backup_state:
+            return logical_indices, state
+        return logical_indices
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        compressed_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+                logical_indices
+            )
+        )
+        self.full_to_hisparse_device_index_mapping[compressed_indices] = 0
 
     def alloc_extend(
         self,
