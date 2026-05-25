@@ -662,6 +662,21 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
+        kv_receiver = decode_req.kv_receiver
+        if kv_receiver is None:
+            return
+
+        try:
+            kv_receiver.clear()
+        except Exception:
+            logger.warning(
+                "Failed to clear decode receiver for aborted prealloc request %s",
+                decode_req.req.rid,
+                exc_info=True,
+            )
+        decode_req.kv_receiver = None
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -802,6 +817,7 @@ class DecodePreallocQueue:
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
+                self._clear_receiver(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1760,6 +1776,48 @@ class DecodeTransferQueue:
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
+        kv_receiver = decode_req.kv_receiver
+        if kv_receiver is None:
+            return
+
+        try:
+            kv_receiver.clear()
+        except Exception:
+            logger.warning(
+                "Failed to clear decode receiver for removed transfer request %s",
+                decode_req.req.rid,
+                exc_info=True,
+            )
+        decode_req.kv_receiver = None
+
+    def _unregister_staging_request(self, decode_req: DecodeRequest) -> None:
+        if (
+            not self.enable_staging
+            or self.staging_handler is None
+            or not self.staging_handler.is_staging_room(decode_req.req.bootstrap_room)
+        ):
+            return
+
+        self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+
+    def _release_metadata_buffer(self, decode_req: DecodeRequest) -> None:
+        idx = decode_req.metadata_buffer_index
+        if idx is None or idx < 0:
+            logger.warning(
+                "Skip freeing missing metadata buffer for removed transfer request %s",
+                decode_req.req.rid,
+            )
+            return
+
+        self.req_to_metadata_buffer_idx_allocator.free(idx)
+        decode_req.metadata_buffer_index = -1
+
+    def _cleanup_removed_transfer_req(self, decode_req: DecodeRequest) -> None:
+        self._unregister_staging_request(decode_req)
+        self._release_metadata_buffer(decode_req)
+        self._clear_receiver(decode_req)
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -1832,15 +1890,7 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if self.enable_staging and self.staging_handler.is_staging_room(
-                self.queue[i].req.bootstrap_room
-            ):
-                self.staging_handler.unregister_decode_req(
-                    self.queue[i].req.bootstrap_room
-                )
-            idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            self._cleanup_removed_transfer_req(self.queue[i])
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
