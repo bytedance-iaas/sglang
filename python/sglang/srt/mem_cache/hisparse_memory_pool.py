@@ -702,6 +702,31 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
+    def logical_available_size(self) -> int:
+        return self.logical_attn_allocator.available_size()
+
+    def dsv4_full_logical_available_size(self) -> int:
+        return self.logical_attn_allocator.full_available_size()
+
+    def host_c4_available_size(self, mem_pool_host) -> int:
+        return mem_pool_host.available_size()
+
+    def c4_tokens_for_full_tokens(self, num_full_tokens: int) -> int:
+        return (
+            max(num_full_tokens, 0) + self.compress_ratio - 1
+        ) // self.compress_ratio
+
+    def gpu_hot_c4_req_budget(
+        self, padded_buffer_size: int, pending_transfer_reqs: int = 0
+    ) -> int:
+        if padded_buffer_size <= 0:
+            return 0
+        return max(
+            0,
+            self.hisparse_attn_allocator.available_size() // padded_buffer_size
+            - pending_transfer_reqs,
+        )
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -742,6 +767,26 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+        )
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len,
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
