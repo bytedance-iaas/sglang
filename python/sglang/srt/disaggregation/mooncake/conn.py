@@ -631,14 +631,131 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _transfer_data(
+        self,
+        mooncake_session_id,
+        transfer_blocks,
+        *,
+        op_name: str = "transfer",
+        room: Optional[int] = None,
+        endpoint: Optional[str] = None,
+        dst_port: Optional[int] = None,
+        state_type: Optional[str] = None,
+    ):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        total_bytes = sum(int(length) for length in lengths)
+        max_bytes = max(int(length) for length in lengths)
+        block_count = len(transfer_blocks)
+        timeout_s = envs.SGLANG_MOONCAKE_TRANSFER_TIMEOUT.get()
+        slow_log_s = envs.SGLANG_MOONCAKE_TRANSFER_SLOW_LOG_SECONDS.get()
+        abort_on_timeout = envs.SGLANG_MOONCAKE_TRANSFER_ABORT_ON_TIMEOUT.get()
+
+        context = (
+            f"op={op_name}, session={mooncake_session_id}, room={room}, "
+            f"endpoint={endpoint}:{dst_port}, state_type={state_type}, "
+            f"blocks={block_count}, total_bytes={total_bytes}, max_bytes={max_bytes}"
         )
+
+        timer = None
+
+        def _log_stuck_transfer():
+            logger.error(
+                "Mooncake transfer has not returned after %.2fs: %s",
+                timeout_s,
+                context,
+            )
+            if abort_on_timeout:
+                logger.error(
+                    "Aborting process because SGLANG_MOONCAKE_TRANSFER_ABORT_ON_TIMEOUT is set: %s",
+                    context,
+                )
+                os._exit(1)
+
+        if timeout_s is not None and timeout_s > 0:
+            timer = threading.Timer(timeout_s, _log_stuck_transfer)
+            timer.daemon = True
+            timer.start()
+
+        start_time = time.monotonic()
+        try:
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+        finally:
+            if timer is not None:
+                timer.cancel()
+
+        elapsed_s = time.monotonic() - start_time
+        if slow_log_s is not None and slow_log_s > 0 and elapsed_s >= slow_log_s:
+            logger.warning(
+                "Mooncake transfer finished slowly in %.2fs with ret=%s: %s",
+                elapsed_s,
+                ret,
+                context,
+            )
+        if (
+            timeout_s is not None
+            and timeout_s > 0
+            and elapsed_s >= timeout_s
+            and ret == 0
+        ):
+            logger.error(
+                "Mooncake transfer exceeded timeout but returned success in %.2fs; "
+                "treating it as failed: %s",
+                elapsed_s,
+                context,
+            )
+            return -1
+        return ret
+
+    def _wait_transfer_futures(
+        self,
+        futures: list[concurrent.futures.Future],
+        *,
+        op_name: str,
+        mooncake_session_id: str,
+        room: Optional[int] = None,
+        endpoint: Optional[str] = None,
+        dst_port: Optional[int] = None,
+        state_type: Optional[str] = None,
+    ) -> int:
+        timeout_s = envs.SGLANG_MOONCAKE_TRANSFER_TIMEOUT.get()
+        try:
+            completed_futures = concurrent.futures.as_completed(
+                futures,
+                timeout=timeout_s if timeout_s is not None and timeout_s > 0 else None,
+            )
+            for future in completed_futures:
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    return status
+        except concurrent.futures.TimeoutError:
+            for f in futures:
+                f.cancel()
+            logger.error(
+                "Mooncake transfer futures timed out after %.2fs: op=%s, "
+                "session=%s, room=%s, endpoint=%s:%s, state_type=%s, futures=%s",
+                timeout_s,
+                op_name,
+                mooncake_session_id,
+                room,
+                endpoint,
+                dst_port,
+                state_type,
+                len(futures),
+            )
+            if envs.SGLANG_MOONCAKE_TRANSFER_ABORT_ON_TIMEOUT.get():
+                logger.error(
+                    "Aborting process because SGLANG_MOONCAKE_TRANSFER_ABORT_ON_TIMEOUT is set"
+                )
+                os._exit(1)
+            return -1
+        return 0
 
     def _send_kvcache_generic(
         self,
@@ -649,6 +766,11 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        op_name: str = "send_kvcache",
+        room: Optional[int] = None,
+        endpoint: Optional[str] = None,
+        dst_port: Optional[int] = None,
+        state_type: Optional[str] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -717,14 +839,30 @@ class MooncakeKVManager(CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id,
+                transfer_blocks,
+                op_name=op_name,
+                room=room,
+                endpoint=endpoint,
+                dst_port=dst_port,
+                state_type=state_type,
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id,
+                transfer_blocks,
+                op_name=op_name,
+                room=room,
+                endpoint=endpoint,
+                dst_port=dst_port,
+                state_type=state_type,
+            )
 
         if self.enable_custom_mem_pool:
             futures = [
@@ -736,13 +874,15 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+            return self._wait_transfer_futures(
+                futures,
+                op_name=op_name,
+                mooncake_session_id=mooncake_session_id,
+                room=room,
+                endpoint=endpoint,
+                dst_port=dst_port,
+                state_type=state_type,
+            )
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
@@ -1052,8 +1192,10 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            return self._transfer_data(
+                mooncake_session_id,
+                list(zip(src_addr_list, dst_addr_list, length_list)),
+                op_name="send_kvcache_slice_tp_aware",
             )
 
         futures = []
@@ -1066,14 +1208,11 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+        return self._wait_transfer_futures(
+            futures,
+            op_name="send_kvcache_slice_tp_aware",
+            mooncake_session_id=mooncake_session_id,
+        )
 
     def send_aux(
         self,
@@ -1098,7 +1237,14 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
-        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+        return self._transfer_data(
+            req.mooncake_session_id,
+            transfer_blocks,
+            op_name="send_aux",
+            room=req.room,
+            endpoint=req.endpoint,
+            dst_port=req.dst_port,
+        )
 
     def send_aux_tcp(
         self,
@@ -1244,7 +1390,22 @@ class MooncakeKVManager(CommonKVManager):
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(dst_state_indices, dtype=np.int32)
-            return self._send_kvcache_generic(
+            logger.info(
+                "Mooncake extra transfer start: state_type=%s, session=%s, room=%s, "
+                "endpoint=%s:%s, src_indices=%s, dst_indices=%s, tensors=%s, "
+                "estimated_bytes=%s",
+                state_type,
+                req.mooncake_session_id,
+                req.room,
+                req.endpoint,
+                req.dst_port,
+                len(prefill_state_indices),
+                len(dst_state_indices),
+                len(src_state_item_lens),
+                len(prefill_state_indices) * sum(src_state_item_lens),
+            )
+            start_time = time.monotonic()
+            ret = self._send_kvcache_generic(
                 mooncake_session_id=req.mooncake_session_id,
                 src_data_ptrs=src_state_data_ptrs,
                 dst_data_ptrs=dst_state_data_ptrs,
@@ -1252,7 +1413,22 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_data_indices=prefill_state_indices,
                 dst_data_indices=dst_state_indices,
                 executor=executor,
+                op_name="send_extra",
+                room=req.room,
+                endpoint=req.endpoint,
+                dst_port=req.dst_port,
+                state_type=state_type,
             )
+            logger.info(
+                "Mooncake extra transfer finish: state_type=%s, session=%s, room=%s, "
+                "ret=%s, elapsed=%.2fs",
+                state_type,
+                req.mooncake_session_id,
+                req.room,
+                ret,
+                time.monotonic() - start_time,
+            )
+            return ret
         elif state_type == "dsv4":
             return self._send_dsv4_state(
                 req,
@@ -1296,6 +1472,11 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=np.asarray(prefill_state_indices, dtype=np.int32),
             dst_data_indices=np.asarray(req.dst_state_indices, dtype=np.int32),
             executor=executor,
+            op_name="send_dsv4_state",
+            room=req.room,
+            endpoint=req.endpoint,
+            dst_port=req.dst_port,
+            state_type="dsv4",
         )
 
     def _send_mamba_state(
@@ -1573,13 +1754,44 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if ret != 0:
+                                    with self.session_lock:
+                                        self.session_failures[
+                                            req.mooncake_session_id
+                                        ] += 1
+                                        if (
+                                            self.session_failures[
+                                                req.mooncake_session_id
+                                            ]
+                                            >= 1
+                                        ):
+                                            self.failed_sessions.add(
+                                                req.mooncake_session_id
+                                            )
+                                            logger.error(
+                                                f"Session {req.mooncake_session_id} failed."
+                                            )
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send extra state of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(

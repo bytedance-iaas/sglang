@@ -649,6 +649,32 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
 
+    def _backup_accepted_device_locs(
+        self, host_locs: torch.Tensor, device_locs: torch.Tensor
+    ) -> None:
+        producer_stream = device_module.current_stream()
+        device_locs = device_locs.contiguous()
+
+        with device_module.stream(self.decode_backup_stream):
+            # Accepted draft KV is produced by the verify forward on the current
+            # stream. The backup stream must not read those slots before that
+            # write has completed.
+            self.decode_backup_stream.wait_stream(producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+
+        event = device_module.Event()
+        event.record(self.decode_backup_stream)
+        producer_stream.wait_event(event)
+
     def supports_hisparse_draft_slots(self) -> bool:
         return True
 
@@ -831,20 +857,7 @@ class HiSparseCoordinator:
 
         full_to_device_mapping[draft_cache_locs] = 0
 
-        with device_module.stream(self.decode_backup_stream):
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                all_device_locs.contiguous(),
-                io_backend="kernel",
-            )
-            if host_locs.is_cuda:
-                host_locs.record_stream(self.decode_backup_stream)
-            if all_device_locs.is_cuda:
-                all_device_locs.record_stream(self.decode_backup_stream)
-        event = device_module.Event()
-        event.record(self.decode_backup_stream)
-        device_module.current_stream().wait_event(event)
+        self._backup_accepted_device_locs(host_locs, all_device_locs)
 
         newest_slots = self.req_to_device_buffer[
             req_pool_indices, self.device_buffer_size
@@ -934,20 +947,7 @@ class HiSparseCoordinator:
 
         full_to_device_mapping[draft_compressed_locs] = 0
 
-        with device_module.stream(self.decode_backup_stream):
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                device_locs.contiguous(),
-                io_backend="kernel",
-            )
-            if host_locs.is_cuda:
-                host_locs.record_stream(self.decode_backup_stream)
-            if device_locs.is_cuda:
-                device_locs.record_stream(self.decode_backup_stream)
-        event = device_module.Event()
-        event.record(self.decode_backup_stream)
-        device_module.current_stream().wait_event(event)
+        self._backup_accepted_device_locs(host_locs, device_locs)
 
         newest_slots = self.req_to_device_buffer[
             req_pool_indices, self.device_buffer_size
@@ -1177,7 +1177,20 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
-        num_reqs = req_pool_indices.size(0)
+        num_reqs = compressed_seq_lens.size(0)
+        if top_k_result.size(0) != num_reqs:
+            raise RuntimeError(
+                "HiSparse swap-in batch mismatch: "
+                f"compressed_seq_lens.shape={tuple(compressed_seq_lens.shape)}, "
+                f"top_k_result.shape={tuple(top_k_result.shape)}"
+            )
+        if req_pool_indices.size(0) < num_reqs:
+            raise RuntimeError(
+                "HiSparse swap-in req_pool_indices shorter than metadata batch: "
+                f"req_pool_indices.shape={tuple(req_pool_indices.shape)}, "
+                f"num_reqs={num_reqs}"
+            )
+        req_pool_indices = req_pool_indices[:num_reqs]
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)

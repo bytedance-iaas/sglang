@@ -304,6 +304,43 @@ class EagleDraftInputV2Mixin:
             else ForwardMode.DRAFT_EXTEND_V2
         )
         batch.capture_hidden_mode = capture_mode
+
+        # HiSparse admission/prealloc state is owned by the target runner. The
+        # draft runner has its own model runner wrapper, but its coordinator is
+        # not the one that admitted the live requests. Bind the draft-extend
+        # logical cache locs through the target coordinator so speculative KV
+        # writes land in the same device-slot layout used by target verify.
+        target_model_runner = getattr(draft_model_runner, "_target_model_runner", None)
+        hisparse_coordinator = (
+            getattr(target_model_runner, "hisparse_coordinator", None)
+            if target_model_runner is not None
+            else getattr(draft_model_runner, "hisparse_coordinator", None)
+        )
+        token_to_kv_pool_allocator = (
+            getattr(target_model_runner, "token_to_kv_pool_allocator", None)
+            if target_model_runner is not None
+            else getattr(draft_model_runner, "token_to_kv_pool_allocator", None)
+        )
+        if (
+            hisparse_coordinator is not None
+            and token_to_kv_pool_allocator is not None
+            and hasattr(token_to_kv_pool_allocator, "bind_device_mapping")
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and not batch.forward_mode.is_idle()
+        ):
+            bs = len(batch.req_pool_indices)
+            tokens_per_req_cpu = torch.full(
+                (bs,), num_draft_tokens, dtype=torch.int64, device="cpu"
+            )
+            device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                batch.req_pool_indices,
+                tokens_per_req_cpu,
+            )
+            token_to_kv_pool_allocator.bind_device_mapping(
+                batch.out_cache_loc,
+                device_slots,
+            )
+
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
@@ -378,12 +415,22 @@ class EagleVerifyInputV2Mixin:
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation
+        graph_runner = target_worker.model_runner.graph_runner
+        graph_token_shape_matches = True
+        if graph_runner is not None and not batch.forward_mode.is_idle():
+            expected_num_tokens = (
+                verify_forward_batch.batch_size * graph_runner.num_tokens_per_bs
+            )
+            graph_token_shape_matches = (
+                verify_forward_batch.input_ids.numel() == expected_num_tokens
+            )
         can_run_cuda_graph = bool(
-            target_worker.model_runner.graph_runner
-            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+            graph_runner
+            and graph_token_shape_matches
+            and graph_runner.can_run(verify_forward_batch)
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            graph_runner.replay_prepare(verify_forward_batch)
         else:
             if not batch.forward_mode.is_idle():
                 target_worker.model_runner.attn_backend.init_forward_metadata(

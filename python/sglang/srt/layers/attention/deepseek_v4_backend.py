@@ -291,6 +291,7 @@ class DSV4RawVerifyMetadata:
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
+    num_draft_tokens: Optional[int] = None
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -298,6 +299,7 @@ class DSV4RawVerifyMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
         self.extend_seq_lens = other.extend_seq_lens
+        self.num_draft_tokens = other.num_draft_tokens
 
 
 @dataclass
@@ -496,14 +498,25 @@ class DeepseekV4AttnBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
+        num_tokens: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
+        num_draft_tokens = self._get_target_verify_tokens_per_req(
+            len(seq_lens), num_tokens=num_tokens, out_cache_loc=out_cache_loc
+        )
+        out_cache_loc = self._pad_target_verify_out_cache_loc(
+            seq_lens, out_cache_loc, len(seq_lens) * num_draft_tokens
+        )
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            assert out_cache_loc is not None
-            if not hasattr(self, "extend_seq_lens_buffer"):
+            if (
+                not hasattr(self, "extend_seq_lens_buffer")
+                or getattr(self, "extend_seq_lens_buffer_num_draft_tokens", None)
+                != num_draft_tokens
+            ):
                 self.extend_seq_lens_buffer = torch.tensor(
-                    [self.speculative_num_draft_tokens] * 1025, device=self.device
+                    [num_draft_tokens] * 1025, device=self.device
                 )
+                self.extend_seq_lens_buffer_num_draft_tokens = num_draft_tokens
             extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
 
             return DSV4RawVerifyMetadata(
@@ -511,6 +524,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
                 extend_seq_lens=extend_seq_lens,
+                num_draft_tokens=num_draft_tokens,
             )
         else:
             seq_lens_cpu = seq_lens.tolist()
@@ -520,8 +534,51 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
+                num_tokens=num_tokens,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
+
+    def _get_target_verify_tokens_per_req(
+        self,
+        batch_size: int,
+        *,
+        num_tokens: Optional[int] = None,
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ) -> int:
+        if batch_size == 0:
+            return self.speculative_num_draft_tokens
+
+        if num_tokens is None:
+            if out_cache_loc is None:
+                return self.speculative_num_draft_tokens
+            num_tokens = out_cache_loc.numel()
+
+        if num_tokens % batch_size != 0:
+            raise RuntimeError(
+                "DeepSeekV4 target-verify metadata requires a uniform token count: "
+                f"{num_tokens=} {batch_size=} "
+                f"out_cache_loc_shape={None if out_cache_loc is None else tuple(out_cache_loc.shape)}"
+            )
+        return num_tokens // batch_size
+
+    def _pad_target_verify_out_cache_loc(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: Optional[torch.Tensor],
+        num_tokens: int,
+    ) -> torch.Tensor:
+        if out_cache_loc is None:
+            return seq_lens.new_zeros(num_tokens)
+        if out_cache_loc.numel() == num_tokens:
+            return out_cache_loc
+        if out_cache_loc.numel() > num_tokens:
+            return out_cache_loc[:num_tokens]
+        return torch.nn.functional.pad(
+            out_cache_loc,
+            pad=(0, num_tokens - out_cache_loc.numel()),
+            mode="constant",
+            value=0,
+        )
 
     def init_forward_metadata_target_verify_old(
         self,
@@ -530,16 +587,21 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
+        num_tokens: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
-        seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+        num_draft_tokens = self._get_target_verify_tokens_per_req(
+            batch_size, num_tokens=num_tokens, out_cache_loc=out_cache_loc
+        )
+        seq_lens = seq_lens + num_draft_tokens
+        seq_lens_cpu = [x + num_draft_tokens for x in seq_lens_cpu]
+        extend_seq_lens_cpu = [num_draft_tokens] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
-        num_tokens = self.speculative_num_draft_tokens * batch_size
-        if out_cache_loc is None:
-            out_cache_loc = seq_lens.new_zeros(num_tokens)
+        num_tokens = num_draft_tokens * batch_size
+        out_cache_loc = self._pad_target_verify_out_cache_loc(
+            seq_lens, out_cache_loc, num_tokens
+        )
         return self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -560,9 +622,19 @@ class DeepseekV4AttnBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
+        bs = len(seq_lens)
+        if raw_metadata.num_draft_tokens is not None:
+            num_draft_tokens = raw_metadata.num_draft_tokens
+        else:
+            num_draft_tokens = self._get_target_verify_tokens_per_req(
+                bs, out_cache_loc=out_cache_loc
+            )
+        seq_lens = seq_lens + num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
+        num_tokens = bs * num_draft_tokens
+        out_cache_loc = self._pad_target_verify_out_cache_loc(
+            seq_lens, out_cache_loc, num_tokens
+        )
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
@@ -589,7 +661,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=None,
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
-            num_q_tokens=num_draft_tokens * bs,
+            num_q_tokens=num_tokens,
         )
         return DSV4Metadata(
             core_attn_metadata,
@@ -681,11 +753,17 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
+            num_tokens = (
+                forward_batch.input_ids.numel()
+                if forward_batch.input_ids is not None
+                else None
+            )
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
+                num_tokens=num_tokens,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -1216,6 +1294,10 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         )
     
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_target_verify():
+            super().init_forward_metadata(forward_batch)
+            return
+
         original_out_cache_loc = forward_batch.out_cache_loc
         draft_cache_locs = getattr(forward_batch.spec_info, "draft_cache_locs", None)
         selected_out_cache_loc = original_out_cache_loc

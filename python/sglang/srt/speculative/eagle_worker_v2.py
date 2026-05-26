@@ -168,6 +168,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # HiSparse request admission and side-buffer state live on the target
+        # runner. Draft-extend reuses that coordinator when binding speculative
+        # cache locs to device slots.
+        self.draft_runner._target_model_runner = self.target_worker.model_runner
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -1040,7 +1044,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
@@ -1083,6 +1087,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             and not batch.forward_mode.is_idle()
         ):
             accept_index_flat = accept_index[accept_index != -1]
+            if accept_index_flat.numel() > batch.out_cache_loc.numel():
+                raise RuntimeError(
+                    "EAGLE HiSparse accepted-token bookkeeping mismatch: "
+                    f"{accept_index_flat.numel()} accepted indices for "
+                    f"{batch.out_cache_loc.numel()} draft cache locs."
+                )
             num_correct_drafts = accept_lens - 1
             hisparse_coordinator.finalize_accepted_tokens(
                 batch.req_pool_indices,
