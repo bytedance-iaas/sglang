@@ -587,6 +587,160 @@ def _get_chunked_embedding_by_item(
     return torch.cat(chunk_slices, dim=0)
 
 
+def _get_item_feature_dim0(item: MultimodalDataItem) -> int:
+    shape = getattr(item.feature, "shape", None)
+    if shape is None or len(shape) == 0:
+        return 1
+    return max(int(shape[0]), 1)
+
+
+def _partition_miss_items_by_feature_size(
+    miss_items: List[Tuple[int, int, MultimodalDataItem, int, int]],
+    infer_times: int,
+) -> List[List[Tuple[int, int, MultimodalDataItem, int, int]]]:
+    if not miss_items:
+        return []
+
+    if len(miss_items) <= 1:
+        return [miss_items]
+
+    num_partitions = min(max(infer_times, 1), len(miss_items))
+    if num_partitions == 1:
+        return [miss_items]
+
+    total_size = sum(_get_item_feature_dim0(item) for _, _, item, _, _ in miss_items)
+    target_size = total_size / num_partitions
+
+    partitions = []
+    cur_partition = []
+    cur_size = 0
+
+    for idx, miss_item in enumerate(miss_items):
+        _, _, item, _, _ = miss_item
+        item_size = _get_item_feature_dim0(item)
+
+        remaining_items = len(miss_items) - idx
+        remaining_partitions = num_partitions - len(partitions)
+        if cur_partition and remaining_items == remaining_partitions:
+            partitions.append(cur_partition)
+            cur_partition = []
+            cur_size = 0
+        elif cur_partition and len(partitions) < num_partitions - 1:
+            size_with_item = cur_size + item_size
+            if cur_size >= target_size or abs(target_size - cur_size) <= abs(
+                target_size - size_with_item
+            ):
+                partitions.append(cur_partition)
+                cur_partition = []
+                cur_size = 0
+
+        cur_partition.append(miss_item)
+        cur_size += item_size
+
+    if cur_partition:
+        partitions.append(cur_partition)
+
+    return partitions
+
+
+def _get_chunked_embedding_by_item_packed(
+    data_embedding_func: DataEmbeddingFunc,
+    per_image_reqs: List[
+        Tuple[
+            List[MultimodalDataItem],
+            List[Tuple[int, int]],
+            int,
+            int,
+        ]
+    ],
+    infer_times: int,
+    device: torch.device,
+) -> List[Optional[torch.Tensor]]:
+    req_states = []
+    miss_items = []
+
+    for req_idx, (
+        embedding_items_per_req,
+        items_offset,
+        extend_prefix_len,
+        extend_seq_len,
+    ) in enumerate(per_image_reqs):
+        chunk_start = extend_prefix_len
+        chunk_end = extend_prefix_len + extend_seq_len
+
+        if extend_seq_len <= 0:
+            req_states.append(None)
+            continue
+
+        overlapping = []
+        for item_idx, (item, offset) in enumerate(
+            zip(embedding_items_per_req, items_offset)
+        ):
+            start, end = offset
+            if end >= chunk_start and start < chunk_end:
+                overlapping.append((item_idx, item, start, end))
+
+        if not overlapping:
+            req_states.append(None)
+            continue
+
+        cached_embeddings = {}
+        for item_idx, item, start, end in overlapping:
+            cached = embedding_cache.get_single(item.hash)
+            if cached is not None:
+                cached_embeddings[item_idx] = cached.embedding
+            else:
+                miss_items.append((req_idx, item_idx, item, start, end))
+
+        req_states.append(
+            {
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "overlapping": overlapping,
+                "cached_embeddings": cached_embeddings,
+            }
+        )
+
+    for partition in _partition_miss_items_by_feature_size(miss_items, infer_times):
+        miss_item_list = [item for _, _, item, _, _ in partition]
+        _move_items_to_device(miss_item_list, device)
+        all_miss_embedding = data_embedding_func(miss_item_list)
+        all_miss_embedding = all_miss_embedding.reshape(
+            -1, all_miss_embedding.shape[-1]
+        )
+
+        token_counts = [end - start + 1 for _, _, _, start, end in partition]
+        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+
+        for (req_idx, item_idx, item, _, _), emb in zip(partition, split_embeddings):
+            req_states[req_idx]["cached_embeddings"][item_idx] = emb
+            emb_result = EmbeddingResult(embedding=emb)
+            embedding_cache.set(item.hash, emb_result)
+
+    chunk_embeddings = []
+    for state in req_states:
+        if state is None:
+            chunk_embeddings.append(None)
+            continue
+
+        chunk_start = state["chunk_start"]
+        chunk_end = state["chunk_end"]
+        cached_embeddings = state["cached_embeddings"]
+        chunk_slices = []
+
+        for item_idx, _, start, end in state["overlapping"]:
+            emb = cached_embeddings[item_idx]
+            overlap_start = max(start, chunk_start)
+            overlap_end = min(end, chunk_end - 1)
+            local_start = overlap_start - start
+            local_end = overlap_end - start + 1
+            chunk_slices.append(emb[local_start:local_end])
+
+        chunk_embeddings.append(torch.cat(chunk_slices, dim=0))
+
+    return chunk_embeddings
+
+
 def _get_chunked_prefill_embedding(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -602,6 +756,44 @@ def _get_chunked_prefill_embedding(
     """
     embedding_list = []
     device = input_ids.device
+    vit_pack = envs.SGLANG_VIT_PACK.get()
+    vit_infer_times = max(envs.SGLANG_VIT_INFER_TIMES.get(), 1)
+    packed_per_image_reqs = []
+
+    def flush_packed_per_image_reqs():
+        if not packed_per_image_reqs:
+            return
+        if len(packed_per_image_reqs) == 1:
+            (
+                embedding_items_per_req,
+                items_offset,
+                extend_prefix_len,
+                extend_seq_len,
+            ) = packed_per_image_reqs[0]
+            chunk_embedding = _get_chunked_embedding_by_item(
+                data_embedding_func,
+                embedding_items_per_req,
+                items_offset,
+                extend_prefix_len,
+                extend_seq_len,
+                device,
+            )
+            if chunk_embedding is not None:
+                embedding_list.append(chunk_embedding)
+            packed_per_image_reqs.clear()
+            return
+
+        chunk_embeddings = _get_chunked_embedding_by_item_packed(
+            data_embedding_func,
+            packed_per_image_reqs,
+            vit_infer_times,
+            device,
+        )
+        for chunk_embedding in chunk_embeddings:
+            if chunk_embedding is not None:
+                embedding_list.append(chunk_embedding)
+        packed_per_image_reqs.clear()
+
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
@@ -625,17 +817,28 @@ def _get_chunked_prefill_embedding(
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
 
         if is_per_image:
-            chunk_embedding = _get_chunked_embedding_by_item(
-                data_embedding_func,
-                embedding_items_per_req,
-                items_offset,
-                extend_prefix_len,
-                extend_seq_len,
-                device,
-            )
-            if chunk_embedding is not None:
-                embedding_list.append(chunk_embedding)
+            if vit_pack:
+                packed_per_image_reqs.append(
+                    (
+                        embedding_items_per_req,
+                        items_offset,
+                        extend_prefix_len,
+                        extend_seq_len,
+                    )
+                )
+            else:
+                chunk_embedding = _get_chunked_embedding_by_item(
+                    data_embedding_func,
+                    embedding_items_per_req,
+                    items_offset,
+                    extend_prefix_len,
+                    extend_seq_len,
+                    device,
+                )
+                if chunk_embedding is not None:
+                    embedding_list.append(chunk_embedding)
         else:
+            flush_packed_per_image_reqs()
             chunk_embedding, input_ids = _get_chunked_embedding_full(
                 data_embedding_func,
                 embedding_items_per_req,
@@ -647,6 +850,8 @@ def _get_chunked_prefill_embedding(
             )
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
+
+    flush_packed_per_image_reqs()
 
     if len(embedding_list) == 0:
         return None, input_ids
@@ -995,6 +1200,9 @@ def general_mm_embed_routine(
     data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    extra_lm_kwargs_fn: Optional[
+        Callable[[Optional[torch.Tensor], ForwardBatch, Dict[str, Any]], Dict[str, Any]]
+    ] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -1007,6 +1215,15 @@ def general_mm_embed_routine(
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
+        extra_lm_kwargs_fn: Optional hook that the outer multimodal model can
+            supply to inject / normalize extra kwargs before they are forwarded
+            to ``language_model``. Receives ``(input_embeds, forward_batch,
+            kwargs)`` and must return the (possibly modified) ``kwargs`` dict.
+            This lets a model like Qwen3-VL guarantee that an
+            ``Optional[Tensor]`` kwarg (e.g. ``input_deepstack_embeds``) is
+            *always* present as a Tensor — including on pure-text requests —
+            so that dynamo's guard built during piecewise cuda-graph warmup
+            keeps matching at runtime and no recompile is triggered.
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -1102,6 +1319,14 @@ def general_mm_embed_routine(
             input_embeds = forward_batch.input_embeds
     else:
         input_embeds = None
+
+    # Allow the outer multimodal model (e.g. Qwen3-VL) to normalize the kwargs
+    # passed into the language_model. This is how Qwen3-VL ensures that
+    # ``input_deepstack_embeds`` is always a Tensor — real feature tensor on
+    # multimodal requests, zero-filled dummy on pure-text — so dynamo's guard
+    # built during piecewise cuda-graph warmup keeps matching at runtime.
+    if extra_lm_kwargs_fn is not None:
+        kwargs = extra_lm_kwargs_fn(input_embeds, forward_batch, kwargs)
 
     hidden_states = language_model(
         input_ids=None,
