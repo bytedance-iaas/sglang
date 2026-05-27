@@ -1076,6 +1076,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._mamba_verify_update(
                 batch, verify_input, accept_lens, accept_index, bs
             )
+        
+        self.target_worker.model_runner.attn_backend.update_online_c128_state_after_mtp_verify(
+            accept_lens=accept_lens,
+            model=self.target_worker.model_runner.model,
+        )
+
+        verify_done = torch.get_device_module(self.device).Event()
+        verify_done.record()
 
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
