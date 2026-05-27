@@ -39,7 +39,110 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
+class HiSparseStagingBackup(NamedTuple):
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+
+
+class DSV4C4PrefixCache:
+    """Host-prefix cache for DSV4 C4 slots.
+
+    The cache key is the full-token prefix, while the value is the compressed
+    C4 host-slot list. This deliberately does not model full KV prefix-cache
+    semantics: a C4 hit can skip C4 host backup/allocation, but it cannot skip
+    prefill compute by itself.
+    """
+
+    def __init__(self, compress_ratio: int, device: str):
+        self.compress_ratio = compress_ratio
+        self.device = device
+        self.enabled = False
+        self.cache: Dict[Tuple[Optional[str], Tuple[int, ...]], torch.Tensor] = {}
+
+    def enable(self) -> None:
+        self.enabled = True
+
+    def full_token_len(self, c4_len: int) -> int:
+        return c4_len * self.compress_ratio
+
+    def key(self, req: Req, c4_len: int) -> Tuple[Optional[str], Tuple[int, ...]]:
+        full_len = min(len(req.fill_ids), self.full_token_len(c4_len))
+        return (req.extra_key, tuple(req.fill_ids[:full_len]))
+
+    def contains(self, req: Req, c4_len: int) -> bool:
+        return self.enabled and c4_len > 0 and self.key(req, c4_len) in self.cache
+
+    def match(
+        self, req: Req, c4_len: int
+    ) -> Tuple[int, Optional[Tuple[Optional[str], Tuple[int, ...]]], torch.Tensor]:
+        if not self.enabled or c4_len <= 0:
+            return 0, None, torch.empty(0, dtype=torch.int64, device=self.device)
+
+        req_token_len = min(len(req.fill_ids), self.full_token_len(c4_len))
+        req_tokens = tuple(req.fill_ids[:req_token_len])
+        best_key = None
+        best_indices = None
+        best_c4_len = 0
+        for key, host_indices in self.cache.items():
+            extra_key, token_key = key
+            if extra_key != req.extra_key:
+                continue
+            candidate_c4_len = min(len(host_indices), c4_len)
+            candidate_full_len = self.full_token_len(candidate_c4_len)
+            if (
+                candidate_c4_len > best_c4_len
+                and candidate_full_len <= len(req_tokens)
+                and req_tokens[:candidate_full_len] == token_key[:candidate_full_len]
+            ):
+                best_key = key
+                best_indices = host_indices[:candidate_c4_len]
+                best_c4_len = candidate_c4_len
+
+        if best_indices is None:
+            return 0, None, torch.empty(0, dtype=torch.int64, device=self.device)
+        return best_c4_len, best_key, best_indices.to(self.device, non_blocking=True)
+
+    def insert(
+        self,
+        req: Req,
+        c4_len: int,
+        req_to_host_pool: torch.Tensor,
+    ) -> bool:
+        if not self.enabled or c4_len <= 0:
+            return False
+
+        key = self.key(req, c4_len)
+        if key in self.cache:
+            return True
+
+        host_indices = req_to_host_pool[req.req_pool_idx, :c4_len]
+        if host_indices.numel() != c4_len or torch.any(host_indices < 0):
+            logger.warning(
+                "Skip DSV4 C4 host-prefix insert for req %s: "
+                "c4_len=%d has missing host slots.",
+                req.rid,
+                c4_len,
+            )
+            return False
+
+        self.cache[key] = host_indices.detach().clone()
+        logger.debug(
+            "DSV4 C4 host-prefix cache insert: req=%s c4_len=%d full_tokens=%d",
+            req.rid,
+            c4_len,
+            len(key[1]),
+        )
+        return True
+
+
 class HiSparseCoordinator:
+    """Coordinates HiSparse-only KV movement and side buffers.
+
+    The non-HiSparse path never enters this coordinator. Within HiSparse, generic
+    staging/release helpers keep the common path separate from DSV4 C4 prefix
+    reuse and EAGLE/MTP draft-slot handling.
+    """
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -171,15 +274,11 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
-        # DSV4 C4 host-prefix cache. This is intentionally separate from the
-        # scheduler radix cache: C4 hits are not sufficient to skip prefill
-        # compute, but they can avoid repeated C4 host backup/allocation.
-        self._c4_host_prefix_cache_enabled = False
-        self._c4_host_prefix_cache: Dict[
-            Tuple[Optional[str], Tuple[int, ...]], torch.Tensor
-        ] = {}
+        self._c4_prefix_cache = DSV4C4PrefixCache(self.compress_ratio, device)
         self._req_c4_prefix_len: Dict[int, int] = {}
         self._req_c4_written_len: Dict[int, int] = {}
+
+    # ---- DSV4 C4 prefix-cache integration ----
 
     def enable_c4_host_prefix_cache(self) -> bool:
         if not self.is_dsv4_hisparse:
@@ -187,80 +286,76 @@ class HiSparseCoordinator:
                 "HiSparse C4 host-prefix cache is only supported for DeepSeek V4."
             )
             return False
-        self._c4_host_prefix_cache_enabled = True
+        self._c4_prefix_cache.enable()
         logger.warning(
             "Enabled DeepSeek V4 HiSparse C4 host-prefix cache. "
             "This does not enable normal scheduler radix matching."
         )
         return True
 
-    def _c4_cache_full_token_len(self, c4_len: int) -> int:
-        return c4_len * self.compress_ratio
-
-    def _c4_cache_key(
-        self, req: Req, c4_len: int
-    ) -> Tuple[Optional[str], Tuple[int, ...]]:
-        full_len = min(len(req.fill_ids), self._c4_cache_full_token_len(c4_len))
-        return (req.extra_key, tuple(req.fill_ids[:full_len]))
-
     def _match_c4_host_prefix(
         self, req: Req, c4_len: int
     ) -> Tuple[int, Optional[Tuple[Optional[str], Tuple[int, ...]]], torch.Tensor]:
-        if not self._c4_host_prefix_cache_enabled or c4_len <= 0:
-            return 0, None, torch.empty(0, dtype=torch.int64, device=self.device)
-
-        req_token_len = min(
-            len(req.fill_ids), self._c4_cache_full_token_len(c4_len)
-        )
-        req_tokens = tuple(req.fill_ids[:req_token_len])
-        best_key = None
-        best_indices = None
-        best_c4_len = 0
-        for key, host_indices in self._c4_host_prefix_cache.items():
-            extra_key, token_key = key
-            if extra_key != req.extra_key:
-                continue
-            candidate_c4_len = min(len(host_indices), c4_len)
-            candidate_full_len = self._c4_cache_full_token_len(candidate_c4_len)
-            if (
-                candidate_c4_len > best_c4_len
-                and candidate_full_len <= len(req_tokens)
-                and req_tokens[:candidate_full_len] == token_key[:candidate_full_len]
-            ):
-                best_key = key
-                best_indices = host_indices[:candidate_c4_len]
-                best_c4_len = candidate_c4_len
-
-        if best_indices is None:
-            return 0, None, torch.empty(0, dtype=torch.int64, device=self.device)
-        return best_c4_len, best_key, best_indices.to(self.device, non_blocking=True)
+        return self._c4_prefix_cache.match(req, c4_len)
 
     def _insert_c4_host_prefix(self, req: Req, c4_len: int) -> bool:
-        if not self._c4_host_prefix_cache_enabled or c4_len <= 0:
-            return False
+        return self._c4_prefix_cache.insert(req, c4_len, self.req_to_host_pool)
 
-        key = self._c4_cache_key(req, c4_len)
-        if key in self._c4_host_prefix_cache:
-            return True
+    def _prepare_staging_backup(
+        self, req: Req, device_indices: torch.Tensor
+    ) -> HiSparseStagingBackup:
+        if self.is_dsv4_hisparse:
+            return self._prepare_dsv4_c4_staging_backup(req, device_indices)
 
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :c4_len]
-        if host_indices.numel() != c4_len or torch.any(host_indices < 0):
-            logger.warning(
-                "Skip DSV4 C4 host-prefix insert for req %s: "
-                "c4_len=%d has missing host slots.",
-                req.rid,
-                c4_len,
-            )
-            return False
-
-        self._c4_host_prefix_cache[key] = host_indices.detach().clone()
-        logger.debug(
-            "DSV4 C4 host-prefix cache insert: req=%s c4_len=%d full_tokens=%d",
-            req.rid,
-            c4_len,
-            len(key[1]),
+        host_indices = self.ensure_host_slots(
+            req.req_pool_idx, 0, len(device_indices)
         )
-        return True
+        return HiSparseStagingBackup(host_indices, device_indices)
+
+    def _prepare_dsv4_c4_staging_backup(
+        self, req: Req, device_indices: torch.Tensor
+    ) -> HiSparseStagingBackup:
+        prefill_len = len(device_indices)
+        prefix_len, _, prefix_host_indices = self._match_c4_host_prefix(
+            req, prefill_len
+        )
+        if prefix_len > 0:
+            self.req_to_host_pool[req.req_pool_idx, :prefix_len] = (
+                prefix_host_indices[:prefix_len]
+            )
+            logger.debug(
+                "DSV4 C4 host-prefix hit: req=%s c4_prefix_len=%d c4_total_len=%d",
+                req.rid,
+                prefix_len,
+                prefill_len,
+            )
+
+        suffix_len = prefill_len - prefix_len
+        host_indices = (
+            self.ensure_host_slots(req.req_pool_idx, prefix_len, suffix_len)
+            if suffix_len > 0
+            else torch.empty((0,), dtype=torch.int64, device=self.device)
+        )
+        self._req_c4_prefix_len[req.req_pool_idx] = prefix_len
+        self._req_c4_written_len[req.req_pool_idx] = prefill_len
+        return HiSparseStagingBackup(host_indices, device_indices[prefix_len:])
+
+    def _release_host_slots(self, req: Req) -> None:
+        if self.is_dsv4_hisparse:
+            self._release_or_cache_dsv4_c4_host_slots(req)
+        else:
+            self._free_request_host_indices_from(req, 0)
+
+    def _release_or_cache_dsv4_c4_host_slots(self, req: Req) -> None:
+        written_len = self._req_c4_written_len.get(req.req_pool_idx, 0)
+        key_already_cached = self._c4_prefix_cache.contains(req, written_len)
+        cached = self._insert_c4_host_prefix(req, written_len)
+        keep_host_len = (
+            written_len
+            if cached and not key_already_cached
+            else self._req_c4_prefix_len.get(req.req_pool_idx, 0)
+        )
+        self._free_request_host_indices_from(req, keep_host_len)
 
     def _free_request_host_indices_from(self, req: Req, start_pos: int) -> None:
         host_len = min(
@@ -279,6 +374,8 @@ class HiSparseCoordinator:
 
     def _round_up_to_host_page(self, size: int) -> int:
         return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    # ---- Host slots and staging ----
 
     def ensure_host_slots(
         self,
@@ -372,48 +469,25 @@ class HiSparseCoordinator:
             )
         )
 
-        prefill_len = len(device_indices)
-        prefix_len, _, prefix_host_indices = self._match_c4_host_prefix(
-            req, prefill_len
-        )
-        if prefix_len > 0:
-            self.req_to_host_pool[req.req_pool_idx, :prefix_len] = (
-                prefix_host_indices[:prefix_len]
-            )
-            logger.debug(
-                "DSV4 C4 host-prefix hit: req=%s c4_prefix_len=%d c4_total_len=%d",
-                req.rid,
-                prefix_len,
-                prefill_len,
-            )
-
-        suffix_len = prefill_len - prefix_len
-        host_indices = (
-            self.ensure_host_slots(req.req_pool_idx, prefix_len, suffix_len)
-            if suffix_len > 0
-            else torch.empty((0,), dtype=torch.int64, device=self.device)
-        )
-        device_indices = device_indices[prefix_len:]
-        self._req_c4_prefix_len[req.req_pool_idx] = prefix_len
-        self._req_c4_written_len[req.req_pool_idx] = prefill_len
+        backup = self._prepare_staging_backup(req, device_indices)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
         start_event.record()
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
-            if suffix_len > 0:
+            if backup.host_indices.numel() > 0:
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device,
-                    host_indices,
-                    device_indices,
+                    backup.host_indices,
+                    backup.device_indices,
                     io_backend="kernel",
                 )
             finish_event.record()
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_staging_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_staging_stream)
+            if backup.host_indices.is_cuda:
+                backup.host_indices.record_stream(self.write_staging_stream)
+            if backup.device_indices.is_cuda:
+                backup.device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
@@ -816,8 +890,37 @@ class HiSparseCoordinator:
         event.record(self.decode_backup_stream)
         producer_stream.wait_event(event)
 
+    def _free_device_buffer_slots(self, req: Req) -> None:
+        current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+        draft_cap = int(self.req_draft_buffer_size[req.req_pool_idx])
+        if current_cap > 0:
+            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
+        else:
+            side_buf_hi = torch.empty(0, dtype=torch.int64, device=self.device)
+        if draft_cap > 0:
+            draft_start = self.device_buffer_size + 1
+            draft_end = draft_start + draft_cap
+            draft_buf_hi = self.req_to_device_buffer[
+                req.req_pool_idx, draft_start:draft_end
+            ]
+            all_hi = torch.unique(
+                torch.cat(
+                    [
+                        side_buf_hi[side_buf_hi > 0],
+                        draft_buf_hi[draft_buf_hi > 0],
+                    ]
+                )
+            )
+        else:
+            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
+
+        if (current_cap > 0 or draft_cap > 0) and all_hi.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+
     def supports_hisparse_draft_slots(self) -> bool:
         return True
+
+    # ---- EAGLE/MTP draft slots ----
 
     def _ensure_draft_buffer(
         self, req_pool_indices: torch.Tensor, num_tokens: int
@@ -934,6 +1037,8 @@ class HiSparseCoordinator:
         col_indices = start + pos_in_segment
 
         return self.req_to_device_buffer[row_indices, col_indices]
+
+    # ---- EAGLE/MTP accepted-token finalization ----
 
     def finalize_accepted_tokens(
         self,
@@ -1266,33 +1371,7 @@ class HiSparseCoordinator:
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv_allocated_len
 
-        # release memory -- only free actually-allocated buffer indices
-        current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
-        draft_cap = int(self.req_draft_buffer_size[req.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-        else:
-            side_buf_hi = torch.empty(0, dtype=torch.int64, device=self.device)
-        if draft_cap > 0:
-            draft_start = self.device_buffer_size + 1
-            draft_end = draft_start + draft_cap
-            draft_buf_hi = self.req_to_device_buffer[
-                req.req_pool_idx, draft_start:draft_end
-            ]
-            all_hi = torch.unique(
-                torch.cat(
-                    [
-                        side_buf_hi[side_buf_hi > 0],
-                        draft_buf_hi[draft_buf_hi > 0],
-                    ]
-                )
-            )
-        else:
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-
-        if current_cap > 0 or draft_cap > 0:
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+        self._free_device_buffer_slots(req)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :allocated_len
@@ -1302,22 +1381,7 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        written_len = self._req_c4_written_len.get(req.req_pool_idx, 0)
-        cache_key = (
-            self._c4_cache_key(req, written_len)
-            if self._c4_host_prefix_cache_enabled and written_len > 0
-            else None
-        )
-        key_already_cached = (
-            cache_key is not None and cache_key in self._c4_host_prefix_cache
-        )
-        cached = self._insert_c4_host_prefix(req, written_len)
-        keep_host_len = (
-            written_len
-            if cached and not key_already_cached
-            else self._req_c4_prefix_len.get(req.req_pool_idx, 0)
-        )
-        self._free_request_host_indices_from(req, keep_host_len)
+        self._release_host_slots(req)
 
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
