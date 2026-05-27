@@ -35,7 +35,8 @@ def get_compress_state_ring_size(
     # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
     # is incompatible with speculative decode for now.
     if compress_ratio == 128 and ONLINE_C128:
-        assert not is_speculative, "online c128 does not support MTP"
+        if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+            raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
@@ -562,6 +563,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
             None
         ] * total_L
+        self.temp_online_compress_state_pools: List[Optional[CompressStatePool]] = [
+            None
+        ] * total_L
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
@@ -582,6 +586,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
             )
+
+            if (
+                ratio == 128
+                and ONLINE_C128
+                and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            ):
+                self.temp_online_compress_state_pools[idx] = CompressStatePool(
+                    size=size,
+                    ring_size=1,
+                    overlap=False,
+                    head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    dtype=self.state_dtype,
+                    device=self.device,
+                    enable_memory_saver=enable_memory_saver,
+                    ratio=ratio,
+                    online=True,
+                )
 
             if ratio == 4:
                 self.indexer_compress_state_pools[idx] = CompressStatePool(
@@ -636,6 +657,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert (
             compress_state_pool is not None
         ), "Only c4/c128 layers have attention states."
+        return compress_state_pool
+    
+    def get_temp_attention_compress_states(self, layer_id: int) -> CompressStatePool:
+        self.wait_layer_transfer(layer_id)
+        compress_state_pool = self.temp_online_compress_state_pools[layer_id]
+        assert (
+            compress_state_pool is not None
+        ), "Only experimental online c128 layers have temp attention states."
         return compress_state_pool
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
