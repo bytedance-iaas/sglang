@@ -108,6 +108,13 @@ class CompressorBackendMixin:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        if hasattr(self, "capture_online_c128_verify_inputs"):
+            self.capture_online_c128_verify_inputs(
+                layer_id=layer_id,
+                compressor=compressor,
+                kv_score_input=kv_score_input,
+                forward_batch=forward_batch,
+            )
         state_pool = compressor.get_state_pool(forward_batch)
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
@@ -227,7 +234,6 @@ def _create_online_paged_compressor_data(
     use_prefill_cuda_graph: bool,
     num_q_tokens: Optional[int],
 ) -> CompressMetadata:
-    assert not use_prefill_cuda_graph, "online c128 doesn't support cuda graph"
 
     swa_page_size = int(token_to_kv_pool.swa_page_size)
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
@@ -256,6 +262,7 @@ def _create_online_paged_compressor_data(
             full_to_swa=full_to_swa,
             num_q_tokens=int(num_q_tokens_planner),
             swa_page_size=swa_page_size,
+            use_cuda_graph=use_prefill_cuda_graph,
         )
     else:
         return CompressorDecodePlan.generate_online(
