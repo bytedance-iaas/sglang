@@ -56,6 +56,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/model_info", get(model_info))
         .route("/get_model_info", get(get_model_info))
+        .route("/get_server_info", get(get_server_info))
+        .route("/server_info", get(server_info))
+        .route("/get_weight_version", get(get_weight_version))
+        .route("/weight_version", get(weight_version))
+        .route("/ping", get(sagemaker_health))
+        .route("/get_load", get(get_load))
         .route("/generate", post(generate).put(generate))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/chat/completions", post(v1_chat_completions))
@@ -106,6 +112,46 @@ async fn get_model_info(state: State<Arc<AppState>>) -> Json<ModelInfo> {
          Please use '/model_info' instead."
     );
     model_info(state).await
+}
+
+async fn get_server_info(state: State<Arc<AppState>>) -> Json<serde_json::Value> {
+    log::warn!("Endpoint '/get_server_info' is deprecated and will be removed in a future version. Please use '/server_info' instead.");
+    server_info(state).await
+}
+
+async fn server_info(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "internal_states": [],
+        "version": "unknown", // or retrieve from env
+    }))
+}
+
+async fn get_weight_version() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "detail": "Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead."
+        }))
+    ).into_response()
+}
+
+async fn weight_version() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "detail": "Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead."
+        }))
+    ).into_response()
+}
+
+async fn sagemaker_health() -> Response {
+    Response::new("".into())
+}
+
+async fn get_load(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    log::warn!("Endpoint '/get_load' is deprecated and will be removed in a future version. Please use '/v1/loads' instead.");
+    // In actual implementation, we would query the tokenizer manager / loads
+    Json(serde_json::json!([]))
 }
 
 // ─────────────────────────────── /generate ─────────────────────────────────
