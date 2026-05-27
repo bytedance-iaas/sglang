@@ -344,6 +344,16 @@ class Compressor(nn.Module):
     def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        backend = forward_batch.attn_backend
+        override = None
+        if hasattr(backend, "get_override_compress_state_pool"):
+            override = backend.get_override_compress_state_pool(
+                compressor=self,
+                token_to_kv_pool=token_to_kv_pool,
+                forward_batch=forward_batch,
+            )
+        if override is not None:
+            return override
         if self.is_in_indexer:
             ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
