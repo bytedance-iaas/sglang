@@ -65,79 +65,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/generate", post(generate).put(generate))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/chat/completions", post(v1_chat_completions))
-        .route("/health/generate", get(health_generate).post(health_generate).put(health_generate).delete(health_generate))
-        .route("/get/server/info", get(get_server_info).post(get_server_info).put(get_server_info).delete(get_server_info))
-        .route("/server/info", get(server_info).post(server_info).put(server_info).delete(server_info))
-        .route("/get/weight/version", get(get_weight_version).post(get_weight_version).put(get_weight_version).delete(get_weight_version))
-        .route("/weight/version", get(weight_version).post(weight_version).put(weight_version).delete(weight_version))
-        .route("/encode", get(encode).post(encode).put(encode).delete(encode))
-        .route("/tokenize", get(tokenize).post(tokenize).put(tokenize).delete(tokenize))
-        .route("/v1/tokenize", get(v1_tokenize).post(v1_tokenize).put(v1_tokenize).delete(v1_tokenize))
-        .route("/detokenize", get(detokenize).post(detokenize).put(detokenize).delete(detokenize))
-        .route("/v1/detokenize", get(v1_detokenize).post(v1_detokenize).put(v1_detokenize).delete(v1_detokenize))
-        .route("/v1/embeddings", get(v1_embeddings).post(v1_embeddings).put(v1_embeddings).delete(v1_embeddings))
-        .route("/v1/classify", get(v1_classify).post(v1_classify).put(v1_classify).delete(v1_classify))
-        .route("/classify", get(classify).post(classify).put(classify).delete(classify))
-        .route("/v1/rerank", get(v1_rerank).post(v1_rerank).put(v1_rerank).delete(v1_rerank))
-        .route("/v1/messages", get(v1_messages).post(v1_messages).put(v1_messages).delete(v1_messages))
-        .route("/v1/messages/count/tokens", get(v1_messages_count_tokens).post(v1_messages_count_tokens).put(v1_messages_count_tokens).delete(v1_messages_count_tokens))
-        .route("/get/load", get(get_load).post(get_load).put(get_load).delete(get_load))
-        .route("/ping", get(ping).post(ping).put(ping).delete(ping))
-        .route("/v1/models/model", get(v1_models_model).post(v1_models_model).put(v1_models_model).delete(v1_models_model))
-        .route("/vertex/generate", get(vertex_generate).post(vertex_generate).put(vertex_generate).delete(vertex_generate))
-        .route("/invocations", get(invocations).post(invocations).put(invocations).delete(invocations))
-        .route("/api/tags", get(api_tags).post(api_tags).put(api_tags).delete(api_tags))
-        .route("/api/chat", get(api_chat).post(api_chat).put(api_chat).delete(api_chat))
-        .route("/api/generate", get(api_generate).post(api_generate).put(api_generate).delete(api_generate))
-        .route("/api/show", get(api_show).post(api_show).put(api_show).delete(api_show))
-        .route("/", get(root_route).post(root_route).put(root_route).delete(root_route))
-        .route("/abort/request", get(abort_request).post(abort_request).put(abort_request).delete(abort_request))
-        .route("/pause/generation", get(pause_generation).post(pause_generation).put(pause_generation).delete(pause_generation))
-        .route("/continue/generation", get(continue_generation).post(continue_generation).put(continue_generation).delete(continue_generation))
-        .route("/open/session", get(open_session).post(open_session).put(open_session).delete(open_session))
-        .route("/close/session", get(close_session).post(close_session).put(close_session).delete(close_session))
-        .route("/v1/responses", get(v1_responses).post(v1_responses).put(v1_responses).delete(v1_responses))
-        .route("/v1/responses/id", get(v1_responses_id).post(v1_responses_id).put(v1_responses_id).delete(v1_responses_id))
-        .route("/v1/responses/id/cancel", get(v1_responses_id_cancel).post(v1_responses_id_cancel).put(v1_responses_id_cancel).delete(v1_responses_id_cancel))
-        .route("/flush/cache", get(flush_cache).post(flush_cache).put(flush_cache).delete(flush_cache))
-        .route("/set/internal/state", get(set_internal_state).post(set_internal_state).put(set_internal_state).delete(set_internal_state))
-        .route("/add/external/corpus", get(add_external_corpus).post(add_external_corpus).put(add_external_corpus).delete(add_external_corpus))
-        .route("/remove/external/corpus", get(remove_external_corpus).post(remove_external_corpus).put(remove_external_corpus).delete(remove_external_corpus))
-        .route("/list/external/corpora", get(list_external_corpora).post(list_external_corpora).put(list_external_corpora).delete(list_external_corpora))
-        .route("/clear/hicache/storage/backend", get(clear_hicache_storage_backend).post(clear_hicache_storage_backend).put(clear_hicache_storage_backend).delete(clear_hicache_storage_backend))
-        .route("/hicache/storage/backend", get(hicache_storage_backend).post(hicache_storage_backend).put(hicache_storage_backend).delete(hicache_storage_backend))
-        .route("/start/profile", get(start_profile).post(start_profile).put(start_profile).delete(start_profile))
-        .route("/stop/profile", get(stop_profile).post(stop_profile).put(stop_profile).delete(stop_profile))
-        .route("/set/trace/level", get(set_trace_level).post(set_trace_level).put(set_trace_level).delete(set_trace_level))
-        .route("/freeze/gc", get(freeze_gc).post(freeze_gc).put(freeze_gc).delete(freeze_gc))
-        .route("/configure/logging", get(configure_logging).post(configure_logging).put(configure_logging).delete(configure_logging))
-        .route("/dumper", get(dumper).post(dumper).put(dumper).delete(dumper))
-        .route("/start/expert/distribution/record", get(start_expert_distribution_record).post(start_expert_distribution_record).put(start_expert_distribution_record).delete(start_expert_distribution_record))
-        .route("/stop/expert/distribution/record", get(stop_expert_distribution_record).post(stop_expert_distribution_record).put(stop_expert_distribution_record).delete(stop_expert_distribution_record))
-        .route("/dump/expert/distribution/record", get(dump_expert_distribution_record).post(dump_expert_distribution_record).put(dump_expert_distribution_record).delete(dump_expert_distribution_record))
-        .route("/update/weights/from/disk", get(update_weights_from_disk).post(update_weights_from_disk).put(update_weights_from_disk).delete(update_weights_from_disk))
-        .route("/update/weights/from/tensor", get(update_weights_from_tensor).post(update_weights_from_tensor).put(update_weights_from_tensor).delete(update_weights_from_tensor))
-        .route("/update/weight/version", get(update_weight_version).post(update_weight_version).put(update_weight_version).delete(update_weight_version))
-        .route("/update/weights/from/distributed", get(update_weights_from_distributed).post(update_weights_from_distributed).put(update_weights_from_distributed).delete(update_weights_from_distributed))
-        .route("/update/weights/from/ipc", get(update_weights_from_ipc).post(update_weights_from_ipc).put(update_weights_from_ipc).delete(update_weights_from_ipc))
-        .route("/get/weights/by/name", get(get_weights_by_name).post(get_weights_by_name).put(get_weights_by_name).delete(get_weights_by_name))
-        .route("/weights/checker", get(weights_checker).post(weights_checker).put(weights_checker).delete(weights_checker))
-        .route("/init/weights/send/group/for/remote/instance", get(init_weights_send_group_for_remote_instance).post(init_weights_send_group_for_remote_instance).put(init_weights_send_group_for_remote_instance).delete(init_weights_send_group_for_remote_instance))
-        .route("/send/weights/to/remote/instance", get(send_weights_to_remote_instance).post(send_weights_to_remote_instance).put(send_weights_to_remote_instance).delete(send_weights_to_remote_instance))
-        .route("/get/remote/instance/transfer/engine/info", get(get_remote_instance_transfer_engine_info).post(get_remote_instance_transfer_engine_info).put(get_remote_instance_transfer_engine_info).delete(get_remote_instance_transfer_engine_info))
-        .route("/remote/instance/transfer/engine/info", get(remote_instance_transfer_engine_info).post(remote_instance_transfer_engine_info).put(remote_instance_transfer_engine_info).delete(remote_instance_transfer_engine_info))
-        .route("/init/weights/update/group", get(init_weights_update_group).post(init_weights_update_group).put(init_weights_update_group).delete(init_weights_update_group))
-        .route("/destroy/weights/update/group", get(destroy_weights_update_group).post(destroy_weights_update_group).put(destroy_weights_update_group).delete(destroy_weights_update_group))
-        .route("/release/memory/occupation", get(release_memory_occupation).post(release_memory_occupation).put(release_memory_occupation).delete(release_memory_occupation))
-        .route("/resume/memory/occupation", get(resume_memory_occupation).post(resume_memory_occupation).put(resume_memory_occupation).delete(resume_memory_occupation))
-        .route("/slow/down", get(slow_down).post(slow_down).put(slow_down).delete(slow_down))
-        .route("/load/lora/adapter", get(load_lora_adapter).post(load_lora_adapter).put(load_lora_adapter).delete(load_lora_adapter))
-        .route("/load/lora/adapter/from/tensors", get(load_lora_adapter_from_tensors).post(load_lora_adapter_from_tensors).put(load_lora_adapter_from_tensors).delete(load_lora_adapter_from_tensors))
-        .route("/unload/lora/adapter", get(unload_lora_adapter).post(unload_lora_adapter).put(unload_lora_adapter).delete(unload_lora_adapter))
-        .route("/v1/audio/transcriptions", get(v1_audio_transcriptions).post(v1_audio_transcriptions).put(v1_audio_transcriptions).delete(v1_audio_transcriptions))
-        .route("/parse/function/call", get(parse_function_call).post(parse_function_call).put(parse_function_call).delete(parse_function_call))
-        .route("/separate/reasoning", get(separate_reasoning).post(separate_reasoning).put(separate_reasoning).delete(separate_reasoning))
-        .route("/v1/score", get(v1_score).post(v1_score).put(v1_score).delete(v1_score))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -185,6 +112,46 @@ async fn get_model_info(state: State<Arc<AppState>>) -> Json<ModelInfo> {
          Please use '/model_info' instead."
     );
     model_info(state).await
+}
+
+async fn get_server_info(state: State<Arc<AppState>>) -> Json<serde_json::Value> {
+    log::warn!("Endpoint '/get_server_info' is deprecated and will be removed in a future version. Please use '/server_info' instead.");
+    server_info(state).await
+}
+
+async fn server_info(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "internal_states": [],
+        "version": "unknown", // or retrieve from env
+    }))
+}
+
+async fn get_weight_version() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "detail": "Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead."
+        }))
+    ).into_response()
+}
+
+async fn weight_version() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "detail": "Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead."
+        }))
+    ).into_response()
+}
+
+async fn sagemaker_health() -> Response {
+    Response::new("".into())
+}
+
+async fn get_load(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    log::warn!("Endpoint '/get_load' is deprecated and will be removed in a future version. Please use '/v1/loads' instead.");
+    // In actual implementation, we would query the tokenizer manager / loads
+    Json(serde_json::json!([]))
 }
 
 // ─────────────────────────────── /generate ─────────────────────────────────
@@ -698,302 +665,4 @@ pub fn start(config: HttpServerConfig) {
             .await
             .expect("HTTP server error");
     });
-}
-
-async fn health_generate() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn get_server_info() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn server_info() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn get_weight_version() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn weight_version() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn encode() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn tokenize() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_tokenize() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn detokenize() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_detokenize() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_embeddings() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_classify() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn classify() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_rerank() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_messages() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_messages_count_tokens() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn get_load(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    log::warn!("Endpoint '/get_load' is deprecated and will be removed in a future version. Please use '/v1/loads' instead.");
-    // In actual implementation, we would query the tokenizer manager / loads
-    Json(serde_json::json!([]))
-}
-
-async fn ping() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_models_model() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn vertex_generate() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn invocations() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn api_tags() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn api_chat() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn api_generate() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn api_show() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn root_route() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn abort_request() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn pause_generation() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn continue_generation() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn open_session() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn close_session() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_responses() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_responses_id() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_responses_id_cancel() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn flush_cache() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn set_internal_state() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn add_external_corpus() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn remove_external_corpus() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn list_external_corpora() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn clear_hicache_storage_backend() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn hicache_storage_backend() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn start_profile() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn stop_profile() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn set_trace_level() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn freeze_gc() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn configure_logging() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn dumper() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn start_expert_distribution_record() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn stop_expert_distribution_record() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn dump_expert_distribution_record() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn update_weights_from_disk() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn update_weights_from_tensor() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn update_weight_version() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn update_weights_from_distributed() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn update_weights_from_ipc() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn get_weights_by_name() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn weights_checker() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn init_weights_send_group_for_remote_instance() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn send_weights_to_remote_instance() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn get_remote_instance_transfer_engine_info() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn remote_instance_transfer_engine_info() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn init_weights_update_group() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn destroy_weights_update_group() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn release_memory_occupation() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn resume_memory_occupation() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn slow_down() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn load_lora_adapter() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn load_lora_adapter_from_tensors() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn unload_lora_adapter() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_audio_transcriptions() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn parse_function_call() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn separate_reasoning() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn v1_score() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"error": "Not implemented yet"}))
-}
-
-async fn sagemaker_health() -> Response {
-    Response::new("".into())
 }
