@@ -448,11 +448,15 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            self.enable_hisparse_c4_prefix_cache = (
+                self.hisparse_coordinator.enable_c4_host_prefix_cache()
+            )
+        else:
+            self.enable_hisparse_c4_prefix_cache = False
 
         if (
             self.server_args.disaggregation_mode == "decode"
