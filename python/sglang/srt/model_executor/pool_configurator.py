@@ -357,10 +357,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # would need rollback / replay across draft and verify, which the
         # online path doesn't support yet.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            assert (
-                mr.spec_algorithm.is_none()
-            ), "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode (MTP) yet"
-            logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
+            allow_experimental_online_c128_mtp = (
+                envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+                and mr.spec_algorithm.is_eagle()
+                #and mr.server_args.speculative_eagle_topk == 1
+            )
+            assert mr.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
+                "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
+                "(MTP) yet, except the experimental EAGLE topk=1 path gated by "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+            )
+            if allow_experimental_online_c128_mtp:
+                logger.warning(
+                    "DSV4 compressed attention: experimental online c128 + MTP enabled "
+                    "(EAGLE topk=1 only). Validate correctness carefully."
+                )
+            else:
+                logger.info(
+                    "DSV4 compressed attention: online c128 enabled (ring_size=1)"
+                )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
