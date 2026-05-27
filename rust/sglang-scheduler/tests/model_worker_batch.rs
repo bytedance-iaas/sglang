@@ -214,6 +214,47 @@ fn wire_dtypes_match_python_expectations() {
 }
 
 #[test]
+fn dp_attn_fields_are_none_for_single_dp() {
+    // Wire-contract regression: single-DP batches MUST send None for
+    // `global_num_tokens`, `global_num_tokens_for_logprob`, and
+    // `global_forward_mode`.  Sending `Some(...)` makes the worker
+    // enter `prepare_mlp_sync_batch` (model_runner.py:3284), whose
+    // padding arithmetic blows up the MoE input tensor — observed as
+    // `m_numtopk = 1162344 > MAX_TOKENS_PER_EXPERT (65536)` in the
+    // `cutlass_moe_fp4` assertion.  Python's `CpuScheduler` only
+    // populates these when `require_mlp_sync` is true.
+    use std::sync::{Arc, RwLock};
+    use sglang_scheduler::memory::ReqToTokenPool;
+    use sglang_scheduler::types::{ForwardMode, Req, SamplingParams, ScheduleBatch};
+
+    let mut batch = ScheduleBatch::new(ForwardMode::Extend);
+    let mut sp = SamplingParams::default();
+    sp.max_new_tokens = 4;
+    let r = Req::new("rid".into(), vec![10, 20, 30], sp);
+    batch.reqs.push(Arc::new(RwLock::new(r)));
+    batch.req_pool_indices.push(1);
+    batch.seq_lens.push(3);
+    batch.orig_seq_lens.push(3);
+    batch.input_ids = vec![10, 20, 30];
+
+    let pool = ReqToTokenPool::new(8, 64);
+    let payload = batch.to_model_worker_batch_payload(32000, "cuda:0", Some(&pool));
+
+    assert!(
+        payload.global_num_tokens.is_none(),
+        "global_num_tokens MUST be None for single-DP — see model_runner.py:3284"
+    );
+    assert!(
+        payload.global_num_tokens_for_logprob.is_none(),
+        "global_num_tokens_for_logprob MUST be None for single-DP"
+    );
+    assert!(
+        payload.global_forward_mode.is_none(),
+        "global_forward_mode MUST be None for single-DP"
+    );
+}
+
+#[test]
 fn capture_hidden_mode_full_when_any_req_returns_hidden_states() {
     use std::sync::{Arc, RwLock};
     use sglang_scheduler::types::{ForwardMode, Req, SamplingParams, ScheduleBatch};

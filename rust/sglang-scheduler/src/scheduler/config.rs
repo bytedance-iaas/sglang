@@ -53,6 +53,13 @@ pub struct SchedulerConfig {
     /// smoke mode also leaves it empty).
     #[pyo3(get, set)]
     pub detokenizer_ipc: String,
+
+    /// Disable the radix prefix cache and fall back to the
+    /// `ChunkedCache` semantics — no prefix matching, no cross-req
+    /// KV sharing.  Mirrors Python's `--disable-radix-cache`.  Also
+    /// settable via the `SGLANG_DISABLE_RADIX_CACHE=1` env var.
+    #[pyo3(get, set)]
+    pub disable_radix_cache: bool,
 }
 
 #[pymethods]
@@ -68,12 +75,14 @@ impl SchedulerConfig {
         worker_ipcs = None,
         tokenizer_ipc = String::new(),
         detokenizer_ipc = String::new(),
+        disable_radix_cache = false,
     ))]
     fn new(
         worker_ipc: Option<String>,
         worker_ipcs: Option<Vec<String>>,
         tokenizer_ipc: String,
         detokenizer_ipc: String,
+        disable_radix_cache: bool,
     ) -> PyResult<Self> {
         let ipcs = match (worker_ipc, worker_ipcs) {
             (Some(_), Some(_)) => {
@@ -98,13 +107,14 @@ impl SchedulerConfig {
             worker_ipcs: ipcs,
             tokenizer_ipc,
             detokenizer_ipc,
+            disable_radix_cache,
         })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "SchedulerConfig(worker_ipcs={:?}, tokenizer_ipc={:?}, detokenizer_ipc={:?})",
-            self.worker_ipcs, self.tokenizer_ipc, self.detokenizer_ipc,
+            "SchedulerConfig(worker_ipcs={:?}, tokenizer_ipc={:?}, detokenizer_ipc={:?}, disable_radix_cache={})",
+            self.worker_ipcs, self.tokenizer_ipc, self.detokenizer_ipc, self.disable_radix_cache,
         )
     }
 }
@@ -115,6 +125,7 @@ impl Default for SchedulerConfig {
             worker_ipcs: Vec::new(),
             tokenizer_ipc: String::new(),
             detokenizer_ipc: String::new(),
+            disable_radix_cache: false,
         }
     }
 }

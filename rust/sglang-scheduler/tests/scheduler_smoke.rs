@@ -138,7 +138,7 @@ fn reclaim_for_decode_prefers_cache_eviction_over_retraction() {
     tracker.update_free_count(0);
 
     let outcome =
-        reclaim_for_decode(&mut batch, &mut waiting, &mut tracker, &mut pool, &mut cache, 4);
+        reclaim_for_decode(&mut batch, &mut waiting, &mut tracker, &mut pool, Some(&mut cache), 4);
     // Cache eviction should have produced enough; retraction
     // shouldn't have kicked in.
     assert!(outcome.evicted_cache_tokens >= 4);
@@ -492,6 +492,7 @@ fn cached_prefix_admission_slices_input_ids_and_snapshots_req_to_token() {
     let builder = BatchBuilder::new(
         PAGE,
         8,
+        8192,
         SchedulePolicy::new(SchedulePolicyKind::Fcfs),
     );
     let running = ScheduleBatch::new(ForwardMode::Extend);
@@ -575,6 +576,7 @@ fn full_cache_hit_caps_prefix_at_input_len_minus_one() {
     let builder = BatchBuilder::new(
         PAGE,
         8,
+        8192,
         SchedulePolicy::new(SchedulePolicyKind::Fcfs),
     );
     let running = ScheduleBatch::new(ForwardMode::Extend);
@@ -645,6 +647,7 @@ fn extend_seq_lens_wire_field_is_extend_lens_not_seq_lens() {
     let builder = BatchBuilder::new(
         PAGE,
         8,
+        8192,
         SchedulePolicy::new(SchedulePolicyKind::Fcfs),
     );
     let running = ScheduleBatch::new(ForwardMode::Extend);
@@ -679,6 +682,138 @@ fn extend_seq_lens_wire_field_is_extend_lens_not_seq_lens() {
 }
 
 #[test]
+fn chunked_cache_admission_skips_prefix_match_entirely() {
+    // ChunkedCache mode = `disable_radix_cache=true`.  Passing `None`
+    // to `get_new_batch_prefill_with_cache` makes the builder bypass
+    // every prefix-cache hook regardless of what an external cache
+    // might contain — matches Python `ChunkCache.match_prefix`
+    // returning an empty match.
+    use sglang_scheduler::queue::{SchedulePolicy, SchedulePolicyKind};
+    use sglang_scheduler::scheduler::BatchBuilder;
+
+    // Seed an external radix cache with a hit that *would* match —
+    // we pass `None` to the builder to prove it's ignored.
+    let mut external_cache = RadixCache::new();
+    external_cache.insert(&[10, 20, 30], &[101, 102, 103]);
+    let _ = external_cache; // would-be hit; not passed to builder
+
+    let mut pool = ReqToTokenPool::new(8, 64);
+    let tracker = CpuPageTracker::new(64, PAGE);
+    let mut waiting = WaitingQueue::new();
+
+    let mut sp = SamplingParams::default();
+    sp.max_new_tokens = 16;
+    waiting.push(Arc::new(RwLock::new(Req::new(
+        "rid".into(),
+        vec![10, 20, 30, 40, 50],
+        sp,
+    ))));
+
+    let builder = BatchBuilder::new(
+        PAGE,
+        8,
+        8192,
+        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
+    );
+    let running = ScheduleBatch::new(ForwardMode::Extend);
+    let batch = builder
+        .get_new_batch_prefill_with_cache(
+            &running,
+            &mut waiting,
+            &tracker,
+            &mut pool,
+            None, // <- ChunkedCache mode
+        )
+        .expect("admission");
+
+    // Full prompt enters input_ids — no prefix is matched.
+    assert_eq!(batch.input_ids, vec![10, 20, 30, 40, 50]);
+    let req_state = batch.reqs[0].read().unwrap();
+    assert_eq!(req_state.prefix_len_from_cache, 0);
+    assert!(req_state.cached_node.is_none());
+
+    // Payload has extend_prefix_lens=[0] and extend_seq_lens=[5] (the
+    // wire's misleadingly-named extend_lens field equals seq_lens
+    // since prefix_lens=0).
+    drop(req_state);
+    let payload = batch.to_model_worker_batch_payload(32000, "cuda:0", Some(&pool));
+    assert_eq!(payload.extend_prefix_lens.as_deref(), Some(&[0i32][..]));
+    assert_eq!(payload.extend_seq_lens.as_deref(), Some(&[5i32][..]));
+    assert_eq!(payload.extend_num_tokens, Some(5));
+    // No req has a cached prefix → no snapshot needed.
+    assert!(payload.req_to_token_cpu.is_none());
+}
+
+#[test]
+fn chunked_cache_finish_frees_all_slots() {
+    // ChunkedCache semantics: `cache_finished_req` frees ALL of the
+    // req's slot indices back to the worker (mirrors
+    // `chunk_cache.py:cache_finished_req`).  Verified by passing
+    // `None` for the cache argument to `process_batch_result_with_cache`
+    // and asserting every slot lands in `page_tracker.pending_free`.
+    use std::sync::{Arc, RwLock};
+
+    use sglang_scheduler::scheduler::output_processor::process_batch_result_with_cache;
+    use sglang_scheduler::types::{FinishReason, Req, SamplingParams};
+
+    let mut pool = ReqToTokenPool::new(8, 64);
+    let mut tracker = CpuPageTracker::new(64, PAGE);
+    tracker.update_free_count(64);
+
+    let slot = pool.alloc(1).unwrap()[0];
+    pool.write(slot, 0, &[201, 202, 203, 204]).unwrap();
+
+    let mut sp = SamplingParams::default();
+    sp.max_new_tokens = 1; // finishes after the next sampled token
+    let mut req = Req::new("rid".into(), vec![10, 20, 30, 40], sp);
+    req.req_pool_idx = Some(slot);
+    req.kv_allocated_len = 4;
+    req.kv_committed_len = 4;
+    // ChunkedCache reqs never have cached_node / cache_protected_len.
+    let req_arc = Arc::new(RwLock::new(req));
+
+    let mut batch = ScheduleBatch::new(ForwardMode::Decode);
+    batch.reqs.push(req_arc.clone());
+    batch.req_pool_indices.push(slot);
+    batch.seq_lens.push(4);
+    batch.orig_seq_lens.push(4);
+
+    let reply = DecodeForwardSlimOutput {
+        next_token_ids: TensorIPC::from_i64(&[99]),
+        deferred_alloc: None,
+        accept_lens: None,
+        can_run_cuda_graph: true,
+        num_accepted_drafts: 0,
+        num_accepted_drafts_per_req_cpu: None,
+        logits_output_pickle: None,
+        routed_experts_output_pickle: None,
+        expert_distribution_metrics_pickle: None,
+        next_draft_input_pickle: None,
+    };
+
+    let _ = process_batch_result_with_cache(
+        &mut batch,
+        &reply,
+        &mut tracker,
+        &mut pool,
+        None, // <- ChunkedCache mode
+    );
+    assert!(matches!(
+        req_arc.read().unwrap().finished_reason,
+        Some(FinishReason::Length { .. })
+    ));
+
+    // Every slot the req owned must land in pending_free.
+    let mut pending = tracker.drain_pending_free();
+    pending.sort();
+    assert_eq!(
+        pending,
+        vec![201, 202, 203, 204],
+        "ChunkedCache.cache_finished_req frees ALL slot indices"
+    );
+}
+
+#[test]
 fn no_cached_prefix_skips_req_to_token_snapshot() {
     use sglang_scheduler::queue::{SchedulePolicy, SchedulePolicyKind};
     use sglang_scheduler::scheduler::BatchBuilder;
@@ -698,6 +833,7 @@ fn no_cached_prefix_skips_req_to_token_snapshot() {
     let builder = BatchBuilder::new(
         PAGE,
         8,
+        8192,
         SchedulePolicy::new(SchedulePolicyKind::Fcfs),
     );
     let running = ScheduleBatch::new(ForwardMode::Extend);
@@ -721,4 +857,114 @@ fn no_cached_prefix_skips_req_to_token_snapshot() {
     );
     assert_eq!(payload.extend_prefix_lens.as_deref(), Some(&[0i32][..]));
     assert_eq!(payload.extend_num_tokens, Some(3));
+}
+
+#[test]
+fn prefill_admission_caps_at_max_prefill_tokens() {
+    // Regression: without this cap a single prefill iter could ship
+    // >65K new tokens to the worker, blowing the MoE kernel's
+    // `m_numtopk <= MAX_TOKENS_PER_EXPERT * topk` assertion
+    // (`MAX_TOKENS_PER_EXPERT = 65536`).  Python's `PrefillAdder`
+    // bounds prefill by `max_prefill_tokens` (scheduler.py:2751).
+    use sglang_scheduler::queue::{SchedulePolicy, SchedulePolicyKind};
+    use sglang_scheduler::scheduler::BatchBuilder;
+
+    let mut pool = ReqToTokenPool::new(8, 4096);
+    // Huge KV budget — without max_prefill_tokens, admission would
+    // happily admit everything below.
+    let mut tracker = CpuPageTracker::new(8192, PAGE);
+    tracker.update_free_count(8192);
+    let mut cache = RadixCache::new();
+    let mut waiting = WaitingQueue::new();
+
+    // Four reqs of 100 tokens each.  With max_prefill_tokens=300,
+    // only three of them can land in a single batch.
+    for i in 0..4 {
+        let mut sp = SamplingParams::default();
+        sp.max_new_tokens = 16;
+        waiting.push(Arc::new(RwLock::new(Req::new(
+            format!("r{i}"),
+            vec![1; 100],
+            sp,
+        ))));
+    }
+
+    let builder = BatchBuilder::new(
+        PAGE,
+        8,
+        300, // <-- only 3 reqs (3x100) fit
+        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
+    );
+    let running = ScheduleBatch::new(ForwardMode::Extend);
+    let batch = builder
+        .get_new_batch_prefill_with_cache(
+            &running,
+            &mut waiting,
+            &tracker,
+            &mut pool,
+            Some(&mut cache),
+        )
+        .expect("admission");
+
+    assert_eq!(
+        batch.input_ids.len(),
+        300,
+        "max_prefill_tokens=300 must cap the per-iter input_ids length"
+    );
+    assert_eq!(
+        batch.reqs.len(),
+        3,
+        "exactly 3 reqs admitted (300 tokens / 100-token prompt)"
+    );
+    assert_eq!(
+        waiting.len(),
+        1,
+        "the 4th req stays in the waiting queue"
+    );
+}
+
+#[test]
+fn prefill_admission_stalls_oversized_req_until_chunked_prefill_lands() {
+    // A single req whose new-token count exceeds max_prefill_tokens
+    // can't be admitted (chunked prefill not yet ported).  The
+    // builder must NOT silently send it — it'd OOM at the worker or
+    // trip the MoE assertion.
+    use sglang_scheduler::queue::{SchedulePolicy, SchedulePolicyKind};
+    use sglang_scheduler::scheduler::BatchBuilder;
+
+    let mut pool = ReqToTokenPool::new(8, 4096);
+    let mut tracker = CpuPageTracker::new(8192, PAGE);
+    tracker.update_free_count(8192);
+    let mut cache = RadixCache::new();
+    let mut waiting = WaitingQueue::new();
+
+    let mut sp = SamplingParams::default();
+    sp.max_new_tokens = 16;
+    waiting.push(Arc::new(RwLock::new(Req::new(
+        "huge".into(),
+        vec![1; 500], // > max_prefill_tokens=200
+        sp,
+    ))));
+
+    let builder = BatchBuilder::new(
+        PAGE,
+        8,
+        200,
+        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
+    );
+    let running = ScheduleBatch::new(ForwardMode::Extend);
+    let admitted = builder.get_new_batch_prefill_with_cache(
+        &running,
+        &mut waiting,
+        &tracker,
+        &mut pool,
+        Some(&mut cache),
+    );
+
+    assert!(
+        admitted.is_none(),
+        "oversized req must NOT be admitted -- it'd trip MoE m_numtopk \
+         assertion at the worker"
+    );
+    assert_eq!(waiting.len(), 1, "oversized req returns to waiting queue");
 }

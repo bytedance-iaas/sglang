@@ -54,7 +54,17 @@ pub enum EventLoopError {
 }
 
 pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
-    let server_args = ServerArgs::default();
+    // Start from defaults; overlay the SchedulerConfig + env vars.
+    let mut server_args = ServerArgs::default();
+    // ChunkedCache toggle — either field on SchedulerConfig (Python
+    // entry point) or `SGLANG_DISABLE_RADIX_CACHE=1` env var (CLI).
+    if cfg.disable_radix_cache
+        || std::env::var("SGLANG_DISABLE_RADIX_CACHE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+            .unwrap_or(false)
+    {
+        server_args.disable_radix_cache = true;
+    }
     let policy = SchedulePolicy::new(SchedulePolicyKind::parse(&server_args.schedule_policy));
 
     let ctx = zmq::Context::new();
@@ -83,6 +93,7 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
     let builder = BatchBuilder::new(
         page_size,
         server_args.max_running_requests as usize,
+        server_args.max_prefill_tokens as i64,
         policy,
     );
 
@@ -90,6 +101,15 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
     let mut running = ScheduleBatch::new(ForwardMode::Decode);
     let mut radix_cache = RadixCache::new();
     let mut metrics = SchedulerMetrics::new();
+
+    if server_args.disable_radix_cache {
+        log::info!(
+            "disable_radix_cache=true → using ChunkedCache semantics \
+             (no prefix matching, no cross-req KV sharing)"
+        );
+    } else {
+        log::info!("Radix prefix cache enabled");
+    }
     // Pending aborts: rids whose AbortReq arrived while they were
     // running.  Applied on the next loop iteration via
     // `apply_pending_aborts`.
@@ -187,15 +207,22 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
         // 1c. Memory pressure check before building the next batch.
         //     If decoding the current running batch would exhaust the
         //     KV budget, try cache eviction first then retraction.
+        //     With `disable_radix_cache`, skip eviction (no cache to
+        //     evict from) — ChunkedCache semantics.
         if !running.is_empty() {
             let need = running.batch_size() as i64 * page_size;
             if page_tracker.available_size() < need {
+                let cache_opt = if server_args.disable_radix_cache {
+                    None
+                } else {
+                    Some(&mut radix_cache)
+                };
                 let outcome = reclaim_for_decode(
                     &mut running,
                     &mut waiting,
                     &mut page_tracker,
                     &mut req_pool,
-                    &mut radix_cache,
+                    cache_opt,
                     need,
                 );
                 if outcome.retracted_reqs + outcome.aborted > 0
@@ -211,14 +238,22 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
             }
         }
 
-        // 2. Choose the next batch.
+        // 2. Choose the next batch.  With `disable_radix_cache`, pass
+        //    `None` so admission skips prefix matching and slot
+        //    planting — matches Python's `ChunkCache.match_prefix`
+        //    returning an empty match.
         let batch_to_send = if !waiting.is_empty() {
+            let cache_opt = if server_args.disable_radix_cache {
+                None
+            } else {
+                Some(&mut radix_cache)
+            };
             builder.get_new_batch_prefill_with_cache(
                 &running,
                 &mut waiting,
                 &page_tracker,
                 &mut req_pool,
-                Some(&mut radix_cache),
+                cache_opt,
             )
         } else if !running.is_empty() {
             builder.prepare_for_decode(&mut running);
@@ -267,13 +302,22 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
         };
         let reply = workers.forward_batch_generation(req)?;
 
-        // 5. Apply the reply to the scheduler-side state.
+        // 5. Apply the reply to the scheduler-side state.  With
+        //    `disable_radix_cache`, pass `None` so the finish path
+        //    frees ALL the req's KV slots back to the worker instead
+        //    of grafting them into the cache — matches Python's
+        //    `ChunkCache.cache_finished_req`.
+        let cache_opt = if server_args.disable_radix_cache {
+            None
+        } else {
+            Some(&mut radix_cache)
+        };
         let mut stats = process_batch_result_with_cache(
             &mut batch,
             &reply,
             &mut page_tracker,
             &mut req_pool,
-            Some(&mut radix_cache),
+            cache_opt,
         );
 
         // 5b. Stream the per-iteration output to the detokenizer.

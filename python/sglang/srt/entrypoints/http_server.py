@@ -2660,6 +2660,9 @@ def _run_rust_scheduler_process(
             worker_ipcs=worker_ipcs,
             tokenizer_ipc=port_args.scheduler_input_ipc_name,
             detokenizer_ipc=port_args.detokenizer_ipc_name,
+            disable_radix_cache=bool(
+                getattr(server_args, "disable_radix_cache", False)
+            ),
         )
         # Blocks until the scheduler loop exits.
         start_scheduler(cfg)

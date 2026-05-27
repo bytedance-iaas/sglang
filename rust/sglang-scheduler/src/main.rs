@@ -46,6 +46,12 @@ struct Args {
     /// emission (the scheduler still runs and consumes tokens).
     #[arg(long, env = "SGLANG_DETOKENIZER_IPC", default_value = "")]
     detokenizer_ipc: String,
+
+    /// Disable the radix prefix cache — fall back to ChunkedCache
+    /// semantics (no prefix matching, no cross-req KV sharing).
+    /// Mirrors Python's `--disable-radix-cache`.
+    #[arg(long, env = "SGLANG_DISABLE_RADIX_CACHE", default_value_t = false)]
+    disable_radix_cache: bool,
 }
 
 fn main() {
@@ -56,6 +62,7 @@ fn main() {
         worker_ipcs: args.worker_ipc,
         tokenizer_ipc: args.tokenizer_ipc,
         detokenizer_ipc: args.detokenizer_ipc,
+        disable_radix_cache: args.disable_radix_cache,
     };
 
     if let Err(err) = run_event_loop(&cfg) {

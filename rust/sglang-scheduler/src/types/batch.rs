@@ -251,24 +251,27 @@ impl ScheduleBatch {
             return_logprob: self.return_logprob,
             top_logprobs_nums: None,
             token_ids_logprobs: None,
-            global_num_tokens: {
-                // Single-DP fallback — see scheduler::dp_attn for the
-                // multi-DP path (not ported yet).
-                let dp = crate::scheduler::dp_attn::prepare_local_dp_attention_sync(self);
-                Some(dp.global_num_tokens)
-            },
-            global_num_tokens_for_logprob: {
-                let dp = crate::scheduler::dp_attn::prepare_local_dp_attention_sync(self);
-                Some(dp.global_num_tokens_for_logprob)
-            },
+            // DP-attention sync fields MUST be `None` for single-DP
+            // setups.  The worker's `_forward_raw` branches on
+            // `forward_batch.global_num_tokens_cpu is not None`
+            // (model_runner.py:3284) and entering the
+            // `prepare_mlp_sync_batch` path triggers the padding /
+            // buffer-len arithmetic that ultimately pads `input_ids`
+            // and downstream tensors to a length much larger than
+            // intended, causing the MoE kernel's `m_numtopk` to blow
+            // past `MAX_TOKENS_PER_EXPERT`.  Python's `CpuScheduler`
+            // only sets these when `require_mlp_sync` is true — i.e.
+            // a real multi-DP topology.  Until the Rust scheduler
+            // grows that path, send `None`.  See
+            // `scheduler::dp_attn::prepare_local_dp_attention_sync`
+            // for the multi-DP-ready (but currently unused) helper.
+            global_num_tokens: None,
+            global_num_tokens_for_logprob: None,
             is_extend_in_batch: self.forward_mode.is_extend(),
             all_extend_in_batch: self.forward_mode == ForwardMode::Extend,
             can_run_dp_cuda_graph: false,
             tbo_split_seq_index: None,
-            global_forward_mode: Some({
-                let dp = crate::scheduler::dp_attn::prepare_local_dp_attention_sync(self);
-                dp.global_forward_mode
-            }),
+            global_forward_mode: None,
             extend_num_tokens,
             extend_seq_lens,
             extend_prefix_lens,

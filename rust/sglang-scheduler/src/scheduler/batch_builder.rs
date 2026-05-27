@@ -32,6 +32,14 @@ use crate::types::{ForwardMode, Req, ScheduleBatch};
 pub struct BatchBuilder {
     page_size: i64,
     max_running_requests: usize,
+    /// Cap on the **new** tokens admitted into a single prefill batch.
+    /// Mirrors Python `PrefillAdder(rem_input_tokens=max_prefill_tokens)`
+    /// (see `scheduler.py:2751`).  Without this cap, the admission only
+    /// bounds by the KV-pool budget — for large KV pools that lets a
+    /// single prefill iter ship 100K+ input tokens to the worker, which
+    /// blows the MoE kernels' `m_numtopk <= MAX_TOKENS_PER_EXPERT * topk`
+    /// assertion (`MAX_TOKENS_PER_EXPERT = 65536`).
+    max_prefill_tokens: i64,
     policy: SchedulePolicy,
 }
 
@@ -39,11 +47,13 @@ impl BatchBuilder {
     pub fn new(
         page_size: i64,
         max_running_requests: usize,
+        max_prefill_tokens: i64,
         policy: SchedulePolicy,
     ) -> Self {
         Self {
             page_size,
             max_running_requests,
+            max_prefill_tokens,
             policy,
         }
     }
@@ -121,11 +131,24 @@ impl BatchBuilder {
             return None;
         }
 
-        // KV page-budget cap.  TODO(rust-port): the Python version uses
-        // `PrefillAdder` to also account for the post-admission seq
-        // length growth, which can be much larger than the prefill
-        // length itself.  This is the simple version.
+        // Per-iter prefill token budget.  Two independent caps:
+        //   1. `free_tokens` — the KV-pool budget (admission can't
+        //      allocate more KV slots than the pool has free).
+        //   2. `max_prefill_tokens` — the per-iter prefill ceiling
+        //      (Python `PrefillAdder.rem_input_tokens`, default 8192).
+        //      Without this cap, large KV pools let a single prefill
+        //      iter ship 100K+ new tokens, blowing the MoE kernel's
+        //      `m_numtopk <= MAX_TOKENS_PER_EXPERT * topk` assertion
+        //      (`MAX_TOKENS_PER_EXPERT = 65536`).
+        //
+        // TODO(rust-port): the Python version also uses `PrefillAdder`
+        // to account for post-admission seq-length growth (much larger
+        // than the prefill length itself) and to chunk long prompts
+        // into `chunked_prefill_size` pieces.  Until that lands, a
+        // single oversized req gets dropped with a warning rather than
+        // sent and OOM'd at the worker.
         let free_tokens = page_tracker.available_size();
+        let token_budget = free_tokens.min(self.max_prefill_tokens);
         let mut admitted: Vec<Arc<RwLock<Req>>> = Vec::new();
         let mut accumulated_tokens: i64 = 0;
 
@@ -154,7 +177,26 @@ impl BatchBuilder {
                 (total, raw.min((total - 1).max(0)))
             };
             let needed = total_len - prefix_len;
-            if accumulated_tokens + needed > free_tokens {
+
+            // A req whose lone new-token count exceeds the per-iter
+            // budget can't fit even in an empty batch.  Until chunked
+            // prefill is ported, log a warning and push back to
+            // waiting — the user will hit a timeout rather than a
+            // silent OOM/wire-blow-up at the worker.
+            if needed > self.max_prefill_tokens && admitted.is_empty() {
+                let rid = req_arc.read().unwrap().rid.clone();
+                log::warn!(
+                    "req {} needs {} new tokens (> max_prefill_tokens={}); \
+                     chunked prefill not yet ported — request will stall",
+                    rid,
+                    needed,
+                    self.max_prefill_tokens
+                );
+                waiting.push(req_arc);
+                break;
+            }
+
+            if accumulated_tokens + needed > token_budget {
                 waiting.push(req_arc);
                 break;
             }

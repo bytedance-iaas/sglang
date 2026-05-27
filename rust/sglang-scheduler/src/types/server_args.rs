@@ -39,6 +39,14 @@ pub struct ServerArgs {
     /// default is `40`.  `0` disables periodic decode-stats logging
     /// (every-iter prefill stats still fire).
     pub decode_log_interval: u32,
+
+    /// Disable the radix prefix cache and fall back to the
+    /// `ChunkedCache` semantics (no prefix matching, no cross-req
+    /// KV sharing, every req frees all its KV slots on finish).
+    /// Mirrors Python's `--disable-radix-cache` flag (see
+    /// `chunk_cache.py`).  Useful when the radix cache is suspected
+    /// of causing cross-request contamination or correctness issues.
+    pub disable_radix_cache: bool,
 }
 
 impl Default for ServerArgs {
@@ -52,6 +60,7 @@ impl Default for ServerArgs {
             schedule_policy: "fcfs".into(),
             schedule_conservativeness: 1.0,
             decode_log_interval: 40,
+            disable_radix_cache: false,
         }
     }
 }

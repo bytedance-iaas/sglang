@@ -212,36 +212,41 @@ pub fn retract_decode_with_cache(
     outcome
 }
 
-/// Full memory-pressure recovery: try radix-cache eviction first, then
-/// fall back to retracting running reqs.  Source:
+/// Full memory-pressure recovery: try radix-cache eviction first (if a
+/// cache is wired), then fall back to retracting running reqs.  Source:
 /// `Scheduler.check_decode_mem` in `scheduler.py`.
 ///
-/// Returns a single outcome with both eviction and retraction tallies.
+/// `cache = None` selects the `ChunkedCache` path — no eviction, just
+/// retract running reqs.  Mirrors Python's `ChunkCache.evict` no-op.
 pub fn reclaim_for_decode(
     batch: &mut ScheduleBatch,
     waiting: &mut WaitingQueue,
     page_tracker: &mut CpuPageTracker,
     req_pool: &mut ReqToTokenPool,
-    cache: &mut RadixCache,
+    mut cache: Option<&mut RadixCache>,
     needed_tokens_per_step: i64,
 ) -> RetractionOutcome {
-    // 1. Evict unprotected radix-cache leaves.
+    // 1. Evict unprotected radix-cache leaves (if a cache is wired).
     let evicted = if page_tracker.available_size() < needed_tokens_per_step {
         let want = needed_tokens_per_step - page_tracker.available_size();
-        evict_from_tree_cache(cache, page_tracker, want)
+        if let Some(c) = cache.as_deref_mut() {
+            evict_from_tree_cache(c, page_tracker, want)
+        } else {
+            0
+        }
     } else {
         0
     };
 
-    // 2. If that wasn't enough, retract running reqs — this time pass
-    //    the cache so each retracted req releases its lock_ref.
+    // 2. If that wasn't enough, retract running reqs.  The cache (if
+    //    any) gets its lock_refs released as part of the retraction.
     let mut outcome = if page_tracker.available_size() < needed_tokens_per_step {
         retract_decode_with_cache(
             batch,
             waiting,
             page_tracker,
             req_pool,
-            Some(cache),
+            cache.as_deref_mut(),
             needed_tokens_per_step,
         )
     } else {
