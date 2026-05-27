@@ -1314,6 +1314,20 @@ class GPUWorkerHandshakeReqOutput(msgspec.Struct, tag=True):
     hybrid_gdn_config: Optional[Dict[str, Any]] = None
     mamba2_config: Optional[Dict[str, Any]] = None
 
+    # ── ModelConfig scalars ────────────────────────────────────────────
+    # Piggybacked off ``model_runner.model_config`` so the Rust scheduler
+    # doesn't have to depend on HuggingFace transformers itself.  All
+    # defaulted so older workers connecting to a newer scheduler still
+    # decode cleanly.
+    vocab_size: int = 0
+    context_len: int = 0
+    is_generation: bool = True
+    # EOS can be a single id or a list of ids depending on the model;
+    # normalize to a list so the Rust mirror has a single shape to read.
+    hf_eos_token_ids: Optional[List[int]] = None
+    # Reasoning-model end-of-think marker (None for non-reasoning models).
+    think_end_id: Optional[int] = None
+
 
 class BatchedPenalizerOrchestratorIPC(msgspec.Struct, tag=True):
     vocab_size: int

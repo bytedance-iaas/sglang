@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sglang-scheduler"
+version = "0.1.0"
+description = "Rust port of SGLang's CPU-only scheduler"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "sglang_scheduler"

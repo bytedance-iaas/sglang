@@ -22,9 +22,12 @@ import atexit
 import dataclasses
 import logging
 import os
+import signal
 import tempfile
 import threading
 import time
+
+import psutil
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -2590,6 +2593,106 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
+def _run_rust_scheduler_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int,
+    moe_ep_rank: int,
+    pp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+) -> None:
+    """Subprocess entry point: drive the Rust scheduler (``sglang_scheduler``).
+
+    Signature mirrors :func:`sglang.srt.managers.scheduler.run_scheduler_process`
+    so this can be passed straight as ``run_scheduler_process_func`` to
+    :func:`Engine._launch_subprocesses`.
+
+    Differences vs the Python ``run_scheduler_process``:
+      * The Rust scheduler drives **all** TP ranks of one PP stage from a
+        single process via ``WorkerClientGroup`` — the launcher in
+        ``engine.py`` already spawns this function once per PP rank with
+        ``tp_rank=0`` (see the ``_rust_path`` branch).
+      * It only speaks msgpack on the tokenizer socket; the Python
+        TokenizerManager must have ``SGLANG_IPC_USE_MSGPACK=1`` set.
+      * Init info (``max_total_num_tokens`` / ``max_req_input_len``) is
+        sourced from a one-shot ``peek_worker_handshake`` against rank 0
+        rather than the Python ``CpuScheduler.get_init_info``.
+    """
+    try:
+        from setproctitle import setproctitle
+
+        setproctitle(f"sglang::rust_scheduler pp{pp_rank}")
+    except ImportError:
+        pass
+
+    # Late import so a stale install without the Rust extension still
+    # imports http_server cleanly.
+    from sglang_scheduler import (
+        SchedulerConfig,
+        peek_worker_handshake,
+        start_scheduler,
+    )
+
+    parent_process = psutil.Process().parent()
+
+    try:
+        worker_ipcs = [
+            tp_worker_ipc_for_rank(port_args.tp_worker_ipc_name, tp, pp_rank)
+            for tp in range(server_args.tp_size)
+        ]
+
+        # Pre-handshake to extract max_total_num_tokens / max_req_input_len.
+        # Connection is dropped before ``start_scheduler`` re-opens.
+        hs = peek_worker_handshake(worker_ipcs)
+        pipe_writer.send(
+            {
+                "status": "ready",
+                "max_total_num_tokens": hs["max_total_num_tokens"],
+                "max_req_input_len": hs["max_req_input_len"],
+            }
+        )
+
+        cfg = SchedulerConfig(
+            worker_ipcs=worker_ipcs,
+            tokenizer_ipc=port_args.scheduler_input_ipc_name,
+            detokenizer_ipc=port_args.detokenizer_ipc_name,
+        )
+        # Blocks until the scheduler loop exits.
+        start_scheduler(cfg)
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"Rust scheduler hit an exception: {traceback}")
+        if parent_process is not None:
+            parent_process.send_signal(signal.SIGQUIT)
+
+
+def _pick_scheduler_launcher(
+    server_args: ServerArgs,
+    fallback: Callable,
+) -> Callable:
+    """Return ``_run_rust_scheduler_process`` when the env vars + topology
+    allow it, otherwise the supplied Python fallback.
+
+    Gating mirrors the ``_rust_path`` check in ``engine.py``: the Rust
+    scheduler only supports the msgpack tokenizer wire format, one PP
+    stage at a time, and TP>=1 GPU worker subprocesses.
+    """
+    if (
+        envs.SGLANG_RUST_SCHEDULER.get()
+        and envs.SGLANG_IPC_USE_MSGPACK.get()
+        and server_args.pp_size == 1
+    ):
+        logger.info(
+            "SGLANG_RUST_SCHEDULER set — using Rust scheduler subprocess"
+        )
+        return _run_rust_scheduler_process
+    return fallback
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -2616,6 +2719,15 @@ def launch_server(
 
     if envs.SGLANG_RUST_DETOKENIZER.get() and envs.SGLANG_IPC_USE_MSGPACK.get():
         return launch_rust_server(server_args, run_scheduler_process_func)
+
+    # When SGLANG_RUST_SCHEDULER is set (and topology allows), swap the
+    # Python scheduler subprocess for the Rust one.  The Python
+    # TokenizerManager still drives requests over the same msgpack
+    # tokenizer socket — the Rust scheduler decodes them and broadcasts
+    # forward batches to the GPU worker subprocesses.
+    run_scheduler_process_func = _pick_scheduler_launcher(
+        server_args, run_scheduler_process_func
+    )
 
     # Launch subprocesses
     (
@@ -2784,7 +2896,11 @@ def launch_rust_server(
     gpu_worker_procs = _launch_gpu_workers(server_args, port_args, ctx)
 
     # 3. Start scheduler subprocesses — GPU workers are bound, so connects
-    #    from TpWorkerClient succeed immediately.
+    #    from TpWorkerClient succeed immediately.  Same env-gated swap as
+    #    in launch_server so SGLANG_RUST_SCHEDULER=1 takes effect here too.
+    run_scheduler_process_func = _pick_scheduler_launcher(
+        server_args, run_scheduler_process_func
+    )
     port_args, _, _ = (
         Engine._launch_scheduler_only(
             server_args=server_args,

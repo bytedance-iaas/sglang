@@ -574,6 +574,12 @@ class Envs:
     SGLANG_IPC_USE_MSGPACK = EnvBool(False)
     SGLANG_RUST_DETOKENIZER = EnvBool(False)
     SGLANG_CPU_PIPELINE_OVERLAP = EnvBool(False)
+    # When set, the scheduler subprocess runs the Rust port
+    # (``sglang_scheduler.start_scheduler``) instead of the Python
+    # ``CpuScheduler``.  Requires ``SGLANG_IPC_USE_MSGPACK=1`` (the Rust
+    # scheduler only speaks msgpack) and ``pp_size==1``.  See
+    # ``_run_rust_scheduler_process`` in ``entrypoints/http_server.py``.
+    SGLANG_RUST_SCHEDULER = EnvBool(False)
 
 
 envs = Envs()

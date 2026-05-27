@@ -2811,12 +2811,12 @@ class ModelWorkerBatch:
     token_type_ids: Optional[torch.Tensor] = None
 
     # Speculative decoding
-    spec_algorithm: SpeculativeAlgorithm = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
 
     spec_info: Optional[SpecInput] = None
 
     # If set, the output of the batch contains the hidden states of the run.
-    capture_hidden_mode: CaptureHiddenMode = None
+    capture_hidden_mode: Optional[CaptureHiddenMode] = None
     hicache_consumer_index: int = -1
 
     # For matryoshka embeddings

@@ -40,7 +40,7 @@ from the shared base stored in ``PortArgs.tp_worker_ipc_name``.
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 import zmq
@@ -231,6 +231,20 @@ class TpWorkerServer:
         """
         model_runner = self.worker.model_runner
         worker_info = self.worker.get_worker_info()
+        model_config = getattr(model_runner, "model_config", None)
+
+        # Normalize hf_eos_token_id (int | list[int] | None) to list[int] | None
+        # so the wire format has a single shape.  See `ModelConfig._get_hf_eos_token_id`.
+        eos_raw = getattr(model_config, "hf_eos_token_id", None) if model_config else None
+        if eos_raw is None:
+            eos_list: Optional[List[int]] = None
+        elif isinstance(eos_raw, int):
+            eos_list = [int(eos_raw)]
+        else:
+            try:
+                eos_list = [int(e) for e in eos_raw]
+            except TypeError:
+                eos_list = None
 
         # worker_info[8] is forward_stream (a CUDA Stream); replace with None
         # so the tuple can be safely pickled for cross-process transport.
@@ -256,6 +270,14 @@ class TpWorkerServer:
             linear_attn_model_spec=getattr(model_runner, "linear_attn_model_spec", None),
             hybrid_gdn_config=getattr(model_runner, "hybrid_gdn_config", None),
             mamba2_config=getattr(model_runner, "mamba2_config", None),
+            # Piggyback model_config scalars so the Rust scheduler doesn't
+            # need its own HuggingFace dependency.  See the matching
+            # `#[serde(default)]` fields in `rust/sglang-scheduler/src/wire/handshake.rs`.
+            vocab_size=int(getattr(model_config, "vocab_size", 0)) if model_config else 0,
+            context_len=int(getattr(model_config, "context_len", 0)) if model_config else 0,
+            is_generation=bool(getattr(model_config, "is_generation", True)) if model_config else True,
+            hf_eos_token_ids=eos_list,
+            think_end_id=getattr(model_config, "think_end_id", None) if model_config else None,
         )
 
     # ------------------------------------------------------------------
@@ -335,7 +357,7 @@ class TpWorkerServer:
                 a["send"] += _t3 - _t2
                 if a["count"] >= a["win"]:
                     n = a["count"]
-                    logger.info(
+                    logger.debug(
                         "TpWorkerServer run_loop[%s %d steps] avg ms: recv_wait=%.2f "
                         "dispatch=%.2f send=%.2f total=%.2f",
                         a["label"], n,
