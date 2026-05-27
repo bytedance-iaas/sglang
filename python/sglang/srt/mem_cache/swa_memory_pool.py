@@ -371,6 +371,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._last_free_swa_debug = None
 
         self.clear()
         self._kvcache = kvcache
@@ -549,8 +550,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
             alloc_swa_indices
         )
-        if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
         return alloc_full_indices
 
     def alloc_decode(
@@ -594,7 +593,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        swa_available_size = self.swa_attn_allocator.available_size()
+        if swa_available_size > self.swa_attn_allocator.size:
+            logger.error(
+                "SWA allocator over-free detected: "
+                "swa_available=%s swa_size=%s full_available=%s full_size=%s "
+                "is_not_in_free_group=%s free_index_numel=%s last_free_swa=%s",
+                swa_available_size,
+                self.swa_attn_allocator.size,
+                self.full_attn_allocator.available_size(),
+                self.full_attn_allocator.size,
+                self.is_not_in_free_group,
+                free_index.numel(),
+                self._last_free_swa_debug,
+            )
+        assert swa_available_size <= self.swa_attn_allocator.size
 
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
@@ -616,8 +629,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
+        if swa_indices.numel() > 0:
+            swa_pages = swa_indices // self.page_size
+            unique_swa_pages = torch.unique(swa_pages)
+            self._last_free_swa_debug = {
+                "full_numel": int(free_index.numel()),
+                "full_unique": int(torch.unique(free_index).numel()),
+                "swa_numel": int(swa_indices.numel()),
+                "swa_unique": int(torch.unique(swa_indices).numel()),
+                "swa_page_unique": int(unique_swa_pages.numel()),
+                "swa_min": int(torch.min(swa_indices).item()),
+                "swa_max": int(torch.max(swa_indices).item()),
+                "swa_page_min": int(torch.min(swa_pages).item()),
+                "swa_page_max": int(torch.max(swa_pages).item()),
+            }
+        else:
+            self._last_free_swa_debug = {
+                "full_numel": int(free_index.numel()),
+                "full_unique": int(torch.unique(free_index).numel()),
+                "swa_numel": 0,
+            }
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        if self.page_size > 1 and swa_indices.numel() > 0:
+            mapped = self.full_to_swa_index_mapping[:-1]
+            mapped_pages = mapped // self.page_size
+            page_mask = torch.isin(mapped_pages, unique_swa_pages)
+            mapped[page_mask] = 0
+        else:
+            self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
         return [
