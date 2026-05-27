@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
+    supports_swa_tail_prealloc,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -134,11 +135,46 @@ class PrefillBootstrapQueue:
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
+            if self._can_admit_hybrid_swa_by_full_pool():
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens,
+                    self.scheduler.tp_worker.model_runner.full_max_total_num_tokens,
+                )
+            else:
+                # Fallback for SWA allocators that still allocate the SWA pool at
+                # full prompt length.
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens,
+                    self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+                )
+
+    def _can_admit_hybrid_swa_by_full_pool(self) -> bool:
+        return self._has_dsv4_swa_tail_allocator() or self._uses_chunked_swa_prefill()
+
+    def _has_dsv4_swa_tail_allocator(self) -> bool:
+        return supports_swa_tail_prealloc(
+            self.token_to_kv_pool,
+            self.scheduler.token_to_kv_pool_allocator,
+            DeepSeekV4TokenToKVPool,
+        )
+
+    def _uses_chunked_swa_prefill(self) -> bool:
+        chunked_prefill_size = self.scheduler.chunked_prefill_size
+        return (
+            chunked_prefill_size is not None
+            and chunked_prefill_size > 0
+            and self._estimated_swa_prefill_peak_tokens()
+            <= self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens
+        )
+
+    def _estimated_swa_prefill_peak_tokens(self) -> int:
+        chunked_prefill_size = self.scheduler.chunked_prefill_size or 0
+        sliding_window_size = self.scheduler.sliding_window_size or 0
+        peak_tokens = max(chunked_prefill_size, sliding_window_size)
+        if peak_tokens <= 0:
+            return 0
+        page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+        return ((peak_tokens + page_size - 1) // page_size + 1) * page_size
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -516,6 +552,16 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                if isinstance(req.to_finish, FINISH_ABORT):
+                    req.update_finish_state()
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_req_to_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    continue
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
