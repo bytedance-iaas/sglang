@@ -177,8 +177,7 @@ impl RadixCache {
                 self.nodes[cur as usize].lock_ref > 0,
                 "dec_lock_ref without matching inc_lock_ref"
             );
-            self.nodes[cur as usize].lock_ref =
-                self.nodes[cur as usize].lock_ref.saturating_sub(1);
+            self.nodes[cur as usize].lock_ref = self.nodes[cur as usize].lock_ref.saturating_sub(1);
             if self.nodes[cur as usize].lock_ref == 0 {
                 self.protected_tokens -= self.nodes[cur as usize].cached_tokens;
             }
@@ -191,7 +190,7 @@ impl RadixCache {
     /// Walk the tree following `tokens`, returning the longest matching
     /// prefix's KV slots.  Mirrors `match_prefix` in radix_cache.py
     /// (page_size == 1 branch).
-    pub fn match_prefix(&self, tokens: &[i32]) -> MatchResult {
+    pub fn match_prefix(&mut self, tokens: &[i32]) -> MatchResult {
         let mut slots = Vec::new();
         let mut node = ROOT;
         let mut pos = 0;
@@ -213,7 +212,8 @@ impl RadixCache {
             pos += shared;
             if shared < child.key.len() {
                 // Tokens diverge inside this edge — partial match.
-                node = child_id;
+                let split_id = self.split_edge(child_id, shared);
+                node = split_id;
                 break;
             }
             node = child_id;
@@ -313,8 +313,7 @@ impl RadixCache {
         // Promote `node` to be the suffix.
         self.nodes[node as usize].key = suffix_key;
         self.nodes[node as usize].value = suffix_value;
-        self.nodes[node as usize].cached_tokens =
-            self.nodes[node as usize].value.len() as i64;
+        self.nodes[node as usize].cached_tokens = self.nodes[node as usize].value.len() as i64;
 
         // Build the mid node.  Inherit `lock_ref` from the suffix so
         // any req that locked `node` before the split keeps the same
@@ -326,6 +325,10 @@ impl RadixCache {
         let mut mid = Node::leaf(parent, mid_key, mid_value);
         mid.cached_tokens = mid_cached;
         mid.lock_ref = inherited_lock_ref;
+        if inherited_lock_ref > 0 {
+            // The protected tokens accounting assumes one lock covers the tokens.
+            // mid and node now share lock_ref.
+        }
         mid.children.insert(suffix_first, node);
         self.nodes.push(mid);
 
@@ -370,8 +373,7 @@ impl RadixCache {
                 continue;
             }
             // Detach the leaf.
-            let parent = self
-                .nodes[idx]
+            let parent = self.nodes[idx]
                 .parent
                 .expect("leaf has parent (root cannot be a leaf with tokens)");
             let key0 = self.nodes[idx].key[0];

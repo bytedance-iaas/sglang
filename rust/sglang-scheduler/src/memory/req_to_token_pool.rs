@@ -146,8 +146,7 @@ impl ReqToTokenPool {
         }
         let row = req_pool_idx as usize;
         let cols = self.max_context_len as usize;
-        let dst = &mut self.req_to_token
-            [row * cols + start as usize..row * cols + end as usize];
+        let dst = &mut self.req_to_token[row * cols + start as usize..row * cols + end as usize];
         dst.copy_from_slice(values);
         Ok(())
     }

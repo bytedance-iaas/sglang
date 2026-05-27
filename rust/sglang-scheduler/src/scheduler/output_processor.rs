@@ -133,11 +133,7 @@ pub fn process_batch_result_with_cache(
         Some(BatchTokenIDOutput::with_capacity(batch.reqs.len()))
     };
 
-    for (i, &tok) in next_token_ids
-        .iter()
-        .take(batch.reqs.len())
-        .enumerate()
-    {
+    for (i, &tok) in next_token_ids.iter().take(batch.reqs.len()).enumerate() {
         let mut req = batch.reqs[i].write().unwrap();
         req.output_ids.push(tok as i32);
         let finish_reason_opt = req.check_finished().cloned();
@@ -167,10 +163,7 @@ pub fn process_batch_result_with_cache(
 
         // Emit one entry into the detokenizer output frame for this req.
         if let Some(o) = out.as_mut() {
-            o.rids
-                .as_mut()
-                .unwrap()
-                .push(req.rid.clone());
+            o.rids.as_mut().unwrap().push(req.rid.clone());
             o.http_worker_ipcs.as_mut().unwrap().push(None);
             o.finished_reasons
                 .push(finish_reason_opt.as_ref().map(finish_reason_to_value));
@@ -187,14 +180,10 @@ pub fn process_batch_result_with_cache(
             o.prompt_tokens.push(req.origin_input_ids.len() as i64);
             o.reasoning_tokens.push(0);
             o.completion_tokens.push(req.output_ids.len() as i64);
-            o.cached_tokens
-                .push(req.prefix_len_from_cache as i64);
+            o.cached_tokens.push(req.prefix_len_from_cache as i64);
             // skip_tokenizer_init path: include the raw output id so
             // the detokenizer manager can stream without re-decoding.
-            o.output_ids
-                .as_mut()
-                .unwrap()
-                .push(vec![new_tok]);
+            o.output_ids.as_mut().unwrap().push(vec![new_tok]);
         }
 
         stats.num_generated_tokens += 1;
@@ -212,10 +201,10 @@ pub fn process_batch_result_with_cache(
     for done in finished {
         if done.kv_len == 0 {
             // No KV ever allocated (admitted but never prefilled?)
-            if let Some(node) = done.cached_node {
-                if let Some(cache) = radix_cache.as_deref_mut() {
-                    cache.dec_lock_ref(node);
-                }
+            if let Some(node) = done.cached_node
+                && let Some(cache) = radix_cache.as_deref_mut()
+            {
+                cache.dec_lock_ref(node);
             }
             if let Err(err) = req_pool.free(done.slot) {
                 log::warn!("req_pool free failed for slot {}: {err}", done.slot);
@@ -232,10 +221,10 @@ pub fn process_batch_result_with_cache(
                     done.slot,
                     done.kv_len
                 );
-                if let Some(node) = done.cached_node {
-                    if let Some(cache) = radix_cache.as_deref_mut() {
-                        cache.dec_lock_ref(node);
-                    }
+                if let Some(node) = done.cached_node
+                    && let Some(cache) = radix_cache.as_deref_mut()
+                {
+                    cache.dec_lock_ref(node);
                 }
                 if let Err(err) = req_pool.free(done.slot) {
                     log::warn!("req_pool free failed for slot {}: {err}", done.slot);
@@ -247,10 +236,10 @@ pub fn process_batch_result_with_cache(
 
         // Release the admission-time lock first so the cache sees the
         // prefix as evictable while we insert the suffix.
-        if let Some(node) = done.cached_node {
-            if let Some(cache) = radix_cache.as_deref_mut() {
-                cache.dec_lock_ref(node);
-            }
+        if let Some(node) = done.cached_node
+            && let Some(cache) = radix_cache.as_deref_mut()
+        {
+            cache.dec_lock_ref(node);
         }
 
         // Graft the full (tokens, slots) span into the cache.  The
@@ -282,7 +271,7 @@ pub fn process_batch_result_with_cache(
         //     as a new leaf.  Cache OWNS these too.  Not freed.
         if radix_cache.is_some() {
             let new_prefix_len = duplicates.len();
-            let protected = (done.prefix_len_from_cache as usize).min(new_prefix_len);
+            let protected = done.prefix_len_from_cache.min(new_prefix_len);
             if new_prefix_len > protected {
                 page_tracker.free_i32(&slot_indices[protected..new_prefix_len]);
             }
@@ -420,9 +409,7 @@ fn apply_decode_deferred_alloc(
         return;
     };
     let Some(seq_lens_minus1) = da.seq_lens_minus1.as_ref().and_then(|t| t.as_i64()) else {
-        log::warn!(
-            "deferred_alloc.seq_lens_minus1 missing for decode mode; skipping writeback"
-        );
+        log::warn!("deferred_alloc.seq_lens_minus1 missing for decode mode; skipping writeback");
         return;
     };
 
@@ -450,9 +437,7 @@ fn apply_decode_deferred_alloc(
         let slot_u32 = slot as u32;
         let col_u32 = col as u32;
         if let Err(err) = req_pool.write(slot_u32, col_u32, &out_cache_loc_owned[i..=i]) {
-            log::warn!(
-                "decode writeback failed for slot {slot_u32} col {col_u32}: {err}"
-            );
+            log::warn!("decode writeback failed for slot {slot_u32} col {col_u32}: {err}");
         }
     }
 }
@@ -479,7 +464,10 @@ fn finish_reason_to_value(reason: &FinishReason) -> Value {
             ("message".into(), Value::from(message.clone())),
         ],
         FinishReason::Retracted => {
-            vec![("type".into(), Value::from("abort")), ("message".into(), Value::from("retracted"))]
+            vec![
+                ("type".into(), Value::from("abort")),
+                ("message".into(), Value::from("retracted")),
+            ]
         }
         FinishReason::Internal { message } => vec![
             ("type".into(), Value::from("abort")),

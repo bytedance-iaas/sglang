@@ -11,11 +11,10 @@
 use std::collections::HashSet;
 
 use sglang_scheduler::queue::WaitingQueue;
-use sglang_scheduler::scheduler::{drain_into, WorkerSnapshot};
+use sglang_scheduler::scheduler::{WorkerSnapshot, drain_into};
 use sglang_scheduler::transport::{PullSource, PushSink};
 use sglang_scheduler::wire::{
-    AbortReq, GPUWorkerHandshakeReqOutput, SamplingParamsIPC,
-    TokenizedGenerateReqInput, Wire,
+    AbortReq, GPUWorkerHandshakeReqOutput, SamplingParamsIPC, TokenizedGenerateReqInput, Wire,
 };
 
 fn snapshot_with(eos: Option<Vec<i64>>, context_len: i64) -> WorkerSnapshot {

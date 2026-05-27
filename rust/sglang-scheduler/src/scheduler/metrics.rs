@@ -112,7 +112,9 @@ impl SchedulerMetrics {
         self.forward_ct_decode += 1;
 
         if decode_log_interval == 0
-            || self.forward_ct_decode % decode_log_interval as u64 != 0
+            || !self
+                .forward_ct_decode
+                .is_multiple_of(decode_log_interval as u64)
         {
             return None;
         }

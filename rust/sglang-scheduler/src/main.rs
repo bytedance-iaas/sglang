@@ -10,7 +10,7 @@
 
 use clap::Parser;
 
-use sglang_scheduler::scheduler::{run_event_loop, SchedulerConfig};
+use sglang_scheduler::scheduler::{SchedulerConfig, run_event_loop};
 
 /// Rust port of SGLang's CPU-only scheduler.
 #[derive(Debug, Parser)]

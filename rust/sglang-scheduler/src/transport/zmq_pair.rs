@@ -70,8 +70,7 @@ impl Transport {
     /// msgspec.Struct branch.
     pub fn send(&self, obj: &Wire) -> Result<(), TransportError> {
         let bytes = rmp_serde::to_vec_named(obj)?;
-        self.socket
-            .send_multipart([MSGPACK_MAGIC, &bytes], 0)?;
+        self.socket.send_multipart([MSGPACK_MAGIC, &bytes], 0)?;
         Ok(())
     }
 
@@ -183,8 +182,7 @@ impl PushSink {
 
     pub fn send(&self, obj: &Wire) -> Result<(), TransportError> {
         let bytes = rmp_serde::to_vec_named(obj)?;
-        self.socket
-            .send_multipart([MSGPACK_MAGIC, &bytes], 0)?;
+        self.socket.send_multipart([MSGPACK_MAGIC, &bytes], 0)?;
         Ok(())
     }
 }

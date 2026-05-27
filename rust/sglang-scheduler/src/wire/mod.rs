@@ -42,24 +42,23 @@ pub use lora::{
 };
 pub use mem_usage::{GetMemUsageReqInput, GetMemUsageReqOutput};
 pub use model_worker_batch::{
-    capture_hidden_mode_wire, forward_mode_wire, ModelWorkerBatchPayload,
-    SamplingBatchInfoPayload, SamplingParamsView,
+    ModelWorkerBatchPayload, SamplingBatchInfoPayload, SamplingParamsView,
+    capture_hidden_mode_wire, forward_mode_wire,
 };
 pub use tensor_ipc::TensorIPC;
 pub use tokenizer::{
-    AbortReq, BatchTokenizedEmbeddingReqInput, BatchTokenizedGenerateReqInput,
-    SamplingParamsIPC, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput,
+    AbortReq, BatchTokenizedEmbeddingReqInput, BatchTokenizedGenerateReqInput, SamplingParamsIPC,
+    TokenizedEmbeddingReqInput, TokenizedGenerateReqInput,
 };
 pub use weights::{
     DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput, GetWeightsByNameReqOutput,
-    InitWeightsSendGroupForRemoteInstanceReqInput,
-    InitWeightsSendGroupForRemoteInstanceReqOutput, InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput, SendWeightsToRemoteInstanceReqInput,
-    SendWeightsToRemoteInstanceReqOutput, UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput, UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput, UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromIPCReqOutput, UpdateWeightsFromTensorReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput, InitWeightsSendGroupForRemoteInstanceReqOutput,
+    InitWeightsUpdateGroupReqInput, InitWeightsUpdateGroupReqOutput,
+    SendWeightsToRemoteInstanceReqInput, SendWeightsToRemoteInstanceReqOutput,
+    UpdateWeightFromDiskReqInput, UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput, UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput, UpdateWeightsFromIPCReqOutput, UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput, WeightOpOutput,
 };
 
@@ -99,12 +98,8 @@ pub enum Wire {
     InitWeightsUpdateGroupReqOutput(InitWeightsUpdateGroupReqOutput),
     DestroyWeightsUpdateGroupReqInput(DestroyWeightsUpdateGroupReqInput),
     DestroyWeightsUpdateGroupReqOutput(DestroyWeightsUpdateGroupReqOutput),
-    InitWeightsSendGroupForRemoteInstanceReqInput(
-        InitWeightsSendGroupForRemoteInstanceReqInput,
-    ),
-    InitWeightsSendGroupForRemoteInstanceReqOutput(
-        InitWeightsSendGroupForRemoteInstanceReqOutput,
-    ),
+    InitWeightsSendGroupForRemoteInstanceReqInput(InitWeightsSendGroupForRemoteInstanceReqInput),
+    InitWeightsSendGroupForRemoteInstanceReqOutput(InitWeightsSendGroupForRemoteInstanceReqOutput),
     SendWeightsToRemoteInstanceReqInput(SendWeightsToRemoteInstanceReqInput),
     SendWeightsToRemoteInstanceReqOutput(SendWeightsToRemoteInstanceReqOutput),
     UpdateWeightsFromDistributedReqInput(UpdateWeightsFromDistributedReqInput),
@@ -147,35 +142,23 @@ impl Wire {
             Wire::ForwardBatchSplitPrefillReq(_) => "ForwardBatchSplitPrefillReq",
             Wire::LoadLoRAAdapterReqInput(_) => "LoadLoRAAdapterReqInput",
             Wire::UnloadLoRAAdapterReqInput(_) => "UnloadLoRAAdapterReqInput",
-            Wire::LoadLoRAAdapterFromTensorsReqInput(_) => {
-                "LoadLoRAAdapterFromTensorsReqInput"
-            }
+            Wire::LoadLoRAAdapterFromTensorsReqInput(_) => "LoadLoRAAdapterFromTensorsReqInput",
             Wire::LoRAUpdateOutput(_) => "LoRAUpdateOutput",
             Wire::UpdateWeightFromDiskReqInput(_) => "UpdateWeightFromDiskReqInput",
             Wire::UpdateWeightFromDiskReqOutput(_) => "UpdateWeightFromDiskReqOutput",
             Wire::InitWeightsUpdateGroupReqInput(_) => "InitWeightsUpdateGroupReqInput",
             Wire::InitWeightsUpdateGroupReqOutput(_) => "InitWeightsUpdateGroupReqOutput",
-            Wire::DestroyWeightsUpdateGroupReqInput(_) => {
-                "DestroyWeightsUpdateGroupReqInput"
-            }
-            Wire::DestroyWeightsUpdateGroupReqOutput(_) => {
-                "DestroyWeightsUpdateGroupReqOutput"
-            }
+            Wire::DestroyWeightsUpdateGroupReqInput(_) => "DestroyWeightsUpdateGroupReqInput",
+            Wire::DestroyWeightsUpdateGroupReqOutput(_) => "DestroyWeightsUpdateGroupReqOutput",
             Wire::InitWeightsSendGroupForRemoteInstanceReqInput(_) => {
                 "InitWeightsSendGroupForRemoteInstanceReqInput"
             }
             Wire::InitWeightsSendGroupForRemoteInstanceReqOutput(_) => {
                 "InitWeightsSendGroupForRemoteInstanceReqOutput"
             }
-            Wire::SendWeightsToRemoteInstanceReqInput(_) => {
-                "SendWeightsToRemoteInstanceReqInput"
-            }
-            Wire::SendWeightsToRemoteInstanceReqOutput(_) => {
-                "SendWeightsToRemoteInstanceReqOutput"
-            }
-            Wire::UpdateWeightsFromDistributedReqInput(_) => {
-                "UpdateWeightsFromDistributedReqInput"
-            }
+            Wire::SendWeightsToRemoteInstanceReqInput(_) => "SendWeightsToRemoteInstanceReqInput",
+            Wire::SendWeightsToRemoteInstanceReqOutput(_) => "SendWeightsToRemoteInstanceReqOutput",
+            Wire::UpdateWeightsFromDistributedReqInput(_) => "UpdateWeightsFromDistributedReqInput",
             Wire::UpdateWeightsFromDistributedReqOutput(_) => {
                 "UpdateWeightsFromDistributedReqOutput"
             }

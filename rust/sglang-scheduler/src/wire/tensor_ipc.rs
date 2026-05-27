@@ -62,6 +62,9 @@ impl TensorIPC {
         // Safety: `int64` tensors arrive packed little-endian with no
         // alignment padding from PyTorch's storage; on a little-endian
         // host (all sglang targets) the cast is sound.
+        if self.numel() == 0 {
+            return Some(&[]);
+        }
         let ptr = bytes.as_ptr() as *const i64;
         Some(unsafe { std::slice::from_raw_parts(ptr, self.numel()) })
     }
@@ -75,6 +78,9 @@ impl TensorIPC {
         if bytes.len() != self.numel() * 4 {
             return None;
         }
+        if self.numel() == 0 {
+            return Some(&[]);
+        }
         let ptr = bytes.as_ptr() as *const i32;
         Some(unsafe { std::slice::from_raw_parts(ptr, self.numel()) })
     }
@@ -85,7 +91,11 @@ impl TensorIPC {
         for v in values {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        TensorIPC(vec![values.len() as i64], "int64".into(), ByteBuf::from(buf))
+        TensorIPC(
+            vec![values.len() as i64],
+            "int64".into(),
+            ByteBuf::from(buf),
+        )
     }
 
     /// Construct from an i32 slice with a 1-D shape.
@@ -94,7 +104,11 @@ impl TensorIPC {
         for v in values {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        TensorIPC(vec![values.len() as i64], "int32".into(), ByteBuf::from(buf))
+        TensorIPC(
+            vec![values.len() as i64],
+            "int32".into(),
+            ByteBuf::from(buf),
+        )
     }
 
     /// Construct from an i32 slice with a 2-D shape `[rows, cols]`.

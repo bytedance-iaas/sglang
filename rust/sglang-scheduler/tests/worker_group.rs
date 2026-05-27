@@ -21,8 +21,8 @@ use std::thread;
 
 use sglang_scheduler::scheduler::WorkerClientGroup;
 use sglang_scheduler::wire::{
-    DecodeForwardSlimOutput, GPUWorkerHandshakeReqOutput, GetMemUsageReqOutput,
-    LoRAUpdateOutput, TensorIPC, UnloadLoRAAdapterReqInput, Wire,
+    DecodeForwardSlimOutput, GPUWorkerHandshakeReqOutput, GetMemUsageReqOutput, LoRAUpdateOutput,
+    TensorIPC, UnloadLoRAAdapterReqInput, Wire,
 };
 
 /// Fake worker: bind a PAIR endpoint and respond to each request with a
@@ -206,10 +206,7 @@ fn broadcast_all_confirm_collects_every_reply() {
     let mut handles = Vec::new();
     // handshake + unload_lora.  All three workers report success.
     for (i, ep) in endpoints.iter().enumerate() {
-        let replies = vec![
-            handshake_reply(i as i64, 32000),
-            unload_lora_reply(true),
-        ];
+        let replies = vec![handshake_reply(i as i64, 32000), unload_lora_reply(true)];
         handles.push(spawn_fake_worker(
             ctx.clone(),
             ep.clone(),

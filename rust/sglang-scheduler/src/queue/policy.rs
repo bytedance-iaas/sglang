@@ -71,20 +71,18 @@ impl SchedulePolicy {
     pub fn order_with_cache(
         &self,
         reqs: &[Arc<RwLock<Req>>],
-        cache: Option<&RadixCache>,
+        mut cache: Option<&mut RadixCache>,
     ) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..reqs.len()).collect();
         match self.kind {
             SchedulePolicyKind::Fcfs => {}
             SchedulePolicyKind::Lof => {
-                idx.sort_by_key(|&i| {
-                    reqs[i].read().unwrap().sampling_params.max_new_tokens
-                });
+                idx.sort_by_key(|&i| reqs[i].read().unwrap().sampling_params.max_new_tokens);
             }
             SchedulePolicyKind::LongestPrefix => {
                 // Sort by prefix match length, descending.  Ties break
                 // by arrival order (stable sort).
-                if let Some(cache) = cache {
+                if let Some(cache) = cache.as_deref_mut() {
                     let scores: Vec<usize> = reqs
                         .iter()
                         .map(|r| {

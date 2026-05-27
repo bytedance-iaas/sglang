@@ -145,15 +145,15 @@ impl Req {
             });
             return self.finished_reason.as_ref();
         }
-        if let Some(stop_ids) = &self.sampling_params.stop_token_ids {
-            if let Some(&last) = self.output_ids.last() {
-                if stop_ids.contains(&last) && !self.sampling_params.no_stop_trim {
-                    self.finished_reason = Some(FinishReason::MatchedToken {
-                        token_id: last as i64,
-                    });
-                    return self.finished_reason.as_ref();
-                }
-            }
+        if let Some(stop_ids) = &self.sampling_params.stop_token_ids
+            && let Some(&last) = self.output_ids.last()
+            && stop_ids.contains(&last)
+            && !self.sampling_params.no_stop_trim
+        {
+            self.finished_reason = Some(FinishReason::MatchedToken {
+                token_id: last as i64,
+            });
+            return self.finished_reason.as_ref();
         }
         None
     }

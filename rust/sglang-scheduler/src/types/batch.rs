@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::types::{forward_mode::ForwardMode, req::Req};
 use crate::wire::{
-    forward_mode_wire, ModelWorkerBatchPayload, SamplingBatchInfoPayload, TensorIPC,
+    ModelWorkerBatchPayload, SamplingBatchInfoPayload, TensorIPC, forward_mode_wire,
 };
 
 /// Mutable in-scheduler batch.  Tracks the running set of requests and
@@ -323,7 +323,11 @@ impl ScheduleBatch {
                     .reqs
                     .iter()
                     .any(|r| r.read().unwrap().return_hidden_states);
-                Some(if any_return_hidden { chm::FULL } else { chm::NULL })
+                Some(if any_return_hidden {
+                    chm::FULL
+                } else {
+                    chm::NULL
+                })
             },
             hicache_consumer_index: -1,
             dimensions: None,
@@ -387,9 +391,7 @@ fn build_req_to_token_cpu(
         match pool.read(slot, pool.max_context_len()) {
             Ok(row) => buf.extend_from_slice(row),
             Err(err) => {
-                log::warn!(
-                    "req_to_token_cpu snapshot: failed to read slot {slot}: {err}"
-                );
+                log::warn!("req_to_token_cpu snapshot: failed to read slot {slot}: {err}");
                 // Zero-fill on read failure so the tensor shape stays
                 // consistent with `req_pool_indices.len()`.
                 buf.extend(std::iter::repeat_n(0i32, max_ctx));

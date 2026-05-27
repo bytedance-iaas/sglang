@@ -50,19 +50,17 @@
 use crate::transport::{Transport, TransportError};
 use crate::wire::{
     DecodeForwardSlimOutput, DecodeStepControlReq, DestroyWeightsUpdateGroupReqInput,
-    DestroyWeightsUpdateGroupReqOutput, ForwardBatchEmbeddingReq,
-    ForwardBatchGenerationReq, ForwardBatchSplitPrefillReq, GPUWorkerHandshakeReqInput,
-    GPUWorkerHandshakeReqOutput, GetMemUsageReqInput, GetMemUsageReqOutput,
-    GetWeightsByNameReqInput, GetWeightsByNameReqOutput,
-    InitWeightsSendGroupForRemoteInstanceReqInput,
-    InitWeightsSendGroupForRemoteInstanceReqOutput, InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput, LoRAUpdateOutput, LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterReqInput, SendWeightsToRemoteInstanceReqInput,
-    SendWeightsToRemoteInstanceReqOutput, UnloadLoRAAdapterReqInput,
-    UpdateWeightFromDiskReqInput, UpdateWeightFromDiskReqOutput,
+    DestroyWeightsUpdateGroupReqOutput, ForwardBatchEmbeddingReq, ForwardBatchGenerationReq,
+    ForwardBatchSplitPrefillReq, GPUWorkerHandshakeReqInput, GPUWorkerHandshakeReqOutput,
+    GetMemUsageReqInput, GetMemUsageReqOutput, GetWeightsByNameReqInput, GetWeightsByNameReqOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput, InitWeightsSendGroupForRemoteInstanceReqOutput,
+    InitWeightsUpdateGroupReqInput, InitWeightsUpdateGroupReqOutput, LoRAUpdateOutput,
+    LoadLoRAAdapterFromTensorsReqInput, LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceReqInput, SendWeightsToRemoteInstanceReqOutput,
+    UnloadLoRAAdapterReqInput, UpdateWeightFromDiskReqInput, UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput, UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromIPCReqInput, UpdateWeightsFromIPCReqOutput,
-    UpdateWeightsFromTensorReqInput, UpdateWeightsFromTensorReqOutput, Wire,
+    UpdateWeightsFromIPCReqInput, UpdateWeightsFromIPCReqOutput, UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput, Wire,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -353,8 +351,8 @@ impl WorkerClientGroup {
     // ------------------------------------------------------------------
 
     pub fn get_mem_usage(&self) -> Result<GetMemUsageReqOutput, WorkerClientError> {
-        let reply = self
-            .broadcast_leader_only(Wire::GetMemUsageReqInput(GetMemUsageReqInput::default()))?;
+        let reply =
+            self.broadcast_leader_only(Wire::GetMemUsageReqInput(GetMemUsageReqInput::default()))?;
         expect_variant!(reply, GetMemUsageReqOutput)
     }
 
@@ -394,8 +392,7 @@ impl WorkerClientGroup {
         &self,
         req: LoadLoRAAdapterFromTensorsReqInput,
     ) -> Result<LoRAUpdateOutput, WorkerClientError> {
-        let replies =
-            self.broadcast_all_confirm(Wire::LoadLoRAAdapterFromTensorsReqInput(req))?;
+        let replies = self.broadcast_all_confirm(Wire::LoadLoRAAdapterFromTensorsReqInput(req))?;
         expect_first_and_check_all_match!(
             replies,
             LoRAUpdateOutput,
@@ -435,8 +432,7 @@ impl WorkerClientGroup {
         &self,
         req: DestroyWeightsUpdateGroupReqInput,
     ) -> Result<DestroyWeightsUpdateGroupReqOutput, WorkerClientError> {
-        let replies =
-            self.broadcast_all_confirm(Wire::DestroyWeightsUpdateGroupReqInput(req))?;
+        let replies = self.broadcast_all_confirm(Wire::DestroyWeightsUpdateGroupReqInput(req))?;
         expect_first_and_check_all_match!(
             replies,
             DestroyWeightsUpdateGroupReqOutput,
@@ -448,8 +444,8 @@ impl WorkerClientGroup {
         &self,
         req: InitWeightsSendGroupForRemoteInstanceReqInput,
     ) -> Result<InitWeightsSendGroupForRemoteInstanceReqOutput, WorkerClientError> {
-        let replies = self
-            .broadcast_all_confirm(Wire::InitWeightsSendGroupForRemoteInstanceReqInput(req))?;
+        let replies =
+            self.broadcast_all_confirm(Wire::InitWeightsSendGroupForRemoteInstanceReqInput(req))?;
         expect_first_and_check_all_match!(
             replies,
             InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -461,8 +457,7 @@ impl WorkerClientGroup {
         &self,
         req: SendWeightsToRemoteInstanceReqInput,
     ) -> Result<SendWeightsToRemoteInstanceReqOutput, WorkerClientError> {
-        let replies =
-            self.broadcast_all_confirm(Wire::SendWeightsToRemoteInstanceReqInput(req))?;
+        let replies = self.broadcast_all_confirm(Wire::SendWeightsToRemoteInstanceReqInput(req))?;
         expect_first_and_check_all_match!(
             replies,
             SendWeightsToRemoteInstanceReqOutput,
@@ -487,8 +482,7 @@ impl WorkerClientGroup {
         &self,
         req: UpdateWeightsFromTensorReqInput,
     ) -> Result<UpdateWeightsFromTensorReqOutput, WorkerClientError> {
-        let replies =
-            self.broadcast_all_confirm(Wire::UpdateWeightsFromTensorReqInput(req))?;
+        let replies = self.broadcast_all_confirm(Wire::UpdateWeightsFromTensorReqInput(req))?;
         expect_first_and_check_all_match!(
             replies,
             UpdateWeightsFromTensorReqOutput,
@@ -543,4 +537,3 @@ fn check_handshake_parity(
     check!(context_len);
     check!(is_generation);
 }
-

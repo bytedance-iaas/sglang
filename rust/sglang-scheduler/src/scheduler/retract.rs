@@ -134,21 +134,20 @@ pub fn retract_decode_with_cache(
             {
                 let mut req = req_arc.write().unwrap();
                 req.finished_reason = Some(FinishReason::Internal {
-                    message:
-                        "Out of memory even after retracting all other requests".into(),
+                    message: "Out of memory even after retracting all other requests".into(),
                 });
-                if let Some(node) = req.cached_node.take() {
-                    if let Some(cache) = radix_cache.as_deref_mut() {
-                        cache.dec_lock_ref(node);
-                    }
+                if let Some(node) = req.cached_node.take()
+                    && let Some(cache) = radix_cache.as_deref_mut()
+                {
+                    cache.dec_lock_ref(node);
                 }
                 if let Some(slot) = req.req_pool_idx.take() {
                     let len = req.kv_allocated_len;
-                    if len > 0 {
-                        if let Ok(slot_indices) = req_pool.read(slot, len) {
-                            let owned = slot_indices.to_vec();
-                            page_tracker.free_i32(&owned);
-                        }
+                    if len > 0
+                        && let Ok(slot_indices) = req_pool.read(slot, len)
+                    {
+                        let owned = slot_indices.to_vec();
+                        page_tracker.free_i32(&owned);
                     }
                     let _ = req_pool.free(slot);
                 }
@@ -172,18 +171,18 @@ pub fn retract_decode_with_cache(
         {
             let mut req = req_arc.write().unwrap();
             // Release the cache lock the admission step took.
-            if let Some(node) = req.cached_node.take() {
-                if let Some(cache) = radix_cache.as_deref_mut() {
-                    cache.dec_lock_ref(node);
-                }
+            if let Some(node) = req.cached_node.take()
+                && let Some(cache) = radix_cache.as_deref_mut()
+            {
+                cache.dec_lock_ref(node);
             }
             if let Some(slot) = req.req_pool_idx.take() {
                 let len = req.kv_allocated_len;
-                if len > 0 {
-                    if let Ok(slot_indices) = req_pool.read(slot, len) {
-                        let owned = slot_indices.to_vec();
-                        page_tracker.free_i32(&owned);
-                    }
+                if len > 0
+                    && let Ok(slot_indices) = req_pool.read(slot, len)
+                {
+                    let owned = slot_indices.to_vec();
+                    page_tracker.free_i32(&owned);
                 }
                 let _ = req_pool.free(slot);
             }

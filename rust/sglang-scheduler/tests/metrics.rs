@@ -57,9 +57,10 @@ fn decode_step_zero_interval_disables_logging() {
     let tracker = CpuPageTracker::new(8, PAGE);
     let batch = decode_batch(2);
     for _ in 0..50 {
-        assert!(m
-            .report_decode_step(&batch, 2, false, &tracker, 0, 0)
-            .is_none());
+        assert!(
+            m.report_decode_step(&batch, 2, false, &tracker, 0, 0)
+                .is_none()
+        );
     }
 }
 
@@ -77,7 +78,11 @@ fn decode_step_counts_tokens_across_interval() {
             emits.push(s);
         }
     }
-    assert_eq!(emits.len(), 2, "two emits expected for 8 steps @ interval 4");
+    assert_eq!(
+        emits.len(),
+        2,
+        "two emits expected for 8 steps @ interval 4"
+    );
 
     // The throughput-counter resets after each emit, so num_generated_tokens
     // must be 0 going into the next interval window.
@@ -116,8 +121,9 @@ fn decode_step_ignored_on_extend_batches() {
     batch.input_ids.extend(std::iter::repeat_n(1, 8));
 
     // report_decode_step should be a no-op when forward_mode is Extend.
-    assert!(m
-        .report_decode_step(&batch, 8, true, &tracker, 0, 1)
-        .is_none());
+    assert!(
+        m.report_decode_step(&batch, 8, true, &tracker, 0, 1)
+            .is_none()
+    );
     assert_eq!(m.forward_ct_decode, 0);
 }

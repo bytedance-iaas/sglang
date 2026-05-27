@@ -26,7 +26,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 #[pyclass(from_py_object, module = "sglang_scheduler")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SchedulerConfig {
     /// One ZMQ PAIR endpoint per TP rank.  Rank 0 is the leader (see
     /// `WorkerClientGroup`).  TP=1 callers pass a one-element list, or
@@ -79,14 +79,14 @@ impl SchedulerConfig {
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "pass exactly one of worker_ipc=<str> or worker_ipcs=<list[str]>, not both",
-                ))
+                ));
             }
             (Some(single), None) => vec![single],
             (None, Some(list)) => list,
             (None, None) => {
                 return Err(PyValueError::new_err(
                     "SchedulerConfig requires either worker_ipc=<str> or worker_ipcs=<list[str]>",
-                ))
+                ));
             }
         };
         if ipcs.is_empty() {
@@ -106,15 +106,5 @@ impl SchedulerConfig {
             "SchedulerConfig(worker_ipcs={:?}, tokenizer_ipc={:?}, detokenizer_ipc={:?})",
             self.worker_ipcs, self.tokenizer_ipc, self.detokenizer_ipc,
         )
-    }
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            worker_ipcs: Vec::new(),
-            tokenizer_ipc: String::new(),
-            detokenizer_ipc: String::new(),
-        }
     }
 }

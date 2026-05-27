@@ -80,11 +80,7 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
         hs.req_to_token_pool_max_context_len as u32,
     );
 
-    let builder = BatchBuilder::new(
-        page_size,
-        server_args.max_running_requests as usize,
-        policy,
-    );
+    let builder = BatchBuilder::new(page_size, server_args.max_running_requests as usize, policy);
 
     let mut waiting = WaitingQueue::new();
     let mut running = ScheduleBatch::new(ForwardMode::Decode);
@@ -198,8 +194,7 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
                     &mut radix_cache,
                     need,
                 );
-                if outcome.retracted_reqs + outcome.aborted > 0
-                    || outcome.evicted_cache_tokens > 0
+                if outcome.retracted_reqs + outcome.aborted > 0 || outcome.evicted_cache_tokens > 0
                 {
                     log::info!(
                         "iter {iter}: reclaim evicted={} tokens, retracted={} reqs, aborted={} reqs",
@@ -241,7 +236,7 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
             idle_iters_without_source = idle_iters_without_source.saturating_add(1);
             // Adaptive back-off: ramp from ~1ms to ~10ms after a string
             // of idle ticks so we don't burn CPU spinning.
-            let sleep_ms = (idle_iters_without_source.min(10)) as u64;
+            let sleep_ms = idle_iters_without_source.min(10);
             std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             continue;
         };
@@ -253,12 +248,11 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
         // 4. Build the wire payload and send it.  `vocab_size` and the
         //    worker `device` come off the cached handshake snapshot
         //    (see `WorkerSnapshot::from_handshake`).
-        let payload =
-            batch.to_model_worker_batch_payload(
-                snapshot.vocab_size,
-                &snapshot.device,
-                Some(&req_pool),
-            );
+        let payload = batch.to_model_worker_batch_payload(
+            snapshot.vocab_size,
+            &snapshot.device,
+            Some(&req_pool),
+        );
         let req = ForwardBatchGenerationReq {
             batch: payload.to_msgpack_value()?,
             pp_proxy_tensors: None,
@@ -279,10 +273,9 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
         // 5b. Stream the per-iteration output to the detokenizer.
         if let (Some(sink), Some(output)) =
             (detokenizer_sink.as_ref(), stats.detokenizer_output.take())
+            && let Err(err) = sink.send(&Wire::BatchTokenIDOutput(output))
         {
-            if let Err(err) = sink.send(&Wire::BatchTokenIDOutput(output)) {
-                log::warn!("failed to push BatchTokenIDOutput to detokenizer: {err}");
-            }
+            log::warn!("failed to push BatchTokenIDOutput to detokenizer: {err}");
         }
         log::debug!(
             "iter {iter}: generated={} finished={} cuda_graph={}",

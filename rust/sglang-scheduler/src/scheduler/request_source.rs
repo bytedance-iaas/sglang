@@ -19,8 +19,7 @@ use crate::scheduler::worker_snapshot::WorkerSnapshot;
 use crate::transport::{PullSource, TransportError};
 use crate::types::{Req, SamplingParams};
 use crate::wire::{
-    AbortReq, BatchTokenizedGenerateReqInput, SamplingParamsIPC, TokenizedGenerateReqInput,
-    Wire,
+    AbortReq, BatchTokenizedGenerateReqInput, SamplingParamsIPC, TokenizedGenerateReqInput, Wire,
 };
 
 #[derive(Debug, Default)]
@@ -62,8 +61,7 @@ pub fn drain_into(
                 outcome.admitted += 1;
             }
             Wire::BatchTokenizedGenerateReqInput(BatchTokenizedGenerateReqInput {
-                reqs,
-                ..
+                reqs, ..
             }) => {
                 for req in reqs {
                     let r = build_req(req, snapshot);
@@ -75,11 +73,8 @@ pub fn drain_into(
                 apply_abort(&abort, waiting, running_rids, &mut outcome);
                 outcome.aborted += 1;
             }
-            Wire::TokenizedEmbeddingReqInput(_)
-            | Wire::BatchTokenizedEmbeddingReqInput(_) => {
-                log::warn!(
-                    "embedding requests not yet supported by the Rust scheduler — dropping"
-                );
+            Wire::TokenizedEmbeddingReqInput(_) | Wire::BatchTokenizedEmbeddingReqInput(_) => {
+                log::warn!("embedding requests not yet supported by the Rust scheduler — dropping");
                 outcome.dropped_unsupported += 1;
             }
             other => {
@@ -107,8 +102,7 @@ fn build_req(input: TokenizedGenerateReqInput, snapshot: &WorkerSnapshot) -> Req
         synthetic
     });
 
-    let mut sampling_params =
-        sampling_from_wire(&input.sampling_params, input.return_logprob);
+    let mut sampling_params = sampling_from_wire(&input.sampling_params, input.return_logprob);
 
     // EOS fallback: if the tokenized request didn't ship any
     // stop_token_ids and the user didn't ask for `ignore_eos`, fall

@@ -57,14 +57,14 @@ impl WaitingQueue {
         &mut self,
         max_count: usize,
         policy: &SchedulePolicy,
-        cache: Option<&RadixCache>,
+        mut cache: Option<&mut RadixCache>,
     ) -> Vec<Arc<RwLock<Req>>> {
         if self.inner.is_empty() || max_count == 0 {
             return Vec::new();
         }
         let snapshot = self.as_slice();
         let take: Vec<usize> = policy
-            .order_with_cache(&snapshot, cache)
+            .order_with_cache(&snapshot, cache.as_deref_mut())
             .into_iter()
             .take(max_count)
             .collect();

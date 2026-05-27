@@ -24,17 +24,15 @@ pub mod worker_snapshot;
 
 pub use batch_builder::BatchBuilder;
 pub use config::SchedulerConfig;
-pub use dp_attn::{prepare_local_dp_attention_sync, DpSync};
+pub use dp_attn::{DpSync, prepare_local_dp_attention_sync};
 pub use event_loop::run_event_loop;
 pub use metrics::SchedulerMetrics;
-pub use session_controller::{Session, SessionController};
-pub use output_processor::{
-    process_batch_result, process_batch_result_with_cache, StepStats,
-};
-pub use request_source::{drain_into, RecvOutcome};
+pub use output_processor::{StepStats, process_batch_result, process_batch_result_with_cache};
+pub use request_source::{RecvOutcome, drain_into};
 pub use retract::{
-    evict_from_tree_cache, reclaim_for_decode, retract_decode, retract_decode_with_cache,
-    RetractionOutcome,
+    RetractionOutcome, evict_from_tree_cache, reclaim_for_decode, retract_decode,
+    retract_decode_with_cache,
 };
+pub use session_controller::{Session, SessionController};
 pub use worker_client::{WorkerClient, WorkerClientError, WorkerClientGroup};
 pub use worker_snapshot::WorkerSnapshot;

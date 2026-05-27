@@ -17,7 +17,7 @@
 
 use rmpv::Value;
 use sglang_scheduler::wire::{
-    forward_mode_wire, ModelWorkerBatchPayload, SamplingBatchInfoPayload, TensorIPC,
+    ModelWorkerBatchPayload, SamplingBatchInfoPayload, TensorIPC, forward_mode_wire,
 };
 
 fn minimal_payload() -> ModelWorkerBatchPayload {
@@ -161,7 +161,10 @@ fn sampling_info_is_nested_map() {
             "sampling_info missing {required:?}"
         );
     }
-    assert_eq!(map_get(si_map, "device").and_then(Value::as_str), Some("cuda:0"));
+    assert_eq!(
+        map_get(si_map, "device").and_then(Value::as_str),
+        Some("cuda:0")
+    );
 }
 
 #[test]
@@ -187,9 +190,9 @@ fn wire_dtypes_match_python_expectations() {
     //   * seq_lens_cpu     — torch.int64  (schedule_batch.py:1602)
     //   * orig_seq_lens    — torch.int32  (schedule_batch.py:1709)
     //   * req_to_token_cpu — torch.int32  (memory_pool.py:149)
-    use std::sync::{Arc, RwLock};
     use sglang_scheduler::memory::ReqToTokenPool;
     use sglang_scheduler::types::{ForwardMode, Req, SamplingParams, ScheduleBatch};
+    use std::sync::{Arc, RwLock};
 
     let mut batch = ScheduleBatch::new(ForwardMode::Extend);
     let mut sp = SamplingParams::default();
@@ -204,20 +207,26 @@ fn wire_dtypes_match_python_expectations() {
     let pool = ReqToTokenPool::new(8, 64);
     let payload = batch.to_model_worker_batch_payload(32000, "cuda:0", Some(&pool));
 
-    assert_eq!(payload.input_ids.dtype(), "int64",
-        "input_ids MUST be int64 (nn.Embedding requires Long)");
+    assert_eq!(
+        payload.input_ids.dtype(),
+        "int64",
+        "input_ids MUST be int64 (nn.Embedding requires Long)"
+    );
     assert_eq!(payload.req_pool_indices.dtype(), "int64");
     assert_eq!(payload.seq_lens.dtype(), "int64");
     assert_eq!(payload.seq_lens_cpu.as_ref().unwrap().dtype(), "int64");
-    assert_eq!(payload.orig_seq_lens.as_ref().unwrap().dtype(), "int32",
-        "orig_seq_lens MUST be int32");
+    assert_eq!(
+        payload.orig_seq_lens.as_ref().unwrap().dtype(),
+        "int32",
+        "orig_seq_lens MUST be int32"
+    );
 }
 
 #[test]
 fn capture_hidden_mode_full_when_any_req_returns_hidden_states() {
-    use std::sync::{Arc, RwLock};
     use sglang_scheduler::types::{ForwardMode, Req, SamplingParams, ScheduleBatch};
     use sglang_scheduler::wire::capture_hidden_mode_wire as chm;
+    use std::sync::{Arc, RwLock};
 
     fn req_with_hidden(rid: &str, return_hidden: bool) -> Arc<RwLock<Req>> {
         let mut r = Req::new(rid.into(), vec![1, 2, 3], SamplingParams::default());
@@ -264,7 +273,10 @@ fn sampling_info_from_per_req_params_sets_need_flags() {
         },
     ];
     let info = SamplingBatchInfoPayload::from_sampling_params(views.into_iter(), 32000, "cuda:0");
-    assert!(info.need_top_p_sampling, "0.9 != 1.0 → top_p sampling required");
+    assert!(
+        info.need_top_p_sampling,
+        "0.9 != 1.0 → top_p sampling required"
+    );
     assert!(info.need_top_k_sampling, "top_k=50 is not TOP_K_ALL");
     assert!(info.need_min_p_sampling, "0.05 > 0");
     assert!(!info.is_all_greedy, "top_k=50 means non-greedy");

@@ -36,11 +36,7 @@ pub struct BatchBuilder {
 }
 
 impl BatchBuilder {
-    pub fn new(
-        page_size: i64,
-        max_running_requests: usize,
-        policy: SchedulePolicy,
-    ) -> Self {
+    pub fn new(page_size: i64, max_running_requests: usize, policy: SchedulePolicy) -> Self {
         Self {
             page_size,
             max_running_requests,
@@ -89,13 +85,7 @@ impl BatchBuilder {
         page_tracker: &CpuPageTracker,
         req_pool: &mut ReqToTokenPool,
     ) -> Option<ScheduleBatch> {
-        self.get_new_batch_prefill_with_cache(
-            running,
-            waiting,
-            page_tracker,
-            req_pool,
-            None,
-        )
+        self.get_new_batch_prefill_with_cache(running, waiting, page_tracker, req_pool, None)
     }
 
     /// Variant of `get_new_batch_prefill` that consults the radix cache
@@ -113,8 +103,9 @@ impl BatchBuilder {
         if waiting.is_empty() {
             return None;
         }
-        let remaining_run_slots =
-            self.max_running_requests.saturating_sub(running.batch_size());
+        let remaining_run_slots = self
+            .max_running_requests
+            .saturating_sub(running.batch_size());
         let remaining_pool_slots = req_pool.available_size() as usize;
         let admission_cap = remaining_run_slots.min(remaining_pool_slots);
         if admission_cap == 0 {
@@ -129,11 +120,8 @@ impl BatchBuilder {
         let mut admitted: Vec<Arc<RwLock<Req>>> = Vec::new();
         let mut accumulated_tokens: i64 = 0;
 
-        let drained = waiting.drain_with_cache(
-            admission_cap,
-            &self.policy,
-            radix_cache.as_deref().map(|c| &*c),
-        );
+        let drained =
+            waiting.drain_with_cache(admission_cap, &self.policy, radix_cache.as_deref_mut());
         for req_arc in drained {
             // Account for prefix reuse: a req with a 100-token prompt
             // and a 60-token cached prefix only needs 40 new KV slots.
@@ -147,7 +135,7 @@ impl BatchBuilder {
             let (total_len, prefix_len) = {
                 let r = req_arc.read().unwrap();
                 let total = r.origin_input_ids.len() as i64;
-                let raw = match radix_cache.as_deref() {
+                let raw = match radix_cache.as_deref_mut() {
                     Some(cache) => cache.match_prefix(&r.origin_input_ids).prefix_len as i64,
                     None => 0,
                 };
@@ -235,12 +223,10 @@ impl BatchBuilder {
                 // `to_model_worker_batch_payload` snapshot copies this
                 // row into `req_to_token_cpu` so the worker can write
                 // it into `req_to_token_gpu` before its forward pass.
-                if !prefix_slots.is_empty() {
-                    if let Err(err) = req_pool.write(slot, 0, &prefix_slots) {
-                        log::warn!(
-                            "failed to plant cached prefix slots at slot {slot}: {err}"
-                        );
-                    }
+                if !prefix_slots.is_empty()
+                    && let Err(err) = req_pool.write(slot, 0, &prefix_slots)
+                {
+                    log::warn!("failed to plant cached prefix slots at slot {slot}: {err}");
                 }
             }
             batch.reqs.push(req_arc);

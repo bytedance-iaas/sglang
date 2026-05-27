@@ -134,11 +134,20 @@ fn reclaim_for_decode_prefers_cache_eviction_over_retraction() {
     batch.reqs.push(r.clone());
 
     // Stack the radix cache with plenty of evictable tokens.
-    cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &[201, 202, 203, 204, 205, 206, 207, 208]);
+    cache.insert(
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        &[201, 202, 203, 204, 205, 206, 207, 208],
+    );
     tracker.update_free_count(0);
 
-    let outcome =
-        reclaim_for_decode(&mut batch, &mut waiting, &mut tracker, &mut pool, &mut cache, 4);
+    let outcome = reclaim_for_decode(
+        &mut batch,
+        &mut waiting,
+        &mut tracker,
+        &mut pool,
+        &mut cache,
+        4,
+    );
     // Cache eviction should have produced enough; retraction
     // shouldn't have kicked in.
     assert!(outcome.evicted_cache_tokens >= 4);
@@ -187,7 +196,10 @@ fn process_batch_result_emits_detokenizer_output_frame() {
         .expect("non-empty batch must populate detokenizer_output");
 
     // Per-req shape.
-    assert_eq!(out.rids.as_ref().unwrap(), &vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(
+        out.rids.as_ref().unwrap(),
+        &vec!["alpha".to_string(), "beta".to_string()]
+    );
     assert_eq!(out.decode_ids, vec![vec![42i64], vec![99]]);
     assert_eq!(out.completion_tokens, vec![2, 2]); // 1 prior + 1 newly sampled
     assert_eq!(out.prompt_tokens, vec![4, 4]);
@@ -489,11 +501,7 @@ fn cached_prefix_admission_slices_input_ids_and_snapshots_req_to_token() {
     let req = Req::new("rid".into(), vec![10, 20, 30, 40, 50], sp);
     waiting.push(Arc::new(RwLock::new(req)));
 
-    let builder = BatchBuilder::new(
-        PAGE,
-        8,
-        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
-    );
+    let builder = BatchBuilder::new(PAGE, 8, SchedulePolicy::new(SchedulePolicyKind::Fcfs));
     let running = ScheduleBatch::new(ForwardMode::Extend);
     let batch = builder
         .get_new_batch_prefill_with_cache(
@@ -572,11 +580,7 @@ fn full_cache_hit_caps_prefix_at_input_len_minus_one() {
         sp,
     ))));
 
-    let builder = BatchBuilder::new(
-        PAGE,
-        8,
-        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
-    );
+    let builder = BatchBuilder::new(PAGE, 8, SchedulePolicy::new(SchedulePolicyKind::Fcfs));
     let running = ScheduleBatch::new(ForwardMode::Extend);
     let batch = builder
         .get_new_batch_prefill_with_cache(
@@ -642,11 +646,7 @@ fn extend_seq_lens_wire_field_is_extend_lens_not_seq_lens() {
         sp,
     ))));
 
-    let builder = BatchBuilder::new(
-        PAGE,
-        8,
-        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
-    );
+    let builder = BatchBuilder::new(PAGE, 8, SchedulePolicy::new(SchedulePolicyKind::Fcfs));
     let running = ScheduleBatch::new(ForwardMode::Extend);
     let batch = builder
         .get_new_batch_prefill_with_cache(
@@ -695,11 +695,7 @@ fn no_cached_prefix_skips_req_to_token_snapshot() {
     let req = Req::new("rid".into(), vec![10, 20, 30], sp);
     waiting.push(Arc::new(RwLock::new(req)));
 
-    let builder = BatchBuilder::new(
-        PAGE,
-        8,
-        SchedulePolicy::new(SchedulePolicyKind::Fcfs),
-    );
+    let builder = BatchBuilder::new(PAGE, 8, SchedulePolicy::new(SchedulePolicyKind::Fcfs));
     let running = ScheduleBatch::new(ForwardMode::Extend);
     let batch = builder
         .get_new_batch_prefill_with_cache(

@@ -53,10 +53,8 @@ use pyo3::types::PyDict;
 fn start_scheduler(py: Python<'_>, config: scheduler::SchedulerConfig) -> PyResult<()> {
     // Initialise env_logger once on the first call.  Subsequent calls
     // re-use the same global logger.
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
 
     py.detach(|| scheduler::run_event_loop(&config))
         .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{err}")))
@@ -106,10 +104,7 @@ fn peek_worker_handshake<'py>(
     dict.set_item("max_req_len", snapshot.max_req_len)?;
     dict.set_item("max_req_input_len", snapshot.max_req_input_len)?;
     dict.set_item("device", snapshot.device.clone())?;
-    dict.set_item(
-        "req_to_token_pool_size",
-        snapshot.req_to_token_pool_size,
-    )?;
+    dict.set_item("req_to_token_pool_size", snapshot.req_to_token_pool_size)?;
     dict.set_item(
         "req_to_token_pool_max_context_len",
         snapshot.req_to_token_pool_max_context_len,

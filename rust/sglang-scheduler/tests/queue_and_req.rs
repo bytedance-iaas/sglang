@@ -40,7 +40,10 @@ fn req_check_finished_stop_token() {
     assert!(r.check_finished().is_none());
     r.output_ids.push(42);
     let reason = r.check_finished().cloned();
-    assert!(matches!(reason, Some(FinishReason::MatchedToken { token_id: 42 })));
+    assert!(matches!(
+        reason,
+        Some(FinishReason::MatchedToken { token_id: 42 })
+    ));
 }
 
 #[test]

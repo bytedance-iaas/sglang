@@ -9,8 +9,8 @@
 
 use serde_bytes::ByteBuf;
 use sglang_scheduler::wire::{
-    DecodeForwardSlimOutput, DecodeStepControlReq, DeferredAllocIPC,
-    GPUWorkerHandshakeReqOutput, TensorIPC, Wire,
+    DecodeForwardSlimOutput, DecodeStepControlReq, DeferredAllocIPC, GPUWorkerHandshakeReqOutput,
+    TensorIPC, Wire,
 };
 
 fn roundtrip(w: Wire) -> Wire {
@@ -82,7 +82,10 @@ fn handshake_older_worker_decodes_with_defaults() {
         ("random_seed".into(), Value::from(0i64)),
         ("device".into(), Value::from("cpu")),
         ("req_to_token_pool_size".into(), Value::from(1i64)),
-        ("req_to_token_pool_max_context_len".into(), Value::from(1i64)),
+        (
+            "req_to_token_pool_max_context_len".into(),
+            Value::from(1i64),
+        ),
         ("token_to_kv_pool_size".into(), Value::from(1i64)),
     ];
     let val = Value::Map(map);
@@ -164,10 +167,7 @@ fn decode_forward_slim_output_roundtrips() {
             let da = o.deferred_alloc.as_ref().expect("deferred_alloc");
             assert_eq!(da.mode, "decode");
             assert_eq!(da.free_pages_remaining, 24000);
-            assert_eq!(
-                da.out_cache_loc.as_i32().expect("int32"),
-                &[160, 176][..]
-            );
+            assert_eq!(da.out_cache_loc.as_i32().expect("int32"), &[160, 176][..]);
         }
         other => panic!("wrong variant after roundtrip: {:?}", other),
     }
