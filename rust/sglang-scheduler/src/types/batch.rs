@@ -94,6 +94,19 @@ impl ScheduleBatch {
         self.reqs.is_empty()
     }
 
+    /// Merge another batch's requests and shape into this batch.
+    pub fn merge(&mut self, mut other: ScheduleBatch) {
+        self.reqs.append(&mut other.reqs);
+        self.req_pool_indices.append(&mut other.req_pool_indices);
+        self.seq_lens.append(&mut other.seq_lens);
+        self.orig_seq_lens.append(&mut other.orig_seq_lens);
+        self.input_ids.append(&mut other.input_ids);
+        self.indices_to_free.append(&mut other.indices_to_free);
+        self.return_logprob |= other.return_logprob;
+        self.has_grammar |= other.has_grammar;
+        self.has_stream |= other.has_stream;
+    }
+
     /// Remove all reqs whose `finished()` returns true.  Mirror of
     /// `ScheduleBatch.filter_batch` in `schedule_batch.py`, simplified
     /// to the common case (no `chunked_req_to_exclude`).

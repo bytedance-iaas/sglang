@@ -133,13 +133,29 @@ pub fn process_batch_result_with_cache(
         Some(BatchTokenIDOutput::with_capacity(batch.reqs.len()))
     };
 
-    for (i, &tok) in next_token_ids
-        .iter()
-        .take(batch.reqs.len())
-        .enumerate()
-    {
-        let mut req = batch.reqs[i].write().unwrap();
-        req.output_ids.push(tok as i32);
+    // Iterate batch.reqs (not next_token_ids) so a worker desync that
+    // ships a shorter `next_token_ids` still emits a frame entry for
+    // every req — the alternative is silently dropping reqs from the
+    // detokenizer stream, which manifests as missing tail tokens on
+    // the client side.
+    let n_tokens = next_token_ids.len();
+    for (i, req_arc) in batch.reqs.iter().enumerate() {
+        let mut req = req_arc.write().unwrap();
+
+        // Defensive: if the same req shows up again after we've already
+        // emitted its final frame, skip.  Python's
+        // `stream_output_generation` does the same via
+        // `req.finished_output`.  The synchronous Rust loop normally
+        // filters finished reqs out before the next batch, but the flag
+        // adds zero cost and matches Python's invariant exactly.
+        if req.finished_output {
+            continue;
+        }
+
+        let maybe_tok = if i < n_tokens { Some(next_token_ids[i]) } else { None };
+        if let Some(tok) = maybe_tok {
+            req.output_ids.push(tok as i32);
+        }
         let finish_reason_opt = req.check_finished().cloned();
         if let Some(reason) = &finish_reason_opt {
             stats.num_finished_reqs += 1;
@@ -167,6 +183,29 @@ pub fn process_batch_result_with_cache(
 
         // Emit one entry into the detokenizer output frame for this req.
         if let Some(o) = out.as_mut() {
+            // Slice `output_ids_through_stop[send_token_offset..]` —
+            // mirrors Python `stream_output_generation`.  Steady-state
+            // this is a single just-sampled token; at finish time it's
+            // every still-unsent token through (and including) the
+            // stop position.  The detokenizer trims the stop token via
+            // `trim_matched_stop_ids` when the finish reason carries
+            // an integer `matched` field, so we include it here.
+            let through_stop_len = req.output_ids_through_stop().len();
+            let start = (req.send_token_offset as usize).min(through_stop_len);
+            let new_slice: Vec<i64> = req.output_ids_through_stop()[start..]
+                .iter()
+                .map(|&v| v as i64)
+                .collect();
+            req.send_token_offset = through_stop_len as u32;
+            // Mark the finish frame so a (hypothetical) follow-up call
+            // for the same req would skip — see Python's
+            // `req.finished_output = True` above the same emit.
+            if finish_reason_opt.is_some() {
+                req.finished_output = true;
+            }
+
+            stats.num_generated_tokens += new_slice.len() as u64;
+
             o.rids
                 .as_mut()
                 .unwrap()
@@ -175,9 +214,10 @@ pub fn process_batch_result_with_cache(
             o.finished_reasons
                 .push(finish_reason_opt.as_ref().map(finish_reason_to_value));
             o.decoded_texts.push(String::new());
-            // One newly-sampled token per req per step.
-            let new_tok = tok;
-            o.decode_ids.push(vec![new_tok]);
+            // skip_tokenizer_init path: include the raw output id so
+            // the detokenizer manager can stream without re-decoding.
+            o.output_ids.as_mut().unwrap().push(new_slice.clone());
+            o.decode_ids.push(new_slice);
             o.read_offsets.push(0);
             o.skip_special_tokens
                 .push(req.sampling_params.skip_special_tokens);
@@ -186,18 +226,12 @@ pub fn process_batch_result_with_cache(
             o.no_stop_trim.push(req.sampling_params.no_stop_trim);
             o.prompt_tokens.push(req.origin_input_ids.len() as i64);
             o.reasoning_tokens.push(0);
-            o.completion_tokens.push(req.output_ids.len() as i64);
+            o.completion_tokens.push(through_stop_len as i64);
             o.cached_tokens
                 .push(req.prefix_len_from_cache as i64);
-            // skip_tokenizer_init path: include the raw output id so
-            // the detokenizer manager can stream without re-decoding.
-            o.output_ids
-                .as_mut()
-                .unwrap()
-                .push(vec![new_tok]);
+        } else if maybe_tok.is_some() {
+            stats.num_generated_tokens += 1;
         }
-
-        stats.num_generated_tokens += 1;
     }
 
     stats.detokenizer_output = out;

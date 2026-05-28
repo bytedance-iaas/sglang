@@ -98,6 +98,34 @@ pub struct Req {
     /// reqs to choose `CaptureHiddenMode::Full` vs `Null` (see
     /// `schedule_batch.py:2607`).
     pub return_hidden_states: bool,
+
+    /// How many of `output_ids` have already been pushed into a
+    /// `BatchTokenIDOutput` frame.  Mirrors Python `Req.send_token_offset`.
+    /// The next emit sends `output_ids_through_stop[send_token_offset..]`
+    /// — this is what lets a single frame carry several accumulated
+    /// tokens at finish time, even though the steady-state stream sends
+    /// one token per iter.  Without it, a finish-iter that wraps the
+    /// final sampled token AND any held-back tokens would drop the
+    /// held-back ones (the bug Python's `output_ids_through_stop`
+    /// machinery is there to prevent).
+    pub send_token_offset: u32,
+
+    /// Set true once the finish-frame for this req has been emitted.
+    /// Mirrors Python `Req.finished_output`.  Guards against a second
+    /// emit when the same req appears in the batch on the iter after
+    /// it finished (defensive — the synchronous Rust loop filters
+    /// finished reqs before the next batch, but the flag costs nothing
+    /// and matches Python's invariant).
+    pub finished_output: bool,
+
+    /// Cutoff for `output_ids_through_stop` — `output_ids[..finished_len]`.
+    /// Set by `check_finished` to:
+    ///   * `output_ids.len()` for length / abort / retracted finishes
+    ///     (every emitted token is real),
+    ///   * `matched_pos + 1` for stop-token matches (so the EOS token
+    ///     itself is included in the slice; the detokenizer trims it).
+    /// `None` while the req is still running.
+    pub finished_len: Option<u32>,
 }
 
 impl Req {
@@ -119,6 +147,23 @@ impl Req {
             cached_node: None,
             prefix_len_from_cache: 0,
             return_hidden_states: false,
+            send_token_offset: 0,
+            finished_output: false,
+            finished_len: None,
+        }
+    }
+
+    /// Mirror of Python `Req.output_ids_through_stop`: every output id
+    /// up to and including the stop position (if any), otherwise the
+    /// raw `output_ids`.  Used to build the per-frame token slice the
+    /// detokenizer ultimately trims and decodes.
+    pub fn output_ids_through_stop(&self) -> &[i32] {
+        match self.finished_len {
+            Some(n) => {
+                let n = (n as usize).min(self.output_ids.len());
+                &self.output_ids[..n]
+            }
+            None => &self.output_ids,
         }
     }
 
@@ -137,12 +182,18 @@ impl Req {
         }
         if let Some(reason) = self.to_finish.take() {
             self.finished_reason = Some(reason);
+            // Abort / retraction: every token already in output_ids
+            // counts as "real" (no stop position to trim).
+            if self.finished_len.is_none() {
+                self.finished_len = Some(self.output_ids.len() as u32);
+            }
             return self.finished_reason.as_ref();
         }
         if self.output_ids.len() >= self.sampling_params.max_new_tokens as usize {
             self.finished_reason = Some(FinishReason::Length {
                 length: self.sampling_params.max_new_tokens,
             });
+            self.finished_len = Some(self.sampling_params.max_new_tokens);
             return self.finished_reason.as_ref();
         }
         if let Some(stop_ids) = &self.sampling_params.stop_token_ids {
@@ -151,6 +202,11 @@ impl Req {
                     self.finished_reason = Some(FinishReason::MatchedToken {
                         token_id: last as i64,
                     });
+                    // Include the stop token itself — mirror Python's
+                    // `finished_len = matched_pos + 1`.  The detokenizer
+                    // strips it via `trim_matched_stop_ids` when the
+                    // finish reason has an integer `matched` field.
+                    self.finished_len = Some(self.output_ids.len() as u32);
                     return self.finished_reason.as_ref();
                 }
             }
@@ -175,6 +231,7 @@ impl Req {
         // Retracted reqs are not `finished` — they go back into the
         // waiting queue for a re-prefill.  Don't clear `output_ids`
         // here: the resumed prefill needs them to rebuild the prompt
-        // continuation.
+        // continuation.  Also keep `send_token_offset` so any tokens
+        // we already streamed aren't re-emitted on resume.
     }
 }

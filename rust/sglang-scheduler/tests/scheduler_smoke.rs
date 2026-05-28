@@ -968,3 +968,43 @@ fn prefill_admission_stalls_oversized_req_until_chunked_prefill_lands() {
     );
     assert_eq!(waiting.len(), 1, "oversized req returns to waiting queue");
 }
+
+#[test]
+fn test_batch_merge_and_filter_finished() {
+    let mut batch1 = ScheduleBatch::new(ForwardMode::Decode);
+    let mut batch2 = ScheduleBatch::new(ForwardMode::Extend);
+
+    let r0 = make_req("alpha", 4, 100, 1);
+    let r1 = make_req("beta", 4, 100, 1);
+
+    batch1.reqs.push(r0.clone());
+    batch1.req_pool_indices.push(10);
+    batch1.seq_lens.push(5);
+    batch1.orig_seq_lens.push(4);
+    batch1.input_ids.push(42);
+
+    batch2.reqs.push(r1.clone());
+    batch2.req_pool_indices.push(11);
+    batch2.seq_lens.push(6);
+    batch2.orig_seq_lens.push(4);
+    batch2.input_ids.push(99);
+
+    batch1.merge(batch2);
+
+    assert_eq!(batch1.reqs.len(), 2);
+    assert_eq!(batch1.req_pool_indices, vec![10, 11]);
+    assert_eq!(batch1.seq_lens, vec![5, 6]);
+    assert_eq!(batch1.orig_seq_lens, vec![4, 4]);
+    assert_eq!(batch1.input_ids, vec![42, 99]);
+
+    // Now, mark r0 finished and check filtering
+    r0.write().unwrap().finished_reason = Some(sglang_scheduler::types::FinishReason::Length { length: 1 });
+    batch1.filter_finished();
+
+    assert_eq!(batch1.reqs.len(), 1);
+    assert_eq!(batch1.reqs[0].read().unwrap().rid, "beta");
+    assert_eq!(batch1.req_pool_indices, vec![11]);
+    assert_eq!(batch1.seq_lens, vec![6]);
+    assert_eq!(batch1.orig_seq_lens, vec![4]);
+}
+

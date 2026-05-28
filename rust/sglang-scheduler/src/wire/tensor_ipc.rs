@@ -59,6 +59,9 @@ impl TensorIPC {
         if bytes.len() != self.numel() * 8 {
             return None;
         }
+        if self.numel() == 0 {
+            return Some(&[]);
+        }
         // Safety: `int64` tensors arrive packed little-endian with no
         // alignment padding from PyTorch's storage; on a little-endian
         // host (all sglang targets) the cast is sound.
@@ -74,6 +77,9 @@ impl TensorIPC {
         let bytes = self.data();
         if bytes.len() != self.numel() * 4 {
             return None;
+        }
+        if self.numel() == 0 {
+            return Some(&[]);
         }
         let ptr = bytes.as_ptr() as *const i32;
         Some(unsafe { std::slice::from_raw_parts(ptr, self.numel()) })

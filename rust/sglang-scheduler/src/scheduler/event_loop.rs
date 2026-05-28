@@ -204,6 +204,9 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
             apply_pending_aborts(&mut running, &mut pending_aborts);
         }
 
+        // 1c. Clean up finished requests from `running` (EOS or aborted).
+        running.filter_finished();
+
         // 1c. Memory pressure check before building the next batch.
         //     If decoding the current running batch would exhaust the
         //     KV budget, try cache eviction first then retraction.
@@ -375,7 +378,13 @@ pub fn run_event_loop(cfg: &SchedulerConfig) -> Result<(), EventLoopError> {
         // 6. Promote the just-run batch back into `running` for the
         //    next iteration.  The Python equivalent is `self.last_batch
         //    = batch`.
-        running = batch;
+        if batch.forward_mode.is_extend() {
+            if !batch.is_empty() {
+                running.merge(batch);
+            }
+        } else {
+            running = batch;
+        }
     }
 }
 
