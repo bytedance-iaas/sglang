@@ -32,7 +32,7 @@ def _get_bf16_masked_static_buffers(num_groups: int, device):
         experts = torch.arange(num_groups, device=device, dtype=torch.int32)
         experts = torch.cat([experts, torch.full((1,), -1, device=device, dtype=torch.int32)])
         list_size = torch.full((1,), num_groups + 1, device=device, dtype=torch.int32)
-        offsets = torch.empty(2 * num_groups, device=device, dtype=torch.int32)
+        offsets = torch.zeros(2 * num_groups, device=device, dtype=torch.int32)
         _bf16_masked_cache[key] = (offsets, experts, list_size)
     return _bf16_masked_cache[key]
 
