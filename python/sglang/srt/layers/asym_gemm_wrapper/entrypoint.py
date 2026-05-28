@@ -23,7 +23,6 @@ if ENABLE_JIT_ASYMGEMM:
 _SANITY_CHECK = get_bool_env_var("SGLANG_ASYMGEMM_SANITY_CHECK")
 
 
-
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -155,7 +154,7 @@ def grouped_gemm_sm89_f8f8bf16_contig(
     scale_a_tensor: Optional[torch.Tensor] = None,
     scale_b_tensor: Optional[torch.Tensor] = None,
 ):
-    asym_gemm.m_grouped_fp8_asym_gemm_sm80(
+    asym_gemm.m_grouped_fp8_asym_gemm_sm89(
         a, b, out, offsets, experts, list_size,
         scale_a=scale_a, scale_b=scale_b,
         scale_a_tensor=scale_a_tensor, scale_b_tensor=scale_b_tensor,
@@ -173,7 +172,7 @@ def grouped_gemm_sm89_f8f8bf16_masked(
     scale_a_tensor: Optional[torch.Tensor] = None,
     scale_b_tensor: Optional[torch.Tensor] = None,
 ):
-    asym_gemm.m_grouped_fp8_asym_gemm_sm80_masked(
+    asym_gemm.m_grouped_fp8_asym_gemm_sm89_masked(
         a, b, out, masked_m, expected_m,
         scale_a=scale_a, scale_b=scale_b,
         scale_a_tensor=scale_a_tensor, scale_b_tensor=scale_b_tensor,
