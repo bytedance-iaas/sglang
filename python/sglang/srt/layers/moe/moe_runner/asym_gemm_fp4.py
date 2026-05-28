@@ -409,7 +409,7 @@ def _silu_mul_and_fp4_quant_masked(
     )
 
     block_k = min(half_n, 1024)
-    block_k = 1 << (block_k - 1).bit_length()
+    block_k = triton.next_power_of_2(block_k)
     assert block_k % group_size == 0
     assert block_k % 2 == 0
 

@@ -23,32 +23,6 @@ if ENABLE_JIT_ASYMGEMM:
 _SANITY_CHECK = get_bool_env_var("SGLANG_ASYMGEMM_SANITY_CHECK")
 
 
-_bf16_masked_cache: dict = {}
-
-
-def _get_bf16_masked_static_buffers(num_groups: int, device):
-    key = (num_groups, device)
-    if key not in _bf16_masked_cache:
-        experts = torch.arange(num_groups, device=device, dtype=torch.int32)
-        experts = torch.cat([experts, torch.full((1,), -1, device=device, dtype=torch.int32)])
-        list_size = torch.full((1,), num_groups + 1, device=device, dtype=torch.int32)
-        offsets = torch.empty(2 * num_groups, device=device, dtype=torch.int32)
-        _bf16_masked_cache[key] = (offsets, experts, list_size)
-    return _bf16_masked_cache[key]
-
-
-def _build_bf16_masked_offsets(
-    masked_m: torch.Tensor,
-    num_groups: int,
-):
-    offsets, experts, list_size = _get_bf16_masked_static_buffers(
-        num_groups, masked_m.device
-    )
-    # The MGroupedMasked kernel reads offsets[blockIdx.y] as the raw token count
-    # for that expert (not start/end pairs). It does its own ceil_div by BLOCK_M.
-    offsets[:num_groups] = masked_m.to(torch.int32)
-    return offsets, experts, list_size
-
 
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -218,10 +192,6 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
     _, n, _ = rhs.shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
 
-    offsets, experts, list_size = _build_bf16_masked_offsets(
-        masked_m, num_groups
-    )
-
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
@@ -229,9 +199,7 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
             lhs,
             rhs,
             out,
-            offsets,
-            experts,
-            list_size,
+            masked_m,
             expected_m,
             compiled_dims="nk",
         )
