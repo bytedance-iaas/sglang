@@ -2,19 +2,21 @@ ARG BASE_IMAGE=lmsysorg/sglang:dev
 
 FROM ${BASE_IMAGE} AS deepgemm_builder
 
-ARG DEEPGEMM_REPO=https://github.com/sgl-project/DeepGEMM.git
-ARG DEEPGEMM_REF=1554ec1d52010e49cdd18b75f57c4d04fee838c7
-ARG SGL_DEEP_GEMM_VERSION=0.1.0+dev.pr36
+ARG DEEPGEMM_REPO=https://github.com/qiushixiaoyu/DeepGEMM.git
+ARG DEEPGEMM_REF=refs/heads/main
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+qiushixiaoyu.main
 
 USER root
 
 RUN set -eux; \
+    echo "${DEEPGEMM_CACHE_BUST}"; \
     rm -rf /tmp/DeepGEMM; \
     git clone --no-checkout "${DEEPGEMM_REPO}" /tmp/DeepGEMM; \
     cd /tmp/DeepGEMM; \
-    git fetch --depth=1 origin refs/pull/36/merge; \
+    git fetch --depth=1 origin "${DEEPGEMM_REF}"; \
     git checkout --detach FETCH_HEAD; \
-    test "$(git rev-parse HEAD)" = "${DEEPGEMM_REF}"; \
+    git rev-parse HEAD | tee /tmp/deepgemm_commit.txt; \
     git submodule update --init --recursive; \
     python3 -c 'from pathlib import Path; p = Path("sgl_deep_gemm/__init__.py"); text = p.read_text(); needle = "    mega_moe_pre_dispatch,\n)"; replacement = "    mega_moe_pre_dispatch,\n    transform_weights_for_mega_moe_sm90,\n    fp8_mega_moe,\n)"; assert needle in text; p.write_text(text.replace(needle, replacement))'; \
     echo -n "${SGL_DEEP_GEMM_VERSION}" > sgl_deep_gemm/VERSION; \
@@ -23,6 +25,7 @@ RUN set -eux; \
 FROM ${BASE_IMAGE}
 
 COPY --from=deepgemm_builder /tmp/DeepGEMM/dist/sgl_deep_gemm-*.whl /tmp/
+COPY --from=deepgemm_builder /tmp/deepgemm_commit.txt /usr/local/share/sgl-deep-gemm-commit.txt
 
 RUN set -eux; \
     python3 -m pip uninstall -y sgl-deep-gemm deep-gemm || true; \
