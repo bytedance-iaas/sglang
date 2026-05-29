@@ -254,7 +254,13 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        prefix_indices = getattr(req, "prefix_indices", None)
+        if (
+            getattr(req, "last_node", None) is not None
+            and prefix_indices is not None
+            and len(prefix_indices) > 0
+        ):
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 

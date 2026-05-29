@@ -157,6 +157,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots(
                     batch.req_pool_indices,
+                    batch.req_pool_indices_cpu,
                     self.draft_token_num,
                 )
                 batch.out_cache_loc = allocator.alloc_extend_with_device_mapping(

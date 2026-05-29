@@ -279,6 +279,11 @@ class SchedulerPoolStatsObserver:
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
         )
+        hisparse_logical_evictable = getattr(
+            self.tree_cache, "dsv4_hisparse_logical_evictable_size", None
+        )
+        if self.enable_hisparse and hisparse_logical_evictable is not None:
+            full_num_used -= hisparse_logical_evictable()
         swa_num_used = self.swa_tokens_per_layer - (
             swa_available_size + swa_evictable_size
         )

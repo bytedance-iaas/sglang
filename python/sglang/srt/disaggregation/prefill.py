@@ -149,7 +149,11 @@ class PrefillBootstrapQueue:
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
-        kv_args.mla_compression_ratios = None
+        kv_args.mla_compression_ratios = (
+            list(self.token_to_kv_pool.compression_ratios)
+            if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            else None
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -810,6 +814,12 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // state_page_size) * state_page_size
+                if req.start_send_idx >= seq_len:
+                    window_start = seq_len
+                elif req.start_send_idx > window_start:
+                    window_start += (
+                        (req.start_send_idx - window_start) // state_page_size
+                    ) * state_page_size
 
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
@@ -821,6 +831,9 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
+                window_kv_indices_swa = window_kv_indices_swa[
+                    window_kv_indices_swa >= 0
+                ]
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, state_page_size)
             elif isinstance(

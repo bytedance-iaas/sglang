@@ -674,6 +674,7 @@ class EAGLEWorker(TpModelWorker):
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots_variable(
                     batch.req_pool_indices,
+                    batch.req_pool_indices_cpu,
                     seq_lens_cpu - prefix_lens_cpu,
                 )
                 out_cache_loc, token_to_kv_pool_state_backup = (

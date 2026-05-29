@@ -452,10 +452,20 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            self.enable_hisparse_radix_cache = False
+            if hasattr(self.tree_cache, "init_hisparse_radix_cache"):
+                self.enable_hisparse_radix_cache = (
+                    self.tree_cache.init_hisparse_radix_cache(
+                        self.hisparse_coordinator.mem_pool_host
+                    )
+                )
+                if self.enable_hisparse_radix_cache:
+                    self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
             self.enable_hisparse_c4_prefix_cache = (
                 self.hisparse_coordinator.enable_c4_host_prefix_cache()
             )
         else:
+            self.enable_hisparse_radix_cache = False
             self.enable_hisparse_c4_prefix_cache = False
 
         if (

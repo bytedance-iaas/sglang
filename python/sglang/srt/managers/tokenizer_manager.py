@@ -444,7 +444,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        start_disagg_service(self.server_args)
+        # Keep the bootstrap server referenced for the tokenizer manager lifetime.
+        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 

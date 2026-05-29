@@ -23,7 +23,7 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.configs.model_config import ModelImpl, is_deepseek_v4
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -201,6 +201,9 @@ def build_kv_cache(
     effective_chunked_prefill_size = server_args.chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
+    enable_dsv4_hisparse_host_radix = server_args.enable_hisparse and is_deepseek_v4(
+        model_config.hf_config
+    )
 
     params = CacheInitParams(
         disable=disable_radix_cache,
@@ -223,7 +226,18 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
     )
 
-    if effective_chunked_prefill_size is not None and disable_radix_cache:
+    if enable_dsv4_hisparse_host_radix:
+        from sglang.srt.mem_cache.unified_cache_components import (
+            ComponentType,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import (
+            UnifiedRadixCache,
+        )
+
+        params.tree_components = (ComponentType.FULL,)
+        tree_cache = UnifiedRadixCache(params)
+        tree_cache.enable_hisparse_mode()
+    elif effective_chunked_prefill_size is not None and disable_radix_cache:
         if not is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 

@@ -142,14 +142,16 @@ class TransferInfo:
             dst_state_indices = []
             dst_device_kv_indices = None
         else:
-            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
+            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32).copy()
             dst_aux_index = int(msg[5].decode("ascii"))
             if msg[6] == b"":
                 dst_state_indices = []
             else:
-                dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
+                dst_state_indices = [
+                    int(v) for v in np.frombuffer(msg[6], dtype=np.int32)
+                ]
             if len(msg) > 9 and msg[9] != b"":
-                dst_device_kv_indices = np.frombuffer(msg[9], dtype=np.int32)
+                dst_device_kv_indices = np.frombuffer(msg[9], dtype=np.int32).copy()
             else:
                 dst_device_kv_indices = None
             is_dummy = False
@@ -188,6 +190,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: list[int]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    dst_hisparse_host_kv_layer_num: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -216,6 +219,11 @@ class KVArgsRegisterInfo:
             ),
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
+            ),
+            dst_hisparse_host_kv_layer_num=(
+                int(msg[15].decode("ascii"))
+                if len(msg) > 15 and len(msg[15]) > 0
+                else 0
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
@@ -646,6 +654,29 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        if any(int(length) <= 0 for length in lengths):
+            logger.error(
+                "Mooncake transfer got non-positive block length: op=%s "
+                "session=%s room=%s lengths=%s",
+                op_name,
+                mooncake_session_id,
+                room,
+                [int(length) for length in lengths[:8]],
+            )
+            return -1
+        if any(int(addr) <= 0 for addr in src_addrs) or any(
+            int(addr) <= 0 for addr in dst_addrs
+        ):
+            logger.error(
+                "Mooncake transfer got invalid address: op=%s session=%s room=%s "
+                "src_min=%s dst_min=%s",
+                op_name,
+                mooncake_session_id,
+                room,
+                min(int(addr) for addr in src_addrs),
+                min(int(addr) for addr in dst_addrs),
+            )
+            return -1
         total_bytes = sum(int(length) for length in lengths)
         max_bytes = max(int(length) for length in lengths)
         block_count = len(transfer_blocks)
@@ -776,6 +807,34 @@ class MooncakeKVManager(CommonKVManager):
         Generic KV cache transfer supporting both MHA and MLA architectures.
         This method is used by both send_kvcache (full pool) and maybe_send_extra.
         """
+        prefill_data_indices = np.asarray(prefill_data_indices, dtype=np.int64).reshape(
+            -1
+        )
+        dst_data_indices = np.asarray(dst_data_indices, dtype=np.int64).reshape(-1)
+        if len(prefill_data_indices) == 0 and len(dst_data_indices) == 0:
+            return 0
+        if len(prefill_data_indices) != len(dst_data_indices):
+            logger.error(
+                "%s index length mismatch: session=%s room=%s src=%d dst=%d",
+                op_name,
+                mooncake_session_id,
+                room,
+                len(prefill_data_indices),
+                len(dst_data_indices),
+            )
+            return -1
+        if np.any(prefill_data_indices < 0) or np.any(dst_data_indices < 0):
+            logger.error(
+                "%s got negative transfer index: session=%s room=%s "
+                "src_min=%s dst_min=%s",
+                op_name,
+                mooncake_session_id,
+                room,
+                int(prefill_data_indices.min()),
+                int(dst_data_indices.min()),
+            )
+            return -1
+
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -788,6 +847,23 @@ class MooncakeKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
+            if (
+                layers_current_pp_stage > len(src_kv_ptrs)
+                or layers_current_pp_stage > len(dst_kv_ptrs)
+                or layers_current_pp_stage > len(item_lens)
+            ):
+                logger.error(
+                    "%s MLA pointer/item length mismatch: session=%s room=%s "
+                    "layers=%d src_ptrs=%d dst_ptrs=%d item_lens=%d",
+                    op_name,
+                    mooncake_session_id,
+                    room,
+                    layers_current_pp_stage,
+                    len(src_kv_ptrs),
+                    len(dst_kv_ptrs),
+                    len(item_lens),
+                )
+                return -1
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
@@ -916,11 +992,13 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_kv_item_len: Optional[int] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_hisparse_host_kv_layer_num: int = 0,
     ):
         """HiSparse transfer uses page-level indices for source and host destination."""
         if dst_device_kv_indices is not None:
             if dst_kv_item_len is None:
-                raise RuntimeError("DeepSeek V4 HiSparse transfer needs dst item len")
+                logger.error("DeepSeek V4 HiSparse transfer needs dst item len")
+                return -1
             return self._send_kvcache_hisparse_dsv4(
                 mooncake_session_id=mooncake_session_id,
                 prefill_kv_indices=prefill_kv_indices,
@@ -930,6 +1008,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor=executor,
                 dst_kv_item_len=dst_kv_item_len,
                 dst_device_kv_indices=dst_device_kv_indices,
+                dst_hisparse_host_kv_layer_num=dst_hisparse_host_kv_layer_num,
             )
 
         chunked_dst_kv_indices = dst_kv_indices[page_index_slice]
@@ -957,39 +1036,147 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_kv_item_len: int,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_hisparse_host_kv_layer_num: int = 0,
     ) -> int:
         """Transfer DeepSeek V4 C4 KV to host and non-sparse KV to device."""
+        if self.kv_args.page_size % 4 != 0:
+            logger.error(
+                "DeepSeek V4 HiSparse requires page_size divisible by 4, got %s",
+                self.kv_args.page_size,
+            )
+            return -1
         c4_page_size = self.kv_args.page_size // 4
-        assert self.kv_args.page_size % 4 == 0
-        src_c4_layer_num = self._dsv4_c4_layer_count()
-        src_c4_layer_num = min(src_c4_layer_num, len(dst_kv_ptrs))
+        (
+            src_c4_layer_num,
+            src_c4_ptrs,
+            dst_c4_ptrs,
+            src_device_ptrs,
+            dst_device_ptrs,
+            device_item_lens,
+        ) = self._dsv4_hisparse_transfer_ptrs(
+            dst_kv_ptrs, dst_hisparse_host_kv_layer_num
+        )
+        if src_c4_layer_num < 0:
+            return -1
+        if src_c4_layer_num == 0 and not src_device_ptrs:
+            logger.error("DeepSeek V4 HiSparse transfer found no KV layers")
+            return -1
 
-        src_c4_indices, dst_c4_indices = self._dsv4_c4_token_indices(
-            prefill_kv_indices, dst_kv_indices, page_index_slice, c4_page_size
-        )
-        ret = self._send_dsv4_c4_to_host(
-            mooncake_session_id,
-            src_c4_indices,
-            dst_c4_indices,
-            self.kv_args.kv_data_ptrs[:src_c4_layer_num],
-            dst_kv_ptrs[:src_c4_layer_num],
-            dst_kv_item_len,
-            c4_page_size,
-        )
-        if ret != 0:
-            return ret
+        if src_c4_layer_num > 0:
+            src_c4_indices, dst_c4_indices = self._dsv4_c4_token_indices(
+                prefill_kv_indices, dst_kv_indices, page_index_slice, c4_page_size
+            )
+            ret = self._send_dsv4_c4_to_host(
+                mooncake_session_id,
+                src_c4_indices,
+                dst_c4_indices,
+                src_c4_ptrs,
+                dst_c4_ptrs,
+                dst_kv_item_len,
+                c4_page_size,
+            )
+            if ret != 0:
+                return ret
 
         return self._send_dsv4_device_kv(
             mooncake_session_id,
             prefill_kv_indices,
-            dst_kv_ptrs,
             page_index_slice,
-            src_c4_layer_num,
             dst_device_kv_indices,
+            src_device_ptrs,
+            dst_device_ptrs,
+            device_item_lens,
             executor,
         )
 
-    def _dsv4_c4_layer_count(self) -> int:
+    def _dsv4_hisparse_transfer_ptrs(
+        self,
+        dst_kv_ptrs: list[int],
+        dst_hisparse_host_kv_layer_num: int,
+    ) -> Tuple[int, list[int], list[int], list[int], list[int], list[int]]:
+        ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+        if ratios:
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = self.kv_args.prefill_end_layer
+            if end_layer is None:
+                end_layer = len(ratios)
+            c4_full = sum(1 for r in ratios if r == 4)
+            c128_full = sum(1 for r in ratios if r == 128)
+            c4_s = sum(1 for r in ratios[:start_layer] if r == 4)
+            c4_e = sum(1 for r in ratios[:end_layer] if r == 4)
+            c128_s = sum(1 for r in ratios[:start_layer] if r == 128)
+            c128_e = sum(1 for r in ratios[:end_layer] if r == 128)
+            src_c4_layer_num = c4_e - c4_s
+            host_c4_full = dst_hisparse_host_kv_layer_num or c4_full
+            if host_c4_full < c4_full:
+                logger.error(
+                    "DSV4 HiSparse host C4 pointer count is too small: "
+                    "dst_host=%d c4_full=%d",
+                    host_c4_full,
+                    c4_full,
+                )
+                return -1, [], [], [], [], []
+
+            src_c4_ptrs = self.kv_args.kv_data_ptrs[:src_c4_layer_num]
+            dst_c4_ptrs = dst_kv_ptrs[c4_s:c4_e]
+            src_device_ptrs = self.kv_args.kv_data_ptrs[src_c4_layer_num:]
+            src_device_lens = self.kv_args.kv_item_lens[src_c4_layer_num:]
+            dst_device_base = dst_kv_ptrs[host_c4_full:]
+            if len(dst_device_base) < c4_full + c128_full:
+                logger.error(
+                    "DSV4 HiSparse device pointer table is too short: "
+                    "dst_device=%d expected=%d host_c4=%d",
+                    len(dst_device_base),
+                    c4_full + c128_full,
+                    host_c4_full,
+                )
+                return -1, [], [], [], [], []
+            dst_device_ptrs = (
+                dst_device_base[c4_s:c4_e]
+                + dst_device_base[c4_full + c128_s : c4_full + c128_e]
+            )
+            if len(src_device_ptrs) != len(dst_device_ptrs):
+                logger.error(
+                    "DSV4 HiSparse device pointer count mismatch: "
+                    "src=%d dst=%d start_layer=%s end_layer=%s c4=%s:%s c128=%s:%s",
+                    len(src_device_ptrs),
+                    len(dst_device_ptrs),
+                    start_layer,
+                    end_layer,
+                    c4_s,
+                    c4_e,
+                    c128_s,
+                    c128_e,
+                )
+                return -1, [], [], [], [], []
+            if len(src_device_lens) != len(src_device_ptrs):
+                logger.error(
+                    "DSV4 HiSparse device item length count mismatch: lens=%d ptrs=%d",
+                    len(src_device_lens),
+                    len(src_device_ptrs),
+                )
+                return -1, [], [], [], [], []
+            return (
+                src_c4_layer_num,
+                src_c4_ptrs,
+                dst_c4_ptrs,
+                src_device_ptrs,
+                dst_device_ptrs,
+                src_device_lens,
+            )
+
+        src_c4_layer_num = self._dsv4_c4_layer_count_by_item_len()
+        src_c4_layer_num = min(src_c4_layer_num, len(dst_kv_ptrs))
+        return (
+            src_c4_layer_num,
+            self.kv_args.kv_data_ptrs[:src_c4_layer_num],
+            dst_kv_ptrs[:src_c4_layer_num],
+            self.kv_args.kv_data_ptrs[src_c4_layer_num:],
+            dst_kv_ptrs[src_c4_layer_num:],
+            self.kv_args.kv_item_lens[src_c4_layer_num:],
+        )
+
+    def _dsv4_c4_layer_count_by_item_len(self) -> int:
         first_item_len = self.kv_args.kv_item_lens[0]
         for i, item_len in enumerate(self.kv_args.kv_item_lens):
             if item_len != first_item_len:
@@ -1028,30 +1215,80 @@ class MooncakeKVManager(CommonKVManager):
         scale_bytes = 8
         gpu_page_bytes = self.kv_args.kv_item_lens[0]
         gpu_scale_page_offset = value_bytes * c4_page_size
+        src_indices = np.asarray(src_indices, dtype=np.int64).reshape(-1)
+        dst_indices = np.asarray(dst_indices, dtype=np.int64).reshape(-1)
+        if len(src_indices) == 0 and len(dst_indices) == 0:
+            return 0
+        if len(src_indices) != len(dst_indices):
+            logger.error(
+                "DSV4 C4 host transfer index length mismatch: session=%s src=%d dst=%d",
+                mooncake_session_id,
+                len(src_indices),
+                len(dst_indices),
+            )
+            return -1
+        if value_bytes <= 0 or c4_page_size <= 0:
+            logger.error(
+                "Invalid DSV4 C4 host transfer layout: session=%s "
+                "dst_kv_item_len=%s c4_page_size=%s",
+                mooncake_session_id,
+                dst_kv_item_len,
+                c4_page_size,
+            )
+            return -1
+        if np.any(src_indices < 0) or np.any(dst_indices < 0):
+            logger.error(
+                "DSV4 C4 host transfer got negative index: session=%s "
+                "src_min=%s dst_min=%s",
+                mooncake_session_id,
+                int(src_indices.min()),
+                int(dst_indices.min()),
+            )
+            return -1
+        if not src_ptrs or not dst_ptrs:
+            logger.error("DSV4 C4 host transfer has empty pointer list")
+            return -1
+        if len(src_ptrs) != len(dst_ptrs):
+            logger.error(
+                "DSV4 C4 host pointer count mismatch: session=%s src=%d dst=%d",
+                mooncake_session_id,
+                len(src_ptrs),
+                len(dst_ptrs),
+            )
+            return -1
 
-        # DSV4 host layout is token-linear.  GPU C4 pages store values first
-        # and scales after that, so each C4 token maps to two transfer blocks.
+        # DSV4 host layout is token-linear. GPU C4 pages store values first and
+        # scales after that, so each C4 token maps to two transfer blocks.
+        # Submit several C4 layers together to reduce Mooncake submit pressure
+        # without creating one huge transfer list for all layers.
         max_tokens_per_batch = 256
-        for src_ptr, dst_ptr in zip(src_ptrs, dst_ptrs):
-            for start in range(0, len(src_indices), max_tokens_per_batch):
+        max_layers_per_batch = 4
+        layer_pairs = list(zip(src_ptrs, dst_ptrs))
+        for start in range(0, len(src_indices), max_tokens_per_batch):
+            src_chunk = src_indices[start : start + max_tokens_per_batch]
+            dst_chunk = dst_indices[start : start + max_tokens_per_batch]
+            for layer_start in range(0, len(layer_pairs), max_layers_per_batch):
                 transfer_blocks = []
-                src_chunk = src_indices[start : start + max_tokens_per_batch]
-                dst_chunk = dst_indices[start : start + max_tokens_per_batch]
-                for src_idx, dst_idx in zip(src_chunk, dst_chunk):
-                    src_page = int(src_idx) // c4_page_size
-                    src_offset = int(src_idx) % c4_page_size
-                    src_base = int(src_ptr) + src_page * gpu_page_bytes
-                    dst_base = int(dst_ptr) + int(dst_idx) * dst_kv_item_len
-                    transfer_blocks.append(
-                        (src_base + src_offset * value_bytes, dst_base, value_bytes)
-                    )
-                    transfer_blocks.append(
-                        (
-                            src_base + gpu_scale_page_offset + src_offset * scale_bytes,
-                            dst_base + value_bytes,
-                            scale_bytes,
+                for src_ptr, dst_ptr in layer_pairs[
+                    layer_start : layer_start + max_layers_per_batch
+                ]:
+                    for src_idx, dst_idx in zip(src_chunk, dst_chunk):
+                        src_page = int(src_idx) // c4_page_size
+                        src_offset = int(src_idx) % c4_page_size
+                        src_base = int(src_ptr) + src_page * gpu_page_bytes
+                        dst_base = int(dst_ptr) + int(dst_idx) * dst_kv_item_len
+                        transfer_blocks.append(
+                            (src_base + src_offset * value_bytes, dst_base, value_bytes)
                         )
-                    )
+                        transfer_blocks.append(
+                            (
+                                src_base
+                                + gpu_scale_page_offset
+                                + src_offset * scale_bytes,
+                                dst_base + value_bytes,
+                                scale_bytes,
+                            )
+                        )
                 ret = self._transfer_data(mooncake_session_id, transfer_blocks)
                 if ret != 0:
                     return ret
@@ -1061,34 +1298,63 @@ class MooncakeKVManager(CommonKVManager):
         self,
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_ptrs: list[int],
         page_index_slice: slice,
-        src_c4_layer_num: int,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]],
+        src_device_ptrs: list[int],
+        dst_device_ptrs: list[int],
+        device_item_lens: list[int],
         executor: concurrent.futures.ThreadPoolExecutor,
     ) -> int:
-        if len(dst_kv_ptrs) <= src_c4_layer_num:
+        if len(src_device_ptrs) == 0 and len(dst_device_ptrs) == 0:
             return 0
+        if len(src_device_ptrs) != len(dst_device_ptrs):
+            logger.error(
+                "DSV4 device KV pointer count mismatch: session=%s src=%d dst=%d",
+                mooncake_session_id,
+                len(src_device_ptrs),
+                len(dst_device_ptrs),
+            )
+            return -1
         if dst_device_kv_indices is None:
-            raise RuntimeError(
+            logger.error(
                 "DeepSeek V4 HiSparse transfer needs device KV indices for "
                 "c4_indexer/c128 KV"
             )
+            return -1
 
         src_pages = prefill_kv_indices.astype(np.int64, copy=False)
         dst_pages = dst_device_kv_indices[page_index_slice].astype(
             np.int64, copy=False
         )
-        count = min(len(src_pages), len(dst_pages))
-        if count == 0:
+        if len(src_pages) == 0 and len(dst_pages) == 0:
             return 0
+        if len(src_pages) != len(dst_pages):
+            logger.error(
+                "DSV4 device KV page index mismatch: session=%s src=%d dst=%d "
+                "slice=%s:%s",
+                mooncake_session_id,
+                len(src_pages),
+                len(dst_pages),
+                page_index_slice.start,
+                page_index_slice.stop,
+            )
+            return -1
+        if np.any(src_pages < 0) or np.any(dst_pages < 0):
+            logger.error(
+                "DSV4 device KV transfer got negative page index: session=%s "
+                "src_min=%s dst_min=%s",
+                mooncake_session_id,
+                int(src_pages.min()),
+                int(dst_pages.min()),
+            )
+            return -1
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs[src_c4_layer_num:],
-            dst_data_ptrs=dst_kv_ptrs[src_c4_layer_num:],
-            item_lens=self.kv_args.kv_item_lens[src_c4_layer_num:],
-            prefill_data_indices=src_pages[:count].astype(np.int32, copy=False),
-            dst_data_indices=dst_pages[:count].astype(np.int32, copy=False),
+            src_data_ptrs=src_device_ptrs,
+            dst_data_ptrs=dst_device_ptrs,
+            item_lens=device_item_lens,
+            prefill_data_indices=src_pages.astype(np.int32, copy=False),
+            dst_data_indices=dst_pages.astype(np.int32, copy=False),
             executor=executor,
         )
 
@@ -1340,6 +1606,26 @@ class MooncakeKVManager(CommonKVManager):
             getattr(self.kv_args, "state_dim_per_tensor", [])
         )
 
+        def align_state_suffix(
+            src_indices: list[int], dst_indices: list[int], name: str
+        ) -> Tuple[list[int], list[int]]:
+            src_indices = [int(v) for v in np.asarray(src_indices).reshape(-1)]
+            dst_indices = [int(v) for v in np.asarray(dst_indices).reshape(-1)]
+            if len(src_indices) == len(dst_indices):
+                return src_indices, dst_indices
+            common = min(len(src_indices), len(dst_indices))
+            logger.warning(
+                "%s state index length mismatch for room=%s: prefill=%d, dst=%d; "
+                "aligning the suffix.",
+                name,
+                req.room,
+                len(src_indices),
+                len(dst_indices),
+            )
+            if common <= 0:
+                return [], []
+            return src_indices[-common:], dst_indices[-common:]
+
         if state_type == "mamba":
             # Check if we need slice transfer for different TP sizes
             if (
@@ -1376,21 +1662,15 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
-            dst_state_indices = req.dst_state_indices
-            if len(prefill_state_indices) > len(dst_state_indices):
-                logger.warning(
-                    f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
-                )
-                prefill_state_indices = prefill_state_indices[: len(dst_state_indices)]
-            elif len(prefill_state_indices) < len(dst_state_indices):
-                logger.warning(
-                    f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
-                )
-                dst_state_indices = dst_state_indices[: len(prefill_state_indices)]
+            prefill_state_indices, dst_state_indices = align_state_suffix(
+                prefill_state_indices, req.dst_state_indices, state_type
+            )
+            if len(prefill_state_indices) == 0:
+                return 0
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(dst_state_indices, dtype=np.int32)
-            logger.info(
+            logger.debug(
                 "Mooncake extra transfer start: state_type=%s, session=%s, room=%s, "
                 "endpoint=%s:%s, src_indices=%s, dst_indices=%s, tensors=%s, "
                 "estimated_bytes=%s",
@@ -1419,7 +1699,7 @@ class MooncakeKVManager(CommonKVManager):
                 dst_port=req.dst_port,
                 state_type=state_type,
             )
-            logger.info(
+            logger.debug(
                 "Mooncake extra transfer finish: state_type=%s, session=%s, room=%s, "
                 "ret=%s, elapsed=%.2fs",
                 state_type,
@@ -1438,6 +1718,7 @@ class MooncakeKVManager(CommonKVManager):
                 if target_rank_registration_info is not None
                 else [],
                 executor,
+                align_state_suffix,
             )
         else:
             return 0
@@ -1449,20 +1730,41 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_data_ptrs: list[int],
         dst_state_item_lens: list[int],
         executor: concurrent.futures.ThreadPoolExecutor,
+        align_state_suffix,
     ):
-        assert len(prefill_state_indices) == len(req.dst_state_indices), (
-            f"State index length mismatch: prefill={len(prefill_state_indices)}, "
-            f"dst={len(req.dst_state_indices)}"
+        prefill_state_indices, dst_state_indices = align_state_suffix(
+            prefill_state_indices, req.dst_state_indices, "dsv4"
         )
+        if len(prefill_state_indices) == 0:
+            return 0
         src_state_data_ptrs = _component_int_values(self.kv_args.state_data_ptrs)
         src_state_item_lens = _component_int_values(self.kv_args.state_item_lens)
-        assert len(src_state_data_ptrs) == len(dst_state_data_ptrs)
-        assert len(src_state_item_lens) == len(dst_state_item_lens)
-        for i, item_len in enumerate(src_state_item_lens):
-            assert item_len == dst_state_item_lens[i], (
-                f"V4 state item length mismatch at index {i}: "
-                f"{item_len} != {dst_state_item_lens[i]}"
+        if len(src_state_data_ptrs) != len(dst_state_data_ptrs):
+            logger.error(
+                "V4 state pointer count mismatch: room=%s src=%d dst=%d",
+                req.room,
+                len(src_state_data_ptrs),
+                len(dst_state_data_ptrs),
             )
+            return -1
+        if len(src_state_item_lens) != len(dst_state_item_lens):
+            logger.error(
+                "V4 state item length count mismatch: room=%s src=%d dst=%d",
+                req.room,
+                len(src_state_item_lens),
+                len(dst_state_item_lens),
+            )
+            return -1
+        for i, item_len in enumerate(src_state_item_lens):
+            if item_len != dst_state_item_lens[i]:
+                logger.error(
+                    "V4 state item length mismatch: room=%s index=%d src=%d dst=%d",
+                    req.room,
+                    i,
+                    item_len,
+                    dst_state_item_lens[i],
+                )
+                return -1
 
         return self._send_kvcache_generic(
             mooncake_session_id=req.mooncake_session_id,
@@ -1470,7 +1772,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_data_ptrs=dst_state_data_ptrs,
             item_lens=src_state_item_lens,
             prefill_data_indices=np.asarray(prefill_state_indices, dtype=np.int32),
-            dst_data_indices=np.asarray(req.dst_state_indices, dtype=np.int32),
+            dst_data_indices=np.asarray(dst_state_indices, dtype=np.int32),
             executor=executor,
             op_name="send_dsv4_state",
             room=req.room,
@@ -1613,6 +1915,12 @@ class MooncakeKVManager(CommonKVManager):
         staging_strategy = None
 
         while True:
+            kv_chunk = None
+            prefill_unique_rank = (
+                self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                + self.pp_rank * self.attn_cp_size
+                + self.attn_cp_rank
+            )
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if (
@@ -1629,11 +1937,6 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
-                prefill_unique_rank = (
-                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-                    + self.pp_rank * self.attn_cp_size
-                    + self.attn_cp_rank
-                )
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -1689,6 +1992,7 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                     target_rank_registration_info.dst_kv_item_len,
                                     req.dst_device_kv_indices,
+                                    target_rank_registration_info.dst_hisparse_host_kv_layer_num,
                                 )
                             else:
                                 ret = self.send_kvcache(
@@ -1734,8 +2038,12 @@ class MooncakeKVManager(CommonKVManager):
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
                                     self.failed_sessions.add(req.mooncake_session_id)
+                                    self.decode_kv_args_table.pop(
+                                        req.mooncake_session_id, None
+                                    )
                                     logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
+                                        "Session %s failed, removed from decode_kv_args_table.",
+                                        req.mooncake_session_id,
                                     )
                             self.record_failure(
                                 kv_chunk.room,
@@ -1775,8 +2083,12 @@ class MooncakeKVManager(CommonKVManager):
                                             self.failed_sessions.add(
                                                 req.mooncake_session_id
                                             )
+                                            self.decode_kv_args_table.pop(
+                                                req.mooncake_session_id, None
+                                            )
                                             logger.error(
-                                                f"Session {req.mooncake_session_id} failed."
+                                                "Session %s failed, removed from decode_kv_args_table.",
+                                                req.mooncake_session_id,
                                             )
                                     self.record_failure(
                                         kv_chunk.room,
@@ -1827,17 +2139,45 @@ class MooncakeKVManager(CommonKVManager):
 
                 if (
                     kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                    or self.check_status(kv_chunk.room)
+                    in (KVPoll.Success, KVPoll.Failed)
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                logger.exception(
+                    "Transfer worker failed for room=%s; marking request failed "
+                    "instead of killing prefill transfer thread",
+                    kv_chunk.room if kv_chunk is not None else None,
                 )
+                if kv_chunk is None:
+                    continue
+                self.record_failure(kv_chunk.room, str(e))
+                self.update_status(kv_chunk.room, KVPoll.Failed)
+                if kv_chunk.room in self.transfer_infos:
+                    for req in self.transfer_infos[kv_chunk.room].values():
+                        if req.is_dummy:
+                            continue
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to sync transfer failure to decode endpoint "
+                                "for room=%s",
+                                req.room,
+                                exc_info=True,
+                            )
+                    self.transfer_infos.pop(kv_chunk.room, None)
+                self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                continue
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -2178,6 +2518,9 @@ class MooncakeKVSender(CommonKVSender):
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
                         )
+                        self.kv_mgr.update_status(
+                            self.bootstrap_room, KVPoll.Failed
+                        )
                         self.conclude_state = KVPoll.Failed
                         return KVPoll.Failed
 
@@ -2240,6 +2583,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
+            hisparse_host_kv_layer_num = str(
+                getattr(self.kv_mgr.kv_args, "hisparse_host_kv_layer_num", 0)
+            ).encode("ascii")
 
             if (
                 self.kv_mgr.enable_staging
@@ -2271,6 +2617,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        hisparse_host_kv_layer_num,
                     ]
                 )
 
@@ -2288,6 +2635,31 @@ class MooncakeKVReceiver(CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        kv_indices = np.asarray(kv_indices, dtype=np.int32).reshape(-1)
+        if device_kv_indices is not None:
+            device_kv_indices = np.asarray(device_kv_indices, dtype=np.int32).reshape(
+                -1
+            )
+        if state_indices is not None:
+            state_indices = [
+                int(v) for v in np.asarray(state_indices, dtype=np.int32).reshape(-1)
+            ]
+        if np.any(kv_indices < 0) or (
+            device_kv_indices is not None and np.any(device_kv_indices < 0)
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "Decode produced negative KV page indices for Mooncake transfer",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        if state_indices is not None and any(v < 0 for v in state_indices):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "Decode produced negative state indices for Mooncake transfer",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -2354,6 +2726,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
+                        )
+                        self.kv_mgr.update_status(
+                            self.bootstrap_room, KVPoll.Failed
                         )
                         self.conclude_state = KVPoll.Failed
                         return KVPoll.Failed
