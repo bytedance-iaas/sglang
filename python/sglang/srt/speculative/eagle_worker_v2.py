@@ -1156,6 +1156,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+        if (
+            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+        ):
+            next_draft_input.online_c128_mtp_commit_events = [verify_done]
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
