@@ -62,7 +62,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -93,7 +93,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    import flash_mla
+    import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 
@@ -528,7 +528,7 @@ class DeepseekV4AttnBackend(
                         state_width=head_dim * 3,
                         main_state=main_pool.kv_score_buffer.kv_score,
                         temp_state=temp_pool.kv_score_buffer.kv_score,
-                        ape=compressor.ape.view(128, head_dim),
+                        ape=compressor.ape.reshape(128, head_dim),
                     )
                 )
             self._online_c128_layer_runtimes = runtimes
@@ -1428,7 +1428,7 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            import sgl_kernel.flash_mla as flash_mla
 
             o = flash_mla.flash_mla_with_kvcache(
                 q=q,
