@@ -16,7 +16,7 @@ RUN set -eux; \
     git checkout --detach FETCH_HEAD; \
     test "$(git rev-parse HEAD)" = "${DEEPGEMM_REF}"; \
     git submodule update --init --recursive; \
-    python3 -c 'from pathlib import Path; p = Path("deep_gemm/__init__.py"); text = p.read_text(); needle = "    mega_moe_pre_dispatch,\n)"; replacement = "    mega_moe_pre_dispatch,\n    transform_weights_for_mega_moe_sm90,\n    fp8_mega_moe,\n)"; assert needle in text; p.write_text(text.replace(needle, replacement))'; \
+    python3 -c 'from pathlib import Path; p = Path("sgl_deep_gemm/__init__.py"); text = p.read_text(); needle = "    mega_moe_pre_dispatch,\n)"; replacement = "    mega_moe_pre_dispatch,\n    transform_weights_for_mega_moe_sm90,\n    fp8_mega_moe,\n)"; assert needle in text; p.write_text(text.replace(needle, replacement))'; \
     echo -n "${SGL_DEEP_GEMM_VERSION}" > sgl_deep_gemm/VERSION; \
     bash build_sgl_deep_gemm.sh
 
