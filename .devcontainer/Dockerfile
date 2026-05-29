@@ -3,7 +3,7 @@ ARG BASE_IMAGE=lmsysorg/sglang:dev
 FROM ${BASE_IMAGE} AS deepgemm_builder
 
 ARG DEEPGEMM_REPO=https://github.com/sgl-project/DeepGEMM.git
-ARG DEEPGEMM_REF=728ddc18efd203dc323c8bdd60e4da3f0635f4f2
+ARG DEEPGEMM_REF=1554ec1d52010e49cdd18b75f57c4d04fee838c7
 ARG SGL_DEEP_GEMM_VERSION=0.1.0+dev.pr36
 
 USER root
