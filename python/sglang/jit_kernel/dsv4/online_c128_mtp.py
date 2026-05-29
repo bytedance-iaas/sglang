@@ -36,7 +36,7 @@ def _online_c128_mtp_prepare_kernel(
     seq_len = tl.load(seq_lens_ptr + bid).to(tl.int64)
     has_partial = (seq_len > 0) & ((seq_len % 128) != 0)
 
-    chunk_start = ((seq_len - 1) // 128) * 128
+    chunk_start = tl.where(has_partial, ((seq_len - 1) // 128) * 128, 0)
     req_idx = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
     full_loc = tl.load(
         req_to_token_ptr + req_idx * req_to_token_stride_b + chunk_start,
@@ -46,7 +46,7 @@ def _online_c128_mtp_prepare_kernel(
     swa_loc = tl.load(full_to_swa_ptr + full_loc, mask=has_partial, other=0).to(
         tl.int64
     )
-    slot = swa_loc // swa_page_size
+    slot = tl.where(has_partial, swa_loc // swa_page_size, 0)
     value = tl.load(
         main_state_ptr + slot * main_state_stride_b + d,
         mask=d_mask & has_partial,
