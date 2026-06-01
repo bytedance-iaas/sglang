@@ -14,6 +14,7 @@ SERVER_LOG="${SERVER_LOG:-/tmp/dsv4-eic-server.log}"
 SERVER_ARGS="${SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --enable-hierarchical-cache --hicache-storage-backend eic --enable-eic-cache --mem-fraction-static 0.8}"
 SERVER_PROC_PATTERN='[s]glang.launch_server|[s]glang serve'
 SKIP_SGL_KERNEL_VERSION_CHECK="${SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
+SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
 
 manifest() {
   cat <<YAML
@@ -55,6 +56,8 @@ spec:
           value: /sgl-workspace/config/remote-eic.yaml
         - name: SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK
           value: "${SKIP_SGL_KERNEL_VERSION_CHECK}"
+        - name: SGLANG_NUMA_BIND_V2
+          value: "${SGLANG_NUMA_BIND_V2}"
         - name: MY_HOST_IP
           valueFrom:
             fieldRef:
@@ -148,6 +151,7 @@ rm -f '${SERVER_LOG}'
   kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -lc "
 set -euo pipefail
 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK='${SKIP_SGL_KERNEL_VERSION_CHECK}' \
+SGLANG_NUMA_BIND_V2='${SGLANG_NUMA_BIND_V2}' \
 nohup python3 -m sglang.launch_server \
   --model-path '${MODEL_PATH}' \
   --host 0.0.0.0 \
