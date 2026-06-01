@@ -29,7 +29,7 @@ MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-marlin}"
 WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1800}"
 BASE_SERVER_ARGS="${BASE_SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --mem-fraction-static 0.8 --disable-cuda-graph --watchdog-timeout ${WATCHDOG_TIMEOUT} --moe-runner-backend ${MOE_RUNNER_BACKEND}}"
 if [[ "${ENABLE_EIC}" == "1" ]]; then
-  DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS} --enable-hierarchical-cache --enable-eic-cache"
+  DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS} --enable-hierarchical-cache --enable-eic-cache --hicache-io-backend kernel"
 else
   DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS}"
 fi
