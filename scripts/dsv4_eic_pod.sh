@@ -6,15 +6,28 @@ POD="${POD:-sglang-eic-test}"
 NAMESPACE="${NAMESPACE:-default}"
 NODE_NAME="${NODE_NAME:-192.168.12.62}"
 IMAGE="${IMAGE:-iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:deepseek-v4-community}"
-EIC_CONFIG_MAP="${EIC_CONFIG_MAP:-sglang-eic-cm}"
+EIC_CONFIG_MAP="${EIC_CONFIG_MAP:-sglang-dsv4-eic-cm}"
 REMOTE_EIC_YAML="${REMOTE_EIC_YAML:-/sgl-workspace/config/remote-eic.yaml}"
+APPLY_EIC_CONFIG="${APPLY_EIC_CONFIG:-1}"
+EIC_REMOTE_URL="${EIC_REMOTE_URL:-eic://192.168.12.61:12500}"
+EIC_MASTER_ADDR="${EIC_MASTER_ADDR:-${EIC_REMOTE_URL#eic://}}"
+EIC_INSTANCE_ID="${EIC_INSTANCE_ID:-h20-perf}"
+EIC_REGION_NAME="${EIC_REGION_NAME:-cn-beijing}"
+EIC_CLUSTER_ZONE="${EIC_CLUSTER_ZONE:-cn-beijing-d}"
+EIC_TRANS_TYPE="${EIC_TRANS_TYPE:-2}"
+EIC_THREAD_NUM="${EIC_THREAD_NUM:-2}"
+EIC_LOG_DIR="${EIC_LOG_DIR:-/sgl-workspace/log}"
+EIC_ENABLE_KVSET_GPU_DIRECT="${EIC_ENABLE_KVSET_GPU_DIRECT:-False}"
+EIC_ENABLE_KVGET_GPU_DIRECT="${EIC_ENABLE_KVGET_GPU_DIRECT:-False}"
+EIC_ENABLE_GPU_NIC_AFFINITY="${EIC_ENABLE_GPU_NIC_AFFINITY:-False}"
 GPU_COUNT="${GPU_COUNT:-8}"
 MODEL_PATH="${MODEL_PATH:-/data01/models/DeepSeek-V4-Flash}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
 SERVER_LOG="${SERVER_LOG:-/tmp/dsv4-eic-server.log}"
 ENABLE_EIC="${ENABLE_EIC:-1}"
 MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-marlin}"
-BASE_SERVER_ARGS="${BASE_SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --mem-fraction-static 0.8 --disable-cuda-graph --moe-runner-backend ${MOE_RUNNER_BACKEND}}"
+WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1800}"
+BASE_SERVER_ARGS="${BASE_SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --mem-fraction-static 0.8 --disable-cuda-graph --watchdog-timeout ${WATCHDOG_TIMEOUT} --moe-runner-backend ${MOE_RUNNER_BACKEND}}"
 if [[ "${ENABLE_EIC}" == "1" ]]; then
   DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS} --enable-hierarchical-cache --enable-eic-cache"
 else
@@ -26,6 +39,71 @@ SKIP_SGL_KERNEL_VERSION_CHECK="${SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
 SGLANG_OPT_DEEPGEMM_HC_PRENORM="${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-false}"
 SGLANG_ENABLE_UNIFIED_RADIX_TREE="${SGLANG_ENABLE_UNIFIED_RADIX_TREE:-${ENABLE_EIC}}"
+
+eic_config_manifest() {
+  cat <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${EIC_CONFIG_MAP}
+  namespace: ${NAMESPACE}
+data:
+  eic_flag_file: |-
+    --eic_region_name=${EIC_REGION_NAME}
+    --eic_cluster_zone=${EIC_CLUSTER_ZONE}
+    --eic_cluster_uuid=${EIC_INSTANCE_ID}
+    --eic_client_master_addr_list=${EIC_MASTER_ADDR}
+    --eic_client_using_fixed_master=true
+    --eic_route_view_type=1
+    --block_group_space_name=eic
+    --eic_client_log_file_size_mb=200
+    --eic_client_log_file_num=20
+    --eic_client_log_dir=${EIC_LOG_DIR}
+    --eic_enable_io_audit_log=false
+    --byterpc_enable_time_profiler=false
+    --byterpc_enable_loop_metrics=false
+    --eic_client_slice_qos_mode=1
+    --eic_client_slice_qos_sliding_window_tx_size=32
+    --eic_client_slice_qos_sliding_window_rx_size=32
+    --eic_client_slice_qos_tx_through_kb=1000000000
+    --eic_client_slice_qos_rx_through_kb=1000000000
+    --eic_client_enable_kv_set_crc=false
+    --eic_client_kv_get_check_crc_type=0
+    --eic_client_slice_qos_timeout_ms=1
+    --eic_client_min_rpc_timeout_in_ms=0
+    --eic_client_kv_enable_smart_timeout=true
+    --eic_client_split_kv_slice_size_byte=1048576
+  remote-eic.yaml: |-
+    remote_url: "${EIC_REMOTE_URL}"
+    eic_instance_id: "${EIC_INSTANCE_ID}"
+    chunk_size: 256
+    local_device: null
+    max_local_cache_size: 5
+    eic_thread_num: ${EIC_THREAD_NUM}
+    eic_log_dir: "${EIC_LOG_DIR}"
+    eic_log_level: 2
+    eic_trans_type: ${EIC_TRANS_TYPE}
+    eic_flag_file: "/sgl-workspace/config/eic_flag_file"
+    remote_serde: null
+    pipelined_backend: False
+    save_decode_cache: False
+    enable_blending: False
+    blend_recompute_ratio: 0.5
+    blend_min_tokens: 256
+    enable_kvset_gpu_direct: ${EIC_ENABLE_KVSET_GPU_DIRECT}
+    enable_kvget_gpu_direct: ${EIC_ENABLE_KVGET_GPU_DIRECT}
+    enable_async_kvset: False
+    enable_gpu_nic_affinity: ${EIC_ENABLE_GPU_NIC_AFFINITY}
+    eic_direct_backup: False
+    eic_direct_writeback: False
+    load_remote_threshold: 1000
+    load_back_check: True
+YAML
+}
+
+apply_eic_config() {
+  eic_config_manifest | kubectl -n "${NAMESPACE}" apply -f -
+}
 
 manifest() {
   cat <<YAML
@@ -254,15 +332,24 @@ rm -f /tmp/dsv4-eic-server.pid
 }
 
 case "${ACTION}" in
+  config)
+    apply_eic_config
+    ;;
   manifest)
     manifest
     ;;
   recreate)
+    if [[ "${APPLY_EIC_CONFIG}" == "1" ]]; then
+      apply_eic_config
+    fi
     kubectl -n "${NAMESPACE}" delete pod "${POD}" --ignore-not-found --wait=true
     manifest | kubectl apply -f -
     status
     ;;
   apply)
+    if [[ "${APPLY_EIC_CONFIG}" == "1" ]]; then
+      apply_eic_config
+    fi
     manifest | kubectl apply -f -
     status
     ;;
@@ -291,7 +378,7 @@ case "${ACTION}" in
     stop
     ;;
   *)
-    echo "usage: $0 [manifest|recreate|apply|status|smoke|serve|wait-server|request|eic-check|logs|stop]" >&2
+    echo "usage: $0 [config|manifest|recreate|apply|status|smoke|serve|wait-server|request|eic-check|logs|stop]" >&2
     exit 2
     ;;
 esac

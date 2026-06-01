@@ -154,6 +154,7 @@ class EICHiRadixCache(RadixCache):
         self.tp_size = self.tp_group.size()
         self.rank = self.tp_group.rank()
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.sliding_window_size = params.sliding_window_size
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
@@ -654,6 +655,7 @@ class EICHiRadixCache(RadixCache):
                 device_indices=empty_value,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -683,6 +685,7 @@ class EICHiRadixCache(RadixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
+            best_match_node=last_host_node,
             host_hit_length=host_hit_length,
         )
 
@@ -1127,6 +1130,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
                 device_indices=empty_value,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -1157,6 +1161,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
+            best_match_node=last_host_node,
             host_hit_length=host_hit_length,
         )
 
