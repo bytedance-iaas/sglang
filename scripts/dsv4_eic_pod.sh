@@ -11,11 +11,19 @@ GPU_COUNT="${GPU_COUNT:-8}"
 MODEL_PATH="${MODEL_PATH:-/data01/models/DeepSeek-V4-Flash}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
 SERVER_LOG="${SERVER_LOG:-/tmp/dsv4-eic-server.log}"
-SERVER_ARGS="${SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --enable-hierarchical-cache --hicache-storage-backend eic --enable-eic-cache --mem-fraction-static 0.8 --disable-cuda-graph}"
+ENABLE_EIC="${ENABLE_EIC:-1}"
+BASE_SERVER_ARGS="${BASE_SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --mem-fraction-static 0.8 --disable-cuda-graph}"
+if [[ "${ENABLE_EIC}" == "1" ]]; then
+  DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS} --enable-hierarchical-cache --hicache-storage-backend eic"
+else
+  DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS}"
+fi
+SERVER_ARGS="${SERVER_ARGS:-${DEFAULT_SERVER_ARGS}}"
 SERVER_PROC_PATTERN='[s]glang.launch_server|[s]glang serve'
 SKIP_SGL_KERNEL_VERSION_CHECK="${SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
 SGLANG_OPT_DEEPGEMM_HC_PRENORM="${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-false}"
+SGLANG_ENABLE_UNIFIED_RADIX_TREE="${SGLANG_ENABLE_UNIFIED_RADIX_TREE:-${ENABLE_EIC}}"
 
 manifest() {
   cat <<YAML
@@ -61,6 +69,8 @@ spec:
           value: "${SGLANG_NUMA_BIND_V2}"
         - name: SGLANG_OPT_DEEPGEMM_HC_PRENORM
           value: "${SGLANG_OPT_DEEPGEMM_HC_PRENORM}"
+        - name: SGLANG_ENABLE_UNIFIED_RADIX_TREE
+          value: "${SGLANG_ENABLE_UNIFIED_RADIX_TREE}"
         - name: MY_HOST_IP
           valueFrom:
             fieldRef:
@@ -156,6 +166,7 @@ set -euo pipefail
 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK='${SKIP_SGL_KERNEL_VERSION_CHECK}' \
 SGLANG_NUMA_BIND_V2='${SGLANG_NUMA_BIND_V2}' \
 SGLANG_OPT_DEEPGEMM_HC_PRENORM='${SGLANG_OPT_DEEPGEMM_HC_PRENORM}' \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE='${SGLANG_ENABLE_UNIFIED_RADIX_TREE}' \
 nohup python3 -m sglang.launch_server \
   --model-path '${MODEL_PATH}' \
   --host 0.0.0.0 \
