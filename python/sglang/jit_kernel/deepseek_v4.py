@@ -327,6 +327,17 @@ def _jit_mega_moe_pre_dispatch_module(quant_group_size: int) -> Module:
 
 
 @cache_once
+def _jit_mega_moe_pre_dispatch_sm90_module(quant_group_size: int) -> Module:
+    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("mega_moe_pre_dispatch_sm90"),
+        *args,
+        cuda_files=["deepseek_v4/mega_moe_pre_dispatch_sm90.cuh"],
+        cuda_wrappers=[("run", f"MegaMoEPreDispatchSM90Kernel<{args}>::run")],
+    )
+
+
+@cache_once
 def _jit_hisparse_transfer_module() -> Module:
     return load_jit(
         make_name("hisparse_transfer"),
@@ -921,6 +932,8 @@ def silu_and_mul_contig_post_quant(
     swizzle: bool = False,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
+    if input.shape[0] == 0:
+        return
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
     )
@@ -952,6 +965,30 @@ def mega_moe_pre_dispatch(
         buf_x_sf,
         buf_topk_idx,
         buf_topk_weights,
+    )
+
+
+def mega_moe_pre_dispatch_sm90(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    buf_x: torch.Tensor,
+    buf_x_sf: torch.Tensor,
+    buf_topk_idx: torch.Tensor,
+    buf_topk_weights: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+    quant_group_size: int = 128,
+) -> None:
+    module = _jit_mega_moe_pre_dispatch_sm90_module(quant_group_size)
+    module.run(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+        float(routed_scaling_factor),
     )
 
 
