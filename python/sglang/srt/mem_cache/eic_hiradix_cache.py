@@ -23,12 +23,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.eic_memory_pool import (
+    EICDeepSeekV4TokenToKVPoolHost,
     EICMHATokenToKVPoolHost,
     EICMLATokenToKVPoolHost,
     EICNSATokenToKVPoolHost,
     MemoryStateInt,
     get_eic_config_file_path,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -152,6 +154,7 @@ class EICHiRadixCache(RadixCache):
         self.tp_size = self.tp_group.size()
         self.rank = self.tp_group.rank()
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
                 self.kv_cache,
@@ -188,10 +191,24 @@ class EICHiRadixCache(RadixCache):
             )
             self.kv_cache.get_flat_data = partial(mla_pool_get_flat_data, self.kv_cache)
             self.kv_cache.transfer = partial(mla_pool_transfer, self.kv_cache)
+        elif isinstance(self.kv_cache, DeepSeekV4TokenToKVPool):
+            self.token_to_kv_pool_host = EICDeepSeekV4TokenToKVPoolHost(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                "cpu",
+                params.page_size,
+                self.rank,
+                extra_info=self.get_extra_info(params, server_args),
+                params=params,
+                server_args=server_args,
+                load_cache_event=self.load_cache_event,
+            )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA, MLA and NSA yet")
+            raise ValueError(
+                "HiRadixCache only supports MHA, MLA, NSA and DeepSeek V4 yet"
+            )
 
-        self.load_cache_event = threading.Event()
         self.cache_controller = EICCacheController(
             params.token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,

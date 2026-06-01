@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool_host import synchronized
 
 try:
@@ -1506,6 +1507,303 @@ class EICNSATokenToKVPoolHost(EICMLATokenToKVPoolHost):
             self.device_pool.index_k_with_scale_buffer[layer_id][
                 page_indices
             ] = nsa_bytes
+
+
+class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
+    """Native EIC shared-page adapter for DeepSeek V4 hybrid KV pools."""
+
+    _KV_SOURCED_POOLS = {
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+    }
+    _SWA_SOURCED_POOLS = {
+        PoolName.SWA,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float = 4.0,
+        host_size: int = 10,
+        device: str = "cpu",
+        page_size: int = 1,
+        rank: int = 0,
+        extra_info: Optional[dict] = None,
+        *,
+        params=None,
+        server_args=None,
+        load_cache_event=None,
+    ):
+        if params is None or server_args is None:
+            raise ValueError("DeepSeek V4 EIC host requires cache init params.")
+        if server_args.disable_eic_shared:
+            raise ValueError("DeepSeek V4 EIC cache requires shared-page mode.")
+
+        self._estimated_page_bytes = self._estimate_page_bytes(device_pool)
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            device,
+            page_size,
+            rank,
+            extra_info,
+        )
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_deepseek_v4_hicache_stack,
+        )
+
+        host_pool_group, staging_controller = build_deepseek_v4_hicache_stack(
+            params=params,
+            server_args=server_args,
+            kvcache=device_pool,
+            page_size=page_size,
+            tp_group=params.tp_cache_group,
+            load_cache_event=load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
+            storage_backend=None,
+            pp_rank=params.pp_rank,
+            pp_size=params.pp_size,
+        )
+        # The assembler creates a temporary HiCache controller that registers a
+        # layer-transfer counter on DSv4. Native EIC load completes before the
+        # scheduler resumes the request, so keep the pool on its normal path.
+        device_pool.register_layer_transfer_counter(None)
+
+        self.host_pool_group = host_pool_group
+        self.io_backend = server_args.hicache_io_backend
+        self.layer_num = device_pool.layer_num
+        self.kvcache_device = device_pool.device
+        self.transfer_layer_num = staging_controller.layer_num
+        self.page_specs = self._build_page_specs()
+        self.page_bytes = sum(spec["numel"] for spec in self.page_specs)
+        if self.page_bytes != self._estimated_page_bytes:
+            logger.warning(
+                "DeepSeek V4 EIC page size estimate mismatch: estimated=%s actual=%s",
+                self._estimated_page_bytes,
+                self.page_bytes,
+            )
+
+        self.dtype = torch.uint8
+        self.kvcache_shape = (self.page_bytes,)
+        self.eic_client = EICKVClient(
+            self.dtype, self.kvcache_shape, device_pool, self.kvcache_device
+        )
+
+    def _estimate_page_bytes(self, device_pool) -> int:
+        page_bytes = 0
+        if device_pool.swa_kv_pool.kv_buffer:
+            page_bytes += len(device_pool.swa_kv_pool.kv_buffer) * int(
+                device_pool.swa_kv_pool.bytes_per_page_padded
+            )
+        if device_pool.c4_kv_pool.kv_buffer:
+            page_bytes += len(device_pool.c4_kv_pool.kv_buffer) * int(
+                device_pool.c4_kv_pool.bytes_per_page_padded
+            )
+        c4_indexer_buffer = device_pool.c4_indexer_kv_pool.index_k_with_scale_buffer
+        if c4_indexer_buffer:
+            page_bytes += len(c4_indexer_buffer) * (
+                c4_indexer_buffer[0].shape[1] * c4_indexer_buffer[0].element_size()
+            )
+        if device_pool.c128_kv_pool.kv_buffer:
+            page_bytes += len(device_pool.c128_kv_pool.kv_buffer) * int(
+                device_pool.c128_kv_pool.bytes_per_page_padded
+            )
+
+        for pools in (
+            device_pool.compress_state_pools,
+            device_pool.indexer_compress_state_pools,
+        ):
+            for pool in pools:
+                if pool is None:
+                    continue
+                state_tensor = pool.kv_score_buffer.kv_score
+                page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
+        return page_bytes
+
+    def get_size_per_token(self):
+        return max(1, self._estimated_page_bytes // max(1, self.page_size))
+
+    def _build_page_specs(self):
+        specs = []
+        for name, entry in self.host_pool_group.entry_map.items():
+            if name == PoolName.KV:
+                continue
+            host_pool = entry.host_pool
+            dummy = host_pool.get_dummy_flat_data_page()
+            if dummy.numel() == 0:
+                continue
+            if name in self._SWA_SOURCED_POOLS:
+                source = PoolName.SWA
+            elif name in self._KV_SOURCED_POOLS:
+                source = PoolName.KV
+            else:
+                raise ValueError(f"Unsupported DeepSeek V4 EIC pool: {name}")
+            specs.append(
+                {
+                    "name": name,
+                    "host_pool": host_pool,
+                    "source": source,
+                    "numel": dummy.numel(),
+                }
+            )
+        return specs
+
+    def _swa_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
+        return self.device_pool.translate_loc_from_full_to_swa(full_indices).to(
+            torch.int64
+        )
+
+    def alloc_device_indices(self, allocator, need_size: int):
+        full_allocator = getattr(allocator, "full_attn_allocator", None)
+        swa_allocator = getattr(allocator, "swa_attn_allocator", None)
+        if full_allocator is None or swa_allocator is None:
+            return allocator.alloc(need_size)
+
+        full_indices = full_allocator.alloc(need_size)
+        if full_indices is None:
+            return None
+        swa_indices = swa_allocator.alloc(need_size)
+        if swa_indices is None:
+            full_allocator.free(full_indices)
+            return None
+        allocator.set_full_to_swa_mapping(full_indices, swa_indices)
+        return full_indices
+
+    def _build_pool_transfers(self, full_indices: torch.Tensor):
+        full_host_indices = full_indices.detach().cpu().to(torch.int64)
+        swa_device_indices = self._swa_indices(full_indices)
+        swa_host_indices = swa_device_indices.detach().cpu().to(torch.int64)
+
+        transfers = []
+        for spec in self.page_specs:
+            if spec["source"] == PoolName.SWA:
+                host_indices = swa_host_indices
+                device_indices = swa_device_indices
+            else:
+                host_indices = full_host_indices
+                device_indices = full_indices
+            transfers.append(
+                PoolTransfer(
+                    name=spec["name"],
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            )
+        return full_host_indices, swa_host_indices, transfers
+
+    def _pack_page(self, full_page_start: int, swa_page_start: int) -> torch.Tensor:
+        pieces = []
+        for spec in self.page_specs:
+            page_start = (
+                swa_page_start if spec["source"] == PoolName.SWA else full_page_start
+            )
+            pieces.append(
+                spec["host_pool"].get_data_page(page_start, flat=True).view(torch.uint8)
+            )
+        return torch.cat(pieces).contiguous()
+
+    def _unpack_page(
+        self, full_page_start: int, swa_page_start: int, page_data: torch.Tensor
+    ) -> None:
+        offset = 0
+        page_data = page_data.view(torch.uint8)
+        for spec in self.page_specs:
+            next_offset = offset + spec["numel"]
+            page_start = (
+                swa_page_start if spec["source"] == PoolName.SWA else full_page_start
+            )
+            spec["host_pool"].set_from_flat_data_page(
+                page_start, page_data[offset:next_offset]
+            )
+            offset = next_offset
+
+    def device_backup(
+        self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]
+    ) -> None:
+        assert len(device_indices) == len(dst_tensors) * self.page_size, (
+            "Length of device_indices must equal dst_tensors * page_size"
+        )
+        full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
+            device_indices
+        )
+        self.host_pool_group.backup_from_device_all_layer(
+            self.device_pool,
+            full_host_indices,
+            device_indices,
+            self.io_backend,
+            pool_transfers=transfers,
+        )
+        torch.cuda.current_stream().synchronize()
+
+        for i, dst in enumerate(dst_tensors):
+            offset = i * self.page_size
+            page = self._pack_page(
+                full_host_indices[offset].item(), swa_host_indices[offset].item()
+            )
+            dst.view(torch.uint8).copy_(page, non_blocking=False)
+
+    def device_writeback(self, device_indices, src_tensor, src_indices):
+        suc_count = len(src_indices)
+        if suc_count == 0:
+            return
+        device_indices = device_indices[: suc_count * self.page_size]
+        full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
+            device_indices
+        )
+
+        for i, src_index in enumerate(src_indices):
+            offset = i * self.page_size
+            self._unpack_page(
+                full_host_indices[offset].item(),
+                swa_host_indices[offset].item(),
+                src_tensor[src_index].view(torch.uint8),
+            )
+        torch.cuda.current_stream().synchronize()
+
+        for layer_id in range(self.transfer_layer_num):
+            self.host_pool_group.load_to_device_per_layer(
+                self.device_pool,
+                full_host_indices,
+                device_indices,
+                layer_id,
+                self.io_backend,
+                pool_transfers=transfers,
+            )
+        torch.cuda.current_stream().synchronize()
+
+    def assign_page_data(self, content_hashes, flat_data, device_indices=None):
+        logger.debug(f"assign_deepseek_v4_page_data hashes {content_hashes}")
+        if len(content_hashes) == 0:
+            return True
+        if device_indices is None:
+            logger.error("DeepSeek V4 EIC assign_page_data requires device_indices")
+            return False
+        keys = self._encode_key_shared(content_hashes)
+        if G_EnableAsyncKVSet:
+            return self.eic_client.async_batch_set(
+                keys, None, device_indices, copy_func=self.device_backup
+            )
+        return self.eic_client.set(
+            keys, None, device_indices, copy_func=self.device_backup
+        )
+
+    def get_page_data(self, content_hashs, device_indices=None):
+        logger.debug(f"get_deepseek_v4_page_data content_hashs {content_hashs}")
+        if device_indices is None:
+            logger.error("DeepSeek V4 EIC get_page_data requires device_indices")
+            return [False] * len(content_hashs)
+        keys = self._encode_key_shared(content_hashs)
+        _, success_mask = self.eic_client.batch_get(
+            keys, device_indices, copy_func=self.device_writeback
+        )
+        return success_mask
 
 
 if __name__ == "__main__":

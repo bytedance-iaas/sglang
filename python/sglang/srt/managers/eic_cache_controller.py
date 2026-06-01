@@ -510,7 +510,12 @@ class EICCacheController(HiCacheController):
         """
         Load KV caches from host memory to device memory.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if hasattr(self.mem_pool_host, "alloc_device_indices"):
+            device_indices = self.mem_pool_host.alloc_device_indices(
+                self.mem_pool_device_allocator, len(host_indices)
+            )
+        else:
+            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
         # to ensure the device indices are ready before accessed by another CUDA stream
