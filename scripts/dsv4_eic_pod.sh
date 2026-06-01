@@ -12,6 +12,7 @@ MODEL_PATH="${MODEL_PATH:-/data01/models/DeepSeek-V4-Flash}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
 SERVER_LOG="${SERVER_LOG:-/tmp/dsv4-eic-server.log}"
 SERVER_ARGS="${SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --enable-hierarchical-cache --hicache-storage-backend eic --enable-eic-cache --mem-fraction-static 0.8}"
+SERVER_PROC_PATTERN='[s]glang.launch_server|[s]glang serve'
 
 manifest() {
   cat <<YAML
@@ -138,7 +139,7 @@ serve() {
   kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${POD}" --timeout=20m
   kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -lc "
 set -euo pipefail
-pkill -f 'sglang.launch_server|sglang serve' || true
+pkill -f '${SERVER_PROC_PATTERN}' || true
 rm -f '${SERVER_LOG}'
 nohup python3 -m sglang.launch_server \
   --model-path '${MODEL_PATH}' \
@@ -159,7 +160,7 @@ for _ in \$(seq 1 180); do
     echo ready
     exit 0
   fi
-  if ! pgrep -f 'sglang.launch_server|sglang serve' >/dev/null; then
+  if ! pgrep -f '${SERVER_PROC_PATTERN}' >/dev/null; then
     tail -200 '${SERVER_LOG}' || true
     exit 1
   fi
@@ -187,7 +188,7 @@ logs() {
 
 stop() {
   kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -lc "
-pkill -f 'sglang.launch_server|sglang serve' || true
+pkill -f '${SERVER_PROC_PATTERN}' || true
 rm -f /tmp/dsv4-eic-server.pid
 "
 }
