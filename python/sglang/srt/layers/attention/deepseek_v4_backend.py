@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.jit_kernel.dsv4.online_c128_mtp import (
     online_c128_mtp_commit,
+    online_c128_mtp_compute_accept_lens,
     online_c128_mtp_prepare,
 )
 from sglang.srt.layers.dp_attention import (
