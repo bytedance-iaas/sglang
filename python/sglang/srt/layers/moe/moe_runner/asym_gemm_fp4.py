@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import triton
@@ -397,12 +397,16 @@ def _silu_mul_and_fp4_quant_masked(
     sf_k = half_n // group_size
     device = gateup_output.device
 
-    packed_out = torch.empty(
+    # Zero-init: only the first masked_m[g] rows of each expert are written by the
+    # fused kernel (inactive rows return early). The down-projection masked GEMM
+    # tiles over block_m rows and reads the padding too, so garbage E4M3 scale bytes
+    # there would decode to NaN/Inf and poison valid outputs. Zeros are inert.
+    packed_out = torch.zeros(
         (num_groups, m, k_packed),
         device=device,
         dtype=torch.uint8,
     )
-    scale_out = torch.empty(
+    scale_out = torch.zeros(
         (num_groups, m, sf_k),
         device=device,
         dtype=torch.float8_e4m3fn,
@@ -441,6 +445,7 @@ class AsymGemmFp4RunnerCore(MoeRunnerCore):
         runner_input: AsymGemmFp4RunnerInput,
         quant_info: AsymGemmFp4MoeQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> AsymGemmFp4RunnerOutput:
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(

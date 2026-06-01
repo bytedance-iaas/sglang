@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -71,6 +71,7 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
         runner_input: AsymGemmBf16RunnerInput,
         quant_info: AsymGemmBf16MoeQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> AsymGemmBf16RunnerOutput:
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 import triton
@@ -407,6 +407,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         runner_input,
         quant_info,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ):
         from sglang.srt.layers.moe.moe_runner.asym_gemm_bf16 import (
             AsymGemmBf16MoeQuantInfo,
@@ -417,9 +418,13 @@ class AsymGemmRunnerCore(MoeRunnerCore):
 
         # Dtype-based dispatch: route to BF16 / FP4 runner core by quant_info type
         if isinstance(quant_info, AsymGemmBf16MoeQuantInfo):
-            return self._bf16_core.run(runner_input, quant_info, running_state)
+            return self._bf16_core.run(
+                runner_input, quant_info, running_state, hooks=hooks
+            )
         if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
-            return self._fp4_core.run(runner_input, quant_info, running_state)
+            return self._fp4_core.run(
+                runner_input, quant_info, running_state, hooks=hooks
+            )
 
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(
@@ -1380,13 +1385,20 @@ def _pre_permute_standard_to_asym_gemm_fp4(
         BLOCK_SIZE=256,
     )
 
-    # Scatter pre-quantized FP4 tokens into the padded buffer
-    gateup_fp4 = torch.empty(
+    # Scatter pre-quantized FP4 tokens into the padded buffer.
+    # The buffer is padded to (num_local_experts, m_max, ...) but only the first
+    # masked_m[g] rows of each expert are filled. The AsymGEMM masked kernel tiles
+    # over block_m rows and reads the full tile, so the unfilled padding rows must
+    # be valid zeros: a garbage E4M3 scale byte (e.g. 0x7F/0xFF) decodes to NaN/Inf
+    # and contaminates the tile's accumulator, poisoning the valid output rows.
+    # Zero-init (FP4 code 0 + E4M3 scale 0 => exact 0 contribution) keeps padding
+    # rows inert. See repro: skewed routing -> NaN with torch.empty, clean with zeros.
+    gateup_fp4 = torch.zeros(
         (num_local_experts, m_max, K_packed),
         device=hidden_states_device,
         dtype=torch.uint8,
     )
-    gateup_scale = torch.empty(
+    gateup_scale = torch.zeros(
         (num_local_experts, m_max, K_sf),
         device=hidden_states_device,
         dtype=torch.float8_e4m3fn,

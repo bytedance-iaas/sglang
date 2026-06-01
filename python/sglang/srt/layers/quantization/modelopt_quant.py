@@ -1852,7 +1852,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
-        if (
+        if get_moe_runner_backend().is_asym_gemm():
+            # AsymGEMM consumes row-major (un-swizzled) per-block E4M3 scales and
+            # re-packs them into its TMA-aligned layout inside the kernel. The
+            # weight_scale_2 global scale was already baked into w13/w2_weight_scale
+            # above. Do NOT run the CUTLASS swizzle below: when the scale tensor is
+            # already 128x4-aligned, swizzle_blockscale() returns the same shape and
+            # alias_or_bind_derived_param() would overwrite w13/w2_weight_scale in
+            # place with the swizzled bytes, which the AsymGEMM kernel would then
+            # misread as row-major and produce garbage output.
+            pass
+        elif (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
