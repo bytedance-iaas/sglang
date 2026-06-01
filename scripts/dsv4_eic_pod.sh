@@ -15,6 +15,7 @@ SERVER_ARGS="${SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --enable-
 SERVER_PROC_PATTERN='[s]glang.launch_server|[s]glang serve'
 SKIP_SGL_KERNEL_VERSION_CHECK="${SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
+SGLANG_OPT_DEEPGEMM_HC_PRENORM="${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-false}"
 
 manifest() {
   cat <<YAML
@@ -58,6 +59,8 @@ spec:
           value: "${SKIP_SGL_KERNEL_VERSION_CHECK}"
         - name: SGLANG_NUMA_BIND_V2
           value: "${SGLANG_NUMA_BIND_V2}"
+        - name: SGLANG_OPT_DEEPGEMM_HC_PRENORM
+          value: "${SGLANG_OPT_DEEPGEMM_HC_PRENORM}"
         - name: MY_HOST_IP
           valueFrom:
             fieldRef:
@@ -152,6 +155,7 @@ rm -f '${SERVER_LOG}'
 set -euo pipefail
 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK='${SKIP_SGL_KERNEL_VERSION_CHECK}' \
 SGLANG_NUMA_BIND_V2='${SGLANG_NUMA_BIND_V2}' \
+SGLANG_OPT_DEEPGEMM_HC_PRENORM='${SGLANG_OPT_DEEPGEMM_HC_PRENORM}' \
 nohup python3 -m sglang.launch_server \
   --model-path '${MODEL_PATH}' \
   --host 0.0.0.0 \
