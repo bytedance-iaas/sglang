@@ -17,6 +17,9 @@ EIC_CLUSTER_ZONE="${EIC_CLUSTER_ZONE:-cn-beijing-d}"
 EIC_TRANS_TYPE="${EIC_TRANS_TYPE:-2}"
 EIC_THREAD_NUM="${EIC_THREAD_NUM:-2}"
 EIC_LOG_DIR="${EIC_LOG_DIR:-/sgl-workspace/log}"
+EIC_CLIENT_SLICE_QOS_TIMEOUT_MS="${EIC_CLIENT_SLICE_QOS_TIMEOUT_MS:-30000}"
+EIC_CLIENT_MIN_RPC_TIMEOUT_MS="${EIC_CLIENT_MIN_RPC_TIMEOUT_MS:-30000}"
+EIC_CLIENT_KV_ENABLE_SMART_TIMEOUT="${EIC_CLIENT_KV_ENABLE_SMART_TIMEOUT:-false}"
 EIC_ENABLE_KVSET_GPU_DIRECT="${EIC_ENABLE_KVSET_GPU_DIRECT:-False}"
 EIC_ENABLE_KVGET_GPU_DIRECT="${EIC_ENABLE_KVGET_GPU_DIRECT:-False}"
 EIC_ENABLE_GPU_NIC_AFFINITY="${EIC_ENABLE_GPU_NIC_AFFINITY:-False}"
@@ -70,9 +73,9 @@ data:
     --eic_client_slice_qos_rx_through_kb=1000000000
     --eic_client_enable_kv_set_crc=false
     --eic_client_kv_get_check_crc_type=0
-    --eic_client_slice_qos_timeout_ms=1
-    --eic_client_min_rpc_timeout_in_ms=0
-    --eic_client_kv_enable_smart_timeout=true
+    --eic_client_slice_qos_timeout_ms=${EIC_CLIENT_SLICE_QOS_TIMEOUT_MS}
+    --eic_client_min_rpc_timeout_in_ms=${EIC_CLIENT_MIN_RPC_TIMEOUT_MS}
+    --eic_client_kv_enable_smart_timeout=${EIC_CLIENT_KV_ENABLE_SMART_TIMEOUT}
     --eic_client_split_kv_slice_size_byte=1048576
   remote-eic.yaml: |-
     remote_url: "${EIC_REMOTE_URL}"
