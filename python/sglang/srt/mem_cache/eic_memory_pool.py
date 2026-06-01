@@ -1577,7 +1577,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         device_pool.register_layer_transfer_counter(None)
 
         self.host_pool_group = host_pool_group
-        self.io_backend = server_args.hicache_io_backend
+        self.io_backend = self._resolve_io_backend(server_args)
         self.layer_num = device_pool.layer_num
         self.kvcache_device = device_pool.device
         self.transfer_layer_num = staging_controller.layer_num
@@ -1595,6 +1595,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         self.eic_client = EICKVClient(
             self.dtype, self.kvcache_shape, device_pool, self.kvcache_device
         )
+
+    def _resolve_io_backend(self, server_args) -> str:
+        if server_args.hicache_io_backend:
+            return server_args.hicache_io_backend
+        if server_args.hicache_mem_layout == "page_first_direct":
+            return "direct"
+        return "kernel"
 
     def _estimate_page_bytes(self, device_pool) -> int:
         page_bytes = 0
