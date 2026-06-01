@@ -141,6 +141,9 @@ serve() {
 set -euo pipefail
 pkill -f '${SERVER_PROC_PATTERN}' || true
 rm -f '${SERVER_LOG}'
+"
+  kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -lc "
+set -euo pipefail
 nohup python3 -m sglang.launch_server \
   --model-path '${MODEL_PATH}' \
   --host 0.0.0.0 \
