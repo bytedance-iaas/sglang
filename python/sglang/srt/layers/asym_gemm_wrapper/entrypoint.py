@@ -7,8 +7,10 @@ import torch
 from sglang.srt.layers.asym_gemm_wrapper import compile_utils
 from sglang.srt.layers.asym_gemm_wrapper.configurer import (  # noqa: F401
     ASYMGEMM_BLACKWELL,
+    ASYMGEMM_NATIVE_FP8,
     ASYMGEMM_SCALE_UE8M0,
     ASYMGEMM_SM89,
+    ASYMGEMM_SM90,
     ENABLE_JIT_ASYMGEMM,
 )
 from sglang.srt.server_args import ServerArgs
@@ -51,7 +53,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 out,
                 masked_m,
                 expected_m,
-                disable_ue8m0_cast=False,
+                # SM90 (Hopper) uses plain FP32 scales; Blackwell casts to UE8M0.
+                disable_ue8m0_cast=not ASYMGEMM_SCALE_UE8M0,
             )
         
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -71,7 +74,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.asym_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(lhs, rhs, out, offsets, experts, list_size,
-            disable_ue8m0_cast=False,
+            # SM90 (Hopper) uses plain FP32 scales; Blackwell casts to UE8M0.
+            disable_ue8m0_cast=not ASYMGEMM_SCALE_UE8M0,
         )
 
 

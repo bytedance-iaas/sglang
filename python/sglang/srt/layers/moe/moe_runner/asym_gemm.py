@@ -521,9 +521,11 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_NATIVE_FP8
 
-        if ASYMGEMM_SM89:
+        # SM89 (Ada) and SM90 (Hopper) share the native FP8 grouped-GEMM kernels;
+        # only Blackwell (SM100) uses the TMA/UMMA `*_nt_*` path below.
+        if ASYMGEMM_NATIVE_FP8:
             return self._run_contiguous_gemm_sm89(
                 runner_input, quant_info, running_state
             )
@@ -797,9 +799,11 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_NATIVE_FP8
 
-        if ASYMGEMM_SM89:
+        # SM89 (Ada) and SM90 (Hopper) share the native FP8 grouped-GEMM kernels;
+        # only Blackwell (SM100) uses the TMA/UMMA `*_nt_*` path below.
+        if ASYMGEMM_NATIVE_FP8:
             return self._run_masked_gemm_sm89(
                 runner_input, quant_info, running_state
             )
@@ -1121,11 +1125,12 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
 
-    from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+    from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_NATIVE_FP8
 
-    # SM89 uses per-token quantization (group_size=K) instead of per-token-group
+    # The native FP8 path (SM89/SM90) uses per-token quantization (group_size=K)
+    # instead of the per-token-group scales the SM100 `*_nt_*` kernels expect.
     K = hidden_states.shape[1]
-    act_block_shape = [1, K] if ASYMGEMM_SM89 else quant_info.block_shape
+    act_block_shape = [1, K] if ASYMGEMM_NATIVE_FP8 else quant_info.block_shape
 
     # PreReorder
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
@@ -1136,7 +1141,7 @@ def _pre_permute_standard_to_asym_gemm_fp8(
             runner_config.top_k,
             act_block_shape,
             scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0
-            and not ASYMGEMM_SM89,
+            and not ASYMGEMM_NATIVE_FP8,
         )
     )
 

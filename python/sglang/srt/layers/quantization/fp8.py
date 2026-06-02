@@ -1180,10 +1180,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
         elif self.runner.runner_backend.is_asym_gemm():
-            from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+            from sglang.srt.layers.asym_gemm_wrapper.configurer import (
+                ASYMGEMM_NATIVE_FP8,
+            )
 
             weight_block_size = self.quant_config.weight_block_size
-            if ASYMGEMM_SM89:
+            if ASYMGEMM_NATIVE_FP8:
+                # SM89 (Ada) and SM90 (Hopper/H20) both use the native FP8
+                # grouped-GEMM kernels, which consume per-expert (per-tensor)
+                # FP8 weight scales. Requantize the block-scaled checkpoint
+                # weights accordingly; no UE8M0 cast.
                 requant_weight_per_expert_inplace(
                     layer.w13_weight,
                     layer.w13_weight_scale_inv,

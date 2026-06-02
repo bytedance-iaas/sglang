@@ -1971,6 +1971,16 @@ class ServerArgs:
                     logger.info(
                         "Use asym_gemm as MoE runner backend on SM89 for DeepseekV3ForCausalLM"
                     )
+            elif is_sm90_supported():
+                if (
+                    self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                    and self.quantization in ["fp8", "modelopt_fp8"]
+                ):
+                    self.moe_runner_backend = "asym_gemm"
+                    logger.info(
+                        "Use asym_gemm as MoE runner backend on SM90 for DeepseekV3ForCausalLM"
+                    )
             elif is_hip():
                 if not self.enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
