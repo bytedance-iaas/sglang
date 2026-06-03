@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -282,6 +283,10 @@ class EICHiRadixCache(RadixCache):
         logger.debug(f"write backup for node {node.id}")
         if node.evicted:
             return 0
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
+            return 0
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             priority=-self.get_height(node),
@@ -312,6 +317,74 @@ class EICHiRadixCache(RadixCache):
             if node.hit_count >= self.write_through_threshold:
                 self.write_backup(node)
                 node.hit_count = 0
+
+    def _backup_unbacked_path(self, node: TreeNode) -> int:
+        if self.cache_controller.write_policy != "write_through":
+            return 0
+
+        path = []
+        while node is not None and node != self.root_node:
+            path.append(node)
+            node = node.parent
+
+        written = 0
+        for path_node in reversed(path):
+            if path_node.evicted or path_node.backuped:
+                continue
+            written += self.write_backup(path_node)
+        return written
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        """Cache a finished request and make EIC's remote prefix contiguous."""
+        if self.disable_finished_insert:
+            is_insert = False
+
+        kv_committed_len = req.pop_committed_kv_cache()
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        key_len = len(radix_key)
+        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+
+        if is_insert:
+            priority = getattr(req, "priority", 0) or 0
+            result = self.insert(
+                InsertParams(key=radix_key, value=values, priority=priority)
+            )
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : result.prefix_len]
+            )
+
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            self._backup_unbacked_path(match_result.last_device_node)
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : key_len]
+            )
+            if req.last_node is not None:
+                self._backup_unbacked_path(req.last_node)
+
+        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
+
+    def cache_unfinished_req(self, req: Req, chunked=False):
+        super().cache_unfinished_req(req, chunked=chunked)
+        if req.last_node is not None:
+            self._backup_unbacked_path(req.last_node)
 
     def get_tp_result(self, flag):
         if isinstance(flag, bool):
@@ -358,21 +431,17 @@ class EICHiRadixCache(RadixCache):
             ack_list.append(ack_id)
             flags.append(success)
         for ack_id, success in zip(ack_list, flags):
-            if (
-                not success
-                and not isinstance(self, EICPagedHiRadixCache)
-                and self.ongoing_write_through[ack_id].host_value is not None
-            ):
-                if (
-                    self.cache_controller.mem_pool_host.get_state(
-                        self.ongoing_write_through[ack_id].host_value
-                    )
-                    != MemoryStateInt.IDLE
-                ):
-                    self.cache_controller.mem_pool_host.free(
-                        self.ongoing_write_through[ack_id].host_value
-                    )
-                self.ongoing_write_through[ack_id].host_value = None
+            if not success:
+                node = self.ongoing_write_through[ack_id]
+                if isinstance(self, EICPagedHiRadixCache):
+                    node.host_value = None
+                elif node.host_value is not None:
+                    if (
+                        self.cache_controller.mem_pool_host.get_state(node.host_value)
+                        != MemoryStateInt.IDLE
+                    ):
+                        self.cache_controller.mem_pool_host.free(node.host_value)
+                    node.host_value = None
             if not write_back:
                 self.dec_lock_ref(self.ongoing_write_through[ack_id])
             # clear the reference
@@ -1179,6 +1248,10 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
     def write_backup(self, node: TreeNode, write_back=False):
         if node.evicted:
+            return 0
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
             return 0
         if _need_calculate_hash(node, self.page_size):
             self._calculate_content_hash(node)

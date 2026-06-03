@@ -46,6 +46,11 @@ G_EnableGPUNicAffinity = False
 G_EnableAsyncKVSet = False
 G_KVSetTTLOption = -1
 
+# The local EIC agent used by DSv4 commonly has a 4 MiB max value class.  A
+# packed DSv4 radix page is much larger, so DSv4 splits one logical page across
+# multiple EIC keys and keeps the radix/page hit test atomic.
+DEFAULT_DSV4_EIC_CHUNK_BYTES = 4 * 1024 * 1024
+
 
 # default H20 gpu nic affinity
 GPUNicAffinity = {
@@ -205,13 +210,13 @@ class EICKVClient:
 
         logger.info(f"eic remote_url:" + remote_url + " endpoint: " + endpoint)
 
-        eic_instance_id = config.get("eic_instance_id", None)
+        eic_instance_id = config.get("eic_instance_id", "")
         logger.info(f"eic instance_id: {eic_instance_id}")
 
         eic_thread_num = config.get("eic_thread_num", 1)
         logger.info(f"eic thread_num: {eic_thread_num}")
 
-        eic_log_dir = config.get("eic_log_dir", None)
+        eic_log_dir = config.get("eic_log_dir", "/tmp/eic-client-log")
         logger.info(f"eic log_dir: {eic_log_dir}")
 
         eic_log_level = config.get("eic_log_level", 2)
@@ -302,7 +307,8 @@ class EICKVClient:
         init_option.log_dir = eic_log_dir
         init_option.log_level = eic.LogLevel(eic_log_level)
         init_option.transport_type = eic.TransportType(eic_trans_type)
-        init_option.flag_file = eic_flag_file
+        if eic_flag_file is not None:
+            init_option.flag_file = eic_flag_file
 
         if G_EnableGPUNicAffinity:
             gpu_id = torch.cuda.current_device()
@@ -674,6 +680,7 @@ class EICKVClient:
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
         if status_code != eic.StatusCode.SUCCESS:
             logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
+            return False
         else:
             logger.debug(f"eic mset {len(keys)} success")
 
@@ -681,9 +688,18 @@ class EICKVClient:
             for item in objs:
                 self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
 
-        err_code = set_outcome.status_codes[0]
-        if err_code != eic.StatusCode.SUCCESS:
-            logger.error(f"set data key {len(keys)} failed, err_code {err_code}")
+        failed = [
+            (i, err_code)
+            for i, err_code in enumerate(set_outcome.status_codes)
+            if err_code != eic.StatusCode.SUCCESS
+        ]
+        if failed:
+            logger.error(
+                "set data key batch failed, total=%s failed=%s first_failed=%s",
+                len(keys),
+                len(failed),
+                failed[0],
+            )
             return False
 
         logger.debug(f"set data key {len(keys)} success")
@@ -719,7 +735,21 @@ class EICKVClient:
             return False
         else:
             logger.debug(f"eic mset {len(keys)} success")
-        return True
+
+        failed = [
+            (i, err_code)
+            for i, err_code in enumerate(set_outcome.status_codes)
+            if err_code != eic.StatusCode.SUCCESS
+        ]
+        if failed:
+            logger.error(
+                "async set data key batch failed, total=%s failed=%s first_failed=%s",
+                len(keys),
+                len(failed),
+                failed[0],
+            )
+            return False
+        return status_code == eic.StatusCode.SUCCESS
 
 
 class EICBaseTokenToKVPoolHost:
@@ -1596,11 +1626,38 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 self.page_bytes,
             )
 
+        self.eic_chunk_bytes = self._resolve_eic_chunk_bytes()
+        self.page_chunk_count = (
+            self.page_bytes + self.eic_chunk_bytes - 1
+        ) // self.eic_chunk_bytes
+        logger.info(
+            "DeepSeek V4 EIC page chunking: page_bytes=%s chunk_bytes=%s chunks_per_page=%s",
+            self.page_bytes,
+            self.eic_chunk_bytes,
+            self.page_chunk_count,
+        )
+
         self.dtype = torch.uint8
-        self.kvcache_shape = (self.page_bytes,)
+        self.kvcache_shape = (self.eic_chunk_bytes,)
         self.eic_client = EICKVClient(
             self.dtype, self.kvcache_shape, device_pool, self.kvcache_device
         )
+
+    def _resolve_eic_chunk_bytes(self) -> int:
+        chunk_bytes = DEFAULT_DSV4_EIC_CHUNK_BYTES
+        config_file = get_eic_config_file_path()
+        if os.path.exists(config_file):
+            with open(config_file, "r") as fin:
+                config = yaml.safe_load(fin) or {}
+            chunk_bytes = int(
+                config.get(
+                    "dsv4_eic_chunk_bytes",
+                    config.get("eic_object_chunk_bytes", chunk_bytes),
+                )
+            )
+        if chunk_bytes <= 0:
+            chunk_bytes = self.page_bytes
+        return max(1, min(chunk_bytes, self.page_bytes))
 
     def _resolve_io_backend(self, server_args) -> str:
         if server_args.hicache_io_backend:
@@ -1737,11 +1794,50 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             )
             offset = next_offset
 
+    def _encode_page_chunk_keys(self, content_hashes):
+        keys = []
+        for page_key in self._encode_key_shared(content_hashes):
+            for chunk_id in range(self.page_chunk_count):
+                keys.append(
+                    f"{page_key}#dsv4chunk{chunk_id}of{self.page_chunk_count}b{self.eic_chunk_bytes}"
+                )
+        return keys
+
+    def batch_exist_page(self, content_hashes):
+        if len(content_hashes) == 0:
+            return []
+
+        chunk_keys = self._encode_page_chunk_keys(content_hashes)
+        batch_size = self.eic_client.eic_check_bs
+        chunk_exists = []
+        for i in range(0, len(chunk_keys), batch_size):
+            chunk_exists.extend(
+                self.eic_client.exists_batch(chunk_keys[i : i + batch_size])
+            )
+
+        page_exists = []
+        for page_id in range(len(content_hashes)):
+            start = page_id * self.page_chunk_count
+            end = start + self.page_chunk_count
+            page_exists.append(all(chunk_exists[start:end]))
+        return page_exists
+
+    def exist_page(self, content_hashes):
+        page_exists = self.batch_exist_page(content_hashes)
+        ret = []
+        for i, exist in enumerate(page_exists):
+            if not exist:
+                break
+            ret.append(content_hashes[i])
+        return ret
+
     def device_backup(
         self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]
     ) -> None:
-        assert len(device_indices) == len(dst_tensors) * self.page_size, (
-            "Length of device_indices must equal dst_tensors * page_size"
+        page_count = len(device_indices) // self.page_size
+        assert len(device_indices) == page_count * self.page_size
+        assert len(dst_tensors) == page_count * self.page_chunk_count, (
+            "Length of dst_tensors must equal pages * DSv4 EIC chunks per page"
         )
         full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
             device_indices
@@ -1755,28 +1851,51 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         )
         torch.cuda.current_stream().synchronize()
 
-        for i, dst in enumerate(dst_tensors):
-            offset = i * self.page_size
+        for page_id in range(page_count):
+            token_offset = page_id * self.page_size
             page = self._pack_page(
-                full_host_indices[offset].item(), swa_host_indices[offset].item()
+                full_host_indices[token_offset].item(),
+                swa_host_indices[token_offset].item(),
             )
-            dst.view(torch.uint8).copy_(page, non_blocking=False)
+            for chunk_id in range(self.page_chunk_count):
+                chunk_offset = chunk_id * self.eic_chunk_bytes
+                chunk_end = min(chunk_offset + self.eic_chunk_bytes, self.page_bytes)
+                dst = dst_tensors[
+                    page_id * self.page_chunk_count + chunk_id
+                ].view(torch.uint8)
+                dst.zero_()
+                if chunk_offset < chunk_end:
+                    dst[: chunk_end - chunk_offset].copy_(
+                        page[chunk_offset:chunk_end], non_blocking=False
+                    )
 
     def device_writeback(self, device_indices, src_tensor, src_indices):
-        suc_count = len(src_indices)
-        if suc_count == 0:
+        chunk_count = len(src_indices)
+        page_count = chunk_count // self.page_chunk_count
+        if page_count == 0:
             return
-        device_indices = device_indices[: suc_count * self.page_size]
+        device_indices = device_indices[: page_count * self.page_size]
         full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
             device_indices
         )
 
-        for i, src_index in enumerate(src_indices):
-            offset = i * self.page_size
+        for page_id in range(page_count):
+            pieces = []
+            for chunk_id in range(self.page_chunk_count):
+                src_index = src_indices[page_id * self.page_chunk_count + chunk_id]
+                chunk_offset = chunk_id * self.eic_chunk_bytes
+                chunk_end = min(chunk_offset + self.eic_chunk_bytes, self.page_bytes)
+                pieces.append(
+                    src_tensor[src_index]
+                    .view(torch.uint8)[: chunk_end - chunk_offset]
+                    .contiguous()
+                )
+            page_data = torch.cat(pieces)
+            token_offset = page_id * self.page_size
             self._unpack_page(
-                full_host_indices[offset].item(),
-                swa_host_indices[offset].item(),
-                src_tensor[src_index].view(torch.uint8),
+                full_host_indices[token_offset].item(),
+                swa_host_indices[token_offset].item(),
+                page_data,
             )
         torch.cuda.current_stream().synchronize()
 
@@ -1798,11 +1917,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         if device_indices is None:
             logger.error("DeepSeek V4 EIC assign_page_data requires device_indices")
             return False
-        keys = self._encode_key_shared(content_hashes)
-        bs = G_GDRBounceTensorCount
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
-            indices = device_indices[i * self.page_size : (i + bs) * self.page_size]
+        page_batch_size = max(1, G_GDRBounceTensorCount // self.page_chunk_count)
+        for i in range(0, len(content_hashes), page_batch_size):
+            page_hashes = content_hashes[i : i + page_batch_size]
+            key = self._encode_page_chunk_keys(page_hashes)
+            indices = device_indices[
+                i * self.page_size : (i + len(page_hashes)) * self.page_size
+            ]
             if G_EnableAsyncKVSet:
                 ret = self.eic_client.async_batch_set(
                     key, None, indices, copy_func=self.device_backup
@@ -1823,17 +1944,24 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         if device_indices is None:
             logger.error("DeepSeek V4 EIC get_page_data requires device_indices")
             return [False] * len(content_hashs)
-        keys = self._encode_key_shared(content_hashs)
-        bs = G_GDRBounceTensorCount
+        page_batch_size = max(1, G_GDRBounceTensorCount // self.page_chunk_count)
         success_mask = []
-        for i in range(0, len(keys), bs):
-            key = keys[i : i + bs]
-            indices = device_indices[i * self.page_size : (i + bs) * self.page_size]
-            _, mask = self.eic_client.batch_get(
+        for i in range(0, len(content_hashs), page_batch_size):
+            page_hashes = content_hashs[i : i + page_batch_size]
+            key = self._encode_page_chunk_keys(page_hashes)
+            indices = device_indices[
+                i * self.page_size : (i + len(page_hashes)) * self.page_size
+            ]
+            _, chunk_mask = self.eic_client.batch_get(
                 key, indices, copy_func=self.device_writeback
             )
-            success_mask.extend(mask)
-            if not all(mask):
+            page_mask = []
+            for page_id in range(len(page_hashes)):
+                start = page_id * self.page_chunk_count
+                end = start + self.page_chunk_count
+                page_mask.append(all(chunk_mask[start:end]))
+            success_mask.extend(page_mask)
+            if not all(page_mask):
                 break
         return success_mask
 
