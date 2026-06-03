@@ -274,6 +274,12 @@ class EICKVClient:
         G_GDRBounceTensorCount = self.gdr_bounce_buffer_size // (
             kv_cache_numel * kv_cache_dtype.itemsize
         )
+        G_GDRBounceTensorCount = max(1, G_GDRBounceTensorCount)
+        eic_max_batch_size = config.get("eic_max_batch_size", None)
+        if eic_max_batch_size is not None:
+            G_GDRBounceTensorCount = min(
+                G_GDRBounceTensorCount, max(1, int(eic_max_batch_size))
+            )
         logger.info(
             f"eic gdr_bounce_tensor_count: {G_GDRBounceTensorCount}, kvcache_size {kv_cache_numel * kv_cache_dtype.itemsize}"
         )
@@ -1793,13 +1799,24 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             logger.error("DeepSeek V4 EIC assign_page_data requires device_indices")
             return False
         keys = self._encode_key_shared(content_hashes)
-        if G_EnableAsyncKVSet:
-            return self.eic_client.async_batch_set(
-                keys, None, device_indices, copy_func=self.device_backup
-            )
-        return self.eic_client.set(
-            keys, None, device_indices, copy_func=self.device_backup
-        )
+        bs = G_GDRBounceTensorCount
+        for i in range(0, len(keys), bs):
+            key = keys[i : i + bs]
+            indices = device_indices[i * self.page_size : (i + bs) * self.page_size]
+            if G_EnableAsyncKVSet:
+                ret = self.eic_client.async_batch_set(
+                    key, None, indices, copy_func=self.device_backup
+                )
+            else:
+                ret = self.eic_client.set(
+                    key, None, indices, copy_func=self.device_backup
+                )
+            if not ret:
+                logger.error(
+                    f"assign_deepseek_v4_page_data keys {key} failed, eic_client return none"
+                )
+                return False
+        return True
 
     def get_page_data(self, content_hashs, device_indices=None):
         logger.debug(f"get_deepseek_v4_page_data content_hashs {content_hashs}")
@@ -1807,9 +1824,17 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             logger.error("DeepSeek V4 EIC get_page_data requires device_indices")
             return [False] * len(content_hashs)
         keys = self._encode_key_shared(content_hashs)
-        _, success_mask = self.eic_client.batch_get(
-            keys, device_indices, copy_func=self.device_writeback
-        )
+        bs = G_GDRBounceTensorCount
+        success_mask = []
+        for i in range(0, len(keys), bs):
+            key = keys[i : i + bs]
+            indices = device_indices[i * self.page_size : (i + bs) * self.page_size]
+            _, mask = self.eic_client.batch_get(
+                key, indices, copy_func=self.device_writeback
+            )
+            success_mask.extend(mask)
+            if not all(mask):
+                break
         return success_mask
 
 

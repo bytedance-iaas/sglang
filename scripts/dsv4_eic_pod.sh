@@ -9,20 +9,35 @@ IMAGE="${IMAGE:-iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:deepseek-v4-com
 EIC_CONFIG_MAP="${EIC_CONFIG_MAP:-sglang-dsv4-eic-cm}"
 REMOTE_EIC_YAML="${REMOTE_EIC_YAML:-/sgl-workspace/config/remote-eic.yaml}"
 APPLY_EIC_CONFIG="${APPLY_EIC_CONFIG:-1}"
-EIC_REMOTE_URL="${EIC_REMOTE_URL:-eic://192.168.12.61:12500}"
+EIC_REMOTE_URL="${EIC_REMOTE_URL:-eic://192.168.12.62:12500}"
 EIC_MASTER_ADDR="${EIC_MASTER_ADDR:-${EIC_REMOTE_URL#eic://}}"
 EIC_INSTANCE_ID="${EIC_INSTANCE_ID:-h20-perf}"
-EIC_REGION_NAME="${EIC_REGION_NAME:-cn-beijing}"
-EIC_CLUSTER_ZONE="${EIC_CLUSTER_ZONE:-cn-beijing-d}"
-EIC_TRANS_TYPE="${EIC_TRANS_TYPE:-2}"
+EIC_REGION_NAME="${EIC_REGION_NAME:-cn-shanghai}"
+EIC_CLUSTER_ZONE="${EIC_CLUSTER_ZONE:-cn-shanghai-d}"
+EIC_TRANS_TYPE="${EIC_TRANS_TYPE:-0}"
 EIC_THREAD_NUM="${EIC_THREAD_NUM:-2}"
 EIC_LOG_DIR="${EIC_LOG_DIR:-/sgl-workspace/log}"
+EIC_CLIENT_RPC_TIMEOUT_MS="${EIC_CLIENT_RPC_TIMEOUT_MS:-30000}"
+EIC_CLIENT_KV_REQ_TIMEOUT_MS="${EIC_CLIENT_KV_REQ_TIMEOUT_MS:-30000}"
 EIC_CLIENT_SLICE_QOS_TIMEOUT_MS="${EIC_CLIENT_SLICE_QOS_TIMEOUT_MS:-30000}"
 EIC_CLIENT_MIN_RPC_TIMEOUT_MS="${EIC_CLIENT_MIN_RPC_TIMEOUT_MS:-30000}"
 EIC_CLIENT_KV_ENABLE_SMART_TIMEOUT="${EIC_CLIENT_KV_ENABLE_SMART_TIMEOUT:-false}"
+EIC_CLIENT_ENABLE_SLICE_TASK_COPY_BYPASS="${EIC_CLIENT_ENABLE_SLICE_TASK_COPY_BYPASS:-false}"
+EIC_CLIENT_ENABLE_SLICE_TASK_COPY_THREAD="${EIC_CLIENT_ENABLE_SLICE_TASK_COPY_THREAD:-false}"
+EIC_CLIENT_ENABLE_KV_SET_CRC="${EIC_CLIENT_ENABLE_KV_SET_CRC:-true}"
+EIC_CLIENT_KV_GET_ENABLE_GDR="${EIC_CLIENT_KV_GET_ENABLE_GDR:-false}"
+EIC_CLIENT_KV_SET_ENABLE_GDR="${EIC_CLIENT_KV_SET_ENABLE_GDR:-false}"
+EIC_USE_POLLING_MODE="${EIC_USE_POLLING_MODE:-true}"
+EIC_USE_BYTE_EXPRESS="${EIC_USE_BYTE_EXPRESS:-false}"
+EIC_ENABLE_MULTI_NIC="${EIC_ENABLE_MULTI_NIC:-false}"
+EIC_CLIENT_MULTI_NET_LOCAL_INTERFACE_NAMES="${EIC_CLIENT_MULTI_NET_LOCAL_INTERFACE_NAMES:-eth0}"
+EIC_CLIENT_DRAM_MEMPOOL_LIMIT_BYTES="${EIC_CLIENT_DRAM_MEMPOOL_LIMIT_BYTES:-17179869184}"
+EIC_CLIENT_SPLIT_KV_SLICE_SIZE_BYTE="${EIC_CLIENT_SPLIT_KV_SLICE_SIZE_BYTE:-65536}"
 EIC_ENABLE_KVSET_GPU_DIRECT="${EIC_ENABLE_KVSET_GPU_DIRECT:-False}"
 EIC_ENABLE_KVGET_GPU_DIRECT="${EIC_ENABLE_KVGET_GPU_DIRECT:-False}"
+EIC_ENABLE_KVSET_DIRECT="${EIC_ENABLE_KVSET_DIRECT:-False}"
 EIC_ENABLE_GPU_NIC_AFFINITY="${EIC_ENABLE_GPU_NIC_AFFINITY:-False}"
+EIC_MAX_BATCH_SIZE="${EIC_MAX_BATCH_SIZE:-1}"
 GPU_COUNT="${GPU_COUNT:-8}"
 MODEL_PATH="${MODEL_PATH:-/data01/models/DeepSeek-V4-Flash}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
@@ -30,7 +45,7 @@ SERVER_LOG="${SERVER_LOG:-/tmp/dsv4-eic-server.log}"
 ENABLE_EIC="${ENABLE_EIC:-1}"
 MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-marlin}"
 WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1800}"
-BASE_SERVER_ARGS="${BASE_SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --mem-fraction-static 0.8 --disable-cuda-graph --watchdog-timeout ${WATCHDOG_TIMEOUT} --moe-runner-backend ${MOE_RUNNER_BACKEND}}"
+BASE_SERVER_ARGS="${BASE_SERVER_ARGS:---tp-size ${GPU_COUNT} --trust-remote-code --mem-fraction-static 0.8 --disable-cuda-graph --disable-overlap-schedule --watchdog-timeout ${WATCHDOG_TIMEOUT} --moe-runner-backend ${MOE_RUNNER_BACKEND}}"
 if [[ "${ENABLE_EIC}" == "1" ]]; then
   DEFAULT_SERVER_ARGS="${BASE_SERVER_ARGS} --enable-hierarchical-cache --enable-eic-cache --hicache-io-backend kernel"
 else
@@ -66,17 +81,28 @@ data:
     --eic_enable_io_audit_log=false
     --byterpc_enable_time_profiler=false
     --byterpc_enable_loop_metrics=false
+    --eic_client_rpc_timeout_in_ms=${EIC_CLIENT_RPC_TIMEOUT_MS}
+    --eic_client_kv_req_timeout_in_ms=${EIC_CLIENT_KV_REQ_TIMEOUT_MS}
+    --eic_client_enable_slice_task_copy_bypass=${EIC_CLIENT_ENABLE_SLICE_TASK_COPY_BYPASS}
+    --eic_client_enable_slice_task_copy_thread=${EIC_CLIENT_ENABLE_SLICE_TASK_COPY_THREAD}
     --eic_client_slice_qos_mode=1
     --eic_client_slice_qos_sliding_window_tx_size=32
     --eic_client_slice_qos_sliding_window_rx_size=32
     --eic_client_slice_qos_tx_through_kb=1000000000
     --eic_client_slice_qos_rx_through_kb=1000000000
-    --eic_client_enable_kv_set_crc=false
+    --eic_client_enable_kv_set_crc=${EIC_CLIENT_ENABLE_KV_SET_CRC}
     --eic_client_kv_get_check_crc_type=0
+    --eic_client_kv_get_enable_gdr=${EIC_CLIENT_KV_GET_ENABLE_GDR}
+    --eic_client_kv_set_enable_gdr=${EIC_CLIENT_KV_SET_ENABLE_GDR}
+    --eic_use_polling_mode=${EIC_USE_POLLING_MODE}
+    --eic_use_byte_express=${EIC_USE_BYTE_EXPRESS}
+    --eic_enable_multi_nic=${EIC_ENABLE_MULTI_NIC}
+    --eic_client_multi_net_local_interface_names=${EIC_CLIENT_MULTI_NET_LOCAL_INTERFACE_NAMES}
+    --eic_client_dram_mempool_limit_bytes=${EIC_CLIENT_DRAM_MEMPOOL_LIMIT_BYTES}
     --eic_client_slice_qos_timeout_ms=${EIC_CLIENT_SLICE_QOS_TIMEOUT_MS}
     --eic_client_min_rpc_timeout_in_ms=${EIC_CLIENT_MIN_RPC_TIMEOUT_MS}
     --eic_client_kv_enable_smart_timeout=${EIC_CLIENT_KV_ENABLE_SMART_TIMEOUT}
-    --eic_client_split_kv_slice_size_byte=1048576
+    --eic_client_split_kv_slice_size_byte=${EIC_CLIENT_SPLIT_KV_SLICE_SIZE_BYTE}
   remote-eic.yaml: |-
     remote_url: "${EIC_REMOTE_URL}"
     eic_instance_id: "${EIC_INSTANCE_ID}"
@@ -96,10 +122,12 @@ data:
     blend_min_tokens: 256
     enable_kvset_gpu_direct: ${EIC_ENABLE_KVSET_GPU_DIRECT}
     enable_kvget_gpu_direct: ${EIC_ENABLE_KVGET_GPU_DIRECT}
+    enable_kvset_direct: ${EIC_ENABLE_KVSET_DIRECT}
     enable_async_kvset: False
     enable_gpu_nic_affinity: ${EIC_ENABLE_GPU_NIC_AFFINITY}
     eic_direct_backup: False
     eic_direct_writeback: False
+    eic_max_batch_size: ${EIC_MAX_BATCH_SIZE}
     load_remote_threshold: 1000
     load_back_check: True
 YAML
@@ -274,6 +302,7 @@ import time
 import yaml
 
 import eic
+import torch
 
 config_file = '${REMOTE_EIC_YAML}'
 config = yaml.safe_load(open(config_file))
@@ -292,7 +321,35 @@ print(f\"config={config_file}\")
 print(f\"instance={config.get('eic_instance_id')} endpoint={endpoint}\")
 ret = client.init(config.get('eic_instance_id'), endpoint, init_option)
 print(f\"ret={ret} cost={time.time() - start:.2f}s\")
-raise SystemExit(0 if ret == 0 else 1)
+if ret != 0:
+    raise SystemExit(1)
+
+key = f'sglang-dsv4-eic-check-{int(time.time() * 1000)}'
+value = b'hello-eic'
+keys = eic.StringVector()
+keys.append(key)
+vals = eic.IOBuffers()
+value_tensor = torch.tensor(list(value), dtype=torch.uint8, device='cpu')
+vals.append(value_tensor.data_ptr(), value_tensor.numel(), False)
+set_option = eic.SetOption()
+set_option.ns = config.get('eic_namespace', '')
+set_code, set_status = client.mset(keys, vals, set_option)
+print(f'mset code={set_code} status={[str(x) for x in set_status.status_codes]}')
+
+out = eic.IOBuffers()
+out_tensor = torch.empty_like(value_tensor)
+out.append(out_tensor.data_ptr(), out_tensor.numel(), False)
+get_option = eic.GetOption()
+get_option.ns = config.get('eic_namespace', '')
+get_code, _, get_status = client.mget(keys, get_option, out)
+got = bytes(out_tensor.tolist()).decode()
+print(f'mget code={get_code} status={[str(x) for x in get_status.status_codes]} value={got!r}')
+ok = (
+    set_code == eic.StatusCode.SUCCESS
+    and get_code == eic.StatusCode.SUCCESS
+    and got == value.decode()
+)
+raise SystemExit(0 if ok else 1)
 PY
 "
 }
@@ -342,6 +399,9 @@ case "${ACTION}" in
   config)
     apply_eic_config
     ;;
+  config-manifest)
+    eic_config_manifest
+    ;;
   manifest)
     manifest
     ;;
@@ -385,7 +445,7 @@ case "${ACTION}" in
     stop
     ;;
   *)
-    echo "usage: $0 [config|manifest|recreate|apply|status|smoke|serve|wait-server|request|eic-check|logs|stop]" >&2
+    echo "usage: $0 [config|config-manifest|manifest|recreate|apply|status|smoke|serve|wait-server|request|eic-check|logs|stop]" >&2
     exit 2
     ;;
 esac

@@ -445,6 +445,18 @@ class EICHiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    def full_evictable_size(self):
+        return self.evictable_size_
+
+    def swa_evictable_size(self):
+        return self.evictable_size_
+
+    def full_protected_size(self):
+        return self.protected_size_
+
+    def swa_protected_size(self):
+        return self.protected_size_
+
     def evict(self, params: EvictParams, retry_times: int = 3) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
@@ -619,7 +631,7 @@ class EICHiRadixCache(RadixCache):
         self,
         params: InitLoadBackParams,
     ):
-        last_node = params.last_host_node
+        last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
