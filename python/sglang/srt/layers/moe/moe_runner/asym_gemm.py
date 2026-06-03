@@ -477,16 +477,15 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             (all_tokens, N), device=hidden_states_device, dtype=torch.bfloat16,
         )
 
-        # Fuse per-token and per-expert scales into GEMM epilogue
-        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_contig(
-            hidden_fp8,
-            quant_info.w13_weight,
+        # Per-token activation scale + per-expert weight scale, carried through the
+        # unified pair API; the library routes to the native FP8 kernel.
+        asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (hidden_fp8, token_scale),
+            (quant_info.w13_weight, quant_info.w13_scale),
             gateup_output,
             offsets,
             experts,
             list_size_val,
-            scale_a_tensor=token_scale.view(-1).contiguous(),
-            scale_b_tensor=quant_info.w13_scale,
         )
         del hidden_fp8
         del token_scale
@@ -500,15 +499,13 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             (all_tokens, K), device=hidden_states_device, dtype=torch.bfloat16,
         )
 
-        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_contig(
-            down_input_fp8,
-            quant_info.w2_weight,
+        asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (down_input_fp8, down_token_scale),
+            (quant_info.w2_weight, quant_info.w2_scale),
             down_output,
             offsets,
             experts,
             list_size_val,
-            scale_a_tensor=down_token_scale.view(-1).contiguous(),
-            scale_b_tensor=quant_info.w2_scale,
         )
         del down_input_fp8
         del down_token_scale
@@ -521,11 +518,10 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_NATIVE_FP8
-
-        # SM89 (Ada) and SM90 (Hopper) share the native FP8 grouped-GEMM kernels;
-        # only Blackwell (SM100) uses the TMA/UMMA `*_nt_*` path below.
-        if ASYMGEMM_NATIVE_FP8:
+        # The library decides which FP8 kernel family the GPU uses; SGLang only
+        # branches on the resulting capability flag to prepare matching scales
+        # (per-token for the SM89/SM90 path, block/UE8M0 for the Blackwell path).
+        if not asym_gemm_wrapper.ASYMGEMM_BLACKWELL:
             return self._run_contiguous_gemm_sm89(
                 runner_input, quant_info, running_state
             )
@@ -692,14 +688,12 @@ class AsymGemmRunnerCore(MoeRunnerCore):
                 gc = gateup_chunk[:c]
 
                 sa_c = hidden_states_scale[g_start:g_end].reshape(c * m).contiguous()
-                asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
-                    hidden_states[g_start:g_end],
-                    w13_weight[g_start:g_end],
+                asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (hidden_states[g_start:g_end], sa_c),
+                    (w13_weight[g_start:g_end], w13_scale[g_start:g_end]),
                     gc,
                     masked_m_c,
                     expected_m,
-                    scale_a_tensor=sa_c,
-                    scale_b_tensor=w13_scale[g_start:g_end],
                 )
 
                 down_input_c, down_input_scale_c = _fused_silu_mul_fp8_quant(
@@ -716,14 +710,12 @@ class AsymGemmRunnerCore(MoeRunnerCore):
                     out_c = down_output[g_start:g_end]
 
                 down_sa_c = down_input_scale_c.reshape(c * m).contiguous()
-                asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
-                    down_input_c,
-                    w2_weight[g_start:g_end],
+                asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (down_input_c, down_sa_c),
+                    (w2_weight[g_start:g_end], w2_scale[g_start:g_end]),
                     out_c,
                     masked_m_c,
                     expected_m,
-                    scale_a_tensor=down_sa_c,
-                    scale_b_tensor=w2_scale[g_start:g_end],
                 )
                 del down_input_c, down_input_scale_c
 
@@ -751,16 +743,15 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
-        # Fuse per-token and per-expert scales into the GEMM epilogue
+        # Per-token activation scale + per-expert weight scale through the unified
+        # pair API; the library routes to the native FP8 masked kernel.
         sa_flat = hidden_states_scale.view(num_groups * m).contiguous()
-        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
-            hidden_states,
-            w13_weight,
+        asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (hidden_states, sa_flat),
+            (w13_weight, w13_scale),
             gateup_output,
             masked_m,
             expected_m,
-            scale_a_tensor=sa_flat,
-            scale_b_tensor=w13_scale,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -779,14 +770,12 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         )
 
         down_sa_flat = down_input_scale.view(num_groups * m).contiguous()
-        asym_gemm_wrapper.grouped_gemm_sm89_f8f8bf16_masked(
-            down_input_fp8,
-            w2_weight,
+        asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (down_input_fp8, down_sa_flat),
+            (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
-            scale_a_tensor=down_sa_flat,
-            scale_b_tensor=w2_scale,
         )
         del down_input_fp8
         del down_input_scale
@@ -799,16 +788,13 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         quant_info: AsymGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_NATIVE_FP8
-
-        # SM89 (Ada) and SM90 (Hopper) share the native FP8 grouped-GEMM kernels;
-        # only Blackwell (SM100) uses the TMA/UMMA `*_nt_*` path below.
-        if ASYMGEMM_NATIVE_FP8:
+        # The library decides which FP8 kernel family the GPU uses; SGLang only
+        # branches on the resulting capability flag to prepare matching scales.
+        if not asym_gemm_wrapper.ASYMGEMM_BLACKWELL:
             return self._run_masked_gemm_sm89(
                 runner_input, quant_info, running_state
             )
 
-        from sglang.srt.layers import asym_gemm_wrapper
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
@@ -1125,12 +1111,11 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
 
-    from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_NATIVE_FP8
-
-    # The native FP8 path (SM89/SM90) uses per-token quantization (group_size=K)
-    # instead of the per-token-group scales the SM100 `*_nt_*` kernels expect.
+    # The SM89/SM90 path uses per-token quantization (group_size=K) instead of the
+    # per-token-group scales the Blackwell `*_nt_*` kernels expect.
+    blackwell = asym_gemm_wrapper.ASYMGEMM_BLACKWELL
     K = hidden_states.shape[1]
-    act_block_shape = [1, K] if ASYMGEMM_NATIVE_FP8 else quant_info.block_shape
+    act_block_shape = quant_info.block_shape if blackwell else [1, K]
 
     # PreReorder
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
@@ -1140,8 +1125,7 @@ def _pre_permute_standard_to_asym_gemm_fp8(
             hidden_states,
             runner_config.top_k,
             act_block_shape,
-            scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0
-            and not ASYMGEMM_NATIVE_FP8,
+            scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0 and blackwell,
         )
     )
 

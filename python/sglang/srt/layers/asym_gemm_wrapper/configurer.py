@@ -2,12 +2,7 @@ import logging
 import os
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import (
-    get_device_sm,
-    is_blackwell_supported,
-    is_sm89_supported,
-    is_sm90_supported,
-)
+from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -27,23 +22,28 @@ def _compute_enable_asym_gemm():
 
 ENABLE_JIT_ASYMGEMM = _compute_enable_asym_gemm()
 
-ASYMGEMM_BLACKWELL = ENABLE_JIT_ASYMGEMM and is_blackwell_supported()
-ASYMGEMM_SCALE_UE8M0 = ASYMGEMM_BLACKWELL
-ASYMGEMM_SM89 = ENABLE_JIT_ASYMGEMM and (
-    (is_sm89_supported() and not ASYMGEMM_BLACKWELL)
-    or os.environ.get("SGLANG_ASYMGEMM_SM89", "0") == "1"
-)
-# SM90 (Hopper / H20). The TMA/UMMA `*_asym_gemm_nt_*` kernels are compiled for
-# SM100 (Blackwell) only in the asym_gemm build, so Hopper cannot use them and
-# instead shares the native FP8 grouped-GEMM kernels with Ada (SM89).
-ASYMGEMM_SM90 = ENABLE_JIT_ASYMGEMM and (
-    (is_sm90_supported() and not ASYMGEMM_BLACKWELL and not ASYMGEMM_SM89)
-    or os.environ.get("SGLANG_ASYMGEMM_SM90", "0") == "1"
-)
 
-# Native FP8 grouped-GEMM path (`m_grouped_fp8_asym_gemm_sm89[_masked]`). These
-# kernels are JIT-compiled for the running architecture, so they run on both Ada
-# (SM89) and Hopper (SM90/H20). Blackwell (SM100) instead uses the TMA/UMMA
-# `*_asym_gemm_nt_*` kernels. The MoE runner detects the GPU architecture through
-# this flag and chooses the matching asym_gemm API.
-ASYMGEMM_NATIVE_FP8 = ENABLE_JIT_ASYMGEMM and (ASYMGEMM_SM89 or ASYMGEMM_SM90)
+def _compute_blackwell() -> bool:
+    """Ask the AsymGEMM library whether the running GPU is Blackwell.
+
+    The arch -> kernel decision lives in the library (see ``asym_gemm.dispatch``),
+    so SGLang never inspects raw SM numbers itself. The env knobs force the
+    non-Blackwell (SM89/SM90) FP8 path when validating on a different GPU.
+    """
+    if not ENABLE_JIT_ASYMGEMM:
+        return False
+    if os.environ.get("SGLANG_ASYMGEMM_SM89", "0") == "1":
+        return False
+    if os.environ.get("SGLANG_ASYMGEMM_SM90", "0") == "1":
+        return False
+    import asym_gemm
+
+    return asym_gemm.is_blackwell()
+
+
+# Blackwell (SM100+) uses the TMA/UMMA `*_asym_gemm_nt_*` kernels with packed
+# UE8M0 block scales; Ada (SM89) and Hopper (SM90/H20) use the `*_sm89` FP8
+# grouped-GEMM kernels. This is the single capability flag the MoE backend
+# branches on — matching DeepGEMM's `DEEPGEMM_BLACKWELL` / `DEEPGEMM_SCALE_UE8M0`.
+ASYMGEMM_BLACKWELL = _compute_blackwell()
+ASYMGEMM_SCALE_UE8M0 = ASYMGEMM_BLACKWELL

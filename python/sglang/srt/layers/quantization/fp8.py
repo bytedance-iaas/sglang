@@ -1181,28 +1181,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_asym_gemm():
             from sglang.srt.layers.asym_gemm_wrapper.configurer import (
-                ASYMGEMM_NATIVE_FP8,
+                ASYMGEMM_BLACKWELL,
             )
 
             weight_block_size = self.quant_config.weight_block_size
-            if ASYMGEMM_NATIVE_FP8:
-                # SM89 (Ada) and SM90 (Hopper/H20) both use the native FP8
-                # grouped-GEMM kernels, which consume per-expert (per-tensor)
-                # FP8 weight scales. Requantize the block-scaled checkpoint
-                # weights accordingly; no UE8M0 cast.
-                requant_weight_per_expert_inplace(
-                    layer.w13_weight,
-                    layer.w13_weight_scale_inv,
-                    weight_block_size,
-                )
-                requant_weight_per_expert_inplace(
-                    layer.w2_weight,
-                    layer.w2_weight_scale_inv,
-                    weight_block_size,
-                )
-                layer.w13_weight_scale_inv.format_ue8m0 = False
-                layer.w2_weight_scale_inv.format_ue8m0 = False
-            else:
+            if ASYMGEMM_BLACKWELL:
                 requant_weight_ue8m0_inplace(
                     layer.w13_weight,
                     layer.w13_weight_scale_inv,
@@ -1215,6 +1198,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
+            else:
+                # Ada (SM89) and Hopper (SM90/H20) use the `*_sm89` FP8 grouped-GEMM
+                # kernels, which consume per-expert (per-tensor) FP8 weight scales.
+                # Requantize the block-scaled checkpoint weights accordingly; no
+                # UE8M0 cast.
+                requant_weight_per_expert_inplace(
+                    layer.w13_weight,
+                    layer.w13_weight_scale_inv,
+                    weight_block_size,
+                )
+                requant_weight_per_expert_inplace(
+                    layer.w2_weight,
+                    layer.w2_weight_scale_inv,
+                    weight_block_size,
+                )
+                layer.w13_weight_scale_inv.format_ue8m0 = False
+                layer.w2_weight_scale_inv.format_ue8m0 = False
             return
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
