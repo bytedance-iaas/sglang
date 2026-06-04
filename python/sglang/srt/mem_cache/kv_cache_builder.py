@@ -236,7 +236,12 @@ def build_kv_cache(
 
         params.tree_components = (ComponentType.FULL,)
         tree_cache = UnifiedRadixCache(params)
-        tree_cache.enable_hisparse_mode()
+        if hasattr(tree_cache, "enable_hisparse_mode"):
+            tree_cache.enable_hisparse_mode()
+        else:
+            # Keep startup robust when the HiSparse builder path is combined
+            # with an older UnifiedRadixCache implementation in an image layer.
+            tree_cache.hisparse_mode = True
     elif effective_chunked_prefill_size is not None and disable_radix_cache:
         if not is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache

@@ -712,9 +712,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return mem_pool_host.available_size()
 
     def c4_tokens_for_full_tokens(self, num_full_tokens: int) -> int:
-        return (
-            max(num_full_tokens, 0) + self.compress_ratio - 1
-        ) // self.compress_ratio
+        return max(num_full_tokens, 0) // self.compress_ratio
 
     def gpu_hot_c4_req_budget(
         self, padded_buffer_size: int, pending_transfer_reqs: int = 0
@@ -728,7 +726,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def full_available_size(self):
-        return self.logical_attn_allocator.full_available_size()
+        return min(
+            self.logical_attn_allocator.full_available_size(),
+            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+        )
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
@@ -737,7 +738,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
-        return self.logical_attn_allocator.available_size()
+        return min(
+            self.logical_attn_allocator.available_size(),
+            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+        )
 
     def alloc(self, need_size: int):
         raise NotImplementedError(

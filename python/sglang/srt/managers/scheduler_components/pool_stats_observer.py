@@ -49,6 +49,10 @@ class PoolStats:
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
+    hisparse_c4_swap_miss_tokens: Optional[int] = None
+    hisparse_c4_swap_hit_tokens: Optional[int] = None
+    hisparse_c4_swap_miss_rate: Optional[float] = None
+    hisparse_c4_swap_h2d_bytes: Optional[int] = None
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -111,6 +115,12 @@ class PoolStats:
                 f"#cpu token: {self.hisparse_host_tokens}",
                 f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
             ]
+            if self.hisparse_c4_swap_miss_tokens is not None:
+                parts += [
+                    f"#c4 miss token: {self.hisparse_c4_swap_miss_tokens}",
+                    f"c4 miss rate: {self.hisparse_c4_swap_miss_rate:.2f}",
+                    f"c4 h2d MB: {self.hisparse_c4_swap_h2d_bytes / (1024 * 1024):.2f}",
+                ]
         if not parts:
             parts.append(
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
@@ -235,6 +245,10 @@ class SchedulerPoolStatsObserver:
                 hisparse_device_token_usage=h.device_token_usage,
                 hisparse_host_tokens=h.host_tokens,
                 hisparse_host_token_usage=h.host_token_usage,
+                hisparse_c4_swap_miss_tokens=h.c4_swap_miss_tokens,
+                hisparse_c4_swap_hit_tokens=h.c4_swap_hit_tokens,
+                hisparse_c4_swap_miss_rate=h.c4_swap_miss_rate,
+                hisparse_c4_swap_h2d_bytes=h.c4_swap_h2d_bytes,
             )
         return pool_stats
 

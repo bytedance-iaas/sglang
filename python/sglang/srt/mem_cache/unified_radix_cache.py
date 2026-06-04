@@ -245,10 +245,19 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller = None
         self.write_through_threshold = 256
         self.hisparse_mode = False
-        self.hisparse_host_pool = None
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+
+    def enable_hisparse_mode(self) -> None:
+        """Mark this tree as the DSV4 HiSparse companion cache.
+
+        DSV4 HiSparse keeps C4 residency in HiSparseCoordinator rather than in
+        the normal radix device values. The builder still uses UnifiedRadixCache
+        as the tree-cache object, so expose the mode switch it expects without
+        changing generic radix behavior.
+        """
+        self.hisparse_mode = True
 
     def reset(self) -> None:
         self._reset_full()
@@ -340,31 +349,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
-    def enable_hisparse_mode(self) -> None:
-        """Use this tree as a host-prefix owner for HiSparse.
-
-        Scheduler prefix matching remains disabled in this mode. The
-        HiSparseCoordinator calls host_match_prefix()/host_insert() directly
-        with host-side indices that it owns.
-        """
-        self.hisparse_mode = True
-
-    def init_hisparse_radix_cache(self, host_pool) -> bool:
-        self.enable_hisparse_mode()
-        self.hisparse_host_pool = host_pool
-        self.components[BASE_COMPONENT_TYPE]._full_kv_pool_host = host_pool
-        logger.warning(
-            "Enabled HiSparse host radix cache (host_pool=%s). "
-            "Scheduler radix match/load-back remains disabled; "
-            "HiSparseCoordinator owns restore semantics.",
-            type(host_pool).__name__,
-        )
-        return True
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        if self.hisparse_mode:
-            return self._empty_match_result
-
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -458,10 +443,6 @@ class UnifiedRadixCache(BasePrefixCache):
         return DecLockRefResult()
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
-        if self.hisparse_mode:
-            self._hisparse_cache_finished_req(req)
-            return
-
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -533,13 +514,6 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     def cache_unfinished_req(self, req: Req, chunked=False, **kwargs) -> None:
-        if self.hisparse_mode:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            return
-
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -634,261 +608,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
-
-    # ---- HiSparse host-radix mode ----
-
-    def _collect_host_indices(self, node: UnifiedTreeNode) -> torch.Tensor:
-        chunks: list[torch.Tensor] = []
-        cur = node
-        while cur is not self.root_node:
-            host_value = cur.component_data[BASE_COMPONENT_TYPE].host_value
-            if host_value is None:
-                break
-            chunks.append(host_value)
-            cur = cur.parent
-        if not chunks:
-            return torch.empty((0,), dtype=torch.int64, device="cpu")
-        chunks.reverse()
-        return torch.cat(chunks)
-
-    def host_match_prefix(
-        self, token_ids: list[Any], extra_key: Optional[str] = None
-    ) -> tuple[torch.Tensor, UnifiedTreeNode, int]:
-        if not self.hisparse_mode or len(token_ids) == 0:
-            return (
-                torch.empty((0,), dtype=torch.int64, device="cpu"),
-                self.root_node,
-                0,
-            )
-
-        key = RadixKey(token_ids=token_ids, extra_key=extra_key).page_aligned(
-            self.page_size
-        )
-        if len(key) == 0:
-            return (
-                torch.empty((0,), dtype=torch.int64, device="cpu"),
-                self.root_node,
-                0,
-            )
-
-        node = self.root_node
-        child_key = key.child_key(self.page_size)
-        host_chunks: list[torch.Tensor] = []
-        best_match_node = self.root_node
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
-            prefix_len = child.key.match(key, page_size=self.page_size)
-            if prefix_len <= 0:
-                break
-
-            host_value = child.component_data[BASE_COMPONENT_TYPE].host_value
-            if host_value is None:
-                break
-            host_chunks.append(host_value[:prefix_len])
-            best_match_node = child
-
-            if prefix_len < len(child.key):
-                break
-            node = child
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
-
-        if not host_chunks:
-            return (
-                torch.empty((0,), dtype=torch.int64, device="cpu"),
-                self.root_node,
-                0,
-            )
-        host_indices = torch.cat(host_chunks)
-        return host_indices, best_match_node, len(host_indices)
-
-    def host_insert(
-        self,
-        token_ids: list[Any],
-        host_indices: torch.Tensor,
-        extra_key: Optional[str] = None,
-    ) -> Optional[UnifiedTreeNode]:
-        if not self.hisparse_mode or len(token_ids) == 0:
-            return None
-        key = RadixKey(token_ids=token_ids, extra_key=extra_key).page_aligned(
-            self.page_size
-        )
-        if len(key) == 0:
-            return None
-        value = host_indices[: len(key)].to(dtype=torch.int64, device="cpu")
-        return self._host_insert_helper(self.root_node, key, value)
-
-    def _add_new_host_node(
-        self,
-        parent: UnifiedTreeNode,
-        key: RadixKey,
-        host_value: torch.Tensor,
-    ) -> UnifiedTreeNode:
-        new_node = UnifiedTreeNode(self.tree_components)
-        new_node.parent = parent
-        new_node.key = key
-        new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
-        parent.children[key.child_key(self.page_size)] = new_node
-        self._update_evictable_leaf_sets(new_node)
-        self._update_evictable_leaf_sets(parent)
-        return new_node
-
-    def _host_insert_helper(
-        self,
-        node: UnifiedTreeNode,
-        key: RadixKey,
-        host_value: torch.Tensor,
-    ) -> UnifiedTreeNode:
-        self._touch_node(node)
-        if len(key) == 0:
-            return node
-
-        child_key = key.child_key(self.page_size)
-        while len(key) > 0 and child_key in node.children:
-            node = node.children[child_key]
-            self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
-            if prefix_len < len(node.key):
-                old_child = node
-                old_entry = node.component_data[BASE_COMPONENT_TYPE].metadata.pop(
-                    "dsv4_hisparse_entry", None
-                )
-                node = self._split_node(node.key, node, prefix_len)
-                if old_entry is not None:
-                    self._attach_split_hisparse_entry(node, old_entry, prefix_len)
-                    self._release_split_child_hisparse_suffix(
-                        old_child, old_entry, prefix_len
-                    )
-
-            cd = node.component_data[BASE_COMPONENT_TYPE]
-            if cd.host_value is None:
-                raise RuntimeError(
-                    "HiSparse host radix found a matching node without host indices "
-                    f"(node_id={node.id})."
-                )
-
-            self._inc_hit_count(node)
-            key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
-
-        if len(key):
-            new_node = self._add_new_host_node(node, key, host_value)
-            self._inc_hit_count(new_node)
-            return new_node
-        return node
-
-    def _attach_split_hisparse_entry(
-        self, node: UnifiedTreeNode, entry: Any, prefix_len: int
-    ) -> None:
-        req_to_token_prefix = getattr(entry, "req_to_token_prefix", None)
-        full_prefix_len = min(
-            getattr(entry, "full_prefix_len", 0),
-            prefix_len * getattr(entry, "full_prefix_len", 0)
-            // max(getattr(entry, "c4_len", 1), 1),
-        )
-        if req_to_token_prefix is not None:
-            req_to_token_prefix = req_to_token_prefix[:full_prefix_len]
-        host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
-        if host_value is None:
-            c4_host_indices = getattr(entry, "c4_host_indices", None)
-            if c4_host_indices is not None:
-                c4_host_indices = c4_host_indices[:prefix_len]
-        else:
-            c4_host_indices = host_value
-        node.component_data[BASE_COMPONENT_TYPE].metadata[
-            "dsv4_hisparse_entry"
-        ] = entry._replace(
-            c4_len=prefix_len,
-            full_prefix_len=full_prefix_len,
-            c4_host_indices=c4_host_indices,
-            c4_key_tokens=entry.c4_key_tokens[:prefix_len],
-            req_to_token_prefix=req_to_token_prefix,
-            radix_node=node,
-        )
-
-    def _release_split_child_hisparse_suffix(
-        self, child: UnifiedTreeNode, entry: Any, prefix_len: int
-    ) -> None:
-        old_full_len = getattr(entry, "full_prefix_len", 0)
-        old_c4_len = max(getattr(entry, "c4_len", 1), 1)
-        kept_full_len = min(old_full_len, prefix_len * old_full_len // old_c4_len)
-
-        req_to_token_prefix = getattr(entry, "req_to_token_prefix", None)
-        if req_to_token_prefix is not None and kept_full_len < req_to_token_prefix.numel():
-            suffix_locs = req_to_token_prefix[kept_full_len:]
-            device = getattr(self.token_to_kv_pool_allocator, "device", None)
-            if device is not None:
-                suffix_locs = suffix_locs.to(device=device, non_blocking=True)
-            self.token_to_kv_pool_allocator.free(suffix_locs)
-
-        cd = child.component_data[BASE_COMPONENT_TYPE]
-        if cd.host_value is not None and self.hisparse_host_pool is not None:
-            self.hisparse_host_pool.free(cd.host_value)
-            cd.host_value = None
-            self._update_evictable_leaf_sets(child)
-
-    def host_inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
-        if node is None:
-            return IncLockRefResult(delta=0)
-        while node is not self.root_node:
-            cd = node.component_data[BASE_COMPONENT_TYPE]
-            if cd.host_value is not None:
-                cd.host_lock_ref += 1
-                self._update_evictable_leaf_sets(node)
-            node = node.parent
-        return IncLockRefResult(delta=0)
-
-    def host_dec_lock_ref(self, node: UnifiedTreeNode) -> DecLockRefResult:
-        if node is None:
-            return DecLockRefResult(delta=0)
-        while node is not self.root_node:
-            cd = node.component_data[BASE_COMPONENT_TYPE]
-            if cd.host_value is not None:
-                assert cd.host_lock_ref > 0
-                cd.host_lock_ref -= 1
-                self._update_evictable_leaf_sets(node)
-            node = node.parent
-        return DecLockRefResult(delta=0)
-
-    def host_evictable_size(self) -> int:
-        return sum(
-            len(node.component_data[BASE_COMPONENT_TYPE].host_value)
-            for node in self.evictable_host_leaves
-            if node.component_data[BASE_COMPONENT_TYPE].host_value is not None
-        )
-
-    def dsv4_hisparse_logical_evictable_size(self) -> int:
-        """Logical full-token locs owned by evictable DSV4 HiSparse host entries."""
-        total = 0
-        for node in self.evictable_host_leaves:
-            metadata = node.component_data[BASE_COMPONENT_TYPE].metadata
-            entry = metadata.get("dsv4_hisparse_entry")
-            if entry is None:
-                continue
-            req_to_token_prefix = getattr(entry, "req_to_token_prefix", None)
-            if req_to_token_prefix is not None:
-                total += req_to_token_prefix.numel()
-        return total
-
-    def host_evict(self, num_tokens: int) -> int:
-        return self.evict_host(num_tokens, component_type=BASE_COMPONENT_TYPE)
-
-    def _hisparse_cache_finished_req(self, req: Req) -> None:
-        kv_committed_len = req.pop_committed_kv_cache()
-        protected_len = max(
-            getattr(req, "hisparse_shared_prefix_len", 0) or 0,
-            getattr(req, "hisparse_cache_owned_prefix_len", 0) or 0,
-        )
-        protected_len = min(protected_len, kv_committed_len)
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, protected_len:kv_committed_len
-        ]
-        if kv_indices.numel() > 0:
-            self.token_to_kv_pool_allocator.free(kv_indices)
-        self.dec_lock_ref(req.last_node)
 
     # ---- Internal Helpers ----
 
@@ -1236,12 +955,6 @@ class UnifiedRadixCache(BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: dict[ComponentType, int] = None,
     ) -> tuple[int, int]:
-        if (
-            self.hisparse_mode
-            and comp.component_type == BASE_COMPONENT_TYPE
-            and EvictLayer.HOST in target
-        ):
-            self._release_hisparse_host_entry(node)
         device_freed, host_freed = comp.evict_component(node, target=target)
         if tracker is not None:
             if EvictLayer.DEVICE in target:
@@ -1260,19 +973,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 if lru.in_list(node):
                     lru.remove_node(node)
         return device_freed, host_freed
-
-    def _release_hisparse_host_entry(self, node: UnifiedTreeNode) -> None:
-        metadata = node.component_data[BASE_COMPONENT_TYPE].metadata
-        entry = metadata.pop("dsv4_hisparse_entry", None)
-        if entry is None:
-            return
-        req_to_token_prefix = getattr(entry, "req_to_token_prefix", None)
-        if req_to_token_prefix is None or req_to_token_prefix.numel() == 0:
-            return
-        device = getattr(self.token_to_kv_pool_allocator, "device", None)
-        if device is not None:
-            req_to_token_prefix = req_to_token_prefix.to(device=device, non_blocking=True)
-        self.token_to_kv_pool_allocator.free(req_to_token_prefix)
 
     def _iteratively_delete_tombstone_leaf(
         self, deleted_node: UnifiedTreeNode, tracker: dict[ComponentType, int]

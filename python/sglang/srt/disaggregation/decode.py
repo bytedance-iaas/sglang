@@ -373,10 +373,9 @@ class DecodePreallocQueue:
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
-        reserved_decode_tokens = self._reserved_decode_tokens_per_req()
         return (
-            full_len + reserved_decode_tokens,
-            swa_len + reserved_decode_tokens,
+            full_len + self.num_reserved_decode_tokens,
+            swa_len + self.num_reserved_decode_tokens,
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -394,6 +393,7 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 host_pool.get_contiguous_buf_infos()
             )
+            kv_args.hisparse_host_kv_layer_num = host_pool.layer_num
             if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 # DSV4 HiSparse writes only C4 KV to host.  The c4_indexer and
                 # c128 KV remain device-to-device transfers and are appended
@@ -402,7 +402,6 @@ class DecodePreallocQueue:
                     self.token_to_kv_pool.get_contiguous_buf_infos()
                 )
                 c4_layer_num = host_pool.layer_num
-                kv_args.hisparse_host_kv_layer_num = c4_layer_num
                 kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
                 kv_data_lens += device_kv_data_lens[c4_layer_num:]
                 kv_item_lens += device_kv_item_lens[c4_layer_num:]
@@ -410,6 +409,7 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+            kv_args.hisparse_host_kv_layer_num = 0
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -925,23 +925,7 @@ class DecodePreallocQueue:
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
-            fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
-            if dsv4_hisparse_prealloc:
-                prefix_indices, prefix_len = (
-                    self.scheduler.hisparse_coordinator.match_dsv4_prefix_for_decode(
-                        decode_req.req, origin_input_len
-                    )
-                )
-                prefix_indices, prefix_len = self._cap_dsv4_prefix_before_swa_tail(
-                    decode_req.req,
-                    fill_len=fill_len,
-                    prefix_indices=prefix_indices,
-                    prefix_len=prefix_len,
-                )
-                required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
-                )
-            elif self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
                 # Align prefix_len down to page boundary so both prefill and
@@ -951,6 +935,7 @@ class DecodePreallocQueue:
                     prefix_len = page_align_floor(prefix_len, page_size)
                     prefix_indices = prefix_indices[:prefix_len]
 
+                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
@@ -974,8 +959,9 @@ class DecodePreallocQueue:
                 prefix_len = 0
                 required_alloc_tokens = origin_input_len
 
-            reserved_decode_tokens = self._reserved_decode_tokens_per_req()
-            required_tokens_for_request = required_alloc_tokens + reserved_decode_tokens
+            required_tokens_for_request = (
+                required_alloc_tokens + self.num_reserved_decode_tokens
+            )
             if dsv4_hisparse_prealloc:
                 # DSV4 HiSparse keeps full logical addresses, but transferred C4
                 # KV is host-compressed and GPU-hot C4 is budgeted per request.
@@ -1008,12 +994,7 @@ class DecodePreallocQueue:
                     clip_max_new_token=CLIP_MAX_NEW_TOKEN,
                 )
                 if prefix_len > 0:
-                    if dsv4_hisparse_prealloc:
-                        self.scheduler.hisparse_coordinator.release_pending_dsv4_prefix_match(
-                            decode_req.req
-                        )
-                    else:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 log_health_prealloc(
@@ -1025,17 +1006,12 @@ class DecodePreallocQueue:
                     required_tokens_for_request=required_tokens_for_request,
                 )
                 if prefix_len > 0:
-                    if dsv4_hisparse_prealloc:
-                        self.scheduler.hisparse_coordinator.release_pending_dsv4_prefix_match(
-                            decode_req.req
-                        )
-                    else:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
             if dsv4_hisparse_prealloc:
                 host_c4_required = self._dsv4_host_c4_len(
-                    required_alloc_tokens + reserved_decode_tokens
+                    required_alloc_tokens + self.num_reserved_decode_tokens
                 )
                 if host_c4_allocatable_tokens is None:
                     host_c4_allocatable_tokens = (
@@ -1053,12 +1029,7 @@ class DecodePreallocQueue:
                         required_alloc_tokens=required_alloc_tokens,
                     )
                     if prefix_len > 0:
-                        if dsv4_hisparse_prealloc:
-                            self.scheduler.hisparse_coordinator.release_pending_dsv4_prefix_match(
-                                decode_req.req
-                            )
-                        else:
-                            self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
             if uses_swa_tail_prealloc:
@@ -1083,12 +1054,7 @@ class DecodePreallocQueue:
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        if dsv4_hisparse_prealloc:
-                            self.scheduler.hisparse_coordinator.release_pending_dsv4_prefix_match(
-                                decode_req.req
-                            )
-                        else:
-                            self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
             log_health_prealloc(
@@ -1123,19 +1089,37 @@ class DecodePreallocQueue:
             decode_req.req.cache_protected_len = prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            c4_prefix_len = None
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
                 device_kv_page_indices = None
                 if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                     # DSV4 host C4 entries are token-linear, while non-sparse KV
                     # still uses device page indices.
                     page_size = 1
+                    host_c4_len = self._dsv4_host_c4_len(origin_input_len)
+                    c4_prefix_len = min(
+                        getattr(decode_req.req, "hisparse_c4_transfer_prefix_len", 0)
+                        or 0,
+                        host_c4_len,
+                    )
+                    kv_indices_tensor = (
+                        self.scheduler.hisparse_coordinator.req_to_host_pool[
+                            decode_req.req.req_pool_idx, :host_c4_len
+                        ]
+                    )
+                    if kv_indices_tensor.numel() != host_c4_len or torch.any(
+                        kv_indices_tensor < 0
+                    ):
+                        raise RuntimeError(
+                            "DeepSeek V4 HiSparse C4 host mirror is incomplete "
+                            f"for req {decode_req.req.rid}: "
+                            f"host_c4_len={host_c4_len}, "
+                            f"c4_prefix_len={c4_prefix_len}."
+                        )
+                    kv_indices = (
+                        kv_indices_tensor.cpu().numpy().astype(np.int32, copy=False)
+                    )
                     kv_indices_full = self.req_to_token_pool.req_to_token[
                         decode_req.req.req_pool_idx, prefix_len:origin_input_len
                     ]
@@ -1143,6 +1127,13 @@ class DecodePreallocQueue:
                         kv_indices_full.cpu().numpy(),
                         self.token_to_kv_pool.page_size,
                     ).astype(np.int32)
+                else:
+                    kv_indices = (
+                        dst_kv_indices[: origin_input_len - prefix_len]
+                        .cpu()
+                        .numpy()
+                        .astype(np.int32)
+                    )
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -1171,12 +1162,6 @@ class DecodePreallocQueue:
 
                 window_start = max(0, seq_len - window_size)
                 window_start = page_align_floor(window_start, state_page_size)
-                if prefix_len >= seq_len:
-                    window_start = seq_len
-                elif prefix_len > window_start:
-                    window_start += (
-                        (prefix_len - window_start) // state_page_size
-                    ) * state_page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -1186,9 +1171,6 @@ class DecodePreallocQueue:
                         window_kv_indices_full
                     )
                 )
-                window_kv_indices_swa = window_kv_indices_swa[
-                    window_kv_indices_swa >= 0
-                ]
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, state_page_size)
             elif isinstance(self.token_to_kv_pool, BaseSWAKVPool):
@@ -1197,12 +1179,6 @@ class DecodePreallocQueue:
 
                 window_start = max(0, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
-                if prefix_len >= seq_len:
-                    window_start = seq_len
-                elif prefix_len > window_start:
-                    window_start += (
-                        (prefix_len - window_start) // page_size
-                    ) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -1213,9 +1189,6 @@ class DecodePreallocQueue:
                         window_kv_indices_full
                     )
                 )
-                window_kv_indices_swa = window_kv_indices_swa[
-                    window_kv_indices_swa >= 0
-                ]
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
@@ -1247,6 +1220,7 @@ class DecodePreallocQueue:
                     state_indices,
                     decode_prefix_len=prefix_len,
                     device_kv_indices=device_kv_page_indices,
+                    decode_c4_prefix_len=c4_prefix_len,
                 )
             else:
                 decode_req.kv_receiver.send_metadata(
@@ -1310,7 +1284,7 @@ class DecodePreallocQueue:
     ) -> int:
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
-        return self._reserved_decode_tokens_per_req() * n_active
+        return self.num_reserved_decode_tokens * n_active
 
     def _is_dsv4_hisparse_prealloc(self) -> bool:
         return (
@@ -1319,71 +1293,10 @@ class DecodePreallocQueue:
             and getattr(self.scheduler.hisparse_coordinator, "is_dsv4_hisparse", False)
         )
 
-    def _reserved_decode_tokens_per_req(self) -> int:
-        if not self._is_dsv4_hisparse_prealloc():
-            return self.num_reserved_decode_tokens
-
-        page_size = getattr(
-            self.token_to_kv_pool_allocator.logical_attn_allocator,
-            "page_size",
-            self.token_to_kv_pool_allocator.page_size,
-        )
-        server_args = self.scheduler.server_args
-        spec_steps = getattr(server_args, "speculative_num_steps", None) or 1
-        spec_topk = getattr(server_args, "speculative_eagle_topk", None) or 1
-        spec_draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None)
-        spec_need = max(spec_steps * spec_topk, spec_draft_tokens or 1)
-
-        # DSV4 HiSparse keeps long C4 state in host memory and only needs full
-        # logical/SWA headroom for the next decode burst plus retraction slack.
-        # Charging the generic PD default (512) per active request makes decode
-        # admission look full long before the real logical allocator is tight.
-        return min(
-            self.num_reserved_decode_tokens,
-            max(page_size, envs.SGLANG_RETRACT_DECODE_STEPS.get(), spec_need),
-        )
-
     def _dsv4_host_c4_len(self, num_full_tokens: int) -> int:
         return self.token_to_kv_pool_allocator.c4_tokens_for_full_tokens(
             num_full_tokens
         )
-
-    def _cap_dsv4_prefix_before_swa_tail(
-        self,
-        req: Req,
-        *,
-        fill_len: int,
-        prefix_indices: torch.Tensor,
-        prefix_len: int,
-    ) -> Tuple[torch.Tensor, int]:
-        if (
-            prefix_len <= 0
-            or not self._is_dsv4_hisparse_prealloc()
-            or not self._uses_swa_tail_prealloc()
-        ):
-            return prefix_indices, prefix_len
-
-        # The current DSV4 HiSparse prefix entry restores C4 host slots and
-        # req_to_token. If the entry also owns valid SWA tail mappings, the full
-        # prefix is safe to reuse; otherwise keep the sliding-window tail in the
-        # transferred suffix.
-        entry = getattr(req, "hisparse_prefix_entry", None)
-        if getattr(entry, "swa_valid_prefix_len", 0) >= prefix_len:
-            return prefix_indices, prefix_len
-
-        max_prefix_len = max(0, fill_len - self._swa_tail_len(fill_len))
-        page_size = self.token_to_kv_pool_allocator.logical_attn_allocator.page_size
-        if page_size > 1:
-            max_prefix_len = page_align_floor(max_prefix_len, page_size)
-        if prefix_len <= max_prefix_len:
-            return prefix_indices, prefix_len
-
-        capped_prefix_len = min(max_prefix_len, prefix_indices.numel())
-        if capped_prefix_len <= 0:
-            self.scheduler.hisparse_coordinator.release_pending_dsv4_prefix_match(req)
-            return prefix_indices[:0], 0
-        req.hisparse_shared_prefix_len = capped_prefix_len
-        return prefix_indices[:capped_prefix_len], capped_prefix_len
 
     def _dsv4_hisparse_host_c4_allocatable_budget(
         self,
@@ -1405,8 +1318,7 @@ class DecodePreallocQueue:
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self._dsv4_host_c4_len(
-                self._reserved_decode_tokens_per_req()
-                * len(self.scheduler.last_batch.reqs)
+                self.num_reserved_decode_tokens * len(self.scheduler.last_batch.reqs)
             )
 
         if count_retracted:
@@ -1457,11 +1369,6 @@ class DecodePreallocQueue:
                 available_size = (
                     self.token_to_kv_pool_allocator.dsv4_full_logical_available_size()
                 )
-                hisparse_logical_evictable = getattr(
-                    self.tree_cache, "dsv4_hisparse_logical_evictable_size", None
-                )
-                if hisparse_logical_evictable is not None:
-                    available_size += hisparse_logical_evictable()
             else:
                 # HiSparse pre-alloc only allocates logical indices
                 # (alloc_logical_only), so the logical pool is the binding
@@ -1495,7 +1402,7 @@ class DecodePreallocQueue:
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            allocatable_tokens -= self._reserved_decode_tokens_per_req() * len(
+            allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
             )
 
@@ -1555,7 +1462,7 @@ class DecodePreallocQueue:
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            prebuilt_reserved_tokens = self._reserved_decode_tokens_per_req() * len(
+            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
             )
             prebuilt_n = len(self.scheduler.last_batch.reqs)
@@ -1594,22 +1501,13 @@ class DecodePreallocQueue:
         if prefix_len is None:
             prefix_len = 0
 
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        if prefix_len > 0:
-            assert prefix_indices is not None
-            prefix_indices, prefix_len = self._cap_dsv4_prefix_before_swa_tail(
-                req,
-                fill_len=fill_len,
-                prefix_indices=prefix_indices,
-                prefix_len=prefix_len,
-            )
-
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
@@ -1625,20 +1523,6 @@ class DecodePreallocQueue:
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len
         )
-
-        if (
-            self.scheduler.enable_hisparse
-            and self._is_dsv4_hisparse_prealloc()
-            and required_alloc_tokens
-            > self.token_to_kv_pool_allocator.dsv4_full_logical_available_size()
-        ):
-            deficit = (
-                required_alloc_tokens
-                - self.token_to_kv_pool_allocator.dsv4_full_logical_available_size()
-            )
-            evict_host = getattr(self.tree_cache, "host_evict", None)
-            if evict_host is not None:
-                evict_host(self._dsv4_host_c4_len(deficit))
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
@@ -1662,51 +1546,43 @@ class DecodePreallocQueue:
                 )
 
         if self.scheduler.enable_hisparse:
+            # HiSparse is incompatible with decode-side L1 radix cache. Keep
+            # this path on the upstream full-allocation semantics.
+            assert prefix_len == 0
+
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
-            last_loc = (
-                prefix_indices[-1:].to(dtype=torch.int64, device=device)
-                if prefix_len > 0
-                else torch.tensor([-1], dtype=torch.int64, device=device)
-            )
-            if delta_len == 0:
-                kv_loc = torch.empty((0,), dtype=torch.int64, device=device)
-            elif coordinator.is_dsv4_hisparse and self._uses_swa_tail_prealloc():
+            if coordinator.is_dsv4_hisparse and self._uses_swa_tail_prealloc():
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor(
-                        [prefix_len], dtype=torch.int64, device=device
-                    ),
-                    prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
                     seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=delta_len,
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
                 )
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                    prefix_lens=torch.tensor(
-                        [prefix_len], dtype=torch.int64, device=device
-                    ),
-                    prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
                     seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=delta_len,
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
                 )
             if coordinator.is_dsv4_hisparse:
                 # DSV4 stores HiSparse host KV at compressed C4-token granularity.
-                host_len = (
-                    fill_len + coordinator.compress_ratio - 1
-                ) // coordinator.compress_ratio
-                prefix_c4_len = coordinator.restore_dsv4_prefix_for_req(
-                    req, prefix_len
+                host_len = self._dsv4_host_c4_len(fill_len)
+                prefix_c4_len = coordinator.restore_dsv4_c4_host_prefix_for_req(
+                    req, host_len
                 )
                 host_indices = coordinator.ensure_host_slots(
                     req.req_pool_idx, prefix_c4_len, host_len - prefix_c4_len
                 )
+                coordinator._req_c4_written_len[req.req_pool_idx] = host_len
             else:
                 # Keep the upstream HiSparse path: one host KV slot per token.
                 host_indices = coordinator.mem_pool_host.alloc(fill_len)
@@ -1825,23 +1701,6 @@ class DecodeTransferQueue:
                     and dr.kv_receiver.require_staging
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
-
-    def _mark_receiver_failed(self, decode_req: DecodeRequest, reason: str) -> None:
-        kv_receiver = decode_req.kv_receiver
-        if kv_receiver is None or not hasattr(kv_receiver, "kv_mgr"):
-            return
-
-        try:
-            kv_receiver.kv_mgr.record_failure(decode_req.req.bootstrap_room, reason)
-            kv_receiver.kv_mgr.update_status(
-                decode_req.req.bootstrap_room, KVPoll.Failed
-            )
-        except Exception:
-            logger.warning(
-                "Failed to mark decode transfer failure for %s",
-                decode_req.req.rid,
-                exc_info=True,
-            )
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
@@ -1989,35 +1848,6 @@ class DecodeTransferQueue:
         self._release_metadata_buffer(decode_req)
         self._clear_receiver(decode_req)
 
-    def _abort_failed_transfer_req(
-        self, decode_req: DecodeRequest, error_message: Optional[str] = None
-    ) -> None:
-        if error_message is None:
-            error_message = (
-                f"Decode transfer failed for request rank={self.tp_rank} "
-                f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-            )
-        try:
-            decode_req.kv_receiver.failure_exception()
-        except Exception as e:
-            error_message += f" with exception {e}"
-        logger.error(error_message)
-        prepare_abort(
-            decode_req.req,
-            error_message,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-        )
-        self.scheduler.output_streamer.stream_output(
-            [decode_req.req],
-            decode_req.req.return_logprob,
-        )
-        if self.scheduler.enable_hisparse:
-            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-        # Release pre-allocated kv cache, but don't insert into the tree since it failed.
-        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-        if self.scheduler.metrics_reporter.enable_metrics:
-            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -2036,8 +1866,28 @@ class DecodeTransferQueue:
                 continue
 
             if poll == KVPoll.Failed:
-                self._abort_failed_transfer_req(decode_req)
+                error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req],
+                    decode_req.req.return_logprob,
+                )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
                 should_remove = self._commit_transfer_to_req(decode_req)
