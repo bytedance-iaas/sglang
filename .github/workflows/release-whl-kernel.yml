@@ -74,7 +74,7 @@ on:
         required: false
 
 concurrency:
-  group: release-sglang-kernels-${{ github.ref }}
+  group: release-sglang-kernels-${{ github.ref }}-${{ inputs.artifact_name || github.event.inputs.target || 'standalone' }}
   cancel-in-progress: true
 
 jobs:
