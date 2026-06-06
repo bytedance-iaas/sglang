@@ -168,6 +168,9 @@ class FutureMap:
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
+            if draft_input.new_seq_lens is None:
+                draft_input.new_seq_lens = batch_result.new_seq_lens
+            assert draft_input.new_seq_lens is not None
             self.store_to_map_for_new_batch(future_indices, draft_input)
 
     def store_to_map_for_new_batch(
