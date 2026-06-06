@@ -259,7 +259,6 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
-    SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS = EnvInt(8)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -697,7 +696,6 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
