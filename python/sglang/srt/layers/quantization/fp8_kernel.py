@@ -460,17 +460,28 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_ue8m0: bool,
 ):
     if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
-        *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = ceil_align(x_s_mn, 4)
-        aligned_k = ceil_align(x_s_k, 4)
-        # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
-            device=device,
-            dtype=torch.int,
-        ).transpose(-1, -2)[..., :x_s_mn, :]
+        if column_major_scales and scale_tma_aligned:
+            *x_batch, x_q_mn, x_q_k = x_shape
+            x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+            aligned_mn = ceil_align(x_s_mn, 4)
+            aligned_k = ceil_align(x_s_k, 4)
+            # TODO(FIXME): Fix cuda kernel and recover here to empty.
+            return torch.empty(
+                (*x_batch, aligned_k // 4, aligned_mn),
+                device=device,
+                dtype=torch.int,
+            ).transpose(-1, -2)[..., :x_s_mn, :]
+        else:
+            assert not column_major_scales, (
+                "column_major_scales requires scale_tma_aligned=True "
+                "when scale_ue8m0 is enabled"
+            )
+            # Row-major float32 scale with power-of-2 values
+            return torch.empty(
+                x_shape[:-1] + (x_shape[-1] // group_size,),
+                device=device,
+                dtype=torch.float32,
+            )
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -1937,6 +1948,17 @@ def is_weak_contiguous(x: torch.Tensor):
     return is_transpose or is_not_transpose
 
 
+def _as_column_scale(scale: torch.Tensor, expected_len: int) -> torch.Tensor:
+    if scale.dim() <= 1:
+        return scale.reshape(-1, 1)
+    if scale.dim() == 2:
+        if scale.shape[1] == 1:
+            return scale
+        if scale.shape[0] == 1 and scale.shape[1] == expected_len:
+            return scale.t()
+    return scale
+
+
 @triton.jit
 def scaled_mm_kernel(
     a_ptr,
@@ -2080,9 +2102,10 @@ def triton_scaled_mm(
     assert weight.shape[0] == K
     assert input.dtype == weight.dtype
 
-    scale_a = scale_a.reshape(-1, 1) if scale_a.dim() <= 1 else scale_a
-    scale_b = scale_b.reshape(-1, 1) if scale_b.dim() <= 1 else scale_b
+    scale_a = _as_column_scale(scale_a, M)
+    scale_b = _as_column_scale(scale_b, N)
 
+    assert scale_a.dim() == 2 and scale_b.dim() == 2
     assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
     assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
     assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)
