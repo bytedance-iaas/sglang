@@ -14,8 +14,8 @@ from sglang.jit_kernel.dsv4.compress_old import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp as dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -74,7 +74,7 @@ class CompressorBackendMixin:
         compress_ratio: int,
         is_paged: bool = False,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
         assert compress_ratio in (
             4,
