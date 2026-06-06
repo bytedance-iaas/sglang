@@ -500,13 +500,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
         self.cached_loc = None
+        self.swa_loc = None
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
         self.cached_loc = None  # mapping replaced; discard any cached translation
+        self.swa_loc = None
 
     def invalidate_loc_cache(self) -> None:
         self.cached_loc = None
+        self.swa_loc = None
+
+    def set_swa_loc(self, loc: torch.Tensor | None) -> None:
+        self.swa_loc = loc
+        self.cached_loc = loc
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
@@ -781,9 +788,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
     ) -> None:
         if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
+            if self.swa_loc is not None:
+                swa_loc = self.swa_loc
+            elif layer_id == self.start_layer or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
+                swa_loc = self.cached_loc
+            else:
+                swa_loc = self.cached_loc
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         return self.swa_kv_pool.set_key_buffer_fused(
@@ -801,9 +812,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
     ) -> None:
         if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
+            if self.swa_loc is not None:
+                swa_loc = self.swa_loc
+            elif layer_id == self.start_layer or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
+                swa_loc = self.cached_loc
+            else:
+                swa_loc = self.cached_loc
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         fused_k_norm_rope_flashmla(
