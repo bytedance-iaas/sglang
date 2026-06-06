@@ -20,14 +20,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
-    get_dsa_index_head_dim,
-    is_deepseek_dsa,
+    get_nsa_index_head_dim,
+    is_deepseek_nsa,
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 
@@ -149,15 +149,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kv_size
                 )
 
-            # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
-            if is_deepseek_dsa(model_config.hf_config):
-                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
+            if is_deepseek_nsa(model_config.hf_config):
+                index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
                 indexer_size_per_token = (
                     index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
                 )
                 element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
