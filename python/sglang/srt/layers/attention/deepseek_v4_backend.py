@@ -1015,6 +1015,62 @@ class DeepseekV4AttnBackend(
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
 
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+    ) -> None:
+        from types import SimpleNamespace
+
+        forward_batch = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=forward_mode,
+            positions=torch.empty(num_tokens, dtype=torch.int32, device=self.device),
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            spec_info=spec_info,
+        )
+        self.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ) -> None:
+        from types import SimpleNamespace
+
+        replay_forward_batch = self._replay_forward_batch
+        forward_batch = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=forward_mode,
+            actual_forward_mode=getattr(
+                replay_forward_batch,
+                "actual_forward_mode",
+                replay_forward_batch.forward_mode,
+            ),
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=replay_forward_batch.out_cache_loc,
+            spec_info=spec_info,
+            _original_batch_size=getattr(
+                replay_forward_batch, "_original_batch_size", bs
+            ),
+        )
+        self.init_forward_metadata_out_graph(forward_batch)
+
     def replay_cuda_graph_metadata_from(
         self,
         bs: int,
@@ -1400,6 +1456,62 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+    ) -> None:
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=spec_info,
+            )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ) -> None:
+        if self.speculative_num_steps == 1:
+            return
+
+        self.attn_backends[0]._replay_forward_batch = self._replay_forward_batch
+        self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        self.attn_backends[0]._replay_forward_batch = None
+        temp_metadata = self.attn_backends[0].forward_metadata
+
+        for i in range(1, self.speculative_num_steps - 1):
+            self.attn_backends[i].replay_cuda_graph_metadata_from(
+                bs=bs,
+                temp_metadata=temp_metadata,
+                bucket=_GraphBucket.DECODE_OR_IDLE,
+            )
 
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
