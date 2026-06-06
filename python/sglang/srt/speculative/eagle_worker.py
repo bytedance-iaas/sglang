@@ -892,12 +892,16 @@ class EAGLEWorker(TpModelWorker):
             # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
             # is no-op for the attn_backend half when a context is already
             # active, so this outer wrap is what reaches RadixAttention.
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ):
-                logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
+            attn_backend = self.draft_attn_backend.attn_backends[i]
+            original_attn_backend = forward_batch.attn_backend
+            forward_batch.attn_backend = attn_backend
+            try:
+                with forward_context(ForwardContext(attn_backend=attn_backend)):
+                    logits_output = self.draft_model_runner.forward(
+                        forward_batch, skip_attn_backend_init=True
+                    ).logits_output
+            finally:
+                forward_batch.attn_backend = original_attn_backend
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -1224,10 +1228,16 @@ class EAGLEWorker(TpModelWorker):
                 ctx_mgr = forward_context(ForwardContext(attn_backend=attn_backend))
             else:
                 ctx_mgr = contextlib.nullcontext()
-            with ctx_mgr:
-                logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
+            original_attn_backend = forward_batch.attn_backend
+            if attn_backend is not None:
+                forward_batch.attn_backend = attn_backend
+            try:
+                with ctx_mgr:
+                    logits_output = self.draft_model_runner.forward(
+                        forward_batch, skip_attn_backend_init=True
+                    ).logits_output
+            finally:
+                forward_batch.attn_backend = original_attn_backend
             # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
