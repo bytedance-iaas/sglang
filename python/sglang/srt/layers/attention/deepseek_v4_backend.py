@@ -1127,6 +1127,20 @@ class DeepseekV4AttnBackend(
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
 
+    def _maybe_upgrade_forward_metadata(self) -> None:
+        # With SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_* can return
+        # Raw metadata. Materialize full metadata before any caller touches
+        # core_attn_metadata.
+        if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
+                raw_metadata=self.forward_metadata,
+                online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
+            )
+        elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
+            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
+                raw_metadata=self.forward_metadata,
+            )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1139,6 +1153,8 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
+        self._maybe_upgrade_forward_metadata()
+
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
