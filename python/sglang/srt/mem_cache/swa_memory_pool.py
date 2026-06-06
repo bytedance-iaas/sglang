@@ -92,6 +92,7 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        self.swa_loc: Optional[torch.Tensor] = None
         self._cached_swa_loc: Optional[torch.Tensor] = None
         self._cached_loc_key: Optional[tuple] = None
 
@@ -106,7 +107,13 @@ class SWAKVPool(BaseSWAKVPool):
         self.invalidate_loc_cache()
 
     def invalidate_loc_cache(self) -> None:
+        self.swa_loc = None
         self._cached_swa_loc = None
+        self._cached_loc_key = None
+
+    def set_swa_loc(self, loc: Optional[torch.Tensor]) -> None:
+        self.swa_loc = loc
+        self._cached_swa_loc = loc
         self._cached_loc_key = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
