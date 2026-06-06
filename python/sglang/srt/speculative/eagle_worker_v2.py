@@ -479,12 +479,16 @@ class EagleDraftWorker(BaseDraftWorker):
             # Run forward under a per-step ForwardContext so the model layer
             # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
             # honors the outer context and does not override.
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ):
-                logits_output = self.draft_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
+            attn_backend = self.draft_attn_backend.attn_backends[i]
+            original_attn_backend = forward_batch.attn_backend
+            forward_batch.attn_backend = attn_backend
+            try:
+                with forward_context(ForwardContext(attn_backend=attn_backend)):
+                    logits_output = self.draft_runner.forward(
+                        forward_batch, skip_attn_backend_init=True
+                    ).logits_output
+            finally:
+                forward_batch.attn_backend = original_attn_backend
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.topk == 1 and not _is_hip:
