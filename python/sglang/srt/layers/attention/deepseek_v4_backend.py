@@ -1475,14 +1475,32 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
 
     def init_forward_metadata_capture_cuda_graph(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info,
+        *args,
+        **kwargs,
     ) -> None:
+        if len(args) == 1 and not kwargs:
+            self.init_forward_metadata_out_graph(args[0], in_capture=True)
+            return
+
+        if args:
+            (
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                _forward_mode,
+                spec_info,
+            ) = args
+        else:
+            bs = kwargs["bs"]
+            num_tokens = kwargs["num_tokens"]
+            req_pool_indices = kwargs["req_pool_indices"]
+            seq_lens = kwargs["seq_lens"]
+            encoder_lens = kwargs.get("encoder_lens")
+            _forward_mode = kwargs["forward_mode"]
+            spec_info = kwargs.get("spec_info")
+
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 bs=bs,
