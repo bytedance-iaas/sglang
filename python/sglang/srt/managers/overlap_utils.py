@@ -135,10 +135,8 @@ class FutureMap:
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # D2H pulls (gated only on publish, off the schedule stream).
+        if _is_cuda or _is_hip:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -254,8 +252,8 @@ class FutureMap:
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             return
 
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
+        # seq_lens_cpu off the schedule stream: D2H the relay buf on a private
+        # stream (gated on publish), host-select via req_pool_indices_cpu.
         self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
         with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
