@@ -1313,7 +1313,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
-                if will_use_deepgemm and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                if (
+                    will_use_deepgemm
+                    and deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
+                ):
                     from deep_gemm import transform_sf_into_required_layout
 
                     for scale_param, weight_param in [
@@ -1322,7 +1325,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ]:
                         num_experts, n, _ = scale_param.data.shape
                         k = weight_param.shape[2] * 2
-                        rhs_s_k = k // 32
                         tma_aligned_n_e8m0 = ((n + 15) // 16) * 16
                         scale_data = transform_sf_into_required_layout(
                             scale_param.data,
