@@ -626,8 +626,8 @@ class MQALayer(nn.Module):
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
+                scale_ue8m0=True,
             )
-            o_s = deep_gemm.ceil_to_ue8m0(o_s)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
@@ -887,12 +887,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not get_moe_a2a_backend().is_none()
         )
         if _use_cp:
-            if get_moe_a2a_backend().is_none():
+            moe_a2a_backend = get_moe_a2a_backend()
+            if moe_a2a_backend.is_none():
                 hidden_states = nsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert get_moe_a2a_backend().is_deepep(), (
-                    "CP requires DeepEP (moe_a2a_backend == deepep). "
-                    "Only DeepEP is tested with CP's per-rank token split."
+                cp_moe_backend_supported = (
+                    moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe()
+                )
+                assert cp_moe_backend_supported, (
+                    "CP requires DeepEP (moe_a2a_backend == deepep) or MegaMoE "
+                    "(moe_a2a_backend == megamoe)."
                 )
                 cp_rank = get_attention_cp_rank()
                 cp_size = get_attention_cp_size()

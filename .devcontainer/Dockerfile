@@ -1,4 +1,38 @@
-FROM lmsysorg/sglang:dev
+ARG BASE_IMAGE=lmsysorg/sglang:dev
+
+FROM ${BASE_IMAGE} AS deepgemm_builder
+
+ARG DEEPGEMM_REPO=https://github.com/qiushixiaoyu/DeepGEMM.git
+ARG DEEPGEMM_REF=refs/heads/main
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+qiushixiaoyu.main
+
+USER root
+
+RUN set -eux; \
+    echo "${DEEPGEMM_CACHE_BUST}"; \
+    rm -rf /tmp/DeepGEMM; \
+    git clone --no-checkout "${DEEPGEMM_REPO}" /tmp/DeepGEMM; \
+    cd /tmp/DeepGEMM; \
+    git fetch --depth=1 origin "${DEEPGEMM_REF}"; \
+    git checkout --detach FETCH_HEAD; \
+    git rev-parse HEAD | tee /tmp/deepgemm_commit.txt; \
+    git submodule update --init --recursive; \
+    python3 -c 'from pathlib import Path; p = Path("sgl_deep_gemm/__init__.py"); text = p.read_text(); needle = "    mega_moe_pre_dispatch,\n)"; replacement = "    mega_moe_pre_dispatch,\n    transform_weights_for_mega_moe_sm90,\n    fp8_mega_moe,\n)"; assert needle in text; p.write_text(text.replace(needle, replacement))'; \
+    echo -n "${SGL_DEEP_GEMM_VERSION}" > sgl_deep_gemm/VERSION; \
+    bash build_sgl_deep_gemm.sh
+
+FROM ${BASE_IMAGE}
+
+COPY --from=deepgemm_builder /tmp/DeepGEMM/dist/sgl_deep_gemm-*.whl /tmp/
+COPY --from=deepgemm_builder /tmp/deepgemm_commit.txt /usr/local/share/sgl-deep-gemm-commit.txt
+
+RUN set -eux; \
+    python3 -m pip uninstall -y sgl-deep-gemm deep-gemm || true; \
+    python3 -m pip install --no-deps --force-reinstall /tmp/sgl_deep_gemm-*.whl; \
+    rm -f /tmp/sgl_deep_gemm-*.whl; \
+    rm -rf /root/.cache/deep_gemm; \
+    python3 -c 'import deep_gemm, importlib.metadata as md; required = ("fp8_mega_moe", "fp8_fp4_mega_moe", "mega_moe_pre_dispatch", "transform_weights_for_mega_moe_sm90"); missing = [name for name in required if not hasattr(deep_gemm, name)]; assert not missing, missing; print("sgl-deep-gemm:", md.version("sgl-deep-gemm")); print("deep_gemm:", deep_gemm.__file__)'
 
 # Create non-root user with specified UID and GID
 # NOTE: Replace with your own UID and GID. This is a workaround from https://github.com/microsoft/vscode-remote-release/issues/49#issuecomment-489060908.
