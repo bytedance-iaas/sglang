@@ -129,59 +129,76 @@ __global__ void online_c128_mtp_write_prefix_kernel(
     init_slot = swa_loc / params.swa_page_size;
   }
 
-  for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim; d += blockDim.x) {
-    float run_max = 0.0f;
-    float run_sum = 0.0f;
-    float run_kv = 0.0f;
-    if (has_partial) {
-      const float* const init = params.state + init_slot * params.state_stride_b;
-      run_max = init[d];
-      run_sum = init[kHeadDim + d];
-      run_kv = init[kHeadDim * 2 + d];
-    }
+  const int64_t d = static_cast<int64_t>(threadIdx.x);
+  float run_max = 0.0f;
+  float run_sum = 0.0f;
+  float run_kv = 0.0f;
+  if (has_partial) {
+    const float* const init = params.state + init_slot * params.state_stride_b;
+    run_max = init[d];
+    run_sum = init[kHeadDim + d];
+    run_kv = init[kHeadDim * 2 + d];
+  }
+
+  constexpr int kMaxVerifyTokens = 8;
+  float kv_steps[kMaxVerifyTokens];
+  float score_steps[kMaxVerifyTokens];
+  int64_t out_slots[kMaxVerifyTokens];
 
 #pragma unroll
-    for (int64_t step = 0; step < 8; ++step) {
-      if (step >= params.num_verify_tokens) break;
+  for (int step = 0; step < kMaxVerifyTokens; ++step) {
+    if (step >= params.num_verify_tokens) break;
 
-      const int64_t pos = (start_pos + step) & 127;
-      const float* const kv =
-          params.kv_score_input + (bid * params.num_verify_tokens + step) * params.kv_score_stride_b;
-      const float kv_step = kv[d];
-      const float score_step = kv[kHeadDim + d] + params.ape[pos * params.ape_stride_r + d];
+    const int64_t pos = (start_pos + step) & 127;
+    const float* const kv =
+        params.kv_score_input + (bid * params.num_verify_tokens + step) * params.kv_score_stride_b;
+    kv_steps[step] = kv[d];
+    score_steps[step] = kv[kHeadDim + d] + params.ape[pos * params.ape_stride_r + d];
 
-      if (pos == 0) {
-        run_kv = kv_step;
-        run_max = score_step;
-        run_sum = 1.0f;
-      } else {
-        const float new_max = fmaxf(run_max, score_step);
-        const float old_sum_scaled = run_sum * __expf(run_max - new_max);
-        const float new_exp = __expf(score_step - new_max);
-        const float new_sum = old_sum_scaled + new_exp;
-        run_kv = (run_kv * old_sum_scaled + kv_step * new_exp) / new_sum;
-        run_max = new_max;
-        run_sum = new_sum;
-      }
+    out_slots[step] = -1;
+    const int64_t final_seq = seq_before + step + 1;
+    if ((final_seq & 127) != 0) {
+      const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
+      const int64_t full_loc =
+          static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
+      const int64_t swa_loc = params.full_to_swa[full_loc];
+      out_slots[step] = swa_loc / params.swa_page_size + (step + 1) * params.state_slot_stride;
+    }
+  }
 
-      const int64_t final_seq = seq_before + step + 1;
-      if ((final_seq & 127) != 0) {
-        const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
-        const int64_t full_loc =
-            static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
-        const int64_t swa_loc = params.full_to_swa[full_loc];
-        const int64_t slot = swa_loc / params.swa_page_size + (step + 1) * params.state_slot_stride;
-        float* const out = params.state + slot * params.state_stride_b;
-        out[d] = run_max;
-        out[kHeadDim + d] = run_sum;
-        out[kHeadDim * 2 + d] = run_kv;
-      }
+#pragma unroll
+  for (int step = 0; step < kMaxVerifyTokens; ++step) {
+    if (step >= params.num_verify_tokens) break;
 
-      if (pos == 127) {
-        run_kv = 0.0f;
-        run_max = 0.0f;
-        run_sum = 0.0f;
-      }
+    const int64_t pos = (start_pos + step) & 127;
+    const float kv_step = kv_steps[step];
+    const float score_step = score_steps[step];
+    if (pos == 0) {
+      run_kv = kv_step;
+      run_max = score_step;
+      run_sum = 1.0f;
+    } else {
+      const float new_max = fmaxf(run_max, score_step);
+      const float old_sum_scaled = run_sum * __expf(run_max - new_max);
+      const float new_exp = __expf(score_step - new_max);
+      const float new_sum = old_sum_scaled + new_exp;
+      run_kv = (run_kv * old_sum_scaled + kv_step * new_exp) / new_sum;
+      run_max = new_max;
+      run_sum = new_sum;
+    }
+
+    const int64_t slot = out_slots[step];
+    if (slot >= 0) {
+      float* const out = params.state + slot * params.state_stride_b;
+      out[d] = run_max;
+      out[kHeadDim + d] = run_sum;
+      out[kHeadDim * 2 + d] = run_kv;
+    }
+
+    if (pos == 127) {
+      run_kv = 0.0f;
+      run_max = 0.0f;
+      run_sum = 0.0f;
     }
   }
 }
@@ -222,7 +239,8 @@ struct OnlineC128MTPWritePrefixKernel {
         .state_slot_stride = state_slot_stride,
     };
 
-    constexpr uint32_t kThreads = 256;
+    static_assert(kHeadDim == 512, "online c128 MTP write-prefix only supports head_dim=512");
+    constexpr uint32_t kThreads = static_cast<uint32_t>(kHeadDim);
     LaunchKernel(static_cast<uint32_t>(layer_bs), kThreads, device)
         (online_c128_mtp_write_prefix_kernel<kHeadDim, TSeq, TReq>, params);
   }
