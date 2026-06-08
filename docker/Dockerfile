@@ -12,11 +12,6 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.2.post2
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0+sm90.mega.moe.sgl.dev
-ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
-ARG DEEPGEMM_REF=sm90-mega-moe-on-sgl-dev
-ARG DEEPGEMM_CACHE_BUST=manual
-ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG GDRCOPY_GITHUB_ARTIFACTORY
@@ -183,11 +178,6 @@ FROM base AS torch_deps
 ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0+sm90.mega.moe.sgl.dev
-ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
-ARG DEEPGEMM_REF=sm90-mega-moe-on-sgl-dev
-ARG DEEPGEMM_CACHE_BUST=manual
-ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
@@ -255,8 +245,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
-       fi \
-    && echo "${DEEPGEMM_CACHE_BUST}" \
+       fi
+
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+merge.pr332.pr36.sgl.dev
+ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
+ARG DEEPGEMM_REF=merge-pr332-pr36-sgl-dev
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG DEEPGEMM_GITHUB_ARTIFACTORY
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo "${DEEPGEMM_CACHE_BUST}" \
     && DEEPGEMM_GITHUB_ARTIFACTORY="${DEEPGEMM_GITHUB_ARTIFACTORY:-${GITHUB_ARTIFACTORY}}" \
     && git config --global url."https://${DEEPGEMM_GITHUB_ARTIFACTORY}/".insteadOf "https://github.com/" \
     && rm -rf /tmp/DeepGEMM \
