@@ -65,6 +65,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.utils import is_w4afp8_or_w4a16_config
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -1226,11 +1227,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
-        if self.quant_config and (
-            self.quant_config.get_name() == "w4afp8"
-            or getattr(self.quant_config, "is_w4afp8_config", lambda: False)()
-            or getattr(self.quant_config, "is_w4a16_config", lambda: False)()
-        ):
+        if is_w4afp8_or_w4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
