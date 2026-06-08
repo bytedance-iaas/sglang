@@ -456,14 +456,20 @@ class Scheduler(
             if hasattr(self.tree_cache, "init_hisparse_radix_cache"):
                 self.enable_hisparse_radix_cache = (
                     self.tree_cache.init_hisparse_radix_cache(
-                        self.hisparse_coordinator.mem_pool_host
+                        self.hisparse_coordinator.mem_pool_host,
+                        self.server_args,
                     )
                 )
                 if self.enable_hisparse_radix_cache:
                     self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
-            self.enable_hisparse_c4_prefix_cache = (
-                self.hisparse_coordinator.enable_c4_host_prefix_cache()
-            )
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
+            self.enable_hisparse_c4_prefix_cache = False
+            if not self.enable_hisparse_radix_cache:
+                self.enable_hisparse_c4_prefix_cache = (
+                    self.hisparse_coordinator.enable_c4_host_prefix_cache()
+                )
         else:
             self.enable_hisparse_radix_cache = False
             self.enable_hisparse_c4_prefix_cache = False
@@ -2430,7 +2436,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -2613,7 +2619,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -2696,7 +2702,7 @@ class Scheduler(
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory

@@ -70,10 +70,6 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
     if is_v4_hisparse:
         return
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-
     if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
         raise ValueError(
             f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "

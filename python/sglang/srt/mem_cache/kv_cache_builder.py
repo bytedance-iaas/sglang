@@ -201,8 +201,13 @@ def build_kv_cache(
     effective_chunked_prefill_size = server_args.chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
-    enable_dsv4_hisparse_host_radix = server_args.enable_hisparse and is_deepseek_v4(
+    is_dsv4_hisparse = server_args.enable_hisparse and is_deepseek_v4(
         model_config.hf_config
+    )
+    enable_hisparse_unified_radix = (
+        server_args.enable_hisparse
+        and not disable_radix_cache
+        and getattr(token_to_kv_pool_allocator, "compress_ratio", 1) == 1
     )
 
     params = CacheInitParams(
@@ -226,7 +231,24 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
     )
 
-    if enable_dsv4_hisparse_host_radix:
+    if enable_hisparse_unified_radix:
+        from sglang.srt.mem_cache.unified_cache_components import (
+            ComponentType,
+        )
+
+        params.tree_components = (ComponentType.FULL,)
+        from sglang.srt.mem_cache.hisparse_unified_radix_cache import (
+            HiSparseUnifiedRadixCache,
+        )
+
+        tree_cache = HiSparseUnifiedRadixCache(params)
+        if hasattr(tree_cache, "enable_hisparse_mode"):
+            tree_cache.enable_hisparse_mode()
+        else:
+            # Keep startup robust when the HiSparse builder path is combined
+            # with an older UnifiedRadixCache implementation in an image layer.
+            tree_cache.hisparse_mode = True
+    elif is_dsv4_hisparse:
         from sglang.srt.mem_cache.unified_cache_components import (
             ComponentType,
         )
@@ -239,8 +261,6 @@ def build_kv_cache(
         if hasattr(tree_cache, "enable_hisparse_mode"):
             tree_cache.enable_hisparse_mode()
         else:
-            # Keep startup robust when the HiSparse builder path is combined
-            # with an older UnifiedRadixCache implementation in an image layer.
             tree_cache.hisparse_mode = True
     elif effective_chunked_prefill_size is not None and disable_radix_cache:
         if not is_hybrid_swa:
