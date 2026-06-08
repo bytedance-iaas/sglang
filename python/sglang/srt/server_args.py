@@ -565,6 +565,7 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    speculative_draft_dp: bool = False
     speculative_skip_dp_mlp_sync: bool = False
 
     @cached_property
@@ -5546,6 +5547,13 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--speculative-draft-dp",
+            action="store_true",
+            default=ServerArgs.speculative_draft_dp,
+            help="Run the draft model with data parallelism (tp_size=1, ep_size=1 per rank) "
+            "to eliminate allreduce/all-to-all communication during draft multi-step decode.",
         )
 
         # Speculative decoding (ngram)

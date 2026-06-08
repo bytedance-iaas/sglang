@@ -98,6 +98,18 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
+    if server_args.speculative_draft_dp:
+        if server_args.tp_size <= 1 and server_args.ep_size <= 1:
+            logger.warning(
+                "--speculative-draft-dp has no effect with tp_size=1 and ep_size=1. Ignoring."
+            )
+            server_args.speculative_draft_dp = False
+        elif server_args.speculative_moe_a2a_backend is None:
+            server_args.speculative_moe_a2a_backend = "none"
+            logger.info(
+                "--speculative-draft-dp: auto-setting --speculative-moe-a2a-backend=none"
+            )
+
     if server_args.speculative_algorithm == "DFLASH":
         _handle_dflash(server_args)
     elif server_args.speculative_algorithm == "FROZEN_KV_MTP":

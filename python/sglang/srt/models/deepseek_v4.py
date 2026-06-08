@@ -664,6 +664,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -875,10 +876,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _use_draft_local_moe = (
+            self.is_nextn and get_global_server_args().speculative_draft_dp
+        )
         _use_tp_moe_gather = (
             not _use_cp
             and get_attention_dp_size() > 1
             and get_moe_a2a_backend().is_none()
+            and not _use_draft_local_moe
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp

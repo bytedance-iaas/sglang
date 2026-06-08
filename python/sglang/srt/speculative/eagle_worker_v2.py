@@ -55,6 +55,8 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    create_draft_dp_group,
+    draft_dp_full_context,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
@@ -142,10 +144,31 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+        from sglang.srt.distributed.parallel_state import patch_moe_parallel_group
+
+        if server_args.speculative_draft_dp and server_args.enable_dp_attention:
+            self.draft_dp_group = create_draft_dp_group()
+            attn_tp_group = get_attention_tp_group()
+            ctx = contextlib.ExitStack()
+            ctx.enter_context(draft_tp_context(attn_tp_group))
+            ctx.enter_context(
+                patch_moe_parallel_group(self.draft_dp_group, self.draft_dp_group)
+            )
+        elif server_args.speculative_draft_dp:
+            self.draft_dp_group = create_draft_dp_group()
+            ctx = draft_dp_full_context(
+                self.draft_dp_group, self.draft_dp_group, self.draft_dp_group
+            )
+        elif server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
+        draft_tp_rank = (
+            tp_rank
+            if server_args.enable_dp_attention
+            else (0 if server_args.speculative_draft_dp else tp_rank)
+        )
+        draft_ep_rank = 0 if server_args.speculative_draft_dp else moe_ep_rank
         with (
             ctx
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -153,10 +176,10 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
+                tp_rank=draft_tp_rank,
                 pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
+                moe_ep_rank=draft_ep_rank,
                 attn_cp_rank=attn_cp_rank,
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
@@ -165,6 +188,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
+        if isinstance(ctx, contextlib.ExitStack):
+            ctx.close()
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
@@ -181,9 +206,23 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
-        self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
-        )
+        if server_args.speculative_draft_dp and server_args.enable_dp_attention:
+            @contextlib.contextmanager
+            def _draft_dp_dpa_context(_tp_group=None):
+                with patch_moe_parallel_group(
+                    self.draft_dp_group, self.draft_dp_group
+                ):
+                    yield
+
+            self.draft_tp_context = _draft_dp_dpa_context
+        elif server_args.speculative_draft_dp:
+            self.draft_tp_context = lambda _tp_group=None: draft_dp_full_context(
+                self.draft_dp_group, self.draft_dp_group, self.draft_dp_group
+            )
+        else:
+            self.draft_tp_context = (
+                draft_tp_context if server_args.enable_dp_attention else empty_context
+            )
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -212,9 +251,59 @@ class EagleDraftWorker(BaseDraftWorker):
         else:
             self.hot_token_id = None
 
+    @staticmethod
+    def _allgather_tensor(tensor, tp_group):
+        if tp_group.world_size <= 1:
+            return tensor
+        gathered = [torch.empty_like(tensor) for _ in range(tp_group.world_size)]
+        torch.distributed.all_gather(gathered, tensor, group=tp_group.device_group)
+        return torch.cat(gathered, dim=0)
+
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        if self.speculative_algorithm.is_eagle3():
+        if self.server_args.speculative_draft_dp and self.server_args.enable_dp_attention:
+            target_tp_group = self.target_worker.model_runner.tp_group
+            full_embed = embed
+            full_head = (
+                head
+                if self.server_args.enable_dp_lm_head
+                else self._allgather_tensor(head, target_tp_group)
+            )
+            if self.speculative_algorithm.is_eagle3():
+                self.draft_runner.model.set_embed(full_embed)
+                if (
+                    hasattr(self.draft_runner.model, "load_lm_head_from_target")
+                    and self.draft_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_runner.model.lm_head.weight.data.copy_(full_head)
+            else:
+                if self.hot_token_id is not None:
+                    full_head = full_head.clone()
+                    self.hot_token_id = self.hot_token_id.to(full_head.device)
+                    full_head.data = full_head.data[self.hot_token_id]
+                self.draft_runner.model.set_embed_and_head(full_embed, full_head)
+        elif self.server_args.speculative_draft_dp:
+            target_tp_group = self.target_worker.model_runner.tp_group
+            full_embed = self._allgather_tensor(embed, target_tp_group)
+            full_head = (
+                head
+                if self.server_args.enable_dp_lm_head
+                else self._allgather_tensor(head, target_tp_group)
+            )
+            if self.speculative_algorithm.is_eagle3():
+                self.draft_runner.model.set_embed(full_embed)
+                if (
+                    hasattr(self.draft_runner.model, "load_lm_head_from_target")
+                    and self.draft_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_runner.model.lm_head.weight.data.copy_(full_head)
+            else:
+                if self.hot_token_id is not None:
+                    full_head = full_head.clone()
+                    self.hot_token_id = self.hot_token_id.to(full_head.device)
+                    full_head.data = full_head.data[self.hot_token_id]
+                self.draft_runner.model.set_embed_and_head(full_embed, full_head)
+        elif self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
             if (
@@ -273,6 +362,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if self.server_args.model_impl == "mindspore":
             return
+
 
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
@@ -339,6 +429,69 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
+    def _use_local_mlp_sync_for_draft(self) -> bool:
+        return self.server_args.speculative_draft_dp
+
+    def _sync_local_swa_out_cache_loc_for_draft(self, forward_batch: ForwardBatch):
+        if getattr(forward_batch, "out_cache_loc_swa", None) is None:
+            return
+
+        out_cache_loc = forward_batch.out_cache_loc
+        if getattr(self.draft_runner, "is_hybrid_swa", False) and out_cache_loc is not None:
+            allocator = getattr(self.draft_runner, "token_to_kv_pool_allocator", None)
+            if allocator is not None:
+                forward_batch.out_cache_loc_swa = (
+                    allocator.translate_loc_from_full_to_swa(out_cache_loc)
+                )
+                return
+
+        num_tokens = (
+            int(forward_batch.input_ids.numel())
+            if forward_batch.input_ids is not None
+            else 0
+        )
+        if forward_batch.out_cache_loc_swa.shape[0] > num_tokens:
+            forward_batch.out_cache_loc_swa = forward_batch.out_cache_loc_swa[
+                :num_tokens
+            ]
+
+    def _set_local_mlp_sync_for_draft(self, forward_batch: ForwardBatch):
+        if (
+            not self._use_local_mlp_sync_for_draft()
+            or forward_batch.global_num_tokens_cpu is None
+        ):
+            return
+
+        self._sync_local_swa_out_cache_loc_for_draft(forward_batch)
+
+        num_tokens = (
+            int(forward_batch.input_ids.numel())
+            if forward_batch.input_ids is not None
+            else 0
+        )
+        spec_info = forward_batch.spec_info
+        num_tokens_for_logprob = num_tokens
+        if spec_info is not None and spec_info.num_tokens_for_logprob_per_req > 0:
+            num_tokens_for_logprob = (
+                forward_batch.batch_size * spec_info.num_tokens_for_logprob_per_req
+            )
+
+        forward_batch.global_num_tokens_cpu = [num_tokens]
+        forward_batch.global_num_tokens_for_logprob_cpu = [num_tokens_for_logprob]
+        device = (
+            forward_batch.input_ids.device
+            if forward_batch.input_ids is not None
+            else self.device
+        )
+        forward_batch.global_num_tokens_gpu = torch.tensor(
+            [num_tokens], dtype=torch.int64, device=device
+        )
+        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+            [num_tokens_for_logprob],
+            dtype=torch.int64,
+            device=device,
+        )
+
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -349,6 +502,13 @@ class EagleDraftWorker(BaseDraftWorker):
             self.topk,
             self.speculative_num_steps,
         )
+
+        if self.server_args.speculative_draft_dp and batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
 
         # Run draft
         if can_cuda_graph:
@@ -363,6 +523,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+            self._set_local_mlp_sync_for_draft(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -464,6 +625,7 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+            self._set_local_mlp_sync_for_draft(forward_batch)
 
             # Run forward
             logits_output = self.draft_runner.forward(
@@ -564,6 +726,7 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
+        self._set_local_mlp_sync_for_draft(forward_batch)
         logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -578,6 +741,9 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        if self.server_args.speculative_draft_dp and batch.forward_mode.is_idle():
+            return
+
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -611,6 +777,7 @@ class EagleDraftWorker(BaseDraftWorker):
             # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
             forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
             forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
+        self._set_local_mlp_sync_for_draft(forward_batch)
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -1035,7 +1202,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            # Re-prepare cuda graph metadata after draft updates verify buffers.
+            skip_attn_backend_init=False,
         )
         logits_output = forward_batch_output.logits_output
 

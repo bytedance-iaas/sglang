@@ -125,8 +125,11 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
-    if not skip_all_gather:
-        batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+    batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+    if skip_all_gather:
+        batch.tbo_split_seq_index = None
+        batch.global_forward_mode = ForwardMode(mlp_sync_info.local_forward_mode)
+    else:
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
@@ -145,6 +148,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    skip_mlp_sync_all_gather: bool = False,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -168,7 +172,9 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    skip_all_gather = (
+        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or skip_mlp_sync_all_gather
+    )
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -212,6 +218,11 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info[:, 4:6],
             )
         )
+    else:
+        mlp_sync_info.global_num_tokens = [mlp_sync_info.num_tokens]
+        mlp_sync_info.global_num_tokens_for_logprob = [
+            mlp_sync_info.num_tokens_for_logprob
+        ]
 
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
@@ -222,7 +233,10 @@ def prepare_mlp_sync_batch_raw(
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
         _update_gather_batch(
-            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+            batch_to_gather,
+            mlp_sync_info,
+            require_mlp_tp_gather and not skip_mlp_sync_all_gather,
+            skip_all_gather,
         )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:

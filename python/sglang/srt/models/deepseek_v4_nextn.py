@@ -134,7 +134,12 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
-        if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
+        use_local_input_ids = get_global_server_args().speculative_draft_dp
+        if (
+            get_attention_dp_size() > 1
+            and get_moe_a2a_backend().is_none()
+            and not use_local_input_ids
+        ):
             input_ids_global = torch.empty(
                 (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
                 dtype=input_ids.dtype,

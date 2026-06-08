@@ -40,6 +40,8 @@ else:
 class FutureIndices:
     indices: torch.Tensor
     interval: Optional[slice] = None
+    slots: Optional[torch.Tensor] = None
+    slot_interval: Optional[slice] = None
 
 
 class FutureMap:
@@ -76,6 +78,31 @@ class FutureMap:
                 (self.future_buffer_len,), dtype=torch.int64, device=self.device
             )
         else:
+            storage_max_running_requests = max_running_requests
+            try:
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_dp_size,
+                    is_dp_attention_enabled,
+                )
+
+                if is_dp_attention_enabled():
+                    dp_size = get_attention_dp_size()
+                    storage_max_running_requests = max(
+                        min(max_running_requests, 128),
+                        (max_running_requests + dp_size - 1) // dp_size,
+                        1,
+                    )
+            except Exception:
+                pass
+            self.storage_buffer_len = min(
+                max(storage_max_running_requests * 5, 1),
+                self.future_buffer_len,
+            )
+            self.future_to_slot = torch.empty(
+                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+            )
+            self.future_to_slot.fill_(-1)
+            self.free_slots = list(range(self.storage_buffer_len))
             # For speculative decoding, we lazily initialize the buffers
             # This is to make the shape derivation easier.
             self.buf_initialized = False
@@ -90,22 +117,22 @@ class FutureMap:
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
         self.topk_p_buf = torch.empty(
-            (self.future_buffer_len, *topk_p0.shape),
+            (self.storage_buffer_len, *topk_p0.shape),
             dtype=topk_p0.dtype,
             device=self.device,
         )
         self.topk_index_buf = torch.empty(
-            (self.future_buffer_len, *topk_index0.shape),
+            (self.storage_buffer_len, *topk_index0.shape),
             dtype=topk_index0.dtype,
             device=self.device,
         )
         self.bonus_tokens_buf = torch.empty(
-            (self.future_buffer_len, *bonus_token0.shape),
+            (self.storage_buffer_len, *bonus_token0.shape),
             dtype=bonus_token0.dtype,
             device=self.device,
         )
         self.new_seq_lens_buf = torch.empty(
-            (self.future_buffer_len, *new_seq_lens0.shape),
+            (self.storage_buffer_len, *new_seq_lens0.shape),
             dtype=new_seq_lens0.dtype,
             device=self.device,
         )
@@ -113,10 +140,50 @@ class FutureMap:
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
             self.hidden_states_buf = torch.empty(
-                (self.future_buffer_len, *hidden_states0.shape),
+                (self.storage_buffer_len, *hidden_states0.shape),
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
+
+    def _grow_storage(self, min_free_slots: int):
+        if self.storage_buffer_len >= self.future_buffer_len:
+            return
+        old_len = self.storage_buffer_len
+        new_len = min(
+            max(self.storage_buffer_len * 2, self.storage_buffer_len + min_free_slots),
+            self.future_buffer_len,
+        )
+
+        def grow_tensor(buf: torch.Tensor):
+            new_buf = torch.empty(
+                (new_len, *buf.shape[1:]), dtype=buf.dtype, device=buf.device
+            )
+            new_buf[:old_len] = buf
+            return new_buf
+
+        self.topk_p_buf = grow_tensor(self.topk_p_buf)
+        self.topk_index_buf = grow_tensor(self.topk_index_buf)
+        self.bonus_tokens_buf = grow_tensor(self.bonus_tokens_buf)
+        self.new_seq_lens_buf = grow_tensor(self.new_seq_lens_buf)
+        if spec_need_hidden_states():
+            self.hidden_states_buf = grow_tensor(self.hidden_states_buf)
+
+        self.free_slots.extend(range(old_len, new_len))
+        self.storage_buffer_len = new_len
+
+    def _alloc_storage_slots(self, bs: int) -> torch.Tensor:
+        if len(self.free_slots) < bs:
+            self._grow_storage(bs - len(self.free_slots))
+        if len(self.free_slots) < bs:
+            raise RuntimeError(
+                "FutureMap compact storage is exhausted: "
+                f"need {bs} slots, free {len(self.free_slots)}, "
+                f"storage_buffer_len={self.storage_buffer_len}, "
+                f"future_buffer_len={self.future_buffer_len}"
+            )
+        slot_list = self.free_slots[-bs:]
+        del self.free_slots[-bs:]
+        return torch.tensor(slot_list, dtype=torch.int64, device=self.device)
 
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
@@ -125,7 +192,13 @@ class FutureMap:
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
-        return FutureIndices(indices=indices, interval=slice(start, end))
+        if self.spec_algo.is_none():
+            return FutureIndices(indices=indices, interval=slice(start, end))
+
+        return FutureIndices(
+            indices=indices,
+            interval=slice(start, end),
+        )
 
     def resolve_future(self, batch: ScheduleBatch):
         if self.spec_algo.is_none():
@@ -143,12 +216,21 @@ class FutureMap:
             # batch.spec_info), so the caching allocator (torch GC) could
             # reclaim the memory before the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+            slots = self.future_to_slot[indices]
+            if torch.any(slots < 0):
+                raise RuntimeError(
+                    "FutureMap resolved a future id without a compact storage slot."
+                )
+            draft_input.topk_p = self.topk_p_buf[slots]
+            draft_input.topk_index = self.topk_index_buf[slots]
+            draft_input.bonus_tokens = self.bonus_tokens_buf[slots]
+            draft_input.new_seq_lens = self.new_seq_lens_buf[slots]
             if spec_need_hidden_states():
-                draft_input.hidden_states = self.hidden_states_buf[indices]
+                draft_input.hidden_states = self.hidden_states_buf[slots]
+            valid_slots = slots[slots >= 0]
+            if len(valid_slots) > 0:
+                self.future_to_slot[indices] = -1
+                self.free_slots.extend(valid_slots.detach().cpu().tolist())
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -181,9 +263,23 @@ class FutureMap:
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
-        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        slots = future_indices.slots
+        if slots is None:
+            slots = self._alloc_storage_slots(len(future_indices.indices))
+            future_indices.slots = slots
+        else:
+            slots = slots.to(device=self.device, dtype=torch.int64)
+        self.future_to_slot[future_indices.indices] = slots
+
+        self.topk_p_buf[slots] = draft_input.topk_p.to(dtype=self.topk_p_buf.dtype)
+        self.topk_index_buf[slots] = draft_input.topk_index.to(
+            dtype=self.topk_index_buf.dtype
+        )
+        self.bonus_tokens_buf[slots] = draft_input.bonus_tokens.to(
+            dtype=self.bonus_tokens_buf.dtype
+        )
+        self.new_seq_lens_buf[slots] = draft_input.new_seq_lens.to(
+            dtype=self.new_seq_lens_buf.dtype
+        )
         if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
+            self.hidden_states_buf[slots] = draft_input.hidden_states
