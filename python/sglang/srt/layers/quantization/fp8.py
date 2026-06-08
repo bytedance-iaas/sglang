@@ -1319,16 +1319,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 if will_use_deepgemm and (
                     deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                    or os.getenv("DG_W4_SCALE_B_BF16", "1") != "0"
                     or os.getenv("DG_W4_SCALE_B_E8M0", "1") != "0"
                     or use_e8m0_only_b_scale
                 ):
                     from deep_gemm import transform_sf_into_required_layout
 
-                    use_bf16_b_scale = (
-                        os.getenv("DG_W4_SCALE_B_BF16", "1") != "0"
-                        and not use_e8m0_only_b_scale
-                    )
                     use_e8m0_b_scale = (
                         os.getenv("DG_W4_SCALE_B_E8M0", "1") != "0"
                         or use_e8m0_only_b_scale
@@ -1383,15 +1378,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             num_groups=num_experts,
                             disable_ue8m0_cast=False,
                         )
-                        if use_bf16_b_scale:
-                            bf16_scale_data = torch.empty_strided(
-                                scale_data.shape,
-                                scale_data.stride(),
-                                device=scale_data.device,
-                                dtype=torch.bfloat16,
-                            )
-                            bf16_scale_data.copy_(scale_data)
-                            scale_param.scale_bf16_data = bf16_scale_data
                         if use_e8m0_b_scale:
                             e8m0_scale_data = torch.empty_strided(
                                 scale_data.shape,
@@ -1995,8 +1981,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                w13_scale_bf16=getattr(w13_scale, "scale_bf16_data", None),
-                w2_scale_bf16=getattr(w2_scale, "scale_bf16_data", None),
                 w13_scale_e8m0=getattr(w13_scale, "scale_e8m0_data", None),
                 w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
                 block_shape=block_shape,
