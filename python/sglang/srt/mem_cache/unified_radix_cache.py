@@ -2083,9 +2083,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         for _, finish_event, ack_list in cc.ack_write_queue:
             if not finish_event.query():
