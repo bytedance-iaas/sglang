@@ -150,6 +150,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 and hisparse_coordinator is not None
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
+                batch.ensure_req_pool_indices()
                 allocator = batch.tree_cache.token_to_kv_pool_allocator
                 evict_from_tree_cache(
                     batch.tree_cache,
@@ -518,8 +519,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             and hisparse_coordinator is not None
             and hisparse_coordinator.supports_hisparse_draft_slots()
         ):
+            batch.ensure_req_pool_indices()
             hisparse_coordinator.finalize_accepted_tokens(
                 batch.req_pool_indices,
+                batch.req_pool_indices_cpu,
                 batch.out_cache_loc[accept_index],
                 batch.out_cache_loc,
                 num_correct_drafts,

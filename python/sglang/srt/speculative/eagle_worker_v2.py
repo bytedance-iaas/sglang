@@ -1092,10 +1092,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     "EAGLE HiSparse accepted-token bookkeeping mismatch: "
                     f"{accept_index_flat.numel()} accepted indices for "
                     f"{batch.out_cache_loc.numel()} draft cache locs."
-                )
+            )
             num_correct_drafts = accept_lens - 1
+            batch.ensure_req_pool_indices()
             hisparse_coordinator.finalize_accepted_tokens(
                 batch.req_pool_indices,
+                batch.req_pool_indices_cpu,
                 batch.out_cache_loc[accept_index_flat],
                 batch.out_cache_loc,
                 num_correct_drafts,

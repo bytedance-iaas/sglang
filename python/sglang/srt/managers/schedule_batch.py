@@ -1635,6 +1635,116 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def set_req_pool_indices(
+        self,
+        req_pool_indices_cpu: Union[List[int], torch.Tensor],
+        req_pool_indices: Optional[torch.Tensor] = None,
+    ):
+        target_device = torch.device(self.device)
+        if not isinstance(req_pool_indices_cpu, torch.Tensor):
+            req_pool_indices_cpu = torch.tensor(req_pool_indices_cpu, dtype=torch.int64)
+        elif req_pool_indices_cpu.device.type != "cpu":
+            req_pool_indices_cpu = req_pool_indices_cpu.cpu()
+
+        if req_pool_indices_cpu.dtype != torch.int64:
+            req_pool_indices_cpu = req_pool_indices_cpu.to(dtype=torch.int64)
+
+        if req_pool_indices is None:
+            req_pool_indices = req_pool_indices_cpu.to(
+                target_device, non_blocking=True
+            )
+        elif req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(dtype=torch.int64)
+
+        if req_pool_indices.device != target_device:
+            req_pool_indices = req_pool_indices.to(target_device, non_blocking=True)
+
+        self.req_pool_indices_cpu = req_pool_indices_cpu
+        self.req_pool_indices = req_pool_indices
+        self.ensure_req_pool_indices()
+
+    def set_req_pool_indices_from_reqs(self):
+        req_pool_indices = []
+        for req in self.reqs:
+            if req.req_pool_idx is None:
+                raise RuntimeError(
+                    "ScheduleBatch request "
+                    f"{getattr(req, 'rid', '<unknown>')} has no req_pool_idx."
+                )
+            req_pool_indices.append(req.req_pool_idx)
+        self.set_req_pool_indices(req_pool_indices)
+
+    def ensure_req_pool_indices(self):
+        if len(self.reqs) == 0:
+            if (
+                self.req_pool_indices_cpu is None
+                or not isinstance(self.req_pool_indices_cpu, torch.Tensor)
+                or self.req_pool_indices_cpu.device.type != "cpu"
+                or self.req_pool_indices_cpu.dtype != torch.int64
+                or self.req_pool_indices_cpu.numel() != 0
+            ):
+                self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
+            if (
+                self.req_pool_indices is None
+                or not isinstance(self.req_pool_indices, torch.Tensor)
+                or self.req_pool_indices.device != torch.device(self.device)
+                or self.req_pool_indices.dtype != torch.int64
+                or self.req_pool_indices.numel() != 0
+            ):
+                self.req_pool_indices = torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                )
+            return
+
+        if self.req_pool_indices is None and self.req_pool_indices_cpu is None:
+            raise RuntimeError(
+                "ScheduleBatch has requests but no req_pool_indices or "
+                "req_pool_indices_cpu."
+            )
+
+        if self.req_pool_indices_cpu is None:
+            self.req_pool_indices_cpu = self.req_pool_indices.detach().cpu().to(
+                dtype=torch.int64
+            )
+        elif not isinstance(self.req_pool_indices_cpu, torch.Tensor):
+            self.req_pool_indices_cpu = torch.tensor(
+                self.req_pool_indices_cpu, dtype=torch.int64
+            )
+        elif self.req_pool_indices_cpu.device.type != "cpu":
+            self.req_pool_indices_cpu = self.req_pool_indices_cpu.cpu()
+
+        if self.req_pool_indices_cpu.dtype != torch.int64:
+            self.req_pool_indices_cpu = self.req_pool_indices_cpu.to(dtype=torch.int64)
+
+        if self.req_pool_indices is None:
+            self.req_pool_indices = self.req_pool_indices_cpu.to(
+                self.device, non_blocking=True
+            )
+        elif not isinstance(self.req_pool_indices, torch.Tensor):
+            self.req_pool_indices = torch.tensor(
+                self.req_pool_indices, dtype=torch.int64, device=self.device
+            )
+        elif self.req_pool_indices.dtype != torch.int64:
+            self.req_pool_indices = self.req_pool_indices.to(dtype=torch.int64)
+        if self.req_pool_indices.device != torch.device(self.device):
+            self.req_pool_indices = self.req_pool_indices.to(
+                self.device, non_blocking=True
+            )
+
+        if self.req_pool_indices_cpu.numel() != len(self.reqs):
+            raise RuntimeError(
+                "ScheduleBatch req_pool_indices_cpu length mismatch: "
+                f"{self.req_pool_indices_cpu.numel()} vs {len(self.reqs)}."
+            )
+        if self.req_pool_indices.numel() != len(self.reqs):
+            raise RuntimeError(
+                "ScheduleBatch req_pool_indices length mismatch: "
+                f"{self.req_pool_indices.numel()} vs {len(self.reqs)}."
+            )
+
+    def ensure_req_pool_indices_cpu(self):
+        self.ensure_req_pool_indices()
+
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         _pin = is_pin_memory_available(self.device)
         self.encoder_lens_cpu = []
@@ -1974,8 +2084,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_positions_tensor = None
 
         self.input_ids = input_ids_tensor
-        self.req_pool_indices = req_pool_indices_tensor
-        self.req_pool_indices_cpu = req_pool_indices_cpu
+        self.set_req_pool_indices(req_pool_indices_cpu, req_pool_indices_tensor)
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -2346,8 +2455,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
+        self.set_req_pool_indices([])
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2365,6 +2473,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        self.ensure_req_pool_indices()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2494,7 +2603,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.set_req_pool_indices([])
+            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.out_cache_loc = None
+            if self.output_ids is not None:
+                self.output_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_sum = 0
             return
+
+        self.ensure_req_pool_indices()
 
         if len(keep_indices) == len(self.reqs):
             # No need to filter
@@ -2562,6 +2681,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
+        self.ensure_req_pool_indices()
+        other.ensure_req_pool_indices()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it

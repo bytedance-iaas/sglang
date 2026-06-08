@@ -943,10 +943,9 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> None:
-        req_pool_indices_cpu = req_pool_indices.cpu()
-
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -1171,7 +1170,10 @@ class HiSparseCoordinator:
     # ---- EAGLE/MTP draft slots ----
 
     def _ensure_draft_buffer(
-        self, req_pool_indices: torch.Tensor, num_tokens: int
+        self,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        num_tokens: int,
     ) -> None:
         if num_tokens <= 0:
             return
@@ -1186,7 +1188,7 @@ class HiSparseCoordinator:
                 f"device_buffer_size={self.device_buffer_size})."
             )
 
-        req_indices_cpu = req_pool_indices.cpu().tolist()
+        req_indices_cpu = req_pool_indices_cpu.to(torch.int64).tolist()
         grow_reqs = []
         total_grow = 0
         for req_idx in req_indices_cpu:
@@ -1225,14 +1227,19 @@ class HiSparseCoordinator:
             self.req_device_buffer_token_locs[:, req_idx, slot_start:slot_end] = chunk
             self.req_draft_buffer_size[req_idx] = num_tokens
 
-    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
+    def _ensure_padded_buffer(
+        self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> None:
         self._ensure_draft_buffer(
-            req_pool_indices, self.padded_buffer_size - self.device_buffer_size - 1
+            req_pool_indices,
+            req_pool_indices_cpu,
+            self.padded_buffer_size - self.device_buffer_size - 1,
         )
 
     def get_draft_device_slots(
         self,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
         num_tokens_per_req: int,
     ) -> torch.Tensor:
         start = self.device_buffer_size + 1
@@ -1244,12 +1251,15 @@ class HiSparseCoordinator:
                 f"available (padded_buffer_size={self.padded_buffer_size}, "
                 f"device_buffer_size={self.device_buffer_size})."
             )
-        self._ensure_draft_buffer(req_pool_indices, num_tokens_per_req)
+        self._ensure_draft_buffer(
+            req_pool_indices, req_pool_indices_cpu, num_tokens_per_req
+        )
         return self.req_to_device_buffer[req_pool_indices, start:end].reshape(-1)
 
     def get_draft_device_slots_variable(
         self,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
         tokens_per_req_cpu: torch.Tensor,
     ) -> torch.Tensor:
         if tokens_per_req_cpu.numel() == 0:
@@ -1263,7 +1273,7 @@ class HiSparseCoordinator:
                 f"capacity ({self.padded_buffer_size - self.device_buffer_size - 1})."
             )
 
-        self._ensure_draft_buffer(req_pool_indices, max_tokens)
+        self._ensure_draft_buffer(req_pool_indices, req_pool_indices_cpu, max_tokens)
 
         total_slots = int(tokens_per_req_cpu.sum().item())
         if total_slots == 0:
@@ -1291,6 +1301,7 @@ class HiSparseCoordinator:
     def finalize_accepted_tokens(
         self,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
         accepted_cache_locs: torch.Tensor,
         draft_cache_locs: torch.Tensor,
         num_correct_drafts: torch.Tensor,
@@ -1303,6 +1314,7 @@ class HiSparseCoordinator:
         if self.is_dsv4_hisparse:
             self._finalize_accepted_tokens_dsv4(
                 req_pool_indices,
+                req_pool_indices_cpu,
                 accepted_cache_locs,
                 draft_cache_locs,
                 num_correct_drafts,
@@ -1334,15 +1346,17 @@ class HiSparseCoordinator:
         starts = seq_lens - counts
         all_indices = torch.arange(total_accepted, device=counts.device)
         req_indices_expanded = torch.repeat_interleave(req_pool_indices, counts)
+        req_indices_expanded_cpu = torch.repeat_interleave(
+            req_pool_indices_cpu.to(torch.int64), counts_cpu
+        )
         pos_in_segment = all_indices - torch.repeat_interleave(offsets[:-1], counts)
         col_indices = torch.repeat_interleave(starts, counts) + pos_in_segment
 
         col_indices_cpu = col_indices.cpu()
-        req_indices_cpu = req_indices_expanded.cpu()
         host_locs = torch.cat(
             [
                 self.ensure_host_slots(int(req_idx), int(col_idx), 1)
-                for req_idx, col_idx in zip(req_indices_cpu, col_indices_cpu)
+                for req_idx, col_idx in zip(req_indices_expanded_cpu, col_indices_cpu)
             ]
         )
         if host_locs.numel() != total_accepted:
@@ -1356,7 +1370,7 @@ class HiSparseCoordinator:
         newest_slots = self.req_to_device_buffer[
             req_pool_indices, self.device_buffer_size
         ]
-        for idx in req_pool_indices.tolist():
+        for idx in req_pool_indices_cpu.tolist():
             self._skip_first_backup[idx] = True
 
         last_offsets = offsets[1:] - 1
@@ -1371,6 +1385,7 @@ class HiSparseCoordinator:
     def _finalize_accepted_tokens_dsv4(
         self,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
         accepted_cache_locs: torch.Tensor,
         draft_cache_locs: torch.Tensor,
         num_correct_drafts: torch.Tensor,
@@ -1413,7 +1428,11 @@ class HiSparseCoordinator:
         device_locs = full_to_device_mapping[compressed_locs]
 
         req_indices_expanded = torch.repeat_interleave(req_pool_indices, counts)
+        req_indices_expanded_cpu = torch.repeat_interleave(
+            req_pool_indices_cpu.to(torch.int64), counts_cpu
+        )
         compressed_req_indices = req_indices_expanded[compressed_mask]
+        compressed_req_indices_cpu = req_indices_expanded_cpu[compressed_mask.cpu()]
         compressed_positions = full_positions[compressed_mask] // self.compress_ratio
         if compressed_locs.numel() != compressed_req_indices.numel():
             full_to_device_mapping[draft_compressed_locs] = draft_mapping_snapshot
@@ -1423,7 +1442,6 @@ class HiSparseCoordinator:
                 f"{compressed_req_indices.numel()} compressed positions."
             )
 
-        compressed_req_indices_cpu = compressed_req_indices.cpu()
         compressed_positions_cpu = compressed_positions.cpu()
         host_locs = torch.cat(
             [
@@ -1450,7 +1468,7 @@ class HiSparseCoordinator:
         newest_slots = self.req_to_device_buffer[
             req_pool_indices, self.device_buffer_size
         ]
-        for idx in req_pool_indices.tolist():
+        for idx in req_pool_indices_cpu.tolist():
             self._skip_first_backup[idx] = True
 
         compressed_offsets = torch.cat(

@@ -246,11 +246,13 @@ class EagleDraftInputV2Mixin:
                 and hisparse_coordinator is not None
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
+                batch.ensure_req_pool_indices()
                 tokens_per_req_cpu = torch.full(
                     (bs,), num_steps, dtype=torch.int64, device="cpu"
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots_variable(
                     batch.req_pool_indices,
+                    batch.req_pool_indices_cpu,
                     tokens_per_req_cpu,
                 )
                 target_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
@@ -328,12 +330,14 @@ class EagleDraftInputV2Mixin:
             and hisparse_coordinator.supports_hisparse_draft_slots()
             and not batch.forward_mode.is_idle()
         ):
+            batch.ensure_req_pool_indices()
             bs = len(batch.req_pool_indices)
             tokens_per_req_cpu = torch.full(
                 (bs,), num_draft_tokens, dtype=torch.int64, device="cpu"
             )
             device_slots = hisparse_coordinator.get_draft_device_slots_variable(
                 batch.req_pool_indices,
+                batch.req_pool_indices_cpu,
                 tokens_per_req_cpu,
             )
             token_to_kv_pool_allocator.bind_device_mapping(
@@ -378,11 +382,13 @@ class EagleVerifyInputV2Mixin:
                 and hisparse_coordinator is not None
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
+                batch.ensure_req_pool_indices()
                 tokens_per_req_cpu = torch.full(
                     (bs,), self.draft_token_num, dtype=torch.int64, device="cpu"
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots_variable(
                     batch.req_pool_indices,
+                    batch.req_pool_indices_cpu,
                     tokens_per_req_cpu,
                 )
                 target_worker.model_runner.token_to_kv_pool_allocator.bind_device_mapping(

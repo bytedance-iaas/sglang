@@ -73,9 +73,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.input_ids = torch.tensor(
             sum(input_ids, []), dtype=torch.int32, device=self.device
         )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
-        )
+        self.set_req_pool_indices(req_pool_indices)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(

@@ -667,6 +667,7 @@ class EAGLEWorker(TpModelWorker):
                 and hisparse_coordinator is not None
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
+                batch.ensure_req_pool_indices()
                 allocator = self.token_to_kv_pool_allocator
                 evict_from_tree_cache(
                     batch.tree_cache,
