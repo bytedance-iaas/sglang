@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -1314,20 +1313,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
-                use_e8m0_only_b_scale = (
-                    os.getenv("DG_W4_SCALE_B_E8M0_ONLY", "0") != "0"
-                )
-                if will_use_deepgemm and (
-                    deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                    or os.getenv("DG_W4_SCALE_B_E8M0", "1") != "0"
-                    or use_e8m0_only_b_scale
-                ):
+                if will_use_deepgemm and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
                     from deep_gemm import transform_sf_into_required_layout
 
-                    use_e8m0_b_scale = (
-                        os.getenv("DG_W4_SCALE_B_E8M0", "1") != "0"
-                        or use_e8m0_only_b_scale
-                    )
                     for scale_param, weight_param in [
                         (layer.w13_weight_scale_inv, layer.w13_weight),
                         (layer.w2_weight_scale_inv, layer.w2_weight),
@@ -1336,40 +1324,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         k = weight_param.shape[2] * 2
                         rhs_s_k = k // 32
                         tma_aligned_n_e8m0 = ((n + 15) // 16) * 16
-                        if use_e8m0_only_b_scale:
-                            e8m0_scale_data = torch.empty_strided(
-                                (num_experts, n, rhs_s_k),
-                                (tma_aligned_n_e8m0 * rhs_s_k, 1, tma_aligned_n_e8m0),
-                                device=scale_param.data.device,
-                                dtype=torch.uint8,
-                            )
-                            if scale_param.data.dtype == torch.uint8:
-                                e8m0_scale_data.copy_(scale_param.data)
-                            elif scale_param.data.dtype == getattr(
-                                torch, "float8_e8m0fnu", None
-                            ):
-                                e8m0_scale_data.copy_(scale_param.data.view(torch.uint8))
-                            elif scale_param.data.dtype == torch.float32:
-                                # Some checkpoints expose E8M0/pow2 scales as
-                                # FP32 values. Convert directly from the source
-                                # tensor into the uint8 MN-major layout without
-                                # materializing an FP32 DeepGEMM fallback copy.
-                                e8m0_scale_data.copy_(
-                                    (
-                                        torch.floor(torch.log2(scale_param.data))
-                                        + 127
-                                    ).to(torch.uint8)
-                                )
-                            else:
-                                raise RuntimeError(
-                                    "DG_W4_SCALE_B_E8M0_ONLY=1 requires FP4 weight "
-                                    "scales to be stored as torch.uint8, "
-                                    "torch.float8_e8m0fnu, or FP32 pow2 values, "
-                                    "but got "
-                                    f"{scale_param.data.dtype}."
-                                )
-                            scale_param.scale_e8m0_data = e8m0_scale_data
-                            continue
                         scale_data = transform_sf_into_required_layout(
                             scale_param.data,
                             mn=n,
@@ -1378,23 +1332,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             num_groups=num_experts,
                             disable_ue8m0_cast=False,
                         )
-                        if use_e8m0_b_scale:
-                            e8m0_scale_data = torch.empty_strided(
-                                scale_data.shape,
-                                (
-                                    tma_aligned_n_e8m0 * scale_data.shape[2],
-                                    1,
-                                    tma_aligned_n_e8m0,
-                                ),
-                                device=scale_data.device,
-                                dtype=torch.uint8,
+                        e8m0_scale_data = torch.empty_strided(
+                            scale_data.shape,
+                            (
+                                tma_aligned_n_e8m0 * scale_data.shape[2],
+                                1,
+                                tma_aligned_n_e8m0,
+                            ),
+                            device=scale_data.device,
+                            dtype=torch.uint8,
+                        )
+                        e8m0_scale_data.copy_(
+                            (torch.floor(torch.log2(scale_data.float())) + 127).to(
+                                torch.uint8
                             )
-                            e8m0_scale_data.copy_(
-                                (torch.floor(torch.log2(scale_data.float())) + 127).to(
-                                    torch.uint8
-                                )
-                            )
-                            scale_param.scale_e8m0_data = e8m0_scale_data
+                        )
+                        scale_param.scale_e8m0_data = e8m0_scale_data
                         scale_param.data = scale_data
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True

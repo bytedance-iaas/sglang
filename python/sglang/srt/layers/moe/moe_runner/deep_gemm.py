@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -60,7 +59,6 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
-_DG_W4_SCALE_B_E8M0_ONLY = os.getenv("DG_W4_SCALE_B_E8M0_ONLY", "0") != "0"
 
 
 def _fp4_pathb_bm32_direct_load_supported(
@@ -84,24 +82,9 @@ def _fp4_e8m0_scale_supported(
     k: int,
     masked_m_max_hint: Optional[int] = None,
 ) -> bool:
-    if (
-        os.getenv("DG_W4_SCALE_B_E8M0", "1") == "0"
-        and not _DG_W4_SCALE_B_E8M0_ONLY
-    ):
+    if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         return False
     return _fp4_pathb_bm32_direct_load_supported(num_groups, m, n, k, masked_m_max_hint)
-
-
-def _raise_fp4_e8m0_only_unsupported(
-    expected_m: int, num_groups: int, m: int, n: int, k: int, scale_name: str
-) -> None:
-    raise RuntimeError(
-        "DG_W4_SCALE_B_E8M0_ONLY=1 requires every FP4 masked DeepGEMM call "
-        "to use the E8M0 scale-B fast path, but this shape is unsupported: "
-        f"{scale_name}, expected_m={expected_m}, num_groups={num_groups}, "
-        f"m={m}, n={n}, k={k}. Disable DG_W4_SCALE_B_E8M0_ONLY or add "
-        "E8M0 support for this shape before running it."
-    )
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -468,10 +451,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm_expected_m, num_groups, m, n, k, runner_input.masked_m_max_hint
             ):
                 w13_scale_for_gemm = quant_info.w13_scale_e8m0
-            elif _DG_W4_SCALE_B_E8M0_ONLY:
-                _raise_fp4_e8m0_only_unsupported(
-                    gemm_expected_m, num_groups, m, n, k, "w13"
-                )
             else:
                 w13_scale_for_gemm = w13_scale
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
@@ -577,10 +556,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 runner_input.masked_m_max_hint,
             ):
                 w2_scale_for_gemm = quant_info.w2_scale_e8m0
-            elif _DG_W4_SCALE_B_E8M0_ONLY:
-                _raise_fp4_e8m0_only_unsupported(
-                    gemm_expected_m, num_groups, m, n, down_k, "w2"
-                )
             else:
                 w2_scale_for_gemm = w2_scale
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
