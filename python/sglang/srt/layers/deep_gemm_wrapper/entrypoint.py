@@ -8,6 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_FP4_SCALE_B_UE8M0,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     DEEPGEMM_SM90_SCALE_B_UE8M0,
