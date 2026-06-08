@@ -144,6 +144,7 @@ class PrefillBootstrapQueue:
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
         kv_args.mla_compression_ratios = None
+        kv_args.dsv4_hisparse_c4_mapping = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -188,6 +189,11 @@ class PrefillBootstrapQueue:
             # buckets rather than by layer.
             kv_args.mla_compression_ratios = list(
                 self.token_to_kv_pool.compression_ratios
+            )
+            kv_args.dsv4_hisparse_c4_mapping = getattr(
+                self.token_to_kv_pool_allocator,
+                "full_to_hisparse_device_index_mapping",
+                None,
             )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

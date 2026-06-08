@@ -62,6 +62,8 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
+    # DSV4 HiSparse prefill only: compressed logical C4 index -> device C4 index.
+    dsv4_hisparse_c4_mapping: Optional[object]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers

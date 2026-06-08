@@ -712,13 +712,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_online_c128_mtp_state_slot_offset(self) -> int:
         for pool in self.compress_state_pools:
             if pool is not None and pool.ratio == 128:
-                return int(pool.online_mtp_state_slot_offset)
+                return int(getattr(pool, "online_mtp_state_slot_offset", 0))
         return 0
 
     def get_online_c128_mtp_max_draft_tokens(self) -> int:
         for pool in self.compress_state_pools:
             if pool is not None and pool.ratio == 128:
-                return int(pool.online_mtp_max_draft_tokens)
+                return int(getattr(pool, "online_mtp_max_draft_tokens", 0))
         return 0
 
     def get_online_c128_mtp_pending_seq_lens(self) -> torch.Tensor:

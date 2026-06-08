@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -830,6 +831,23 @@ class MooncakeKVManager(CommonKVManager):
         )
         return src_indices[valid], dst_indices
 
+    def _map_dsv4_c4_src_indices(
+        self, src_indices: npt.NDArray[np.int64]
+    ) -> npt.NDArray[np.int64]:
+        mapping = getattr(self.kv_args, "dsv4_hisparse_c4_mapping", None)
+        if mapping is None or src_indices.size == 0:
+            return src_indices
+
+        src_tensor = torch.as_tensor(
+            src_indices, dtype=torch.int64, device=mapping.device
+        )
+        mapped = mapping[src_tensor].to(torch.int64).cpu().numpy()
+        if np.any(mapped <= 0):
+            raise RuntimeError(
+                "DSV4 HiSparse C4 source mapping contains unbound device slots."
+            )
+        return mapped
+
     def _get_dsv4_c4_transfer_plan(
         self,
         prefill_kv_indices: npt.NDArray[np.int32],
@@ -856,6 +874,7 @@ class MooncakeKVManager(CommonKVManager):
             empty = np.array([], dtype=np.int64)
             return DSV4C4TransferPlan(empty, empty, empty, value_bytes)
 
+        src_indices = self._map_dsv4_c4_src_indices(src_indices)
         scale_bytes = 8
         src_pages = src_indices // c4_page_size
         src_offsets = src_indices % c4_page_size
