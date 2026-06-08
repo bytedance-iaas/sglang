@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple
 
@@ -75,6 +76,63 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     else {}
                 ),
             )
+
+
+def grouped_gemm_nt_f8fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    gran_k_a: int = 128,
+    gran_k_b: int = 32,
+    masked_m_max_hint: Optional[int] = None,
+    active_groups_hint: Optional[int] = None,
+):
+    if overlap_args is not None:
+        raise RuntimeError("SM90 FP8xFP4 masked DeepGEMM does not support overlap yet")
+
+    kernel = getattr(
+        deep_gemm,
+        "m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma",
+        None,
+    )
+    if kernel is None:
+        raise RuntimeError(
+            "DeepGEMM does not expose "
+            "m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma"
+        )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        block_m_override = int(os.getenv("DG_W4_BLOCK_M_OVERRIDE", "0")) or None
+        block_n_override = int(os.getenv("DG_W4_BLOCK_N_OVERRIDE", "0")) or None
+        return kernel(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            gran_k=gran_k_a,
+            gran_k_a=gran_k_a,
+            gran_k_b=gran_k_b,
+            block_m_override=block_m_override,
+            block_n_override=block_n_override,
+            masked_m_max_hint=masked_m_max_hint,
+            active_groups_hint=active_groups_hint,
+        )
 
 
 def _ensure_cuda(
