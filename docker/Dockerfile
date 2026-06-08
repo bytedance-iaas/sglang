@@ -12,9 +12,14 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.2.post2
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+sm90.mega.moe.sgl.dev
+ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
+ARG DEEPGEMM_REF=sm90-mega-moe-on-sgl-dev
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
+ARG GDRCOPY_GITHUB_ARTIFACTORY
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -134,8 +139,9 @@ fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
+    && GDRCOPY_GITHUB_ARTIFACTORY="${GDRCOPY_GITHUB_ARTIFACTORY:-${GITHUB_ARTIFACTORY}}" \
     && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
-        https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
+        https://${GDRCOPY_GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
     && CUDA=/usr/local/cuda ./build-deb-packages.sh \
@@ -177,6 +183,11 @@ FROM base AS torch_deps
 ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+sm90.mega.moe.sgl.dev
+ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
+ARG DEEPGEMM_REF=sm90-mega-moe-on-sgl-dev
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
@@ -244,8 +255,25 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
-           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
+    && echo "${DEEPGEMM_CACHE_BUST}" \
+    && DEEPGEMM_GITHUB_ARTIFACTORY="${DEEPGEMM_GITHUB_ARTIFACTORY:-${GITHUB_ARTIFACTORY}}" \
+    && git config --global url."https://${DEEPGEMM_GITHUB_ARTIFACTORY}/".insteadOf "https://github.com/" \
+    && rm -rf /tmp/DeepGEMM \
+    && git clone --no-checkout "https://${DEEPGEMM_GITHUB_ARTIFACTORY}/${DEEPGEMM_REPO}.git" /tmp/DeepGEMM \
+    && cd /tmp/DeepGEMM \
+    && git fetch --depth=1 origin "${DEEPGEMM_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && git submodule update --init --recursive \
+    && mkdir -p /usr/local/share \
+    && git rev-parse HEAD | tee /usr/local/share/sgl-deep-gemm-commit.txt \
+    && echo -n "${SGL_DEEP_GEMM_VERSION}" > sgl_deep_gemm/VERSION \
+    && bash build_sgl_deep_gemm.sh \
+    && (python3 -m pip uninstall -y sgl-deep-gemm deep-gemm || true) \
+    && python3 -m pip install --no-deps --force-reinstall dist/sgl_deep_gemm-*.whl \
+    && rm -rf /tmp/DeepGEMM /root/.cache/deep_gemm \
+    && python3 -c 'import importlib.metadata as md; version = md.version("sgl-deep-gemm"); files = {str(p) for p in (md.files("sgl-deep-gemm") or [])}; required = ("deep_gemm/_C.so", "deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh", "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh"); missing = [p for p in required if p not in files]; assert not missing, missing; print("sgl-deep-gemm:", version)' \
+    && test "$(python3 -c 'import importlib.metadata as md; print(md.version("sgl-deep-gemm"))')" = "${SGL_DEEP_GEMM_VERSION}" \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
