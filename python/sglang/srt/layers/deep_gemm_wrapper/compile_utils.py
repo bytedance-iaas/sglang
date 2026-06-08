@@ -417,14 +417,7 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
 
     def execute(self, m):
         rhs_s = self.rhs_s
-        bm32_skew_fast_path = (
-            self.max_m >= 1024
-            and self.num_groups == 32
-            and self.n in (4096, 7168)
-            and self.k in (2048, 4096, 7168)
-        )
-        scale_b_fast_path = m <= 16 or bm32_skew_fast_path
-        if self.rhs_s_e8m0 is not None and scale_b_fast_path:
+        if self.rhs_s_e8m0 is not None:
             rhs_s = self.rhs_s_e8m0
         deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
             (self.lhs_q, self.lhs_s),

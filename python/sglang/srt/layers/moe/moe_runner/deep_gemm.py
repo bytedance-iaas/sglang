@@ -61,30 +61,15 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
-def _fp4_pathb_bm32_direct_load_supported(
-    num_groups: int, m: int, n: int, k: int, masked_m_max_hint: Optional[int]
-) -> bool:
-    real_hot_present = masked_m_max_hint is None or masked_m_max_hint > 16
-    return (
-        real_hot_present
-        and m >= 1024
-        and num_groups == 32
-        and n in (4096, 7168)
-        and k in (2048, 4096, 7168)
-    )
-
-
 def _fp4_e8m0_scale_supported(
     _expected_m: int,
-    num_groups: int,
-    m: int,
-    n: int,
-    k: int,
-    masked_m_max_hint: Optional[int] = None,
+    _num_groups: int,
+    _m: int,
+    _n: int,
+    _k: int,
+    _masked_m_max_hint: Optional[int] = None,
 ) -> bool:
-    if not deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0:
-        return False
-    return _fp4_pathb_bm32_direct_load_supported(num_groups, m, n, k, masked_m_max_hint)
+    return deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
