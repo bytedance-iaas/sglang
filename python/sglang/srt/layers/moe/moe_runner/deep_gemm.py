@@ -82,7 +82,7 @@ def _fp4_e8m0_scale_supported(
     k: int,
     masked_m_max_hint: Optional[int] = None,
 ) -> bool:
-    if not deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0:
+    if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         return False
     return _fp4_pathb_bm32_direct_load_supported(num_groups, m, n, k, masked_m_max_hint)
 

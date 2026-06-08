@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-    DEEPGEMM_FP4_SCALE_B_UE8M0,
+    DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -266,7 +266,7 @@ class _BaseWarmupExecutor:
                 + num_groups * max_m * n * 2
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED:
-            rhs_scale_bytes = 4 + (1 if DEEPGEMM_FP4_SCALE_B_UE8M0 else 0)
+            rhs_scale_bytes = 4 + (1 if DEEPGEMM_SCALE_UE8M0 else 0)
             return (
                 num_groups * max_m * k
                 + num_groups * n * ceil_div(k, 2)
@@ -402,7 +402,7 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
             (num_groups, n, rhs_s_k), device="cuda", dtype=torch.float32
         )
         self.rhs_s_e8m0 = None
-        if DEEPGEMM_FP4_SCALE_B_UE8M0:
+        if DEEPGEMM_SCALE_UE8M0:
             tma_aligned_n = ceil_div(n, 16) * 16
             self.rhs_s_e8m0 = torch.empty_strided(
                 (num_groups, n, rhs_s_k),

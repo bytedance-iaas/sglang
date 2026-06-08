@@ -1315,7 +1315,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 if (
                     will_use_deepgemm
-                    and deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
+                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                 ):
                     from deep_gemm import transform_sf_into_required_layout
 
