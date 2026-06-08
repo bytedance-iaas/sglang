@@ -1318,7 +1318,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
+                if (
+                    will_use_deepgemm
+                    and deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
+                ):
                     from deep_gemm import transform_sf_into_required_layout
 
                     for scale_param, weight_param in [
@@ -1327,7 +1330,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ]:
                         num_experts, n, _ = scale_param.data.shape
                         k = weight_param.shape[2] * 2
-                        scale_param.data = transform_sf_into_required_layout(
+                        tma_aligned_n_e8m0 = ((n + 15) // 16) * 16
+                        scale_data = transform_sf_into_required_layout(
                             scale_param.data,
                             mn=n,
                             k=k,
@@ -1335,6 +1339,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             num_groups=num_experts,
                             disable_ue8m0_cast=False,
                         )
+                        e8m0_scale_data = torch.empty_strided(
+                            scale_data.shape,
+                            (
+                                tma_aligned_n_e8m0 * scale_data.shape[2],
+                                1,
+                                tma_aligned_n_e8m0,
+                            ),
+                            device=scale_data.device,
+                            dtype=torch.uint8,
+                        )
+                        e8m0_scale_data.copy_(
+                            (torch.floor(torch.log2(scale_data.float())) + 127).to(
+                                torch.uint8
+                            )
+                        )
+                        scale_param.scale_e8m0_data = e8m0_scale_data
+                        scale_param.data = scale_data
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
@@ -1929,6 +1950,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
+                w13_scale_e8m0=getattr(w13_scale, "scale_e8m0_data", None),
+                w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
             )
