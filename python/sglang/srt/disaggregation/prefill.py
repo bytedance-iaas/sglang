@@ -124,6 +124,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        self.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.max_token_pool_size
         )

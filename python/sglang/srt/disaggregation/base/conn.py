@@ -179,6 +179,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        decode_c4_prefix_len: Optional[int] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
