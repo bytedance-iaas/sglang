@@ -913,15 +913,65 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
+            metadata_decode_prefix_len = prefix_len
+            decode_c4_prefix_len = None
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
-                page_size = 1  # host pool page_size
+                coordinator = self.scheduler.hisparse_coordinator
+                if (
+                    isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and coordinator.is_dsv4_hisparse
+                ):
+                    if self.transfer_backend != TransferBackend.MOONCAKE:
+                        raise NotImplementedError(
+                            "DeepSeek V4 HiSparse direct-to-host C4 transfer "
+                            "currently requires the Mooncake transfer backend."
+                        )
+                    page_size = 1  # DSV4 host C4 pool is token-linear.
+                    host_c4_len = (
+                        self.token_to_kv_pool_allocator.c4_tokens_for_full_tokens(
+                            origin_input_len
+                        )
+                    )
+                    decode_c4_prefix_len = min(
+                        getattr(
+                            decode_req.req, "hisparse_c4_transfer_prefix_len", 0
+                        )
+                        or 0,
+                        host_c4_len,
+                    )
+                    c4_transfer_prefix_len = min(
+                        prefix_len,
+                        decode_c4_prefix_len
+                        * self.token_to_kv_pool_allocator.compress_ratio,
+                    )
+                    # Prefill counts full KV pages from decode_prefix_len, so
+                    # keep this prefix full-page aligned. The C4 sender still
+                    # skips C4 slots below decode_c4_prefix_len.
+                    metadata_decode_prefix_len = (
+                        c4_transfer_prefix_len // self.token_to_kv_pool.page_size
+                    ) * self.token_to_kv_pool.page_size
+                    kv_indices_tensor = coordinator.req_to_host_pool[
+                        decode_req.req.req_pool_idx, :host_c4_len
+                    ]
+                    if kv_indices_tensor.numel() != host_c4_len or torch.any(
+                        kv_indices_tensor < 0
+                    ):
+                        raise RuntimeError(
+                            "DeepSeek V4 HiSparse C4 host mirror is incomplete "
+                            f"for req {decode_req.req.rid}: "
+                            f"host_c4_len={host_c4_len}, "
+                            f"decode_c4_prefix_len={decode_c4_prefix_len}."
+                        )
+                    kv_indices = kv_indices_tensor.cpu().numpy().astype(np.int32)
+                else:
+                    kv_indices = (
+                        dst_kv_indices[: origin_input_len - prefix_len]
+                        .cpu()
+                        .numpy()
+                        .astype(np.int32)
+                    )
+                    page_size = 1  # host pool page_size
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -987,11 +1037,14 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            metadata_kwargs = {"decode_prefix_len": metadata_decode_prefix_len}
+            if decode_c4_prefix_len is not None:
+                metadata_kwargs["decode_c4_prefix_len"] = decode_c4_prefix_len
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=prefix_len,
+                **metadata_kwargs,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1261,23 +1314,54 @@ class DecodePreallocQueue:
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
+            if coordinator.is_dsv4_hisparse and self._uses_swa_tail_prealloc():
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                    swa_tail_len=self._swa_tail_len(fill_len),
                 )
-            host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                )
+            if coordinator.is_dsv4_hisparse:
+                # DSV4 host mirror stores only compressed C4 tokens. Restore the
+                # cached prefix first, then allocate only the suffix that prefill
+                # still needs to transfer.
+                host_len = self.token_to_kv_pool_allocator.c4_tokens_for_full_tokens(
+                    fill_len
+                )
+                prefix_c4_len = coordinator.restore_dsv4_c4_host_prefix_for_req(
+                    req, host_len
+                )
+                coordinator.ensure_host_slots(
+                    req.req_pool_idx, prefix_c4_len, host_len - prefix_c4_len
+                )
+                coordinator._req_c4_written_len[req.req_pool_idx] = host_len
+                host_indices = coordinator.req_to_host_pool[
+                    req.req_pool_idx, :host_len
+                ]
+            else:
+                # Allocate host indices for the RDMA transfer target.
+                host_indices = coordinator.mem_pool_host.alloc(fill_len)
+                if host_indices is None:
+                    raise RuntimeError(
+                        f"HiSparse host mem pool alloc failed for {fill_len} tokens "
+                        f"in _pre_alloc (req {req.rid})"
+                    )
+                host_indices = host_indices.to(device=coordinator.device)
+                coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = (
+                    host_indices
+                )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:

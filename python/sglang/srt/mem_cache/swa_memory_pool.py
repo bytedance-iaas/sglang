@@ -585,7 +585,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        # NOTE: the API is not idempotent.
+        # NOTE: repeated calls are not idempotent. A single grouped free can,
+        # however, contain duplicate indices from overlapping release ranges;
+        # collapse those before touching the non-idempotent inner allocators.
+        if self.page_size == 1:
+            free_index = self._unique_free_indices(free_index, "full")
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
@@ -616,8 +620,25 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
+        if self.page_size == 1:
+            swa_indices = self._unique_free_indices(swa_indices, "swa")
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+
+    @staticmethod
+    def _unique_free_indices(indices: torch.Tensor, label: str) -> torch.Tensor:
+        if indices.numel() <= 1:
+            return indices
+
+        unique_indices = torch.unique(indices)
+        num_duplicates = indices.numel() - unique_indices.numel()
+        if num_duplicates > 0:
+            logger.warning(
+                "Deduplicated %d duplicate %s KV indices in SWA allocator free.",
+                num_duplicates,
+                label,
+            )
+        return unique_indices
 
     def backup_state(self):
         return [
