@@ -12,24 +12,6 @@ logger = logging.getLogger(__name__)
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
 
-def get_mooncake_metadata_server() -> str:
-    """Return the metadata server used by the shared transfer engine."""
-    return (
-        envs.MOONCAKE_TE_META_DATA_SERVER.get()
-        if envs.MOONCAKE_TE_META_DATA_SERVER.is_set()
-        else "P2PHANDSHAKE"
-    )
-
-
-def get_mooncake_protocol(default: str = "rdma") -> str:
-    """Return the protocol used by the shared transfer engine."""
-    return (
-        envs.MOONCAKE_PROTOCOL.get()
-        if envs.MOONCAKE_PROTOCOL.is_set()
-        else default
-    )
-
-
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
     """
     Parse IB device string and get IB devices for a specific GPU ID.
@@ -194,46 +176,28 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        metadata_server = get_mooncake_metadata_server()
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
                 hostname += f":{get_free_port()}:npu_{self.gpu_id}"
             else:
                 hostname += f":{get_free_port()}:npu_{npu_phy_id}"
-            protocol = "ascend"
             ret_value = self.engine.initialize(
                 hostname,
-                metadata_server,
-                protocol,
+                "P2PHANDSHAKE",
+                "ascend",
                 device_name if device_name is not None else "",
             )
         else:
-            protocol = get_mooncake_protocol(default="rdma")
             ret_value = self.engine.initialize(
                 hostname,
-                metadata_server,
-                protocol,
+                "P2PHANDSHAKE",
+                "rdma",
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
-            logger.error(
-                "Mooncake Transfer Engine initialization failed with hostname=%s, "
-                "metadata_server=%s, protocol=%s, device=%s",
-                hostname,
-                metadata_server,
-                protocol,
-                device_name if device_name is not None else "",
-            )
+            logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
-        logger.info(
-            "Mooncake Transfer Engine initialized with hostname=%s, "
-            "metadata_server=%s, protocol=%s, device=%s",
-            hostname,
-            metadata_server,
-            protocol,
-            device_name if device_name is not None else "",
-        )
 
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int

@@ -907,10 +907,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                get_mooncake_metadata_server,
-                get_mooncake_protocol,
-            )
         except ImportError as e:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake"
@@ -918,18 +914,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
-        metadata_server = get_mooncake_metadata_server()
-        protocol = get_mooncake_protocol(default="rdma")
         self.remote_instance_transfer_engine.initialize(
-            local_ip, metadata_server, protocol, envs.MOONCAKE_DEVICE.get()
-        )
-        logger.info(
-            "Remote instance Mooncake Transfer Engine initialized with "
-            "hostname=%s, metadata_server=%s, protocol=%s, device=%s",
-            local_ip,
-            metadata_server,
-            protocol,
-            envs.MOONCAKE_DEVICE.get(),
+            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
