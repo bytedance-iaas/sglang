@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+_COMPRESS_STATE_SUPPORTS_ONLINE_MTP = (
+    "online_mtp_max_draft_tokens"
+    in inspect.signature(CompressStatePool.__init__).parameters
+)
 
 
 def get_compress_state_ring_size(
@@ -620,7 +625,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
             ring_size = self.get_ring_size(ratio)
 
-            self.compress_state_pools[idx] = CompressStatePool(
+            online_mtp_max_draft_tokens = (
+                self.online_mtp_max_draft_tokens if ratio == 128 else 0
+            )
+            compress_state_kwargs = dict(
                 size=size,
                 ring_size=ring_size,
                 overlap=overlap,
@@ -631,9 +639,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
                 swa_page_size=self.swa_page_size,
-                online_mtp_max_draft_tokens=(
-                    self.online_mtp_max_draft_tokens if ratio == 128 else 0
-                ),
+            )
+            if _COMPRESS_STATE_SUPPORTS_ONLINE_MTP:
+                compress_state_kwargs["online_mtp_max_draft_tokens"] = (
+                    online_mtp_max_draft_tokens
+                )
+            elif online_mtp_max_draft_tokens > 0:
+                raise RuntimeError(
+                    "DeepSeek V4 online C128 MTP requires a CompressStatePool "
+                    "implementation with online_mtp_max_draft_tokens support."
+                )
+
+            self.compress_state_pools[idx] = CompressStatePool(
+                **compress_state_kwargs
             )
 
             if ratio == 4:
