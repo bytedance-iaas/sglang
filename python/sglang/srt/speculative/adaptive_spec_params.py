@@ -73,6 +73,21 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
     return cfg
 
 
+def resolve_candidate_steps_from_config(cfg_path: str | None) -> list[int]:
+    """Resolve adaptive speculative candidate steps from config."""
+    cfg = load_adaptive_config(cfg_path)
+    raw_steps = cfg.get("candidate_steps", [1, 3, 7])
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError("candidate_steps must be a non-empty list")
+    try:
+        candidate_steps = sorted({int(x) for x in raw_steps})
+    except (TypeError, ValueError) as e:
+        raise ValueError("candidate_steps must contain integers") from e
+    if candidate_steps[0] <= 0:
+        raise ValueError("candidate_steps must contain positive integers")
+    return candidate_steps
+
+
 class AdaptiveSpeculativeParams:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
