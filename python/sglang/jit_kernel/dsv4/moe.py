@@ -195,6 +195,12 @@ def mega_moe_pre_dispatch_sm90(
     routed_scaling_factor: float = 1.0,
     quant_group_size: int = 128,
 ) -> None:
+    """SM90 variant of ``mega_moe_pre_dispatch``.
+
+    Writes per-128 raw FP32 scales into ``buf_x_sf`` and can fold
+    ``routed_scaling_factor`` into ``buf_topk_weights`` so callers can skip a
+    post-mega scale kernel. Pass 1.0 when the scale is already applied.
+    """
     module = _jit_mega_moe_pre_dispatch_sm90_module(quant_group_size)
     module.run(
         x,
@@ -260,6 +266,10 @@ def silu_and_mul_contig_post_quant(
     swizzle: bool = False,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
+    # Empty inputs can happen when an EP rank receives no tokens after dispatch.
+    # A grid=0 launch is invalid; the matching grouped GEMM path also no-ops.
+    if input.shape[0] == 0:
+        return
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
     )
