@@ -139,7 +139,6 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
   constexpr int kMaxVerifyTokens = 8;
   float kv_steps[kMaxVerifyTokens];
   float score_steps[kMaxVerifyTokens];
-  int64_t out_slots[kMaxVerifyTokens];
 
 #pragma unroll
   for (int step = 0; step < kMaxVerifyTokens; ++step) {
@@ -150,16 +149,6 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
         params.kv_score_input + (bid * params.num_verify_tokens + step) * params.kv_score_stride_b;
     kv_steps[step] = kv[d];
     score_steps[step] = kv[kHeadDim + d] + params.ape[pos * params.ape_stride_r + d];
-
-    out_slots[step] = -1;
-    const int64_t final_seq = seq_before + step + 1;
-    if ((final_seq & 127) != 0) {
-      const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
-      const int64_t full_loc =
-          static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
-      const int64_t swa_loc = params.full_to_swa[full_loc];
-      out_slots[step] = swa_loc / params.swa_page_size + (step + 1) * params.state_slot_stride;
-    }
   }
 
 #pragma unroll
@@ -183,8 +172,13 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
       run_sum = new_sum;
     }
 
-    const int64_t slot = out_slots[step];
-    if (slot >= 0) {
+    const int64_t final_seq = seq_before + step + 1;
+    if ((final_seq & 127) != 0) {
+      const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
+      const int64_t full_loc =
+          static_cast<int64_t>(params.req_to_token[req_idx * params.req_to_token_stride_b + chunk_start]);
+      const int64_t swa_loc = params.full_to_swa[full_loc];
+      const int64_t slot = swa_loc / params.swa_page_size + (step + 1) * params.state_slot_stride;
       float* const out = params.state + slot * params.state_stride_b;
       out[d] = run_max;
       out[kHeadDim + d] = run_sum;
