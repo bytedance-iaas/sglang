@@ -766,8 +766,9 @@ class SchedulerDisaggregationPrefillMixin:
         """
         # PD sends source KV pages. For DSV4 HiSparse the allocator wrapper's
         # page_size is the C4 device page, while the source KV transfer still
-        # uses the full DeepSeekV4TokenToKVPool page size.
-        page_size = self.token_to_kv_pool.page_size
+        # uses the underlying DeepSeekV4TokenToKVPool page size.
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = token_to_kv_pool.page_size
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -833,7 +834,7 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                device_page_size = self.token_to_kv_pool.page_size
+                device_page_size = token_to_kv_pool.page_size
                 return kv_to_page_indices(
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
