@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
+    state_page_size_from_allocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -984,6 +985,9 @@ class DecodePreallocQueue:
                 page_size = self.token_to_kv_pool_allocator.page_size
 
             seq_len = len(decode_req.req.origin_input_ids)
+            swa_state_page_size = state_page_size_from_allocator(
+                self.token_to_kv_pool_allocator
+            )
 
             def _mamba_payload():
                 return [
@@ -997,7 +1001,7 @@ class DecodePreallocQueue:
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = page_align_floor(window_start, swa_state_page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -1007,7 +1011,7 @@ class DecodePreallocQueue:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), swa_state_page_size
                 )
 
             def _nsa_payload():

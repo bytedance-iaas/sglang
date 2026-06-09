@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_num,
     maybe_cache_unfinished_req,
     release_kv_cache,
+    state_page_size_from_allocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -763,7 +764,10 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        page_size = self.token_to_kv_pool_allocator.page_size
+        # PD sends source KV pages. For DSV4 HiSparse the allocator wrapper's
+        # page_size is the C4 device page, while the source KV transfer still
+        # uses the full DeepSeekV4TokenToKVPool page size.
+        page_size = self.token_to_kv_pool.page_size
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -794,6 +798,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_metadata_buffers.set_buf(req)
 
             seq_len = len(req.fill_ids)
+            swa_state_page_size = state_page_size_from_allocator(
+                self.token_to_kv_pool_allocator
+            )
 
             def _mamba_payload():
                 return [
@@ -807,7 +814,9 @@ class SchedulerDisaggregationPrefillMixin:
             def _swa_payload():
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
+                window_start = (window_start // swa_state_page_size) * (
+                    swa_state_page_size
+                )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
@@ -817,14 +826,17 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), swa_state_page_size
                 )
 
             def _nsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                device_page_size = self.token_to_kv_pool.page_size
+                return kv_to_page_indices(
+                    kv_indices_full.cpu().numpy(), device_page_size
+                )
 
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types

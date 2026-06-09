@@ -39,6 +39,18 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
 
+def state_page_size_from_allocator(token_to_kv_pool_allocator) -> int:
+    logical_allocator = getattr(
+        token_to_kv_pool_allocator,
+        "logical_attn_allocator",
+        token_to_kv_pool_allocator,
+    )
+    kvcache = getattr(logical_allocator, "_kvcache", None)
+    if kvcache is not None and hasattr(kvcache, "swa_page_size"):
+        return kvcache.swa_page_size
+    return logical_allocator.page_size
+
+
 def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
