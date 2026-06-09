@@ -618,12 +618,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        swa_indices = self.full_to_swa_index_mapping[free_index]
+        if free_index.numel() == 0:
+            return
+
+        if self.page_size == 1:
+            mapping_indices = self._unique_free_indices(free_index, "full")
+        else:
+            mapping_indices = self._expand_to_full_pages(free_index)
+
+        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
         if self.page_size == 1:
             swa_indices = self._unique_free_indices(swa_indices, "swa")
+        else:
+            swa_indices = self._unique_free_pages(swa_indices, "swa")
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        self.full_to_swa_index_mapping[mapping_indices] = 0
 
     @staticmethod
     def _unique_free_indices(indices: torch.Tensor, label: str) -> torch.Tensor:
@@ -639,6 +649,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 label,
             )
         return unique_indices
+
+    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
+        pages = torch.unique(indices // self.page_size)
+        page_offsets = torch.arange(
+            self.page_size, dtype=indices.dtype, device=indices.device
+        )
+        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
+
+    def _unique_free_pages(self, indices: torch.Tensor, label: str) -> torch.Tensor:
+        if indices.numel() <= 1:
+            return indices
+
+        pages = torch.unique(indices // self.page_size)
+        num_duplicate_pages = indices.numel() - pages.numel()
+        if num_duplicate_pages > 0:
+            logger.warning(
+                "Deduplicated %d duplicate %s KV page references in SWA allocator free.",
+                num_duplicate_pages,
+                label,
+            )
+        return pages * self.page_size
 
     def backup_state(self):
         return [
