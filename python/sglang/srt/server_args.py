@@ -3688,7 +3688,13 @@ class ServerArgs:
                         "('nixl', 'mooncake'), but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
-                if self.speculative_algorithm is not None:
+                if self.speculative_algorithm is not None and not (
+                    envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get()
+                    and self.speculative_algorithm.upper() == "EAGLE"
+                    and self.speculative_eagle_topk == 1
+                    and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                    and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+                ):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with speculative decoding "
