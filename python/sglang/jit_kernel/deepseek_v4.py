@@ -405,6 +405,7 @@ def topk_transform_512_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     module = _jit_topk_v2_module(out_page_indices.shape[1])
     bs = scores.shape[0]
@@ -417,6 +418,7 @@ def topk_transform_512_v2(
         page_size,
         workspace,
         metadata,
+        out_raw_indices,
     )
 
 

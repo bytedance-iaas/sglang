@@ -365,6 +365,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
+        self.full_to_swa_page_generation_mapping = torch.zeros(
+            self.full_to_swa_index_mapping.shape, dtype=torch.int32, device=device
+        )
+        # Page generations distinguish stale full->SWA aliases from pages that
+        # have since been freed and reused by another request.
+        self._swa_page_live = torch.zeros(
+            size_swa // page_size + 1, dtype=torch.bool, device=device
+        )
+        self._swa_page_generations = torch.zeros(
+            size_swa // page_size + 1, dtype=torch.int32, device=device
+        )
+        self._warned_stale_swa_free = False
 
         self.need_sort = need_sort
         self.free_pages = None
@@ -427,12 +439,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._set_full_to_swa_mapping(
+            alloc_full_indices, alloc_swa_indices, swa_pages_are_unique=True
+        )
         return alloc_full_indices
 
     def alloc_extend(
@@ -477,12 +486,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._set_full_to_swa_mapping(
+            alloc_full_indices,
+            alloc_swa_indices,
+            swa_pages_are_unique=self.page_size == 1,
+        )
 
         return alloc_full_indices
 
@@ -527,6 +535,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
 
         if swa_tail_len == 0:
+            self.full_to_swa_index_mapping[alloc_full_indices] = 0
+            self.full_to_swa_page_generation_mapping[alloc_full_indices] = 0
             return alloc_full_indices
 
         device = self.device
@@ -546,11 +556,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
-            alloc_swa_indices
+        self._set_full_to_swa_mapping(
+            alloc_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
             self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
+            self.full_to_swa_page_generation_mapping[
+                alloc_full_indices[:-swa_tail_len]
+            ] = 0
         return alloc_full_indices
 
     def alloc_decode(
@@ -572,12 +585,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._set_full_to_swa_mapping(
+            alloc_full_indices, alloc_swa_indices, swa_pages_are_unique=True
+        )
 
         return alloc_full_indices
 
@@ -610,12 +620,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
-        if _is_npu:
-            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
-                swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[full_indices] = swa_indices
+        self._set_full_to_swa_mapping(full_indices, swa_indices)
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -627,13 +632,81 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
+        swa_generations = self.full_to_swa_page_generation_mapping[mapping_indices]
+        valid_mapping = (swa_indices > 0) & (swa_generations > 0)
+        swa_indices = swa_indices[valid_mapping]
+        swa_generations = swa_generations[valid_mapping]
+        if swa_indices.numel() == 0:
+            self.full_to_swa_index_mapping[mapping_indices] = 0
+            self.full_to_swa_page_generation_mapping[mapping_indices] = 0
+            return
+
+        swa_pages = swa_indices // self.page_size
+        current_generations = self._swa_page_generations[swa_pages]
+        live_pages = self._swa_page_live[swa_pages]
+        # Skip aliases from older owners or pages already returned to the free list.
+        valid_pages = live_pages & (swa_generations == current_generations)
+        self._maybe_warn_stale_swa_free(valid_pages)
+        swa_indices = swa_indices[valid_pages]
+        if swa_indices.numel() == 0:
+            self.full_to_swa_index_mapping[mapping_indices] = 0
+            self.full_to_swa_page_generation_mapping[mapping_indices] = 0
+            return
+
         if self.page_size == 1:
             swa_indices = self._unique_free_indices(swa_indices, "swa")
+            swa_pages = swa_indices
         else:
             swa_indices = self._unique_free_pages(swa_indices, "swa")
+            swa_pages = swa_indices // self.page_size
+        self._swa_page_live[swa_pages] = False
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
+        self.full_to_swa_page_generation_mapping[mapping_indices] = 0
+
+    def _set_full_to_swa_mapping(
+        self,
+        full_indices: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_pages_are_unique: bool = False,
+    ) -> None:
+        if full_indices.numel() == 0:
+            return
+
+        assert full_indices.numel() == swa_indices.numel()
+        if _is_npu:
+            full_indices = full_indices.to(torch.int64)
+            swa_indices = swa_indices.to(torch.int64)
+
+        self.full_to_swa_index_mapping[full_indices] = 0
+        self.full_to_swa_page_generation_mapping[full_indices] = 0
+
+        valid_indices = swa_indices > 0
+        full_indices = full_indices[valid_indices]
+        swa_indices = swa_indices[valid_indices]
+        if swa_indices.numel() == 0:
+            return
+
+        swa_pages = swa_indices // self.page_size
+        unique_swa_pages = (
+            swa_pages if swa_pages_are_unique else torch.unique(swa_pages)
+        )
+        new_swa_pages = unique_swa_pages[~self._swa_page_live[unique_swa_pages]]
+        if new_swa_pages.numel() > 0:
+            self._swa_page_generations[new_swa_pages] += 1
+            self._swa_page_live[new_swa_pages] = True
+        swa_generations = self._swa_page_generations[swa_pages]
+
+        self.full_to_swa_index_mapping[full_indices] = swa_indices
+        self.full_to_swa_page_generation_mapping[full_indices] = swa_generations
+
+    def _maybe_warn_stale_swa_free(self, valid_pages: torch.Tensor) -> None:
+        if self._warned_stale_swa_free or not logger.isEnabledFor(logging.DEBUG):
+            return
+        if bool(torch.all(valid_pages).item()):
+            return
+        self._warned_stale_swa_free = True
+        logger.debug("Skipped stale SWA KV page references during allocator free.")
 
     @staticmethod
     def _unique_free_indices(indices: torch.Tensor, label: str) -> torch.Tensor:
@@ -681,14 +754,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(state) == 2
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
+        self._rebuild_swa_page_live_from_allocator()
 
     def clear(self):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        self.full_to_swa_page_generation_mapping.fill_(0)
+        self._swa_page_live.fill_(False)
+        self._swa_page_generations.fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
+
+    def _rebuild_swa_page_live_from_allocator(self) -> None:
+        self._swa_page_live.fill_(True)
+        self._swa_page_live[0] = False
+        if self.swa_attn_allocator.free_pages.numel() > 0:
+            self._swa_page_live[self.swa_attn_allocator.free_pages] = False
+        if self.swa_attn_allocator.release_pages.numel() > 0:
+            self._swa_page_live[self.swa_attn_allocator.release_pages] = False
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
