@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import pack_tensors
 from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.srt.observability import trace as srt_trace
+from sglang.srt.observability_patch import trace as srt_trace
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 try:

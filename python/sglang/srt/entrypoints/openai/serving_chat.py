@@ -55,7 +55,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.observability import accumulate_stream_items, otel_provider
+from sglang.srt.observability_patch import accumulate_stream_items, otel_provider
 
 _SSE_DATA_B = b"data: "
 _SSE_NL_B = b"\n\n"
@@ -105,6 +105,35 @@ def _fast_sse_content(
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
 ) -> str:
+    chunk = _build_fast_chunk(
+        chunk_id=chunk_id,
+        created=created,
+        model=model,
+        index=index,
+        role=role,
+        content=content,
+        reasoning_content=reasoning_content,
+        finish_reason=finish_reason,
+        logprobs=logprobs,
+        matched_stop=matched_stop,
+        usage=usage,
+    )
+    return _fast_sse_from_chunk(chunk)
+
+
+def _build_fast_chunk(
+    chunk_id: str,
+    created: int,
+    model: str,
+    index: int,
+    role: Optional[str] = None,
+    content: Optional[str] = None,
+    reasoning_content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+    logprobs: Optional[dict] = None,
+    matched_stop: Union[None, int, str] = None,
+    usage: Optional[dict] = None,
+) -> _StreamChunk:
     delta = _StreamDelta(
         role=role, content=content, reasoning_content=reasoning_content
     )
@@ -115,7 +144,7 @@ def _fast_sse_content(
         finish_reason=finish_reason,
         matched_stop=matched_stop,
     )
-    chunk = _StreamChunk(
+    return _StreamChunk(
         id=chunk_id,
         object="chat.completion.chunk",
         created=created,
@@ -123,6 +152,9 @@ def _fast_sse_content(
         choices=[choice],
         usage=usage,
     )
+
+
+def _fast_sse_from_chunk(chunk: _StreamChunk) -> str:
     return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()
 
 
@@ -906,7 +938,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    yield _fast_sse_content(
+                    chunk = _build_fast_chunk(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
                         model=request.model,
@@ -916,7 +948,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     stream_started = True
                     accumulate_stream_items(chunk, complete_response)
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    yield _fast_sse_from_chunk(chunk)
 
                 offset = stream_offsets.get(index, 0)
                 if self.tokenizer_manager.server_args.incremental_streaming_output:
@@ -940,7 +972,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 completion_tokens=completion_tokens.get(index, 0),
                             ).model_dump()
 
-                        yield _fast_sse_content(
+                        chunk = _build_fast_chunk(
                             chunk_id=content["meta_info"]["id"],
                             created=int(time.time()),
                             model=request.model,
@@ -949,7 +981,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             usage=usage,
                         )
                         accumulate_stream_items(chunk, complete_response)
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield _fast_sse_from_chunk(chunk)
 
                 # Handle tool calls
                 if (
@@ -964,8 +996,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         content,
                         request,
                         has_tool_calls,
-                        continuous_usage_stats,
                         complete_response,
+                        continuous_usage_stats,
                     ):
                         if chunk:
                             yield chunk
@@ -991,7 +1023,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 completion_tokens=completion_tokens.get(index, 0),
                             ).model_dump()
 
-                        yield _fast_sse_content(
+                        chunk = _build_fast_chunk(
                             chunk_id=content["meta_info"]["id"],
                             created=int(time.time()),
                             model=request.model,
@@ -1001,7 +1033,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             usage=usage,
                         )
                         accumulate_stream_items(chunk, complete_response)
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield _fast_sse_from_chunk(chunk)
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -1013,7 +1045,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-                yield _fast_sse_content(
+                finish_reason_chunk = _build_fast_chunk(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
                     model=request.model,
@@ -1022,7 +1054,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     matched_stop=matched_stop,
                 )
                 accumulate_stream_items(finish_reason_chunk, complete_response)
-                yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
+                yield _fast_sse_from_chunk(finish_reason_chunk)
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:
@@ -1591,8 +1623,8 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
-        continuous_usage_stats: bool = False,
         complete_response: Dict[str, Any],
+        continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
