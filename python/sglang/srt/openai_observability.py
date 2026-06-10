@@ -4,7 +4,6 @@ import os
 import time
 from collections.abc import Mapping
 from enum import Enum
-from importlib.metadata import version
 from typing import Optional
 from sglang.srt.openai_observability_buckets import (
     _GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
@@ -24,7 +23,6 @@ _is_otel_imported = False
 otel_import_error_traceback: Optional[str] = None
 tracer = None
 meter = None
-_IS_PYDANTIC_V1 = version("pydantic") < "2.0.0"
 
 try:
     import msgspec  # type: ignore
@@ -595,106 +593,132 @@ def model_as_dict(model):
     ):
         # Fast-path chunks are msgspec Structs; convert to plain dict for accumulation.
         return msgspec.structs.asdict(model)
-    if _IS_PYDANTIC_V1:
-        return model.dict()
-    if hasattr(model, "model_dump"):
-        return model.model_dump()
-    elif hasattr(model, "parse"):  # Raw API response
-        return model_as_dict(model.parse())
-    else:
-        return model
+    model_dump = getattr(model, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+
+    model_dict = getattr(model, "dict", None)
+    if callable(model_dict):
+        return model_dict()
+
+    parse = getattr(model, "parse", None)
+    if callable(parse):  # Raw API response
+        return model_as_dict(parse())
+
+    return model
 
 
 def accumulate_stream_items(item, complete_response):
-    if is_otel_available():
+    """Accumulate a streaming chunk into complete_response when provided."""
+    if not is_otel_available() or complete_response is None:
+        return
 
-        if complete_response is None:
-            complete_response = {"choices": [], "model": "", "usage": None, "error": None}
-        item = model_as_dict(item)
-        if not isinstance(item, dict):
-            return
-        complete_response["model"] = item.get("model")
+    item = model_as_dict(item)
+    if not isinstance(item, dict):
+        return
+    complete_response["model"] = item.get("model")
 
-        if item.get("error"):
-            complete_response["error"] = item.get("error")
+    if item.get("error"):
+        complete_response["error"] = item.get("error")
 
-        if item.get("usage"):
-            complete_response["usage"] = item.get("usage")
+    if item.get("usage"):
+        complete_response["usage"] = item.get("usage")
 
-        # prompt filter results
-        if item.get("prompt_filter_results"):
-            complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
+    # prompt filter results
+    if item.get("prompt_filter_results"):
+        complete_response["prompt_filter_results"] = item.get("prompt_filter_results")
 
-        if item.get("choices"):
-            for choice in item.get("choices"):
-                index = choice.get("index")
-                while len(complete_response.get("choices")) <= index:
-                    complete_response["choices"].append(
-                        {
-                            "index": len(complete_response.get("choices")),
-                            "message": {
-                                "content": "",
-                                "role": "",
-                                "reasoning_content": "",
-                            },
-                        }
-                    )
-                complete_choice = complete_response.get("choices")[index]
-                if choice.get("finish_reason"):
-                    complete_choice["finish_reason"] = choice.get("finish_reason")
-                if choice.get("content_filter_results"):
-                    complete_choice["content_filter_results"] = choice.get(
-                        "content_filter_results"
-                    )
+    if item.get("choices"):
+        for choice in item.get("choices"):
+            index = choice.get("index")
+            while len(complete_response.get("choices")) <= index:
+                complete_response["choices"].append(
+                    {
+                        "index": len(complete_response.get("choices")),
+                        "message": {
+                            "content": "",
+                            "role": "",
+                            "reasoning_content": "",
+                        },
+                    }
+                )
+            complete_choice = complete_response.get("choices")[index]
+            if choice.get("finish_reason"):
+                complete_choice["finish_reason"] = choice.get("finish_reason")
+            if choice.get("content_filter_results"):
+                complete_choice["content_filter_results"] = choice.get(
+                    "content_filter_results"
+                )
 
-                delta = choice.get("delta")
-                if not delta:
+            delta = choice.get("delta")
+            if not delta:
+                continue
+
+            if delta.get("content"):
+                complete_choice["message"]["content"] += delta.get("content")
+
+            if delta.get("reasoning_content"):
+                complete_choice["message"]["reasoning_content"] += delta.get(
+                    "reasoning_content"
+                )
+
+            if delta.get("role"):
+                complete_choice["message"]["role"] = delta.get("role")
+
+            if delta and delta.get("tool_calls"):
+                tool_calls = delta.get("tool_calls")
+                if not tool_calls:
                     continue
 
-                if delta.get("content"):
-                    complete_choice["message"]["content"] += delta.get("content")
+                if not complete_choice["message"].get("tool_calls"):
+                    complete_choice["message"]["tool_calls"] = []
 
-                if delta.get("reasoning_content"):
-                    complete_choice["message"]["reasoning_content"] += delta.get(
-                        "reasoning_content"
-                    )
-
-                if delta.get("role"):
-                    complete_choice["message"]["role"] = delta.get("role")
-
-                if delta and delta.get("tool_calls"):
-                    tool_calls = delta.get("tool_calls")
-                    if not isinstance(tool_calls, list) or len(tool_calls) == 0:
+                for tool_call in tool_calls:
+                    tool_call = model_as_dict(tool_call)
+                    if not isinstance(tool_call, dict):
                         continue
+                    tool_call_index = tool_call.get("index")
+                    if tool_call_index is None:
+                        continue
+                    i = int(tool_call_index)
+                    while len(complete_choice["message"]["tool_calls"]) <= i:
+                        complete_choice["message"]["tool_calls"].append(
+                            {"id": "", "function": {"name": "", "arguments": ""}}
+                        )
 
-                    if not complete_choice["message"].get("tool_calls"):
-                        complete_choice["message"]["tool_calls"] = []
+                    span_tool_call = complete_choice["message"]["tool_calls"][i]
+                    span_function = span_tool_call["function"]
+                    tool_call_function = tool_call.get("function")
 
-                    for tool_call in tool_calls:
-                        i = int(tool_call["index"])
-                        while len(complete_choice["message"]["tool_calls"]) <= i:
-                            complete_choice["message"]["tool_calls"].append(
-                                {"id": "", "function": {"name": "", "arguments": ""}}
-                            )
+                    if tool_call.get("id"):
+                        span_tool_call["id"] = tool_call.get("id")
+                    if tool_call_function and tool_call_function.get("name"):
+                        span_function["name"] = tool_call_function.get("name")
+                    if tool_call_function and tool_call_function.get("arguments"):
+                        span_function["arguments"] += tool_call_function.get("arguments")
 
-                        span_tool_call = complete_choice["message"]["tool_calls"][i]
-                        span_function = span_tool_call["function"]
-                        tool_call_function = tool_call.get("function")
-
-                        if tool_call.get("id"):
-                            span_tool_call["id"] = tool_call.get("id")
-                        if tool_call_function and tool_call_function.get("name"):
-                            span_function["name"] = tool_call_function.get("name")
-                        if tool_call_function and tool_call_function.get("arguments"):
-                            span_function["arguments"] += tool_call_function.get("arguments")
 
 class OpenTelemetryProvider:
     def __init__(self):
         self.tracer = None
         self.meter = None
         if is_otel_available():
-            self.tracer = init_tracer("sglang")
-            self.meter = init_metrics("sglang")
+            try:
+                self.tracer = init_tracer("sglang")
+                self.meter = init_metrics("sglang")
+            except Exception as ex:  # pylint: disable=broad-except
+                global _is_otel_imported, otel_import_error_traceback
+                import traceback
+
+                _is_otel_imported = False
+                otel_import_error_traceback = traceback.format_exc()
+                self.tracer = None
+                self.meter = None
+                logger.warning(
+                    "Failed to initialize OpenTelemetry provider, disabling "
+                    "OpenTelemetry observability. Error: %s",
+                    str(ex),
+                )
 
     def recordException(self, name, headers, request, exception: Exception):
         if is_otel_available():
@@ -761,51 +785,44 @@ class OpenTelemetryProvider:
                 set_token_counter_metrics(usage, shared_attributes)
 
             # duration metrics
-            if start_time and isinstance(start_time, (float, int)):
-                duration = time.time() - start_time
-            else:
-                duration = None
-            if (
-                duration
-                and isinstance(duration, (float, int))
-                and Meters.is_metrics_inited
-            ):
+            now = time.time()
+            duration = now - start_time
+            if Meters.is_metrics_inited:
                 Meters.chat_duration_histogram.record(
                     duration, attributes=shared_attributes
                 )
             if Meters.is_metrics_inited and stream:
                 if (
-                    time_of_first_token
-                    and isinstance(time_of_first_token, (float, int))
+                    time_of_first_token is not None
                     and time_of_first_token > start_time
                 ):
+                    time_to_first_token = time_of_first_token - start_time
+                    time_to_generate = now - time_of_first_token
                     Meters.streaming_time_to_first_token.record(
-                        (time_of_first_token - start_time), attributes=shared_attributes
+                        time_to_first_token, attributes=shared_attributes
                     )
                     Meters.streaming_time_to_generate.record(
-                        time.time() - time_of_first_token, attributes=shared_attributes
+                        time_to_generate, attributes=shared_attributes
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_FIRST_TOKEN,
-                        time_of_first_token - start_time,
+                        time_to_first_token,
                     )
                     span.set_attribute(
                         SpanAttributes.GEN_AI_STREAMING_TIME_TO_GENERATE,
-                        time.time() - time_of_first_token,
+                        time_to_generate,
                     )
-                if usage and usage.get("completion_tokens"):
-                    if not isinstance(usage, dict):
-                        usage = usage.__dict__
-                    completion_tokens = usage.get("completion_tokens")
-                    if Meters.is_metrics_inited and request.stream:
-                        Meters.streaming_time_per_output_token.record(
-                            (time.time() - time_of_first_token) / completion_tokens,
-                            attributes=shared_attributes,
-                        )
-                        span.set_attribute(
-                            SpanAttributes.GEN_AI_STREAMING_TIME_PER_OUTPUT_TOKEN,
-                            (time.time() - time_of_first_token) / completion_tokens,
-                        )
+                completion_tokens = usage.get("completion_tokens") if usage else 0
+                if time_of_first_token is not None and completion_tokens:
+                    time_per_output_token = (now - time_of_first_token) / completion_tokens
+                    Meters.streaming_time_per_output_token.record(
+                        time_per_output_token,
+                        attributes=shared_attributes,
+                    )
+                    span.set_attribute(
+                        SpanAttributes.GEN_AI_STREAMING_TIME_PER_OUTPUT_TOKEN,
+                        time_per_output_token,
+                    )
 
             set_response_attributes(span, response, usage)
 
