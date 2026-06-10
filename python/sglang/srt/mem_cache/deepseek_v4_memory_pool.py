@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
@@ -26,10 +25,6 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-_COMPRESS_STATE_SUPPORTS_ONLINE_MTP = (
-    "online_mtp_max_draft_tokens"
-    in inspect.signature(CompressStatePool.__init__).parameters
-)
 
 
 def get_compress_state_ring_size(
@@ -40,8 +35,7 @@ def get_compress_state_ring_size(
     # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
     # is incompatible with speculative decode for now.
     if compress_ratio == 128 and ONLINE_C128:
-        if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            raise AssertionError("online c128 does not support MTP")
+        assert not is_speculative, "online c128 does not support MTP"
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
@@ -420,7 +414,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
-        online_mtp_max_draft_tokens: int = 0,
     ):
         super().__init__(
             swa_size,
@@ -449,12 +442,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c128_state_pool_size = c128_state_pool_size
         self.state_dtype = state_dtype
         self.compression_ratios = compression_ratios
-        self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
-        self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
-        if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            self.online_c128_mtp_pending_seq_lens = torch.empty(
-                max_num_reqs, dtype=torch.int64, device=device
-            )
 
         # Determine this PP stage's absolute layer range
         if (
@@ -625,9 +612,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
             ring_size = self.get_ring_size(ratio)
 
-            online_mtp_max_draft_tokens = (
-                self.online_mtp_max_draft_tokens if ratio == 128 else 0
-            )
             compress_state_kwargs = dict(
                 size=size,
                 ring_size=ring_size,
@@ -640,16 +624,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 online=(ratio == 128 and ONLINE_C128),
                 swa_page_size=self.swa_page_size,
             )
-            if _COMPRESS_STATE_SUPPORTS_ONLINE_MTP:
-                compress_state_kwargs["online_mtp_max_draft_tokens"] = (
-                    online_mtp_max_draft_tokens
-                )
-            elif online_mtp_max_draft_tokens > 0:
-                raise RuntimeError(
-                    "DeepSeek V4 online C128 MTP requires a CompressStatePool "
-                    "implementation with online_mtp_max_draft_tokens support."
-                )
-
             self.compress_state_pools[idx] = CompressStatePool(
                 **compress_state_kwargs
             )
@@ -708,22 +682,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_state_pool is not None
         ), "Only c4/c128 layers have attention states."
         return compress_state_pool
-
-    def get_online_c128_mtp_state_slot_offset(self) -> int:
-        for pool in self.compress_state_pools:
-            if pool is not None and pool.ratio == 128:
-                return int(getattr(pool, "online_mtp_state_slot_offset", 0))
-        return 0
-
-    def get_online_c128_mtp_max_draft_tokens(self) -> int:
-        for pool in self.compress_state_pools:
-            if pool is not None and pool.ratio == 128:
-                return int(getattr(pool, "online_mtp_max_draft_tokens", 0))
-        return 0
-
-    def get_online_c128_mtp_pending_seq_lens(self) -> torch.Tensor:
-        assert self.online_c128_mtp_pending_seq_lens is not None
-        return self.online_c128_mtp_pending_seq_lens
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
