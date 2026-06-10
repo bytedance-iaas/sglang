@@ -630,6 +630,9 @@ def accumulate_stream_items(item, complete_response):
 
     if item.get("choices"):
         for choice in item.get("choices"):
+            choice = model_as_dict(choice)
+            if not isinstance(choice, dict):
+                continue
             index = choice.get("index")
             while len(complete_response.get("choices")) <= index:
                 complete_response["choices"].append(
@@ -652,6 +655,9 @@ def accumulate_stream_items(item, complete_response):
 
             delta = choice.get("delta")
             if not delta:
+                continue
+            delta = model_as_dict(delta)
+            if not isinstance(delta, dict):
                 continue
 
             if delta.get("content"):
