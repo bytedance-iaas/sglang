@@ -382,6 +382,7 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
+        kv_args.prefill_pp_size = self.prefill_pp_size
         kv_args.system_dp_rank = self.scheduler.dp_rank
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory

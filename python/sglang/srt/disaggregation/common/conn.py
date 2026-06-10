@@ -462,7 +462,7 @@ class CommonKVManager(BaseKVManager):
         elif (
             num_kv_layers < dst_num_total_layers
             and dst_num_total_layers % num_kv_layers != 0
-            and self.kv_args.prefill_pp_size == 1
+            and getattr(self.kv_args, "prefill_pp_size", self.pp_size) == 1
         ):
             # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
             # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
