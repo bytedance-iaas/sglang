@@ -895,6 +895,7 @@ class DecodePreallocQueue:
                     prefix_len = dsv4_safe_prefix_len
                     prefix_indices = prefix_indices[:prefix_len]
 
+                decode_req.req.cache_protected_len = prefix_len
                 if locked_prefix_len > 0 and prefix_len == 0:
                     self.tree_cache.dec_lock_ref(
                         decode_req.req.last_node,
