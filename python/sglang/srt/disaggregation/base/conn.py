@@ -32,6 +32,8 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    # Number of non-draft KV pointers before any draft/MTP KV pointers are appended.
+    non_draft_kv_data_lens: int
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
