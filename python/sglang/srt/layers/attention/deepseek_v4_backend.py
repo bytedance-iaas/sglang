@@ -1078,6 +1078,7 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ):
+        logical_forward_mode = _get_logical_forward_mode(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
