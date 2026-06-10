@@ -65,6 +65,10 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
+    # For hybrid linear-attention models: full-model mamba layer ids and this
+    # PP stage's indices into that list.
+    total_mamba_layer_ids: List[int]
+    mamba_layer_ids: List[int]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers

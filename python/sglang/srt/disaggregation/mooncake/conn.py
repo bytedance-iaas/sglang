@@ -1022,6 +1022,21 @@ class MooncakeKVManager(CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                (
+                    src_data_ptrs,
+                    src_item_lens,
+                    src_dim_per_tensor,
+                    dst_data_ptrs,
+                    dst_item_lens,
+                    dst_dim_per_tensor,
+                ) = self._slice_mamba_state_for_pp(
+                    src_data_ptrs,
+                    src_item_lens,
+                    src_dim_per_tensor,
+                    dst_data_ptrs,
+                    dst_item_lens,
+                    dst_dim_per_tensor,
+                )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -1091,6 +1106,49 @@ class MooncakeKVManager(CommonKVManager):
                     or rc
                 )
         return rc
+
+    def _slice_mamba_state_for_pp(
+        self,
+        src_data_ptrs: list[int],
+        src_item_lens: list[int],
+        src_dim_per_tensor: list[int],
+        dst_data_ptrs: list[int],
+        dst_item_lens: list[int],
+        dst_dim_per_tensor: list[int],
+    ):
+        total_mamba_layer_ids = getattr(self.kv_args, "total_mamba_layer_ids", [])
+        mamba_layer_ids = getattr(self.kv_args, "mamba_layer_ids", [])
+        total_layers = len(total_mamba_layer_ids)
+        local_layers = len(mamba_layer_ids)
+        if total_layers == 0 or local_layers == 0:
+            return (
+                src_data_ptrs,
+                src_item_lens,
+                src_dim_per_tensor,
+                dst_data_ptrs,
+                dst_item_lens,
+                dst_dim_per_tensor,
+            )
+
+        def maybe_slice(values):
+            if not values:
+                return values
+            if len(values) % total_layers == 0:
+                return [
+                    values[base + idx]
+                    for base in range(0, len(values), total_layers)
+                    for idx in mamba_layer_ids
+                ]
+            return values
+
+        return (
+            maybe_slice(src_data_ptrs),
+            maybe_slice(src_item_lens),
+            maybe_slice(src_dim_per_tensor),
+            maybe_slice(dst_data_ptrs),
+            maybe_slice(dst_item_lens),
+            maybe_slice(dst_dim_per_tensor),
+        )
 
     def _send_mamba_state(
         self,
