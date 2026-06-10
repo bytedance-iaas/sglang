@@ -197,6 +197,26 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            # ---- Stage 1: prefix-aware fields for decode-radix + spec coexistence ----
+            # These slots are reserved so that, when --disaggregation-decode-enable-radix-cache
+            # is combined with speculative decoding (EAGLE / EAGLE3 / MTP), the prefill side
+            # can attach the *prefix-end* anchor (page-aligned prefix length, last topk and
+            # last hidden state at that position) to the metadata buffer. Stage 1 only
+            # reserves the layout so that protocol/backends agree on the slot positions
+            # and sizes; the values stay zero and no path consumes them yet. Behavior is
+            # unchanged from the prior protocol.
+            self.prefix_aligned_len = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.prefix_last_topk_p = torch.zeros(
+                (size, 16), dtype=torch.float32, device=device
+            )
+            self.prefix_last_topk_index = torch.zeros(
+                (size, 16), dtype=torch.int64, device=device
+            )
+            self.prefix_last_hidden_states = torch.zeros(
+                (size, hidden_size), dtype=hidden_states_dtype, device=device
+            )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -213,6 +233,11 @@ class MetadataBuffers:
             self.output_topk_p.data_ptr(),
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
+            # Stage 1 prefix-aware slots (reserved, default zero)
+            self.prefix_aligned_len.data_ptr(),
+            self.prefix_last_topk_p.data_ptr(),
+            self.prefix_last_topk_index.data_ptr(),
+            self.prefix_last_hidden_states.data_ptr(),
             self.bootstrap_room.data_ptr(),
         ]
         data_lens = [
@@ -225,6 +250,10 @@ class MetadataBuffers:
             self.output_topk_p.nbytes,
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
+            self.prefix_aligned_len.nbytes,
+            self.prefix_last_topk_p.nbytes,
+            self.prefix_last_topk_index.nbytes,
+            self.prefix_last_hidden_states.nbytes,
             self.bootstrap_room.nbytes,
         ]
         item_lens = [
@@ -237,6 +266,10 @@ class MetadataBuffers:
             self.output_topk_p[0].nbytes,
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
+            self.prefix_aligned_len[0].nbytes,
+            self.prefix_last_topk_p[0].nbytes,
+            self.prefix_last_topk_index[0].nbytes,
+            self.prefix_last_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
@@ -252,6 +285,10 @@ class MetadataBuffers:
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
+            self.prefix_aligned_len[idx].clone(),
+            self.prefix_last_topk_p[idx].clone(),
+            self.prefix_last_topk_index[idx].clone(),
+            self.prefix_last_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
         )
 

@@ -1402,6 +1402,14 @@ class DecodeTransferQueue:
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            # Stage 1: prefix-aware slots (reserved, default zero, not consumed yet).
+            # Kept here so the get_buf tuple shape stays in sync with MetadataBuffers
+            # and any future stage that decides to consume them does not need to
+            # re-thread the unpack site.
+            _prefix_aligned_len,
+            _prefix_last_topk_p,
+            _prefix_last_topk_index,
+            _prefix_last_hidden_states,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
