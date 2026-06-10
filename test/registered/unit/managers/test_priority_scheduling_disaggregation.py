@@ -7,7 +7,11 @@ import torch
 
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
+    KVPoll,
     SchedulerDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (  # noqa: E402
+    ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
@@ -244,6 +248,82 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
+
+
+class TestDecodeHandshakeWaiters(unittest.TestCase):
+    def test_multi_tp_queue_length_mismatch_skips_poll(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [
+            SimpleNamespace(
+                req=SimpleNamespace(
+                    rid="req",
+                    bootstrap_room=1,
+                    time_stats=MagicMock(),
+                ),
+                waiting_for_input=False,
+                kv_receiver=MagicMock(conclude_state=None),
+            )
+        ]
+        queue.gloo_group = object()
+        queue.tp_rank = 0
+        queue.scheduler = MagicMock()
+        queue.scheduler.metrics_reporter.enable_metrics = False
+
+        def _mock_all_reduce(tensor, op, group):
+            tensor[1] = 1
+            tensor[2] = -2
+
+        with patch(
+            "sglang.srt.disaggregation.decode.dist.get_world_size", return_value=2
+        ), patch(
+            "sglang.srt.disaggregation.decode.dist.all_reduce",
+            side_effect=_mock_all_reduce,
+        ), patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce"
+        ) as poll:
+            queue._update_handshake_waiters()
+
+        poll.assert_not_called()
+
+
+class TestDecodePrebuiltCachedTokens(unittest.TestCase):
+    def test_prepare_for_prebuilt_does_not_double_count_decode_prefix_hit(self):
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            fill_ids=[10, 11, 12, 13, 14],
+            prefix_indices=torch.tensor([100, 101, 102], dtype=torch.int64),
+            extend_input_len=2,
+            origin_input_ids=[10, 11, 12, 13, 14],
+            output_ids=[],
+            retracted_stain=False,
+            cached_tokens=7,
+            already_computed=0,
+            is_retracted=True,
+            extend_logprob_start_len=0,
+            multimodal_inputs=None,
+            logprob=SimpleNamespace(top_logprobs_num=0, token_ids_logprob=None),
+            return_logprob=False,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int64)
+            ),
+            device="cpu",
+            return_logprob=False,
+            model_config=SimpleNamespace(vocab_size=32000),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "SamplingBatchInfo.from_schedule_batch",
+            return_value=MagicMock(),
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+
+        self.assertEqual(req.cached_tokens, 7)
+        self.assertEqual(req.already_computed, 5)
+        self.assertFalse(req.is_retracted)
 
 
 if __name__ == "__main__":

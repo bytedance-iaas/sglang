@@ -61,7 +61,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                # In disagg decode, cached_tokens is already populated from the
+                # prefill side metadata during transfer completion. Don't add the
+                # decode-side prefix match again here, or the cache hit count is
+                # double-counted.
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -610,11 +611,28 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
+        all_waiting_for_input = all(
+            decode_req.waiting_for_input for decode_req in self.queue
+        )
         # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
+        has_failed_receiver = any(
             getattr(decode_req.kv_receiver, "conclude_state", None) == KVPoll.Failed
             for decode_req in self.queue
-        ):
+        )
+        need_poll = not all_waiting_for_input or has_failed_receiver
+
+        # All TPs must agree on whether to poll and on queue size, otherwise
+        # poll_and_all_reduce (which sizes its tensor by queue length) can hang.
+        if dist.get_world_size(self.gloo_group) > 1:
+            n = len(self.queue)
+            local = torch.tensor(
+                [int(need_poll), n, -n], dtype=torch.int64, device="cpu"
+            )
+            dist.all_reduce(local, op=dist.ReduceOp.MIN, group=self.gloo_group)
+            if local[0].item() == 0 or local[1].item() != -local[2].item():
+                return
+
+        if not need_poll:
             return
 
         polls = poll_and_all_reduce(
