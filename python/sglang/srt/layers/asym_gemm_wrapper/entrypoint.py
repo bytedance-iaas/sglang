@@ -8,6 +8,7 @@ from sglang.srt.layers.asym_gemm_wrapper import compile_utils
 from sglang.srt.layers.asym_gemm_wrapper.configurer import (  # noqa: F401
     ASYMGEMM_BLACKWELL,
     ASYMGEMM_SCALE_UE8M0,
+    ASYMGEMM_UNIFIED_MOE,
     ENABLE_JIT_ASYMGEMM,
 )
 from sglang.srt.server_args import ServerArgs

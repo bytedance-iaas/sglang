@@ -411,6 +411,15 @@ class Envs:
     SGLANG_JIT_ASYMGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_ASYMGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_IN_ASYMGEMM_PRECOMPILE_STAGE = EnvBool(False)
+    # Unified CPU(AMX INT8)+GPU(SM90 INT8) MoE kernel for the asym_gemm
+    # backend (BF16 checkpoints only). Off by default; the existing
+    # asym_gemm paths are untouched when disabled.
+    SGLANG_ASYMGEMM_UNIFIED_MOE = EnvBool(False)
+    # Per-expert dispatch threshold: experts with <= this many routed tokens
+    # run on the CPU AMX bucket, the rest on the GPU INT8 grouped kernel.
+    SGLANG_ASYMGEMM_UNIFIED_M_CPU = EnvInt(16)
+    # CPU worker threads for the AMX bucket (0 = library default).
+    SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS = EnvInt(0)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
