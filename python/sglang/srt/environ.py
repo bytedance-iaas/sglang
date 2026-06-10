@@ -250,6 +250,9 @@ class Envs:
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
     SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
+    # DSV4 HiSparse keeps C4 KV compressed/host-backed on decode, so reserving
+    # the full clipped output length during PD preallocation is too conservative.
+    SGLANG_HISPARSE_RELAX_DECODE_OUTPUT_RESERVE = EnvBool(True)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -627,7 +630,8 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(True)
+    # HiSparse still needs a separate swap-in pass after raw top-k output.
+    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

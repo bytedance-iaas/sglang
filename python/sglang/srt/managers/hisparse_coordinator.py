@@ -184,6 +184,11 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
+        if self.device_buffer_size < self.top_k:
+            raise ValueError(
+                "HiSparse device_buffer_size must be no smaller than top_k: "
+                f"device_buffer_size={self.device_buffer_size}, top_k={self.top_k}."
+            )
         self.device = device
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
@@ -291,7 +296,7 @@ class HiSparseCoordinator:
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
         self._c4_miss_sample_interval_s = float(
-            os.getenv("SGLANG_HISPARSE_C4_MISS_SAMPLE_INTERVAL", "10")
+            os.getenv("SGLANG_HISPARSE_C4_MISS_SAMPLE_INTERVAL", "-1")
         )
         self._last_c4_miss_sample_time = 0.0
         self._c4_swap_miss_tokens = 0

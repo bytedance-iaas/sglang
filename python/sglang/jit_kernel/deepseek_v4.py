@@ -377,10 +377,16 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    if out_page_indices.shape[1] == 512:
+    topk = out_page_indices.shape[1]
+    if topk == 512:
         module = _jit_topk_module()
-    else:
+    elif topk == 1024:
         module = _jit_topk1024_module()
+    else:
+        raise ValueError(
+            "topk_transform_512 only supports top_k=512 or 1024; "
+            f"got top_k={topk}. Use topk_transform_512_v2 for flexible top-k."
+        )
     module.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
     )
@@ -398,6 +404,10 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
     return metadata
 
 
+def new_topk_v2_workspace(seq_lens: torch.Tensor) -> torch.Tensor:
+    return seq_lens.new_empty(seq_lens.shape[0], _WORKSPACE_INTS_PER_BATCH)
+
+
 def topk_transform_512_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -406,10 +416,14 @@ def topk_transform_512_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> None:
     module = _jit_topk_v2_module(out_page_indices.shape[1])
     bs = scores.shape[0]
-    workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
+    if workspace is None:
+        workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
+    else:
+        workspace = workspace[:bs]
     module.topk_transform(
         scores,
         seq_lens,

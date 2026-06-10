@@ -255,12 +255,21 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(self):
-        # c4_sparse_topk is set from model_config.index_topk per-model
-        # (small model: 512, large model: 1024).
-        assert self.c4_sparse_topk in (512, 1024), (
-            f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
-            "supported: 512 (small) or 1024 (large)"
-        )
+        if self.c4_sparse_topk not in (512, 1024):
+            if (
+                self.c4_sparse_topk <= 0
+                or self.c4_sparse_topk > 1024
+                or self.c4_sparse_topk % PAGE_INDEX_ALIGNED_SIZE != 0
+            ):
+                raise ValueError(
+                    "DSV4 c4_sparse_topk must be a positive <=1024 multiple of "
+                    f"{PAGE_INDEX_ALIGNED_SIZE}, got {self.c4_sparse_topk}."
+                )
+            if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+                raise ValueError(
+                    "DSV4 c4_sparse_topk values other than 512/1024 require "
+                    "SGLANG_OPT_USE_TOPK_V2=1."
+                )
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
             self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
@@ -382,9 +391,16 @@ class DeepseekV4AttnBackend(
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.c4_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
-        )
+        if model_runner.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import resolve_hisparse_top_k
+
+            self.c4_topk = resolve_hisparse_top_k(
+                model_runner.server_args, model_runner.model_config.hf_text_config
+            )
+        else:
+            self.c4_topk = getattr(
+                model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            )
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"

@@ -57,8 +57,10 @@ def copy_metadata(
     check_eq_fields: List[str],
     copy_fields: List[str],
     assign_fields: Optional[List[str]] = None,
+    keep_fields: Optional[List[str]] = None,
 ):
     assign_fields = assign_fields or []
+    keep_fields = keep_fields or []
 
     for field_name in check_eq_fields:
         src_val = getattr(src, field_name)
@@ -82,7 +84,7 @@ def copy_metadata(
     for field_name in assign_fields:
         setattr(dst, field_name, getattr(src, field_name))
 
-    provided_fields = check_eq_fields + copy_fields + assign_fields
+    provided_fields = check_eq_fields + copy_fields + assign_fields + keep_fields
     provided_fields_unique = set(provided_fields)
     assert len(provided_fields) == len(
         provided_fields_unique
@@ -101,6 +103,7 @@ class PagedIndexerMetadata:
     c4_seq_lens: torch.Tensor
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
+    topk_workspace: Optional[torch.Tensor] = field(init=False, repr=False)
 
     def __post_init__(self):
         if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
@@ -130,6 +133,7 @@ class PagedIndexerMetadata:
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
+        self.topk_workspace = None
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
@@ -145,6 +149,18 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
+    def get_topk_workspace(self) -> torch.Tensor:
+        if (
+            self.topk_workspace is None
+            or self.topk_workspace.shape[0] < self.c4_seq_lens.shape[0]
+            or self.topk_workspace.device != self.c4_seq_lens.device
+            or self.topk_workspace.dtype != self.c4_seq_lens.dtype
+        ):
+            from sglang.jit_kernel.deepseek_v4 import new_topk_v2_workspace
+
+            self.topk_workspace = new_topk_v2_workspace(self.c4_seq_lens)
+        return self.topk_workspace
+
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
@@ -156,6 +172,7 @@ class PagedIndexerMetadata:
             dst=self,
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
+            keep_fields=["topk_workspace"],
         )
 
 

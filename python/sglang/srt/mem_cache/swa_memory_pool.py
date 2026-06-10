@@ -628,8 +628,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.page_size == 1:
             mapping_indices = self._unique_free_indices(free_index, "full")
-        else:
-            mapping_indices = self._expand_to_full_pages(free_index)
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+            swa_indices = swa_indices[swa_indices > 0]
+            swa_indices = self._unique_free_indices(swa_indices, "swa")
+            self.swa_attn_allocator.free(swa_indices)
+            self.full_to_swa_index_mapping[mapping_indices] = 0
+            self.full_to_swa_page_generation_mapping[mapping_indices] = 0
+            return
+
+        mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_generations = self.full_to_swa_page_generation_mapping[mapping_indices]
@@ -644,7 +651,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_pages = swa_indices // self.page_size
         current_generations = self._swa_page_generations[swa_pages]
         live_pages = self._swa_page_live[swa_pages]
-        # Skip aliases from older owners or pages already returned to the free list.
         valid_pages = live_pages & (swa_generations == current_generations)
         self._maybe_warn_stale_swa_free(valid_pages)
         swa_indices = swa_indices[valid_pages]
@@ -653,12 +659,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_page_generation_mapping[mapping_indices] = 0
             return
 
-        if self.page_size == 1:
-            swa_indices = self._unique_free_indices(swa_indices, "swa")
-            swa_pages = swa_indices
-        else:
-            swa_indices = self._unique_free_pages(swa_indices, "swa")
-            swa_pages = swa_indices // self.page_size
+        swa_indices = self._unique_free_pages(swa_indices)
+        swa_pages = swa_indices // self.page_size
         self._swa_page_live[swa_pages] = False
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
@@ -730,18 +732,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
-    def _unique_free_pages(self, indices: torch.Tensor, label: str) -> torch.Tensor:
+    def _unique_free_pages(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.numel() <= 1:
             return indices
 
         pages = torch.unique(indices // self.page_size)
-        num_duplicate_pages = indices.numel() - pages.numel()
-        if num_duplicate_pages > 0:
-            logger.warning(
-                "Deduplicated %d duplicate %s KV page references in SWA allocator free.",
-                num_duplicate_pages,
-                label,
-            )
         return pages * self.page_size
 
     def backup_state(self):

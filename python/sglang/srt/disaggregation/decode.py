@@ -313,6 +313,15 @@ class DecodePreallocQueue:
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self._last_prealloc_admission_log_time: float = 0.0
+        self._prealloc_admission_log_interval: float = 5.0
+        hisparse_coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+        self._relax_decode_output_reserve = (
+            envs.SGLANG_HISPARSE_RELAX_DECODE_OUTPUT_RESERVE.get()
+            and self.scheduler.enable_hisparse
+            and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and getattr(hisparse_coordinator, "is_dsv4_hisparse", False)
+        )
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -370,6 +379,30 @@ class DecodePreallocQueue:
         return (
             full_len + self.num_reserved_decode_tokens,
             swa_len + self.num_reserved_decode_tokens,
+        )
+
+    def _output_reserve_tokens_for_admission(self, req: Req) -> int:
+        max_new_tokens = min(
+            req.sampling_params.max_new_tokens,
+            CLIP_MAX_NEW_TOKEN,
+        )
+        if self._relax_decode_output_reserve:
+            return min(max_new_tokens, self.num_reserved_decode_tokens)
+        return max_new_tokens
+
+    def _future_full_tokens_for_admission(
+        self,
+        req: Req,
+        *,
+        origin_input_len: int,
+        prefix_len: int,
+        retractable_tokens: int,
+    ) -> int:
+        return (
+            origin_input_len
+            - prefix_len
+            + self._output_reserve_tokens_for_admission(req)
+            - retractable_tokens
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -648,6 +681,56 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _maybe_log_prealloc_admission_blocked(
+        self,
+        *,
+        reason: str,
+        full_allocatable_tokens: int,
+        swa_allocatable_tokens: int,
+        hisparse_req_budget,
+        hisparse_avail: Optional[int],
+    ) -> None:
+        now = time.monotonic()
+        if (
+            now - self._last_prealloc_admission_log_time
+            < self._prealloc_admission_log_interval
+        ):
+            return
+        self._last_prealloc_admission_log_time = now
+
+        coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+        logger.info(
+            "Decode prealloc admission limited: reason=%s, queue=%d, "
+            "ready=%d, pending=%d, transfer=%d, running=%d, retracted=%d, "
+            "req_slots=%d, metadata_slots=%d, full_allocatable_tokens=%d, "
+            "swa_allocatable_tokens=%d, hisparse_req_budget=%s, "
+            "hisparse_avail=%s, hisparse_padded_buffer_size=%s, "
+            "hisparse_top_k=%s, hisparse_device_buffer_size=%s, "
+            "max_running_requests=%s, relaxed_output_reserve=%s, "
+            "decode_output_reserve_cap=%s",
+            reason,
+            len(self.queue),
+            sum(1 for req in self.queue if req.waiting_for_input),
+            len(self.pending_reqs),
+            len(self.transfer_queue.queue),
+            len(self.scheduler.running_batch.reqs),
+            len(self.retracted_queue),
+            self.req_to_token_pool.available_size(),
+            self.req_to_metadata_buffer_idx_allocator.available_size(),
+            full_allocatable_tokens,
+            swa_allocatable_tokens,
+            hisparse_req_budget,
+            hisparse_avail,
+            getattr(coordinator, "padded_buffer_size", None),
+            getattr(coordinator, "top_k", None),
+            getattr(coordinator, "device_buffer_size", None),
+            getattr(self.scheduler, "max_running_requests", None),
+            self._relax_decode_output_reserve,
+            self.num_reserved_decode_tokens
+            if self._relax_decode_output_reserve
+            else CLIP_MAX_NEW_TOKEN,
+        )
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -796,6 +879,7 @@ class DecodePreallocQueue:
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
+        hisparse_avail = None
         if self.scheduler.enable_hisparse:
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
@@ -807,6 +891,7 @@ class DecodePreallocQueue:
             )
 
         # Then, preallocate the remaining requests if possible
+        blocked_reason = None
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -818,12 +903,15 @@ class DecodePreallocQueue:
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                blocked_reason = "req_to_token_slots"
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                blocked_reason = "metadata_buffer_slots"
                 break
 
             if hisparse_req_budget <= 0:
+                blocked_reason = "hisparse_c4_hot_req_budget"
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -863,30 +951,30 @@ class DecodePreallocQueue:
             if (
                 max(
                     required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+                    self._future_full_tokens_for_admission(
+                        decode_req.req,
+                        origin_input_len=origin_input_len,
+                        prefix_len=prefix_len,
+                        retractable_tokens=retractable_tokens,
+                    ),
                 )
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                blocked_reason = "full_allocatable_tokens"
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                blocked_reason = "full_required_tokens"
                 break
 
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
+                max_new_tokens = self._output_reserve_tokens_for_admission(
+                    decode_req.req
                 )
                 if (
                     max(
@@ -897,6 +985,7 @@ class DecodePreallocQueue:
                 ):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    blocked_reason = "swa_allocatable_tokens"
                     break
 
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
@@ -1062,6 +1151,15 @@ class DecodePreallocQueue:
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
+        if blocked_reason is not None:
+            self._maybe_log_prealloc_admission_blocked(
+                reason=blocked_reason,
+                full_allocatable_tokens=full_allocatable_tokens,
+                swa_allocatable_tokens=swa_allocatable_tokens,
+                hisparse_req_budget=hisparse_req_budget,
+                hisparse_avail=hisparse_avail,
+            )
+
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
@@ -1080,7 +1178,7 @@ class DecodePreallocQueue:
         need_space_for_single_req = (
             max(
                 [
-                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    self._output_reserve_tokens_for_admission(x)
                     + len(x.origin_input_ids)
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
@@ -1197,7 +1295,7 @@ class DecodePreallocQueue:
         ):
             need_swa_space_for_single_req = max(
                 self._swa_tail_len(len(x.origin_input_ids))
-                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                + self._output_reserve_tokens_for_admission(x)
                 - retractable_swa_tokens
                 for x in self.scheduler.running_batch.reqs
             )
@@ -1795,6 +1893,20 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        if num_not_used_batch <= 0:
+            now = time.monotonic()
+            last_log_time = getattr(self, "_last_prebuilt_admission_log_time", 0.0)
+            if now - last_log_time >= 5.0:
+                self._last_prebuilt_admission_log_time = now
+                logger.info(
+                    "Decode prebuilt admission limited: reason=max_running_requests, "
+                    "waiting=%d, running=%d, req_pool_size=%d, max_running_requests=%d",
+                    len(self.waiting_queue),
+                    curr_batch_size,
+                    self.req_to_token_pool.size,
+                    self.max_running_requests,
+                )
+            return None
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

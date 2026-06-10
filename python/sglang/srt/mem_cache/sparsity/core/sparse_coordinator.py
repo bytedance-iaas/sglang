@@ -56,6 +56,7 @@ class SparseConfig:
     """Configuration for sparse attention."""
 
     top_k: int = 2048
+    top_k_explicit: bool = False
     device_buffer_size: int = 4096
     host_to_device_ratio: int = 2
     algorithm: Optional[str] = None

@@ -58,7 +58,9 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown attention backend: {backend}")
 
 
-def _parse_sparse_config(server_args) -> SparseConfig:
+def _parse_sparse_config(
+    server_args, *, validate_default_top_k: bool = True
+) -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
@@ -75,11 +77,12 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     else:
         extra_config = {}
 
+    top_k_explicit = "top_k" in extra_config
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
 
-    if device_buffer_size < top_k:
+    if (top_k_explicit or validate_default_top_k) and device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
         )
@@ -91,6 +94,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
 
     return SparseConfig(
         top_k=top_k,
+        top_k_explicit=top_k_explicit,
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
         algorithm=algorithm,
@@ -103,7 +107,21 @@ def _parse_sparse_config(server_args) -> SparseConfig:
 
 def parse_hisparse_config(server_args) -> SparseConfig:
     """Parse hisparse config from server_args, returning defaults if no config provided."""
-    return _parse_sparse_config(server_args)
+    return _parse_sparse_config(server_args, validate_default_top_k=False)
+
+
+def resolve_hisparse_top_k(server_args, hf_text_config) -> int:
+    """Return the C4/indexer top-k used by HiSparse.
+
+    DSV4 carries model-quality defaults in hf_text_config.index_topk.  Treat
+    hisparse_config.top_k as an explicit opt-in override only, so existing
+    deployments keep the model default unless they deliberately trade C4 recall
+    for a smaller hot-buffer footprint.
+    """
+    config = parse_hisparse_config(server_args)
+    if config.top_k_explicit:
+        return config.top_k
+    return getattr(hf_text_config, "index_topk", config.top_k)
 
 
 def create_sparse_coordinator(

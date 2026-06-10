@@ -760,11 +760,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Init hisparse coordinator (must happen before CUDA graph capture)
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+                from sglang.srt.mem_cache.sparsity import (
+                    parse_hisparse_config,
+                    resolve_hisparse_top_k,
+                )
 
                 hisparse_cfg = parse_hisparse_config(self.server_args)
-                hisparse_top_k = getattr(
-                    self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+                hisparse_top_k = resolve_hisparse_top_k(
+                    self.server_args, self.model_config.hf_text_config
                 )
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
@@ -875,6 +878,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         hf_text_config = self.model_config.hf_text_config
         num_indexer_layers = get_num_indexer_layers(hf_text_config)
         index_topk = getattr(hf_text_config, "index_topk", 0)
+        if self.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import resolve_hisparse_top_k
+
+            index_topk = resolve_hisparse_top_k(self.server_args, hf_text_config)
         set_global_indexer_capturer(
             create_indexer_capturer(
                 enable=enable,
