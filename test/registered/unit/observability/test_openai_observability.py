@@ -97,6 +97,14 @@ class _FakeTracer:
         return self.span
 
 
+class _Dumpable:
+    def __init__(self, **kwargs):
+        self._kwargs = kwargs
+
+    def model_dump(self):
+        return self._kwargs
+
+
 class TestOpenAIObservability(CustomTestCase):
     def test_model_as_dict_tolerates_plain_object(self):
         plain = object()
@@ -150,6 +158,52 @@ class TestOpenAIObservability(CustomTestCase):
         self.assertEqual(tool_calls[0]["id"], "call-0")
         self.assertEqual(tool_calls[0]["function"]["name"], "lookup")
         self.assertEqual(tool_calls[0]["function"]["arguments"], '{"city": "Paris"}')
+
+    def test_accumulate_stream_items_converts_nested_choice_objects(self):
+        complete_response = {"choices": [], "model": "", "usage": None, "error": None}
+        chunk = {
+            "model": "test-model",
+            "choices": [
+                _Dumpable(
+                    index=0,
+                    delta=_Dumpable(role="assistant", content="hello"),
+                    finish_reason=None,
+                )
+            ],
+        }
+
+        with patch.object(mod, "is_otel_available", return_value=True):
+            mod.accumulate_stream_items(chunk, complete_response)
+
+        self.assertEqual(complete_response["choices"][0]["message"]["role"], "assistant")
+        self.assertEqual(complete_response["choices"][0]["message"]["content"], "hello")
+
+    @unittest.skipUnless(mod._is_msgspec_available, "msgspec not installed")
+    def test_accumulate_stream_items_converts_msgspec_nested_choice(self):
+        class Delta(mod.msgspec.Struct, omit_defaults=True):
+            reasoning_content: str | None = None
+            role: str | None = None
+            content: str | None = None
+
+        class Choice(mod.msgspec.Struct):
+            index: int
+            delta: Delta
+            logprobs: dict | None = None
+            finish_reason: str | None = None
+
+        class Chunk(mod.msgspec.Struct, omit_defaults=True):
+            model: str
+            choices: list[Choice]
+            usage: dict | None = None
+
+        complete_response = {"choices": [], "model": "", "usage": None, "error": None}
+        chunk = Chunk("test-model", [Choice(0, Delta(role="assistant", content="hello"))])
+
+        with patch.object(mod, "is_otel_available", return_value=True):
+            mod.accumulate_stream_items(chunk, complete_response)
+
+        self.assertEqual(complete_response["choices"][0]["message"]["role"], "assistant")
+        self.assertEqual(complete_response["choices"][0]["message"]["content"], "hello")
 
     def test_provider_init_disables_otel_when_initialization_fails(self):
         original = mod._is_otel_imported
