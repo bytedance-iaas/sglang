@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -342,6 +343,23 @@ class DecodePreallocQueue:
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
+
+    def _uses_dsv4_decode_radix_cache(self) -> bool:
+        return (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        )
+
+    def _dsv4_safe_prefix_len(self, prefix_len: int) -> int:
+        """Avoid splitting reused prefixes through compressed DSV4 blocks."""
+        if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
+            return prefix_len
+
+        compression_ratios = getattr(self.token_to_kv_pool, "compression_ratios", [])
+        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        alignment = math.lcm(page_size, max_compression_ratio)
+        return (prefix_len // alignment) * alignment
 
     # SWA caches make the flat size accessors raise and expose full-pool sizes
     # via full_*() instead; pick the full-pool view for SWA, flat otherwise.
@@ -852,6 +870,7 @@ class DecodePreallocQueue:
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
+                locked_prefix_len = prefix_len
                 # Align prefix_len down to page boundary so both prefill and
                 # decode agree on the page-aligned split point for KV transfer.
                 page_size = self.token_to_kv_pool_allocator.page_size
@@ -870,6 +889,21 @@ class DecodePreallocQueue:
                     if prefix_len > swa_prefix_cap:
                         prefix_len = swa_prefix_cap
                         prefix_indices = prefix_indices[:prefix_len]
+
+                dsv4_safe_prefix_len = self._dsv4_safe_prefix_len(prefix_len)
+                if dsv4_safe_prefix_len < prefix_len:
+                    prefix_len = dsv4_safe_prefix_len
+                    prefix_indices = prefix_indices[:prefix_len]
+
+                if locked_prefix_len > 0 and prefix_len == 0:
+                    self.tree_cache.dec_lock_ref(
+                        decode_req.req.last_node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                        ),
+                    )
+                    decode_req.req.last_node = self.tree_cache.root_node
+                    decode_req.req.swa_uuid_for_lock = None
 
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
