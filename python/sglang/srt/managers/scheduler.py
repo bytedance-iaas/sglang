@@ -3470,6 +3470,10 @@ class Scheduler(
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
+                        if self.enable_hisparse and self.hisparse_coordinator:
+                            self.hisparse_coordinator.release_retracted_decode_req(
+                                decode_req
+                            )
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )

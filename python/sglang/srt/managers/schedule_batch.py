@@ -2352,6 +2352,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
+            return True
+
+        # SWA eviction is normally done while preparing the next decode batch.
+        # When SWA becomes the first limiting pool, the scheduler can reach this
+        # OOM check before prepare_for_decode() gets a chance to release
+        # out-of-window SWA pages. Try that cheap cleanup once before retracting.
+        if (
+            self.forward_mode is not None
+            and self.forward_mode.is_decode()
+            and self.tree_cache.supports_swa()
+        ):
+            self.maybe_evict_swa(force=True)
+            evict_from_tree_cache(self.tree_cache, num_tokens)
+
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
@@ -2430,7 +2445,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
-            self.hisparse_coordinator.retract_req(req)
+            if (
+                server_args.disaggregation_mode == "decode"
+                and self.hisparse_coordinator.is_dsv4_hisparse
+            ):
+                self.hisparse_coordinator.retract_decode_req(req)
+            else:
+                self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
@@ -2763,7 +2784,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
         )
 
-    def maybe_evict_swa(self):
+    def maybe_evict_swa(self, force: bool = False):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
@@ -2788,7 +2809,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
                     # 2. Evict swa every eviction_interval tokens to reduce the overhead.
-                    if req.decode_batch_idx % eviction_interval == 1:
+                    if req.decode_batch_idx > 0 and (
+                        force or req.decode_batch_idx % eviction_interval == 1
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
