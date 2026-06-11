@@ -685,7 +685,6 @@ class DeepseekV4AttnBackend(
         c128_compress_metadata = create(compress_ratio=128)
         return DSV4Metadata(
             core_attn_metadata,
-            core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=c4_compress_metadata,
             c128_compress_metadata=c128_compress_metadata,
