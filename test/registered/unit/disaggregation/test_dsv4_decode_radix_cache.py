@@ -206,6 +206,34 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     assert req.dsv4_decode_radix_cache_prompt_once is False
 
 
+def test_dsv4_swa_release_tail_len_uses_sliding_window():
+    processor = SimpleNamespace(
+        tree_cache=SimpleNamespace(sliding_window_size=4),
+        model_config=SimpleNamespace(sliding_window_size=16),
+    )
+
+    assert (
+        SchedulerBatchResultProcessor._dsv4_swa_release_tail_len(
+            processor, protected_len=100, page_size=2
+        )
+        == 4
+    )
+
+
+def test_dsv4_swa_release_tail_len_falls_back_to_page():
+    processor = SimpleNamespace(
+        tree_cache=SimpleNamespace(sliding_window_size=None),
+        model_config=SimpleNamespace(sliding_window_size=None),
+    )
+
+    assert (
+        SchedulerBatchResultProcessor._dsv4_swa_release_tail_len(
+            processor, protected_len=100, page_size=2
+        )
+        == 2
+    )
+
+
 def test_swa_component_force_leaf_creation_allows_full_only_leaf():
     component = SWAComponent.__new__(SWAComponent)
 
