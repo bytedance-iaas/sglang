@@ -152,6 +152,20 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
         )
 
+    def _dsv4_swa_release_tail_len(self, protected_len: int, page_size: int) -> int:
+        if protected_len <= 0:
+            return 0
+
+        sliding_window_size = getattr(self.tree_cache, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.model_config, "sliding_window_size", None)
+        if sliding_window_size is None or sliding_window_size <= 0:
+            return min(protected_len, page_size)
+
+        # alloc_extend_swa_tail only maps the SWA window tail back to full
+        # indices. Scan that tail rather than the full 64K/128K donated prefix.
+        return min(protected_len, max(page_size, sliding_window_size))
+
     def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req):
         if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
             return
@@ -202,8 +216,12 @@ class SchedulerBatchResultProcessor:
             maybe_cache_unfinished_req(req, self.tree_cache)
             protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
             if protected_len > 0 and hasattr(self.token_to_kv_pool_allocator, "free_swa"):
+                swa_release_tail_len = self._dsv4_swa_release_tail_len(
+                    protected_len, page_size
+                )
+                swa_release_start = protected_len - swa_release_tail_len
                 donated_full_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :protected_len
+                    req.req_pool_idx, swa_release_start:protected_len
                 ]
                 # The donated DSV4 prompt leaf is full-only. Release any
                 # request-private SWA tail mapped from those full indices; the
