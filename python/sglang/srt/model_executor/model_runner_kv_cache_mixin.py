@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
@@ -586,6 +587,17 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                total_full_attention_layer_ids = list(config.full_attention_layer_ids)
+                total_mamba_layer_ids = list(config.mamba2_cache_params.layers)
+                local_mamba_layer_indices = (
+                    []
+                    if self.is_draft_worker
+                    else [
+                        i
+                        for i, layer_id in enumerate(total_mamba_layer_ids)
+                        if self.start_layer <= layer_id < self.end_layer
+                    ]
+                )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -612,6 +624,14 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     **extra_args,
                 )
+                self.token_to_kv_pool.transfer_start_layer = bisect.bisect_left(
+                    total_full_attention_layer_ids, self.start_layer
+                )
+                self.token_to_kv_pool.transfer_end_layer = bisect.bisect_left(
+                    total_full_attention_layer_ids, self.end_layer
+                )
+                self.token_to_kv_pool.total_mamba_layer_ids = total_mamba_layer_ids
+                self.token_to_kv_pool.mamba_layer_ids = local_mamba_layer_indices
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(

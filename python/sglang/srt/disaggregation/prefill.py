@@ -145,9 +145,22 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
+        kv_args.prefill_pp_size = self.pp_size
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        kv_args.prefill_start_layer = getattr(
+            self.token_to_kv_pool,
+            "transfer_start_layer",
+            self.token_to_kv_pool.start_layer,
+        )
+        kv_args.prefill_end_layer = getattr(
+            self.token_to_kv_pool,
+            "transfer_end_layer",
+            getattr(self.token_to_kv_pool, "end_layer", None),
+        )
+        kv_args.total_mamba_layer_ids = getattr(
+            self.token_to_kv_pool, "total_mamba_layer_ids", []
+        )
+        kv_args.mamba_layer_ids = getattr(self.token_to_kv_pool, "mamba_layer_ids", [])
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()

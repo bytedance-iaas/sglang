@@ -280,6 +280,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         pp_rank: int,
+        prefill_pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -301,6 +302,9 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
+        # Default to the local decode PP size until bootstrap returns the
+        # authoritative prefill topology for this decode instance.
+        self.prefill_pp_size = prefill_pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -378,6 +382,7 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
+        kv_args.prefill_pp_size = self.prefill_pp_size
         kv_args.system_dp_rank = self.scheduler.dp_rank
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
@@ -389,6 +394,7 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+        kv_args.non_draft_kv_data_lens = len(kv_data_ptrs)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
