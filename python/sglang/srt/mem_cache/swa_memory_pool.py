@@ -717,8 +717,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         unique_indices = torch.unique(indices)
         num_duplicates = indices.numel() - unique_indices.numel()
-        if num_duplicates > 0:
-            logger.warning(
+        if num_duplicates > 0 and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
                 "Deduplicated %d duplicate %s KV indices in SWA allocator free.",
                 num_duplicates,
                 label,

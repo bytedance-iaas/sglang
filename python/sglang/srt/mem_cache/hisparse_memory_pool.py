@@ -296,11 +296,21 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
+        required_tokens = extend_num_tokens
+        if self.page_size > 1:
+            required_tokens = (
+                get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+                * self.page_size
+            )
         avail = self.logical_attn_allocator.available_size()
-        if avail < extend_num_tokens:
+        if avail < required_tokens:
             raise RuntimeError(
-                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
-                f"{avail} are available."
+                f"HiSparse logical alloc: need {required_tokens} new-page tokens "
+                f"for {extend_num_tokens} extend tokens but only {avail} are available."
             )
 
         logical_state = (
@@ -316,7 +326,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if logical_indices is None:
             raise RuntimeError(
-                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"HiSparse logical alloc failed for {extend_num_tokens} extend tokens "
+                f"({required_tokens} new-page tokens). "
                 f"Logical pool available: {self.logical_attn_allocator.available_size()}"
             )
 
@@ -699,6 +710,16 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self.logical_attn_allocator.get_cpu_copy(
+            indices, mamba_indices=mamba_indices
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self.logical_attn_allocator.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
@@ -858,11 +879,22 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
+        required_tokens = extend_num_tokens
+        if self.page_size > 1:
+            required_tokens = (
+                get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+                * self.page_size
+            )
         avail = self.logical_attn_allocator.available_size()
-        if avail < extend_num_tokens:
+        if avail < required_tokens:
             raise RuntimeError(
-                f"DeepSeek V4 HiSparse logical alloc: need {extend_num_tokens} "
-                f"tokens but only {avail} are available."
+                "DeepSeek V4 HiSparse logical alloc: "
+                f"need {required_tokens} new-page tokens for {extend_num_tokens} "
+                f"extend tokens but only {avail} are available."
             )
 
         logical_state = (
@@ -879,7 +911,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if logical_indices is None:
             raise RuntimeError(
                 f"DeepSeek V4 HiSparse logical alloc failed for {extend_num_tokens} "
-                f"tokens. Logical pool available: {self.logical_attn_allocator.available_size()}"
+                f"extend tokens ({required_tokens} new-page tokens). "
+                "Logical pool available: "
+                f"{self.logical_attn_allocator.available_size()}"
             )
 
         if backup_state:

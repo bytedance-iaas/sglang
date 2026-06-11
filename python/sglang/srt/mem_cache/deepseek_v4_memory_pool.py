@@ -15,8 +15,12 @@ from sglang.srt.layers.attention.dsv4 import (
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+    KVAndScore,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
@@ -159,6 +163,54 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
+
+    def _token_byte_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        bytes_per_token = self.get_bytes_per_token()
+        byte_offsets = torch.arange(bytes_per_token, device=self.device)
+        pages = indices // self.page_size
+        offsets = (indices % self.page_size) * bytes_per_token
+        return (
+            pages[:, None] * self.bytes_per_page_padded
+            + offsets[:, None]
+            + byte_offsets[None, :]
+        ).reshape(-1)
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        bytes_per_token = self.get_bytes_per_token()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            flat_buffer = self.kv_buffer[layer_id].reshape(-1)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                byte_indices = self._token_byte_indices(chunk_indices)
+                kv_cache_cpu[-1].append(
+                    flat_buffer[byte_indices]
+                    .reshape(len(chunk_indices), bytes_per_token)
+                    .to("cpu", non_blocking=True)
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            flat_buffer = self.kv_buffer[layer_id].reshape(-1)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                cpu_data = kv_cache_cpu[layer_id][i // chunk_size]
+                assert cpu_data.shape[0] == len(chunk_indices)
+                byte_indices = self._token_byte_indices(chunk_indices)
+                flat_buffer[byte_indices] = cpu_data.to(
+                    self.device, non_blocking=True
+                ).reshape(-1)
+        current_platform.synchronize()
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
@@ -382,6 +434,60 @@ class DeepSeekV4IndexerPool(KVCache):
             page_size=self.page_size,
             type="indexer",
         )
+
+    def _bytes_per_token(self) -> int:
+        page_bytes = self.index_k_with_scale_buffer[0].shape[1]
+        assert page_bytes % self.page_size == 0
+        return page_bytes // self.page_size
+
+    def _token_byte_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        bytes_per_token = self._bytes_per_token()
+        page_bytes = self.index_k_with_scale_buffer[0].shape[1]
+        byte_offsets = torch.arange(bytes_per_token, device=self.device)
+        pages = indices // self.page_size
+        offsets = (indices % self.page_size) * bytes_per_token
+        return (
+            pages[:, None] * page_bytes
+            + offsets[:, None]
+            + byte_offsets[None, :]
+        ).reshape(-1)
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        bytes_per_token = self._bytes_per_token()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            flat_buffer = self.index_k_with_scale_buffer[layer_id].reshape(-1)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                byte_indices = self._token_byte_indices(chunk_indices)
+                kv_cache_cpu[-1].append(
+                    flat_buffer[byte_indices]
+                    .reshape(len(chunk_indices), bytes_per_token)
+                    .to("cpu", non_blocking=True)
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            flat_buffer = self.index_k_with_scale_buffer[layer_id].reshape(-1)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                cpu_data = kv_cache_cpu[layer_id][i // chunk_size]
+                assert cpu_data.shape[0] == len(chunk_indices)
+                byte_indices = self._token_byte_indices(chunk_indices)
+                flat_buffer[byte_indices] = cpu_data.to(
+                    self.device, non_blocking=True
+                ).reshape(-1)
+        current_platform.synchronize()
 
 
 class DeepSeekV4LayerItem(NamedTuple):
@@ -778,6 +884,208 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
+
+    def _compressed_indices_from_full(
+        self, indices: torch.Tensor, compress_ratio: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mask = (indices + 1) % compress_ratio == 0
+        return mask, (indices[mask] // compress_ratio).to(torch.int64)
+
+    def _compressed_indices_from_mask(
+        self,
+        indices: torch.Tensor,
+        compress_ratio: int,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = mask.to(device=indices.device)
+        target_mask = (indices + 1) % compress_ratio == 0
+        if not torch.equal(mask, target_mask):
+            raise RuntimeError(
+                "DSV4 KV offload/load compression boundary mismatch: "
+                f"ratio={compress_ratio}, saved={int(mask.sum().item())}, "
+                f"target={int(target_mask.sum().item())}."
+            )
+        return (indices[mask] // compress_ratio).to(torch.int64)
+
+    def _compress_state_locs_from_full(
+        self, indices: torch.Tensor, compress_ratio: int
+    ) -> torch.Tensor:
+        swa_loc = self.translate_loc_from_full_to_swa(indices).to(torch.int64)
+        swa_loc = swa_loc[swa_loc > 0]
+        if swa_loc.numel() == 0:
+            return swa_loc
+
+        ring_size = self.get_ring_size(compress_ratio)
+        swa_pages = swa_loc // self.swa_page_size
+        state_locs = (
+            swa_pages * ring_size + (swa_loc % ring_size)
+        ) // compress_ratio
+        return torch.unique(state_locs.to(torch.int64), sorted=True)
+
+    def _copy_compress_state_pools(
+        self,
+        state_locs: torch.Tensor,
+        state_pools: List[Optional[CompressStatePool]],
+        compress_ratio: int,
+    ) -> List[Optional[torch.Tensor]]:
+        copied_states: List[Optional[torch.Tensor]] = []
+        for layer_id, pool in enumerate(state_pools):
+            if (
+                pool is None
+                or self.compression_ratios[layer_id] != compress_ratio
+                or state_locs.numel() == 0
+            ):
+                copied_states.append(None)
+                continue
+            copied_states.append(
+                pool.kv_score_buffer.kv_score[state_locs].to(
+                    "cpu", non_blocking=True
+                )
+            )
+        return copied_states
+
+    def _load_compress_state_pools(
+        self,
+        copied_states: List[Optional[torch.Tensor]],
+        state_locs: torch.Tensor,
+        state_pools: List[Optional[CompressStatePool]],
+        compress_ratio: int,
+    ) -> None:
+        for layer_id, (copied_state, pool) in enumerate(zip(copied_states, state_pools)):
+            if (
+                copied_state is None
+                or pool is None
+                or self.compression_ratios[layer_id] != compress_ratio
+            ):
+                continue
+            if state_locs.numel() != copied_state.shape[0]:
+                raise RuntimeError(
+                    "DSV4 KV offload/load state location mismatch: "
+                    f"saved={copied_state.shape[0]}, target={state_locs.numel()}."
+                )
+            pool.set_state_by_state_loc(
+                state_locs, KVAndScore(copied_state.to(self.device, non_blocking=True))
+            )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        indices = indices.to(device=self.device, dtype=torch.int64)
+
+        swa_indices = self.translate_loc_from_full_to_swa(indices).to(torch.int64)
+        swa_mask = swa_indices > 0
+        swa_kv_cpu = (
+            self.swa_kv_pool.get_cpu_copy(swa_indices[swa_mask])
+            if torch.any(swa_mask)
+            else None
+        )
+
+        c4_mask, c4_indices = self._compressed_indices_from_full(indices, 4)
+        c128_mask, c128_indices = self._compressed_indices_from_full(indices, 128)
+
+        c4_kv_cpu = None
+        if not isinstance(self.c4_kv_pool, HiSparseC4DevicePool):
+            c4_kv_cpu = (
+                self.c4_kv_pool.get_cpu_copy(c4_indices)
+                if c4_indices.numel() > 0
+                else None
+            )
+        c4_indexer_cpu = (
+            self.c4_indexer_kv_pool.get_cpu_copy(c4_indices)
+            if c4_indices.numel() > 0
+            else None
+        )
+        c128_kv_cpu = (
+            self.c128_kv_pool.get_cpu_copy(c128_indices)
+            if c128_indices.numel() > 0
+            else None
+        )
+
+        c4_state_locs = self._compress_state_locs_from_full(indices, 4)
+        c128_state_locs = self._compress_state_locs_from_full(indices, 128)
+        c4_attention_states = self._copy_compress_state_pools(
+            c4_state_locs, self.compress_state_pools, 4
+        )
+        c4_indexer_states = self._copy_compress_state_pools(
+            c4_state_locs, self.indexer_compress_state_pools, 4
+        )
+        c128_attention_states = self._copy_compress_state_pools(
+            c128_state_locs, self.compress_state_pools, 128
+        )
+
+        current_platform.synchronize()
+        return {
+            "length": len(indices),
+            "swa": swa_kv_cpu,
+            "swa_mask": swa_mask.cpu(),
+            "c4": c4_kv_cpu,
+            "c4_indexer": c4_indexer_cpu,
+            "c4_mask": c4_mask.cpu(),
+            "c4_attention_states": c4_attention_states,
+            "c4_indexer_states": c4_indexer_states,
+            "c128": c128_kv_cpu,
+            "c128_mask": c128_mask.cpu(),
+            "c128_attention_states": c128_attention_states,
+        }
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        if len(indices) != kv_cache_cpu["length"]:
+            raise RuntimeError(
+                "DSV4 KV offload/load length mismatch: "
+                f"saved={kv_cache_cpu['length']}, target={len(indices)}."
+            )
+
+        swa_kv_cpu = kv_cache_cpu["swa"]
+        swa_indices = self.translate_loc_from_full_to_swa(indices).to(torch.int64)
+        old_swa_mask = kv_cache_cpu["swa_mask"].to(device=indices.device)
+        new_swa_mask = swa_indices > 0
+        if not torch.equal(old_swa_mask, new_swa_mask):
+            raise RuntimeError(
+                "DSV4 KV offload/load SWA mapping mismatch: "
+                f"saved={int(old_swa_mask.sum().item())}, "
+                f"target={int(new_swa_mask.sum().item())}."
+            )
+        if swa_kv_cpu is not None:
+            self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices[old_swa_mask])
+
+        c4_indices = self._compressed_indices_from_mask(
+            indices, 4, kv_cache_cpu["c4_mask"]
+        )
+        c128_indices = self._compressed_indices_from_mask(
+            indices, 128, kv_cache_cpu["c128_mask"]
+        )
+
+        if kv_cache_cpu["c4"] is not None:
+            self.c4_kv_pool.load_cpu_copy(kv_cache_cpu["c4"], c4_indices)
+        if kv_cache_cpu["c4_indexer"] is not None:
+            self.c4_indexer_kv_pool.load_cpu_copy(
+                kv_cache_cpu["c4_indexer"], c4_indices
+            )
+        if kv_cache_cpu["c128"] is not None:
+            self.c128_kv_pool.load_cpu_copy(kv_cache_cpu["c128"], c128_indices)
+
+        c4_state_locs = self._compress_state_locs_from_full(indices, 4)
+        c128_state_locs = self._compress_state_locs_from_full(indices, 128)
+        self._load_compress_state_pools(
+            kv_cache_cpu["c4_attention_states"],
+            c4_state_locs,
+            self.compress_state_pools,
+            4,
+        )
+        self._load_compress_state_pools(
+            kv_cache_cpu["c4_indexer_states"],
+            c4_state_locs,
+            self.indexer_compress_state_pools,
+            4,
+        )
+        self._load_compress_state_pools(
+            kv_cache_cpu["c128_attention_states"],
+            c128_state_locs,
+            self.compress_state_pools,
+            128,
+        )
+        current_platform.synchronize()
 
     def set_swa_key_buffer_radix(
         self,
