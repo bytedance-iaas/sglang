@@ -680,9 +680,9 @@ class DeepseekV4AttnBackend(
                     use_prefill_cuda_graph=use_graph_plan,
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
-        c4_compress_metadata = create(compress_ratio=4)
         c128_compress_metadata = create(compress_ratio=128)
         return DSV4Metadata(
+            core_attn_metadata,
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=c4_compress_metadata,
