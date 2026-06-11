@@ -81,10 +81,14 @@ SGL_DEVICE uint32_t extract_exact_bin(float x) {
 }
 
 SGL_DEVICE void trivial_transform(const TransformParams& params, uint32_t length, uint32_t K) {
-  if (const auto tx = threadIdx.x; tx < length) {
-    params.write(tx, tx);
-  } else if (tx < K) {
-    params.indices_out[tx] = -1;
+  // K may exceed kBlockSize, so loop until we cover all K positions.
+  for (uint32_t base = 0; base < K; base += kBlockSize) {
+    const uint32_t tx = base + threadIdx.x;
+    if (tx < length) {
+      params.write(tx, tx);
+    } else if (tx < K) {
+      params.indices_out[tx] = -1;
+    }
   }
 }
 
