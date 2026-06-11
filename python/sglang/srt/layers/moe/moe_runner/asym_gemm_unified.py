@@ -74,8 +74,6 @@ def _check_convertible(layer: torch.nn.Module) -> str | None:
         return f"activation {layer.moe_runner_config.activation!r} != 'silu'"
     if w13.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
         return f"weights are {w13.dtype}/{w2.dtype}, need bfloat16"
-    if w13.is_cuda or w2.is_cuda:
-        return "weights are not host-resident"
     if layer.moe_ep_size > 1:
         return "expert parallelism is not supported yet"
     if getattr(layer, "num_fused_shared_experts", 0):
@@ -117,8 +115,17 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
 
     from asym_gemm.unified_moe import Layer as UnifiedMoeLayer
 
+    # The default loader's device_loading_context temporarily moves the
+    # pinned-CPU masters onto the GPU while process_weights_after_loading
+    # runs (and restores them afterwards). The unified layer quantizes from
+    # host memory and keeps its own pinned INT8 copies, so take a transient
+    # host copy here when needed.
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
+    if w13.is_cuda:
+        w13 = w13.to("cpu")
+    if w2.is_cuda:
+        w2 = w2.to("cpu")
     inter = w13.shape[1] // 2
 
     # sglang's silu_and_mul convention: first half of w13 is gate, second up.
@@ -141,6 +148,45 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
         inter,
         unified_layer.m_cpu,
     )
+    _maybe_warm_bf16_fallback_kernels(w13.shape[0], w13.shape[2], inter)
+
+
+_warmed_fallback_shapes = set()
+
+
+def _maybe_warm_bf16_fallback_kernels(
+    num_experts: int, hidden: int, inter: int
+) -> None:
+    """Pre-warm the BF16 asym kernels the capture-time fallback will run.
+
+    Piecewise CUDA graph capture replays the existing BF16 asym path (the
+    unified kernel cannot be captured). With the unified path serving all
+    eager forwards, the BF16 kernels would otherwise first run *inside*
+    capture, where the asym JIT ensure-compiled step's stream synchronize is
+    illegal. Run that step here, outside capture, for this layer's shapes.
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        if get_global_server_args().disable_piecewise_cuda_graph:
+            return
+    except ValueError:
+        pass  # no global server args (unit tests) — warming is harmless
+
+    from sglang.srt.layers.asym_gemm_wrapper import compile_utils
+
+    # (n, k) of the two grouped GEMMs in AsymGemmBf16RunnerCore._run_masked_gemm
+    for n, k in ((2 * inter, hidden), (hidden, inter)):
+        key = (n, k, num_experts)
+        if key in _warmed_fallback_shapes:
+            continue
+        _warmed_fallback_shapes.add(key)
+        compile_utils._maybe_compile_asym_gemm_one_type_all(
+            compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED,
+            n,
+            k,
+            num_experts,
+        )
 
 
 _warned_graph_capture = False
