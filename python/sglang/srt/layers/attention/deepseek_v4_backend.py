@@ -89,10 +89,18 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
 
 
 def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
+    actual_forward_mode = getattr(
+        forward_batch, "actual_forward_mode", forward_batch.forward_mode
+    )
+    if actual_forward_mode.is_idle():
+        return 0
+
     spec_info = getattr(forward_batch, "spec_info", None)
     draft_token_num = getattr(spec_info, "draft_token_num", 0)
     draft_token = getattr(spec_info, "draft_token", None)
-    if draft_token is None or draft_token_num <= 0:
+    if draft_token is None:
+        return forward_batch.batch_size
+    if draft_token_num <= 0:
         return 0
     draft_count = len(draft_token)
     if draft_count % draft_token_num != 0:
