@@ -5,6 +5,7 @@
 
 #include "common.cuh"
 #include "ptx.cuh"
+#include <bit>
 #include <cooperative_groups.h>
 #include <cstdint>
 
@@ -21,7 +22,9 @@ struct ClusterTopK {
   static constexpr uint32_t kNumStages = 4;
   static constexpr uint32_t kMaxLength = kClusterSize * kNumStages * kSizePerStage;
   static constexpr uint32_t kStoreLane = kBlockSize - 1;
-  static constexpr uint32_t kAboveBits = 11;
+  // kAboveBits must satisfy (1 << kAboveBits) - 1 >= K so the packed
+  // (local_equal << kAboveBits) | local_above field can hold prefix_above < K.
+  static constexpr uint32_t kAboveBits = std::bit_width(K);
 
   // ---------------------------------------------------------------------------
   // Shared memory layouts
