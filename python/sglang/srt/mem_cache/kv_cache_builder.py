@@ -170,6 +170,9 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    is_dsv4_hisparse = server_args.enable_hisparse and is_deepseek_v4(
+        model_config.hf_config
+    )
 
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
@@ -187,7 +190,7 @@ def build_kv_cache(
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
     ):
-        if is_hybrid_swa:
+        if is_hybrid_swa and not is_dsv4_hisparse:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
                 "with sliding window attention (SWA) models"
@@ -201,9 +204,6 @@ def build_kv_cache(
     effective_chunked_prefill_size = server_args.chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
-    is_dsv4_hisparse = server_args.enable_hisparse and is_deepseek_v4(
-        model_config.hf_config
-    )
     enable_hisparse_unified_radix = (
         server_args.enable_hisparse
         and not disable_radix_cache

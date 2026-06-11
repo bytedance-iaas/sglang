@@ -3656,19 +3656,35 @@ class ServerArgs:
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
+                is_dsv4_hisparse_decode = False
                 if self.enable_hisparse:
+                    try:
+                        from sglang.srt.configs.model_config import is_deepseek_v4
+
+                        hf_config = self.get_model_config().hf_config
+                        is_dsv4_hisparse_decode = is_deepseek_v4(hf_config)
+                    except Exception:
+                        is_dsv4_hisparse_decode = False
+                if self.enable_hisparse and not is_dsv4_hisparse_decode:
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with --enable-hisparse"
                     )
-                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+                if is_dsv4_hisparse_decode:
+                    supported_transfer_backends = ("mooncake",)
+                else:
+                    supported_transfer_backends = ("nixl", "mooncake")
+                if self.disaggregation_transfer_backend not in supported_transfer_backends:
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache currently "
                         "requires --disaggregation-transfer-backend in "
-                        "('nixl', 'mooncake'), but got "
+                        f"{supported_transfer_backends}, but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
-                if self.speculative_algorithm is not None:
+                if (
+                    self.speculative_algorithm is not None
+                    and not is_dsv4_hisparse_decode
+                ):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with speculative decoding "

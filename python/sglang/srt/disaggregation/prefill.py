@@ -337,6 +337,15 @@ class PrefillBootstrapQueue:
             # if decode has a cached prefix, we need to send the delta indices
             # otherwise, send the entire request
             decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            if decode_prefix_len < 0 or decode_prefix_len > num_kv_indices:
+                logger.warning(
+                    "Clamping invalid decode_prefix_len for req %s: "
+                    "decode_prefix_len=%d, num_kv_indices=%d",
+                    req.rid,
+                    decode_prefix_len,
+                    num_kv_indices,
+                )
+                decode_prefix_len = min(max(decode_prefix_len, 0), num_kv_indices)
             req.start_send_idx = decode_prefix_len
             num_kv_indices_to_send = num_kv_indices - decode_prefix_len
             num_pages = kv_to_page_num(

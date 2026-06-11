@@ -51,6 +51,12 @@ class HiSparseStagingBackup(NamedTuple):
     indexer_ranges: Optional[List[Tuple[int, int, int]]] = None
 
 
+class DSV4C4PrefixEntry:
+    def __init__(self, host_indices: torch.Tensor):
+        self.host_indices = host_indices
+        self.ref_count = 0
+
+
 class DSV4C4PrefixCache:
     """Host-prefix cache for DSV4 C4 slots.
 
@@ -64,7 +70,8 @@ class DSV4C4PrefixCache:
         self.compress_ratio = compress_ratio
         self.device = device
         self.enabled = False
-        self.cache: Dict[Tuple[Optional[str], Tuple[int, ...]], torch.Tensor] = {}
+        self.cache: Dict[Tuple[Optional[str], Tuple[int, ...]], DSV4C4PrefixEntry] = {}
+        self.req_refs: Dict[int, Tuple[Tuple[Optional[str], Tuple[int, ...]], int]] = {}
 
     def enable(self) -> None:
         self.enabled = True
@@ -94,13 +101,26 @@ class DSV4C4PrefixCache:
         token_ids = self.prefix_token_ids(req)
         req_token_len = min(len(token_ids), self.full_token_len(c4_len))
         req_tokens = tuple(token_ids[:req_token_len])
+        exact_key = (req.extra_key, req_tokens)
+        exact_entry = self.cache.get(exact_key)
+        if exact_entry is not None:
+            exact_c4_len = min(c4_len, len(exact_entry.host_indices))
+            return (
+                exact_c4_len,
+                exact_key,
+                exact_entry.host_indices[:exact_c4_len].to(
+                    self.device, non_blocking=True
+                ),
+            )
+
         best_key = None
         best_indices = None
         best_c4_len = 0
-        for key, host_indices in self.cache.items():
+        for key, entry in self.cache.items():
             extra_key, token_key = key
             if extra_key != req.extra_key:
                 continue
+            host_indices = entry.host_indices
             max_full_len = min(
                 len(token_key),
                 len(req_tokens),
@@ -126,6 +146,102 @@ class DSV4C4PrefixCache:
             return 0, None, torch.empty(0, dtype=torch.int64, device=self.device)
         return best_c4_len, best_key, best_indices.to(self.device, non_blocking=True)
 
+    def indices(
+        self,
+        key: Tuple[Optional[str], Tuple[int, ...]],
+        c4_len: int,
+    ) -> torch.Tensor:
+        entry = self.cache[key]
+        return entry.host_indices[:c4_len].to(self.device, non_blocking=True)
+
+    def acquire(
+        self,
+        req_pool_idx: int,
+        key: Optional[Tuple[Optional[str], Tuple[int, ...]]],
+        c4_len: int,
+    ) -> bool:
+        if key is None or c4_len <= 0 or key not in self.cache:
+            return False
+
+        old_ref = self.req_refs.get(req_pool_idx)
+        if old_ref == (key, c4_len):
+            return True
+        if old_ref is not None:
+            self.release_req(req_pool_idx)
+
+        self.cache[key].ref_count += 1
+        self.req_refs[req_pool_idx] = (key, c4_len)
+        return True
+
+    def release_req(self, req_pool_idx: int) -> None:
+        old_ref = self.req_refs.pop(req_pool_idx, None)
+        if old_ref is None:
+            return
+
+        key, _ = old_ref
+        entry = self.cache.get(key)
+        if entry is not None:
+            entry.ref_count = max(0, entry.ref_count - 1)
+
+    def retain_req_ref(
+        self, req_pool_idx: int
+    ) -> Optional[Tuple[Tuple[Optional[str], Tuple[int, ...]], int]]:
+        old_ref = self.req_refs.get(req_pool_idx)
+        if old_ref is None:
+            return None
+
+        key, _ = old_ref
+        entry = self.cache.get(key)
+        if entry is None:
+            return None
+
+        entry.ref_count += 1
+        return old_ref
+
+    def release_retained(
+        self, retained_ref: Optional[Tuple[Tuple[Optional[str], Tuple[int, ...]], int]]
+    ) -> None:
+        if retained_ref is None:
+            return
+
+        key, _ = retained_ref
+        entry = self.cache.get(key)
+        if entry is not None:
+            entry.ref_count = max(0, entry.ref_count - 1)
+
+    def evict_unref(self, need_tokens: int) -> torch.Tensor:
+        if need_tokens <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+
+        freed_indices = []
+        freed_tokens = 0
+        for key in list(self.cache.keys()):
+            entry = self.cache[key]
+            if entry.ref_count > 0:
+                continue
+            candidate_indices = torch.unique(entry.host_indices)
+            del self.cache[key]
+
+            if self.cache:
+                remaining_indices = torch.unique(
+                    torch.cat([x.host_indices for x in self.cache.values()])
+                )
+                candidate_indices = candidate_indices[
+                    ~torch.isin(candidate_indices, remaining_indices)
+                ]
+
+            if candidate_indices.numel() > 0:
+                freed_indices.append(candidate_indices)
+                freed_tokens += int(candidate_indices.numel())
+            if freed_tokens >= need_tokens:
+                break
+
+        if not freed_indices:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        return torch.unique(torch.cat(freed_indices)).to(
+            device=self.device, non_blocking=True
+        )
+
     def insert(
         self,
         req: Req,
@@ -149,7 +265,7 @@ class DSV4C4PrefixCache:
             )
             return False
 
-        self.cache[key] = host_indices.detach().clone()
+        self.cache[key] = DSV4C4PrefixEntry(host_indices.detach().clone())
         logger.debug(
             "DSV4 C4 host-prefix cache insert: req=%s c4_len=%d full_tokens=%d",
             req.rid,
@@ -346,6 +462,58 @@ class HiSparseCoordinator:
     def _insert_c4_host_prefix(self, req: Req, c4_len: int) -> bool:
         return self._c4_prefix_cache.insert(req, c4_len, self.req_to_host_pool)
 
+    def _prompt_c4_len(self, req: Req) -> int:
+        prompt_len = len(req.origin_input_ids)
+        if prompt_len <= 0 and getattr(req, "fill_ids", None):
+            prompt_len = len(req.fill_ids)
+        return min(
+            self._host_token_len(prompt_len),
+            self.req_to_host_pool.shape[1],
+        )
+
+    def _publish_dsv4_c4_host_prompt_prefix(self, req: Req) -> int:
+        if not self.is_dsv4_hisparse:
+            return 0
+
+        prompt_c4_len = self._prompt_c4_len(req)
+        if prompt_c4_len <= 0:
+            return 0
+
+        written_len = self._req_c4_written_len.get(req.req_pool_idx, 0)
+        prefix_len = min(prompt_c4_len, written_len)
+        if prefix_len <= 0:
+            return 0
+
+        key = self._c4_prefix_cache.key(req, prefix_len)
+        key_exists = self._c4_prefix_cache.contains(req, prefix_len)
+        current_prefix = self.req_to_host_pool[req.req_pool_idx, :prefix_len]
+
+        if key_exists:
+            canonical_indices = self._c4_prefix_cache.indices(key, prefix_len)
+        else:
+            if not self._insert_c4_host_prefix(req, prefix_len):
+                return 0
+            canonical_indices = self._c4_prefix_cache.indices(key, prefix_len)
+
+        if key_exists and not torch.equal(current_prefix, canonical_indices):
+            current_indices = current_prefix[current_prefix >= 0]
+            current_unique = torch.unique(current_indices)
+            canonical_unique = torch.unique(canonical_indices)
+            duplicate_indices = current_unique[
+                ~torch.isin(current_unique, canonical_unique)
+            ]
+            if duplicate_indices.numel() > 0:
+                self.mem_pool_host.free(duplicate_indices)
+        self.req_to_host_pool[req.req_pool_idx, :prefix_len] = canonical_indices
+        if not self._c4_prefix_cache.acquire(req.req_pool_idx, key, prefix_len):
+            return 0
+
+        self._req_c4_prefix_len[req.req_pool_idx] = max(
+            self._req_c4_prefix_len.get(req.req_pool_idx, 0),
+            prefix_len,
+        )
+        return prefix_len
+
     def restore_dsv4_c4_host_prefix_for_req(self, req: Req, c4_len: int) -> int:
         """Populate req_to_host_pool from the C4-only prefix cache.
 
@@ -357,7 +525,9 @@ class HiSparseCoordinator:
             req.hisparse_c4_transfer_prefix_len = 0
             return 0
 
-        prefix_len, _, prefix_host_indices = self._match_c4_host_prefix(req, c4_len)
+        prefix_len, prefix_key, prefix_host_indices = self._match_c4_host_prefix(
+            req, c4_len
+        )
         if prefix_len <= 0:
             req.hisparse_c4_transfer_prefix_len = 0
             return 0
@@ -365,6 +535,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :prefix_len] = prefix_host_indices[
             :prefix_len
         ]
+        self._c4_prefix_cache.acquire(req.req_pool_idx, prefix_key, prefix_len)
         self._req_c4_prefix_len[req.req_pool_idx] = prefix_len
         req.hisparse_c4_transfer_prefix_len = prefix_len
         logger.debug(
@@ -392,13 +563,14 @@ class HiSparseCoordinator:
         self, req: Req, device_indices: torch.Tensor
     ) -> HiSparseStagingBackup:
         prefill_len = len(device_indices)
-        prefix_len, _, prefix_host_indices = self._match_c4_host_prefix(
+        prefix_len, prefix_key, prefix_host_indices = self._match_c4_host_prefix(
             req, prefill_len
         )
         if prefix_len > 0:
             self.req_to_host_pool[req.req_pool_idx, :prefix_len] = (
                 prefix_host_indices[:prefix_len]
             )
+            self._c4_prefix_cache.acquire(req.req_pool_idx, prefix_key, prefix_len)
             logger.debug(
                 "DSV4 C4 host-prefix hit: req=%s c4_prefix_len=%d c4_total_len=%d",
                 req.rid,
@@ -510,13 +682,13 @@ class HiSparseCoordinator:
         return written_len
 
     def _release_or_cache_dsv4_c4_host_slots(self, req: Req) -> None:
-        written_len = self._req_c4_written_len.get(req.req_pool_idx, 0)
-        key_already_cached = self._c4_prefix_cache.contains(req, written_len)
-        cached = self._insert_c4_host_prefix(req, written_len)
-        keep_host_len = (
-            written_len
-            if cached and not key_already_cached
-            else self._req_c4_prefix_len.get(req.req_pool_idx, 0)
+        # Only the prompt C4 mirror is reusable across benchmark requests.  The
+        # generated C4 suffix is request-specific; caching it keeps host slots
+        # alive without improving admission for the next request.
+        published_len = self._publish_dsv4_c4_host_prompt_prefix(req)
+        keep_host_len = max(
+            published_len,
+            self._req_c4_prefix_len.get(req.req_pool_idx, 0),
         )
         self._free_request_host_indices_from(req, keep_host_len)
 
@@ -532,6 +704,7 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(torch.unique(host_indices))
 
     def _clear_c4_prefix_req_state(self, req_pool_idx: int) -> None:
+        self._c4_prefix_cache.release_req(req_pool_idx)
         self._req_c4_prefix_len.pop(req_pool_idx, None)
         self._req_c4_written_len.pop(req_pool_idx, None)
         self._req_host_written_len.pop(req_pool_idx, None)
@@ -569,6 +742,12 @@ class HiSparseCoordinator:
                 self.host_radix_cache.evict_host_if_needed(
                     self.mem_pool_host, num_missing_pages * self.page_size
                 )
+            elif self.is_dsv4_hisparse:
+                need_tokens = num_missing_pages * self.page_size
+                evict_tokens = need_tokens - self.mem_pool_host.available_size()
+                evicted_indices = self._c4_prefix_cache.evict_unref(evict_tokens)
+                if evicted_indices.numel() > 0:
+                    self.mem_pool_host.free(evicted_indices)
             host_locs = self.mem_pool_host.alloc(num_missing_pages * self.page_size)
             if host_locs is None:
                 logger.error(
@@ -726,6 +905,7 @@ class HiSparseCoordinator:
                 ),
             )
             self._req_c4_written_len[req.req_pool_idx] = host_len
+            self._publish_dsv4_c4_host_prompt_prefix(req)
         if self.host_radix_cache is not None:
             self._req_host_written_len[req.req_pool_idx] = host_len
         logger.debug("HiSparse: admitting request %s directly", req.rid)
@@ -757,7 +937,7 @@ class HiSparseCoordinator:
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
-            allocated_len = len(req.fill_ids)
+            allocated_len = req.kv_allocated_len or len(req.fill_ids)
             alloc_size = self.padded_buffer_size
         else:
             allocated_len = req.kv_allocated_len
@@ -934,9 +1114,7 @@ class HiSparseCoordinator:
             if self.host_radix_cache is not None:
                 self._insert_prefill_into_radix_cache(req)
             else:
-                self._insert_c4_host_prefix(
-                    req, self._req_c4_written_len.get(req.req_pool_idx, 0)
-                )
+                self._publish_dsv4_c4_host_prompt_prefix(req)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
@@ -1628,6 +1806,172 @@ class HiSparseCoordinator:
         self._clear_c4_prefix_req_state(req.req_pool_idx)
         req.hisparse_staging = False
 
+    def _clear_request_runtime_state(self, req_pool_idx: int) -> None:
+        self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
+        self.req_to_device_buffer[req_pool_idx, :] = 0
+        self.req_device_buffer_size[req_pool_idx] = 0
+        self.req_draft_buffer_size[req_pool_idx] = 0
+        self.req_to_host_pool[req_pool_idx, :] = -1
+        self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req_pool_idx] = False
+
+    def retract_decode_req(self, req: Req) -> None:
+        """Detach DSV4 HiSparse request state without treating the request as done.
+
+        Decode retraction is a cold OOM recovery path.  Unlike
+        request_finished(), it must preserve the authoritative C4 host mirror so
+        the request can resume later without a new PD transfer.
+        """
+        if not self.is_dsv4_hisparse:
+            self.retract_req(req)
+            return
+
+        if req.hisparse_staging:
+            self.abort_staging_request(req)
+            return
+
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+
+        req_pool_idx = req.req_pool_idx
+        host_len = self._host_token_len(req.kv_allocated_len)
+        host_indices = self.req_to_host_pool[req_pool_idx, :host_len]
+        if host_len > 0 and torch.any(host_indices < 0):
+            raise RuntimeError(
+                "Cannot retract DSV4 HiSparse request with incomplete C4 host "
+                f"mirror: req={req.rid}, host_len={host_len}."
+            )
+
+        req.hisparse_retract_host_indices = host_indices.detach().clone()
+        req.hisparse_retract_host_len = host_len
+        c4_prefix_ref = self._c4_prefix_cache.retain_req_ref(req_pool_idx)
+        c4_prefix_len = self._req_c4_prefix_len.get(req_pool_idx, 0)
+        if c4_prefix_ref is None:
+            c4_prefix_len = 0
+        req.hisparse_retract_c4_prefix_len = c4_prefix_len
+        req.hisparse_retract_c4_written_len = self._req_c4_written_len.get(
+            req_pool_idx, host_len
+        )
+        req.hisparse_retract_host_written_len = self._req_host_written_len.get(
+            req_pool_idx, 0
+        )
+        req.hisparse_retract_c4_prefix_ref = c4_prefix_ref
+
+        self._free_device_buffer_slots(req)
+
+        allocated_len = req.kv_allocated_len
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, :allocated_len
+        ]
+        if allocated_locs.numel() > 0:
+            compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                allocated_locs
+            )
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
+
+        self._clear_request_runtime_state(req_pool_idx)
+        self._clear_c4_prefix_req_state(req_pool_idx)
+        self._req_host_written_len.pop(req_pool_idx, None)
+        req.hisparse_staging = False
+
+    def restore_retracted_decode_req(self, req: Req) -> bool:
+        """Restore DSV4 HiSparse host/device side state saved by retraction."""
+        if not self.is_dsv4_hisparse:
+            return False
+
+        host_indices = getattr(req, "hisparse_retract_host_indices", None)
+        if host_indices is None:
+            return False
+
+        req_pool_idx = req.req_pool_idx
+        host_len = int(getattr(req, "hisparse_retract_host_len", len(host_indices)))
+        if host_len > self.req_to_host_pool.shape[1]:
+            raise RuntimeError(
+                "DSV4 HiSparse retracted host state is larger than req host row: "
+                f"req={req.rid}, host_len={host_len}, "
+                f"row={self.req_to_host_pool.shape[1]}."
+            )
+
+        self.req_to_host_pool[req_pool_idx, :] = -1
+        if host_len > 0:
+            self.req_to_host_pool[req_pool_idx, :host_len] = host_indices[
+                :host_len
+            ].to(device=self.device, non_blocking=True)
+
+        self._req_c4_prefix_len[req_pool_idx] = min(
+            int(getattr(req, "hisparse_retract_c4_prefix_len", 0)), host_len
+        )
+        self._req_c4_written_len[req_pool_idx] = min(
+            int(getattr(req, "hisparse_retract_c4_written_len", host_len)),
+            host_len,
+        )
+        host_written_len = int(getattr(req, "hisparse_retract_host_written_len", 0))
+        if host_written_len > 0:
+            self._req_host_written_len[req_pool_idx] = min(host_written_len, host_len)
+
+        self.alloc_device_buffer(req)
+        if host_len <= self.device_buffer_size:
+            self._preload_to_device_buffer(req)
+        else:
+            self.req_device_buffer_tokens[
+                :, req_pool_idx, : self.device_buffer_size
+            ] = -1
+
+        self._skip_first_backup[req_pool_idx] = True
+        self._publish_dsv4_c4_host_prompt_prefix(req)
+        self._c4_prefix_cache.release_retained(
+            getattr(req, "hisparse_retract_c4_prefix_ref", None)
+        )
+        req.hisparse_staging = False
+
+        for attr in (
+            "hisparse_retract_host_indices",
+            "hisparse_retract_host_len",
+            "hisparse_retract_c4_prefix_len",
+            "hisparse_retract_c4_written_len",
+            "hisparse_retract_host_written_len",
+            "hisparse_retract_c4_prefix_ref",
+        ):
+            if hasattr(req, attr):
+                delattr(req, attr)
+        return True
+
+    def release_retracted_decode_req(self, req: Req) -> None:
+        """Free DSV4 HiSparse state for a request aborted while retracted."""
+        if not self.is_dsv4_hisparse:
+            return
+
+        host_indices = getattr(req, "hisparse_retract_host_indices", None)
+        if host_indices is None:
+            return
+
+        prefix_len = int(getattr(req, "hisparse_retract_c4_prefix_len", 0))
+        host_len = int(getattr(req, "hisparse_retract_host_len", len(host_indices)))
+        host_indices = host_indices[:host_len].to(device=self.device, non_blocking=True)
+        suffix_indices = host_indices[prefix_len:]
+        suffix_indices = suffix_indices[suffix_indices >= 0]
+        if suffix_indices.numel() > 0:
+            self.mem_pool_host.free(torch.unique(suffix_indices))
+
+        self._c4_prefix_cache.release_retained(
+            getattr(req, "hisparse_retract_c4_prefix_ref", None)
+        )
+
+        for attr in (
+            "hisparse_retract_host_indices",
+            "hisparse_retract_host_len",
+            "hisparse_retract_c4_prefix_len",
+            "hisparse_retract_c4_written_len",
+            "hisparse_retract_host_written_len",
+            "hisparse_retract_c4_prefix_ref",
+        ):
+            if hasattr(req, attr):
+                delattr(req, attr)
+
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
             self.abort_staging_request(req)
@@ -1643,9 +1987,9 @@ class HiSparseCoordinator:
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
         # extra slots may carry stale mapping entries pointing at buffer slots
-        # we just freed via free_hisparse_indices(all_hi). If left set, the
-        # subsequent release_kv_cache -> allocator.free -> free_hisparse path
-        # re-frees them (double-free into the page allocator's free list).
+        # we just freed via free_hisparse_indices(all_hi).  The C4 host prefix
+        # cache may be shared across requests, but the GPU hot buffer slots are
+        # request-owned, so clear the whole hot mapping range.
         allocated_len = req.kv_allocated_len
 
         self._free_device_buffer_slots(req)
@@ -1653,22 +1997,18 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :allocated_len
         ]
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            allocated_locs
-        )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+        if allocated_locs.numel() > 0:
+            compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                allocated_locs
+            )
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
 
         self._release_host_slots(req)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_draft_buffer_size[req.req_pool_idx] = 0
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
-        self._skip_first_backup[req.req_pool_idx] = False
+        self._clear_request_runtime_state(req.req_pool_idx)
         self._clear_c4_prefix_req_state(req.req_pool_idx)
 
     def _maybe_log_c4_swap_in_sample(
