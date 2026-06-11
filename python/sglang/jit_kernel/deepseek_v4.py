@@ -373,8 +373,14 @@ def topk_transform_512(
     )
 
 
-_WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
 _PLAN_METADATA_INTS_PER_BATCH = 4
+
+
+def _workspace_ints_per_batch(topk: int) -> int:
+    # Mirrors WorkSpace { uint2 metadata; Tie ties[kMaxTies]; } in topk/cluster.cuh,
+    # where kMaxTies = max(1024, SGL_TOPK) (Tie = 8 bytes = 2 ints).
+    k_max_ties = max(1024, topk)
+    return 2 + k_max_ties * 2
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
@@ -395,7 +401,9 @@ def topk_transform_512_v2(
 ) -> None:
     module = _jit_topk_v2_module(out_page_indices.shape[1])
     bs = scores.shape[0]
-    workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
+    workspace = seq_lens.new_empty(
+        bs, _workspace_ints_per_batch(out_page_indices.shape[1])
+    )
     module.topk_transform(
         scores,
         seq_lens,
