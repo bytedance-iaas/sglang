@@ -441,6 +441,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+            should_use_unified_asym_gemm_forward,
+            unified_asym_gemm_forward,
+        )
+
+        if should_use_unified_asym_gemm_forward(layer):
+            return unified_asym_gemm_forward(layer, dispatch_output)
+
         x = dispatch_output.hidden_states
 
         moe_runner_config = self.moe_runner_config

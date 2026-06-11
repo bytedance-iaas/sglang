@@ -141,3 +141,68 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
         inter,
         unified_layer.m_cpu,
     )
+
+
+_warned_graph_capture = False
+
+
+def should_use_unified_asym_gemm_forward(layer: torch.nn.Module) -> bool:
+    """Early-return guard for UnquantizedFusedMoEMethod.forward_cuda."""
+    if not has_unified_asym_gemm_layer(layer):
+        return False
+    # The CPU bucket does host-side work and device syncs, which cannot be
+    # captured into a CUDA graph. Fall back to the existing asym_gemm path
+    # (the BF16 masters are kept for exactly this) instead of crashing.
+    if torch.cuda.is_current_stream_capturing():
+        global _warned_graph_capture
+        if not _warned_graph_capture:
+            _warned_graph_capture = True
+            logger.warning(
+                "AsymGEMM unified MoE cannot run under CUDA graph capture; "
+                "using the existing asym_gemm path for captured graphs. "
+                "Run with --disable-cuda-graph to use the unified kernel "
+                "everywhere."
+            )
+        return False
+    return True
+
+
+def unified_asym_gemm_forward(
+    layer: torch.nn.Module,
+    dispatch_output: StandardDispatchOutput,
+) -> StandardCombineInput:
+    """Run one MoE layer through the unified CPU+GPU INT8 kernel.
+
+    The unified layer consumes raw router output and applies the routing
+    weights internally; only routed_scaling_factor is applied here, matching
+    post_permute_asym_gemm_to_standard.
+    """
+    from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+    hidden_states = dispatch_output.hidden_states
+    topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+    route_w = topk_weights.to(torch.float32)
+    # Padding / non-local slots carry expert_id < 0: zero their routing
+    # weight and clamp the index so the unified layer's per-expert token
+    # lists never see a negative id.
+    if topk_ids.dtype != torch.int64:
+        topk_ids = topk_ids.to(torch.int64)
+    route_w = torch.where(topk_ids < 0, torch.zeros_like(route_w), route_w)
+    expert_ids = topk_ids.clamp_min(0)
+
+    x = (
+        hidden_states
+        if hidden_states.dtype == torch.bfloat16
+        else hidden_states.to(torch.bfloat16)
+    )
+
+    unified_layer = getattr(layer, _UNIFIED_LAYER_ATTR)
+    output = unified_layer.forward(x, expert_ids, route_w)
+
+    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
+    if routed_scaling_factor is not None:
+        output *= routed_scaling_factor
+    if output.dtype != hidden_states.dtype:
+        output = output.to(hidden_states.dtype)
+    return StandardCombineInput(hidden_states=output)
