@@ -457,6 +457,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            # 重置 req_pool_indices 的 padding 区域，避免上一轮残留的脏 req-pool
+            # 索引被 captured graph 内的 req_to_token / SWA mapping gather 用作行
+            # 索引，进而触发 vectorized_gather_kernel 的 index out of bounds。
+            buffers.req_pool_indices.zero_()
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
