@@ -444,6 +444,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For Decode Context Parallel (DCP).
+    # Bool tensor of shape [num_tokens]; True at position i means the slot
+    # ``out_cache_loc[i]`` belongs to the current dcp rank and the writer
+    # kernel should actually persist this token's KV. Filled in ``init_new``
+    # only when ``model_runner.dcp_size > 1``; ``None`` otherwise.
+    dcp_kv_mask: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
@@ -661,6 +668,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ret.out_cache_loc
                 )
             )
+
+        # Precompute DCP write mask: each rank only persists kv for its slice
+        # of token positions (``out_cache_loc[i] % dcp_size == dcp_rank``).
+        dcp_size = getattr(model_runner, "dcp_size", 1)
+        if dcp_size > 1 and ret.out_cache_loc is not None:
+            dcp_rank = getattr(model_runner, "dcp_rank", 0)
+            ret.dcp_kv_mask = ret.out_cache_loc % dcp_size == dcp_rank
 
         # Init lora information
         if model_runner.server_args.enable_lora:
