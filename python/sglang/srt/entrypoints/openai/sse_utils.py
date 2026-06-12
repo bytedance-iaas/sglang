@@ -61,6 +61,7 @@ def build_sse_content(
     logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
+    complete_response: Optional[dict] = None,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -96,4 +97,8 @@ def build_sse_content(
         choices=[choice],
         usage=usage,
     )
+    if complete_response is not None:
+        from sglang.srt.openai_observability import accumulate_stream_items
+
+        accumulate_stream_items(chunk, complete_response)
     return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()
