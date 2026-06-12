@@ -58,6 +58,11 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_ENABLE_JIT_DEEPGEMM` | Enable Just-In-Time compilation of DeepGEMM kernels (enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) GPUs when the DeepGEMM package is installed; set to `"0"` to disable) | `"true"` |
 | `SGLANG_JIT_DEEPGEMM_PRECOMPILE` | Enable precompilation of DeepGEMM kernels | `"true"` |
+| `SGLANG_JIT_DEEPGEMM_USE_SHARED_PRECOMPILE_MARKER` | Coordinate DeepGEMM precompile through marker files under `SGLANG_DG_CACHE_DIR` so replicas sharing the same cache skip repeated all-M warmup once a source process or offline warmup has populated it | `"false"` |
+| `SGLANG_JIT_DEEPGEMM_SHARD_PRECOMPILE` | Shard DeepGEMM all-M precompile ownership across local TP ranks by shape so multiple GPUs can populate different cached shapes during startup | `"false"` |
+| `SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_RANK` | Override the local shard rank used by DeepGEMM sharded precompile and the lightweight warmup script | Not set |
+| `SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_SIZE` | Override the shard count used by DeepGEMM sharded precompile and the lightweight warmup script | Not set |
+| `SGLANG_JIT_DEEPGEMM_SHOW_PROGRESS` | Show tqdm progress for DeepGEMM all-M warmup. In sharded precompile mode, each shard rank uses a stable tqdm line position so multiple local ranks can display progress together. Set to `0` when the log collector does not render multi-line progress cleanly | `"true"` |
 | `SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS` | Number of workers for parallel DeepGEMM kernel compilation | `4` |
 | `SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE` | Indicator flag used during the DeepGEMM precompile script | `"false"` |
 | `SGLANG_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |

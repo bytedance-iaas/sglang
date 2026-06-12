@@ -2299,6 +2299,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and envs.SGLANG_JIT_DEEPGEMM_SHARD_PRECOMPILE.get()
+        ):
+            deep_gemm_wrapper.sync_deep_gemm_precompile_markers()
+
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 
