@@ -414,6 +414,7 @@ class MQALayer(nn.Module):
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
+            dcp_kv_mask=forward_batch.dcp_kv_mask,
         )
 
     def _compute_kv_bf16(

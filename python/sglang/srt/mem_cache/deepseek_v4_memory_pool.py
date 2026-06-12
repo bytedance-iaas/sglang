@@ -689,7 +689,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP (Decode Context Parallel) is not yet supported on DSv4 "
+                "set_swa_key_buffer; the writer kernel must be extended to "
+                "consume dcp_kv_mask in Phase 3."
+            )
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
         )
@@ -710,7 +717,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP (Decode Context Parallel) is not yet supported on DSv4 "
+                "set_extra_key_buffer; the writer kernel must be extended to "
+                "consume dcp_kv_mask in Phase 3."
+            )
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         compress_kv_pool.set_key_buffer(
@@ -745,7 +759,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP (Decode Context Parallel) is not yet supported on DSv4 "
+                "set_index_k_scale_buffer; the writer kernel must be extended "
+                "to consume dcp_kv_mask in Phase 3."
+            )
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         self.c4_indexer_kv_pool.set_index_k_scale_buffer(
@@ -769,7 +790,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         raw_loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP not yet supported on DSv4 set_swa_key_buffer_radix; "
+                "needs Phase 3 kernel-level mask integration."
+            )
         swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
@@ -784,7 +811,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         raw_loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP not yet supported on DSv4 set_swa_key_buffer_radix_fused; "
+                "needs Phase 3 kernel-level mask integration."
+            )
         if self._should_cache_swa:
             if layer_id == self.start_layer or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
@@ -804,7 +837,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP not yet supported on DSv4 "
+                "set_swa_key_buffer_radix_fused_norm_rope; needs Phase 3 "
+                "kernel-level mask integration."
+            )
         if self._should_cache_swa:
             if layer_id == self.start_layer or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
@@ -827,7 +867,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP not yet supported on DSv4 set_extra_key_buffer_fused; "
+                "needs Phase 3 kernel-level mask integration."
+            )
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
@@ -837,7 +883,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "DCP not yet supported on DSv4 set_index_k_fused; needs "
+                "Phase 3 kernel-level mask integration."
+            )
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
