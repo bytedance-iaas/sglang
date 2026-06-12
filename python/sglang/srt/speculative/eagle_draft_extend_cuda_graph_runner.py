@@ -457,6 +457,20 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            # Reset the padding region of req_pool_indices so that stale
+            # req-pool slot ids from a previous replay are not picked up by
+            # gathers (req_to_token / full->swa mapping) inside the captured
+            # graph, which would trigger vectorized_gather_kernel index out of
+            # bounds.
+            buffers.req_pool_indices.zero_()
+            # Likewise, input_ids is used as a gather index by the vocab
+            # embedding inside the captured graph. If the padding region
+            # [num_tokens : bs*num_tokens_per_bs] still holds stale token ids
+            # from a previous replay (possibly >= vocab_size), it will trigger
+            # the same vectorized_gather_kernel index out of bounds.
+            buffers.input_ids.zero_()
+            if buffers.hidden_states is not None:
+                buffers.hidden_states.zero_()
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
