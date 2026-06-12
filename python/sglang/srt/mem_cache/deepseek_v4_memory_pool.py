@@ -912,6 +912,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> torch.Tensor:
         swa_loc = self.translate_loc_from_full_to_swa(indices).to(torch.int64)
         swa_loc = swa_loc[swa_loc > 0]
+        return self._compress_state_locs_from_swa(swa_loc, compress_ratio)
+
+    def _compress_state_locs_from_swa(
+        self, swa_loc: torch.Tensor, compress_ratio: int
+    ) -> torch.Tensor:
+        state_locs = self._raw_compress_state_locs_from_swa(swa_loc, compress_ratio)
+        return torch.unique(state_locs.to(torch.int64), sorted=True)
+
+    def _raw_compress_state_locs_from_swa(
+        self, swa_loc: torch.Tensor, compress_ratio: int
+    ) -> torch.Tensor:
         if swa_loc.numel() == 0:
             return swa_loc
 
@@ -920,7 +931,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         state_locs = (
             swa_pages * ring_size + (swa_loc % ring_size)
         ) // compress_ratio
-        return torch.unique(state_locs.to(torch.int64), sorted=True)
+        return state_locs.to(torch.int64)
 
     def _copy_compress_state_pools(
         self,
@@ -965,6 +976,102 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 )
             pool.set_state_by_state_loc(
                 state_locs, KVAndScore(copied_state.to(self.device, non_blocking=True))
+            )
+
+    def _filter_layer_chunks(self, kv_cache_cpu, row_mask: torch.Tensor, pool):
+        if kv_cache_cpu is None:
+            return None
+        if row_mask is None or bool(torch.all(row_mask).item()):
+            return kv_cache_cpu
+
+        chunk_size = getattr(pool, "cpu_offloading_chunk_size", len(row_mask))
+        filtered = []
+        for layer_chunks in kv_cache_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+
+            filtered_layer = []
+            first_chunk = layer_chunks[0]
+            if isinstance(first_chunk, (list, tuple)):
+                k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
+                v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
+                k_cpu = k_cpu[row_mask]
+                v_cpu = v_cpu[row_mask]
+                for i in range(0, len(k_cpu), chunk_size):
+                    filtered_layer.append(
+                        [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
+                    )
+            else:
+                data_cpu = torch.cat(layer_chunks, dim=0)
+                data_cpu = data_cpu[row_mask]
+                for i in range(0, len(data_cpu), chunk_size):
+                    filtered_layer.append(data_cpu[i : i + chunk_size])
+            filtered.append(filtered_layer)
+        return filtered
+
+    def _load_remapped_compress_state_pools(
+        self,
+        copied_states: List[Optional[torch.Tensor]],
+        saved_state_locs_cpu: torch.Tensor,
+        old_swa_locs: torch.Tensor,
+        new_swa_locs: torch.Tensor,
+        state_pools: List[Optional[CompressStatePool]],
+        compress_ratio: int,
+    ) -> None:
+        if old_swa_locs.numel() == 0 or new_swa_locs.numel() == 0:
+            return
+
+        old_state_locs = self._raw_compress_state_locs_from_swa(
+            old_swa_locs.to(device=self.device, dtype=torch.int64), compress_ratio
+        )
+        new_state_locs = self._raw_compress_state_locs_from_swa(
+            new_swa_locs.to(device=self.device, dtype=torch.int64), compress_ratio
+        )
+        if old_state_locs.numel() == 0 or new_state_locs.numel() == 0:
+            return
+        old_unique_state_locs = torch.unique(old_state_locs.to(torch.int64), sorted=True)
+        new_unique_state_locs = torch.unique(new_state_locs.to(torch.int64), sorted=True)
+        if torch.equal(old_unique_state_locs, new_unique_state_locs):
+            self._load_compress_state_pools(
+                copied_states, new_unique_state_locs, state_pools, compress_ratio
+            )
+            return
+
+        saved_state_locs = saved_state_locs_cpu.to(device="cpu", dtype=torch.int64)
+        saved_rows = {int(loc): row for row, loc in enumerate(saved_state_locs.tolist())}
+        new_to_old = {}
+        for old_loc, new_loc in zip(
+            old_state_locs.to("cpu").tolist(), new_state_locs.to("cpu").tolist()
+        ):
+            if old_loc in saved_rows and new_loc not in new_to_old:
+                new_to_old[new_loc] = old_loc
+
+        if not new_to_old:
+            return
+
+        target_locs_cpu = torch.tensor(
+            sorted(new_to_old), dtype=torch.int64, device="cpu"
+        )
+        source_rows = torch.tensor(
+            [saved_rows[new_to_old[int(loc)]] for loc in target_locs_cpu.tolist()],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        target_locs = target_locs_cpu.to(device=self.device)
+
+        for layer_id, (copied_state, pool) in enumerate(zip(copied_states, state_pools)):
+            if (
+                copied_state is None
+                or pool is None
+                or self.compression_ratios[layer_id] != compress_ratio
+            ):
+                continue
+            pool.set_state_by_state_loc(
+                target_locs,
+                KVAndScore(
+                    copied_state[source_rows].to(self.device, non_blocking=True)
+                ),
             )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
@@ -1017,13 +1124,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             "length": len(indices),
             "swa": swa_kv_cpu,
             "swa_mask": swa_mask.cpu(),
+            "swa_indices": swa_indices[swa_mask].cpu(),
             "c4": c4_kv_cpu,
             "c4_indexer": c4_indexer_cpu,
             "c4_mask": c4_mask.cpu(),
+            "c4_state_locs": c4_state_locs.cpu(),
             "c4_attention_states": c4_attention_states,
             "c4_indexer_states": c4_indexer_states,
             "c128": c128_kv_cpu,
             "c128_mask": c128_mask.cpu(),
+            "c128_state_locs": c128_state_locs.cpu(),
             "c128_attention_states": c128_attention_states,
         }
 
@@ -1040,14 +1150,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         swa_indices = self.translate_loc_from_full_to_swa(indices).to(torch.int64)
         old_swa_mask = kv_cache_cpu["swa_mask"].to(device=indices.device)
         new_swa_mask = swa_indices > 0
-        if not torch.equal(old_swa_mask, new_swa_mask):
-            raise RuntimeError(
-                "DSV4 KV offload/load SWA mapping mismatch: "
-                f"saved={int(old_swa_mask.sum().item())}, "
-                f"target={int(new_swa_mask.sum().item())}."
+        row_mask = torch.empty((0,), dtype=torch.bool, device="cpu")
+        load_swa_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        old_swa_locs = torch.empty((0,), dtype=torch.int64, device=self.device)
+        if torch.any(old_swa_mask):
+            saved_swa_indices = kv_cache_cpu["swa_indices"].to(
+                device=self.device, dtype=torch.int64
             )
+            row_mask = new_swa_mask[old_swa_mask].cpu()
+            load_swa_indices = swa_indices[old_swa_mask][
+                row_mask.to(device=indices.device)
+            ]
+            old_swa_locs = saved_swa_indices[row_mask.to(device=self.device)]
         if swa_kv_cpu is not None:
-            self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices[old_swa_mask])
+            if load_swa_indices.numel() > 0:
+                swa_kv_cpu = self._filter_layer_chunks(
+                    swa_kv_cpu, row_mask, self.swa_kv_pool
+                )
+                self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, load_swa_indices)
 
         c4_indices = self._compressed_indices_from_mask(
             indices, 4, kv_cache_cpu["c4_mask"]
@@ -1065,23 +1185,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if kv_cache_cpu["c128"] is not None:
             self.c128_kv_pool.load_cpu_copy(kv_cache_cpu["c128"], c128_indices)
 
-        c4_state_locs = self._compress_state_locs_from_full(indices, 4)
-        c128_state_locs = self._compress_state_locs_from_full(indices, 128)
-        self._load_compress_state_pools(
+        self._load_remapped_compress_state_pools(
             kv_cache_cpu["c4_attention_states"],
-            c4_state_locs,
+            kv_cache_cpu["c4_state_locs"],
+            old_swa_locs,
+            load_swa_indices,
             self.compress_state_pools,
             4,
         )
-        self._load_compress_state_pools(
+        self._load_remapped_compress_state_pools(
             kv_cache_cpu["c4_indexer_states"],
-            c4_state_locs,
+            kv_cache_cpu["c4_state_locs"],
+            old_swa_locs,
+            load_swa_indices,
             self.indexer_compress_state_pools,
             4,
         )
-        self._load_compress_state_pools(
+        self._load_remapped_compress_state_pools(
             kv_cache_cpu["c128_attention_states"],
-            c128_state_locs,
+            kv_cache_cpu["c128_state_locs"],
+            old_swa_locs,
+            load_swa_indices,
             self.compress_state_pools,
             128,
         )

@@ -869,6 +869,37 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.get_last_loc_compressed(last_locs)
         )
 
+    def _merge_logical_release_pages_if_needed(self, num_new_pages: int) -> None:
+        """Make recently released logical pages allocatable for a small draft extend."""
+        if num_new_pages <= 0:
+            return
+
+        for allocator_name in ("full_attn_allocator", "swa_attn_allocator"):
+            allocator = getattr(
+                self.logical_attn_allocator, allocator_name, None
+            )
+            if (
+                allocator is not None
+                and allocator.need_sort
+                and len(allocator.free_pages) < num_new_pages
+                and len(allocator.release_pages) > 0
+            ):
+                allocator.merge_and_sort_free()
+
+    def _logical_allocator_page_state(self) -> str:
+        states = []
+        for allocator_name in ("full_attn_allocator", "swa_attn_allocator"):
+            allocator = getattr(
+                self.logical_attn_allocator, allocator_name, None
+            )
+            if allocator is None:
+                continue
+            states.append(
+                f"{allocator_name}: free_pages={len(allocator.free_pages)}, "
+                f"release_pages={len(allocator.release_pages)}"
+            )
+        return "; ".join(states)
+
     def alloc_extend_logical_only(
         self,
         prefix_lens: torch.Tensor,
@@ -880,15 +911,15 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         backup_state: bool = False,
     ):
         required_tokens = extend_num_tokens
+        num_new_pages = 0
         if self.page_size > 1:
-            required_tokens = (
-                get_num_new_pages(
-                    seq_lens=seq_lens_cpu,
-                    page_size=self.page_size,
-                    prefix_lens=prefix_lens_cpu,
-                )
-                * self.page_size
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
             )
+            required_tokens = num_new_pages * self.page_size
+            self._merge_logical_release_pages_if_needed(num_new_pages)
         avail = self.logical_attn_allocator.available_size()
         if avail < required_tokens:
             raise RuntimeError(
@@ -913,7 +944,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 f"DeepSeek V4 HiSparse logical alloc failed for {extend_num_tokens} "
                 f"extend tokens ({required_tokens} new-page tokens). "
                 "Logical pool available: "
-                f"{self.logical_attn_allocator.available_size()}"
+                f"{self.logical_attn_allocator.available_size()}; "
+                f"{self._logical_allocator_page_state()}"
             )
 
         if backup_state:

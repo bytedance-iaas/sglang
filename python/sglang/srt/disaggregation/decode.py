@@ -373,6 +373,37 @@ class DecodePreallocQueue:
             and self._uses_swa_tail_prealloc()
         )
 
+    def _uses_hisparse_eagle_draft_logical_slots(self) -> bool:
+        coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+        return (
+            self._is_dsv4_hisparse_swa_tail_prealloc()
+            and self.scheduler.spec_algorithm.is_eagle()
+            and self.scheduler.server_args.speculative_eagle_topk == 1
+            and coordinator is not None
+            and coordinator.supports_hisparse_draft_slots()
+            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_logical_only")
+        )
+
+    def _hisparse_eagle_draft_logical_reserve_tokens(
+        self, n_active: Optional[int] = None
+    ) -> int:
+        if not self._uses_hisparse_eagle_draft_logical_slots():
+            return 0
+
+        if n_active is None:
+            n_active = self._active_req_count()
+        if n_active <= 0:
+            return 0
+
+        draft_tokens = self.scheduler.server_args.speculative_num_draft_tokens
+        if draft_tokens is None:
+            draft_tokens = self.scheduler.server_args.speculative_num_steps or 0
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        tokens_per_req = max(1, int(draft_tokens) + 1)
+        pages_per_req = max(1, (tokens_per_req + page_size - 1) // page_size)
+        return n_active * pages_per_req * page_size
+
     def _enable_decode_radix_prefix_reuse(self) -> bool:
         if not self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
             return False
@@ -464,10 +495,10 @@ class DecodePreallocQueue:
         max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
         committed_output_tokens = max(len(req.output_ids) - 1, 0)
         remaining_output_tokens = max(0, max_new_tokens - committed_output_tokens)
-        if self._relax_decode_output_reserve:
-            remaining_output_tokens = min(
-                remaining_output_tokens, self.num_reserved_decode_tokens
-            )
+        # C4 host mirror grows on compressed-token boundaries during decode.
+        # Unlike logical full/SWA reserve, a missing C4 host slot cannot be fixed
+        # by retracting a running request after the backup point is reached, so
+        # keep the CLIP_MAX_NEW_TOKEN bound instead of the smaller relaxed cap.
         compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
         return (remaining_output_tokens + compress_ratio - 1) // compress_ratio
 
@@ -828,6 +859,9 @@ class DecodePreallocQueue:
             and hasattr(logical_allocator, "available_size")
             else None
         )
+        eagle_draft_reserve_tokens = (
+            self._hisparse_eagle_draft_logical_reserve_tokens()
+        )
         logger.info(
             "Decode prealloc admission limited: reason=%s, queue=%d, "
             "ready=%d, pending=%d, transfer=%d, running=%d, retracted=%d, "
@@ -835,7 +869,7 @@ class DecodePreallocQueue:
             "full_evictable_tokens=%d, full_available_tokens=%s, "
             "logical_available_tokens=%s, swa_allocatable_tokens=%d, "
             "c4_host_allocatable_tokens=%s, c4_host_required_tokens=%d, "
-            "hisparse_req_budget=%s, "
+            "hisparse_req_budget=%s, eagle_draft_reserve_tokens=%d, "
             "hisparse_avail=%s, hisparse_padded_buffer_size=%s, "
             "hisparse_top_k=%s, hisparse_device_buffer_size=%s, "
             "max_running_requests=%s, relaxed_output_reserve=%s, "
@@ -857,6 +891,7 @@ class DecodePreallocQueue:
             c4_host_allocatable_tokens,
             c4_host_required_tokens,
             hisparse_req_budget,
+            eagle_draft_reserve_tokens,
             hisparse_avail,
             getattr(coordinator, "padded_buffer_size", None),
             getattr(coordinator, "top_k", None),
@@ -1033,9 +1068,15 @@ class DecodePreallocQueue:
                 self.scheduler.hisparse_coordinator.is_dsv4_hisparse
                 and self.scheduler.hisparse_coordinator.host_radix_cache is None
             ):
+                c4_host_decode_reserve_tokens = (
+                    self._dsv4_c4_host_decode_reserve_tokens()
+                )
+                self.scheduler.hisparse_coordinator.reclaim_dsv4_c4_host_prefix_cache(
+                    c4_host_decode_reserve_tokens
+                )
                 c4_host_allocatable_tokens = (
                     self.scheduler.hisparse_coordinator.mem_pool_host.available_size()
-                    - self._dsv4_c4_host_decode_reserve_tokens()
+                    - c4_host_decode_reserve_tokens
                 )
 
         # Then, preallocate the remaining requests if possible
@@ -1348,20 +1389,62 @@ class DecodePreallocQueue:
             metadata_kwargs = {"decode_prefix_len": metadata_decode_prefix_len}
             if decode_c4_prefix_len is not None:
                 metadata_kwargs["decode_c4_prefix_len"] = decode_c4_prefix_len
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
+            try:
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
                 )
+                if (
+                    self.transfer_queue.enable_staging
+                    and hasattr(decode_req.kv_receiver, "require_staging")
+                    and decode_req.kv_receiver.require_staging
+                ):
+                    self.transfer_queue.staging_handler.register_decode_req(
+                        decode_req.req.bootstrap_room, decode_req
+                    )
+            except Exception as e:
+                error_message = (
+                    "Decode preallocation metadata send failed for request "
+                    f"rank={self.tp_rank} {decode_req.req.rid=} "
+                    f"{decode_req.req.bootstrap_room=}: {e}"
+                )
+                logger.exception(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req],
+                    decode_req.req.return_logprob,
+                )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                if (
+                    self.transfer_queue.enable_staging
+                    and self.transfer_queue.staging_handler is not None
+                ):
+                    self.transfer_queue.staging_handler.unregister_decode_req(
+                        decode_req.req.bootstrap_room
+                    )
+                if decode_req.metadata_buffer_index is not None:
+                    self.req_to_metadata_buffer_idx_allocator.free(
+                        decode_req.metadata_buffer_index
+                    )
+                    decode_req.metadata_buffer_index = -1
+                if decode_req.kv_receiver is not None:
+                    if hasattr(decode_req.kv_receiver, "abort"):
+                        decode_req.kv_receiver.abort()
+                    if hasattr(decode_req.kv_receiver, "clear"):
+                        decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
+                indices_to_remove.add(i)
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                continue
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1539,9 +1622,16 @@ class DecodePreallocQueue:
         swa_used = swa_total - self.token_to_kv_pool_allocator.swa_available_size()
         swa_growth_potential = max(0, n_active * window_size - swa_used)
         swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
+        eagle_draft_reserve_tokens = (
+            self._hisparse_eagle_draft_logical_reserve_tokens(n_active)
+        )
         swa_allocatable_tokens = (
             self.token_to_kv_pool_allocator.swa_available_size()
-            - max(swa_reserved_tokens, need_swa_space_for_single_req)
+            - max(
+                swa_reserved_tokens,
+                need_swa_space_for_single_req,
+                eagle_draft_reserve_tokens,
+            )
         )
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
@@ -1556,6 +1646,9 @@ class DecodePreallocQueue:
             prebuilt_n = len(self.scheduler.last_batch.reqs)
             prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
             swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
+            swa_allocatable_tokens -= (
+                self._hisparse_eagle_draft_logical_reserve_tokens(prebuilt_n)
+            )
 
         if count_retracted:
             for req in self.retracted_queue:

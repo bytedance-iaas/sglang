@@ -7,7 +7,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     DeepSeekV4SingleKVPoolHost,
@@ -454,6 +454,26 @@ class HiSparseCoordinator:
         )
         return True
 
+    def reclaim_dsv4_c4_host_prefix_cache(self, min_available_tokens: int) -> int:
+        if (
+            not self.is_dsv4_hisparse
+            or self.host_radix_cache is not None
+            or min_available_tokens <= 0
+        ):
+            return 0
+
+        need_tokens = min_available_tokens - self.mem_pool_host.available_size()
+        if need_tokens <= 0:
+            return 0
+
+        evicted_indices = self._c4_prefix_cache.evict_unref(need_tokens)
+        if evicted_indices.numel() == 0:
+            return 0
+
+        evicted_indices = torch.unique(evicted_indices)
+        self.mem_pool_host.free(evicted_indices)
+        return int(evicted_indices.numel())
+
     def _match_c4_host_prefix(
         self, req: Req, c4_len: int
     ) -> Tuple[int, Optional[Tuple[Optional[str], Tuple[int, ...]]], torch.Tensor]:
@@ -623,7 +643,10 @@ class HiSparseCoordinator:
             self._release_or_cache_host_radix_slots(req)
             return
         if self.is_dsv4_hisparse:
-            self._release_or_cache_dsv4_c4_host_slots(req)
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self._release_aborted_dsv4_c4_host_slots(req)
+            else:
+                self._release_or_cache_dsv4_c4_host_slots(req)
         else:
             self._free_request_host_indices_from(req, 0)
 
@@ -692,16 +715,34 @@ class HiSparseCoordinator:
         )
         self._free_request_host_indices_from(req, keep_host_len)
 
+    def _release_aborted_dsv4_c4_host_slots(self, req: Req) -> None:
+        # Do not publish aborted requests into the C4 host prefix cache.  If this
+        # request already referenced an existing prefix cache entry, keep that
+        # protected prefix alive and let _clear_c4_prefix_req_state drop the ref.
+        keep_host_len = self._req_c4_prefix_len.get(req.req_pool_idx, 0)
+        self._free_request_host_indices_from(req, keep_host_len)
+
     def _free_request_host_indices_from(self, req: Req, start_pos: int) -> None:
         host_len = min(
             self._round_up_to_host_page(self._host_token_len(req.kv_allocated_len)),
             self.req_to_host_pool.shape[1],
         )
         start_pos = min(max(start_pos, 0), host_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, start_pos:host_len]
+        req_host_row = self.req_to_host_pool[req.req_pool_idx]
+        host_indices = req_host_row[start_pos:host_len]
         host_indices = host_indices[host_indices >= 0]
         if host_indices.numel() > 0:
-            self.mem_pool_host.free(torch.unique(host_indices))
+            host_indices = torch.unique(host_indices)
+            if start_pos > 0:
+                protected_indices = req_host_row[:start_pos]
+                protected_indices = protected_indices[protected_indices >= 0]
+                if protected_indices.numel() > 0:
+                    host_indices = host_indices[
+                        ~torch.isin(host_indices, torch.unique(protected_indices))
+                    ]
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+        req_host_row[start_pos:host_len] = -1
 
     def _clear_c4_prefix_req_state(self, req_pool_idx: int) -> None:
         self._c4_prefix_cache.release_req(req_pool_idx)
@@ -743,11 +784,9 @@ class HiSparseCoordinator:
                     self.mem_pool_host, num_missing_pages * self.page_size
                 )
             elif self.is_dsv4_hisparse:
-                need_tokens = num_missing_pages * self.page_size
-                evict_tokens = need_tokens - self.mem_pool_host.available_size()
-                evicted_indices = self._c4_prefix_cache.evict_unref(evict_tokens)
-                if evicted_indices.numel() > 0:
-                    self.mem_pool_host.free(evicted_indices)
+                self.reclaim_dsv4_c4_host_prefix_cache(
+                    num_missing_pages * self.page_size
+                )
             host_locs = self.mem_pool_host.alloc(num_missing_pages * self.page_size)
             if host_locs is None:
                 logger.error(

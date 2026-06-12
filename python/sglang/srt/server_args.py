@@ -402,6 +402,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
+    _swa_full_tokens_ratio_specified: bool = False
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -4595,7 +4596,7 @@ class ServerArgs:
         parser.add_argument(
             "--swa-full-tokens-ratio",
             type=float,
-            default=ServerArgs.swa_full_tokens_ratio,
+            default=None,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
         )
@@ -6776,8 +6777,14 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
+        if args.swa_full_tokens_ratio is None:
+            args.swa_full_tokens_ratio = ServerArgs.swa_full_tokens_ratio
+            args._swa_full_tokens_ratio_specified = False
+        else:
+            args._swa_full_tokens_ratio_specified = True
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        return cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"

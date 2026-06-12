@@ -3409,7 +3409,10 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
+                if self.enable_hisparse and self.hisparse_coordinator is not None:
+                    req.finished_reason = req.finished_reason or FINISH_ABORT()
+                    self.hisparse_coordinator.request_finished(req)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
