@@ -119,6 +119,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = mr.num_effective_layers
 
+        # DCP world size; allocator will divide back to per-rank physical.
+        self._dcp_size = mr.dcp_size if hasattr(mr, "dcp_size") else 1
+
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
         # DFLASH: scale cell_size to account for draft model KV cache
@@ -201,6 +204,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        # DCP: scale per-rank physical capacity to cluster-wide logical capacity
+        # so allocator wrapping (DcpTokenToKVPoolAllocator) can divide back to
+        # physical when sharding KV across dcp ranks.
+        if self._dcp_size > 1:
+            max_total_num_tokens *= self._dcp_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
@@ -222,6 +230,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype = mr.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
+
+        # DCP world size; allocator wrappers expect logical (cluster-wide) sizes.
+        self._dcp_size = mr.dcp_size if hasattr(mr, "dcp_size") else 1
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
@@ -305,6 +316,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = int(available_bytes // self._cell_size)
+        # DCP: scale per-rank physical capacity to cluster-wide logical
+        # capacity. _solve_pool_sizes downstream then derives full/swa sub-pool
+        # sizes which inherit the logical scaling.
+        if self._dcp_size > 1:
+            max_total_num_tokens *= self._dcp_size
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
     def calculate_pool_sizes_from_max_tokens(
@@ -343,6 +359,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.online_c128_mtp_max_draft_tokens = (
             mr.server_args.max_speculative_num_draft_tokens or 0
         )
+        # DCP world size; allocator wrappers expect logical (cluster-wide)
+        # full/swa/c4/c128 token counts.
+        self._dcp_size = mr.dcp_size if hasattr(mr, "dcp_size") else 1
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -449,14 +468,27 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        # c4/c128 state pools are not DCP-sharded through token allocators:
+        # each DCP rank owns a private CompressStatePool buffer. Keep the
+        # public token capacities logical, but size state pools per rank.
+        per_rank_full_token = (
+            full_token // self._dcp_size if self._dcp_size > 1 else full_token
+        )
+        per_rank_swa_tokens = (
+            swa_tokens // self._dcp_size if self._dcp_size > 1 else swa_tokens
+        )
         c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        c128_state_pool_size = full_token // 128 if c128_online else full_token
+        c128_state_pool_size = (
+            per_rank_full_token // 128 if c128_online else per_rank_full_token
+        )
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
+            c4_state_pool_size=per_rank_swa_tokens
+            // self.swa_page_size
+            * self.c4_ring_size,
             c128_state_pool_size=c128_state_pool_size,
         )
 
@@ -488,6 +520,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         ), "page_size must be multiple of 128 for compressed attention"
 
         full_token = int(available_bytes / self.bytes_per_full_token)
+        # DCP: scale per-rank physical capacity to cluster-wide logical
+        # capacity. _compute_dsv4_sizes derives swa/c4/c128 sub-pool sizes
+        # which inherit the logical scaling; allocator wrappers divide back to
+        # physical. State pool sizes stay per-rank (handled inside
+        # _compute_dsv4_sizes).
+        if self._dcp_size > 1:
+            full_token *= self._dcp_size
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
             f"DSV4 memory calculation: "
