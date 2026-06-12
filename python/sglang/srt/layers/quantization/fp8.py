@@ -64,7 +64,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
-    requant_weight_per_expert_inplace,
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -1180,20 +1179,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
         elif self.runner.runner_backend.is_asym_gemm():
-            from sglang.srt.layers.asym_gemm_wrapper.configurer import ASYMGEMM_SM89
+            from sglang.srt.layers.asym_gemm_wrapper.configurer import (
+                ASYMGEMM_SCALE_UE8M0,
+            )
 
             weight_block_size = self.quant_config.weight_block_size
-            if ASYMGEMM_SM89:
-                requant_weight_per_expert_inplace(
-                    layer.w13_weight,
-                    layer.w13_weight_scale_inv,
-                    weight_block_size,
-                )
-                requant_weight_per_expert_inplace(
-                    layer.w2_weight,
-                    layer.w2_weight_scale_inv,
-                    weight_block_size,
-                )
+            if not ASYMGEMM_SCALE_UE8M0:
+                # SM89/SM90: the block-scale AsymGEMM kernels consume the
+                # checkpoint's 128x128 float32 scales directly — no requant.
                 layer.w13_weight_scale_inv.format_ue8m0 = False
                 layer.w2_weight_scale_inv.format_ue8m0 = False
             else:

@@ -8,7 +8,6 @@ from sglang.srt.layers.asym_gemm_wrapper import compile_utils
 from sglang.srt.layers.asym_gemm_wrapper.configurer import (  # noqa: F401
     ASYMGEMM_BLACKWELL,
     ASYMGEMM_SCALE_UE8M0,
-    ASYMGEMM_SM89,
     ENABLE_JIT_ASYMGEMM,
 )
 from sglang.srt.server_args import ServerArgs
@@ -140,43 +139,6 @@ def grouped_gemm_nt_fp4fp4bf16_contig(
             recipe=recipe if recipe is not None else _FP4_RECIPE,
             disable_ue8m0_cast=True,
         )
-
-
-def grouped_gemm_sm89_f8f8bf16_contig(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out: torch.Tensor,
-    offsets: torch.Tensor,
-    experts: torch.Tensor,
-    list_size: int,
-    scale_a: float = 1.0,
-    scale_b: float = 1.0,
-    scale_a_tensor: Optional[torch.Tensor] = None,
-    scale_b_tensor: Optional[torch.Tensor] = None,
-):
-    asym_gemm.m_grouped_fp8_asym_gemm_sm89(
-        a, b, out, offsets, experts, list_size,
-        scale_a=scale_a, scale_b=scale_b,
-        scale_a_tensor=scale_a_tensor, scale_b_tensor=scale_b_tensor,
-    )
-
-
-def grouped_gemm_sm89_f8f8bf16_masked(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m: int,
-    scale_a: float = 1.0,
-    scale_b: float = 1.0,
-    scale_a_tensor: Optional[torch.Tensor] = None,
-    scale_b_tensor: Optional[torch.Tensor] = None,
-):
-    asym_gemm.m_grouped_fp8_asym_gemm_sm89_masked(
-        a, b, out, masked_m, expected_m,
-        scale_a=scale_a, scale_b=scale_b,
-        scale_a_tensor=scale_a_tensor, scale_b_tensor=scale_b_tensor,
-    )
 
 
 def grouped_gemm_nt_bf16bf16bf16_masked(
