@@ -65,6 +65,18 @@ def validate_deepseek_v4_dcp(server_args: "ServerArgs") -> None:
     if server_args.dcp_size <= 1:
         return
 
+    # Phase 7 master gate: DCP path is implemented but not yet numerically
+    # validated against dcp_size=1 baseline. Require explicit env opt-in so
+    # accidental --dcp-size > 1 fails fast with a clear error.
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DSV4_ENABLE_DCP.get():
+        raise ValueError(
+            "DeepSeekV4 DCP (--dcp-size > 1) is gated behind "
+            "SGLANG_DSV4_ENABLE_DCP=1. Set the env var explicitly after "
+            "verifying numerical equivalence vs. dcp_size=1 on your cluster."
+        )
+
     # attn_tp = tp_size // dp_size; dcp must divide attn_tp so each dcp group
     # consists of attn_tp / dcp_size consecutive tp ranks within a dp shard.
     attn_tp = server_args.tp_size // max(server_args.dp_size, 1)
@@ -75,8 +87,6 @@ def validate_deepseek_v4_dcp(server_args: "ServerArgs") -> None:
         )
 
     # Online c128 + DCP: untested combination; warn but allow.
-    from sglang.srt.environ import envs
-
     if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
         logger.warning(
             "DeepSeekV4 DCP + SGLANG_OPT_USE_ONLINE_COMPRESS combo is "
