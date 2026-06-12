@@ -417,6 +417,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
+    dcp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
@@ -1309,6 +1310,10 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 4. Pipeline parallelism
         if self.pp_size > 1:
+            self.disable_piecewise_cuda_graph = True
+        # 4b. Decode Context Parallelism (extra collectives in attention path
+        # are not yet supported by piecewise cuda graph capture).
+        if self.dcp_size > 1:
             self.disable_piecewise_cuda_graph = True
         # 5. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
@@ -4718,6 +4723,18 @@ class ServerArgs:
             help="The pipeline parallelism size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="The decode context parallelism size. When > 1, the KV cache "
+            "is sharded across DCP ranks (token positions interleaved by "
+            "(position // page_size) % dcp_size for paged backends), and "
+            "MLA decode attention is computed locally on each rank then "
+            "merged via all-gather(LSE) + reduce-scatter(O). Must divide "
+            "tp-size. Defaults to 1 (disabled).",
+        )
+        parser.add_argument(
             "--pp-max-micro-batch-size",
             type=int,
             default=ServerArgs.pp_max_micro_batch_size,
@@ -6906,6 +6923,14 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+
+        if self.dcp_size > 1:
+            assert (
+                self.tp_size % self.dcp_size == 0
+            ), f"tp_size ({self.tp_size}) must be divisible by dcp_size ({self.dcp_size})"
+            assert (
+                self.pp_size == 1
+            ), "Decode context parallelism is not compatible with pipeline parallelism"
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
