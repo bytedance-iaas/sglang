@@ -14,6 +14,7 @@ from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
+    DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
@@ -731,6 +732,8 @@ class ModelRunnerKVCacheMixin:
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
+                        dcp_rank=self.dcp_rank,
+                        dcp_world_size=self.dcp_size,
                     )
                 else:
                     if self.enable_hisparse:
@@ -751,22 +754,52 @@ class ModelRunnerKVCacheMixin:
                             )
                         )
                     elif self.page_size == 1:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        if self.dcp_size > 1:
+                            self.token_to_kv_pool_allocator = (
+                                DcpTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    dcp_rank=self.dcp_rank,
+                                    dcp_world_size=self.dcp_size,
+                                )
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                     else:
-                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        if self.dcp_size > 1:
+                            self.token_to_kv_pool_allocator = (
+                                DcpTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    dcp_rank=self.dcp_rank,
+                                    dcp_world_size=self.dcp_size,
+                                )
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = (
+                                PagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
+                            )
 
             if self.enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."

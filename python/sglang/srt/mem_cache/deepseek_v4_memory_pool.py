@@ -124,12 +124,16 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
     ):
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
             loc=loc,
             nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
     def set_key_buffer_fused(
@@ -144,6 +148,28 @@ class DeepSeekV4SingleKVPool(KVCache):
             indices=loc,
             page_size=self.page_size,
             type="flashmla",
+        )
+
+    def set_key_buffer_fused_fallback_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+    ) -> None:
+        """DCP fallback path: quantize the bf16 ``cache_k`` to a NopeFp8RopeBf16
+        pack on-device, then write through the Triton kernel which honors
+        ``dcp_world_size``/``dcp_rank``. Used when ``dcp_size > 1`` because the
+        fused C++ flashmla store kernel is not yet DCP-aware.
+        """
+        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+            quant_to_nope_fp8_rope_bf16_pack_triton,
+        )
+
+        pack = quant_to_nope_fp8_rope_bf16_pack_triton(cache_k)
+        self.set_key_buffer(
+            layer_id, loc, pack, dcp_world_size=dcp_world_size, dcp_rank=dcp_rank
         )
 
     def get_key_buffer(self, layer_id: int):
@@ -225,9 +251,17 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
+        super().set_key_buffer(
+            layer_id,
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+        )
 
     def set_key_buffer_fused(
         self,
@@ -237,6 +271,23 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
+
+    def set_key_buffer_fused_fallback_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+    ) -> None:
+        loc = self.translate_loc_to_hisparse_device(loc)
+        return super().set_key_buffer_fused_fallback_triton(
+            layer_id,
+            loc,
+            cache_k,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -327,10 +378,18 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
-            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+            pool=self,
+            buf=buf,
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
     def set_index_fused(
@@ -345,6 +404,30 @@ class DeepSeekV4IndexerPool(KVCache):
             indices=loc,
             page_size=self.page_size,
             type="indexer",
+        )
+
+    def set_index_fused_fallback_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+    ) -> None:
+        """DCP fallback: split ``cache_k`` into the (index_k, index_k_scale)
+        layout the Triton path expects, then write through the DCP-aware
+        Triton kernel. Used when ``dcp_size > 1``.
+        """
+        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+        index_k_fp8, index_k_scale = act_quant(cache_k)
+        self.set_index_k_scale_buffer(
+            layer_id=layer_id,
+            loc=loc,
+            index_k=index_k_fp8,
+            index_k_scale=index_k_scale,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
 
@@ -684,6 +767,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
+    def _dcp_world_rank(self) -> Tuple[int, int]:
+        """Resolve current DCP (decode context parallel) world size and rank.
+
+        Imported lazily so non-DCP setups don't pay an import cost. Returns
+        ``(world_size, rank)``; when DCP is disabled the group is ``None``
+        and we fall back to ``(1, 0)`` which makes the Triton kernel a no-op
+        on the dcp dimension.
+        """
+        from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
+
+        group = get_dcp_group_no_assert()
+        if group is None or group.world_size == 1:
+            return 1, 0
+        return group.world_size, group.rank_in_group
+
     def set_swa_key_buffer(
         self,
         layer_id: int,
@@ -692,13 +790,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP (Decode Context Parallel) is not yet supported on DSv4 "
-                "set_swa_key_buffer; the writer kernel must be extended to "
-                "consume dcp_kv_mask in Phase 3."
-            )
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+        else:
+            dcp_world_size, dcp_rank = 1, 0
         self.swa_kv_pool.set_key_buffer(
-            self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
+            self._swa_local_layer_id(layer_id),
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
@@ -720,15 +820,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP (Decode Context Parallel) is not yet supported on DSv4 "
-                "set_extra_key_buffer; the writer kernel must be extended to "
-                "consume dcp_kv_mask in Phase 3."
-            )
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+        else:
+            dcp_world_size, dcp_rank = 1, 0
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         compress_kv_pool.set_key_buffer(
-            compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
+            compress_layer_id,
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
     def get_index_k_page_size(self) -> int:
@@ -762,15 +864,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP (Decode Context Parallel) is not yet supported on DSv4 "
-                "set_index_k_scale_buffer; the writer kernel must be extended "
-                "to consume dcp_kv_mask in Phase 3."
-            )
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+        else:
+            dcp_world_size, dcp_rank = 1, 0
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         self.c4_indexer_kv_pool.set_index_k_scale_buffer(
-            compress_layer_id, loc, index_k, index_k_scale
+            compress_layer_id,
+            loc,
+            index_k,
+            index_k_scale,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -793,13 +898,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP not yet supported on DSv4 set_swa_key_buffer_radix; "
-                "needs Phase 3 kernel-level mask integration."
-            )
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+        else:
+            dcp_world_size, dcp_rank = 1, 0
         swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         self.swa_kv_pool.set_key_buffer(
-            self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
+            self._swa_local_layer_id(layer_id),
+            swa_loc,
+            cache_nope_fp8_rope_bf16_pack,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
@@ -824,6 +932,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             swa_loc = self.cached_loc
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if dcp_kv_mask is not None:
+            # DCP fallback: dequantize through Triton path which honors
+            # dcp_world_size/dcp_rank. The fused C++ store kernel is not
+            # yet DCP-aware.
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+            return self.swa_kv_pool.set_key_buffer_fused_fallback_triton(
+                self._swa_local_layer_id(layer_id),
+                swa_loc,
+                cache_k,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
         return self.swa_kv_pool.set_key_buffer_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
@@ -851,6 +971,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             swa_loc = self.cached_loc
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if dcp_kv_mask is not None:
+            # DCP fallback: split fused norm+rope+store into
+            # ``fused_norm_rope_inplace`` (bf16 result) then a DCP-aware
+            # Triton store. The single-shot C++ flashmla path is not yet
+            # DCP-aware.
+            from sglang.jit_kernel.deepseek_v4 import fused_norm_rope_inplace
+
+            kv = kv.contiguous()
+            fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+            return self.swa_kv_pool.set_key_buffer_fused_fallback_triton(
+                self._swa_local_layer_id(layer_id),
+                swa_loc,
+                kv,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -876,6 +1013,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
+        if dcp_kv_mask is not None:
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+            return compress_kv_pool.set_key_buffer_fused_fallback_triton(
+                compress_layer_id,
+                loc,
+                cache_k,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
 
     def set_index_k_fused(
@@ -892,4 +1038,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        if dcp_kv_mask is not None:
+            dcp_world_size, dcp_rank = self._dcp_world_rank()
+            return self.c4_indexer_kv_pool.set_index_fused_fallback_triton(
+                compress_layer_id,
+                loc,
+                cache_k,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
