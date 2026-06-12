@@ -617,9 +617,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        # Negative indices are sentinels (for example, last_loc=-1) and must not
-        # be expanded or cleared in the mapping table.
-        free_index = free_index[free_index >= 0]
+        # Negative indices are sentinels (for example, last_loc=-1), and values
+        # beyond the mapping table may come from full-only pools. Do not use
+        # either as gather indices into full_to_swa_index_mapping.
+        free_index = free_index[
+            (free_index >= 0) & (free_index < self.full_to_swa_index_mapping.shape[0])
+        ]
         if free_index.numel() == 0:
             return
 
