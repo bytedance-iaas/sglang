@@ -457,14 +457,17 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
-            # 重置 req_pool_indices 的 padding 区域，避免上一轮残留的脏 req-pool
-            # 索引被 captured graph 内的 req_to_token / SWA mapping gather 用作行
-            # 索引，进而触发 vectorized_gather_kernel 的 index out of bounds。
+            # Reset the padding region of req_pool_indices so that stale
+            # req-pool slot ids from a previous replay are not picked up by
+            # gathers (req_to_token / full->swa mapping) inside the captured
+            # graph, which would trigger vectorized_gather_kernel index out of
+            # bounds.
             buffers.req_pool_indices.zero_()
-            # 同样地，input_ids 在 captured graph 中会被 vocab embedding 作为
-            # gather 索引使用。如果 padding 区域 [num_tokens : bs*num_tokens_per_bs]
-            # 残留上一轮的 token id（可能 >= vocab_size），同样会触发
-            # vectorized_gather_kernel 的 index out of bounds。
+            # Likewise, input_ids is used as a gather index by the vocab
+            # embedding inside the captured graph. If the padding region
+            # [num_tokens : bs*num_tokens_per_bs] still holds stale token ids
+            # from a previous replay (possibly >= vocab_size), it will trigger
+            # the same vectorized_gather_kernel index out of bounds.
             buffers.input_ids.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
