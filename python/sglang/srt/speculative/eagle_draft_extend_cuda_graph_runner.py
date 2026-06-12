@@ -55,6 +55,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    dcp_kv_mask: Optional[torch.Tensor]
 
 
 class EAGLEDraftExtendCudaGraphRunner:
@@ -198,6 +199,13 @@ class EAGLEDraftExtendCudaGraphRunner:
                 dtype=torch.float,
             )
 
+            dcp_size = self.model_runner.dcp_size
+            dcp_kv_mask = (
+                torch.zeros((self.max_num_token,), dtype=torch.bool)
+                if dcp_size > 1
+                else None
+            )
+
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -213,6 +221,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dcp_kv_mask=dcp_kv_mask,
         )
         self.buffers.share_buffers()
 
@@ -304,6 +313,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
+        dcp_kv_mask = (
+            buffers.dcp_kv_mask[:num_tokens]
+            if buffers.dcp_kv_mask is not None
+            else None
+        )
 
         # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
         # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
@@ -381,6 +395,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
         self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -471,6 +486,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.input_ids.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
+            if buffers.dcp_kv_mask is not None:
+                buffers.dcp_kv_mask.zero_()
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -481,6 +498,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
+        if (
+            buffers.dcp_kv_mask is not None
+            and forward_batch.dcp_kv_mask is not None
+        ):
+            buffers.dcp_kv_mask[:num_tokens].copy_(forward_batch.dcp_kv_mask)
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None

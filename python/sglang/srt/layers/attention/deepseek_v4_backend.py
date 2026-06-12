@@ -1192,17 +1192,27 @@ class DeepseekV4AttnBackend(
             if use_dcp:
                 from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
 
-                # DSv4 q is unsqueeze(1)'d so o is [B, 1, H_q, D_v] and lse is
-                # [B, H_q, 1]. cp_lse_ag_out_rs expects out=[B, H, D] /
-                # lse=[B, H] and returns [H/N, B, D] (reduce-scattered along
-                # the head dim).
+                # DSv4 q is unsqueeze(1)'d so o is [B, S_q, H_q, D_v] and lse
+                # is [B, H_q, S_q]. cp_lse_ag_out_rs expects out=[B', H, D] /
+                # lse=[B', H] and returns [H/N, B', D] (reduce-scattered along
+                # the head dim). For decode S_q==1; for target_verify /
+                # draft_extend S_q>1, so flatten (B, S_q) -> B*S_q before the
+                # collective and reshape back afterwards.
                 # TODO(dcp): verify head-dim distribution matches attn_tp
                 # expectations on the caller side.
                 o, lse = mla_result[0], mla_result[1]
-                o_3d = o.squeeze(1)
-                lse_2d = lse.squeeze(-1)
-                o_3d = cp_lse_ag_out_rs(o_3d, lse_2d, dcp_group)
-                o = o_3d.transpose(0, 1).unsqueeze(1)
+                B, S_q, H_q, D_v = o.shape
+                o_flat = o.reshape(B * S_q, H_q, D_v)
+                lse_flat = (
+                    lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
+                )
+                merged = cp_lse_ag_out_rs(o_flat, lse_flat, dcp_group)
+                # merged: [H_q/N, B*S_q, D_v]
+                o = (
+                    merged.transpose(0, 1)
+                    .contiguous()
+                    .reshape(B, S_q, -1, D_v)
+                )
             else:
                 o = mla_result[0]
 

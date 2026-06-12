@@ -82,6 +82,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    dcp_kv_mask: Optional[torch.Tensor]
 
 
 class MultiLayerEagleDraftExtendCudaGraphRunner:
@@ -163,6 +164,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             num_correct_drafts = cuda_graph_buffers["num_correct_drafts"]
             num_accept_tokens = cuda_graph_buffers["num_accept_tokens"]
 
+            _dcp_buf = cuda_graph_buffers.get("dcp_kv_mask")
+            dcp_kv_mask = (
+                _dcp_buf[offset : offset + self.max_num_token]
+                if _dcp_buf is not None
+                else None
+            )
+
             extend_seq_lens = torch.full(
                 (self.max_bs,),
                 self.num_tokens_per_bs,
@@ -243,6 +251,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
         # Capture
@@ -316,6 +325,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
+        dcp_kv_mask = (
+            buffers.dcp_kv_mask[:num_tokens]
+            if buffers.dcp_kv_mask is not None
+            else None
+        )
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -397,6 +411,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             extend_num_tokens=self.num_tokens_per_bs * bs,
             num_token_non_padded_cpu=self.num_tokens_per_bs * bs,
             return_hidden_states_before_norm=True,
+            dcp_kv_mask=dcp_kv_mask,
         )
         return forward_batch
 
@@ -525,6 +540,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             buffers.extend_start_loc[:raw_bs].copy_(forward_batch.extend_start_loc)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
+        if (
+            buffers.dcp_kv_mask is not None
+            and forward_batch.dcp_kv_mask is not None
+        ):
+            buffers.dcp_kv_mask[:num_tokens].copy_(forward_batch.dcp_kv_mask)
         if (
             forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
@@ -706,6 +726,14 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 (self.max_bs,), 1, dtype=torch.int32
             )
 
+            _dcp_size = self.eagle_worker.server_args.dcp_size
+            if _dcp_size > 1:
+                self.cuda_graph_buffers["dcp_kv_mask"] = torch.zeros(
+                    (self.offsets[-1],), dtype=torch.bool
+                )
+            else:
+                self.cuda_graph_buffers["dcp_kv_mask"] = None
+
         for step in range(self.speculative_num_steps - 1, -1, -1):
             if self.runners[step] is not None:
                 tic = time.perf_counter()
@@ -743,6 +771,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers["num_accept_tokens"][:bs].copy_(
             batch_result.accept_lens
         )
+        if self.cuda_graph_buffers.get("dcp_kv_mask") is not None:
+            self.cuda_graph_buffers["dcp_kv_mask"].zero_()
 
     def get_runner(self, step):
         return self.runners[step]
