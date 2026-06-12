@@ -44,6 +44,10 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Return the full matched prefix (all full-attention cards) instead of the
+    # SWA-window-safe truncation. For the decode-side dedup/repoint, where cards
+    # are present even when SWA is tombstoned. No effect on non-SWA caches.
+    return_full_match: bool = False
 
 
 @dataclasses.dataclass
@@ -59,6 +63,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    force_leaf_creation: bool = False
 
     # General
     chunked: bool = False
@@ -71,6 +76,7 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    inserted_host_node: Any = None
 
 
 @dataclasses.dataclass
@@ -97,6 +103,7 @@ class IncLockRefResult:
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_host_lock: Optional[int] = None
     # Component nodes that were tombstones at acquire time. Replaying this set
     # at release prevents a short-lived lock from consuming a later load-back or
     # request lock after that tombstone becomes a valid device value.
@@ -108,6 +115,7 @@ class IncLockRefResult:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
+            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skip_lock_node_ids={
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
@@ -120,6 +128,7 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref operation."""
 
     swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_host_lock: Optional[int] = None
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )

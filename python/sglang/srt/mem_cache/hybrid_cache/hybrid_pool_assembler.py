@@ -376,7 +376,7 @@ def build_deepseek_v4_hicache_stack(
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
             state_pools=[
-                kvcache.compress_state_pools[layer_id]
+                kvcache.compress_state_pools[kvcache.start_layer + layer_id]
                 for layer_id in c4_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -387,7 +387,7 @@ def build_deepseek_v4_hicache_stack(
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
             state_pools=[
-                kvcache.indexer_compress_state_pools[layer_id]
+                kvcache.indexer_compress_state_pools[kvcache.start_layer + layer_id]
                 for layer_id in c4_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -441,7 +441,7 @@ def build_deepseek_v4_hicache_stack(
         c128_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
             state_pools=[
-                kvcache.compress_state_pools[layer_id]
+                kvcache.compress_state_pools[kvcache.start_layer + layer_id]
                 for layer_id in c128_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -651,6 +651,9 @@ def attach_hybrid_pool_to_unified_cache(
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    storage_backend: Optional[str] = None,
+    storage_extra_config: Optional[dict] = None,
+    storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -707,7 +710,11 @@ def attach_hybrid_pool_to_unified_cache(
                 load_cache_event=load_cache_event,
                 attn_cp_group=attn_cp_group,
                 attn_tp_group=attn_tp_group,
-                storage_backend=None,
+                storage_backend=storage_backend,
+                storage_backend_extra_config=storage_extra_config,
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=server_args.served_model_name,
+                enable_storage_metrics=server_args.enable_metrics,
                 host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
                 device_swa_evict_fn=lambda n: cache.evict(
                     EvictParams(swa_num_tokens=n)
