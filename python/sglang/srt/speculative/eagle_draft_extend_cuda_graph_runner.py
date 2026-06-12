@@ -461,6 +461,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             # 索引被 captured graph 内的 req_to_token / SWA mapping gather 用作行
             # 索引，进而触发 vectorized_gather_kernel 的 index out of bounds。
             buffers.req_pool_indices.zero_()
+            # 同样地，input_ids 在 captured graph 中会被 vocab embedding 作为
+            # gather 索引使用。如果 padding 区域 [num_tokens : bs*num_tokens_per_bs]
+            # 残留上一轮的 token id（可能 >= vocab_size），同样会触发
+            # vectorized_gather_kernel 的 index out of bounds。
+            buffers.input_ids.zero_()
+            if buffers.hidden_states is not None:
+                buffers.hidden_states.zero_()
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
