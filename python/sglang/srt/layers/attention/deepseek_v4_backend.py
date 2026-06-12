@@ -1166,7 +1166,14 @@ class DeepseekV4AttnBackend(
 
             import flash_mla
 
-            o = flash_mla.flash_mla_with_kvcache(
+            from sglang.srt.distributed.parallel_state import (
+                get_dcp_group_no_assert,
+            )
+
+            dcp_group = get_dcp_group_no_assert()
+            use_dcp = dcp_group is not None and dcp_group.world_size > 1
+
+            mla_result = flash_mla.flash_mla_with_kvcache(
                 q=q,
                 k_cache=swa_k_cache,
                 head_dim_v=self.head_dim_v,
@@ -1181,7 +1188,23 @@ class DeepseekV4AttnBackend(
                 extra_k_cache=extra_k_cache,
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
-            )[0]
+            )
+            if use_dcp:
+                from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
+
+                # DSv4 q is unsqueeze(1)'d so o is [B, 1, H_q, D_v] and lse is
+                # [B, H_q, 1]. cp_lse_ag_out_rs expects out=[B, H, D] /
+                # lse=[B, H] and returns [H/N, B, D] (reduce-scattered along
+                # the head dim).
+                # TODO(dcp): verify head-dim distribution matches attn_tp
+                # expectations on the caller side.
+                o, lse = mla_result[0], mla_result[1]
+                o_3d = o.squeeze(1)
+                lse_2d = lse.squeeze(-1)
+                o_3d = cp_lse_ag_out_rs(o_3d, lse_2d, dcp_group)
+                o = o_3d.transpose(0, 1).unsqueeze(1)
+            else:
+                o = mla_result[0]
 
             o = o.squeeze(1)
             return o
