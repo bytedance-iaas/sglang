@@ -51,6 +51,52 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
+    validate_deepseek_v4_dcp(server_args)
+
+
+def validate_deepseek_v4_dcp(server_args: "ServerArgs") -> None:
+    """Validate DeepSeek V4 DCP (decode context parallel) compatibility.
+
+    server_args.py already enforces ``tp_size % dcp_size == 0`` and disables
+    piecewise cuda graph for ``dcp_size > 1``. This hook adds the DSV4-specific
+    finer-grained checks: attn_tp divisibility and combo warnings for
+    HiSparse / online c128.
+    """
+    if server_args.dcp_size <= 1:
+        return
+
+    # attn_tp = tp_size // dp_size; dcp must divide attn_tp so each dcp group
+    # consists of attn_tp / dcp_size consecutive tp ranks within a dp shard.
+    attn_tp = server_args.tp_size // max(server_args.dp_size, 1)
+    if attn_tp % server_args.dcp_size != 0:
+        raise ValueError(
+            f"DeepSeekV4 DCP requires attn_tp ({attn_tp}) % dcp_size "
+            f"({server_args.dcp_size}) == 0; configure tp/dp_size accordingly."
+        )
+
+    # Online c128 + DCP: untested combination; warn but allow.
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        logger.warning(
+            "DeepSeekV4 DCP + SGLANG_OPT_USE_ONLINE_COMPRESS combo is "
+            "experimental; numerical correctness has not been validated."
+        )
+
+    # HiSparse + DCP: HiSparse C4 device pool uses index translation that is
+    # not yet DCP-aware in the fused C++ kernels; only the Triton fallback
+    # write path supports DCP.
+    if server_args.enable_hisparse:
+        logger.warning(
+            "DeepSeekV4 DCP + enable_hisparse falls back to Triton write "
+            "path for KV writes; expect throughput regression vs. fused C++."
+        )
+
+    logger.info(
+        f"DeepSeekV4 DCP enabled: dcp_size={server_args.dcp_size}, "
+        f"attn_tp={attn_tp}"
+    )
+
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
