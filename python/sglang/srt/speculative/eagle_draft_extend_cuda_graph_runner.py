@@ -519,17 +519,24 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-        )
+        # Some attention backends (DSv4) need the original ForwardBatch for
+        # replay-only metadata fields such as out_cache_loc and logical mode.
+        forward_batch.batch_size_before_padding = raw_bs
+        self.draft_extend_attn_backend._replay_forward_batch = forward_batch
+        try:
+            self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=buffers.req_pool_indices,
+                seq_lens=buffers.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu,
+            )
+        finally:
+            self.draft_extend_attn_backend._replay_forward_batch = None
 
         # Replay
         self.raw_bs = raw_bs
