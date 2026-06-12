@@ -51,6 +51,22 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
+    # Decode Context Parallel (DCP) on DSv4 is currently a work-in-progress:
+    # Phase 1 (distributed group + CLI) and Phase 2 (ForwardBatch.dcp_kv_mask
+    # plumbing + pool API surface) are landed, but the actual kernel-level
+    # mask integration in the fused DSv4 KV writers is Phase 3 and not yet
+    # implemented. Reject ``--dcp-size > 1`` upfront so users get a clean
+    # error instead of a NotImplementedError mid-forward.
+    if server_args.dcp_size > 1:
+        raise NotImplementedError(
+            f"DCP (decode context parallel) on {model_arch} is not yet "
+            f"functional (got --dcp-size={server_args.dcp_size}). The fused "
+            f"DSv4 KV writers (set_swa_key_buffer_radix_fused_norm_rope, "
+            f"set_extra_key_buffer_fused, set_index_k_fused) need Phase 3 "
+            f"kernel-level dcp_kv_mask integration before this flag can be "
+            f"enabled. Please run with --dcp-size 1 for now."
+        )
+
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
