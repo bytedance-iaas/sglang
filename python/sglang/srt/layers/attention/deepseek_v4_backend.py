@@ -648,7 +648,11 @@ class DeepseekV4AttnBackend(
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices
+                bs,
+                num_draft_tokens,
+                seq_lens,
+                req_pool_indices,
+                padded_num_tokens=out_cache_loc.shape[0],
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -1262,6 +1266,7 @@ class DeepseekV4AttnBackend(
         qo_len: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        padded_num_tokens: Optional[int] = None,
     ):
         seq_lens_casual = seq_lens[:, None] + torch.arange(
             -qo_len + 1, 1, **self.cuda_int32_kwargs
@@ -1271,6 +1276,19 @@ class DeepseekV4AttnBackend(
             bs, **self.cuda_int32_kwargs
         ).repeat_interleave(qo_len)
         req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
+        num_tokens = seq_lens_casual.shape[0]
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
+            pad_size = padded_num_tokens - num_tokens
+            seq_lens_casual = torch.nn.functional.pad(
+                seq_lens_casual,
+                (0, pad_size),
+                value=1,
+            )
+            req_pool_indices_repeated = torch.nn.functional.pad(
+                req_pool_indices_repeated,
+                (0, pad_size),
+                value=req_pool_indices_repeated[-1].item(),
+            )
         return seq_lens_casual, req_pool_indices_repeated
 
     def make_core_attn_metadata(
