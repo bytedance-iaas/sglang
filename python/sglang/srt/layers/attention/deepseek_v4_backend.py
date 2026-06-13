@@ -1259,6 +1259,7 @@ class DeepseekV4AttnBackend(
                     head_start = dst_rank * local_heads
                     head_end = head_start + local_heads
                     q_slice = q[:, :, head_start:head_end, :].contiguous()
+                    attn_sink_slice = attn_sink[head_start:head_end].contiguous()
                     mla_result = flash_mla.flash_mla_with_kvcache(
                         q=q_slice,
                         k_cache=swa_k_cache,
@@ -1270,7 +1271,7 @@ class DeepseekV4AttnBackend(
                         is_fp8_kvcache=True,
                         indices=swa_page_indices,
                         topk_length=swa_topk_lengths,
-                        attn_sink=attn_sink,
+                        attn_sink=attn_sink_slice,
                         extra_k_cache=extra_k_cache,
                         extra_indices_in_kvcache=extra_indices,
                         extra_topk_length=extra_topk_lengths,
