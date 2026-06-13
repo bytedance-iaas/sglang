@@ -119,7 +119,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = mr.num_effective_layers
 
-        # DCP world size; allocator will divide back to per-rank physical.
+        # DCP world size; pool sizes are reported in logical token capacity.
         self._dcp_size = mr.dcp_size if hasattr(mr, "dcp_size") else 1
 
         self._cell_size = self._compute_cell_size(mr, num_layers)

@@ -608,7 +608,16 @@ class MQALayer(nn.Module):
             attn_sink=self.attn_sink,
             save_kv_cache=False,
         )
-        o = o[:, tp_slice, :]
+        if self.tp_size > 1:
+            if o.shape[1] == self.n_heads:
+                o = o[:, tp_slice, :]
+            elif o.shape[1] != self.n_local_heads:
+                raise RuntimeError(
+                    "Unexpected DSv4 attention output head count: "
+                    f"got {o.shape[1]}, expected full heads {self.n_heads} "
+                    f"or local heads {self.n_local_heads}. This usually "
+                    "indicates an unsupported DCP/attention-TP layout."
+                )
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
