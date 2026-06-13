@@ -77,13 +77,15 @@ def validate_deepseek_v4_dcp(server_args: "ServerArgs") -> None:
             "verifying numerical equivalence vs. dcp_size=1 on your cluster."
         )
 
-    # attn_tp = tp_size // dp_size; dcp must divide attn_tp so each dcp group
-    # consists of attn_tp / dcp_size consecutive tp ranks within a dp shard.
+    # Current DSv4 DCP implementation reduce-scatters attention output across
+    # the attention-TP head dimension. This is only valid when the DCP group is
+    # exactly the attention-TP group; smaller DCP subgroups would produce a
+    # larger-than-local head shard that the caller cannot map back correctly.
     attn_tp = server_args.tp_size // max(server_args.dp_size, 1)
-    if attn_tp % server_args.dcp_size != 0:
+    if attn_tp != server_args.dcp_size:
         raise ValueError(
-            f"DeepSeekV4 DCP requires attn_tp ({attn_tp}) % dcp_size "
-            f"({server_args.dcp_size}) == 0; configure tp/dp_size accordingly."
+            f"DeepSeekV4 DCP currently requires dcp_size ({server_args.dcp_size}) "
+            f"== attn_tp ({attn_tp}); configure tp/dp_size/dcp_size accordingly."
         )
 
     # Online c128 + DCP: untested combination; warn but allow.
