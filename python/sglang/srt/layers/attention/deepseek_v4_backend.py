@@ -1254,10 +1254,21 @@ class DeepseekV4AttnBackend(
                     f"dcp_size={dcp_group.world_size}"
                 )
                 local_heads = H_q // dcp_group.world_size
+                flashmla_min_heads = 32
+                heads_per_call = max(local_heads, flashmla_min_heads)
+                assert H_q % heads_per_call == 0, (
+                    f"DCP FlashMLA head chunk {heads_per_call} must divide "
+                    f"query head count {H_q}"
+                )
+                assert heads_per_call % local_heads == 0, (
+                    f"DCP FlashMLA head chunk {heads_per_call} must be a "
+                    f"multiple of local heads {local_heads}"
+                )
                 local_o = None
-                for dst_rank in range(dcp_group.world_size):
-                    head_start = dst_rank * local_heads
-                    head_end = head_start + local_heads
+                local_head_start = dcp_group.rank_in_group * local_heads
+                local_head_end = local_head_start + local_heads
+                for head_start in range(0, H_q, heads_per_call):
+                    head_end = head_start + heads_per_call
                     q_slice = q[:, :, head_start:head_end, :].contiguous()
                     attn_sink_slice = attn_sink[head_start:head_end].contiguous()
                     mla_result = flash_mla.flash_mla_with_kvcache(
@@ -1289,16 +1300,18 @@ class DeepseekV4AttnBackend(
                             lse,
                             torch.full_like(lse, float("-inf")),
                         )
-                    o_flat = o.reshape(B * S_q, local_heads, D_v)
+                    o_flat = o.reshape(B * S_q, heads_per_call, D_v)
                     lse_flat = (
                         lse.permute(0, 2, 1)
-                        .reshape(B * S_q, local_heads)
+                        .reshape(B * S_q, heads_per_call)
                         .contiguous()
                     )
                     merged = cp_lse_ag_out_ar(o_flat, lse_flat, dcp_group)
-                    if dst_rank == dcp_group.rank_in_group:
+                    if head_start <= local_head_start and local_head_end <= head_end:
+                        offset = local_head_start - head_start
                         local_o = (
-                            merged.transpose(0, 1)
+                            merged[offset : offset + local_heads]
+                            .transpose(0, 1)
                             .contiguous()
                             .reshape(B, S_q, local_heads, D_v)
                         )
