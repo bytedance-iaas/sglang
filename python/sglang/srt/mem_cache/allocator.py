@@ -532,20 +532,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Decode-Context-Parallel (DCP) wrapper over ``PagedTokenToKVPoolAllocator``.
 
-    DCP shards the KV cache across ``dcp_world_size`` ranks: each rank holds
-    ``physical_size_per_rank = size // dcp_world_size`` tokens of physical
-    storage, but the logical address space spans the full ``size`` so that
-    request-level metadata (kv_indices, last_loc, ...) can use a single
-    striped indexing scheme where token index ``i`` lives on rank
-    ``i % dcp_world_size`` at local offset ``i // dcp_world_size``.
+    Request metadata, SWA mappings, radix-cache bookkeeping, and free paths all
+    operate on the cluster-wide logical token-index space. DCP only changes KV
+    *storage*: logical token index ``i`` is persisted by rank
+    ``i % dcp_world_size`` at local physical offset ``i // dcp_world_size``.
 
-    To make a paged allocator hand out striped logical indices automatically,
-    we set the *real* underlying paged allocator's page_size to
-    ``dcp_world_size * page_size`` and its size to ``physical_size_per_rank``.
-    Each underlying physical page therefore covers ``dcp_world_size`` logical
-    page slots; the free-list and alloc kernels operate purely on
-    per-rank-physical units, while alloc/free callers see the unchanged
-    logical token-index space.
+    Therefore the allocator must remain a logical paged allocator. Translating
+    to physical offsets inside the allocator would make alloc/free operate on a
+    different address space than the rest of the scheduler and can leave pages
+    permanently unavailable after a request finishes.
     """
 
     def __init__(
@@ -577,10 +572,9 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.dcp_rank = dcp_rank
         self.dcp_world_size = dcp_world_size
 
-        physical_size_per_rank = size // dcp_world_size
         self.real_allocator = PagedTokenToKVPoolAllocator(
-            physical_size_per_rank,
-            dcp_world_size * page_size,
+            size,
+            page_size,
             dtype,
             device,
             kvcache,
@@ -645,9 +639,7 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.real_allocator.clear()
 
     def available_size(self):
-        # Surface the logical-token view so scheduler metrics reflect what the
-        # request scheduler can address, not just one rank's slice.
-        return self.real_allocator.available_size() * self.dcp_world_size
+        return self.real_allocator.available_size()
 
     def debug_print(self) -> str:
         return self.real_allocator.debug_print()

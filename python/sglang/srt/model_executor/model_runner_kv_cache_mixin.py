@@ -357,8 +357,8 @@ class ModelRunnerKVCacheMixin:
         # DCP: pool_configurator now produces logical (cluster-wide) token
         # counts. KVPool constructors size GPU buffers, which are per-rank.
         # Convert logical → physical per-rank by dividing by dcp_size.
-        # Allocators still receive logical sizes (DcpTokenToKVPoolAllocator
-        # divides back to physical internally).
+        # Allocators still receive logical sizes; KV writers map logical locs
+        # to per-rank physical offsets when DCP is enabled.
         _dcp_div = self.dcp_size if self.dcp_size > 1 else 1
         _phys_max_total = self.max_total_num_tokens // _dcp_div
         if self.is_hybrid_swa:

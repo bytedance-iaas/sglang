@@ -205,8 +205,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         # DCP: scale per-rank physical capacity to cluster-wide logical capacity
-        # so allocator wrapping (DcpTokenToKVPoolAllocator) can divide back to
-        # physical when sharding KV across dcp ranks.
+        # because request metadata remains logical while KV storage is per-rank.
         if self._dcp_size > 1:
             max_total_num_tokens *= self._dcp_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
