@@ -1245,58 +1245,81 @@ class DeepseekV4AttnBackend(
             dcp_group = get_dcp_group_no_assert()
             use_dcp = dcp_group is not None and dcp_group.world_size > 1
 
-            mla_result = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )
             if use_dcp:
-                from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
+                from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_ar
 
-                # DSv4 q is unsqueeze(1)'d so o is [B, S_q, H_q, D_v] and lse
-                # is [B, H_q, S_q]. cp_lse_ag_out_rs expects out=[B', H, D] /
-                # lse=[B', H] and returns [H/N, B', D] (reduce-scattered along
-                # the head dim). For decode S_q==1; for target_verify /
-                # draft_extend S_q>1, so flatten (B, S_q) -> B*S_q before the
-                # collective and reshape back afterwards.
-                # TODO(dcp): verify head-dim distribution matches attn_tp
-                # expectations on the caller side.
-                o, lse = mla_result[0], mla_result[1]
-                B, S_q, H_q, D_v = o.shape
-                if core_attn_metadata.dcp_has_local_kv is not None:
-                    has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
-                    has_local_kv = has_local_kv.reshape(B, S_q)
-                    o = torch.where(
-                        has_local_kv[:, :, None, None], o, torch.zeros_like(o)
-                    )
-                    lse = torch.where(
-                        has_local_kv[:, None, :],
-                        lse,
-                        torch.full_like(lse, float("-inf")),
-                    )
-                o_flat = o.reshape(B * S_q, H_q, D_v)
-                lse_flat = (
-                    lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
+                B, S_q, H_q, _ = q.shape
+                assert H_q % dcp_group.world_size == 0, (
+                    f"DCP query head count {H_q} must be divisible by "
+                    f"dcp_size={dcp_group.world_size}"
                 )
-                merged = cp_lse_ag_out_rs(o_flat, lse_flat, dcp_group)
-                # merged: [H_q/N, B*S_q, D_v]
-                o = (
-                    merged.transpose(0, 1)
-                    .contiguous()
-                    .reshape(B, S_q, -1, D_v)
-                )
+                local_heads = H_q // dcp_group.world_size
+                local_o = None
+                for dst_rank in range(dcp_group.world_size):
+                    head_start = dst_rank * local_heads
+                    head_end = head_start + local_heads
+                    q_slice = q[:, :, head_start:head_end, :].contiguous()
+                    mla_result = flash_mla.flash_mla_with_kvcache(
+                        q=q_slice,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        block_table=None,
+                        cache_seqlens=None,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )
+                    o, lse = mla_result[0], mla_result[1]
+                    B, S_q, _, D_v = o.shape
+                    if core_attn_metadata.dcp_has_local_kv is not None:
+                        has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
+                        has_local_kv = has_local_kv.reshape(B, S_q)
+                        o = torch.where(
+                            has_local_kv[:, :, None, None], o, torch.zeros_like(o)
+                        )
+                        lse = torch.where(
+                            has_local_kv[:, None, :],
+                            lse,
+                            torch.full_like(lse, float("-inf")),
+                        )
+                    o_flat = o.reshape(B * S_q, local_heads, D_v)
+                    lse_flat = (
+                        lse.permute(0, 2, 1)
+                        .reshape(B * S_q, local_heads)
+                        .contiguous()
+                    )
+                    merged = cp_lse_ag_out_ar(o_flat, lse_flat, dcp_group)
+                    if dst_rank == dcp_group.rank_in_group:
+                        local_o = (
+                            merged.transpose(0, 1)
+                            .contiguous()
+                            .reshape(B, S_q, local_heads, D_v)
+                        )
+                assert local_o is not None
+                o = local_o
             else:
+                mla_result = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
                 o = mla_result[0]
 
             o = o.squeeze(1)
