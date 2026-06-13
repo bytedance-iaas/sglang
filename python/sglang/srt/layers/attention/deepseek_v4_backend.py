@@ -128,6 +128,7 @@ class DSV4AttnMetadata:
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    dcp_has_local_kv: Optional[torch.Tensor] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -171,6 +172,7 @@ class DSV4AttnMetadata:
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
+                "dcp_has_local_kv",
             ],
             assign_fields=[
                 "c1_flashmla_metadata",
@@ -231,6 +233,13 @@ class DSV4AttnMetadata:
         compacted = torch.where(
             compact_mask, compacted, torch.full_like(compacted, -1)
         )
+        # FlashMLA does not reliably support 0-length rows. Put a safe dummy
+        # entry at column 0; callers must ignore the row using local_lengths.
+        zero_length_mask = local_lengths.unsqueeze(-1) == 0
+        first_col_mask = col == 0
+        compacted = torch.where(
+            zero_length_mask & first_col_mask, torch.zeros_like(compacted), compacted
+        )
         return compacted.to(torch.int32), local_lengths
 
     def apply_dcp_local_kv_indices(self) -> None:
@@ -239,17 +248,22 @@ class DSV4AttnMetadata:
             return
 
         dcp_rank = get_dcp_rank()
-        self.swa_page_indices, self.swa_topk_lengths = (
+        self.swa_page_indices, swa_local_lengths = (
             self._compact_dcp_local_indices(
                 self.swa_page_indices, dcp_world_size, dcp_rank
             )
         )
+        has_local_kv = swa_local_lengths > 0
+        self.swa_topk_lengths = torch.clamp(swa_local_lengths, min=1)
         if self.c128_page_indices is not None:
-            self.c128_page_indices, self.c128_topk_lengths_clamp1 = (
+            self.c128_page_indices, c128_local_lengths = (
                 self._compact_dcp_local_indices(
                     self.c128_page_indices, dcp_world_size, dcp_rank
                 )
             )
+            has_local_kv |= c128_local_lengths > 0
+            self.c128_topk_lengths_clamp1 = torch.clamp(c128_local_lengths, min=1)
+        self.dcp_has_local_kv = has_local_kv
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -261,6 +275,7 @@ class DSV4AttnMetadata:
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
+        "dcp_has_local_kv",
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
@@ -1194,6 +1209,13 @@ class DeepseekV4AttnBackend(
                     swa_topk_lengths = _pad_tensor_to_size(
                         swa_topk_lengths, q.shape[0], value=1
                     )
+                if (
+                    core_attn_metadata.dcp_has_local_kv is not None
+                    and core_attn_metadata.dcp_has_local_kv.shape[0] != q.shape[0]
+                ):
+                    core_attn_metadata.dcp_has_local_kv = _pad_tensor_to_size(
+                        core_attn_metadata.dcp_has_local_kv, q.shape[0], value=False
+                    )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -1252,6 +1274,17 @@ class DeepseekV4AttnBackend(
                 # expectations on the caller side.
                 o, lse = mla_result[0], mla_result[1]
                 B, S_q, H_q, D_v = o.shape
+                if core_attn_metadata.dcp_has_local_kv is not None:
+                    has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
+                    has_local_kv = has_local_kv.reshape(B, S_q)
+                    o = torch.where(
+                        has_local_kv[:, :, None, None], o, torch.zeros_like(o)
+                    )
+                    lse = torch.where(
+                        has_local_kv[:, None, :],
+                        lse,
+                        torch.full_like(lse, float("-inf")),
+                    )
                 o_flat = o.reshape(B * S_q, H_q, D_v)
                 lse_flat = (
                     lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
