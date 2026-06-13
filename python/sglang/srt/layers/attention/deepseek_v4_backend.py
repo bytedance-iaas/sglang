@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -202,8 +203,53 @@ class DSV4AttnMetadata:
             compute_page_indices=True,
         )
 
+        self.apply_dcp_local_kv_indices()
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+
+    @staticmethod
+    def _compact_dcp_local_indices(
+        indices: torch.Tensor,
+        dcp_world_size: int,
+        dcp_rank: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid_mask = indices >= 0
+        local_mask = valid_mask & ((indices % dcp_world_size) == dcp_rank)
+        physical_indices = torch.where(
+            local_mask, indices // dcp_world_size, torch.full_like(indices, -1)
+        )
+
+        col = torch.arange(indices.shape[-1], device=indices.device).view(
+            *([1] * (indices.dim() - 1)), -1
+        )
+        order_key = torch.where(local_mask, col, col + indices.shape[-1])
+        order = torch.argsort(order_key, dim=-1)
+        compacted = torch.gather(physical_indices, dim=-1, index=order)
+
+        local_lengths = local_mask.sum(dim=-1).to(torch.int32)
+        compact_mask = col < local_lengths.unsqueeze(-1)
+        compacted = torch.where(
+            compact_mask, compacted, torch.full_like(compacted, -1)
+        )
+        return compacted.to(torch.int32), local_lengths
+
+    def apply_dcp_local_kv_indices(self) -> None:
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size == 1:
+            return
+
+        dcp_rank = get_dcp_rank()
+        self.swa_page_indices, self.swa_topk_lengths = (
+            self._compact_dcp_local_indices(
+                self.swa_page_indices, dcp_world_size, dcp_rank
+            )
+        )
+        if self.c128_page_indices is not None:
+            self.c128_page_indices, self.c128_topk_lengths_clamp1 = (
+                self._compact_dcp_local_indices(
+                    self.c128_page_indices, dcp_world_size, dcp_rank
+                )
+            )
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
