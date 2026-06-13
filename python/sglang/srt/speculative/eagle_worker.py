@@ -879,7 +879,18 @@ class EAGLEWorker(TpModelWorker):
                 and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
             ):
                 out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
+            step_out_cache_loc = out_cache_loc[i]
+            forward_batch.out_cache_loc = step_out_cache_loc
+            if forward_batch.out_cache_loc_swa is not None:
+                forward_batch.out_cache_loc_swa = (
+                    self.draft_model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        step_out_cache_loc
+                    )
+                )
+            if forward_batch.dcp_kv_mask is not None:
+                dcp_size = getattr(self.draft_model_runner, "dcp_size", 1)
+                dcp_rank = getattr(self.draft_model_runner, "dcp_rank", 0)
+                forward_batch.dcp_kv_mask = step_out_cache_loc % dcp_size == dcp_rank
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
