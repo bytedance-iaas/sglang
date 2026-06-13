@@ -89,6 +89,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
@@ -443,8 +444,12 @@ class DeepseekV2MoE(nn.Module):
         is_deepseek_v4: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        if enable_nextn_moe_sparse_fully_dp():
+            self.tp_size = 1
+            self.moe_ep_size = 1
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
 
@@ -520,7 +525,11 @@ class DeepseekV2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe
-            + get_global_server_args().ep_num_redundant_experts,
+            + (
+                0
+                if enable_nextn_moe_sparse_fully_dp()
+                else get_global_server_args().ep_num_redundant_experts
+            ),
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -603,6 +612,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or enable_nextn_moe_sparse_fully_dp()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
             self.shared_experts = DeepseekV2MLP(
@@ -1553,7 +1563,7 @@ class DeepseekV2AttentionMLA(
             attention_backend = get_global_server_args().decode_attention_backend
         elif (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             # Use the specified backend for speculative operations (both verify and draft extend)
             if get_global_server_args().speculative_attention_mode == "decode":
