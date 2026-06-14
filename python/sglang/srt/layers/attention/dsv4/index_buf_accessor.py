@@ -33,61 +33,16 @@ class NopeFp8RopeBf16Pack:
 
 class SetKAndS:
     @classmethod
-    def execute(
-        cls,
-        pool,
-        buf,
-        loc,
-        nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
-        dcp_world_size: int = 1,
-        dcp_rank: int = 0,
-    ):
-        cls.triton(
-            pool,
-            buf,
-            loc,
-            nope_fp8_rope_bf16_pack,
-            dcp_world_size=dcp_world_size,
-            dcp_rank=dcp_rank,
-        )
+    def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
+        cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
 
     @classmethod
-    def torch(
-        cls,
-        pool,
-        buf,
-        loc,
-        nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
-        dcp_world_size: int = 1,
-        dcp_rank: int = 0,
-    ):
-        _set_k_and_s_torch(
-            buf,
-            loc,
-            nope_fp8_rope_bf16_pack,
-            pool.page_size,
-            dcp_world_size=dcp_world_size,
-            dcp_rank=dcp_rank,
-        )
+    def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
+        _set_k_and_s_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
     @classmethod
-    def triton(
-        cls,
-        pool,
-        buf,
-        loc,
-        nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
-        dcp_world_size: int = 1,
-        dcp_rank: int = 0,
-    ):
-        _set_k_and_s_triton(
-            buf,
-            loc,
-            nope_fp8_rope_bf16_pack,
-            pool.page_size,
-            dcp_world_size=dcp_world_size,
-            dcp_rank=dcp_rank,
-        )
+    def triton(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
+        _set_k_and_s_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
 
 def _set_k_and_s_triton(
@@ -95,8 +50,6 @@ def _set_k_and_s_triton(
     loc: torch.Tensor,
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     page_size: int,
-    dcp_world_size: int = 1,
-    dcp_rank: int = 0,
 ):
     num_pages, buf_numel_per_page = buf.shape
     (num_tokens_to_write,) = loc.shape
@@ -160,8 +113,6 @@ def _set_k_and_s_triton(
         BLOCK_NOPE=512,
         BLOCK_ROPE=64,
         BLOCK_SCALE=8,
-        DCP_WORLD_SIZE=dcp_world_size,
-        DCP_RANK=dcp_rank,
     )
 
 
@@ -188,13 +139,9 @@ def _set_k_and_s_triton_kernel(
     BLOCK_NOPE: tl.constexpr,
     BLOCK_ROPE: tl.constexpr,
     BLOCK_SCALE: tl.constexpr,
-    DCP_WORLD_SIZE: tl.constexpr,
-    DCP_RANK: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     loc = tl.load(loc_ptr + token_id)
-    is_local_dcp = (loc % DCP_WORLD_SIZE) == DCP_RANK
-    loc = loc // DCP_WORLD_SIZE
 
     nope_range = tl.arange(0, BLOCK_NOPE)
     nope_mask = nope_range < NUM_NOPE_ELEMS_PER_TOKEN
@@ -233,9 +180,9 @@ def _set_k_and_s_triton_kernel(
         + scale_range
     )
 
-    tl.store(buf_fp8_ptr + out_k_nope_offsets, k_nope, mask=nope_mask & is_local_dcp)
-    tl.store(buf_bf16_ptr + out_k_rope_offsets, k_rope, mask=is_local_dcp)
-    tl.store(buf_uint8_ptr + out_s_offsets, k_scale, mask=scale_mask & is_local_dcp)
+    tl.store(buf_fp8_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
+    tl.store(buf_bf16_ptr + out_k_rope_offsets, k_rope)
+    tl.store(buf_uint8_ptr + out_s_offsets, k_scale, mask=scale_mask)
 
 
 def _set_k_and_s_torch(
@@ -243,8 +190,6 @@ def _set_k_and_s_torch(
     loc: torch.Tensor,
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     page_size: int,
-    dcp_world_size: int = 1,
-    dcp_rank: int = 0,
 ):
     num_pages, buf_numel_per_page = buf.shape
     (num_tokens_to_write,) = loc.shape
@@ -286,9 +231,8 @@ def _set_k_and_s_torch(
     buf_bf16 = buf.view(torch.bfloat16).flatten()
     buf_scale = buf.view(torch.uint8).flatten()
 
-    local_loc = loc // dcp_world_size
-    loc_page_index = local_loc // page_size
-    loc_token_offset_in_page = local_loc % page_size
+    loc_page_index = loc // page_size
+    loc_token_offset_in_page = loc % page_size
 
     s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
 
@@ -308,8 +252,6 @@ def _set_k_and_s_torch(
     )
 
     for i in range(num_tokens_to_write):
-        if loc[i] % dcp_world_size != dcp_rank:
-            continue
         buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
