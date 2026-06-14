@@ -921,11 +921,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP not yet supported on DSv4 set_swa_key_buffer_radix_fused; "
-                "needs Phase 3 kernel-level mask integration."
-            )
         if self._should_cache_swa:
             if layer_id == self.start_layer or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
@@ -959,12 +954,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP not yet supported on DSv4 "
-                "set_swa_key_buffer_radix_fused_norm_rope; needs Phase 3 "
-                "kernel-level mask integration."
-            )
         if self._should_cache_swa:
             if layer_id == self.start_layer or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
@@ -1006,11 +995,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP not yet supported on DSv4 set_extra_key_buffer_fused; "
-                "needs Phase 3 kernel-level mask integration."
-            )
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if dcp_kv_mask is not None:
@@ -1031,11 +1015,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        if dcp_kv_mask is not None:
-            raise NotImplementedError(
-                "DCP not yet supported on DSv4 set_index_k_fused; needs "
-                "Phase 3 kernel-level mask integration."
-            )
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         if dcp_kv_mask is not None:

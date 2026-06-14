@@ -27,11 +27,13 @@ needs ``requests`` so it can run from any Python 3.8+ environment.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -59,17 +61,121 @@ DEFAULT_PROMPTS: List[str] = [
 
 
 @dataclass
+class TestCase:
+    name: str
+    endpoint: str
+    prompt: Optional[str] = None
+    messages: Optional[List[Dict[str, str]]] = None
+    stream: bool = False
+    tools: Optional[List[Dict[str, Any]]] = None
+
+
+@dataclass
 class CompletionResult:
     text: str
     token_ids: List[int]
     chosen_logprobs: List[float]  # logprob of each chosen token
+    raw: Dict[str, Any]
 
     def fingerprint(self) -> str:
         # Stable repr for diffing.
         return json.dumps(
-            {"token_ids": self.token_ids, "text": self.text},
+            {"token_ids": self.token_ids, "text": self.text, "raw": self.raw},
             ensure_ascii=False,
+            sort_keys=True,
         )
+
+
+def stable_token_id(token: str) -> int:
+    return int.from_bytes(hashlib.sha256(token.encode("utf-8")).digest()[:8], "big")
+
+
+def build_test_cases(num_prompts: int) -> List[TestCase]:
+    cases = [
+        TestCase(name=f"completion_{idx}", endpoint="completion", prompt=prompt)
+        for idx, prompt in enumerate(DEFAULT_PROMPTS[:num_prompts])
+    ]
+    cases.extend(
+        [
+            TestCase(
+                name="completion_stream",
+                endpoint="completion",
+                prompt="Stream a short deterministic checklist about KV cache correctness.",
+                stream=True,
+            ),
+            TestCase(
+                name="chat_reasoning_cn",
+                endpoint="chat",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "请用三句话解释在线 c128 压缩和 DCP 等价性验证的关系。",
+                    }
+                ],
+            ),
+            TestCase(
+                name="chat_multi_turn",
+                endpoint="chat",
+                messages=[
+                    {"role": "user", "content": "Remember the word radix."},
+                    {"role": "assistant", "content": "I will remember the word radix."},
+                    {"role": "user", "content": "What word did I ask you to remember?"},
+                ],
+            ),
+            TestCase(
+                name="chat_stream",
+                endpoint="chat",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "List two invariants for decode context parallel KV sharding.",
+                    }
+                ],
+                stream=True,
+            ),
+            TestCase(
+                name="chat_tool_call",
+                endpoint="chat",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Use the tool to report weather for Beijing in celsius.",
+                    }
+                ],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get current weather for a city.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "city": {"type": "string"},
+                                    "unit": {"type": "string", "enum": ["celsius"]},
+                                },
+                                "required": ["city", "unit"],
+                            },
+                        },
+                    }
+                ],
+            ),
+        ]
+    )
+    return cases
+
+
+def iter_sse_json(resp: requests.Response):
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if payload == "[DONE]":
+            break
+        yield json.loads(payload)
 
 
 def call_completion(
@@ -78,6 +184,7 @@ def call_completion(
     prompt: str,
     max_tokens: int,
     timeout: float,
+    stream: bool = False,
 ) -> CompletionResult:
     """Call the OpenAI-compatible /v1/completions endpoint."""
     payload = {
@@ -90,34 +197,160 @@ def call_completion(
         "top_k": 1,
         "logprobs": 1,
         "echo": False,
-        "stream": False,
+        "stream": stream,
         "seed": 42,
     }
     resp = requests.post(
         f"{url.rstrip('/')}/v1/completions",
         json=payload,
         timeout=timeout,
+        stream=stream,
     )
     resp.raise_for_status()
+    if stream:
+        chunks = list(iter_sse_json(resp))
+        text = "".join(chunk["choices"][0].get("text", "") for chunk in chunks)
+        return CompletionResult(text=text, token_ids=[], chosen_logprobs=[], raw={})
+
     data = resp.json()
     choice = data["choices"][0]
     text = choice["text"]
     lp = choice.get("logprobs") or {}
     token_logprobs = lp.get("token_logprobs") or []
-    # Token ids are not in OpenAI logprobs; fall back to per-token strings.
-    # We hash strings as a stand-in for token ids — sufficient for divergence
-    # detection on identical tokenizers.
+    # Token ids are not in OpenAI logprobs; fall back to stable per-token hashes.
     tokens = lp.get("tokens") or []
-    token_ids = [hash(t) & 0xFFFFFFFF for t in tokens]
+    token_ids = [stable_token_id(t) for t in tokens]
     chosen_logprobs = [float(x) if x is not None else 0.0 for x in token_logprobs]
     return CompletionResult(
-        text=text, token_ids=token_ids, chosen_logprobs=chosen_logprobs
+        text=text, token_ids=token_ids, chosen_logprobs=chosen_logprobs, raw={}
     )
 
 
+def call_chat(
+    url: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    max_tokens: int,
+    timeout: float,
+    stream: bool = False,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> CompletionResult:
+    """Call the OpenAI-compatible /v1/chat/completions endpoint."""
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 1,
+        "stream": stream,
+        "seed": 42,
+    }
+    if tools is not None:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    resp = requests.post(
+        f"{url.rstrip('/')}/v1/chat/completions",
+        json=payload,
+        timeout=timeout,
+        stream=stream,
+    )
+    resp.raise_for_status()
+    if stream:
+        chunks = list(iter_sse_json(resp))
+        text = "".join(
+            chunk["choices"][0].get("delta", {}).get("content") or ""
+            for chunk in chunks
+        )
+        return CompletionResult(text=text, token_ids=[], chosen_logprobs=[], raw={})
+
+    data = resp.json()
+    message = data["choices"][0]["message"]
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    tool_calls = message.get("tool_calls") or []
+    raw = {"reasoning": reasoning, "tool_calls": tool_calls}
+    return CompletionResult(
+        text=content,
+        token_ids=[],
+        chosen_logprobs=[],
+        raw=raw,
+    )
+
+
+def run_case(url: str, model: str, case: TestCase, max_tokens: int, timeout: float):
+    if case.endpoint == "completion":
+        assert case.prompt is not None
+        return call_completion(
+            url, model, case.prompt, max_tokens, timeout, stream=case.stream
+        )
+    if case.endpoint == "chat":
+        assert case.messages is not None
+        return call_chat(
+            url,
+            model,
+            case.messages,
+            max_tokens,
+            timeout,
+            stream=case.stream,
+            tools=case.tools,
+        )
+    raise ValueError(f"unsupported endpoint {case.endpoint!r}")
+
+
+def run_cases(
+    url: str,
+    model: str,
+    cases: List[TestCase],
+    max_tokens: int,
+    timeout: float,
+    concurrency: int,
+) -> Dict[str, CompletionResult]:
+    if concurrency <= 1:
+        return {
+            case.name: run_case(url, model, case, max_tokens, timeout)
+            for case in cases
+        }
+
+    results: Dict[str, CompletionResult] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(run_case, url, model, case, max_tokens, timeout): case.name
+            for case in cases
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
+def save_results(path: str, results: Dict[str, CompletionResult]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {name: result.__dict__ for name, result in results.items()},
+            f,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def load_results(path: str) -> Dict[str, CompletionResult]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        name: CompletionResult(
+            text=item.get("text", ""),
+            token_ids=item.get("token_ids", []),
+            chosen_logprobs=item.get("chosen_logprobs", []),
+            raw=item.get("raw", {}),
+        )
+        for name, item in data.items()
+    }
+
+
 def compare_one(
-    idx: int,
-    prompt: str,
+    name: str,
     base: CompletionResult,
     cand: CompletionResult,
     logprob_atol: float,
@@ -126,9 +359,14 @@ def compare_one(
     ok = True
     if base.text != cand.text:
         ok = False
-        print(f"[prompt #{idx}] TEXT MISMATCH")
+        print(f"[{name}] TEXT MISMATCH")
         print(f"  baseline:  {base.text!r}")
         print(f"  candidate: {cand.text!r}")
+    if base.raw != cand.raw:
+        ok = False
+        print(f"[{name}] RAW MISMATCH")
+        print(f"  baseline:  {json.dumps(base.raw, ensure_ascii=False, sort_keys=True)}")
+        print(f"  candidate: {json.dumps(cand.raw, ensure_ascii=False, sort_keys=True)}")
     if base.token_ids != cand.token_ids:
         ok = False
         # Find first diverging position
@@ -138,7 +376,7 @@ def compare_one(
             n,
         )
         print(
-            f"[prompt #{idx}] TOKEN MISMATCH at position {first_div} "
+            f"[{name}] TOKEN MISMATCH at position {first_div} "
             f"(baseline_len={len(base.token_ids)}, "
             f"candidate_len={len(cand.token_ids)})"
         )
@@ -151,16 +389,16 @@ def compare_one(
         if max_delta > logprob_atol:
             ok = False
             print(
-                f"[prompt #{idx}] LOGPROB DELTA exceeds atol={logprob_atol}: "
+                f"[{name}] LOGPROB DELTA exceeds atol={logprob_atol}: "
                 f"max={max_delta:.6f}"
             )
         else:
             print(
-                f"[prompt #{idx}] OK (max_logprob_delta={max_delta:.6f}, "
+                f"[{name}] OK (max_logprob_delta={max_delta:.6f}, "
                 f"len={len(base.token_ids)})"
             )
     elif ok:
-        print(f"[prompt #{idx}] OK (text+tokens identical, no logprob compare)")
+        print(f"[{name}] OK")
     return ok
 
 
@@ -180,8 +418,11 @@ def wait_for_health(url: str, timeout: float = 60.0) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--baseline-url", required=True, help="dcp_size=1 server URL")
-    ap.add_argument("--candidate-url", required=True, help="dcp_size>1 server URL")
+    ap.add_argument("--baseline-url", help="dcp_size=1 server URL")
+    ap.add_argument("--candidate-url", help="dcp_size>1 server URL")
+    ap.add_argument("--capture-url", help="capture results from one endpoint and exit")
+    ap.add_argument("--capture-output", help="JSON output path for --capture-url")
+    ap.add_argument("--baseline-results", help="saved baseline JSON from --capture-url")
     ap.add_argument(
         "--model-path",
         required=True,
@@ -190,6 +431,7 @@ def main() -> int:
     ap.add_argument("--num-prompts", type=int, default=len(DEFAULT_PROMPTS))
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument(
         "--logprob-atol",
         type=float,
@@ -209,46 +451,89 @@ def main() -> int:
 
     if args.prompts_file:
         with open(args.prompts_file, "r", encoding="utf-8") as f:
-            prompts = [line.rstrip("\n") for line in f if line.strip()]
+            cases = [
+                TestCase(name=f"prompt_file_{idx}", endpoint="completion", prompt=line.rstrip("\n"))
+                for idx, line in enumerate(f)
+                if line.strip()
+            ]
     else:
-        prompts = DEFAULT_PROMPTS[: args.num_prompts]
+        cases = build_test_cases(args.num_prompts)
 
-    if not prompts:
-        print("No prompts to evaluate.", file=sys.stderr)
+    if not cases:
+        print("No test cases to evaluate.", file=sys.stderr)
         return 2
 
+    urls_to_check = []
+    if args.capture_url:
+        urls_to_check.append(args.capture_url)
+    else:
+        if args.baseline_url:
+            urls_to_check.append(args.baseline_url)
+        if args.candidate_url:
+            urls_to_check.append(args.candidate_url)
     if not args.skip_health_check:
-        for url in (args.baseline_url, args.candidate_url):
+        for url in urls_to_check:
             print(f"Waiting for {url} ...")
             wait_for_health(url)
 
-    failures = 0
-    for i, prompt in enumerate(prompts):
-        try:
-            base = call_completion(
-                args.baseline_url,
-                args.model_path,
-                prompt,
-                args.max_tokens,
-                args.timeout,
-            )
-            cand = call_completion(
-                args.candidate_url,
-                args.model_path,
-                prompt,
-                args.max_tokens,
-                args.timeout,
-            )
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"[prompt #{i}] REQUEST FAILED: {e}")
-            continue
+    if args.capture_url:
+        if not args.capture_output:
+            print("--capture-output is required with --capture-url", file=sys.stderr)
+            return 2
+        results = run_cases(
+            args.capture_url,
+            args.model_path,
+            cases,
+            args.max_tokens,
+            args.timeout,
+            args.concurrency,
+        )
+        save_results(args.capture_output, results)
+        print(f"Captured {len(results)} cases to {args.capture_output}")
+        return 0
 
-        if not compare_one(i, prompt, base, cand, args.logprob_atol):
+    if args.baseline_results:
+        base_results = load_results(args.baseline_results)
+    elif args.baseline_url:
+        base_results = run_cases(
+            args.baseline_url,
+            args.model_path,
+            cases,
+            args.max_tokens,
+            args.timeout,
+            args.concurrency,
+        )
+    else:
+        print("Either --baseline-url or --baseline-results is required", file=sys.stderr)
+        return 2
+
+    if not args.candidate_url:
+        print("--candidate-url is required for comparison", file=sys.stderr)
+        return 2
+
+    cand_results = run_cases(
+        args.candidate_url,
+        args.model_path,
+        cases,
+        args.max_tokens,
+        args.timeout,
+        args.concurrency,
+    )
+
+    failures = 0
+    for case in cases:
+        try:
+            base = base_results[case.name]
+            cand = cand_results[case.name]
+        except KeyError as e:
+            failures += 1
+            print(f"[{case.name}] MISSING RESULT: {e}")
+            continue
+        if not compare_one(case.name, base, cand, args.logprob_atol):
             failures += 1
 
     print()
-    print(f"Total prompts: {len(prompts)}, failures: {failures}")
+    print(f"Total cases: {len(cases)}, failures: {failures}")
     return 0 if failures == 0 else 1
 
 

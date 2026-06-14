@@ -591,7 +591,6 @@ class Envs:
     # cannot enable an unvalidated combination by accident. Flip to 1 once
     # numerical-equivalence regression has been verified on the target cluster.
     SGLANG_DSV4_ENABLE_DCP = EnvBool(False)
-    SGLANG_DEBUG_DSV4_DCP_ATTENTION = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

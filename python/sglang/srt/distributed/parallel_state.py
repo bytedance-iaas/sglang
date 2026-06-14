@@ -735,8 +735,15 @@ class GroupCoordinator:
     def reduce_scatter_along_dim(
         self, input_: torch.Tensor, dim: int = -1
     ) -> torch.Tensor:
-        """Reduce-scatter ``input_`` along ``dim``."""
+        """Reduce-scatter ``input_`` along ``dim``.
+
+        This is a thin wrapper around ``reduce_scatter_tensor`` that supports
+        an arbitrary scatter dimension by moving it to dim 0, calling
+        reduce-scatter, and moving it back. Used by Decode Context Parallel
+        (DCP) to merge per-rank attention outputs.
+        """
         world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
         assert (
@@ -744,18 +751,27 @@ class GroupCoordinator:
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
         if dim < 0:
+            # Convert negative dim to positive.
             dim += input_.dim()
 
+        # Note: This will produce an incorrect answer if we don't make
+        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
         input_tensor = input_.movedim(dim, 0).contiguous()
+
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
+
         output_tensor = torch.empty(
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
+
+        # Perform reduce-scatter operation
         torch.distributed.reduce_scatter_tensor(
             output_tensor, input_tensor, group=self.device_group
         )
+
+        # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
 
     def _reduce_scatter_tensor(
@@ -1521,7 +1537,7 @@ def get_attn_tp_group() -> GroupCoordinator:
 def get_attn_cp_group() -> GroupCoordinator:
     assert (
         _ATTN_CP is not None
-    ), "attention context model parallel group is not initialized"
+    ), "attention context parallel group is not initialized"
     return _ATTN_CP
 
 
@@ -1587,6 +1603,11 @@ def get_mooncake_transfer_engine():
 
 @contextmanager
 def _maybe_dcp_graph_capture(context):
+    """If a DCP group exists, hook its graph_capture into the outer ``with``.
+
+    When DCP is disabled (``_DCP is None``) we yield a no-op so that the
+    existing graph_capture call site stays unchanged.
+    """
     if _DCP is None:
         yield context
         return
@@ -2089,6 +2110,7 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
     )
 
+    # Build the decode context parallel groups.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
     if decode_context_parallel_size > 1:
@@ -2097,7 +2119,9 @@ def initialize_model_parallel(
             f" divisible by decode_context_parallel_size"
             f" ({decode_context_parallel_size})"
         )
-        num_decode_context_parallel_groups = world_size // decode_context_parallel_size
+        num_decode_context_parallel_groups: int = (
+            world_size // decode_context_parallel_size
+        )
         group_ranks = []
         for i in range(num_decode_context_parallel_groups):
             ranks = list(
@@ -2266,10 +2290,12 @@ def get_tensor_model_parallel_rank():
 
 # DCP helpers (return 1 / 0 when DCP is not enabled)
 def get_dcp_world_size() -> int:
+    """Return world size for the decode context parallel group, or 1 when off."""
     return _DCP.world_size if _DCP is not None else 1
 
 
 def get_dcp_rank() -> int:
+    """Return my rank for the decode context parallel group, or 0 when off."""
     return _DCP.rank_in_group if _DCP is not None else 0
 
 
