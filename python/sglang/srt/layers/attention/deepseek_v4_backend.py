@@ -128,6 +128,8 @@ class DSV4AttnMetadata:
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    dcp_swa_has_local_kv: Optional[torch.Tensor] = None
+    dcp_c128_has_local_kv: Optional[torch.Tensor] = None
     dcp_has_local_kv: Optional[torch.Tensor] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -172,6 +174,8 @@ class DSV4AttnMetadata:
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
+                "dcp_swa_has_local_kv",
+                "dcp_c128_has_local_kv",
                 "dcp_has_local_kv",
             ],
             assign_fields=[
@@ -244,7 +248,7 @@ class DSV4AttnMetadata:
 
     def apply_dcp_local_kv_indices(self) -> None:
         dcp_world_size = get_dcp_world_size()
-        if dcp_world_size == 1:
+        if dcp_world_size == 1 or self.dcp_swa_has_local_kv is not None:
             return
 
         dcp_rank = get_dcp_rank()
@@ -253,7 +257,7 @@ class DSV4AttnMetadata:
                 self.swa_page_indices, dcp_world_size, dcp_rank
             )
         )
-        has_local_kv = swa_local_lengths > 0
+        self.dcp_swa_has_local_kv = swa_local_lengths > 0
         self.swa_topk_lengths = torch.clamp(swa_local_lengths, min=1)
         if self.c128_page_indices is not None:
             self.c128_page_indices, c128_local_lengths = (
@@ -261,9 +265,18 @@ class DSV4AttnMetadata:
                     self.c128_page_indices, dcp_world_size, dcp_rank
                 )
             )
-            has_local_kv |= c128_local_lengths > 0
+            self.dcp_c128_has_local_kv = c128_local_lengths > 0
             self.c128_topk_lengths_clamp1 = torch.clamp(c128_local_lengths, min=1)
-        self.dcp_has_local_kv = has_local_kv
+        # Backward-compatible alias for existing metadata copy/replay paths.
+        # Forward must use the compress-ratio-specific mask below instead.
+        self.dcp_has_local_kv = self.dcp_swa_has_local_kv
+
+    def get_dcp_has_local_kv(self, compress_ratio: Literal[0, 4, 128]):
+        if self.dcp_swa_has_local_kv is None:
+            return self.dcp_has_local_kv
+        if compress_ratio == 128 and self.dcp_c128_has_local_kv is not None:
+            return self.dcp_swa_has_local_kv | self.dcp_c128_has_local_kv
+        return self.dcp_swa_has_local_kv
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -275,6 +288,8 @@ class DSV4AttnMetadata:
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
+        "dcp_swa_has_local_kv",
+        "dcp_c128_has_local_kv",
         "dcp_has_local_kv",
     ]
     _CP_GLOBAL_FIELDS = [
@@ -295,13 +310,17 @@ class DSV4AttnMetadata:
         expected_local_len = pre_global_len // cp_size
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
+            if val is None:
+                continue
             assert isinstance(
                 val, torch.Tensor
             ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name)
+            val = getattr(self, field_name, None)
+            if val is None:
+                continue
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
                 f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
@@ -1216,6 +1235,17 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata.dcp_has_local_kv = _pad_tensor_to_size(
                         core_attn_metadata.dcp_has_local_kv, q.shape[0], value=False
                     )
+                for field_name in (
+                    "dcp_swa_has_local_kv",
+                    "dcp_c128_has_local_kv",
+                ):
+                    val = getattr(core_attn_metadata, field_name, None)
+                    if val is not None and val.shape[0] != q.shape[0]:
+                        setattr(
+                            core_attn_metadata,
+                            field_name,
+                            _pad_tensor_to_size(val, q.shape[0], value=False),
+                        )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -1270,8 +1300,11 @@ class DeepseekV4AttnBackend(
                 # the TP-local head slice.
                 o, lse = mla_result[0], mla_result[1]
                 B, S_q, H_q, D_v = o.shape
-                if core_attn_metadata.dcp_has_local_kv is not None:
-                    has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
+                dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
+                    compress_ratio
+                )
+                if dcp_has_local_kv is not None:
+                    has_local_kv = dcp_has_local_kv[: B * S_q]
                     has_local_kv = has_local_kv.reshape(B, S_q)
                     o = torch.where(
                         has_local_kv[:, :, None, None], o, torch.zeros_like(o)
@@ -1420,6 +1453,7 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.init_compression_metadata()
             core_attn_metadata.init_flashmla_related()
         else:
+            core_attn_metadata.apply_dcp_local_kv_indices()
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
