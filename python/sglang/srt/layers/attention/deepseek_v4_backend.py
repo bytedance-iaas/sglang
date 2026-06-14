@@ -1528,6 +1528,16 @@ class DeepseekV4AttnBackend(
                 o = mla_result[0]
 
             o = o.squeeze(1)
+            # Unified final-output fingerprint for both DCP and non-DCP paths
+            # so a dcp_size=1 baseline run and a dcp_size>1 candidate run can be
+            # diffed per layer to locate the first diverging layer. ``o`` is the
+            # full-head output on the non-DCP path and this rank's head slice on
+            # the DCP path; min/max/mean still surface numerical drift.
+            _dcp_log(
+                f"final_attn_output layer={layer_id} compress_ratio={compress_ratio} "
+                f"use_dcp={use_dcp}",
+                _dcp_tensor_summary("o", o),
+            )
             return o
 
         raise NotImplementedError("ragged attention")
