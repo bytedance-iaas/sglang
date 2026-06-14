@@ -129,7 +129,6 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
     dcp_swa_has_local_kv: Optional[torch.Tensor] = None
-    dcp_c4_has_local_kv: Optional[torch.Tensor] = None
     dcp_c128_has_local_kv: Optional[torch.Tensor] = None
     dcp_has_local_kv: Optional[torch.Tensor] = None
 
@@ -176,7 +175,6 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
                 "dcp_swa_has_local_kv",
-                "dcp_c4_has_local_kv",
                 "dcp_c128_has_local_kv",
                 "dcp_has_local_kv",
             ],
@@ -273,25 +271,9 @@ class DSV4AttnMetadata:
         # Forward must use the compress-ratio-specific mask below instead.
         self.dcp_has_local_kv = self.dcp_swa_has_local_kv
 
-    def apply_dcp_local_c4_sparse_indices(self) -> None:
-        dcp_world_size = get_dcp_world_size()
-        if dcp_world_size == 1:
-            return
-
-        dcp_rank = get_dcp_rank()
-        self.c4_sparse_page_indices, c4_local_lengths = (
-            self._compact_dcp_local_indices(
-                self.c4_sparse_page_indices, dcp_world_size, dcp_rank
-            )
-        )
-        self.dcp_c4_has_local_kv = c4_local_lengths > 0
-        self.c4_sparse_topk_lengths = torch.clamp(c4_local_lengths, min=1)
-
     def get_dcp_has_local_kv(self, compress_ratio: Literal[0, 4, 128]):
         if self.dcp_swa_has_local_kv is None:
             return self.dcp_has_local_kv
-        if compress_ratio == 4 and self.dcp_c4_has_local_kv is not None:
-            return self.dcp_swa_has_local_kv | self.dcp_c4_has_local_kv
         if compress_ratio == 128 and self.dcp_c128_has_local_kv is not None:
             return self.dcp_swa_has_local_kv | self.dcp_c128_has_local_kv
         return self.dcp_swa_has_local_kv
@@ -307,7 +289,6 @@ class DSV4AttnMetadata:
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
         "dcp_swa_has_local_kv",
-        "dcp_c4_has_local_kv",
         "dcp_c128_has_local_kv",
         "dcp_has_local_kv",
     ]
@@ -1256,7 +1237,6 @@ class DeepseekV4AttnBackend(
                     )
                 for field_name in (
                     "dcp_swa_has_local_kv",
-                    "dcp_c4_has_local_kv",
                     "dcp_c128_has_local_kv",
                 ):
                     val = getattr(core_attn_metadata, field_name, None)
