@@ -383,7 +383,7 @@ class SetKAndS:
         SetS.execute(pool=pool, buf=buf, loc=loc, index_k_scale=index_k_scale)
 
     @classmethod
-    def triton(cls, pool, buf, loc, index_k, index_k_scale, dcp_world_size=1, dcp_rank=0):
+    def triton(cls, pool, buf, loc, index_k, index_k_scale):
         loc = loc.to(torch.int64)
 
         _set_k_and_s_triton(
@@ -392,8 +392,6 @@ class SetKAndS:
             index_k=index_k,
             index_k_scale=index_k_scale,
             page_size=pool.page_size,
-            dcp_world_size=dcp_world_size,
-            dcp_rank=dcp_rank,
         )
 
 
@@ -403,8 +401,6 @@ def _set_k_and_s_triton(
     index_k: torch.Tensor,
     index_k_scale: torch.Tensor,
     page_size: int,
-    dcp_world_size: int = 1,
-    dcp_rank: int = 0,
 ):
     """
     :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
@@ -469,8 +465,6 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
-        DCP_WORLD_SIZE=dcp_world_size,
-        DCP_RANK=dcp_rank,
     )
 
 
@@ -486,18 +480,10 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    DCP_WORLD_SIZE: tl.constexpr,
-    DCP_RANK: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
     loc = tl.load(loc_ptr + token_id)
-
-    # DCP: every rank only owns the slots whose ``loc % world_size == rank``.
-    if DCP_WORLD_SIZE > 1:
-        if (loc % DCP_WORLD_SIZE) != DCP_RANK:
-            return
-        loc = loc // DCP_WORLD_SIZE
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 

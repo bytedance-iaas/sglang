@@ -597,10 +597,6 @@ class MQALayer(nn.Module):
         dcp_group = get_dcp_group_no_assert()
         use_dcp = dcp_group is not None and dcp_group.world_size > 1
         if use_dcp:
-            # DCP shards KV tokens across ranks, but every rank must evaluate
-            # attention for the same full set of query heads before the backend
-            # LSE-merge/reduce-scatter step. ``q_padded`` only has this rank's
-            # TP slice initialized, so gather local heads from the DCP group.
             q_for_attn = dcp_group.all_gather(q.contiguous(), dim=1)
         else:
             q_for_attn = q_padded if q_padded is not None else q
@@ -627,8 +623,7 @@ class MQALayer(nn.Module):
                 raise RuntimeError(
                     "Unexpected DSv4 attention output head count: "
                     f"got {o.shape[1]}, expected full heads {self.n_heads} "
-                    f"or local heads {self.n_local_heads}. This usually "
-                    "indicates an unsupported DCP/attention-TP layout."
+                    f"or local heads {self.n_local_heads}."
                 )
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],

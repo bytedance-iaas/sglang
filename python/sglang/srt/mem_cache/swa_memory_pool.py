@@ -336,8 +336,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             if dcp_world_size > 1:
-                # DCP keeps allocation/free bookkeeping in logical token-index
-                # space; KV writers map logical locs to rank-local storage.
+                # DCP wrapper handles striped logical addressing on top of a
+                # paged allocator with effective page_size = dcp_world_size *
+                # page_size.
                 def _make_paged(pool_size, kv_pool):
                     return DcpTokenToKVPoolAllocator(
                         pool_size,

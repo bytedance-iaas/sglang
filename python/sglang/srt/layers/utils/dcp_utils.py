@@ -8,10 +8,8 @@ Ported from upstream PR #14194 (Decode CP for MLA models). Provides:
   rewrites the output as ``correction * local_out`` into a transposed
   ``[H, B, D]`` buffer ready for ``reduce_scatter_along_dim(out, dim=0)``.
 - ``correct_attn_out`` Python wrapper around the kernel.
-- ``cp_lse_ag_out_rs`` higher-level helper: all-gather LSE → correct one
-  destination head slice at a time → all-reduce, returning the merged attention
-  output for the caller's rank. This is mathematically equivalent to a
-  full-head reduce-scatter while avoiding a full ``[H, B, D]`` fp32 workspace.
+- ``cp_lse_ag_out_rs`` higher-level helper: all-gather LSE → correct → reduce
+  scatter back, returning the merged attention output for the caller's rank.
 
 These are all no-ops when ``cp_group.world_size == 1`` so they are safe to
 call unconditionally from DSv4 attention forward.
@@ -234,34 +232,20 @@ def cp_lse_ag_out_rs(
     if ctx is None:
         ctx = CPTritonContext()
 
-    B, H, D = cp_attn_out.shape
-    assert H % cp_group.world_size == 0, (
-        f"DCP head count {H} must be divisible by world_size={cp_group.world_size}"
+    # The kernel expects an [H, B, D] output buffer; we'll reduce-scatter
+    # along dim=0 (heads) afterwards.
+    new_output = cp_attn_out.new_empty(
+        cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
     )
-    local_heads = H // cp_group.world_size
-
-    # Clone before the collective so CUDA graph does not keep FlashMLA's LSE
-    # storage alive longer than necessary. This follows the upstream DCP PR's
-    # memory optimization for graph replay.
+    # Clone before the collective so CUDA graph replay does not keep
+    # FlashMLA's LSE storage alive longer than necessary.
     cp_attn_lse = cp_attn_lse.to(torch.float32).clone()
+
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-
-    result = cp_attn_out.new_empty((local_heads, B, D))
-    new_output = torch.empty(
-        (local_heads, B, D), device=cp_attn_out.device, dtype=torch.float32
+    out, _ = correct_attn_out(
+        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
-    for dst_rank in range(cp_group.world_size):
-        head_start = dst_rank * local_heads
-        head_end = head_start + local_heads
-        out_slice = cp_attn_out[:, head_start:head_end, :]
-        lses_slice = lses[:, :, head_start:head_end]
-        partial, _ = correct_attn_out(
-            out_slice, lses_slice, cp_group.rank_in_group, ctx, new_output
-        )
-        partial = cp_group.all_reduce(partial)
-        if dst_rank == cp_group.rank_in_group:
-            result.copy_(partial.to(result.dtype))
-
-    return result
+    out = cp_group.reduce_scatter_along_dim(out, dim=0)
+    return out.to(cp_attn_out.dtype)
