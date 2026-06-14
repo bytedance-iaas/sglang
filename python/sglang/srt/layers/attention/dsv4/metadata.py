@@ -143,7 +143,16 @@ class PagedIndexerMetadata:
 
     @property
     def max_c4_seq_len(self) -> int:
-        return self.page_table.shape[1] * self.c4_page_size
+        if self.c4_seq_lens.numel() == 0:
+            return self.c4_page_size
+
+        # CUDA graph/raw metadata may keep a max-capacity page table. The indexer
+        # should only materialize logits up to the active compressed length.
+        max_c4_seq_len = int(self.c4_seq_lens.max().item())
+        max_c4_pages = max(
+            1, (max_c4_seq_len + self.c4_page_size - 1) // self.c4_page_size
+        )
+        return min(max_c4_pages, self.page_table.shape[1]) * self.c4_page_size
 
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
