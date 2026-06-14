@@ -458,9 +458,6 @@ class C4IndexerBackendMixin:
                     )
                 )
 
-        if hisparse_coordinator is None:
-            core_metadata.apply_dcp_local_c4_sparse_indices()
-
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
