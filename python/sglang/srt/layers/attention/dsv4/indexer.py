@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -14,6 +15,7 @@ from sglang.jit_kernel.deepseek_v4 import (
     topk_transform_512_v2,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -28,6 +30,64 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+_DCP_INDEXER_LOG_COUNT = 0
+
+
+def _dcp_indexer_should_log() -> bool:
+    global _DCP_INDEXER_LOG_COUNT
+    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
+    if limit <= 0 or _DCP_INDEXER_LOG_COUNT >= limit:
+        return False
+    _DCP_INDEXER_LOG_COUNT += 1
+    return True
+
+
+def _dcp_indexer_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
+    if x is None:
+        return f"{name}=None"
+    with torch.no_grad():
+        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
+        if x.numel() == 0:
+            parts.append("empty")
+        elif x.is_floating_point():
+            finite = torch.isfinite(x)
+            parts.append(f"finite={int(finite.sum().item())}/{x.numel()}")
+            if finite.any():
+                xf = x[finite].float()
+                parts.append(f"min={float(xf.min().item()):.6g}")
+                parts.append(f"max={float(xf.max().item()):.6g}")
+        else:
+            valid = x >= 0
+            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
+            if valid.any():
+                xv = x[valid]
+                parts.append(f"min={int(xv.min().item())}")
+                parts.append(f"max={int(xv.max().item())}")
+                dcp_world_size = get_dcp_world_size()
+                if dcp_world_size > 1:
+                    hist = torch.bincount(
+                        (xv % dcp_world_size).to(torch.int64),
+                        minlength=dcp_world_size,
+                    )
+                    parts.append(
+                        "mod_hist="
+                        + ",".join(str(int(v.item())) for v in hist[:dcp_world_size])
+                    )
+        return " ".join(parts)
+
+
+def _dcp_indexer_log(message: str, *summaries: str) -> None:
+    if not _dcp_indexer_should_log():
+        return
+    logger.warning(
+        "DSV4_DCP_ACC_DEBUG rank=%s/%s %s %s",
+        get_dcp_rank(),
+        get_dcp_world_size(),
+        message,
+        " | ".join(summaries),
+    )
 
 
 if is_hip():
@@ -438,6 +498,22 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        _dcp_indexer_log(
+            f"c4_topk_after_transform layer={c4_indexer.layer_id} "
+            f"hisparse={hisparse_coordinator is not None} "
+            f"capture={capture_enabled}",
+            _dcp_indexer_tensor_summary("logits", logits),
+            _dcp_indexer_tensor_summary(
+                "c4_seq_lens", indexer_metadata.c4_seq_lens
+            ),
+            _dcp_indexer_tensor_summary(
+                "c4_sparse_page_indices", core_metadata.c4_sparse_page_indices
+            ),
+            _dcp_indexer_tensor_summary("raw_indices", raw_indices),
+            _dcp_indexer_tensor_summary(
+                "c4_sparse_topk_lengths", core_metadata.c4_sparse_topk_lengths
+            ),
+        )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
@@ -457,6 +533,13 @@ class C4IndexerBackendMixin:
                         core_metadata.c4_sparse_page_indices
                     )
                 )
+            _dcp_indexer_log(
+                f"c4_topk_after_hisparse layer={c4_indexer.layer_id}",
+                _dcp_indexer_tensor_summary(
+                    "c4_sparse_page_indices", core_metadata.c4_sparse_page_indices
+                ),
+                _dcp_indexer_tensor_summary("raw_indices", raw_indices),
+            )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[

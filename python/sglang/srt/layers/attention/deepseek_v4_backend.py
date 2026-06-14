@@ -69,6 +69,69 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+_DCP_ACCURACY_LOG_COUNT = 0
+
+
+def _dcp_accuracy_log_enabled() -> bool:
+    return envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get() > 0
+
+
+def _dcp_accuracy_should_log() -> bool:
+    global _DCP_ACCURACY_LOG_COUNT
+    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
+    if limit <= 0 or _DCP_ACCURACY_LOG_COUNT >= limit:
+        return False
+    _DCP_ACCURACY_LOG_COUNT += 1
+    return True
+
+
+def _dcp_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
+    if x is None:
+        return f"{name}=None"
+    with torch.no_grad():
+        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
+        if x.numel() == 0:
+            parts.append("empty")
+        elif x.dtype == torch.bool:
+            parts.append(f"true={int(x.sum().item())}/{x.numel()}")
+        elif x.is_floating_point():
+            finite = torch.isfinite(x)
+            parts.append(f"finite={int(finite.sum().item())}/{x.numel()}")
+            if finite.any():
+                xf = x[finite].float()
+                parts.append(f"min={float(xf.min().item()):.6g}")
+                parts.append(f"max={float(xf.max().item()):.6g}")
+                parts.append(f"mean={float(xf.mean().item()):.6g}")
+        else:
+            valid = x >= 0
+            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
+            if valid.any():
+                xv = x[valid]
+                parts.append(f"min={int(xv.min().item())}")
+                parts.append(f"max={int(xv.max().item())}")
+                dcp_world_size = get_dcp_world_size()
+                if dcp_world_size > 1:
+                    hist = torch.bincount(
+                        (xv % dcp_world_size).to(torch.int64),
+                        minlength=dcp_world_size,
+                    )
+                    parts.append(
+                        "mod_hist="
+                        + ",".join(str(int(v.item())) for v in hist[:dcp_world_size])
+                    )
+        return " ".join(parts)
+
+
+def _dcp_log(message: str, *summaries: str) -> None:
+    if not _dcp_accuracy_should_log():
+        return
+    logger.warning(
+        "DSV4_DCP_ACC_DEBUG rank=%s/%s %s %s",
+        get_dcp_rank(),
+        get_dcp_world_size(),
+        message,
+        " | ".join(summaries),
+    )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -252,6 +315,16 @@ class DSV4AttnMetadata:
             return
 
         dcp_rank = get_dcp_rank()
+        if _dcp_accuracy_log_enabled():
+            _dcp_log(
+                "before_localize_base_indices",
+                _dcp_tensor_summary("swa_page_indices", self.swa_page_indices),
+                _dcp_tensor_summary("swa_topk_lengths", self.swa_topk_lengths),
+                _dcp_tensor_summary("c128_page_indices", self.c128_page_indices),
+                _dcp_tensor_summary(
+                    "c128_topk_lengths", self.c128_topk_lengths_clamp1
+                ),
+            )
         self.swa_page_indices, swa_local_lengths = (
             self._compact_dcp_local_indices(
                 self.swa_page_indices, dcp_world_size, dcp_rank
@@ -270,6 +343,17 @@ class DSV4AttnMetadata:
         # Backward-compatible alias for existing metadata copy/replay paths.
         # Forward must use the compress-ratio-specific mask below instead.
         self.dcp_has_local_kv = self.dcp_swa_has_local_kv
+        _dcp_log(
+            "after_localize_base_indices",
+            _dcp_tensor_summary("swa_page_indices", self.swa_page_indices),
+            _dcp_tensor_summary("swa_local_lengths", swa_local_lengths),
+            _dcp_tensor_summary("dcp_swa_has_local_kv", self.dcp_swa_has_local_kv),
+            _dcp_tensor_summary("c128_page_indices", self.c128_page_indices),
+            _dcp_tensor_summary(
+                "c128_topk_lengths", self.c128_topk_lengths_clamp1
+            ),
+            _dcp_tensor_summary("dcp_c128_has_local_kv", self.dcp_c128_has_local_kv),
+        )
 
     def get_dcp_has_local_kv(self, compress_ratio: Literal[0, 4, 128]):
         if self.dcp_swa_has_local_kv is None:
@@ -1278,6 +1362,18 @@ class DeepseekV4AttnBackend(
             if use_dcp:
                 from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
 
+                _dcp_log(
+                    f"flashmla_input layer={layer_id} compress_ratio={compress_ratio}",
+                    _dcp_tensor_summary("q", q),
+                    _dcp_tensor_summary("swa_page_indices", swa_page_indices),
+                    _dcp_tensor_summary("swa_topk_lengths", swa_topk_lengths),
+                    _dcp_tensor_summary("extra_indices", extra_indices),
+                    _dcp_tensor_summary("extra_topk_lengths", extra_topk_lengths),
+                    _dcp_tensor_summary(
+                        "active_has_local_kv",
+                        core_attn_metadata.get_dcp_has_local_kv(compress_ratio),
+                    ),
+                )
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
@@ -1300,6 +1396,12 @@ class DeepseekV4AttnBackend(
                 # the TP-local head slice.
                 o, lse = mla_result[0], mla_result[1]
                 B, S_q, H_q, D_v = o.shape
+                _dcp_log(
+                    f"flashmla_output_pre_mask layer={layer_id} "
+                    f"compress_ratio={compress_ratio}",
+                    _dcp_tensor_summary("o", o),
+                    _dcp_tensor_summary("lse", lse),
+                )
                 dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
                     compress_ratio
                 )
@@ -1314,9 +1416,22 @@ class DeepseekV4AttnBackend(
                         lse,
                         torch.full_like(lse, float("-inf")),
                     )
+                    _dcp_log(
+                        f"flashmla_output_post_mask layer={layer_id} "
+                        f"compress_ratio={compress_ratio}",
+                        _dcp_tensor_summary("has_local_kv", has_local_kv),
+                        _dcp_tensor_summary("o", o),
+                        _dcp_tensor_summary("lse", lse),
+                    )
                 o_flat = o.reshape(B * S_q, H_q, D_v)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
                 merged = cp_lse_ag_out_rs(o_flat, lse_flat, dcp_group)
+                _dcp_log(
+                    f"dcp_merge_output layer={layer_id} compress_ratio={compress_ratio}",
+                    _dcp_tensor_summary("o_flat", o_flat),
+                    _dcp_tensor_summary("lse_flat", lse_flat),
+                    _dcp_tensor_summary("merged", merged),
+                )
                 o = merged.transpose(0, 1).contiguous().reshape(B, S_q, -1, D_v)
             else:
                 mla_result = flash_mla.flash_mla_with_kvcache(
