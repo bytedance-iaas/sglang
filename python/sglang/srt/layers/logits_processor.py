@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_rank,
     get_attention_tp_size,
     get_dp_device,
     get_dp_dtype,
