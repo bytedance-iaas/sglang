@@ -904,7 +904,6 @@ class DeepseekV4HipRadixBackend(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
                 cache_k=swa_k,
-                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
@@ -912,7 +911,6 @@ class DeepseekV4HipRadixBackend(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
 
     def _maybe_upgrade_forward_metadata(self) -> None:
