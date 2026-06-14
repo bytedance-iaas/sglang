@@ -1388,17 +1388,13 @@ class DeepseekV4AttnBackend(
             if use_dcp:
                 from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
 
-                # Attention sink is a global softmax term with zero value. In
-                # DCP each rank computes a partial KV shard, so counting the
-                # sink on every rank would add it dcp_size times during LSE
-                # merge. Let rank 0 own it and make other ranks contribute no
-                # sink term.
-                dcp_owns_attn_sink = dcp_group.rank_in_group == 0
-                dcp_attn_sink = (
-                    attn_sink
-                    if dcp_owns_attn_sink
-                    else torch.full_like(attn_sink, float("-inf"))
-                )
+                # Attention sink is a global softmax term with zero value. Do
+                # not pass it into per-rank FlashMLA partials: rows with no
+                # local KV use dummy index 0/length 1, and an in-kernel sink
+                # would prevent the post-mask from removing that dummy KV. We
+                # merge KV-only attention first and fold the sink denominator
+                # into the merged local head slice below.
+                dcp_attn_sink = torch.full_like(attn_sink, float("-inf"))
                 active_dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
                     compress_ratio
                 )
@@ -1408,16 +1404,6 @@ class DeepseekV4AttnBackend(
                     else:
                         active_dcp_has_local_kv = (
                             active_dcp_has_local_kv | c4_has_local_kv
-                        )
-                if dcp_owns_attn_sink:
-                    sink_has_local = torch.ones(
-                        q.shape[0], dtype=torch.bool, device=q.device
-                    )
-                    if active_dcp_has_local_kv is None:
-                        active_dcp_has_local_kv = sink_has_local
-                    else:
-                        active_dcp_has_local_kv = (
-                            active_dcp_has_local_kv | sink_has_local
                         )
 
                 _dcp_log(
@@ -1482,11 +1468,31 @@ class DeepseekV4AttnBackend(
                     )
                 o_flat = o.reshape(B * S_q, H_q, D_v)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
-                merged = cp_lse_ag_out_rs(o_flat, lse_flat, dcp_group)
+                merged, merged_lse = cp_lse_ag_out_rs(
+                    o_flat, lse_flat, dcp_group, return_lse=True
+                )
+                local_heads = H_q // dcp_group.world_size
+                sink_start = dcp_group.rank_in_group * local_heads
+                sink_end = sink_start + local_heads
+                local_attn_sink = attn_sink[sink_start:sink_end].to(torch.float32)
+                sink_scale = torch.where(
+                    torch.isneginf(merged_lse),
+                    torch.zeros_like(merged_lse),
+                    1.0
+                    / (
+                        1.0
+                        + torch.exp(local_attn_sink[None, :] - merged_lse)
+                    ),
+                )
+                merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1).to(
+                    merged.dtype
+                )
                 _dcp_log(
                     f"dcp_merge_output layer={layer_id} compress_ratio={compress_ratio}",
                     _dcp_tensor_summary("o_flat", o_flat),
                     _dcp_tensor_summary("lse_flat", lse_flat),
+                    _dcp_tensor_summary("merged_lse", merged_lse),
+                    _dcp_tensor_summary("sink_scale", sink_scale),
                     _dcp_tensor_summary("merged", merged),
                 )
                 o = merged.transpose(0, 1).contiguous().reshape(B, S_q, -1, D_v)
