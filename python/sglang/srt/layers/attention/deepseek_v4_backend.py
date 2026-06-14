@@ -1655,6 +1655,18 @@ class DeepseekV4AttnBackend(
         assert raw_indices.shape == (num_qo_tokens, SWA_WINDOW)
         raw_indices.masked_fill_(invalid_offset_mask, -1)
         swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
+        if get_dcp_world_size() > 1 and _dcp_accuracy_log_enabled():
+            dcp_world_size = get_dcp_world_size()
+            valid_mapping = (raw_indices >= 0) & (swa_indices >= 0)
+            owner_mismatch = valid_mapping & (
+                (raw_indices % dcp_world_size) != (swa_indices % dcp_world_size)
+            )
+            _dcp_log(
+                "swa_full_to_swa_mapping",
+                _dcp_tensor_summary("raw_indices", raw_indices),
+                _dcp_tensor_summary("swa_indices", swa_indices),
+                _dcp_tensor_summary("owner_mismatch", owner_mismatch),
+            )
         return swa_indices
 
 
