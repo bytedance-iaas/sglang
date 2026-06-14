@@ -1331,6 +1331,26 @@ class DeepseekV4AttnBackend(
                             _pad_tensor_to_size(val, q.shape[0], value=False),
                         )
 
+            c4_has_local_kv = None
+            if (
+                get_dcp_world_size() > 1
+                and compress_ratio == 4
+                and extra_indices is not None
+            ):
+                extra_indices, c4_local_lengths = (
+                    core_attn_metadata._compact_dcp_local_indices(
+                        extra_indices, get_dcp_world_size(), get_dcp_rank()
+                    )
+                )
+                extra_topk_lengths = torch.clamp(c4_local_lengths, min=1)
+                c4_has_local_kv = c4_local_lengths > 0
+                _dcp_log(
+                    f"after_localize_c4_extra_indices layer={layer_id}",
+                    _dcp_tensor_summary("extra_indices", extra_indices),
+                    _dcp_tensor_summary("c4_local_lengths", c4_local_lengths),
+                    _dcp_tensor_summary("c4_has_local_kv", c4_has_local_kv),
+                )
+
             if q.ndim == 3:
                 q = q.unsqueeze(1)
             if swa_page_indices.ndim == 2:
@@ -1362,6 +1382,17 @@ class DeepseekV4AttnBackend(
             if use_dcp:
                 from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
 
+                active_dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
+                    compress_ratio
+                )
+                if c4_has_local_kv is not None:
+                    if active_dcp_has_local_kv is None:
+                        active_dcp_has_local_kv = c4_has_local_kv
+                    else:
+                        active_dcp_has_local_kv = (
+                            active_dcp_has_local_kv | c4_has_local_kv
+                        )
+
                 _dcp_log(
                     f"flashmla_input layer={layer_id} compress_ratio={compress_ratio}",
                     _dcp_tensor_summary("q", q),
@@ -1371,7 +1402,7 @@ class DeepseekV4AttnBackend(
                     _dcp_tensor_summary("extra_topk_lengths", extra_topk_lengths),
                     _dcp_tensor_summary(
                         "active_has_local_kv",
-                        core_attn_metadata.get_dcp_has_local_kv(compress_ratio),
+                        active_dcp_has_local_kv,
                     ),
                 )
                 mla_result = flash_mla.flash_mla_with_kvcache(
@@ -1402,9 +1433,7 @@ class DeepseekV4AttnBackend(
                     _dcp_tensor_summary("o", o),
                     _dcp_tensor_summary("lse", lse),
                 )
-                dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
-                    compress_ratio
-                )
+                dcp_has_local_kv = active_dcp_has_local_kv
                 if dcp_has_local_kv is not None:
                     has_local_kv = dcp_has_local_kv[: B * S_q]
                     has_local_kv = has_local_kv.reshape(B, S_q)
