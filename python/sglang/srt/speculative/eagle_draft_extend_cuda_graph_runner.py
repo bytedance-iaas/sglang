@@ -198,6 +198,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
+
             dcp_size = self.model_runner.dcp_size
             dcp_kv_mask = (
                 torch.zeros((self.max_num_token,), dtype=torch.bool)
@@ -497,7 +498,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        if buffers.dcp_kv_mask is not None and forward_batch.dcp_kv_mask is not None:
+        if (
+            buffers.dcp_kv_mask is not None
+            and forward_batch.dcp_kv_mask is not None
+        ):
             buffers.dcp_kv_mask[:num_tokens].copy_(forward_batch.dcp_kv_mask)
         if (
             buffers.hidden_states is not None

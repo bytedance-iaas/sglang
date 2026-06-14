@@ -233,6 +233,8 @@ class DSV4AttnMetadata:
         compacted = torch.where(
             compact_mask, compacted, torch.full_like(compacted, -1)
         )
+        # FlashMLA does not reliably support 0-length rows. Put a safe dummy
+        # entry at column 0; callers must ignore the row using local_lengths.
         zero_length_mask = local_lengths.unsqueeze(-1) == 0
         first_col_mask = col == 0
         compacted = torch.where(
@@ -246,8 +248,10 @@ class DSV4AttnMetadata:
             return
 
         dcp_rank = get_dcp_rank()
-        self.swa_page_indices, swa_local_lengths = self._compact_dcp_local_indices(
-            self.swa_page_indices, dcp_world_size, dcp_rank
+        self.swa_page_indices, swa_local_lengths = (
+            self._compact_dcp_local_indices(
+                self.swa_page_indices, dcp_world_size, dcp_rank
+            )
         )
         has_local_kv = swa_local_lengths > 0
         self.swa_topk_lengths = torch.clamp(swa_local_lengths, min=1)
@@ -456,136 +460,6 @@ class DeepseekV4AttnBackend(
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
         self.online_c128_mtp = OnlineC128MTPController(self)
-        self._dcp_debug_forward_count = 0
-
-    def _next_dcp_debug_enabled(self, layer_id: int) -> bool:
-        if not envs.SGLANG_DEBUG_DSV4_DCP_ATTENTION.get():
-            return False
-        self._dcp_debug_forward_count += 1
-        count = self._dcp_debug_forward_count
-        # Keep logs useful but bounded: early calls catch startup/prefill, and
-        # sparse later samples catch long decode drift without flooding logs.
-        return count <= 32 or layer_id < 2 or count % 512 == 0
-
-    def _log_dcp_attention_metadata(
-        self,
-        *,
-        layer_id: int,
-        compress_ratio: int,
-        q: torch.Tensor,
-        swa_page_indices: torch.Tensor,
-        swa_topk_lengths: torch.Tensor,
-        extra_indices: Optional[torch.Tensor],
-        extra_topk_lengths: Optional[torch.Tensor],
-        dcp_has_local_kv: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-    ) -> None:
-        try:
-            valid_swa = swa_page_indices >= 0
-            swa_valid_count = int(valid_swa.sum().item())
-            if swa_valid_count > 0:
-                swa_valid_values = swa_page_indices[valid_swa]
-                swa_min = int(swa_valid_values.min().item())
-                swa_max = int(swa_valid_values.max().item())
-            else:
-                swa_min = swa_max = -1
-
-            if extra_indices is not None:
-                valid_extra = extra_indices >= 0
-                extra_valid_count = int(valid_extra.sum().item())
-                if extra_valid_count > 0:
-                    extra_valid_values = extra_indices[valid_extra]
-                    extra_min = int(extra_valid_values.min().item())
-                    extra_max = int(extra_valid_values.max().item())
-                else:
-                    extra_min = extra_max = -1
-            else:
-                extra_valid_count = 0
-                extra_min = extra_max = -1
-
-            if dcp_has_local_kv is not None:
-                local_true = int(dcp_has_local_kv.sum().item())
-                local_total = int(dcp_has_local_kv.numel())
-            else:
-                local_true = local_total = -1
-
-            dcp_kv_mask = forward_batch.dcp_kv_mask
-            if dcp_kv_mask is not None:
-                write_true = int(dcp_kv_mask.sum().item())
-                write_total = int(dcp_kv_mask.numel())
-            else:
-                write_true = write_total = -1
-
-            logger.warning(
-                "[DSV4_DCP_DEBUG][metadata] layer=%s compress=%s q_shape=%s "
-                "swa_shape=%s swa_len_min=%s swa_len_max=%s swa_valid=%s "
-                "swa_min=%s swa_max=%s extra_shape=%s extra_len_min=%s "
-                "extra_len_max=%s extra_valid=%s extra_min=%s extra_max=%s "
-                "has_local=%s/%s write_mask=%s/%s out_loc_shape=%s",
-                layer_id,
-                compress_ratio,
-                tuple(q.shape),
-                tuple(swa_page_indices.shape),
-                int(swa_topk_lengths.min().item()),
-                int(swa_topk_lengths.max().item()),
-                swa_valid_count,
-                swa_min,
-                swa_max,
-                None if extra_indices is None else tuple(extra_indices.shape),
-                None
-                if extra_topk_lengths is None
-                else int(extra_topk_lengths.min().item()),
-                None
-                if extra_topk_lengths is None
-                else int(extra_topk_lengths.max().item()),
-                extra_valid_count,
-                extra_min,
-                extra_max,
-                local_true,
-                local_total,
-                write_true,
-                write_total,
-                None
-                if forward_batch.out_cache_loc is None
-                else tuple(forward_batch.out_cache_loc.shape),
-            )
-        except Exception:
-            logger.exception("[DSV4_DCP_DEBUG] failed to log metadata summary")
-
-    def _log_dcp_attention_merge(
-        self,
-        *,
-        layer_id: int,
-        compress_ratio: int,
-        o_before_mask: torch.Tensor,
-        lse_before_mask: torch.Tensor,
-        o_after_mask: torch.Tensor,
-        lse_after_mask: torch.Tensor,
-        merged: torch.Tensor,
-    ) -> None:
-        try:
-            lse_before_finite = torch.isfinite(lse_before_mask)
-            lse_after_finite = torch.isfinite(lse_after_mask)
-            logger.warning(
-                "[DSV4_DCP_DEBUG][merge] layer=%s compress=%s o_shape=%s "
-                "lse_shape=%s lse_finite_before=%s/%s lse_finite_after=%s/%s "
-                "o_norm_before=%.6e o_norm_after=%.6e merged_shape=%s "
-                "merged_norm=%.6e",
-                layer_id,
-                compress_ratio,
-                tuple(o_before_mask.shape),
-                tuple(lse_before_mask.shape),
-                int(lse_before_finite.sum().item()),
-                int(lse_before_finite.numel()),
-                int(lse_after_finite.sum().item()),
-                int(lse_after_finite.numel()),
-                float(torch.linalg.vector_norm(o_before_mask.float()).item()),
-                float(torch.linalg.vector_norm(o_after_mask.float()).item()),
-                tuple(merged.shape),
-                float(torch.linalg.vector_norm(merged.float()).item()),
-            )
-        except Exception:
-            logger.exception("[DSV4_DCP_DEBUG] failed to log merge summary")
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1370,23 +1244,9 @@ class DeepseekV4AttnBackend(
 
             dcp_group = get_dcp_group_no_assert()
             use_dcp = dcp_group is not None and dcp_group.world_size > 1
-            dcp_debug = use_dcp and self._next_dcp_debug_enabled(layer_id)
 
             if use_dcp:
                 from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
-
-                if dcp_debug:
-                    self._log_dcp_attention_metadata(
-                        layer_id=layer_id,
-                        compress_ratio=compress_ratio,
-                        q=q,
-                        swa_page_indices=swa_page_indices,
-                        swa_topk_lengths=swa_topk_lengths,
-                        extra_indices=extra_indices,
-                        extra_topk_lengths=extra_topk_lengths,
-                        dcp_has_local_kv=core_attn_metadata.dcp_has_local_kv,
-                        forward_batch=forward_batch,
-                    )
 
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
@@ -1404,10 +1264,11 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )
+                # DCP shards KV/sequence, not heads. Compute partial attention
+                # for the full gathered query heads on each KV shard, then
+                # combine shards with LSE correction and reduce-scatter back to
+                # the TP-local head slice.
                 o, lse = mla_result[0], mla_result[1]
-                if dcp_debug:
-                    o_before_mask = o.detach()
-                    lse_before_mask = lse.detach()
                 B, S_q, H_q, D_v = o.shape
                 if core_attn_metadata.dcp_has_local_kv is not None:
                     has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
@@ -1421,26 +1282,9 @@ class DeepseekV4AttnBackend(
                         torch.full_like(lse, float("-inf")),
                     )
                 o_flat = o.reshape(B * S_q, H_q, D_v)
-                lse_flat = (
-                    lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
-                )
+                lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
                 merged = cp_lse_ag_out_rs(o_flat, lse_flat, dcp_group)
-                if dcp_debug:
-                    self._log_dcp_attention_merge(
-                        layer_id=layer_id,
-                        compress_ratio=compress_ratio,
-                        o_before_mask=o_before_mask,
-                        lse_before_mask=lse_before_mask,
-                        o_after_mask=o.detach(),
-                        lse_after_mask=lse.detach(),
-                        merged=merged.detach(),
-                    )
-                # merged: [H_q/N, B*S_q, D_v]
-                o = (
-                    merged.transpose(0, 1)
-                    .contiguous()
-                    .reshape(B, S_q, -1, D_v)
-                )
+                o = merged.transpose(0, 1).contiguous().reshape(B, S_q, -1, D_v)
             else:
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,

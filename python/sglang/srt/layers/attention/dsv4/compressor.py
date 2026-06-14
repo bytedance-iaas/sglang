@@ -140,10 +140,13 @@ class CompressorBackendMixin:
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+            token_to_kv_pool.set_extra_key_buffer(
+                layer_id, out_loc, pack, dcp_kv_mask=forward_batch.dcp_kv_mask
+            )
 
     def forward_indexer_compressor(
         self,
@@ -165,6 +168,7 @@ class CompressorBackendMixin:
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 cache_k=new_compressed_kv,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
@@ -175,6 +179,7 @@ class CompressorBackendMixin:
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
 
 

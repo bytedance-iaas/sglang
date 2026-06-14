@@ -148,6 +148,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    # Static DCP write mask. Allocated only when dcp_size > 1; ``None``
+    # otherwise. ``populate_from_forward_batch`` mirrors the per-replay mask
+    # into this buffer so that the captured graph references a stable tensor.
     dcp_kv_mask: Optional[torch.Tensor]
 
     @classmethod
@@ -204,6 +207,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             mamba_track_mask = (
                 torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
             )
+
             dcp_kv_mask = (
                 torch.zeros((max_num_token,), dtype=torch.bool) if dcp_size > 1 else None
             )
@@ -304,6 +308,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
             # positions map to the sentinel slot (matches piecewise runner).
             if self.out_cache_loc_swa is not None:
                 self.out_cache_loc_swa.zero_()
+            # Padded positions must not write KV in any rank's slice. Zero the
+            # mask so kernels skip padded slots (out_cache_loc was already
+            # zeroed to the sentinel slot above).
             if self.dcp_kv_mask is not None:
                 self.dcp_kv_mask.zero_()
             if self.mamba_track_indices is not None:
@@ -390,9 +397,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.out_cache_loc_swa[:raw_num_token])
             srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
 
+        # DCP write mask (bool) — mirror per-replay mask into the static
+        # buffer captured by the graph.
         if self.dcp_kv_mask is not None and forward_batch.dcp_kv_mask is not None:
             dsts.append(self.dcp_kv_mask[:raw_num_token])
-            srcs.append(forward_batch.dcp_kv_mask[:raw_num_token])
+            srcs.append(forward_batch.dcp_kv_mask)
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
@@ -1032,6 +1041,7 @@ class CudaGraphRunner:
             if buffers.mamba_track_mask is not None
             else None
         )
+
         dcp_kv_mask = (
             buffers.dcp_kv_mask[:num_tokens]
             if buffers.dcp_kv_mask is not None

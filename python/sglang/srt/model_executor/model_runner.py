@@ -369,8 +369,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attn_cp_size = server_args.attn_cp_size
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
-        # Decode Context Parallel (DCP) topology. Each TP rank belongs to one
-        # DCP group of size ``server_args.dcp_size``.
+        # Decode Context Parallel (DCP) topology. Each tp rank belongs to
+        # exactly one dcp group of size ``server_args.dcp_size`` consisting of
+        # ``dcp_size`` consecutive tp ranks. ``dcp_rank`` is this rank's index
+        # inside that group.
         self.dcp_size = server_args.dcp_size
         self.dcp_rank = (
             tp_rank % server_args.dcp_size if server_args.dcp_size > 1 else 0
