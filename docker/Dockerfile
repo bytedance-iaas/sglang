@@ -416,9 +416,19 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+RUN JUST_VERSION=1.42.4 \
+    && case "$(uname -m)" in \
+        x86_64) JUST_TARGET=x86_64-unknown-linux-musl ;; \
+        aarch64) JUST_TARGET=aarch64-unknown-linux-musl ;; \
+        *) echo "Unsupported architecture for just: $(uname -m)" && exit 1 ;; \
+    esac \
+    && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 -fsSL \
+        -o /tmp/just.tar.gz \
+        "https://${GITHUB_ARTIFACTORY}/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-${JUST_TARGET}.tar.gz" \
+    && tar -xzf /tmp/just.tar.gz -C /tools just \
+    && chmod +x /tools/just \
+    && /tools/just --version \
+    && rm -f /tmp/just.tar.gz
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
