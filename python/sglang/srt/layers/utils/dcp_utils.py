@@ -86,8 +86,8 @@ def _correct_attn_cp_out_kernel(
         num_n_offsets * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
     )
 
-    # Online softmax over LSEs from all ranks: log2-sum-exp, normalised by
-    # the max for numerical stability.
+    # FlashMLA returns natural-log LSEs, so the cross-rank merge must use
+    # natural exp/log. Using exp2/log2 skews the softmax correction weights.
     lse = tl.load(lses_ptr + lse_offsets)
     neg_inf = float("-inf")
     lse = tl.where((lse != lse) | (lse == float("inf")), neg_inf, lse)
@@ -95,9 +95,9 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
     lse = lse - lse_max
-    lse_exp = tl.exp2(lse)
+    lse_exp = tl.exp(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    final_lse = tl.log2(lse_acc) + lse_max
+    final_lse = tl.log(lse_acc) + lse_max
 
     # Correction factor for this rank.
     lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
@@ -108,7 +108,7 @@ def _correct_attn_cp_out_kernel(
         neg_inf,
         lse_diff,
     )
-    factor = tl.exp2(lse_diff)
+    factor = tl.exp(lse_diff)
 
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
 
