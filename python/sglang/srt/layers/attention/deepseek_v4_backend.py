@@ -1246,77 +1246,45 @@ class DeepseekV4AttnBackend(
             use_dcp = dcp_group is not None and dcp_group.world_size > 1
 
             if use_dcp:
-                from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_ar
+                from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
 
-                B, S_q, H_q, _ = q.shape
-                assert H_q % dcp_group.world_size == 0, (
-                    f"DCP query head count {H_q} must be divisible by "
-                    f"dcp_size={dcp_group.world_size}"
+                mla_result = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
                 )
-                local_heads = H_q // dcp_group.world_size
-                flashmla_min_heads = 32
-                heads_per_call = max(local_heads, flashmla_min_heads)
-                assert H_q % heads_per_call == 0, (
-                    f"DCP FlashMLA head chunk {heads_per_call} must divide "
-                    f"query head count {H_q}"
-                )
-                assert heads_per_call % local_heads == 0, (
-                    f"DCP FlashMLA head chunk {heads_per_call} must be a "
-                    f"multiple of local heads {local_heads}"
-                )
-                local_o = None
-                local_head_start = dcp_group.rank_in_group * local_heads
-                local_head_end = local_head_start + local_heads
-                for head_start in range(0, H_q, heads_per_call):
-                    head_end = head_start + heads_per_call
-                    q_slice = q[:, :, head_start:head_end, :].contiguous()
-                    attn_sink_slice = attn_sink[head_start:head_end].contiguous()
-                    mla_result = flash_mla.flash_mla_with_kvcache(
-                        q=q_slice,
-                        k_cache=swa_k_cache,
-                        head_dim_v=self.head_dim_v,
-                        block_table=None,
-                        cache_seqlens=None,
-                        tile_scheduler_metadata=flashmla_metadata,
-                        softmax_scale=self.softmax_scale,
-                        is_fp8_kvcache=True,
-                        indices=swa_page_indices,
-                        topk_length=swa_topk_lengths,
-                        attn_sink=attn_sink_slice,
-                        extra_k_cache=extra_k_cache,
-                        extra_indices_in_kvcache=extra_indices,
-                        extra_topk_length=extra_topk_lengths,
+                # DCP shards KV/sequence, not heads. Compute partial attention
+                # for the full gathered query heads on each KV shard, then
+                # combine shards with LSE correction and reduce-scatter back to
+                # the TP-local head slice.
+                o, lse = mla_result[0], mla_result[1]
+                B, S_q, H_q, D_v = o.shape
+                if core_attn_metadata.dcp_has_local_kv is not None:
+                    has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
+                    has_local_kv = has_local_kv.reshape(B, S_q)
+                    o = torch.where(
+                        has_local_kv[:, :, None, None], o, torch.zeros_like(o)
                     )
-                    o, lse = mla_result[0], mla_result[1]
-                    B, S_q, _, D_v = o.shape
-                    if core_attn_metadata.dcp_has_local_kv is not None:
-                        has_local_kv = core_attn_metadata.dcp_has_local_kv[: B * S_q]
-                        has_local_kv = has_local_kv.reshape(B, S_q)
-                        o = torch.where(
-                            has_local_kv[:, :, None, None], o, torch.zeros_like(o)
-                        )
-                        lse = torch.where(
-                            has_local_kv[:, None, :],
-                            lse,
-                            torch.full_like(lse, float("-inf")),
-                        )
-                    o_flat = o.reshape(B * S_q, heads_per_call, D_v)
-                    lse_flat = (
-                        lse.permute(0, 2, 1)
-                        .reshape(B * S_q, heads_per_call)
-                        .contiguous()
+                    lse = torch.where(
+                        has_local_kv[:, None, :],
+                        lse,
+                        torch.full_like(lse, float("-inf")),
                     )
-                    merged = cp_lse_ag_out_ar(o_flat, lse_flat, dcp_group)
-                    if head_start <= local_head_start and local_head_end <= head_end:
-                        offset = local_head_start - head_start
-                        local_o = (
-                            merged[offset : offset + local_heads]
-                            .transpose(0, 1)
-                            .contiguous()
-                            .reshape(B, S_q, local_heads, D_v)
-                        )
-                assert local_o is not None
-                o = local_o
+                o_flat = o.reshape(B * S_q, H_q, D_v)
+                lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
+                merged = cp_lse_ag_out_rs(o_flat, lse_flat, dcp_group)
+                o = merged.transpose(0, 1).contiguous().reshape(B, S_q, -1, D_v)
             else:
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,

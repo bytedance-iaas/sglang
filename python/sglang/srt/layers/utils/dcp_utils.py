@@ -240,7 +240,10 @@ def cp_lse_ag_out_rs(
     )
     local_heads = H // cp_group.world_size
 
-    cp_attn_lse = cp_attn_lse.to(torch.float32)
+    # Clone before the collective so CUDA graph does not keep FlashMLA's LSE
+    # storage alive longer than necessary. This follows the upstream DCP PR's
+    # memory optimization for graph replay.
+    cp_attn_lse = cp_attn_lse.to(torch.float32).clone()
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
@@ -262,35 +265,3 @@ def cp_lse_ag_out_rs(
             result.copy_(partial.to(result.dtype))
 
     return result
-
-
-def cp_lse_ag_out_ar(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group: GroupCoordinator,
-    ctx: Optional[CPTritonContext] = None,
-) -> torch.Tensor:
-    """Merge one already-selected head slice across DCP KV shards.
-
-    All ranks must call this with the same query head slice. The function
-    gathers LSEs across KV shards, applies the softmax correction to the local
-    output, and all-reduces the corrected partial outputs.
-    """
-    if cp_group.world_size == 1:
-        return cp_attn_out.transpose(0, 1)
-
-    if ctx is None:
-        ctx = CPTritonContext()
-
-    cp_attn_lse = cp_attn_lse.to(torch.float32)
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
-    new_output = cp_attn_out.new_empty(
-        cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
-    )
-    out, _ = correct_attn_out(
-        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
-    )
-    out = cp_group.all_reduce(out)
-    return out.to(cp_attn_out.dtype)
