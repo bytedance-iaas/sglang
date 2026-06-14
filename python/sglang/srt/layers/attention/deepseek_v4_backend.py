@@ -1388,6 +1388,17 @@ class DeepseekV4AttnBackend(
             if use_dcp:
                 from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
 
+                # Attention sink is a global softmax term with zero value. In
+                # DCP each rank computes a partial KV shard, so counting the
+                # sink on every rank would add it dcp_size times during LSE
+                # merge. Let rank 0 own it and make other ranks contribute no
+                # sink term.
+                dcp_owns_attn_sink = dcp_group.rank_in_group == 0
+                dcp_attn_sink = (
+                    attn_sink
+                    if dcp_owns_attn_sink
+                    else torch.full_like(attn_sink, float("-inf"))
+                )
                 active_dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
                     compress_ratio
                 )
@@ -1397,6 +1408,16 @@ class DeepseekV4AttnBackend(
                     else:
                         active_dcp_has_local_kv = (
                             active_dcp_has_local_kv | c4_has_local_kv
+                        )
+                if dcp_owns_attn_sink:
+                    sink_has_local = torch.ones(
+                        q.shape[0], dtype=torch.bool, device=q.device
+                    )
+                    if active_dcp_has_local_kv is None:
+                        active_dcp_has_local_kv = sink_has_local
+                    else:
+                        active_dcp_has_local_kv = (
+                            active_dcp_has_local_kv | sink_has_local
                         )
 
                 _dcp_log(
@@ -1410,6 +1431,7 @@ class DeepseekV4AttnBackend(
                         "active_has_local_kv",
                         active_dcp_has_local_kv,
                     ),
+                    _dcp_tensor_summary("attn_sink", dcp_attn_sink),
                 )
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
@@ -1422,7 +1444,7 @@ class DeepseekV4AttnBackend(
                     is_fp8_kvcache=True,
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
+                    attn_sink=dcp_attn_sink,
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
