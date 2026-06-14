@@ -339,7 +339,10 @@ class DSV4AttnMetadata:
                 )
             )
             self.dcp_c128_has_local_kv = c128_local_lengths > 0
-            self.c128_topk_lengths_clamp1 = torch.clamp(c128_local_lengths, min=1)
+            # Extra KV sources may be empty while SWA still has local KV for
+            # this row. Do not clamp extra lengths to 1, otherwise the dummy
+            # index participates in FlashMLA and pollutes DCP LSE merging.
+            self.c128_topk_lengths_clamp1 = c128_local_lengths
         # Backward-compatible alias for existing metadata copy/replay paths.
         # Forward must use the compress-ratio-specific mask below instead.
         self.dcp_has_local_kv = self.dcp_swa_has_local_kv
@@ -1342,7 +1345,10 @@ class DeepseekV4AttnBackend(
                         extra_indices, get_dcp_world_size(), get_dcp_rank()
                     )
                 )
-                extra_topk_lengths = torch.clamp(c4_local_lengths, min=1)
+                # Same rule as C128: C4 is an optional extra source, so a
+                # per-rank empty C4 shard should contribute zero keys rather
+                # than a dummy key.
+                extra_topk_lengths = c4_local_lengths
                 c4_has_local_kv = c4_local_lengths > 0
                 _dcp_log(
                     f"after_localize_c4_extra_indices layer={layer_id}",
