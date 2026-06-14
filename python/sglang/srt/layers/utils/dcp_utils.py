@@ -17,7 +17,7 @@ These are all no-ops when ``cp_group.world_size == 1`` so they are safe to
 call unconditionally from DSv4 attention forward.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -213,7 +213,8 @@ def cp_lse_ag_out_rs(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     ctx: Optional[CPTritonContext] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """All-gather LSE, correct local outputs, then reduce-scatter back.
 
     Args:
@@ -227,8 +228,12 @@ def cp_lse_ag_out_rs(
         The cross-rank-merged attention output for this rank's slice of the
         head dimension, shape ``[H // world_size, B, D]``. When
         ``world_size == 1`` simply returns ``cp_attn_out`` unchanged.
+        If ``return_lse`` is true, also returns this rank's merged LSE slice
+        with shape ``[B, H // world_size]``.
     """
     if cp_group.world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
         return cp_attn_out
 
     if ctx is None:
@@ -249,6 +254,11 @@ def cp_lse_ag_out_rs(
     )
 
     result = cp_attn_out.new_empty((local_heads, B, D))
+    result_lse = (
+        torch.empty((B, local_heads), device=cp_attn_lse.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
     new_output = torch.empty(
         (local_heads, B, D), device=cp_attn_out.device, dtype=torch.float32
     )
@@ -257,11 +267,16 @@ def cp_lse_ag_out_rs(
         head_end = head_start + local_heads
         out_slice = cp_attn_out[:, head_start:head_end, :]
         lses_slice = lses[:, :, head_start:head_end]
-        partial, _ = correct_attn_out(
+        partial, final_lse = correct_attn_out(
             out_slice, lses_slice, cp_group.rank_in_group, ctx, new_output
         )
         partial = cp_group.all_reduce(partial)
         if dst_rank == cp_group.rank_in_group:
             result.copy_(partial.to(result.dtype))
+            if result_lse is not None:
+                result_lse.copy_(final_lse.to(torch.float32))
 
+    if return_lse:
+        assert result_lse is not None
+        return result, result_lse
     return result
