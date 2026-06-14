@@ -168,7 +168,6 @@ class CompressorBackendMixin:
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 cache_k=new_compressed_kv,
-                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
@@ -179,7 +178,6 @@ class CompressorBackendMixin:
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
-                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
 
 
