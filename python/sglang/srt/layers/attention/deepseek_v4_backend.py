@@ -1356,6 +1356,18 @@ class DeepseekV4AttnBackend(
                     _dcp_tensor_summary("c4_local_lengths", c4_local_lengths),
                     _dcp_tensor_summary("c4_has_local_kv", c4_has_local_kv),
                 )
+                # Poison check: rows where this rank's SWA shard is empty (so
+                # swa_topk_length was clamped to 1 and reads dummy physical
+                # page 0) but C4 is non-empty (so active mask keeps the row).
+                # In those rows the SWA dummy page 0 leaks a bogus contribution
+                # into the shared FlashMLA LSE and corrupts the DCP merge.
+                _swa_h = core_attn_metadata.dcp_swa_has_local_kv
+                if _swa_h is not None:
+                    _n = min(_swa_h.shape[0], c4_has_local_kv.shape[0])
+                    _poison = (
+                        (~_swa_h[:_n] & c4_has_local_kv[:_n]).sum().item()
+                    )
+                    _dcp_log(f"SWA_DUMMY_POISON layer={layer_id} rows={_poison}")
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
