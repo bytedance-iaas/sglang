@@ -4725,7 +4725,6 @@ class ServerArgs:
         parser.add_argument(
             "--decode-context-parallel-size",
             "--dcp-size",
-            dest="dcp_size",
             type=int,
             default=ServerArgs.dcp_size,
             help="The decode context parallelism size. When > 1, the KV cache "
