@@ -1280,20 +1280,40 @@ def _pre_permute_deepep_normal_to_asym_gemm_fp8(
     running_state["output_index"] = output_index
 
     # Build the contiguous-GEMM expert list host-side from the dispatcher's CPU
-    # token counts: no device sync, and list_size stays a host int (the SM89/
-    # SM90 kernel needs it for grid sizing). Layout: experts = active expert
-    # ids, offsets = cumulative end-row indices (SM89/SM90 kernel format; the
-    # Blackwell contiguous kernel expects start/end pairs instead and would
-    # need its own builder).
-    ends, active_experts = [], []
+    # token counts so there is no device sync. The two backends use different
+    # offsets/list_size ABIs, so emit the format the target kernel expects:
+    #
+    #   SM89/SM90: offsets = cumulative end-row indices, experts = active expert
+    #     ids, list_size = a host int (the kernel reads it for grid sizing).
+    #   Blackwell: offsets = flat (start, end) row pairs, experts = active ids
+    #     terminated by a -1 sentinel, list_size = a 1-element int32 CUDA tensor
+    #     counting the experts entries *including* the sentinel. This mirrors
+    #     AsymGEMM's canonical build_offsets_experts_from_m_indices.
+    offsets_list, active_experts = [], []
     acc = 0
     for expert_id, cnt in enumerate(num_recv_tokens_per_expert):
+        start = acc
         acc += cnt
         if cnt == 0:
             continue
         active_experts.append(expert_id)
-        ends.append(acc)
-    offsets = torch.tensor(ends, dtype=torch.int32, device=hidden_states_device)
+        if asym_gemm_wrapper.ASYMGEMM_BLACKWELL:
+            offsets_list.append(start)
+            offsets_list.append(acc)
+        else:
+            offsets_list.append(acc)
+
+    if asym_gemm_wrapper.ASYMGEMM_BLACKWELL:
+        active_experts.append(-1)  # sentinel terminating the experts list
+        list_size = torch.tensor(
+            [len(active_experts)], dtype=torch.int32, device=hidden_states_device
+        )
+    else:
+        list_size = len(active_experts)
+
+    offsets = torch.tensor(
+        offsets_list, dtype=torch.int32, device=hidden_states_device
+    )
     experts = torch.tensor(
         active_experts, dtype=torch.int32, device=hidden_states_device
     )
@@ -1305,7 +1325,7 @@ def _pre_permute_deepep_normal_to_asym_gemm_fp8(
         m_indices=m_indices,
         offsets=offsets,
         experts=experts,
-        list_size=len(active_experts),
+        list_size=list_size,
     )
 
 
