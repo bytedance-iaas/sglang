@@ -1,19 +1,23 @@
 name: Release Docker Images
 #
 # Builds and publishes framework Docker images to Volcengine CR:
-#   - v{sglang}.byted.{release}.{timestamp} (CUDA 13)
-#   - v{sglang}.byted.{release}.{timestamp}-cu130
-#   - v{sglang}.byted.{release}.{timestamp}-cu129
+#   - v{sglang}.byted.{internal_release}.{timestamp} (CUDA 13)
+#   - v{sglang}.byted.{internal_release}.{timestamp}-cu130
+#   - v{sglang}.byted.{internal_release}.{timestamp}-cu129
 #
 on:
   push:
     tags:
       - "v[0-9]+.*"
+      - "[0-9]+.*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build (without v prefix, e.g. 0.5.7)"
-        required: true
+        description: "SGLang version for sgl-project builds; fallback internal version for Byted builds"
+        required: false
+      internal_version:
+        description: "Byted internal version for Volcengine tags, e.g. 0.0.11"
+        required: false
 
 jobs:
   resolve-version:
@@ -52,11 +56,12 @@ jobs:
         ]
     secrets: inherit
 
-  validate-volcengine-version-tag:
+  resolve-volcengine-release:
     if: github.repository == 'bytedance-iaas/sglang'
     runs-on: ubuntu-22.04
     outputs:
-      git-tag-value: ${{ steps.tag.outputs.value }}
+      community-version: ${{ steps.release.outputs.community-version }}
+      internal-version: ${{ steps.release.outputs.internal-version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -66,30 +71,45 @@ jobs:
       - name: Fetch version tags
         run: git fetch --force --tags origin
 
-      - name: Resolve required git tag
-        id: tag
+      - name: Resolve Volcengine release versions
+        id: release
         run: |
           set -euo pipefail
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW_TAG="v${{ github.event.inputs.version }}"
+            INTERNAL_VERSION="${{ github.event.inputs.internal_version || github.event.inputs.version }}"
+            RAW_TAG="v${INTERNAL_VERSION}"
             if ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
-              RAW_TAG="${{ github.event.inputs.version }}"
+              RAW_TAG="${INTERNAL_VERSION}"
             fi
           else
             RAW_TAG="${GITHUB_REF_NAME}"
+            INTERNAL_VERSION="${RAW_TAG#v}"
           fi
 
           if [ -z "${RAW_TAG}" ] || ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
-            echo "::error::Version image publishing requires an existing git tag"
+            echo "::error::Volcengine image publishing requires an existing git tag for the internal version"
             exit 1
           fi
 
-          echo "value=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+          INTERNAL_VERSION="${INTERNAL_VERSION#v}"
+          if [ -z "${INTERNAL_VERSION}" ] || ! echo "${INTERNAL_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)*$'; then
+            echo "::error::Invalid internal version: ${INTERNAL_VERSION} (expected: X.Y.Z, for example 0.0.11)"
+            exit 1
+          fi
+
+          COMMUNITY_VERSION="$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')"
+          if [ -z "${COMMUNITY_VERSION}" ] || ! echo "${COMMUNITY_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid community version resolved from checkout: ${COMMUNITY_VERSION}"
+            exit 1
+          fi
+
+          echo "community-version=${COMMUNITY_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "internal-version=${INTERNAL_VERSION}" >> "$GITHUB_OUTPUT"
 
   build-and-publish-volcengine:
     if: github.repository == 'bytedance-iaas/sglang'
-    needs: [validate-volcengine-version-tag]
+    needs: [resolve-volcengine-release]
     strategy:
       fail-fast: false
       matrix:
@@ -109,9 +129,9 @@ jobs:
       cuda_version: ${{ matrix.cuda_version }}
       cuda_suffix: ${{ matrix.cuda_suffix }}
       publish_default_cuda_alias: ${{ matrix.publish_default_cuda_alias }}
-      sgl_version: ${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}
+      sgl_version: ${{ needs.resolve-volcengine-release.outputs.community-version }}
       tag_mode: version
-      tag_value: ${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}
+      tag_value: ${{ needs.resolve-volcengine-release.outputs.internal-version }}
       use_environment: prod
       extra_build_args: >-
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
