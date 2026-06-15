@@ -247,13 +247,10 @@ class EagleDraftInputV2Mixin:
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
                 batch.ensure_req_pool_indices()
-                tokens_per_req_cpu = torch.full(
-                    (bs,), num_steps, dtype=torch.int64, device="cpu"
-                )
-                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                device_slots = hisparse_coordinator.get_draft_device_slots(
                     batch.req_pool_indices,
                     batch.req_pool_indices_cpu,
-                    tokens_per_req_cpu,
+                    num_steps,
                 )
                 target_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
                     draft_cache_locs,
@@ -331,14 +328,10 @@ class EagleDraftInputV2Mixin:
             and not batch.forward_mode.is_idle()
         ):
             batch.ensure_req_pool_indices()
-            bs = len(batch.req_pool_indices)
-            tokens_per_req_cpu = torch.full(
-                (bs,), num_draft_tokens, dtype=torch.int64, device="cpu"
-            )
-            device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+            device_slots = hisparse_coordinator.get_draft_device_slots(
                 batch.req_pool_indices,
                 batch.req_pool_indices_cpu,
-                tokens_per_req_cpu,
+                num_draft_tokens,
             )
             token_to_kv_pool_allocator.bind_device_mapping(
                 batch.out_cache_loc,
@@ -383,13 +376,10 @@ class EagleVerifyInputV2Mixin:
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
                 batch.ensure_req_pool_indices()
-                tokens_per_req_cpu = torch.full(
-                    (bs,), self.draft_token_num, dtype=torch.int64, device="cpu"
-                )
-                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                device_slots = hisparse_coordinator.get_draft_device_slots(
                     batch.req_pool_indices,
                     batch.req_pool_indices_cpu,
-                    tokens_per_req_cpu,
+                    self.draft_token_num,
                 )
                 target_worker.model_runner.token_to_kv_pool_allocator.bind_device_mapping(
                     batch.out_cache_loc,

@@ -1487,6 +1487,24 @@ class HiSparseCoordinator:
         if tokens_per_req_cpu.numel() == 0:
             return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
 
+        if not tokens_per_req_cpu.is_cuda:
+            tokens_per_req_cpu = tokens_per_req_cpu.to(torch.int64)
+            first_tokens = int(tokens_per_req_cpu[0].item())
+            if first_tokens < 0:
+                raise ValueError(
+                    f"Negative draft slot count is invalid: {first_tokens}."
+                )
+            if bool(torch.all(tokens_per_req_cpu == first_tokens).item()):
+                if first_tokens == 0:
+                    return torch.empty(
+                        0, dtype=torch.int64, device=req_pool_indices.device
+                    )
+                return self.get_draft_device_slots(
+                    req_pool_indices,
+                    req_pool_indices_cpu,
+                    first_tokens,
+                )
+
         start = self.device_buffer_size + 1
         max_tokens = int(tokens_per_req_cpu.max().item())
         if start + max_tokens > self.padded_buffer_size:
