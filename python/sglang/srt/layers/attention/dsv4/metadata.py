@@ -146,6 +146,13 @@ class PagedIndexerMetadata:
         if self.c4_seq_lens.numel() == 0:
             return self.c4_page_size
 
+        # During CUDA graph capture, ``.item()`` forces a device->host sync,
+        # which is illegal on a capturing stream. The captured logits buffer
+        # must also be sized for the worst case so replay shapes stay valid.
+        # Fall back to the static max-capacity bound in that case.
+        if torch.cuda.is_current_stream_capturing():
+            return self.page_table.shape[1] * self.c4_page_size
+
         # CUDA graph/raw metadata may keep a max-capacity page table. The indexer
         # should only materialize logits up to the active compressed length.
         max_c4_seq_len = int(self.c4_seq_lens.max().item())
