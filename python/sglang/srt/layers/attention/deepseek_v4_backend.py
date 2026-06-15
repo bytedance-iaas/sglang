@@ -237,13 +237,18 @@ class DSV4AttnMetadata:
         compacted = torch.where(
             compact_mask, compacted, torch.full_like(compacted, -1)
         )
-        # FlashMLA does not reliably support 0-length rows. Put a safe dummy
-        # entry at column 0; callers must ignore the row using local_lengths.
-        zero_length_mask = local_lengths.unsqueeze(-1) == 0
-        first_col_mask = col == 0
-        compacted = torch.where(
-            zero_length_mask & first_col_mask, torch.zeros_like(compacted), compacted
-        )
+        # FlashMLA's sm90 sparse_fp8 MODEL1 kernel handles topk_length=0
+        # correctly: its mainloop forces ``orig_topk_padded >= TOPK_BLOCK_SIZE``
+        # but masks every column via ``rel_block_idx*TOPK_BLOCK_SIZE + col <
+        # topk_length`` and ``index != -1``, so all logits become -inf, rL
+        # collapses to 0, ``o_scales`` is forced to 0 and the kernel writes
+        # ``o=0, lse=+inf`` -- exactly the "no contribution" signal the DCP
+        # merge expects (``cp_lse_ag_out_rs`` already maps +inf/NaN to -inf).
+        # Leaving the empty-row indices at -1 keeps that path active. We
+        # used to substitute a dummy ``index=0`` here, which combined with
+        # the caller's ``clamp(swa_topk_lengths, min=1)`` made FlashMLA
+        # treat the row as if it had 1 valid KV (page 0 / token 0) and
+        # poisoned the cross-rank LSE merge.
         return compacted.to(torch.int32), local_lengths
 
     def apply_dcp_local_kv_indices(self) -> None:
@@ -258,7 +263,11 @@ class DSV4AttnMetadata:
             )
         )
         self.dcp_swa_has_local_kv = swa_local_lengths > 0
-        self.swa_topk_lengths = torch.clamp(swa_local_lengths, min=1)
+        # Do not clamp swa lengths to 1: FlashMLA correctly emits
+        # ``o=0, lse=+inf`` for topk_length=0 rows (see the comment in
+        # ``_compact_dcp_local_indices``); a clamp would force a dummy KV
+        # into the row's softmax and pollute the cross-rank LSE merge.
+        self.swa_topk_lengths = swa_local_lengths
         if self.c128_page_indices is not None:
             self.c128_page_indices, c128_local_lengths = (
                 self._compact_dcp_local_indices(
