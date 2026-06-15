@@ -61,6 +61,21 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
+def _masked_gemm_has_no_work(
+    hidden_states: torch.Tensor, expected_m: Optional[int], output_dim: int
+) -> bool:
+    if expected_m is None:
+        return False
+    num_groups, m, k = hidden_states.shape
+    return (
+        expected_m <= 0
+        or num_groups <= 0
+        or m <= 0
+        or k <= 0
+        or output_dim <= 0
+    )
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -384,6 +399,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
 
         # GroupGemm-0
+        assert masked_m is not None and expected_m is not None
+        num_groups, m, k = hidden_states.shape
+        output_dim = w2_weight.shape[1]
+        if _masked_gemm_has_no_work(hidden_states, expected_m, output_dim):
+            output = torch.zeros(
+                (num_groups, m, output_dim),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            return output
+
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
@@ -398,7 +426,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale
             )
 
-        num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
@@ -512,7 +539,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
 
         # GroupGemm-0
+        assert masked_m is not None and expected_m is not None
         num_groups, m, k = hidden_states.shape
+        output_dim = w2_weight.shape[1]
+        if _masked_gemm_has_no_work(hidden_states, expected_m, output_dim):
+            output = torch.zeros(
+                (num_groups, m, output_dim),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            dispose_tensor(hidden_states)
+            return output
+
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
