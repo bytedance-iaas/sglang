@@ -8,10 +8,9 @@ Ported from upstream PR #14194 (Decode CP for MLA models). Provides:
   rewrites the output as ``correction * local_out`` into a transposed
   ``[H, B, D]`` buffer ready for ``reduce_scatter_along_dim(out, dim=0)``.
 - ``correct_attn_out`` Python wrapper around the kernel.
-- ``cp_lse_ag_out_rs`` higher-level helper: all-gather LSE → correct one
-  destination head slice at a time → all-reduce, returning the merged attention
-  output for the caller's rank. This is mathematically equivalent to a
-  full-head reduce-scatter while avoiding a full ``[H, B, D]`` fp32 workspace.
+- ``cp_lse_ag_out_rs`` higher-level helper: all-gather LSE → correct the full
+  ``[H, B, D]`` corrected output once → ``reduce_scatter_along_dim`` along the
+  head dim, returning the merged attention output for the caller's rank.
 
 These are all no-ops when ``cp_group.world_size == 1`` so they are safe to
 call unconditionally from DSv4 attention forward.
@@ -217,6 +216,14 @@ def cp_lse_ag_out_rs(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """All-gather LSE, correct local outputs, then reduce-scatter back.
 
+    Implementation: each rank corrects its local ``[B, H, D]`` attention
+    output against the all-gathered LSE table once (writing the transposed
+    ``[H, B, D]`` corrected partial), then a single
+    ``reduce_scatter_along_dim(dim=0)`` over the head dim sums across ranks
+    and scatters, leaving this rank with ``[H // world_size, B, D]``. This
+    replaces the previous loop of ``world_size`` all-reduces and avoids
+    ``O(world_size)`` NCCL launches per layer.
+
     Args:
         cp_attn_out: This rank's local attention output ``[B, H, D]``.
         cp_attn_lse: This rank's local LSE ``[B, H]``.
@@ -240,50 +247,42 @@ def cp_lse_ag_out_rs(
         ctx = CPTritonContext()
 
     B, H, D = cp_attn_out.shape
-    assert H % cp_group.world_size == 0, (
-        f"DCP head count {H} must be divisible by world_size={cp_group.world_size}"
+    world_size = cp_group.world_size
+    assert H % world_size == 0, (
+        f"DCP head count {H} must be divisible by world_size={world_size}"
     )
-    local_heads = H // cp_group.world_size
+    local_heads = H // world_size
 
     # Clone before the collective so CUDA graph does not keep FlashMLA's LSE
     # storage alive longer than necessary. This follows the upstream DCP PR's
     # memory optimization for graph replay.
     cp_attn_lse = cp_attn_lse.to(torch.float32).clone()
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
+        (world_size,) + cp_attn_lse.shape
     )
 
-    # Keep the merged output in fp32 across the cross-rank reduce so the
-    # per-shard partial outputs are not re-quantised to bf16 before the
-    # weighted sum. The caller casts back to the model dtype after the sink
-    # fold. This matches the non-DCP path which keeps the whole softmax/merge
-    # in fp32 inside the FlashMLA kernel.
-    result = torch.empty(
-        (local_heads, B, D), device=cp_attn_out.device, dtype=torch.float32
+    # Apply LSE correction over the full head range in a single kernel
+    # launch. The output is laid out as ``[H, B, D]`` so the head dim is at
+    # position 0, ready for ``reduce_scatter_along_dim(dim=0)``.
+    full_corrected = torch.empty(
+        (H, B, D), device=cp_attn_out.device, dtype=torch.float32
     )
-    result_lse = (
-        torch.empty((B, local_heads), device=cp_attn_lse.device, dtype=torch.float32)
-        if return_lse
-        else None
+    _, final_lse = correct_attn_out(
+        cp_attn_out, lses, cp_group.rank_in_group, ctx, full_corrected
     )
-    new_output = torch.empty(
-        (local_heads, B, D), device=cp_attn_out.device, dtype=torch.float32
-    )
-    for dst_rank in range(cp_group.world_size):
-        head_start = dst_rank * local_heads
-        head_end = head_start + local_heads
-        out_slice = cp_attn_out[:, head_start:head_end, :]
-        lses_slice = lses[:, :, head_start:head_end]
-        partial, final_lse = correct_attn_out(
-            out_slice, lses_slice, cp_group.rank_in_group, ctx, new_output
-        )
-        partial = cp_group.all_reduce(partial)
-        if dst_rank == cp_group.rank_in_group:
-            result.copy_(partial.to(result.dtype))
-            if result_lse is not None:
-                result_lse.copy_(final_lse.to(torch.float32))
+
+    # One reduce-scatter along the head dim sums per-rank corrected outputs
+    # and scatters the head dim, replacing the previous N successive
+    # all-reduces. This both reduces NCCL launch overhead and avoids the
+    # extra rounds of bf16/fp32 accumulation noise that came from looping.
+    result = cp_group.reduce_scatter_along_dim(full_corrected, dim=0)
 
     if return_lse:
-        assert result_lse is not None
+        # ``final_lse`` has shape ``[B, H]`` (with ``lses`` strides) and is
+        # identical on every rank because it is computed from the
+        # all-gathered LSE table. Slice it to this rank's local head range.
+        head_start = cp_group.rank_in_group * local_heads
+        head_end = head_start + local_heads
+        result_lse = final_lse[:, head_start:head_end].to(torch.float32).contiguous()
         return result, result_lse
     return result
