@@ -1316,6 +1316,34 @@ class DeepseekV4AttnBackend(
                             active_dcp_has_local_kv | c4_has_local_kv
                         )
 
+                # Instrumentation: count rows where SWA shard is empty but the
+                # extra (C4/C128) shard is non-empty. Such rows keep a dummy
+                # SWA page-0 (clamp(min=1)) that pollutes the per-rank o/lse.
+                # Scalar reduces only -- no boolean-index materialisation.
+                _swa_mask = core_attn_metadata.dcp_swa_has_local_kv
+                if _swa_mask is not None:
+                    if compress_ratio == 4:
+                        _extra_mask = c4_has_local_kv
+                    elif compress_ratio == 128:
+                        _extra_mask = core_attn_metadata.dcp_c128_has_local_kv
+                    else:
+                        _extra_mask = None
+                    if _extra_mask is not None:
+                        _n = _swa_mask.shape[0]
+                        _em = _extra_mask[:_n]
+                        _swa_empty = (~_swa_mask).sum().item()
+                        _poison = ((~_swa_mask) & _em).sum().item()
+                        logger.info(
+                            "DCP_SWA_DUMMY_POISON layer=%d ratio=%d rank=%d "
+                            "rows=%d swa_empty=%d swa_empty_extra_nonempty=%d",
+                            layer_id,
+                            compress_ratio,
+                            dcp_group.rank_in_group,
+                            _n,
+                            int(_swa_empty),
+                            int(_poison),
+                        )
+
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
