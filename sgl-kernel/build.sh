@@ -25,6 +25,21 @@ mkdir -p "${BUILDX_CACHE_DIR}" "${CCACHE_HOST_DIR}"
 
 # Ensure a buildx builder with docker-container driver (required for cache export)
 BUILDER_NAME="sgl-kernel-builder"
+BUILDER_PROXY_CONFIG="${CACHE_DIR}/buildx-proxy.env"
+
+PROXY_DRIVER_OPTS=()
+PROXY_BUILD_ARGS=()
+PROXY_CONFIG_LINES=()
+for PROXY_ENV_NAME in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
+  PROXY_ENV_VALUE="${!PROXY_ENV_NAME:-}"
+  if [ -n "${PROXY_ENV_VALUE}" ]; then
+    PROXY_DRIVER_OPTS+=(--driver-opt "env.${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
+    PROXY_BUILD_ARGS+=(--build-arg "${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
+    PROXY_CONFIG_LINES+=("${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
+  fi
+done
+CURRENT_PROXY_CONFIG="$(printf "%s\n" "${PROXY_CONFIG_LINES[@]}")"
+
 # RESET_BUILDER=1 removes and recreates the builder to clear corrupted internal
 # state (e.g. stale containerd snapshots from base image layer GC).
 if [ "${RESET_BUILDER:-0}" = "1" ]; then
@@ -33,8 +48,24 @@ if [ "${RESET_BUILDER:-0}" = "1" ]; then
   rm -rf "${BUILDX_CACHE_DIR}"
   mkdir -p "${BUILDX_CACHE_DIR}"
 fi
+if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+  PREVIOUS_PROXY_CONFIG=""
+  if [ -f "${BUILDER_PROXY_CONFIG}" ]; then
+    PREVIOUS_PROXY_CONFIG="$(cat "${BUILDER_PROXY_CONFIG}")"
+  fi
+  if [ "${PREVIOUS_PROXY_CONFIG}" != "${CURRENT_PROXY_CONFIG}" ]; then
+    echo "Recreating buildx builder to apply proxy environment"
+    docker buildx rm "${BUILDER_NAME}" 2>/dev/null || true
+  fi
+fi
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap
+  docker buildx create \
+    --name "${BUILDER_NAME}" \
+    --driver docker-container \
+    "${PROXY_DRIVER_OPTS[@]}" \
+    --use \
+    --bootstrap
+  printf "%s" "${CURRENT_PROXY_CONFIG}" > "${BUILDER_PROXY_CONFIG}"
 else
   docker buildx use "${BUILDER_NAME}"
 fi
@@ -69,6 +100,7 @@ BUILD_ARGS=()
 [ -n "${USE_CCACHE:-}" ]           && BUILD_ARGS+=(--build-arg USE_CCACHE="${USE_CCACHE}")
 [ -n "${BUILD_JOBS:-}" ]           && BUILD_ARGS+=(--build-arg BUILD_JOBS="${BUILD_JOBS}")
 [ -n "${NVCC_THREADS:-}" ]         && BUILD_ARGS+=(--build-arg NVCC_THREADS="${NVCC_THREADS}")
+BUILD_ARGS+=("${PROXY_BUILD_ARGS[@]}")
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
