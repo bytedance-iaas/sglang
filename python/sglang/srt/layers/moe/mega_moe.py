@@ -397,6 +397,13 @@ def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Ten
     return torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
 
 
+def _interleave_l1_weights(
+    weights: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weight, scale = weights
+    return _interleave_l1_weight_only(weight), _interleave_l1_weight_only(scale)
+
+
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
