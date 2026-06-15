@@ -1478,7 +1478,7 @@ class DeepseekV4AttnBackend(
                         _dcp_tensor_summary("o", o),
                         _dcp_tensor_summary("lse", lse),
                     )
-                o_flat = o.reshape(B * S_q, H_q, D_v)
+                o_flat = o.reshape(B * S_q, H_q, D_v).to(torch.float32)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
                 merged, merged_lse = cp_lse_ag_out_rs(
                     o_flat, lse_flat, dcp_group, return_lse=True
@@ -1496,9 +1496,9 @@ class DeepseekV4AttnBackend(
                         + torch.exp(local_attn_sink[None, :] - merged_lse)
                     ),
                 )
-                merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1).to(
-                    merged.dtype
-                )
+                # ``merged`` and ``sink_scale`` are both fp32 here; keep the fold
+                # in fp32 and only cast back to the model dtype after the fold.
+                merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1)
                 _dcp_log(
                     f"dcp_merge_output layer={layer_id} compress_ratio={compress_ratio}",
                     _dcp_tensor_summary("o_flat", o_flat),
@@ -1507,7 +1507,12 @@ class DeepseekV4AttnBackend(
                     _dcp_tensor_summary("sink_scale", sink_scale),
                     _dcp_tensor_summary("merged", merged),
                 )
-                o = merged.transpose(0, 1).contiguous().reshape(B, S_q, -1, D_v)
+                o = (
+                    merged.transpose(0, 1)
+                    .contiguous()
+                    .reshape(B, S_q, -1, D_v)
+                    .to(q.dtype)
+                )
             else:
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,

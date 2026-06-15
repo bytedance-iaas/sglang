@@ -253,7 +253,14 @@ def cp_lse_ag_out_rs(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
 
-    result = cp_attn_out.new_empty((local_heads, B, D))
+    # Keep the merged output in fp32 across the cross-rank reduce so the
+    # per-shard partial outputs are not re-quantised to bf16 before the
+    # weighted sum. The caller casts back to the model dtype after the sink
+    # fold. This matches the non-DCP path which keeps the whole softmax/merge
+    # in fp32 inside the FlashMLA kernel.
+    result = torch.empty(
+        (local_heads, B, D), device=cp_attn_out.device, dtype=torch.float32
+    )
     result_lse = (
         torch.empty((B, local_heads), device=cp_attn_lse.device, dtype=torch.float32)
         if return_lse
