@@ -13,7 +13,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.asym_gemm_wrapper.configurer import ENABLE_JIT_ASYMGEMM
+from sglang.srt.layers.asym_gemm_wrapper.configurer import (
+    ASYMGEMM_BLACKWELL,
+    ENABLE_JIT_ASYMGEMM,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div, get_available_gpu_memory
 
@@ -270,15 +273,38 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
-        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        # Single-expert offsets/experts list: all m rows belong to expert 0.
+        # The two backends use different ABIs (see the runner's pre-permute):
+        #   SM89/SM90: offsets = [end], experts = [0], list_size = host int 1.
+        #   Blackwell: offsets = [start, end] pair, experts = [0, -1] (sentinel-
+        #     terminated), list_size = 1-element int32 CUDA tensor counting the
+        #     experts entries including the sentinel (2).
+        if ASYMGEMM_BLACKWELL:
+            self.offsets = torch.empty((2,), device="cuda", dtype=torch.int32)
+            self.experts = torch.tensor(
+                [0, -1], device="cuda", dtype=torch.int32
+            )
+            self.list_size = torch.tensor([2], device="cuda", dtype=torch.int32)
+        else:
+            self.offsets = torch.empty((1,), device="cuda", dtype=torch.int32)
+            self.experts = torch.zeros((1,), device="cuda", dtype=torch.int32)
+            self.list_size = 1
 
     def execute(self, m):
+        if ASYMGEMM_BLACKWELL:
+            self.offsets.copy_(
+                torch.tensor([0, m], device="cuda", dtype=torch.int32)
+            )
+        else:
+            self.offsets.fill_(m)
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.offsets,
+            self.experts,
+            self.list_size,
         )
 
 
