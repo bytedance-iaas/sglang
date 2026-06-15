@@ -367,7 +367,7 @@ class UnifiedRadixCache(BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, params)
         return self._match_post_processor(
             params,
             value,
@@ -466,7 +466,12 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = None
 
         if is_insert:
-            insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+            insert_params = InsertParams(
+                prev_prefix_len=req.cache_protected_len,
+                skip_swa_component=getattr(
+                    req, "skip_swa_radix_cache_insert", False
+                ),
+            )
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -496,10 +501,16 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+            if insert_params.skip_swa_component:
+                self.token_to_kv_pool_allocator.free_swa(values)
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
+            if getattr(req, "skip_swa_radix_cache_insert", False):
+                self.token_to_kv_pool_allocator.free_swa(
+                    kv_indices[: req.cache_protected_len]
+                )
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
         self.dec_lock_ref(
@@ -532,7 +543,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len, chunked=chunked
+            prev_prefix_len=req.cache_protected_len,
+            chunked=chunked,
+            skip_swa_component=getattr(req, "skip_swa_radix_cache_insert", False),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -568,7 +581,14 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.insert(insert_params)
 
         # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(
+                key=radix_key,
+                ignore_component_types=(
+                    (ComponentType.SWA,) if insert_params.skip_swa_component else ()
+                ),
+            )
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -612,7 +632,7 @@ class UnifiedRadixCache(BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, params: MatchPrefixParams
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
@@ -625,18 +645,24 @@ class UnifiedRadixCache(BasePrefixCache):
         best_match_device_node = node
         best_match_device_value_len = 0
         separate_device_match = self.cache_controller is not None
+        ignored_components = set(params.ignore_component_types)
+        components = tuple(
+            comp
+            for comp in self._components_tuple
+            if comp.component_type not in ignored_components
+        )
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in self._components_tuple
+                comp.create_match_validator() for comp in components
             )
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self._components_tuple
+                for comp in components
             )
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self._components_tuple
+                for comp in components
             )
 
         def _all_valid(validators, node):
@@ -697,7 +723,10 @@ class UnifiedRadixCache(BasePrefixCache):
         best_match_device_value_len: int,
     ) -> MatchResult:
         node_update = best_match_node
+        ignored_components = set(params.ignore_component_types)
         for comp in self._components_tuple:
+            if comp.component_type in ignored_components:
+                continue
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
             self.lru_lists[comp.component_type].reset_node_and_parents_mru(
@@ -731,6 +760,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         for component in self._components_tuple:
+            if component.component_type in ignored_components:
+                continue
             result = component.finalize_match_result(
                 result=result,
                 params=params,

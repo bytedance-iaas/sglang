@@ -781,6 +781,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # DSV4 HiSparse decode can reuse full radix pages while keeping SWA as
+        # a request-local sliding tail.
+        self.skip_swa_radix_cache_insert: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -1276,6 +1279,7 @@ class Req(ReqDllmMixin):
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.skip_swa_radix_cache_insert = False
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -2853,7 +2857,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert (
             req.cache_protected_len % self.tree_cache.page_size == 0
         ), "cache_protected_len must be page aligned"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+        if not getattr(req, "skip_swa_radix_cache_insert", False):
+            req.swa_evicted_seqlen = max(
+                req.swa_evicted_seqlen, req.cache_protected_len
+            )
 
         # Subtract an extra page_size so the eviction frontier never reaches the
         # radix tree insert boundary (page_floor(seq_len)). This keeps at least one

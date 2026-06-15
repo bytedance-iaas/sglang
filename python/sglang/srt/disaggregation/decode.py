@@ -70,6 +70,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -621,6 +622,11 @@ class DecodePreallocQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        req.skip_swa_radix_cache_insert = (
+            self._enable_decode_radix_prefix_reuse()
+            and self._is_dsv4_hisparse_swa_tail_prealloc()
+        )
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -654,6 +660,11 @@ class DecodePreallocQueue:
             token_ids if token_ids is not None else req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
+            ignore_component_types=(
+                (ComponentType.SWA,)
+                if getattr(req, "skip_swa_radix_cache_insert", False)
+                else ()
+            ),
         )
         prefix_indices = result.device_indices
         last_device_node = result.last_device_node
@@ -1781,6 +1792,14 @@ class DecodePreallocQueue:
             )
             if use_dsv4_safe_prefix:
                 swa_tail_len = self._swa_tail_len(fill_len)
+                swa_tail_start = fill_len - swa_tail_len
+                if self.token_to_kv_pool_allocator.page_size > 1:
+                    swa_tail_start = page_align_floor(
+                        swa_tail_start, self.token_to_kv_pool_allocator.page_size
+                    )
+                req.swa_evicted_seqlen = max(
+                    req.swa_evicted_seqlen, swa_tail_start
+                )
                 if delta_len < swa_tail_len:
                     raise RuntimeError(
                         "Unsafe DSV4 HiSparse logical prefix crosses SWA tail: "
