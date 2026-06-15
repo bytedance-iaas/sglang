@@ -1362,29 +1362,40 @@ class HiSparseCoordinator:
     def _free_device_buffer_slots(self, req: Req) -> None:
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
         draft_cap = int(self.req_draft_buffer_size[req.req_pool_idx])
+        if current_cap <= 0 and draft_cap <= 0:
+            return
+
+        buffers_to_free = []
         if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-        else:
-            side_buf_hi = torch.empty(0, dtype=torch.int64, device=self.device)
+            buffers_to_free.append(
+                self.req_to_device_buffer[req.req_pool_idx, :current_cap]
+            )
         if draft_cap > 0:
             draft_start = self.device_buffer_size + 1
             draft_end = draft_start + draft_cap
-            draft_buf_hi = self.req_to_device_buffer[
-                req.req_pool_idx, draft_start:draft_end
-            ]
-            all_hi = torch.unique(
-                torch.cat(
-                    [
-                        side_buf_hi[side_buf_hi > 0],
-                        draft_buf_hi[draft_buf_hi > 0],
+            # If the request already owns the padded extra page through the side
+            # buffer, draft slots live inside that range and must not be freed
+            # again.  Otherwise free only the separately allocated draft tail.
+            draft_free_start = max(draft_start, current_cap)
+            if draft_free_start < draft_end:
+                buffers_to_free.append(
+                    self.req_to_device_buffer[
+                        req.req_pool_idx, draft_free_start:draft_end
                     ]
                 )
-            )
-        else:
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
 
-        if (current_cap > 0 or draft_cap > 0) and all_hi.numel() > 0:
-            self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+        if not buffers_to_free:
+            return
+
+        if len(buffers_to_free) == 1:
+            all_hi = buffers_to_free[0]
+        else:
+            all_hi = torch.cat(buffers_to_free)
+
+        if all_hi.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(
+                all_hi, already_filtered=True
+            )
 
     def supports_hisparse_draft_slots(self) -> bool:
         return True
