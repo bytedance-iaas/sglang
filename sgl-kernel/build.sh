@@ -29,16 +29,21 @@ BUILDER_PROXY_CONFIG="${CACHE_DIR}/buildx-proxy.env"
 
 PROXY_DRIVER_OPTS=()
 PROXY_BUILD_ARGS=()
-PROXY_CONFIG_LINES=()
+PROXY_DRIVER_CONFIG_LINES=()
+
 for PROXY_ENV_NAME in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
   PROXY_ENV_VALUE="${!PROXY_ENV_NAME:-}"
   if [ -n "${PROXY_ENV_VALUE}" ]; then
-    PROXY_DRIVER_OPTS+=(--driver-opt "env.${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
+    if [[ "${PROXY_ENV_VALUE}" != *","* ]]; then
+      PROXY_DRIVER_OPTS+=(--driver-opt "env.${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
+      PROXY_DRIVER_CONFIG_LINES+=("${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
+    else
+      echo "Skipping buildx driver env ${PROXY_ENV_NAME}: buildx --driver-opt cannot parse comma-separated values"
+    fi
     PROXY_BUILD_ARGS+=(--build-arg "${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
-    PROXY_CONFIG_LINES+=("${PROXY_ENV_NAME}=${PROXY_ENV_VALUE}")
   fi
 done
-CURRENT_PROXY_CONFIG="$(printf "%s\n" "${PROXY_CONFIG_LINES[@]}")"
+CURRENT_PROXY_CONFIG="$(printf "%s\n" "${PROXY_DRIVER_CONFIG_LINES[@]}")"
 
 # RESET_BUILDER=1 removes and recreates the builder to clear corrupted internal
 # state (e.g. stale containerd snapshots from base image layer GC).
