@@ -1471,13 +1471,6 @@ class DeepseekV4AttnBackend(
                         lse,
                         torch.full_like(lse, float("-inf")),
                     )
-                    _dcp_log(
-                        f"flashmla_output_post_mask layer={layer_id} "
-                        f"compress_ratio={compress_ratio}",
-                        _dcp_tensor_summary("has_local_kv", has_local_kv),
-                        _dcp_tensor_summary("o", o),
-                        _dcp_tensor_summary("lse", lse),
-                    )
                 o_flat = o.reshape(B * S_q, H_q, D_v).to(torch.float32)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
                 merged, merged_lse = cp_lse_ag_out_rs(
