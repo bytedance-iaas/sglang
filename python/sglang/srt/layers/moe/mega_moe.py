@@ -368,12 +368,19 @@ def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Ten
     )
 
 
+def _interleave_l1_weights(
+    weights: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weight, scale = weights
+    return _interleave_l1_weight_only(weight), _interleave_l1_weight_only(scale)
+
+
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
-    from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
+    from deep_gemm.mega import _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
