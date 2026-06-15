@@ -69,69 +69,6 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
-_DCP_ACCURACY_LOG_COUNT = 0
-
-
-def _dcp_accuracy_log_enabled() -> bool:
-    return envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get() > 0
-
-
-def _dcp_accuracy_should_log() -> bool:
-    global _DCP_ACCURACY_LOG_COUNT
-    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
-    if limit <= 0 or _DCP_ACCURACY_LOG_COUNT >= limit:
-        return False
-    _DCP_ACCURACY_LOG_COUNT += 1
-    return True
-
-
-def _dcp_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
-    if x is None:
-        return f"{name}=None"
-    with torch.no_grad():
-        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
-        if x.numel() == 0:
-            parts.append("empty")
-        elif x.dtype == torch.bool:
-            parts.append(f"true={int(x.sum().item())}/{x.numel()}")
-        elif x.is_floating_point():
-            finite = torch.isfinite(x)
-            parts.append(f"finite={int(finite.sum().item())}/{x.numel()}")
-            if finite.any():
-                xf = x[finite].float()
-                parts.append(f"min={float(xf.min().item()):.6g}")
-                parts.append(f"max={float(xf.max().item()):.6g}")
-                parts.append(f"mean={float(xf.mean().item()):.6g}")
-        else:
-            valid = x >= 0
-            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
-            if valid.any():
-                xv = x[valid]
-                parts.append(f"min={int(xv.min().item())}")
-                parts.append(f"max={int(xv.max().item())}")
-                dcp_world_size = get_dcp_world_size()
-                if dcp_world_size > 1:
-                    hist = torch.bincount(
-                        (xv % dcp_world_size).to(torch.int64),
-                        minlength=dcp_world_size,
-                    )
-                    parts.append(
-                        "mod_hist="
-                        + ",".join(str(int(v.item())) for v in hist[:dcp_world_size])
-                    )
-        return " ".join(parts)
-
-
-def _dcp_log(message: str, *summaries: str) -> None:
-    if not _dcp_accuracy_should_log():
-        return
-    logger.warning(
-        "DSV4_DCP_ACC_DEBUG rank=%s/%s %s %s",
-        get_dcp_rank(),
-        get_dcp_world_size(),
-        message,
-        " | ".join(summaries),
-    )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -315,16 +252,6 @@ class DSV4AttnMetadata:
             return
 
         dcp_rank = get_dcp_rank()
-        if _dcp_accuracy_log_enabled():
-            _dcp_log(
-                "before_localize_base_indices",
-                _dcp_tensor_summary("swa_page_indices", self.swa_page_indices),
-                _dcp_tensor_summary("swa_topk_lengths", self.swa_topk_lengths),
-                _dcp_tensor_summary("c128_page_indices", self.c128_page_indices),
-                _dcp_tensor_summary(
-                    "c128_topk_lengths", self.c128_topk_lengths_clamp1
-                ),
-            )
         self.swa_page_indices, swa_local_lengths = (
             self._compact_dcp_local_indices(
                 self.swa_page_indices, dcp_world_size, dcp_rank
@@ -346,17 +273,6 @@ class DSV4AttnMetadata:
         # Backward-compatible alias for existing metadata copy/replay paths.
         # Forward must use the compress-ratio-specific mask below instead.
         self.dcp_has_local_kv = self.dcp_swa_has_local_kv
-        _dcp_log(
-            "after_localize_base_indices",
-            _dcp_tensor_summary("swa_page_indices", self.swa_page_indices),
-            _dcp_tensor_summary("swa_local_lengths", swa_local_lengths),
-            _dcp_tensor_summary("dcp_swa_has_local_kv", self.dcp_swa_has_local_kv),
-            _dcp_tensor_summary("c128_page_indices", self.c128_page_indices),
-            _dcp_tensor_summary(
-                "c128_topk_lengths", self.c128_topk_lengths_clamp1
-            ),
-            _dcp_tensor_summary("dcp_c128_has_local_kv", self.dcp_c128_has_local_kv),
-        )
 
     def get_dcp_has_local_kv(self, compress_ratio: Literal[0, 4, 128]):
         if self.dcp_swa_has_local_kv is None:
@@ -1350,24 +1266,6 @@ class DeepseekV4AttnBackend(
                 # than a dummy key.
                 extra_topk_lengths = c4_local_lengths
                 c4_has_local_kv = c4_local_lengths > 0
-                _dcp_log(
-                    f"after_localize_c4_extra_indices layer={layer_id}",
-                    _dcp_tensor_summary("extra_indices", extra_indices),
-                    _dcp_tensor_summary("c4_local_lengths", c4_local_lengths),
-                    _dcp_tensor_summary("c4_has_local_kv", c4_has_local_kv),
-                )
-                # Poison check: rows where this rank's SWA shard is empty (so
-                # swa_topk_length was clamped to 1 and reads dummy physical
-                # page 0) but C4 is non-empty (so active mask keeps the row).
-                # In those rows the SWA dummy page 0 leaks a bogus contribution
-                # into the shared FlashMLA LSE and corrupts the DCP merge.
-                _swa_h = core_attn_metadata.dcp_swa_has_local_kv
-                if _swa_h is not None:
-                    _n = min(_swa_h.shape[0], c4_has_local_kv.shape[0])
-                    _poison = (
-                        (~_swa_h[:_n] & c4_has_local_kv[:_n]).sum().item()
-                    )
-                    _dcp_log(f"SWA_DUMMY_POISON layer={layer_id} rows={_poison}")
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -1418,19 +1316,6 @@ class DeepseekV4AttnBackend(
                             active_dcp_has_local_kv | c4_has_local_kv
                         )
 
-                _dcp_log(
-                    f"flashmla_input layer={layer_id} compress_ratio={compress_ratio}",
-                    _dcp_tensor_summary("q", q),
-                    _dcp_tensor_summary("swa_page_indices", swa_page_indices),
-                    _dcp_tensor_summary("swa_topk_lengths", swa_topk_lengths),
-                    _dcp_tensor_summary("extra_indices", extra_indices),
-                    _dcp_tensor_summary("extra_topk_lengths", extra_topk_lengths),
-                    _dcp_tensor_summary(
-                        "active_has_local_kv",
-                        active_dcp_has_local_kv,
-                    ),
-                    _dcp_tensor_summary("attn_sink", dcp_attn_sink),
-                )
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
@@ -1453,12 +1338,6 @@ class DeepseekV4AttnBackend(
                 # the TP-local head slice.
                 o, lse = mla_result[0], mla_result[1]
                 B, S_q, H_q, D_v = o.shape
-                _dcp_log(
-                    f"flashmla_output_pre_mask layer={layer_id} "
-                    f"compress_ratio={compress_ratio}",
-                    _dcp_tensor_summary("o", o),
-                    _dcp_tensor_summary("lse", lse),
-                )
                 dcp_has_local_kv = active_dcp_has_local_kv
                 if dcp_has_local_kv is not None:
                     has_local_kv = dcp_has_local_kv[: B * S_q]
@@ -1492,13 +1371,6 @@ class DeepseekV4AttnBackend(
                 # ``merged`` and ``sink_scale`` are both fp32 here; keep the fold
                 # in fp32 and only cast back to the model dtype after the fold.
                 merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1)
-                _dcp_log(
-                    f"dcp_merge_output layer={layer_id} compress_ratio={compress_ratio}",
-                    _dcp_tensor_summary("lse_flat", lse_flat),
-                    _dcp_tensor_summary("merged_lse", merged_lse),
-                    _dcp_tensor_summary("sink_scale", sink_scale),
-                    _dcp_tensor_summary("merged", merged),
-                )
                 o = (
                     merged.transpose(0, 1)
                     .contiguous()
@@ -1525,16 +1397,6 @@ class DeepseekV4AttnBackend(
                 o = mla_result[0]
 
             o = o.squeeze(1)
-            # Unified final-output fingerprint for both DCP and non-DCP paths
-            # so a dcp_size=1 baseline run and a dcp_size>1 candidate run can be
-            # diffed per layer to locate the first diverging layer. ``o`` is the
-            # full-head output on the non-DCP path and this rank's head slice on
-            # the DCP path; min/max/mean still surface numerical drift.
-            _dcp_log(
-                f"final_attn_output layer={layer_id} compress_ratio={compress_ratio} "
-                f"use_dcp={use_dcp}",
-                _dcp_tensor_summary("o", o),
-            )
             return o
 
         raise NotImplementedError("ragged attention")
@@ -1674,18 +1536,6 @@ class DeepseekV4AttnBackend(
         assert raw_indices.shape == (num_qo_tokens, SWA_WINDOW)
         raw_indices.masked_fill_(invalid_offset_mask, -1)
         swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
-        if get_dcp_world_size() > 1 and _dcp_accuracy_log_enabled():
-            dcp_world_size = get_dcp_world_size()
-            valid_mapping = (raw_indices >= 0) & (swa_indices >= 0)
-            owner_mismatch = valid_mapping & (
-                (raw_indices % dcp_world_size) != (swa_indices % dcp_world_size)
-            )
-            _dcp_log(
-                "swa_full_to_swa_mapping",
-                _dcp_tensor_summary("raw_indices", raw_indices),
-                _dcp_tensor_summary("swa_indices", swa_indices),
-                _dcp_tensor_summary("owner_mismatch", owner_mismatch),
-            )
         return swa_indices
 
 
