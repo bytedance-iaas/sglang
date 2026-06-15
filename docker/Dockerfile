@@ -195,8 +195,11 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -454,7 +457,11 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y \
+    && rm /tmp/rustup-init.sh \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
