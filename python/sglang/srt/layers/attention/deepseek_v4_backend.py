@@ -1305,24 +1305,44 @@ class DeepseekV4AttnBackend(
                 # merge KV-only attention first and fold the sink denominator
                 # into the merged local head slice below.
                 dcp_attn_sink = torch.full_like(attn_sink, float("-inf"))
-                # Partial-output validity must follow SWA presence only.
-                # FlashMLA fuses SWA + extra (C4/C128) keys into a single
-                # softmax, and ``_compact_dcp_local_indices`` clamps SWA's
-                # ``topk_length`` to >=1 with a dummy page-0 index when the
-                # row has no local SWA KV (FlashMLA does not reliably support
-                # 0-length rows). That dummy KV pollutes the row's partial
-                # o/lse regardless of how many extra keys this rank holds, so
-                # the row must be excluded from the cross-rank LSE merge even
-                # when ``c4_has_local_kv`` / ``dcp_c128_has_local_kv`` is true.
-                # Losing those rows' extra contribution on this rank is
-                # acceptable because extra keys are page-sharded across all
-                # DCP ranks; including them would propagate dummy-page noise
-                # into the merged output.
-                active_dcp_has_local_kv = core_attn_metadata.dcp_swa_has_local_kv
-                if active_dcp_has_local_kv is None:
-                    active_dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
-                        compress_ratio
-                    )
+                active_dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
+                    compress_ratio
+                )
+                if c4_has_local_kv is not None:
+                    if active_dcp_has_local_kv is None:
+                        active_dcp_has_local_kv = c4_has_local_kv
+                    else:
+                        active_dcp_has_local_kv = (
+                            active_dcp_has_local_kv | c4_has_local_kv
+                        )
+
+                # Instrumentation: count rows where SWA shard is empty but the
+                # extra (C4/C128) shard is non-empty. Such rows keep a dummy
+                # SWA page-0 (clamp(min=1)) that pollutes the per-rank o/lse.
+                # Scalar reduces only -- no boolean-index materialisation.
+                _swa_mask = core_attn_metadata.dcp_swa_has_local_kv
+                if _swa_mask is not None:
+                    if compress_ratio == 4:
+                        _extra_mask = c4_has_local_kv
+                    elif compress_ratio == 128:
+                        _extra_mask = core_attn_metadata.dcp_c128_has_local_kv
+                    else:
+                        _extra_mask = None
+                    if _extra_mask is not None:
+                        _n = _swa_mask.shape[0]
+                        _em = _extra_mask[:_n]
+                        _swa_empty = (~_swa_mask).sum().item()
+                        _poison = ((~_swa_mask) & _em).sum().item()
+                        logger.info(
+                            "DCP_SWA_DUMMY_POISON layer=%d ratio=%d rank=%d "
+                            "rows=%d swa_empty=%d swa_empty_extra_nonempty=%d",
+                            layer_id,
+                            compress_ratio,
+                            dcp_group.rank_in_group,
+                            _n,
+                            int(_swa_empty),
+                            int(_poison),
+                        )
 
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
