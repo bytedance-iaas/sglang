@@ -1494,7 +1494,6 @@ class DeepseekV4AttnBackend(
                 merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1)
                 _dcp_log(
                     f"dcp_merge_output layer={layer_id} compress_ratio={compress_ratio}",
-                    _dcp_tensor_summary("o_flat", o_flat),
                     _dcp_tensor_summary("lse_flat", lse_flat),
                     _dcp_tensor_summary("merged_lse", merged_lse),
                     _dcp_tensor_summary("sink_scale", sink_scale),
