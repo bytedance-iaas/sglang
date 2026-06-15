@@ -70,6 +70,51 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
+# DCP merge 诊断日志：per-(layer, ratio) 限流计数；通过环境变量
+# SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS 控制每个 (layer, ratio) 打印的 step 上限。
+_DCP_MERGE_LOG_COUNT: Dict[Tuple[int, int], int] = {}
+
+
+def _dcp_merge_should_log(layer_id: int, compress_ratio: int) -> bool:
+    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
+    if limit <= 0:
+        return False
+    key = (layer_id, compress_ratio)
+    cur = _DCP_MERGE_LOG_COUNT.get(key, 0)
+    if cur >= limit:
+        return False
+    _DCP_MERGE_LOG_COUNT[key] = cur + 1
+    return True
+
+
+def _dcp_merge_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
+    if x is None:
+        return f"{name}=None"
+    with torch.no_grad():
+        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
+        if x.numel() == 0:
+            parts.append("empty")
+        elif x.dtype == torch.bool:
+            parts.append(f"true={int(x.sum().item())}/{x.numel()}")
+        elif x.is_floating_point():
+            xf = x.float()
+            finite = torch.isfinite(xf)
+            n_finite = int(finite.sum().item())
+            parts.append(f"finite={n_finite}/{x.numel()}")
+            parts.append(f"neginf={int(torch.isneginf(xf).sum().item())}")
+            parts.append(f"posinf={int(torch.isposinf(xf).sum().item())}")
+            parts.append(f"nan={int(torch.isnan(xf).sum().item())}")
+            if n_finite > 0:
+                xv = xf[finite]
+                parts.append(f"min={float(xv.min().item()):.6g}")
+                parts.append(f"max={float(xv.max().item()):.6g}")
+                parts.append(f"mean={float(xv.mean().item()):.6g}")
+                parts.append(f"absmean={float(xv.abs().mean().item()):.6g}")
+        else:
+            parts.append(f"min={int(x.min().item())}")
+            parts.append(f"max={int(x.max().item())}")
+        return " ".join(parts)
+
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     if forward_batch.forward_mode.is_idle():
@@ -1375,6 +1420,22 @@ class DeepseekV4AttnBackend(
                 # the TP-local head slice.
                 o, lse = mla_result[0], mla_result[1]
                 B, S_q, H_q, D_v = o.shape
+                _dcp_log_enabled = _dcp_merge_should_log(layer_id, compress_ratio)
+                if _dcp_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
+                        "stage=per_rank_pre_mask B=%d S_q=%d H_q=%d D_v=%d | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        dcp_group.rank_in_group,
+                        dcp_group.world_size,
+                        B,
+                        S_q,
+                        H_q,
+                        D_v,
+                        _dcp_merge_tensor_summary("o", o),
+                        _dcp_merge_tensor_summary("lse", lse),
+                    )
                 dcp_has_local_kv = active_dcp_has_local_kv
                 if dcp_has_local_kv is not None:
                     has_local_kv = dcp_has_local_kv[: B * S_q]
@@ -1389,6 +1450,20 @@ class DeepseekV4AttnBackend(
                     )
                 o_flat = o.reshape(B * S_q, H_q, D_v).to(torch.float32)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
+                if _dcp_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
+                        "stage=per_rank_post_mask | %s | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        dcp_group.rank_in_group,
+                        dcp_group.world_size,
+                        _dcp_merge_tensor_summary("o_flat", o_flat),
+                        _dcp_merge_tensor_summary("lse_flat", lse_flat),
+                        _dcp_merge_tensor_summary(
+                            "dcp_has_local_kv", dcp_has_local_kv
+                        ),
+                    )
                 merged, merged_lse = cp_lse_ag_out_rs(
                     o_flat, lse_flat, dcp_group, return_lse=True
                 )
@@ -1407,6 +1482,7 @@ class DeepseekV4AttnBackend(
                 )
                 # ``merged`` and ``sink_scale`` are both fp32 here; keep the fold
                 # in fp32 and only cast back to the model dtype after the fold.
+                merged_pre_sink = merged
                 merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1)
                 o = (
                     merged.transpose(0, 1)
@@ -1414,6 +1490,25 @@ class DeepseekV4AttnBackend(
                     .reshape(B, S_q, -1, D_v)
                     .to(q.dtype)
                 )
+                if _dcp_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
+                        "stage=after_merge local_heads=%d sink_range=[%d,%d) | "
+                        "%s | %s | %s | %s | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        dcp_group.rank_in_group,
+                        dcp_group.world_size,
+                        local_heads,
+                        sink_start,
+                        sink_end,
+                        _dcp_merge_tensor_summary("merged_pre_sink", merged_pre_sink),
+                        _dcp_merge_tensor_summary("merged_lse", merged_lse),
+                        _dcp_merge_tensor_summary("local_attn_sink", local_attn_sink),
+                        _dcp_merge_tensor_summary("sink_scale", sink_scale),
+                        _dcp_merge_tensor_summary("merged_post_sink", merged),
+                        _dcp_merge_tensor_summary("o_final", o),
+                    )
             else:
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
@@ -1432,6 +1527,16 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )
                 o = mla_result[0]
+                if _dcp_merge_should_log(layer_id, compress_ratio):
+                    _lse = mla_result[1] if len(mla_result) > 1 else None
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d single_rank "
+                        "stage=flashmla_out | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        _dcp_merge_tensor_summary("o", o),
+                        _dcp_merge_tensor_summary("lse", _lse),
+                    )
 
             o = o.squeeze(1)
             return o
