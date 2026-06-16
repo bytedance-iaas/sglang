@@ -997,10 +997,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
         dtype=hidden_states.dtype,
     )
     if use_sm90_mxfp8:
+        assert hidden_states_scale is not None, "SM90 MXFP8 DeepEP normal path requires activation scales"
         input_tensor_scale = torch.empty(
             (all_tokens, K // 32),
             device=hidden_states.device,
-            dtype=torch.uint8,
+            dtype=hidden_states_scale.dtype,
         )
     elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
@@ -1047,6 +1048,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
+
+    if use_sm90_mxfp8 and input_tensor_scale.dtype != torch.uint8:
+        old_input_tensor_scale = input_tensor_scale
+        input_tensor_scale = _cast_to_e8m0_u8_with_rounding_up(input_tensor_scale)
+        dispose_tensor(old_input_tensor_scale)
 
     running_state["output_index"] = output_index
 
