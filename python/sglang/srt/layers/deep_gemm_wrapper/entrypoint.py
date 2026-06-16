@@ -79,7 +79,7 @@ def _normalize_sm90_mxfp8_pair(
 
     if sf.dtype == torch.int32:
         if allow_packed_scale and x.dtype == torch.float8_e4m3fn:
-            return x, sf.contiguous()
+            return x, sf
         sf_u8 = _unpack_ue8m0_i32_to_u8(sf)
         if sf_u8.shape[-1] >= k32 and x.dtype == torch.float8_e4m3fn:
             return x, sf_u8[..., :k32].contiguous()
@@ -113,6 +113,13 @@ def _pad_sm90_mxfp8_lhs(
     padded_sf = torch.empty(
         (*sf.shape[:-2], expected_m, sf.shape[-1]), device=sf.device, dtype=sf.dtype
     )
+    if sf.dtype == torch.int32 and not sf.is_contiguous() and sf.dim() >= 2:
+        padded_sf_storage = torch.empty(
+            (*sf.shape[:-2], sf.shape[-1], expected_m),
+            device=sf.device,
+            dtype=sf.dtype,
+        )
+        padded_sf = padded_sf_storage.transpose(-1, -2)
     padded_x[..., : x.shape[-2], :] = x
     padded_sf[..., : sf.shape[-2], :] = sf
     return padded_x, padded_sf
