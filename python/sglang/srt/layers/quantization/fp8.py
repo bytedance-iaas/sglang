@@ -890,6 +890,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 out.unsqueeze(0),
                 masked_m,
                 expected_m=m,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
             )
         else:
             m_indices = torch.empty((m,), device=x_2d.device, dtype=torch.int32)
@@ -899,6 +901,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 (weight, weight_scale),
                 out,
                 m_indices,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
             )
 
         if bias is not None:

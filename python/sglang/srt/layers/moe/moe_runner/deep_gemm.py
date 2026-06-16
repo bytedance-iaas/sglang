@@ -205,9 +205,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         use_mxfp8_ue8m0_scales = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or use_sm90_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
+        if use_sm90_mxfp8:
+            recipe_a, recipe_b = (
+                (1, running_state.get("mxfp8_act_gran_k", scale_block_size)),
+                (1, scale_block_size),
+            )
+        else:
+            recipe_a, recipe_b = (
+                ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+            )
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -230,6 +236,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w13_weight_fp8,
                 gateup_output,
                 m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -319,6 +327,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w2_weight_fp8,
                 down_output,
                 m_indices,
+                recipe_a=(1, scale_block_size),
+                recipe_b=recipe_b,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -421,7 +431,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         use_sm90_mxfp8 = _use_sm90_mxfp8_fp8_grouped_gemm(quant_info)
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
         if use_sm90_mxfp8:
-            recipe_a, recipe_b = None, None
+            gran_k_act = running_state.get("mxfp8_act_gran_k", scale_block_size)
+            recipe_a, recipe_b = (1, gran_k_act), (1, scale_block_size)
         elif use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
             # gran_k depends on the dispatch path that quantised the gateup acts,
@@ -478,6 +489,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gateup_output,
                 masked_m,
                 expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
@@ -608,6 +621,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_output,
                     masked_m,
                     expected_m,
+                    recipe_a=(1, scale_block_size),
+                    recipe_b=recipe_b,
                 )
             )
         else:

@@ -178,6 +178,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
 ):
     if not supports_sm90_mxfp8_fp8_grouped_gemm():
         raise RuntimeError(
@@ -216,6 +218,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
             kernel_out,
             masked_m,
             padded_expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
     if kernel_out is not out:
         out.copy_(kernel_out[..., : out.shape[-2], :])
@@ -289,6 +293,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     m_indices: torch.Tensor,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
 ):
     if not supports_sm90_mxfp8_fp8_grouped_gemm():
         raise RuntimeError(
@@ -317,6 +323,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
             rhs,
             out,
             m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
 
 
