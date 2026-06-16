@@ -168,10 +168,14 @@ def _sm90_mxfp8_model_debug_report(location: str, msg: str, data: dict) -> None:
         return
     if get_tensor_model_parallel_rank() != 0:
         return
+    is_summary_event = location.startswith(
+        "minimax_m3.py:MiniMaxM3Model.forward"
+    ) or location.startswith("minimax_m3.py:MiniMaxM3SparseForCausalLM.forward")
     max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
-    if _SM90_MXFP8_MODEL_DEBUG_EVENTS >= max_events:
+    if not is_summary_event and _SM90_MXFP8_MODEL_DEBUG_EVENTS >= max_events:
         return
-    _SM90_MXFP8_MODEL_DEBUG_EVENTS += 1
+    if not is_summary_event:
+        _SM90_MXFP8_MODEL_DEBUG_EVENTS += 1
     payload = {
         "sessionId": "sm90-mxfp8-precision",
         "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
@@ -1730,10 +1734,29 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         if hidden_states.shape[0] != 0:
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3Model.forward:before_final_norm",
+                "SM90 MiniMax model output before final norm",
+                {
+                    "hidden_states": _sm90_mxfp8_model_debug_stats(hidden_states),
+                    "residual": (
+                        _sm90_mxfp8_model_debug_stats(residual)
+                        if residual is not None
+                        else {"is_none": True}
+                    ),
+                },
+            )
             if residual is not None:
                 hidden_states, _ = self.norm(hidden_states, residual)
             else:
                 hidden_states = self.norm(hidden_states)
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3Model.forward:after_final_norm",
+                "SM90 MiniMax model output after final norm",
+                {
+                    "hidden_states": _sm90_mxfp8_model_debug_stats(hidden_states),
+                },
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1854,6 +1877,20 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            debug_hidden_states = (
+                hidden_states[0]
+                if self.capture_aux_hidden_states and isinstance(hidden_states, tuple)
+                else hidden_states
+            )
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3SparseForCausalLM.forward:before_logits",
+                "SM90 MiniMax hidden states before logits processor",
+                {
+                    "hidden_states": _sm90_mxfp8_model_debug_stats(
+                        debug_hidden_states
+                    ),
+                },
+            )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
