@@ -998,8 +998,9 @@ def pre_permute_deepep_normal_to_deep_gemm(
     )
     if use_sm90_mxfp8:
         assert hidden_states_scale is not None, "SM90 MXFP8 DeepEP normal path requires activation scales"
+        input_scale_cols = hidden_states_scale.shape[-1]
         input_tensor_scale = torch.empty(
-            (all_tokens, K // 32),
+            (all_tokens, input_scale_cols),
             device=hidden_states.device,
             dtype=hidden_states_scale.dtype,
         )
@@ -1043,15 +1044,21 @@ def pre_permute_deepep_normal_to_deep_gemm(
         m_indices,
         output_index,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not use_sm90_mxfp8,
-        quant_block_size=32 if use_sm90_mxfp8 else 128,
+        quant_block_size=K // hidden_states_scale.shape[-1] if use_sm90_mxfp8 else 128,
     )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
 
-    if use_sm90_mxfp8 and input_tensor_scale.dtype != torch.uint8:
+    if use_sm90_mxfp8 and (
+        input_tensor_scale.dtype != torch.uint8 or input_tensor_scale.shape[-1] != K // 32
+    ):
+        old_input_tensor = input_tensor
         old_input_tensor_scale = input_tensor_scale
-        input_tensor_scale = _cast_to_e8m0_u8_with_rounding_up(input_tensor_scale)
+        input_tensor, input_tensor_scale = _requantize_masked_fp8_to_mxfp8_k32(
+            input_tensor, input_tensor_scale
+        )
+        dispose_tensor(old_input_tensor)
         dispose_tensor(old_input_tensor_scale)
 
     running_state["output_index"] = output_index
