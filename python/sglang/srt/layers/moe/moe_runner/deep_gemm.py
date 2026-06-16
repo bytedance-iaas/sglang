@@ -484,6 +484,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         use_mxfp8 = quant_info.use_mxfp8
         use_sm90_mxfp8 = _use_sm90_mxfp8_fp8_grouped_gemm(quant_info)
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        original_m = hidden_states.shape[1]
+        padded_expected_m = expected_m
 
         if use_sm90_mxfp8:
             recipe_a, recipe_b = None, None
@@ -508,6 +510,29 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 f"SM90 MXFP8 gateup scale mismatch: K={k_for_recipe}, "
                 f"act_sf_last={act_sf_last}, expected {ceil_div(k_for_recipe, 32)}"
             )
+            assert expected_m is not None
+            padded_expected_m = ((expected_m + 127) // 128) * 128
+            if padded_expected_m != original_m:
+                padded_hidden_states = torch.empty(
+                    (hidden_states.shape[0], padded_expected_m, hidden_states.shape[2]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                padded_hidden_states_scale = torch.empty(
+                    (
+                        hidden_states_scale.shape[0],
+                        padded_expected_m,
+                        hidden_states_scale.shape[2],
+                    ),
+                    device=hidden_states_scale.device,
+                    dtype=hidden_states_scale.dtype,
+                )
+                padded_hidden_states[:, :original_m] = hidden_states
+                padded_hidden_states_scale[:, :original_m] = hidden_states_scale
+                dispose_tensor(hidden_states)
+                dispose_tensor(hidden_states_scale)
+                hidden_states = padded_hidden_states
+                hidden_states_scale = padded_hidden_states_scale
         elif use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
             # gran_k depends on the dispatch path that quantised the gateup acts,
@@ -566,7 +591,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 (w13_weight, w13_scale),
                 gateup_output,
                 masked_m,
-                expected_m,
+                padded_expected_m,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
@@ -698,7 +723,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     (w2_weight, w2_scale),
                     down_output,
                     masked_m,
-                    expected_m,
+                    padded_expected_m,
                 )
             )
         else:
@@ -720,7 +745,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
-        return down_output
+        return down_output[:, :original_m, :] if use_sm90_mxfp8 else down_output
 
     def _run_masked_bf16_gemm(
         self,
