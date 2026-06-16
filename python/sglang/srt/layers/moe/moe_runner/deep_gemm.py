@@ -102,6 +102,29 @@ def _cast_to_e8m0_u8_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     return exp.to(torch.uint8).contiguous()
 
 
+def _requantize_masked_fp8_to_mxfp8_k32(
+    x: torch.Tensor, scale: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+
+    original_shape = x.shape
+    x_2d = x.reshape(-1, original_shape[-1])
+    if x.dtype == torch.float8_e4m3fn:
+        assert scale is not None, "FP8 activations require scales for MXFP8 repacking"
+        scale_2d = scale.reshape(x_2d.shape[0], -1)
+        if scale_2d.dtype == torch.uint8:
+            scale_2d = (scale_2d.to(torch.int32) << 23).view(torch.float32)
+        else:
+            scale_2d = scale_2d.to(torch.float32)
+        gran_k = original_shape[-1] // scale_2d.shape[-1]
+        group_idx = torch.arange(original_shape[-1], device=x.device) // gran_k
+        x_2d = (x_2d.float() * scale_2d[:, group_idx]).to(torch.bfloat16)
+    else:
+        x_2d = x_2d.contiguous()
+    q_2d, sf_2d = mxfp8_group_quantize(x_2d.contiguous())
+    return q_2d.reshape(original_shape), sf_2d.reshape(*original_shape[:-1], -1)
+
+
 def copy_list_to_gpu_no_ce(arr: List[int]):
     from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
@@ -456,7 +479,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if use_sm90_mxfp8:
             recipe_a, recipe_b = None, None
             _, _, k_for_recipe = hidden_states.shape
-            act_sf_last = hidden_states_scale.shape[-1]
+            act_sf_last = (
+                hidden_states_scale.shape[-1]
+                if hidden_states_scale is not None
+                else -1
+            )
+            expected_act_sf_last = ceil_div(k_for_recipe, 32)
+            if act_sf_last != expected_act_sf_last:
+                old_hidden_states = hidden_states
+                old_hidden_states_scale = hidden_states_scale
+                hidden_states, hidden_states_scale = _requantize_masked_fp8_to_mxfp8_k32(
+                    hidden_states, hidden_states_scale
+                )
+                dispose_tensor(old_hidden_states)
+                if old_hidden_states_scale is not None:
+                    dispose_tensor(old_hidden_states_scale)
+                act_sf_last = hidden_states_scale.shape[-1]
             assert ceil_div(k_for_recipe, 32) == act_sf_last, (
                 f"SM90 MXFP8 gateup scale mismatch: K={k_for_recipe}, "
                 f"act_sf_last={act_sf_last}, expected {ceil_div(k_for_recipe, 32)}"
