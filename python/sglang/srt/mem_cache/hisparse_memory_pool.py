@@ -6,6 +6,8 @@ from typing import Optional
 
 import psutil
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
@@ -34,6 +36,29 @@ else:
             "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
             "It is not available on this backend."
         )
+
+
+@triton.jit
+def bind_dsv4_hisparse_device_mapping_kernel(
+    logical_indices,
+    device_slots,
+    full_to_hisparse_device_index_mapping,
+    num_indices,
+    compress_ratio: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_indices
+    logical_loc = tl.load(logical_indices + offsets, mask=mask, other=0).to(tl.int64)
+    device_slot = tl.load(device_slots + offsets, mask=mask, other=0).to(tl.int64)
+
+    compressed_mask = (logical_loc + 1) % compress_ratio == 0
+    compressed_loc = logical_loc // compress_ratio
+    tl.store(
+        full_to_hisparse_device_index_mapping + compressed_loc,
+        device_slot,
+        mask=mask & compressed_mask,
+    )
 
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):
@@ -963,21 +988,24 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def bind_device_mapping(
         self, logical_indices: torch.Tensor, device_slots: torch.Tensor
     ):
-        compressed_logical_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
-                logical_indices
-            )
-        )
-        compressed_mask = (logical_indices + 1) % self.compress_ratio == 0
-        compressed_device_slots = device_slots[compressed_mask]
-        if compressed_logical_indices.numel() != compressed_device_slots.numel():
+        if logical_indices.numel() != device_slots.numel():
             raise RuntimeError(
                 "DeepSeek V4 HiSparse draft mapping mismatch: "
-                f"{compressed_logical_indices.numel()} compressed locs vs "
-                f"{compressed_device_slots.numel()} device slots."
+                f"{logical_indices.numel()} logical locs vs "
+                f"{device_slots.numel()} device slots."
             )
-        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
-            compressed_device_slots.to(torch.int64)
+        if logical_indices.numel() == 0:
+            return
+
+        block = min(1024, triton.next_power_of_2(logical_indices.numel()))
+        grid = (triton.cdiv(logical_indices.numel(), block),)
+        bind_dsv4_hisparse_device_mapping_kernel[grid](
+            logical_indices,
+            device_slots,
+            self.full_to_hisparse_device_index_mapping,
+            logical_indices.numel(),
+            self.compress_ratio,
+            BLOCK=block,
         )
 
     def alloc_extend_with_device_mapping(
