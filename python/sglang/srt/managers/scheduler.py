@@ -2425,7 +2425,90 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _get_next_batch_offline_pp(self) -> Optional[ScheduleBatch]:
+        """Offline-PP batch formation (plan §3.3, gated by the manager).
+
+        Priority each iteration:
+          1. If the last batch just finished prefill, offload it to host and
+             free its slots (it does NOT continue to decode in place).
+          2. Run prefill while there are waiting requests (accumulate waves).
+          3. Otherwise, run the current DECODING wave's decode step.
+          4. Otherwise, promote a DECODE_READY wave and start its decode.
+
+        Returns None to fall back to the default path when nothing applies
+        (e.g. before any wave exists), which keeps behaviour safe at startup.
+        """
+        mgr = self.offline_pp_offload_manager
+
+        # Step 1: a freshly prefilled batch -> offload instead of decoding it.
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
+            and not self.last_batch.is_empty()
+        ):
+            prefilled = [
+                r for r in self.last_batch.reqs if not r.finished()
+            ]
+            self.last_batch = None
+            if prefilled:
+                mgr.offload_prefilled_wave(prefilled)
+
+        # Step 2: keep prefilling while there is work, to build up waves.
+        new_batch = self.get_new_batch_prefill()
+        if new_batch is not None:
+            return new_batch
+
+        # Step 3: continue decoding the active wave, if any.
+        if not self.running_batch.is_empty():
+            self.running_batch = self.update_running_batch(self.running_batch)
+            if not self.running_batch.is_empty():
+                return self.running_batch
+
+        # Step 4: promote a fully-prefetched wave into a decode batch.
+        wave = mgr.take_decode_ready_wave()
+        if wave is not None:
+            self.running_batch = self._build_offline_pp_decode_batch(wave)
+            return self.running_batch
+
+        return None
+
+    def _build_offline_pp_decode_batch(self, wave) -> ScheduleBatch:
+        """Build a decode ScheduleBatch from a prefetched (resident) wave.
+
+        The wave's requests already have their committed KV/mamba state restored
+        on device and their req_to_token rows rebuilt by prefetch_step.
+        """
+        reqs = wave.reqs
+        device = self.device
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+        )
+        batch.req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        )
+        seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq_lens)
+        batch.forward_mode = ForwardMode.DECODE
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        return batch
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.offline_pp_offload_manager is not None:
+            ret = self._get_next_batch_offline_pp()
+            if ret is not None:
+                return ret
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()

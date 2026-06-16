@@ -79,8 +79,14 @@ class _ReqStateEntry:
 
     rid: str
     token_len: int
+    # Number of committed KV tokens that actually exist and must be moved
+    # (== prompt length at prefill completion). Distinct from token_len, which
+    # is the prompt+gen demand used only for the admission budget.
+    committed_len: int = 0
     # Host (CPU) copy of this request's state, as returned by pool.get_cpu_copy.
     cpu_state: object = None
+    # Device KV slot indices allocated during prefetch (for exact rollback free).
+    device_kv_indices: object = None
     # Whether this request's state has been brought back to device (drip unit).
     prefetched: bool = False
 
@@ -177,7 +183,9 @@ class OfflinePPStateOffloadManager:
         )
         for r in reqs:
             handle.entries[r.rid] = _ReqStateEntry(
-                rid=r.rid, token_len=self._req_slot_demand(r)
+                rid=r.rid,
+                token_len=self._req_slot_demand(r),
+                committed_len=self._req_committed_len(r),
             )
         self.waves[wave_id] = handle
         return handle
@@ -189,10 +197,21 @@ class OfflinePPStateOffloadManager:
         gen = getattr(req.sampling_params, "max_new_tokens", 0) or 0
         return prompt + gen
 
-    def _req_device_indices(self, req: "Req") -> torch.Tensor:
-        """KV slot indices currently mapped to this request."""
+    def _req_committed_len(self, req: "Req") -> int:
+        """Number of KV tokens that actually exist for this req right now.
+
+        At prefill completion this is the committed prompt length; this is what
+        must be physically moved device<->host (not the prompt+gen demand).
+        """
+        committed = getattr(req, "kv_committed_len", 0) or 0
+        if committed > 0:
+            return committed
+        return len(req.origin_input_ids)
+
+    def _req_device_indices(self, req: "Req", length: int) -> torch.Tensor:
+        """First ``length`` KV slot indices currently mapped to this request."""
         idx = self.req_to_token_pool.req_to_token[req.req_pool_idx]
-        return idx[: self._req_slot_demand(req)]
+        return idx[:length]
 
     def _req_mamba_indices(self, req: "Req") -> Optional[torch.Tensor]:
         if not self.is_hybrid:
@@ -230,7 +249,7 @@ class OfflinePPStateOffloadManager:
         with self.device_module.stream(self.offload_stream):
             for req in wave.reqs:
                 entry = wave.entries[req.rid]
-                kv_indices = self._req_device_indices(req)
+                kv_indices = self._req_device_indices(req, entry.committed_len)
                 mamba_indices = self._req_mamba_indices(req)
                 if mamba_indices is not None:
                     cpu_state = self.kv_cache.get_cpu_copy(kv_indices, mamba_indices)
@@ -247,13 +266,13 @@ class OfflinePPStateOffloadManager:
         """
         assert wave.offload_ready, "mark_wave_offloaded before offload completed"
         for req in wave.reqs:
-            self._free_req_device_slots(req)
+            self._free_req_device_slots(req, wave.entries[req.rid].committed_len)
         wave.state = WaveState.OFFLOADED
         wave.last_progress_tick = self._tick
         self.offloaded_queue.append(wave.wave_id)
 
-    def _free_req_device_slots(self, req: "Req") -> None:
-        kv_indices = self._req_device_indices(req)
+    def _free_req_device_slots(self, req: "Req", length: int) -> None:
+        kv_indices = self._req_device_indices(req, length)
         self.token_to_kv_pool_allocator.free(kv_indices)
         if self.is_hybrid and hasattr(self.req_to_token_pool, "free_mamba_cache"):
             # Free the mamba slot; it will be re-allocated on prefetch.
@@ -329,8 +348,10 @@ class OfflinePPStateOffloadManager:
                 entry = wave.entries[req.rid]
                 if entry.prefetched:
                     continue
-                need = entry.token_len
-                if need > free_slots - consumed:
+                # Only the committed prefix exists and needs slots now; the
+                # decode path extends per-step as usual once the wave runs.
+                committed = entry.committed_len
+                if committed > free_slots - consumed:
                     # Not enough budget yet for this request; drip continues
                     # next tick as more slots are freed by the DECODING wave.
                     break
@@ -341,11 +362,12 @@ class OfflinePPStateOffloadManager:
                 alloc_idx = self.req_to_token_pool.alloc([req])
                 if alloc_idx is None:
                     break
-                kv_indices = self.token_to_kv_pool_allocator.alloc(need)
+                kv_indices = self.token_to_kv_pool_allocator.alloc(committed)
                 if kv_indices is None:
                     break
+                entry.device_kv_indices = kv_indices
                 self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, need)), kv_indices
+                    (req.req_pool_idx, slice(0, committed)), kv_indices
                 )
                 cpu_state = self.codec.decode_on_prefetch(entry.cpu_state)
                 mamba_indices = self._req_mamba_indices(req)
@@ -355,7 +377,7 @@ class OfflinePPStateOffloadManager:
                     self.kv_cache.load_cpu_copy(cpu_state, kv_indices)
                 entry.prefetched = True
                 wave.prefetch_done_units += 1
-                consumed += need
+                consumed += committed
                 progressed = True
         if progressed:
             wave.last_progress_tick = self._tick
@@ -383,8 +405,14 @@ class OfflinePPStateOffloadManager:
         self.prefetch_stream.synchronize()
         for req in wave.reqs:
             entry = wave.entries[req.rid]
-            if entry.prefetched and req.req_pool_idx is not None:
-                self._free_req_device_slots(req)
+            if entry.prefetched and entry.device_kv_indices is not None:
+                self.token_to_kv_pool_allocator.free(entry.device_kv_indices)
+                if self.is_hybrid and hasattr(
+                    self.req_to_token_pool, "free_mamba_cache"
+                ):
+                    self.req_to_token_pool.free_mamba_cache(req)
+                self.req_to_token_pool.free(req)
+                entry.device_kv_indices = None
                 entry.prefetched = False
             req.req_pool_idx = None
             if self.is_hybrid:
@@ -418,3 +446,26 @@ class OfflinePPStateOffloadManager:
     def retire_wave(self, wave: WaveStateHandle) -> None:
         """Drop a fully-decoded wave's bookkeeping."""
         self.waves.pop(wave.wave_id, None)
+
+    # ------------------------------------------------------------------ #
+    # High-level hooks used by batch formation
+    # ------------------------------------------------------------------ #
+    def offload_prefilled_wave(self, reqs: List["Req"]) -> WaveStateHandle:
+        """Register a just-prefilled batch as a wave, snapshot its state to
+        host, and free its device slots. Returns the OFFLOADED wave handle.
+
+        v1 performs the host snapshot synchronously here (finalize_offload);
+        layer-wise overlap is a future refinement (offload_wave_layer hook).
+        """
+        wave = self.new_wave(reqs)
+        self.finalize_offload(wave)
+        self.mark_wave_offloaded(wave)
+        return wave
+
+    def take_decode_ready_wave(self) -> Optional[WaveStateHandle]:
+        """Return a DECODE_READY wave and transition it to DECODING, or None."""
+        for wave in self.waves.values():
+            if wave.state == WaveState.DECODE_READY:
+                wave.state = WaveState.DECODING
+                return wave
+        return None
