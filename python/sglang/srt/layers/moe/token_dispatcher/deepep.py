@@ -34,7 +34,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
-    is_sm90_supported,
     load_json_config,
 )
 
@@ -398,10 +397,7 @@ class _DeepEPDispatcherImplBase:
             self.use_fp8
             and self.quant_config is not None
             and self.quant_config.get("use_mxfp8", False)
-            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and is_sm90_supported()
-            and not is_blackwell()
-            and deep_gemm_wrapper.supports_sm90_mxfp8_fp8_grouped_gemm()
+            and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
         )
 
     def set_deepep_dispatcher_dtype(self) -> None:

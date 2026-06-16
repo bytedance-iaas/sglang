@@ -13,6 +13,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,19 @@ def supports_sm90_mxfp8_fp8_grouped_gemm() -> bool:
     return hasattr(deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_contiguous") and hasattr(
         deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_masked"
     )
+
+
+def is_sm90_mxfp8_deepgemm_enabled() -> bool:
+    return (
+        is_cuda()
+        and is_sm90_supported()
+        and not is_sm100_supported()
+        and supports_sm90_mxfp8_fp8_grouped_gemm()
+    )
+
+
+def supports_mxfp8_deepgemm() -> bool:
+    return DEEPGEMM_BLACKWELL or is_sm90_mxfp8_deepgemm_enabled()
 
 
 # TODO maybe rename these functions

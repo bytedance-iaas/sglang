@@ -27,8 +27,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 from sglang.srt.utils.offloader import get_offloader
 
@@ -64,13 +62,7 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
 def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
-    return (
-        quant_info.use_mxfp8
-        and _is_cuda
-        and is_sm90_supported()
-        and not is_sm100_supported()
-        and deep_gemm_wrapper.supports_sm90_mxfp8_fp8_grouped_gemm()
-    )
+    return quant_info.use_mxfp8 and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -185,10 +177,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
                 32,
             ], f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
             if not (
-                _is_cuda
-                and is_sm90_supported()
-                and not is_sm100_supported()
-                and deep_gemm_wrapper.supports_sm90_mxfp8_fp8_grouped_gemm()
+                deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
             ):
                 assert (
                     deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0

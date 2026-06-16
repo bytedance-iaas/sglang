@@ -116,9 +116,6 @@ _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 dense checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
-_sm90_mxfp8_dense_deepgemm_required = (
-    _is_cuda and is_sm90_supported() and not is_sm100_supported()
-)
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -371,13 +368,18 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.use_sm90_mxfp8_deepgemm_linear = False
-        if self.use_mxfp8 and _sm90_mxfp8_dense_deepgemm_required:
+        if self.use_mxfp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
             self.use_sm90_mxfp8_deepgemm_linear = (
-                deep_gemm_wrapper.supports_sm90_mxfp8_fp8_grouped_gemm()
+                deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
             )
-            if not self.use_sm90_mxfp8_deepgemm_linear:
+            if (
+                _is_cuda
+                and is_sm90_supported()
+                and not is_sm100_supported()
+                and not self.use_sm90_mxfp8_deepgemm_linear
+            ):
                 raise RuntimeError(
                     "SM90 MXFP8 dense linear requires DeepGEMM grouped MXFP8 APIs."
                 )
