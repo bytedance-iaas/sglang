@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from datetime import date
+
+from sync_docker_images_to_volcengine import (
+    DockerTag,
+    build_sync_plan,
+    parse_tags,
+    resolve_tag_specs,
+)
+
+
+class SyncDockerImagesToVolcengineTest(unittest.TestCase):
+    def test_builds_default_sglang_and_vllm_latest_plan(self) -> None:
+        plan = build_sync_plan(
+            registry="iaas-gpu-cn-beijing.cr.volces.com",
+            namespace="serving",
+            sglang_source="docker.io/lmsysorg/sglang",
+            sglang_repository="sglang",
+            sglang_tags=["latest"],
+            vllm_source="docker.io/vllm/vllm-openai",
+            vllm_repository="vllm",
+            vllm_tags=["latest"],
+        )
+
+        self.assertEqual(
+            [(item.source, item.destination) for item in plan],
+            [
+                (
+                    "docker.io/lmsysorg/sglang:latest",
+                    "iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:latest",
+                ),
+                (
+                    "docker.io/vllm/vllm-openai:latest",
+                    "iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:latest",
+                ),
+            ],
+        )
+
+    def test_parse_tags_accepts_commas_and_newlines(self) -> None:
+        self.assertEqual(
+            parse_tags("latest, nightly\nlatest-cu130"),
+            ["latest", "nightly", "latest-cu130"],
+        )
+
+    def test_resolves_latest_version_family(self) -> None:
+        tags = [
+            DockerTag("nightly-dev-20260616-abc", "2026-06-16T01:53:18Z"),
+            DockerTag("latest", "2026-06-15T08:39:02Z"),
+            DockerTag("v0.5.13.post1", "2026-06-15T08:39:01Z"),
+            DockerTag("latest-cu130", "2026-06-15T08:39:06Z"),
+            DockerTag("v0.5.13.post1-cu130", "2026-06-15T08:39:04Z"),
+            DockerTag("v0.5.12", "2026-05-10T08:00:00Z"),
+            DockerTag("latest-runtime", "2026-06-15T09:25:15Z"),
+            DockerTag("v0.5.13.post1-runtime", "2026-06-15T09:25:13Z"),
+        ]
+
+        self.assertEqual(
+            resolve_tag_specs(["version"], tags, today=date(2026, 6, 16)),
+            [
+                "latest",
+                "latest-cu130",
+                "latest-runtime",
+                "v0.5.13.post1",
+                "v0.5.13.post1-cu130",
+                "v0.5.13.post1-runtime",
+            ],
+        )
+
+    def test_resolves_today_nightly_and_daily_alias_tags(self) -> None:
+        tags = [
+            DockerTag("nightly-dev-cu13-20260616-abc", "2026-06-16T01:53:20Z"),
+            DockerTag("nightly-dev-20260616-abc", "2026-06-16T01:53:18Z"),
+            DockerTag("dev-cu13", "2026-06-16T01:53:17Z"),
+            DockerTag("dev", "2026-06-16T01:53:15Z"),
+            DockerTag("nightly-dev-cu12-20260615-old", "2026-06-15T01:53:12Z"),
+            DockerTag("latest", "2026-06-15T08:39:02Z"),
+        ]
+
+        self.assertEqual(
+            resolve_tag_specs(
+                ["today-nightly"],
+                tags,
+                today=date(2026, 6, 16),
+                daily_aliases={"dev", "dev-cu12", "dev-cu13"},
+            ),
+            [
+                "dev",
+                "dev-cu13",
+                "nightly-dev-20260616-abc",
+                "nightly-dev-cu13-20260616-abc",
+            ],
+        )
+
+    def test_rejects_missing_registry_or_namespace(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "registry is required"):
+            build_sync_plan(
+                registry="",
+                namespace="serving",
+                sglang_source="docker.io/lmsysorg/sglang",
+                sglang_repository="sglang",
+                sglang_tags=["latest"],
+                vllm_source="docker.io/vllm/vllm-openai",
+                vllm_repository="vllm",
+                vllm_tags=["latest"],
+            )
+
+        with self.assertRaisesRegex(SystemExit, "namespace is required"):
+            build_sync_plan(
+                registry="iaas-gpu-cn-beijing.cr.volces.com",
+                namespace="",
+                sglang_source="docker.io/lmsysorg/sglang",
+                sglang_repository="sglang",
+                sglang_tags=["latest"],
+                vllm_source="docker.io/vllm/vllm-openai",
+                vllm_repository="vllm",
+                vllm_tags=["latest"],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
