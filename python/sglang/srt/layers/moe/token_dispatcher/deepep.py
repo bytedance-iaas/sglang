@@ -493,15 +493,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and self.use_fp8
-            and not self.use_sm90_mxfp8_deepgemm()
         ):
             # TODO hard code 128 block quant,use fp8 communication
+            use_ue8m0_scales = (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                or self.use_sm90_mxfp8_deepgemm()
+            )
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
                 128,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                column_major_scales=use_ue8m0_scales,
+                scale_tma_aligned=use_ue8m0_scales,
+                scale_ue8m0=use_ue8m0_scales,
             )
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
@@ -714,7 +717,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
-        dispatch_fp8 = self.use_fp8 and not self.use_sm90_mxfp8_deepgemm()
+        dispatch_fp8 = self.use_fp8
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -722,9 +725,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         fp8_deepgemm_scale_opts = (
             dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and (
+                    deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                    or self.use_sm90_mxfp8_deepgemm()
+                ),
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and (
+                    deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                    or self.use_sm90_mxfp8_deepgemm()
+                ),
             )
             if dispatch_fp8
             else dict()

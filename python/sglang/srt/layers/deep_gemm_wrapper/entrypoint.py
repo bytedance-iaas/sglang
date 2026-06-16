@@ -45,6 +45,108 @@ def supports_mxfp8_deepgemm() -> bool:
     return DEEPGEMM_BLACKWELL or is_sm90_mxfp8_deepgemm_enabled()
 
 
+def _ceil_align(x: int, align: int) -> int:
+    return ((x + align - 1) // align) * align
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def _e8m0_fp32_to_u8(sf: torch.Tensor) -> torch.Tensor:
+    sf_i32 = sf.to(torch.float32).view(torch.int32)
+    exp = torch.bitwise_right_shift(sf_i32, 23)
+    mant = torch.bitwise_and(sf_i32, 0x7FFFFF)
+    round_up = torch.logical_and(
+        torch.logical_and(mant > 0, exp != 0xFE),
+        ~torch.logical_and(exp == 0, mant <= 0x400000),
+    )
+    return torch.where(round_up, exp + 1, exp).to(torch.uint8).contiguous()
+
+
+def _unpack_ue8m0_i32_to_u8(sf: torch.Tensor) -> torch.Tensor:
+    return sf.contiguous().view(torch.uint8).view(*sf.shape[:-1], sf.shape[-1] * 4)
+
+
+def _e8m0_u8_to_fp32(sf: torch.Tensor) -> torch.Tensor:
+    return (sf.to(torch.int32) << 23).view(torch.float32)
+
+
+def _requantize_sm90_mxfp8_k32(
+    x: torch.Tensor, sf: torch.Tensor, k: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+
+    original_shape = x.shape
+    x_2d = x.reshape(-1, k)
+    if x_2d.shape[0] == 0:
+        return (
+            torch.empty(original_shape, device=x.device, dtype=torch.float8_e4m3fn),
+            torch.empty(
+                (*original_shape[:-1], _ceil_align(k, 32) // 32),
+                device=x.device,
+                dtype=torch.uint8,
+            ),
+        )
+
+    if x.dtype == torch.float8_e4m3fn:
+        if sf.dtype == torch.int32:
+            sf = _unpack_ue8m0_i32_to_u8(sf)
+        if sf.dtype == torch.uint8:
+            sf = _e8m0_u8_to_fp32(sf)
+        else:
+            sf = sf.to(torch.float32)
+        sf_2d = sf.reshape(x_2d.shape[0], sf.shape[-1])
+        gran_k = k // sf_2d.shape[-1]
+        group_idx = torch.arange(k, device=x.device) // gran_k
+        x_2d = (x_2d.float() * sf_2d[:, group_idx]).to(torch.bfloat16)
+    else:
+        x_2d = x_2d.contiguous()
+
+    q_2d, sf_2d = mxfp8_group_quantize(x_2d.contiguous())
+    return q_2d.reshape(original_shape), sf_2d.reshape(*original_shape[:-1], -1)
+
+
+def _normalize_sm90_mxfp8_pair(
+    pair: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x, sf = pair
+    k = x.shape[-1]
+    k32 = _ceil_align(k, 32) // 32
+
+    if sf.dtype == torch.uint8 and sf.shape[-1] == k32 and x.dtype == torch.float8_e4m3fn:
+        return x, sf.contiguous()
+
+    if sf.dtype == torch.int32:
+        sf_u8 = _unpack_ue8m0_i32_to_u8(sf)
+        if sf_u8.shape[-1] >= k32 and x.dtype == torch.float8_e4m3fn:
+            return x, sf_u8[..., :k32].contiguous()
+        sf_u8 = sf_u8[..., : min(sf_u8.shape[-1], _ceil_div(k, 128))]
+        return _requantize_sm90_mxfp8_k32(x, sf_u8, k)
+
+    if sf.dtype == torch.float32 and sf.shape[-1] == k32 and x.dtype == torch.float8_e4m3fn:
+        return x, _e8m0_fp32_to_u8(sf)
+
+    return _requantize_sm90_mxfp8_k32(x, sf, k)
+
+
+def _pad_sm90_mxfp8_lhs(
+    lhs: Tuple[torch.Tensor, torch.Tensor], expected_m: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x, sf = lhs
+    if x.shape[-2] >= expected_m:
+        return lhs
+    padded_x = torch.empty(
+        (*x.shape[:-2], expected_m, x.shape[-1]), device=x.device, dtype=x.dtype
+    )
+    padded_sf = torch.empty(
+        (*sf.shape[:-2], expected_m, sf.shape[-1]), device=sf.device, dtype=sf.dtype
+    )
+    padded_x[..., : x.shape[-2], :] = x
+    padded_sf[..., : sf.shape[-2], :] = sf
+    return padded_x, padded_sf
+
+
 # TODO maybe rename these functions
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -117,26 +219,32 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
         compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_MASKED
     )
 
-    lhs = _ensure_cuda(lhs)
-    rhs = _ensure_cuda(rhs)
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs))
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs))
 
-    assert (
-        lhs[1].dtype == torch.uint8
-    ), "SM90 MXFP8 grouped GEMM requires uint8 A scales"
-    assert (
-        rhs[1].dtype == torch.uint8
-    ), "SM90 MXFP8 grouped GEMM requires uint8 B scales"
+    padded_expected_m = _ceil_align(max(lhs[0].shape[-2], expected_m), 128)
+    lhs = _pad_sm90_mxfp8_lhs(lhs, padded_expected_m)
+    kernel_out = out
+    if out.shape[-2] < padded_expected_m:
+        kernel_out = torch.empty(
+            (*out.shape[:-2], padded_expected_m, out.shape[-1]),
+            device=out.device,
+            dtype=out.dtype,
+        )
 
     with compile_utils.deep_gemm_execution_hook(
-        expected_m, n, k, num_groups, kernel_type
+        padded_expected_m, n, k, num_groups, kernel_type
     ):
-        return deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
+        ret = deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
             lhs,
             rhs,
-            out,
+            kernel_out,
             masked_m,
-            expected_m,
+            padded_expected_m,
         )
+    if kernel_out is not out:
+        out.copy_(kernel_out[..., : out.shape[-2], :])
+    return ret
 
 
 def _ensure_cuda(
@@ -221,15 +329,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
     if m == 0:
         return
 
-    lhs = _ensure_cuda(lhs)
-    rhs = _ensure_cuda(rhs)
-
-    assert (
-        lhs[1].dtype == torch.uint8
-    ), "SM90 MXFP8 grouped GEMM requires uint8 A scales"
-    assert (
-        rhs[1].dtype == torch.uint8
-    ), "SM90 MXFP8 grouped GEMM requires uint8 B scales"
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs))
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs))
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
