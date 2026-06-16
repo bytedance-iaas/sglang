@@ -214,6 +214,13 @@ class Fp8Config(QuantizationConfig):
             return 31
         if self.use_mxfp8 and _is_hip and _is_gfx95_supported:
             return 95
+        if (
+            self.use_mxfp8
+            and _is_cuda
+            and is_sm90_supported()
+            and get_moe_runner_backend().is_deep_gemm()
+        ):
+            return 90
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
             # gfx942 has no MX matmul HW; MXFP8 is converted to block-fp8 at
             # load. Reported device capability there is 94.
@@ -1545,11 +1552,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
+        use_sm90_deepgemm_mxfp8 = (
+            _is_cuda
+            and is_sm90_supported()
+            and not is_sm100_supported()
+            and get_moe_runner_backend().is_deep_gemm()
+        )
         if not (
-            (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and is_sm100_supported())
+            or use_sm90_deepgemm_mxfp8
+            or (_is_hip and _is_gfx95_supported)
         ):
             raise RuntimeError(
-                "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
+                "MXFP8 MoE quantization requires SM100, SM90+DeepGEMM, or ROCm gfx95 "
                 "(gfx942 converts MXFP8 to block-fp8 at load instead)."
             )
 
@@ -1656,7 +1671,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return (scale_u8.to(torch.int32) << 23).view(torch.float32)
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
-            """Quantize weights to MXFP8 with int32 packed UE8M0 scales for DeepGemm."""
+            """Quantize weights to MXFP8 scales consumed by the active DeepGEMM API."""
             weight = weight.contiguous()
             num_experts, m, k = weight.shape
             assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
@@ -1664,6 +1679,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             weight_flat = weight.view(-1, k).contiguous()
             qweight, scale_u8 = mxfp8_group_quantize(weight_flat)
             qweight = qweight.view_as(weight)
+            if use_sm90_deepgemm_mxfp8:
+                return qweight, scale_u8.view(num_experts, m, k // 32)
             # Convert uint8 UE8M0 → float32, then pack to int32 MN-major
             scale_fp32 = _ue8m0_to_float32(scale_u8).view(num_experts, m, k // 32)
             scale_packed = _pack_moe_scale_for_deepgemm(scale_fp32)
@@ -1693,8 +1710,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         def _convert_ue8m0_scales_for_deepgemm(
             scale_u8: torch.Tensor, shape: tuple
         ) -> torch.Tensor:
-            """Convert pre-quantized UE8M0 uint8 scales to int32 packed format for DeepGemm."""
+            """Convert checkpoint UE8M0 scales to the active DeepGEMM scale layout."""
             num_experts, m, k_groups = shape[0], shape[1], scale_u8.shape[-1]
+            scale_u8 = scale_u8.contiguous().view(num_experts, m, k_groups)
+            if use_sm90_deepgemm_mxfp8:
+                return scale_u8
             scale_fp32 = _ue8m0_to_float32(scale_u8.contiguous().view(-1)).view(
                 num_experts, m, k_groups
             )

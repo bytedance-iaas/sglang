@@ -23,6 +23,14 @@ if ENABLE_JIT_DEEPGEMM:
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
+def supports_sm90_mxfp8_fp8_grouped_gemm() -> bool:
+    if not ENABLE_JIT_DEEPGEMM:
+        return False
+    return hasattr(deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_contiguous") and hasattr(
+        deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_masked"
+    )
+
+
 # TODO maybe rename these functions
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -75,6 +83,43 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     else {}
                 ),
             )
+
+
+def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    if not supports_sm90_mxfp8_fp8_grouped_gemm():
+        raise RuntimeError(
+            "The installed deep_gemm does not expose SM90 MXFP8 grouped GEMM APIs."
+        )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_MASKED
+    )
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    assert (
+        rhs[1].dtype == torch.uint8
+    ), "SM90 MXFP8 grouped GEMM requires uint8 B scales"
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+        )
 
 
 def _ensure_cuda(
@@ -136,6 +181,42 @@ def grouped_gemm_nt_f8f8bf16_contig(
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
+        )
+
+
+def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+):
+    if not supports_sm90_mxfp8_fp8_grouped_gemm():
+        raise RuntimeError(
+            "The installed deep_gemm does not expose SM90 MXFP8 grouped GEMM APIs."
+        )
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_CONTIG
+    )
+
+    if m == 0:
+        return
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    assert (
+        rhs[1].dtype == torch.uint8
+    ), "SM90 MXFP8 grouped GEMM requires uint8 B scales"
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
         )
 
 
