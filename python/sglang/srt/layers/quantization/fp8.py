@@ -172,6 +172,29 @@ def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
     }
 
 
+def _sm90_mxfp8_debug_tensor_stats(t: torch.Tensor) -> dict:
+    import os
+
+    meta = _sm90_mxfp8_debug_tensor_meta(t)
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
+        return meta
+    if t.is_cuda and torch.cuda.is_current_stream_capturing():
+        meta["stats_skipped"] = "cuda_graph_capture"
+        return meta
+    if t.numel() == 0:
+        meta["stats_skipped"] = "empty"
+        return meta
+    sample = t.reshape(-1)[: min(t.numel(), 4096)].float()
+    meta.update(
+        {
+            "sample_mean": float(sample.mean().item()),
+            "sample_absmax": float(sample.abs().max().item()),
+            "sample_isfinite": bool(torch.isfinite(sample).all().item()),
+        }
+    )
+    return meta
+
+
 def _sm90_mxfp8_debug_report(
     hypothesis_id: str, location: str, msg: str, data: dict
 ) -> None:
@@ -1010,6 +1033,21 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if bias is not None:
             out = out + bias
+        if use_masked or os.environ.get("SGLANG_SM90_MXFP8_DEBUG_DENSE_ALL") == "1":
+            _sm90_mxfp8_debug_report(
+                "H5",
+                "fp8.py:_apply_sm90_mxfp8_deepgemm_linear:output",
+                "SM90 dense MXFP8 linear output metadata",
+                {
+                    "layer_type": layer.__class__.__name__,
+                    "layer_prefix": getattr(layer, "prefix", None),
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "use_masked": use_masked,
+                    "out": _sm90_mxfp8_debug_tensor_stats(out),
+                },
+            )
         return out.reshape(output_shape)
 
     def apply(
