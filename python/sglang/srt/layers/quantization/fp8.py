@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -116,7 +117,7 @@ _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 dense checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
-_sm90_mxfp8_dense_to_block_fp8_required = (
+_sm90_mxfp8_dense_deepgemm_required = (
     _is_cuda and is_sm90_supported() and not is_sm100_supported()
 )
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
@@ -370,18 +371,32 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        # gfx942 and SM90 lack dense MXFP8 matmul support; convert dense MXFP8
+        self.use_sm90_mxfp8_deepgemm_linear = False
+        if self.use_mxfp8 and _sm90_mxfp8_dense_deepgemm_required:
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            self.use_sm90_mxfp8_deepgemm_linear = (
+                deep_gemm_wrapper.supports_sm90_mxfp8_fp8_grouped_gemm()
+            )
+            if not self.use_sm90_mxfp8_deepgemm_linear:
+                raise RuntimeError(
+                    "SM90 MXFP8 dense linear requires DeepGEMM grouped MXFP8 APIs."
+                )
+        # gfx942 lacks dense MXFP8 matmul support; convert dense MXFP8
         # -> block-fp8 [128,128] at load and run native block-fp8 kernels.
-        # MoE experts are handled by Fp8MoEMethod and keep their own backend path.
-        self.convert_mxfp8_to_block = self.use_mxfp8 and (
-            _mxfp8_to_block_fp8_required or _sm90_mxfp8_dense_to_block_fp8_required
+        self.convert_mxfp8_to_block = (
+            self.use_mxfp8
+            and _mxfp8_to_block_fp8_required
+            and not self.use_sm90_mxfp8_deepgemm_linear
         )
         # Effective per-instance block size for the apply path. Defaults to the
         # config value; conversion overrides it to [128,128].
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        if self.use_sm90_mxfp8_deepgemm_linear:
+            pass
+        elif self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
@@ -532,9 +547,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # Convert dense MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [128,128]
-        # (e4m3fn + fp32), then fall through to the standard block-fp8 path.
-        # On ROCm this also fnuz-normalizes below. After this the layer is plain
-        # block-fp8 and will not call dense MXFP8 kernels at runtime.
+        # only for targets without a direct MXFP8 path (currently gfx942).
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -561,6 +574,9 @@ class Fp8LinearMethod(LinearMethodBase):
             # Keep parameter object to preserve weight_loader attrs for hot reload.
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
+            if self.use_sm90_mxfp8_deepgemm_linear:
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.contiguous()
+                return
             self._process_mxfp8_linear_weight_scale(layer)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -832,6 +848,65 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def _apply_sm90_mxfp8_deepgemm_linear(
+        self,
+        layer: torch.nn.Module,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if isinstance(x, tuple):
+            x_data, x_scale = x
+            output_shape = (*x_data.shape[:-1], layer.weight.shape[0])
+            x_2d = x_data.reshape(-1, x_data.shape[-1]).contiguous()
+            x_scale_2d = x_scale.reshape(x_2d.shape[0], -1).contiguous()
+        else:
+            output_shape = (*x.shape[:-1], layer.weight.shape[0])
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            x_2d, x_scale_2d = sglang_per_token_group_quant_fp8(
+                x_2d,
+                group_size=128,
+                column_major_scales=False,
+                scale_tma_aligned=False,
+                scale_ue8m0=False,
+            )
+
+        m = x_2d.shape[0]
+        n = layer.weight.shape[0]
+        out = torch.empty((m, n), device=x_2d.device, dtype=torch.bfloat16)
+        if m == 0:
+            return out.reshape(output_shape)
+
+        weight = layer.weight.unsqueeze(0)
+        weight_scale = layer.weight_scale_inv.unsqueeze(0)
+
+        # Decode/low-latency shapes are small and benefit from the masked kernel;
+        # normal/prefill shapes use contiguous with a single all-zero group.
+        if m <= 64:
+            masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
+            masked_m.fill_(m)
+            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
+                (x_2d.unsqueeze(0), x_scale_2d.unsqueeze(0)),
+                (weight, weight_scale),
+                out.unsqueeze(0),
+                masked_m,
+                expected_m=m,
+            )
+        else:
+            m_indices = torch.empty((m,), device=x_2d.device, dtype=torch.int32)
+            m_indices.zero_()
+            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+                (x_2d, x_scale_2d),
+                (weight, weight_scale),
+                out,
+                m_indices,
+            )
+
+        if bias is not None:
+            out = out + bias
+        return out.reshape(output_shape)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -850,6 +925,8 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
+            if self.use_sm90_mxfp8_deepgemm_linear:
+                return self._apply_sm90_mxfp8_deepgemm_linear(layer, x, bias)
             if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif get_fp8_gemm_runner_backend().is_deep_gemm():

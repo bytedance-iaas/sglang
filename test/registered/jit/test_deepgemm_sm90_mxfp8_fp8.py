@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torch import nn
 
 from sglang.srt.layers import deep_gemm_wrapper
 
@@ -116,3 +117,49 @@ def test_sm90_mxfp8_grouped_masked_wrapper_accuracy():
         for group_id, valid_m in enumerate(masked_m.tolist())
     )
     assert diff < 0.03
+
+
+@pytest.mark.parametrize("m", [32, 128])
+def test_sm90_mxfp8_dense_linear_uses_grouped_kernel_accuracy(m):
+    _require_sm90_mxfp8_grouped_gemm()
+
+    from deep_gemm.utils.math import per_token_cast_to_fp8
+
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    n, k = 48, 128
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    w_ref = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    w_data, w_sf_fp32 = per_token_cast_to_fp8(w_ref, use_ue8m0=True, gran_k=32)
+
+    layer = nn.Module()
+    layer.weight = nn.Parameter(w_data, requires_grad=False)
+    layer.weight_scale_inv = nn.Parameter(
+        _e8m0_from_fp32_pow2(w_sf_fp32), requires_grad=False
+    )
+
+    config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[1, 32],
+        use_mxfp8=True,
+    )
+    quant_method = Fp8LinearMethod(config)
+    assert quant_method.use_sm90_mxfp8_deepgemm_linear
+
+    out = quant_method.apply(layer, x)
+
+    x_data, x_sf = sglang_per_token_group_quant_fp8(
+        x.contiguous(),
+        group_size=128,
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    )
+    x_dequant = _cast_back_from_fp8_1d(x_data, x_sf, gran_k=128)
+    w_dequant = _cast_back_from_fp8_1d(w_data, w_sf_fp32, gran_k=32)
+    ref = (x_dequant @ w_dequant.t()).to(torch.bfloat16)
+
+    assert _calc_diff(out, ref) < 0.03
