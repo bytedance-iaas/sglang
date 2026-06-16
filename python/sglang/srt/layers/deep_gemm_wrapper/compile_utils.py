@@ -257,7 +257,7 @@ class _BaseWarmupExecutor:
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_CONTIG:
             return (
                 max_m * k
-                + max_m * ceil_div(k, 128) * 4
+                + max_m * ceil_div(k, 32)
                 + num_groups * n * k
                 + num_groups * n * ceil_div(k, 32)
                 + max_m * 4
@@ -277,7 +277,7 @@ class _BaseWarmupExecutor:
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_MASKED:
             return (
                 num_groups * max_m * k
-                + num_groups * max_m * ceil_div(k, 128) * 4
+                + num_groups * max_m * ceil_div(k, 32)
                 + num_groups * n * k
                 + num_groups * n * ceil_div(k, 32)
                 + num_groups * 4
@@ -395,9 +395,7 @@ def _empty_mxfp8_lhs(size):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
-            (*dims, ceil_div(k, 128)), device="cuda", dtype=torch.float32
-        ),
+        torch.empty((*dims, ceil_div(k, 32)), device="cuda", dtype=torch.uint8),
     )
 
 

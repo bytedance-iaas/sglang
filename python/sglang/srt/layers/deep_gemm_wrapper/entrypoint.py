@@ -107,6 +107,9 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
     rhs = _ensure_cuda(rhs)
 
     assert (
+        lhs[1].dtype == torch.uint8
+    ), "SM90 MXFP8 grouped GEMM requires uint8 A scales"
+    assert (
         rhs[1].dtype == torch.uint8
     ), "SM90 MXFP8 grouped GEMM requires uint8 B scales"
 
@@ -207,6 +210,9 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
     lhs = _ensure_cuda(lhs)
     rhs = _ensure_cuda(rhs)
 
+    assert (
+        lhs[1].dtype == torch.uint8
+    ), "SM90 MXFP8 grouped GEMM requires uint8 A scales"
     assert (
         rhs[1].dtype == torch.uint8
     ), "SM90 MXFP8 grouped GEMM requires uint8 B scales"

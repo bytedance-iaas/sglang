@@ -51,7 +51,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
-    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -864,13 +863,7 @@ class Fp8LinearMethod(LinearMethodBase):
         else:
             output_shape = (*x.shape[:-1], layer.weight.shape[0])
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-            x_2d, x_scale_2d = sglang_per_token_group_quant_fp8(
-                x_2d,
-                group_size=128,
-                column_major_scales=False,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-            )
+            x_2d, x_scale_2d = mxfp8_group_quantize(x_2d)
 
         m = x_2d.shape[0]
         n = layer.weight.shape[0]
