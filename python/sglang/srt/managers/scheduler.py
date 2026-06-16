@@ -486,6 +486,19 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
+        if self.server_args.enable_offline_pp_offload:
+            from sglang.srt.managers.offline_pp_offload_manager import (
+                OfflinePPStateOffloadManager,
+            )
+
+            self.offline_pp_offload_manager = OfflinePPStateOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                server_args=self.server_args,
+            )
+        else:
+            self.offline_pp_offload_manager = None
+
         # Register draft KV pool (when spec + HiCache co-enabled).
         kv_cache_builder.maybe_register_hicache_draft(
             tree_cache=self.tree_cache,

@@ -723,6 +723,14 @@ class ServerArgs:
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
 
+    # Offline PP state offload (prefill async offload + decode async prefetch).
+    # Targets throughput-oriented offline PP serving; offloads KV (and mamba
+    # state for hybrid models) to host after prefill and prefetches it back
+    # wave-by-wave during decode. double-buffer (=2 resident waves) is a
+    # structural constant and intentionally NOT exposed as a knob.
+    enable_offline_pp_offload: bool = False
+    offline_pp_prefetch_stall_ticks: int = 64
+
     # Scoring configuration
     # Enable Multi-Item Scoring optimization. Combines query and multiple items
     # into a single sequence for efficient batch processing. Item boundaries are
@@ -4193,6 +4201,22 @@ class ServerArgs:
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
                 )
 
+        if self.enable_offline_pp_offload:
+            if self.pp_size <= 1:
+                raise ValueError(
+                    "--enable-offline-pp-offload requires --pp-size > 1."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-offline-pp-offload is for non-disaggregated offline PP "
+                    "serving and is incompatible with --disaggregation-mode."
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "--enable-offline-pp-offload and "
+                    "--disaggregation-decode-enable-offload-kvcache are mutually exclusive."
+                )
+
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -6454,6 +6478,23 @@ class ServerArgs:
             type=str,
             default=ServerArgs.offload_mode,
             help="Mode of offloading.",
+        )
+        parser.add_argument(
+            "--enable-offline-pp-offload",
+            action="store_true",
+            default=ServerArgs.enable_offline_pp_offload,
+            help="Enable offline pipeline-parallel state offload: after prefill, "
+            "asynchronously offload KV (and mamba state for hybrid models) to host "
+            "and free GPU slots; during decode, prefetch each wave back wave-by-wave. "
+            "Requires --pp-size > 1 and non-disaggregated mode. Targets offline "
+            "throughput, not latency.",
+        )
+        parser.add_argument(
+            "--offline-pp-prefetch-stall-ticks",
+            type=int,
+            default=ServerArgs.offline_pp_prefetch_stall_ticks,
+            help="Number of scheduler ticks without prefetch progress before a "
+            "stalled wave is rolled back (deadlock avoidance for offline PP offload).",
         )
 
         # Args for multi-item-scoring

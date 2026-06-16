@@ -24,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.offline_pp_offload_manager import WaveState
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -162,9 +163,60 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
+            # Drive the offline-PP offload/prefetch state machine once per
+            # scheduler iteration (drip-prefetch + progress checks + stall
+            # rollback). No-op unless --enable-offline-pp-offload.
+            if self.offline_pp_offload_manager is not None:
+                self._offline_pp_offload_step()
+
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
+
+    def _offline_pp_offload_step(self: Scheduler):
+        """Advance the offline-PP wave state machine (plan §3.3 B/D, §3.3.1).
+
+        Steps performed each iteration:
+          - tick the logical clock;
+          - promote PREFILLING waves whose state finished offloading to host
+            (free their GPU slots → OFFLOADED queue);
+          - maintain a single PREFETCHING wave (double-buffer): admit one from
+            the OFFLOADED queue if none is active, then drip-prefetch using the
+            currently free slot budget;
+          - detect no-progress stalls and roll the wave back (lossless, host
+            keeps the authoritative copy).
+
+        Wave registration at prefill completion and consumption of DECODE_READY
+        waves are driven by the batch-formation path via the shared manager
+        wave registry.
+        """
+        mgr = self.offline_pp_offload_manager
+        mgr.tick()
+
+        # Promote finished-offload prefill waves to OFFLOADED.
+        for wave in list(mgr.waves.values()):
+            if wave.state == WaveState.PREFILLING and wave.offload_ready:
+                mgr.mark_wave_offloaded(wave)
+
+        # Maintain at most one in-flight PREFETCHING wave (double-buffer).
+        prefetching = [
+            w for w in mgr.waves.values() if w.state == WaveState.PREFETCHING
+        ]
+        if not prefetching:
+            wave = mgr.pop_next_offloaded()
+            if wave is not None and mgr.admit_wave(wave):
+                wave.state = WaveState.PREFETCHING
+                wave.last_progress_tick = mgr._tick
+                prefetching = [wave]
+
+        for wave in prefetching:
+            free_slots = self.token_to_kv_pool_allocator.available_size()
+            if free_slots > 0:
+                mgr.prefetch_step(wave, free_slots)
+            if mgr.is_wave_decode_ready(wave):
+                continue
+            if mgr.is_stalled(wave):
+                mgr.rollback_wave(wave)
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
