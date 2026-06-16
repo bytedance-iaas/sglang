@@ -105,7 +105,19 @@ def latest_version_tags(tags: Iterable[DockerTag]) -> list[str]:
 
 
 def tag_updated_date(tag: DockerTag, timezone: ZoneInfo) -> date:
-    updated = datetime.fromisoformat(tag.last_updated.replace("Z", "+00:00"))
+    value = tag.last_updated
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    if "." in value:
+        prefix, suffix = value.split(".", 1)
+        match = re.fullmatch(r"(\d+)(.*)", suffix)
+        if not match:
+            raise SystemExit(f"invalid Docker Hub last_updated timestamp: {tag.last_updated}")
+        fraction, offset = match.groups()
+        fraction = fraction[:6]
+        fraction = fraction.ljust(6, "0")
+        value = f"{prefix}.{fraction}{offset}"
+    updated = datetime.fromisoformat(value)
     return updated.astimezone(timezone).date()
 
 

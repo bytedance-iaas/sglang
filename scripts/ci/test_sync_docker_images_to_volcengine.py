@@ -10,12 +10,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from datetime import date
+from zoneinfo import ZoneInfo
 
 from sync_docker_images_to_volcengine import (
     DockerTag,
     build_sync_plan,
     parse_tags,
     resolve_tag_specs,
+    tag_updated_date,
 )
 
 
@@ -99,6 +101,15 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
                 "nightly-dev-20260616-abc",
                 "nightly-dev-cu13-20260616-abc",
             ],
+        )
+
+    def test_tag_updated_date_accepts_non_six_digit_fraction(self) -> None:
+        self.assertEqual(
+            tag_updated_date(
+                DockerTag("dev-cu13", "2026-06-16T01:53:17.12614Z"),
+                timezone=ZoneInfo("Asia/Shanghai"),
+            ),
+            date(2026, 6, 16),
         )
 
     def test_rejects_missing_registry_or_namespace(self) -> None:
