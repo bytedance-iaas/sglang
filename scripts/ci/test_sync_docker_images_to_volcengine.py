@@ -14,7 +14,9 @@ from zoneinfo import ZoneInfo
 
 from sync_docker_images_to_volcengine import (
     DockerTag,
+    SyncItem,
     build_sync_plan,
+    build_imagetools_command,
     parse_tags,
     resolve_tag_specs,
     tag_updated_date,
@@ -110,6 +112,28 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
                 timezone=ZoneInfo("Asia/Shanghai"),
             ),
             date(2026, 6, 16),
+        )
+
+    def test_imagetools_command_filters_platform_when_requested(self) -> None:
+        self.assertEqual(
+            build_imagetools_command(
+                SyncItem(
+                    source="docker.io/lmsysorg/sglang:latest",
+                    destination="iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:latest",
+                ),
+                platform="linux/amd64",
+            ),
+            [
+                "docker",
+                "buildx",
+                "imagetools",
+                "create",
+                "--platform",
+                "linux/amd64",
+                "-t",
+                "iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:latest",
+                "docker.io/lmsysorg/sglang:latest",
+            ],
         )
 
     def test_rejects_missing_registry_or_namespace(self) -> None:

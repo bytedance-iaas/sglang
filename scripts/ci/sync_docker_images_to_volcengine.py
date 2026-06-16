@@ -232,17 +232,17 @@ def build_sync_plan(
     return plan
 
 
-def sync_images(plan: Iterable[SyncItem], *, execute: bool) -> None:
+def build_imagetools_command(item: SyncItem, *, platform: str = "") -> list[str]:
+    command = ["docker", "buildx", "imagetools", "create"]
+    if platform:
+        command.extend(["--platform", platform])
+    command.extend(["-t", item.destination, item.source])
+    return command
+
+
+def sync_images(plan: Iterable[SyncItem], *, execute: bool, platform: str = "") -> None:
     for item in plan:
-        command = [
-            "docker",
-            "buildx",
-            "imagetools",
-            "create",
-            "-t",
-            item.destination,
-            item.source,
-        ]
+        command = build_imagetools_command(item, platform=platform)
         print(f"{item.source} -> {item.destination}", flush=True)
         if execute:
             subprocess.run(command, check=True)
@@ -302,6 +302,11 @@ def main() -> None:
         default="Asia/Shanghai",
         help="Timezone used to decide which Docker Hub tags were updated today.",
     )
+    parser.add_argument(
+        "--platform",
+        default="linux/amd64",
+        help="Optional platform filter passed to docker buildx imagetools create.",
+    )
     args = parser.parse_args()
 
     timezone = ZoneInfo(args.timezone)
@@ -340,7 +345,7 @@ def main() -> None:
             timezone=timezone,
         ),
     )
-    sync_images(plan, execute=args.execute)
+    sync_images(plan, execute=args.execute, platform=args.platform)
 
 
 if __name__ == "__main__":
