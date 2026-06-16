@@ -511,7 +511,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 f"act_sf_last={act_sf_last}, expected {ceil_div(k_for_recipe, 32)}"
             )
             assert expected_m is not None
-            padded_expected_m = ((expected_m + 127) // 128) * 128
+            padded_expected_m = ((max(original_m, expected_m) + 127) // 128) * 128
             if padded_expected_m != original_m:
                 padded_hidden_states = torch.empty(
                     (hidden_states.shape[0], padded_expected_m, hidden_states.shape[2]),
