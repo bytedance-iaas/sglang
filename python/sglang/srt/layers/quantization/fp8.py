@@ -113,9 +113,12 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-# gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
+# gfx942 (MI300) has no MX matmul HW; MXFP8 dense checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
+_sm90_mxfp8_dense_to_block_fp8_required = (
+    _is_cuda and is_sm90_supported() and not is_sm100_supported()
+)
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -367,10 +370,12 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        # gfx942: convert MXFP8 -> block-fp8 [128,128] at load and run the fast
-        # native block-fp8 kernels (set by process_weights_after_loading). Weights
-        # still load as MXFP8 (1x32) first; conversion flips this method to block.
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        # gfx942 and SM90 lack dense MXFP8 matmul support; convert dense MXFP8
+        # -> block-fp8 [128,128] at load and run native block-fp8 kernels.
+        # MoE experts are handled by Fp8MoEMethod and keep their own backend path.
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _mxfp8_to_block_fp8_required or _sm90_mxfp8_dense_to_block_fp8_required
+        )
         # Effective per-instance block size for the apply path. Defaults to the
         # config value; conversion overrides it to [128,128].
         self.weight_block_size = self.quant_config.weight_block_size
@@ -526,9 +531,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        # gfx942: convert MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [128,128]
-        # (e4m3fn + fp32), then fall through to the standard block-fp8 ROCm path
-        # (which fnuz-normalizes below). After this the layer is plain block-fp8.
+        # Convert dense MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [128,128]
+        # (e4m3fn + fp32), then fall through to the standard block-fp8 path.
+        # On ROCm this also fnuz-normalizes below. After this the layer is plain
+        # block-fp8 and will not call dense MXFP8 kernels at runtime.
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
