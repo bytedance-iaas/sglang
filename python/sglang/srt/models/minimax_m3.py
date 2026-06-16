@@ -15,7 +15,9 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M3 model compatible with HuggingFace weights."""
 
+import json
 import logging
+import os
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -123,6 +125,59 @@ if _is_hip:
         _has_rocm_qk_norm_rope = False
 
 logger = logging.getLogger(__name__)
+_SM90_MXFP8_MODEL_DEBUG_EVENTS = 0
+
+
+def _sm90_mxfp8_model_debug_enabled() -> bool:
+    return (
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
+        and os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") == "1"
+    )
+
+
+def _sm90_mxfp8_model_debug_stats(t: torch.Tensor) -> dict:
+    meta = {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "numel": t.numel(),
+        "device": str(t.device),
+    }
+    if t.is_cuda and torch.cuda.is_current_stream_capturing():
+        meta["stats_skipped"] = "cuda_graph_capture"
+        return meta
+    if t.numel() == 0:
+        meta["stats_skipped"] = "empty"
+        return meta
+    sample = t.reshape(-1)[: min(t.numel(), 4096)].float()
+    meta.update(
+        {
+            "sample_mean": float(sample.mean().item()),
+            "sample_absmax": float(sample.abs().max().item()),
+            "sample_isfinite": bool(torch.isfinite(sample).all().item()),
+        }
+    )
+    return meta
+
+
+def _sm90_mxfp8_model_debug_report(location: str, msg: str, data: dict) -> None:
+    global _SM90_MXFP8_MODEL_DEBUG_EVENTS
+    if not _sm90_mxfp8_model_debug_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
+    if _SM90_MXFP8_MODEL_DEBUG_EVENTS >= max_events:
+        return
+    _SM90_MXFP8_MODEL_DEBUG_EVENTS += 1
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H6",
+        "location": location,
+        "msg": f"[DEBUG] {msg}",
+        "data": data,
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -1285,7 +1340,21 @@ class MiniMaxM3Attention(nn.Module):
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
-            return output + idx_output
+            final_output = output + idx_output
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_core:sparse_output",
+                "SM90 MiniMax sparse attention output statistics",
+                {
+                    "layer_id": self.layer_id,
+                    "is_sparse_attention_layer": self.is_sparse_attention_layer,
+                    "disable_index_value": self.disable_index_value,
+                    "attn_output": _sm90_mxfp8_model_debug_stats(attn_output),
+                    "o_proj_output": _sm90_mxfp8_model_debug_stats(output),
+                    "idx_output": _sm90_mxfp8_model_debug_stats(idx_output),
+                    "final_output": _sm90_mxfp8_model_debug_stats(final_output),
+                },
+            )
+            return final_output
 
         q, k, v, gate, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
@@ -1293,6 +1362,17 @@ class MiniMaxM3Attention(nn.Module):
             gate = torch.sigmoid(gate.float())
             attn_output = (attn_output * gate).to(attn_output.dtype)
         output, _ = self.o_proj(attn_output)
+        _sm90_mxfp8_model_debug_report(
+            "minimax_m3.py:MiniMaxM3Attention.forward_core:dense_output",
+            "SM90 MiniMax dense attention output statistics",
+            {
+                "layer_id": self.layer_id,
+                "is_sparse_attention_layer": self.is_sparse_attention_layer,
+                "attention_output_gate": self.attention_output_gate,
+                "attn_output": _sm90_mxfp8_model_debug_stats(attn_output),
+                "o_proj_output": _sm90_mxfp8_model_debug_stats(output),
+            },
+        )
         return output
 
     def forward(
@@ -1452,6 +1532,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_attn",
+                "SM90 MiniMax decoder output after attention",
+                {
+                    "layer_id": self.layer_id,
+                    "is_layer_sparse": self.is_layer_sparse,
+                    "is_sparse_attention_layer": self.self_attn.is_sparse_attention_layer,
+                    "hidden_states": _sm90_mxfp8_model_debug_stats(hidden_states),
+                },
+            )
 
         # Fully Connected (MLP or MoE)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -1485,12 +1575,37 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 should_allreduce_fusion,
                 use_reduce_scatter,
             )
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_mlp",
+                "SM90 MiniMax decoder output after MLP/MoE",
+                {
+                    "layer_id": self.layer_id,
+                    "is_layer_sparse": self.is_layer_sparse,
+                    "should_allreduce_fusion": should_allreduce_fusion,
+                    "use_reduce_scatter": use_reduce_scatter,
+                    "hidden_states": _sm90_mxfp8_model_debug_stats(hidden_states),
+                },
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3DecoderLayer.forward:postprocess_layer",
+                "SM90 MiniMax decoder output after layer postprocess",
+                {
+                    "layer_id": self.layer_id,
+                    "is_layer_sparse": self.is_layer_sparse,
+                    "hidden_states": _sm90_mxfp8_model_debug_stats(hidden_states),
+                    "residual": (
+                        _sm90_mxfp8_model_debug_stats(residual)
+                        if residual is not None
+                        else {"is_none": True}
+                    ),
+                },
             )
 
         return hidden_states, residual
