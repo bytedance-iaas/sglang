@@ -429,6 +429,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             if not use_sm90_mxfp8:
                 down_input_scale = tma_align_input_scale(down_input_scale)
+        if use_sm90_mxfp8 and down_input_scale.dtype == torch.float32:
+            import deep_gemm.utils.layout
+
+            down_input_scale = (
+                deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                    down_input_scale
+                )
+            )
 
         if use_sm90_mxfp8:
             # #region debug-point H3:contiguous-down-quant
@@ -744,12 +752,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if use_sm90_mxfp8:
-            pass
-        elif (
-            use_mxfp8
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and down_input_scale.dtype != torch.int32
+        if (
+            (use_sm90_mxfp8 or (use_mxfp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0))
+            and down_input_scale.dtype == torch.float32
         ):
             # Already-packed int32 (from the fused-pack activation above) skips this.
             import deep_gemm.utils.layout
