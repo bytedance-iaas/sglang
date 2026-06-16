@@ -65,6 +65,97 @@ def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
     return quant_info.use_mxfp8 and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
 
 
+# #region debug-point setup:sm90-mxfp8-precision
+_SM90_MXFP8_DEBUG_SESSION = "sm90-mxfp8-precision"
+_SM90_MXFP8_DEBUG_EVENTS = 0
+
+
+def _sm90_mxfp8_debug_enabled() -> bool:
+    import os
+
+    return (
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
+        or os.environ.get("SGLANG_SM90_MXFP8_DEBUG_URL") is not None
+    )
+
+
+def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
+    if t is None:
+        return {"is_none": True}
+    meta = {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+    }
+    if _sm90_mxfp8_debug_enabled() and t.numel() > 0:
+        sample = t.detach().reshape(-1)[: min(2048, t.numel())].float()
+        meta.update(
+            {
+                "sample_mean": float(sample.mean().item()),
+                "sample_absmax": float(sample.abs().max().item()),
+                "sample_isfinite": bool(torch.isfinite(sample).all().item()),
+            }
+        )
+    return meta
+
+
+def _sm90_mxfp8_debug_report(
+    hypothesis_id: str, location: str, msg: str, data: dict
+) -> None:
+    import json
+    import os
+    import urllib.request
+
+    global _SM90_MXFP8_DEBUG_EVENTS
+    if not _sm90_mxfp8_debug_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
+    if _SM90_MXFP8_DEBUG_EVENTS >= max_events:
+        return
+    _SM90_MXFP8_DEBUG_EVENTS += 1
+    url = os.environ.get("SGLANG_SM90_MXFP8_DEBUG_URL")
+    if url is None:
+        for path in (
+            f".dbg/{_SM90_MXFP8_DEBUG_SESSION}.env",
+            f"../.dbg/{_SM90_MXFP8_DEBUG_SESSION}.env",
+        ):
+            try:
+                with open(path) as f:
+                    for line in f:
+                        if line.startswith("DEBUG_SERVER_URL="):
+                            url = line.split("=", 1)[1].strip()
+                            break
+            except OSError:
+                pass
+            if url is not None:
+                break
+    if url is None:
+        return
+    payload = {
+        "sessionId": _SM90_MXFP8_DEBUG_SESSION,
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": f"[DEBUG] {msg}",
+        "data": data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.05,
+        ).read()
+    except Exception:
+        pass
+
+
+# #endregion
+
+
 def _infer_mxfp8_gran_k_from_scale(
     scale: torch.Tensor,
     k: int,
@@ -259,6 +350,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         if use_sm90_mxfp8:
+            # #region debug-point H1:contiguous-gateup-input
+            _sm90_mxfp8_debug_report(
+                "H1",
+                "deep_gemm.py:_run_contiguous_gemm:gateup_input",
+                "SM90 contiguous gateup input recipe and scale metadata",
+                {
+                    "all_tokens": all_tokens,
+                    "K": K,
+                    "N": N,
+                    "recipe_a": recipe_a,
+                    "recipe_b": recipe_b,
+                    "hidden_states": _sm90_mxfp8_debug_tensor_meta(hidden_states),
+                    "hidden_states_scale": _sm90_mxfp8_debug_tensor_meta(
+                        hidden_states_scale
+                    ),
+                    "w13_weight": _sm90_mxfp8_debug_tensor_meta(quant_info.w13_weight),
+                    "w13_scale": _sm90_mxfp8_debug_tensor_meta(quant_info.w13_scale),
+                },
+            )
+            # #endregion
             deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
                 (hidden_states, hidden_states_scale),
                 w13_weight_fp8,
@@ -267,6 +378,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 recipe_a=recipe_a,
                 recipe_b=recipe_b,
             )
+            # #region debug-point H4:contiguous-gateup-output
+            _sm90_mxfp8_debug_report(
+                "H4",
+                "deep_gemm.py:_run_contiguous_gemm:gateup_output",
+                "SM90 contiguous gateup output statistics",
+                {"gateup_output": _sm90_mxfp8_debug_tensor_meta(gateup_output)},
+            )
+            # #endregion
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
                 (hidden_states, hidden_states_scale),
@@ -350,6 +469,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale = tma_align_input_scale(down_input_scale)
 
         if use_sm90_mxfp8:
+            # #region debug-point H3:contiguous-down-quant
+            _sm90_mxfp8_debug_report(
+                "H3",
+                "deep_gemm.py:_run_contiguous_gemm:down_quant",
+                "SM90 contiguous down activation quant metadata",
+                {
+                    "recipe_a": (1, scale_block_size),
+                    "recipe_b": recipe_b,
+                    "down_input_fp8": _sm90_mxfp8_debug_tensor_meta(down_input_fp8),
+                    "down_input_scale": _sm90_mxfp8_debug_tensor_meta(
+                        down_input_scale
+                    ),
+                    "w2_weight": _sm90_mxfp8_debug_tensor_meta(quant_info.w2_weight),
+                    "w2_scale": _sm90_mxfp8_debug_tensor_meta(quant_info.w2_scale),
+                },
+            )
+            # #endregion
             deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
                 (down_input_fp8, down_input_scale),
                 w2_weight_fp8,
@@ -358,6 +494,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 recipe_a=(1, scale_block_size),
                 recipe_b=recipe_b,
             )
+            # #region debug-point H2:contiguous-down-output
+            _sm90_mxfp8_debug_report(
+                "H2",
+                "deep_gemm.py:_run_contiguous_gemm:down_output",
+                "SM90 contiguous down output statistics",
+                {"down_output": _sm90_mxfp8_debug_tensor_meta(down_output)},
+            )
+            # #endregion
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
                 (down_input_fp8, down_input_scale),
@@ -516,6 +660,29 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         if use_sm90_mxfp8:
+            # #region debug-point H1:masked-gateup-input
+            _sm90_mxfp8_debug_report(
+                "H1",
+                "deep_gemm.py:_run_masked_gemm:gateup_input",
+                "SM90 masked gateup input recipe and scale metadata",
+                {
+                    "num_groups": num_groups,
+                    "m": m,
+                    "k": k,
+                    "n": n,
+                    "expected_m": expected_m,
+                    "recipe_a": recipe_a,
+                    "recipe_b": recipe_b,
+                    "masked_m": _sm90_mxfp8_debug_tensor_meta(masked_m),
+                    "hidden_states": _sm90_mxfp8_debug_tensor_meta(hidden_states),
+                    "hidden_states_scale": _sm90_mxfp8_debug_tensor_meta(
+                        hidden_states_scale
+                    ),
+                    "w13_weight": _sm90_mxfp8_debug_tensor_meta(w13_weight),
+                    "w13_scale": _sm90_mxfp8_debug_tensor_meta(w13_scale),
+                },
+            )
+            # #endregion
             deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
                 (hidden_states, hidden_states_scale),
                 (w13_weight, w13_scale),
@@ -525,6 +692,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 recipe_a=recipe_a,
                 recipe_b=recipe_b,
             )
+            # #region debug-point H4:masked-gateup-output
+            _sm90_mxfp8_debug_report(
+                "H4",
+                "deep_gemm.py:_run_masked_gemm:gateup_output",
+                "SM90 masked gateup output statistics",
+                {"gateup_output": _sm90_mxfp8_debug_tensor_meta(gateup_output)},
+            )
+            # #endregion
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (hidden_states, hidden_states_scale),
@@ -647,6 +822,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             }
 
         if use_sm90_mxfp8:
+            # #region debug-point H3:masked-down-quant
+            _sm90_mxfp8_debug_report(
+                "H3",
+                "deep_gemm.py:_run_masked_gemm:down_quant",
+                "SM90 masked down activation quant metadata",
+                {
+                    "recipe_a": (1, scale_block_size),
+                    "recipe_b": recipe_b,
+                    "num_real_tokens": num_real_tokens,
+                    "down_input": _sm90_mxfp8_debug_tensor_meta(down_input),
+                    "down_input_scale": _sm90_mxfp8_debug_tensor_meta(
+                        down_input_scale
+                    ),
+                    "w2_weight": _sm90_mxfp8_debug_tensor_meta(w2_weight),
+                    "w2_scale": _sm90_mxfp8_debug_tensor_meta(w2_scale),
+                },
+            )
+            # #endregion
             deep_gemm_return_value = (
                 deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
                     (down_input, down_input_scale),
@@ -658,6 +851,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     recipe_b=recipe_b,
                 )
             )
+            # #region debug-point H2:masked-down-output
+            _sm90_mxfp8_debug_report(
+                "H2",
+                "deep_gemm.py:_run_masked_gemm:down_output",
+                "SM90 masked down output statistics",
+                {"down_output": _sm90_mxfp8_debug_tensor_meta(down_output)},
+            )
+            # #endregion
         else:
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (down_input, down_input_scale),
