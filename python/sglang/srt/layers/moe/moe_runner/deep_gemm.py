@@ -65,6 +65,29 @@ def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
     return quant_info.use_mxfp8 and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
 
 
+def _infer_mxfp8_gran_k_from_scale(
+    scale: torch.Tensor,
+    k: int,
+    *,
+    preferred_gran_k: Optional[int] = None,
+) -> int:
+    pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+    last_dim = scale.shape[-1]
+    candidates = []
+    if preferred_gran_k in (32, 128):
+        candidates.append(preferred_gran_k)
+    candidates.extend(gran_k for gran_k in (32, 128) if gran_k not in candidates)
+    for gran_k in candidates:
+        if last_dim == ceil_div(k, gran_k * pack_factor):
+            return gran_k
+    raise AssertionError(
+        "MXFP8 scale shape does not match supported gran_k: "
+        f"K={k}, scale_dtype={scale.dtype}, scale_last_dim={last_dim}, "
+        f"expected_k32={ceil_div(k, 32 * pack_factor)}, "
+        f"expected_k128={ceil_div(k, 128 * pack_factor)}"
+    )
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -206,8 +229,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
         if use_sm90_mxfp8:
+            gran_k_act = _infer_mxfp8_gran_k_from_scale(
+                hidden_states_scale,
+                K,
+                preferred_gran_k=running_state.get("mxfp8_act_gran_k"),
+            )
             recipe_a, recipe_b = (
-                (1, running_state.get("mxfp8_act_gran_k", scale_block_size)),
+                (1, gran_k_act),
                 (1, scale_block_size),
             )
         else:
@@ -431,7 +459,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         use_sm90_mxfp8 = _use_sm90_mxfp8_fp8_grouped_gemm(quant_info)
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
         if use_sm90_mxfp8:
-            gran_k_act = running_state.get("mxfp8_act_gran_k", scale_block_size)
+            _, _, k_for_recipe = hidden_states.shape
+            gran_k_act = _infer_mxfp8_gran_k_from_scale(
+                hidden_states_scale,
+                k_for_recipe,
+                preferred_gran_k=running_state.get("mxfp8_act_gran_k"),
+            )
             recipe_a, recipe_b = (1, gran_k_act), (1, scale_block_size)
         elif use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
