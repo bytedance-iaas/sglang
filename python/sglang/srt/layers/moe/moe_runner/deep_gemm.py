@@ -100,6 +100,9 @@ def _sm90_mxfp8_debug_report(
     global _SM90_MXFP8_DEBUG_EVENTS
     if not _sm90_mxfp8_debug_enabled():
         return
+    # Keep the current precision pass focused on dense MXFP8 H5 logs.
+    if hypothesis_id != "H5":
+        return
     max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
     if _SM90_MXFP8_DEBUG_EVENTS >= max_events:
         return
