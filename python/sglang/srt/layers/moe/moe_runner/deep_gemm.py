@@ -110,10 +110,13 @@ def _requantize_masked_fp8_to_mxfp8_k32(
     original_shape = x.shape
     x_2d = x.reshape(-1, original_shape[-1])
     if x_2d.shape[0] == 0:
-        return x, torch.empty(
-            (*original_shape[:-1], ceil_div(original_shape[-1], 32)),
-            device=x.device,
-            dtype=torch.uint8,
+        return (
+            torch.empty(original_shape, device=x.device, dtype=torch.float8_e4m3fn),
+            torch.empty(
+                (*original_shape[:-1], ceil_div(original_shape[-1], 32)),
+                device=x.device,
+                dtype=torch.uint8,
+            ),
         )
     if x.dtype == torch.float8_e4m3fn:
         assert scale is not None, "FP8 activations require scales for MXFP8 repacking"
