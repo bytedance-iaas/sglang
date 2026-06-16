@@ -1891,9 +1891,28 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     ),
                 },
             )
-            return self.logits_processor(
+            logits_output = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            _sm90_mxfp8_model_debug_report(
+                "minimax_m3.py:MiniMaxM3SparseForCausalLM.forward:after_logits",
+                "SM90 MiniMax logits processor output",
+                {
+                    "next_token_logits": (
+                        _sm90_mxfp8_model_debug_stats(
+                            logits_output.next_token_logits
+                        )
+                        if logits_output.next_token_logits is not None
+                        else {"is_none": True}
+                    ),
+                    "full_logits": (
+                        _sm90_mxfp8_model_debug_stats(logits_output.full_logits)
+                        if logits_output.full_logits is not None
+                        else {"is_none": True}
+                    ),
+                },
+            )
+            return logits_output
         else:
             return hidden_states
 
