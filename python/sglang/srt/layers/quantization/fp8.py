@@ -880,15 +880,32 @@ class Fp8LinearMethod(LinearMethodBase):
         # assumptions and corrupt the prefill state.
         use_masked = m <= 64 or m % 128 != 0
         if use_masked:
+            expected_m = ((m + 127) // 128) * 128
+            if expected_m != m:
+                x_padded = torch.empty(
+                    (expected_m, x_2d.shape[-1]), device=x_2d.device, dtype=x_2d.dtype
+                )
+                x_scale_padded = torch.empty(
+                    (expected_m, x_scale_2d.shape[-1]),
+                    device=x_scale_2d.device,
+                    dtype=x_scale_2d.dtype,
+                )
+                x_padded[:m] = x_2d
+                x_scale_padded[:m] = x_scale_2d
+            else:
+                x_padded = x_2d
+                x_scale_padded = x_scale_2d
+            out_padded = torch.empty((expected_m, n), device=x_2d.device, dtype=torch.bfloat16)
             masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
             masked_m.fill_(m)
             deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
-                (x_2d.unsqueeze(0), x_scale_2d.unsqueeze(0)),
+                (x_padded.unsqueeze(0), x_scale_padded.unsqueeze(0)),
                 (weight, weight_scale),
-                out.unsqueeze(0),
+                out_padded.unsqueeze(0),
                 masked_m,
-                expected_m=m,
+                expected_m=expected_m,
             )
+            out = out_padded[:m]
         else:
             m_indices = torch.empty((m,), device=x_2d.device, dtype=torch.int32)
             m_indices.zero_()
