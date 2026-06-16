@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -147,75 +146,6 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
-
-
-_SM90_MXFP8_DENSE_DEBUG_SESSION = "sm90-mxfp8-precision"
-_SM90_MXFP8_DENSE_DEBUG_EVENTS = 0
-
-
-def _sm90_mxfp8_debug_enabled() -> bool:
-    import os
-
-    return os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
-
-
-def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
-    if t is None:
-        return {"is_none": True}
-    return {
-        "shape": list(t.shape),
-        "stride": list(t.stride()),
-        "dtype": str(t.dtype),
-        "is_contiguous": t.is_contiguous(),
-        "numel": t.numel(),
-        "device": str(t.device),
-    }
-
-
-def _sm90_mxfp8_debug_tensor_stats(t: torch.Tensor) -> dict:
-    import os
-
-    meta = _sm90_mxfp8_debug_tensor_meta(t)
-    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
-        return meta
-    if t.is_cuda and torch.cuda.is_current_stream_capturing():
-        meta["stats_skipped"] = "cuda_graph_capture"
-        return meta
-    if t.numel() == 0:
-        meta["stats_skipped"] = "empty"
-        return meta
-    sample = t.reshape(-1)[: min(t.numel(), 4096)].float()
-    meta.update(
-        {
-            "sample_mean": float(sample.mean().item()),
-            "sample_absmax": float(sample.abs().max().item()),
-            "sample_isfinite": bool(torch.isfinite(sample).all().item()),
-        }
-    )
-    return meta
-
-
-def _sm90_mxfp8_debug_report(
-    hypothesis_id: str, location: str, msg: str, data: dict
-) -> None:
-    import os
-
-    global _SM90_MXFP8_DENSE_DEBUG_EVENTS
-    if not _sm90_mxfp8_debug_enabled():
-        return
-    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
-    if _SM90_MXFP8_DENSE_DEBUG_EVENTS >= max_events:
-        return
-    _SM90_MXFP8_DENSE_DEBUG_EVENTS += 1
-    payload = {
-        "sessionId": _SM90_MXFP8_DENSE_DEBUG_SESSION,
-        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "msg": f"[DEBUG] {msg}",
-        "data": data,
-    }
-    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def _infer_sm90_mxfp8_gran_k_from_scale(
@@ -980,7 +910,6 @@ class Fp8LinearMethod(LinearMethodBase):
         # the single dense group can still hit the contiguous scheduler's tail
         # assumptions and corrupt the prefill state.
         use_masked = m <= 64 or m % 128 != 0
-        import os
 
         if use_masked:
             masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
@@ -1008,21 +937,6 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if bias is not None:
             out = out + bias
-        if use_masked or os.environ.get("SGLANG_SM90_MXFP8_DEBUG_DENSE_ALL") == "1":
-            _sm90_mxfp8_debug_report(
-                "H5",
-                "fp8.py:_apply_sm90_mxfp8_deepgemm_linear:output",
-                "SM90 dense MXFP8 linear output metadata",
-                {
-                    "layer_type": layer.__class__.__name__,
-                    "layer_prefix": getattr(layer, "prefix", None),
-                    "m": m,
-                    "n": n,
-                    "k": k,
-                    "use_masked": use_masked,
-                    "out": _sm90_mxfp8_debug_tensor_stats(out),
-                },
-            )
         return out.reshape(output_shape)
 
     def apply(

@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -164,6 +165,8 @@ def _sm90_mxfp8_model_debug_stats(t: torch.Tensor) -> dict:
 def _sm90_mxfp8_model_debug_report(location: str, msg: str, data: dict) -> None:
     global _SM90_MXFP8_MODEL_DEBUG_EVENTS
     if not _sm90_mxfp8_model_debug_enabled():
+        return
+    if get_tensor_model_parallel_rank() != 0:
         return
     max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
     if _SM90_MXFP8_MODEL_DEBUG_EVENTS >= max_events:

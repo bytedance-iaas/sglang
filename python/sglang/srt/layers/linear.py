@@ -5,9 +5,7 @@
 from __future__ import annotations
 
 import itertools
-import json
 import logging
-import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -57,60 +55,6 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 )
 
 logger = logging.getLogger(__name__)
-_SM90_MXFP8_LINEAR_DEBUG_EVENTS = 0
-
-
-def _sm90_mxfp8_linear_debug_enabled() -> bool:
-    return os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
-
-
-def _sm90_mxfp8_linear_debug_stats(t: torch.Tensor) -> dict:
-    meta = {
-        "shape": list(t.shape),
-        "stride": list(t.stride()),
-        "dtype": str(t.dtype),
-        "is_contiguous": t.is_contiguous(),
-        "numel": t.numel(),
-        "device": str(t.device),
-    }
-    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
-        return meta
-    if t.is_cuda and torch.cuda.is_current_stream_capturing():
-        meta["stats_skipped"] = "cuda_graph_capture"
-        return meta
-    if t.numel() == 0:
-        meta["stats_skipped"] = "empty"
-        return meta
-    sample = t.reshape(-1)[: min(t.numel(), 4096)].float()
-    meta.update(
-        {
-            "sample_mean": float(sample.mean().item()),
-            "sample_absmax": float(sample.abs().max().item()),
-            "sample_isfinite": bool(torch.isfinite(sample).all().item()),
-        }
-    )
-    return meta
-
-
-def _sm90_mxfp8_linear_debug_report(
-    hypothesis_id: str, location: str, msg: str, data: dict
-) -> None:
-    global _SM90_MXFP8_LINEAR_DEBUG_EVENTS
-    if not _sm90_mxfp8_linear_debug_enabled():
-        return
-    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
-    if _SM90_MXFP8_LINEAR_DEBUG_EVENTS >= max_events:
-        return
-    _SM90_MXFP8_LINEAR_DEBUG_EVENTS += 1
-    payload = {
-        "sessionId": "sm90-mxfp8-precision",
-        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "msg": f"[DEBUG] {msg}",
-        "data": data,
-    }
-    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -1614,28 +1558,6 @@ class RowParallelLinear(LinearBase):
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
-
-        if (
-            _sm90_mxfp8_linear_debug_enabled()
-            and os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") == "1"
-            and getattr(self.quant_method, "use_mxfp8", False)
-            and self.reduce_results
-        ):
-            _sm90_mxfp8_linear_debug_report(
-                "H5",
-                "linear.py:RowParallelLinear.forward:reduced_output",
-                "SM90 RowParallelLinear reduced output statistics",
-                {
-                    "layer_prefix": getattr(self, "prefix", None),
-                    "input_size": self.input_size,
-                    "input_size_per_partition": self.input_size_per_partition,
-                    "output_size": self.output_size,
-                    "tp_rank": self.tp_rank,
-                    "tp_size": self.tp_size,
-                    "skip_all_reduce": skip_all_reduce,
-                    "output": _sm90_mxfp8_linear_debug_stats(output),
-                },
-            )
 
         output_bias = self.bias if self.skip_bias_add else None
 
