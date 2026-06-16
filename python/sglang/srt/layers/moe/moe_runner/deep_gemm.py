@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -59,6 +61,7 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+logger = logging.getLogger(__name__)
 
 
 def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
@@ -73,10 +76,7 @@ _SM90_MXFP8_DEBUG_EVENTS = 0
 def _sm90_mxfp8_debug_enabled() -> bool:
     import os
 
-    return (
-        os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
-        or os.environ.get("SGLANG_SM90_MXFP8_DEBUG_URL") is not None
-    )
+    return os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
 
 
 def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
@@ -103,9 +103,7 @@ def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
 def _sm90_mxfp8_debug_report(
     hypothesis_id: str, location: str, msg: str, data: dict
 ) -> None:
-    import json
     import os
-    import urllib.request
 
     global _SM90_MXFP8_DEBUG_EVENTS
     if not _sm90_mxfp8_debug_enabled():
@@ -114,24 +112,6 @@ def _sm90_mxfp8_debug_report(
     if _SM90_MXFP8_DEBUG_EVENTS >= max_events:
         return
     _SM90_MXFP8_DEBUG_EVENTS += 1
-    url = os.environ.get("SGLANG_SM90_MXFP8_DEBUG_URL")
-    if url is None:
-        for path in (
-            f".dbg/{_SM90_MXFP8_DEBUG_SESSION}.env",
-            f"../.dbg/{_SM90_MXFP8_DEBUG_SESSION}.env",
-        ):
-            try:
-                with open(path) as f:
-                    for line in f:
-                        if line.startswith("DEBUG_SERVER_URL="):
-                            url = line.split("=", 1)[1].strip()
-                            break
-            except OSError:
-                pass
-            if url is not None:
-                break
-    if url is None:
-        return
     payload = {
         "sessionId": _SM90_MXFP8_DEBUG_SESSION,
         "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
@@ -140,17 +120,7 @@ def _sm90_mxfp8_debug_report(
         "msg": f"[DEBUG] {msg}",
         "data": data,
     }
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            ),
-            timeout=0.05,
-        ).read()
-    except Exception:
-        pass
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 # #endregion
