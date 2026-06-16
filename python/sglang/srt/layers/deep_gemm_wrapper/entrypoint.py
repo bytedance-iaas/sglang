@@ -49,10 +49,6 @@ def _ceil_align(x: int, align: int) -> int:
     return ((x + align - 1) // align) * align
 
 
-def _ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
 def _e8m0_fp32_to_u8(sf: torch.Tensor) -> torch.Tensor:
     sf_i32 = sf.to(torch.float32).view(torch.int32)
     exp = torch.bitwise_right_shift(sf_i32, 23)
@@ -66,45 +62,6 @@ def _e8m0_fp32_to_u8(sf: torch.Tensor) -> torch.Tensor:
 
 def _unpack_ue8m0_i32_to_u8(sf: torch.Tensor) -> torch.Tensor:
     return sf.contiguous().view(torch.uint8).view(*sf.shape[:-1], sf.shape[-1] * 4)
-
-
-def _e8m0_u8_to_fp32(sf: torch.Tensor) -> torch.Tensor:
-    return (sf.to(torch.int32) << 23).view(torch.float32)
-
-
-def _requantize_sm90_mxfp8_k32(
-    x: torch.Tensor, sf: torch.Tensor, k: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
-
-    original_shape = x.shape
-    x_2d = x.reshape(-1, k)
-    if x_2d.shape[0] == 0:
-        return (
-            torch.empty(original_shape, device=x.device, dtype=torch.float8_e4m3fn),
-            torch.empty(
-                (*original_shape[:-1], _ceil_align(k, 32) // 32),
-                device=x.device,
-                dtype=torch.uint8,
-            ),
-        )
-
-    if x.dtype == torch.float8_e4m3fn:
-        if sf.dtype == torch.int32:
-            sf = _unpack_ue8m0_i32_to_u8(sf)
-        if sf.dtype == torch.uint8:
-            sf = _e8m0_u8_to_fp32(sf)
-        else:
-            sf = sf.to(torch.float32)
-        sf_2d = sf.reshape(x_2d.shape[0], sf.shape[-1])
-        gran_k = k // sf_2d.shape[-1]
-        group_idx = torch.arange(k, device=x.device) // gran_k
-        x_2d = (x_2d.float() * sf_2d[:, group_idx]).to(torch.bfloat16)
-    else:
-        x_2d = x_2d.contiguous()
-
-    q_2d, sf_2d = mxfp8_group_quantize(x_2d.contiguous())
-    return q_2d.reshape(original_shape), sf_2d.reshape(*original_shape[:-1], -1)
 
 
 def _normalize_sm90_mxfp8_pair(
@@ -121,13 +78,21 @@ def _normalize_sm90_mxfp8_pair(
         sf_u8 = _unpack_ue8m0_i32_to_u8(sf)
         if sf_u8.shape[-1] >= k32 and x.dtype == torch.float8_e4m3fn:
             return x, sf_u8[..., :k32].contiguous()
-        sf_u8 = sf_u8[..., : min(sf_u8.shape[-1], _ceil_div(k, 128))]
-        return _requantize_sm90_mxfp8_k32(x, sf_u8, k)
+        raise RuntimeError(
+            "SM90 MXFP8 kernel received packed UE8M0 scales that do not cover "
+            f"K/32: unpacked_scales={sf_u8.shape[-1]}, expected={k32}. "
+            "Do not requantize K/128 activations in SGLang; update the SM90 "
+            "kernel to consume packed int32 UE8M0 with recipe/gran_k support."
+        )
 
     if sf.dtype == torch.float32 and sf.shape[-1] == k32 and x.dtype == torch.float8_e4m3fn:
         return x, _e8m0_fp32_to_u8(sf)
 
-    return _requantize_sm90_mxfp8_k32(x, sf, k)
+    raise RuntimeError(
+        "SM90 MXFP8 wrapper only performs lossless scale layout adaptation. "
+        f"Got activation dtype={x.dtype}, scale dtype={sf.dtype}, "
+        f"scale_last_dim={sf.shape[-1]}, expected K/32={k32}."
+    )
 
 
 def _pad_sm90_mxfp8_lhs(
