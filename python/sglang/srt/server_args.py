@@ -4216,6 +4216,12 @@ class ServerArgs:
                     "--enable-offline-pp-offload and "
                     "--disaggregation-decode-enable-offload-kvcache are mutually exclusive."
                 )
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--enable-offline-pp-offload and --enable-hisparse are "
+                    "mutually exclusive because both own the prefill-to-decode "
+                    "KV lifecycle."
+                )
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")

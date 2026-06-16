@@ -232,10 +232,15 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not self.server_args.enable_offline_pp_offload,
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        if not self.server_args.enable_offline_pp_offload:
+                            maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -316,9 +321,13 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not self.server_args.enable_offline_pp_offload,
+                        )
                         req.time_stats.set_completion_time()
-                    else:
+                    elif not self.server_args.enable_offline_pp_offload:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
@@ -845,6 +854,8 @@ class SchedulerBatchResultProcessor:
                     if get_global_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
+                if self.server_args.enable_offline_pp_offload:
+                    is_insert = False
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()

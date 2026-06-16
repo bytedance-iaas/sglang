@@ -2446,12 +2446,12 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
             and not self.last_batch.is_empty()
         ):
-            prefilled = [
-                r for r in self.last_batch.reqs if not r.finished()
-            ]
+            prefilled_batch = self.last_batch
+            prefilled = [r for r in prefilled_batch.reqs if not r.finished()]
             self.last_batch = None
             if prefilled:
                 mgr.offload_prefilled_wave(prefilled)
+            prefilled_batch.filter_batch(keep_indices=[])
 
         # Step 2: keep prefilling while there is work, to build up waves.
         new_batch = self.get_new_batch_prefill()
@@ -2460,7 +2460,13 @@ class Scheduler(
 
         # Step 3: continue decoding the active wave, if any.
         if not self.running_batch.is_empty():
+            active_wave_id = self.running_batch.offline_pp_wave_id
             self.running_batch = self.update_running_batch(self.running_batch)
+            if active_wave_id is not None:
+                if self.running_batch.is_empty():
+                    mgr.retire_wave_by_id(active_wave_id)
+                else:
+                    self.running_batch.offline_pp_wave_id = active_wave_id
             if not self.running_batch.is_empty():
                 return self.running_batch
 
@@ -2490,18 +2496,43 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
         )
+        req_pool_indices_cpu = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64
+        )
+        seq_lens_cpu = torch.tensor(
+            [wave.entries[r.rid].committed_len for r in reqs],
+            dtype=torch.int64,
+        )
         batch.req_pool_indices = torch.tensor(
             [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
         )
-        seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
-        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
-        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        batch.seq_lens_sum = sum(seq_lens)
+        batch.req_pool_indices_cpu = req_pool_indices_cpu
+        batch.seq_lens = seq_lens_cpu.to(device=device, non_blocking=True)
+        batch.seq_lens_cpu = seq_lens_cpu
+        batch.orig_seq_lens = seq_lens_cpu.to(dtype=torch.int32, device=device)
+        batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
         batch.forward_mode = ForwardMode.DECODE
+
+        last_tokens = torch.tensor(
+            [
+                r.output_ids[-1] if len(r.output_ids) else r.origin_input_ids[-1]
+                for r in reqs
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.future_map.stash(batch.req_pool_indices, last_tokens)
+        batch.input_ids = None
+
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
+
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
+        batch.offline_pp_wave_id = wave.wave_id
+        batch.prepare_for_decode()
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
@@ -3442,6 +3473,8 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        if self.offline_pp_offload_manager is not None:
+            idle &= not self.offline_pp_offload_manager.has_active_waves()
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch

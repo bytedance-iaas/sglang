@@ -86,6 +86,9 @@ class _ReqStateEntry:
     # Host (CPU) copy of this request's state, as returned by pool.get_cpu_copy.
     cpu_state: object = None
     # Device KV slot indices allocated during prefetch (for exact rollback free).
+    # With paged allocators this can be longer than committed_len because the
+    # allocator works in whole pages. Only the first committed_len entries are
+    # written into req_to_token / loaded from the CPU snapshot.
     device_kv_indices: object = None
     # Whether this request's state has been brought back to device (drip unit).
     prefetched: bool = False
@@ -195,7 +198,13 @@ class OfflinePPStateOffloadManager:
         prompt = len(req.origin_input_ids)
         # max_new_tokens is the upper bound on generated tokens for this req.
         gen = getattr(req.sampling_params, "max_new_tokens", 0) or 0
-        return prompt + gen
+        return self._align_slot_count(prompt + gen)
+
+    def _align_slot_count(self, token_count: int) -> int:
+        page_size = getattr(self.token_to_kv_pool_allocator, "page_size", 1) or 1
+        if page_size <= 1 or token_count == 0:
+            return token_count
+        return ((token_count + page_size - 1) // page_size) * page_size
 
     def _req_committed_len(self, req: "Req") -> int:
         """Number of KV tokens that actually exist for this req right now.
@@ -288,7 +297,7 @@ class OfflinePPStateOffloadManager:
 
         Returns True if admitted. If the wave's demand exceeds the per-wave
         budget it is split in place (reqs trimmed, remainder re-queued as a new
-        wave) and we return False for this tick so the caller retries.
+        wave). The kept half stays schedulable in this tick.
         """
         total = self.token_to_kv_pool_allocator.size
         budget = int(total * ADMISSION_ALPHA / RESIDENT_WAVES)
@@ -299,37 +308,41 @@ class OfflinePPStateOffloadManager:
         kept: List["Req"] = []
         acc = 0
         for req in wave.reqs:
-            d = self._req_slot_demand(req)
-            if acc + d > budget and kept:
+            d = wave.entries[req.rid].token_len
+            if acc + d > budget:
+                if not kept:
+                    raise ValueError(
+                        f"Single request demand {d} exceeds per-wave budget "
+                        f"{budget}; cannot schedule under offline-pp-offload. "
+                        "Reduce sequence length or pp memory."
+                    )
                 break
             acc += d
             kept.append(req)
 
-        if not kept:
-            raise ValueError(
-                f"Single request demand {self._req_slot_demand(wave.reqs[0])} "
-                f"exceeds per-wave budget {budget}; cannot schedule under "
-                f"offline-pp-offload. Reduce sequence length or pp memory."
-            )
-
+        original_entries = wave.entries
         remainder = [r for r in wave.reqs if r not in kept]
         wave.reqs = kept
-        wave.entries = {r.rid: wave.entries[r.rid] for r in kept}
+        wave.entries = {r.rid: original_entries[r.rid] for r in kept}
         wave.d_wave_slots = acc
         if remainder:
-            self._requeue_remainder(remainder)
-        return False
+            self._requeue_remainder(remainder, original_entries)
+        return True
 
-    def _requeue_remainder(self, reqs: List["Req"]) -> None:
+    def _requeue_remainder(
+        self, reqs: List["Req"], source_entries: Dict[str, _ReqStateEntry]
+    ) -> None:
         rem = self.new_wave(reqs)
         # The remainder's state is still on host from the original offload;
         # carry the cpu_state handles over so it does not need re-prefill.
         rem.state = WaveState.OFFLOADED
         rem.offload_ready = True
         for r in reqs:
-            rem.entries[r.rid].cpu_state = getattr(
-                r, "_offline_pp_cpu_state", None
-            )
+            entry = source_entries[r.rid]
+            entry.device_kv_indices = None
+            entry.prefetched = False
+            rem.entries[r.rid] = entry
+        rem.d_wave_slots = sum(rem.entries[r.rid].token_len for r in reqs)
         self.offloaded_queue.append(rem.wave_id)
 
     def prefetch_step(self, wave: WaveStateHandle, free_slots: int) -> int:
@@ -348,36 +361,55 @@ class OfflinePPStateOffloadManager:
                 entry = wave.entries[req.rid]
                 if entry.prefetched:
                     continue
-                # Only the committed prefix exists and needs slots now; the
-                # decode path extends per-step as usual once the wave runs.
+                # Only the committed prefix exists and needs slots now; with a
+                # paged allocator the actual allocation must still be page
+                # aligned, while req_to_token maps only committed tokens.
                 committed = entry.committed_len
-                if committed > free_slots - consumed:
+                alloc_len = self._align_slot_count(committed)
+                if alloc_len > free_slots - consumed:
                     # Not enough budget yet for this request; drip continues
                     # next tick as more slots are freed by the DECODING wave.
                     break
+                if entry.cpu_state is None:
+                    raise RuntimeError(
+                        "Offline-PP prefetch missing host state for "
+                        f"wave={wave.wave_id}, req={req.rid}."
+                    )
+
                 # Re-allocate device slots for this request and restore mapping.
+                kv_indices = self.token_to_kv_pool_allocator.alloc(alloc_len)
+                if kv_indices is None:
+                    break
+
                 req.req_pool_idx = None
                 if self.is_hybrid:
                     req.mamba_pool_idx = None
-                alloc_idx = self.req_to_token_pool.alloc([req])
-                if alloc_idx is None:
-                    break
-                kv_indices = self.token_to_kv_pool_allocator.alloc(committed)
-                if kv_indices is None:
-                    break
                 entry.device_kv_indices = kv_indices
-                self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, committed)), kv_indices
-                )
-                cpu_state = self.codec.decode_on_prefetch(entry.cpu_state)
-                mamba_indices = self._req_mamba_indices(req)
-                if mamba_indices is not None:
-                    self.kv_cache.load_cpu_copy(cpu_state, kv_indices, mamba_indices)
-                else:
-                    self.kv_cache.load_cpu_copy(cpu_state, kv_indices)
+                try:
+                    req_pool_indices = self.req_to_token_pool.alloc([req])
+                    if req_pool_indices is None:
+                        self.token_to_kv_pool_allocator.free(kv_indices)
+                        entry.device_kv_indices = None
+                        break
+
+                    restore_indices = kv_indices[:committed]
+                    self.req_to_token_pool.write(
+                        (req.req_pool_idx, slice(0, committed)), restore_indices
+                    )
+                    cpu_state = self.codec.decode_on_prefetch(entry.cpu_state)
+                    mamba_indices = self._req_mamba_indices(req)
+                    if mamba_indices is not None:
+                        self.kv_cache.load_cpu_copy(
+                            cpu_state, restore_indices, mamba_indices
+                        )
+                    else:
+                        self.kv_cache.load_cpu_copy(cpu_state, restore_indices)
+                except Exception:
+                    self._release_prefetched_req(req, entry)
+                    raise
                 entry.prefetched = True
                 wave.prefetch_done_units += 1
-                consumed += committed
+                consumed += alloc_len
                 progressed = True
         if progressed:
             wave.last_progress_tick = self._tick
@@ -389,6 +421,23 @@ class OfflinePPStateOffloadManager:
         if ready:
             wave.state = WaveState.DECODE_READY
         return ready
+
+    def _release_prefetched_req(self, req: "Req", entry: _ReqStateEntry) -> None:
+        """Release a partially/fully prefetched request back to host-only state."""
+        if entry.device_kv_indices is not None:
+            self.token_to_kv_pool_allocator.free(entry.device_kv_indices)
+            entry.device_kv_indices = None
+        if req.req_pool_idx is not None:
+            if (
+                self.is_hybrid
+                and hasattr(self.req_to_token_pool, "free_mamba_cache")
+                and req.mamba_pool_idx is not None
+            ):
+                self.req_to_token_pool.free_mamba_cache(req)
+            self.req_to_token_pool.free(req)
+        if self.is_hybrid:
+            req.mamba_pool_idx = None
+        entry.prefetched = False
 
     # ------------------------------------------------------------------ #
     # Deadlock avoidance
@@ -405,15 +454,12 @@ class OfflinePPStateOffloadManager:
         self.prefetch_stream.synchronize()
         for req in wave.reqs:
             entry = wave.entries[req.rid]
-            if entry.prefetched and entry.device_kv_indices is not None:
-                self.token_to_kv_pool_allocator.free(entry.device_kv_indices)
-                if self.is_hybrid and hasattr(
-                    self.req_to_token_pool, "free_mamba_cache"
-                ):
-                    self.req_to_token_pool.free_mamba_cache(req)
-                self.req_to_token_pool.free(req)
-                entry.device_kv_indices = None
-                entry.prefetched = False
+            if (
+                entry.prefetched
+                or entry.device_kv_indices is not None
+                or req.req_pool_idx is not None
+            ):
+                self._release_prefetched_req(req, entry)
             req.req_pool_idx = None
             if self.is_hybrid:
                 req.mamba_pool_idx = None
@@ -446,6 +492,17 @@ class OfflinePPStateOffloadManager:
     def retire_wave(self, wave: WaveStateHandle) -> None:
         """Drop a fully-decoded wave's bookkeeping."""
         self.waves.pop(wave.wave_id, None)
+        self.offloaded_queue = [
+            wid for wid in self.offloaded_queue if wid != wave.wave_id
+        ]
+
+    def retire_wave_by_id(self, wave_id: int) -> None:
+        wave = self.waves.get(wave_id)
+        if wave is not None:
+            self.retire_wave(wave)
+
+    def has_active_waves(self) -> bool:
+        return bool(self.waves)
 
     # ------------------------------------------------------------------ #
     # High-level hooks used by batch formation

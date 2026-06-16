@@ -1597,6 +1597,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Offline PP offload bookkeeping: the active wave represented by this batch.
+    offline_pp_wave_id: Optional[int] = None
 
     # For split prefill
     split_index: int = 0
@@ -2763,6 +2765,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            offline_pp_wave_id=self.offline_pp_wave_id,
         )
 
     def maybe_evict_swa(self):
