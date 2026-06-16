@@ -881,9 +881,12 @@ class Fp8LinearMethod(LinearMethodBase):
         weight = layer.weight.unsqueeze(0)
         weight_scale = layer.weight_scale_inv.unsqueeze(0)
 
-        # Decode/low-latency shapes are small and benefit from the masked kernel;
-        # normal/prefill shapes use contiguous with a single all-zero group.
-        if m <= 64:
+        # Decode/low-latency shapes are small and benefit from the masked kernel.
+        # Use contiguous only for block-aligned normal/prefill shapes; otherwise
+        # the single dense group can still hit the contiguous scheduler's tail
+        # assumptions and corrupt the prefill state.
+        use_masked = m <= 64 or m % 128 != 0
+        if use_masked:
             masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
             masked_m.fill_(m)
             deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(

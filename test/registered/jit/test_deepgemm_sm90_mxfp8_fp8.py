@@ -119,7 +119,7 @@ def test_sm90_mxfp8_grouped_masked_wrapper_accuracy():
     assert diff < 0.03
 
 
-@pytest.mark.parametrize("m", [32, 128])
+@pytest.mark.parametrize("m", [32, 181, 128])
 def test_sm90_mxfp8_dense_linear_uses_grouped_kernel_accuracy(m):
     _require_sm90_mxfp8_grouped_gemm()
 
