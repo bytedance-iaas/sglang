@@ -54,7 +54,6 @@ try:
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
-        from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 
     use_deepep = True
 except ImportError:
@@ -495,18 +494,19 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
-            if self.use_sm90_mxfp8_deepgemm():
-                hidden_states = mxfp8_group_quantize(hidden_states.contiguous())
-            else:
-                # TODO hard code 128 block quant,use fp8 communication
-                hidden_states = sglang_per_token_group_quant_fp8(
-                    hidden_states,
-                    128,
-                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                )
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and self.use_fp8
+            and not self.use_sm90_mxfp8_deepgemm()
+        ):
+            # TODO hard code 128 block quant,use fp8 communication
+            hidden_states = sglang_per_token_group_quant_fp8(
+                hidden_states,
+                128,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
