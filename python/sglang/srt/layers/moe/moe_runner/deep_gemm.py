@@ -82,22 +82,14 @@ def _sm90_mxfp8_debug_enabled() -> bool:
 def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
     if t is None:
         return {"is_none": True}
-    meta = {
+    return {
         "shape": list(t.shape),
         "stride": list(t.stride()),
         "dtype": str(t.dtype),
         "is_contiguous": t.is_contiguous(),
+        "numel": t.numel(),
+        "device": str(t.device),
     }
-    if _sm90_mxfp8_debug_enabled() and t.numel() > 0:
-        sample = t.detach().reshape(-1)[: min(2048, t.numel())].float()
-        meta.update(
-            {
-                "sample_mean": float(sample.mean().item()),
-                "sample_absmax": float(sample.abs().max().item()),
-                "sample_isfinite": bool(torch.isfinite(sample).all().item()),
-            }
-        )
-    return meta
 
 
 def _sm90_mxfp8_debug_report(
