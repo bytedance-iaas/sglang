@@ -943,6 +943,12 @@ class MiniMaxM3Attention(nn.Module):
         # Both projections must share the same quant method/layout to concat.
         if type(ip.quant_method) is not type(qm):
             return
+        # On SM90, dense MXFP8 linear is converted to block-fp8 during the
+        # loader's post-process pass. The fused holder skips that pass, so keep
+        # the two original projections and let their quant methods convert
+        # weights normally.
+        if getattr(qm, "convert_mxfp8_to_block", False):
+            return
 
         weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
         if isinstance(qm, UnquantizedLinearMethod):
