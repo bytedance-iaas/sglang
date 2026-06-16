@@ -982,31 +982,6 @@ class Fp8LinearMethod(LinearMethodBase):
         use_masked = m <= 64 or m % 128 != 0
         import os
 
-        if use_masked or os.environ.get("SGLANG_SM90_MXFP8_DEBUG_DENSE_ALL") == "1":
-            _sm90_mxfp8_debug_report(
-                "H5",
-                "fp8.py:_apply_sm90_mxfp8_deepgemm_linear:input",
-                "SM90 dense MXFP8 linear metadata",
-                {
-                    "layer_type": layer.__class__.__name__,
-                    "layer_prefix": getattr(layer, "prefix", None),
-                    "input_size": getattr(layer, "input_size", None),
-                    "output_size": getattr(layer, "output_size", None),
-                    "output_size_per_partition": getattr(
-                        layer, "output_size_per_partition", None
-                    ),
-                    "m": m,
-                    "n": n,
-                    "k": k,
-                    "use_masked": use_masked,
-                    "recipe_a": recipe_a,
-                    "recipe_b": recipe_b,
-                    "x": _sm90_mxfp8_debug_tensor_meta(x_2d),
-                    "x_scale": _sm90_mxfp8_debug_tensor_meta(x_scale_2d),
-                    "weight": _sm90_mxfp8_debug_tensor_meta(weight),
-                    "weight_scale": _sm90_mxfp8_debug_tensor_meta(weight_scale),
-                },
-            )
         if use_masked:
             masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
             masked_m.fill_(m)
