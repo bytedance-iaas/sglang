@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
+    maybe_cache_unfinished_req,
     page_align_floor,
     release_kv_cache,
     state_page_size_from_allocator,
@@ -351,6 +352,13 @@ class DecodePreallocQueue:
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _logical_kv_page_size(self) -> int:
+        return getattr(
+            self.token_to_kv_pool_allocator,
+            "logical_page_size",
+            self.token_to_kv_pool_allocator.page_size,
+        )
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -359,7 +367,7 @@ class DecodePreallocQueue:
         if window_size is None or window_size <= 0:
             return seq_len
 
-        page_size = self.token_to_kv_pool_allocator.page_size
+        page_size = self._logical_kv_page_size()
         window_start = max(0, seq_len - window_size)
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
@@ -400,7 +408,7 @@ class DecodePreallocQueue:
         if draft_tokens is None:
             draft_tokens = self.scheduler.server_args.speculative_num_steps or 0
 
-        page_size = self.token_to_kv_pool_allocator.page_size
+        page_size = self._logical_kv_page_size()
         tokens_per_req = max(1, int(draft_tokens) + 1)
         pages_per_req = max(1, (tokens_per_req + page_size - 1) // page_size)
         return n_active * pages_per_req * page_size
@@ -443,7 +451,7 @@ class DecodePreallocQueue:
         ):
             return matched_prefix_len
 
-        page_size = self.token_to_kv_pool_allocator.page_size
+        page_size = self._logical_kv_page_size()
         swa_tail_len = self._swa_tail_len(fill_len)
         swa_tail_start = max(fill_len - swa_tail_len, 0)
         safe_prefix_len = min(
@@ -710,6 +718,49 @@ class DecodePreallocQueue:
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
         self.queue.append(decode_req)
         return decode_req
+
+    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
+        kv_receiver = decode_req.kv_receiver
+        if kv_receiver is None:
+            return
+        if hasattr(kv_receiver, "abort"):
+            kv_receiver.abort()
+        if hasattr(kv_receiver, "clear"):
+            kv_receiver.clear()
+        decode_req.kv_receiver = None
+
+    def abort_requests(self, rid: str, abort_all: bool = False) -> None:
+        """Abort requests before KV preallocation has been committed.
+
+        Requests in this queue have a receiver/handshake in progress but have
+        not yet been moved to the transfer queue.  Cleaning the receiver here
+        keeps abort_all from leaving dead waiters that would otherwise rely on a
+        later poll to notice FINISH_ABORT.
+        """
+        remaining_queue: List[DecodeRequest] = []
+        aborted: List[Req] = []
+        aborted_ids = set()
+
+        for decode_req in self.queue:
+            req = decode_req.req
+            if abort_all or req.rid.startswith(rid):
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    prepare_abort(req, "Request aborted.", status_code=HTTPStatus.GONE)
+                self._clear_receiver(decode_req)
+                aborted.append(req)
+                aborted_ids.add(id(decode_req))
+            else:
+                remaining_queue.append(decode_req)
+
+        if aborted_ids:
+            self.queue = remaining_queue
+            self.pending_reqs = [
+                decode_req
+                for decode_req in self.pending_reqs
+                if id(decode_req) not in aborted_ids
+            ]
+            for req in aborted:
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -1128,7 +1179,7 @@ class DecodePreallocQueue:
                 prefix_lock_acquired = True
                 # Align prefix_len down to page boundary so both prefill and
                 # decode agree on the page-aligned split point for KV transfer.
-                page_size = self.token_to_kv_pool_allocator.page_size
+                page_size = self._logical_kv_page_size()
                 if page_size > 1 and prefix_len % page_size != 0:
                     prefix_len = page_align_floor(prefix_len, page_size)
                     prefix_indices = prefix_indices[:prefix_len]
@@ -1669,7 +1720,7 @@ class DecodePreallocQueue:
         return swa_allocatable_tokens
 
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
-        page_size = self.token_to_kv_pool_allocator.page_size
+        page_size = self._logical_kv_page_size()
         if page_size == 1:
             return fill_len - prefix_len
 
@@ -1683,12 +1734,30 @@ class DecodePreallocQueue:
     def _dsv4_c4_host_required_tokens_for_admission(
         self, req: Req, fill_len: int
     ) -> Tuple[int, int, int]:
-        """Return missing C4 host mirror tokens for DSV4 HiSparse admission."""
+        """Return missing C4 host slots and ready C4 prefix length.
+
+        Pending C4 prefixes can share already allocated destination slots across
+        concurrent transfers, so they reduce the allocation requirement.  They
+        are not ready cache hits, so the returned prefix length remains the
+        ready prefix used for logical-prefix safety and transfer skipping.
+        """
         coordinator = self.scheduler.hisparse_coordinator
-        host_c4_len = self.token_to_kv_pool_allocator.c4_tokens_for_full_tokens(fill_len)
-        prefix_c4_len, _, _ = coordinator._match_c4_host_prefix(req, host_c4_len)
-        prefix_c4_len = min(prefix_c4_len, host_c4_len)
-        return host_c4_len - prefix_c4_len, host_c4_len, prefix_c4_len
+        host_c4_len = self.token_to_kv_pool_allocator.c4_tokens_for_full_tokens(
+            fill_len
+        )
+        ready_prefix_c4_len, _, _ = coordinator._match_c4_host_prefix(
+            req, host_c4_len
+        )
+        allocated_prefix_c4_len, _, _ = coordinator._match_c4_host_prefix(
+            req, host_c4_len, include_pending=True
+        )
+        ready_prefix_c4_len = min(ready_prefix_c4_len, host_c4_len)
+        allocated_prefix_c4_len = min(allocated_prefix_c4_len, host_c4_len)
+        return (
+            host_c4_len - allocated_prefix_c4_len,
+            host_c4_len,
+            ready_prefix_c4_len,
+        )
 
     def _pre_alloc(
         self,
@@ -1760,7 +1829,7 @@ class DecodePreallocQueue:
                     f"evictable_size={self.tree_cache.evictable_size()}, "
                     f"protected_size={self.tree_cache.protected_size()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, delta_len={delta_len}, "
-                    f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+                    f"page_size={self._logical_kv_page_size()}, "
                     f"req={req.rid}"
                 )
 
@@ -1793,9 +1862,10 @@ class DecodePreallocQueue:
             if use_dsv4_safe_prefix:
                 swa_tail_len = self._swa_tail_len(fill_len)
                 swa_tail_start = fill_len - swa_tail_len
-                if self.token_to_kv_pool_allocator.page_size > 1:
+                page_size = self._logical_kv_page_size()
+                if page_size > 1:
                     swa_tail_start = page_align_floor(
-                        swa_tail_start, self.token_to_kv_pool_allocator.page_size
+                        swa_tail_start, page_size
                     )
                 req.swa_evicted_seqlen = max(
                     req.swa_evicted_seqlen, swa_tail_start
@@ -1839,13 +1909,7 @@ class DecodePreallocQueue:
                         (host_len,), dtype=torch.int64, device=coordinator.device
                     )
                 else:
-                    prefix_c4_len = coordinator.restore_dsv4_c4_host_prefix_for_req(
-                        req, host_len
-                    )
-                    coordinator.ensure_host_slots(
-                        req.req_pool_idx, prefix_c4_len, host_len - prefix_c4_len
-                    )
-                    coordinator._req_c4_written_len[req.req_pool_idx] = host_len
+                    coordinator.reserve_dsv4_c4_host_transfer_slots(req, host_len)
                     host_indices = coordinator.req_to_host_pool[
                         req.req_pool_idx, :host_len
                     ]
@@ -1903,7 +1967,7 @@ class DecodePreallocQueue:
             f"protected={self.tree_cache.protected_size()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+            f"page_size={self._logical_kv_page_size()}, "
             f"req={req.rid}"
         )
 
@@ -2058,10 +2122,37 @@ class DecodeTransferQueue:
                 ].tolist()
             )
 
+        self._publish_transferred_prefix_if_needed(decode_req.req)
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
+
+    def _publish_transferred_prefix_if_needed(self, req: Req) -> None:
+        if not self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            return
+        if not self.scheduler.enable_hisparse:
+            return
+
+        coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+        if (
+            coordinator is None
+            or not getattr(coordinator, "is_dsv4_hisparse", False)
+            or coordinator.host_radix_cache is not None
+            or req.req_pool_idx is None
+            or req.kv_committed_len is None
+            or req.kv_committed_len <= 0
+            or req.cache_protected_len >= req.kv_committed_len
+        ):
+            return
+
+        # The transfer has completed, so both logical KV and the C4 host mirror
+        # are ready. Publish this committed prefix immediately; otherwise later
+        # same-prefix requests allocate the whole long prompt while this request
+        # waits to enter decode, which can pin the full/logical pool at 0.99.
+        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        coordinator._publish_dsv4_c4_host_prompt_prefix(req)
+        maybe_cache_unfinished_req(req, self.tree_cache)
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
@@ -2078,6 +2169,57 @@ class DecodeTransferQueue:
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
+
+    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
+        kv_receiver = decode_req.kv_receiver
+        if kv_receiver is None:
+            return
+        if hasattr(kv_receiver, "abort"):
+            kv_receiver.abort()
+        if hasattr(kv_receiver, "clear"):
+            kv_receiver.clear()
+        decode_req.kv_receiver = None
+
+    def _release_metadata_buffer(self, decode_req: DecodeRequest) -> None:
+        idx = decode_req.metadata_buffer_index
+        if idx is not None and idx >= 0:
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.metadata_buffer_index = -1
+
+    def _unregister_staging_req(self, decode_req: DecodeRequest) -> None:
+        if (
+            self.enable_staging
+            and self.staging_handler is not None
+            and self.staging_handler.is_staging_room(decode_req.req.bootstrap_room)
+        ):
+            self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+
+    def _cleanup_failed_decode_req(self, decode_req: DecodeRequest) -> None:
+        self._clear_receiver(decode_req)
+        if self.scheduler.enable_hisparse:
+            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+        self._unregister_staging_req(decode_req)
+        self._release_metadata_buffer(decode_req)
+
+    def abort_requests(self, rid: str, abort_all: bool = False) -> None:
+        """Abort requests after KV preallocation but before transfer completion."""
+        remaining_queue: List[DecodeRequest] = []
+        aborted = False
+
+        for decode_req in self.queue:
+            req = decode_req.req
+            if abort_all or req.rid.startswith(rid):
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    prepare_abort(req, "Request aborted.", status_code=HTTPStatus.GONE)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                self._cleanup_failed_decode_req(decode_req)
+                aborted = True
+            else:
+                remaining_queue.append(decode_req)
+
+        if aborted:
+            self.queue = remaining_queue
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -2112,6 +2254,7 @@ class DecodeTransferQueue:
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
+                self._clear_receiver(decode_req)
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed

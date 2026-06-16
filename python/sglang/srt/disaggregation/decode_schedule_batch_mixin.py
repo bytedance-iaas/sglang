@@ -108,7 +108,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            if req.cache_protected_len < len(req.fill_ids):
+                maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

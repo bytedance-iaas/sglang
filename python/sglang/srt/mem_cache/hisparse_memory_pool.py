@@ -660,6 +660,8 @@ class DeepSeekV4SingleKVPoolHost:
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    _FULL_STATE_TAG = "dsv4_hisparse_full_state"
+    _LOGICAL_ONLY_STATE_TAG = "dsv4_hisparse_logical_only_state"
 
     def __init__(
         self,
@@ -678,6 +680,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.dtype = self.hisparse_kvcache.dtype
         self.device = self.hisparse_kvcache.device
         self.page_size = self.hisparse_kvcache.page_size
+        self.logical_page_size = logical_attn_allocator.page_size
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
@@ -706,6 +709,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._logical_full_page_live = torch.zeros(
+            self._size_full // self.logical_page_size + 1,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.clear()
 
         self.hisparse_kvcache.register_mapping(
@@ -808,7 +816,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
-        return self.logical_attn_allocator.alloc_extend(
+        logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -816,6 +824,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+        if logical_indices is not None:
+            self._mark_logical_pages_allocated(logical_indices)
+        return logical_indices
 
     def alloc_extend_swa_tail(
         self,
@@ -827,7 +838,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        return self.logical_attn_allocator.alloc_extend_swa_tail(
+        logical_indices = self.logical_attn_allocator.alloc_extend_swa_tail(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -836,6 +847,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
             swa_tail_len,
         )
+        if logical_indices is not None:
+            self._mark_logical_pages_allocated(logical_indices)
+        return logical_indices
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
@@ -945,13 +959,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         required_tokens = extend_num_tokens
         num_new_pages = 0
-        if self.page_size > 1:
+        if self.logical_page_size > 1:
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
+                page_size=self.logical_page_size,
                 prefix_lens=prefix_lens_cpu,
             )
-            required_tokens = num_new_pages * self.page_size
+            required_tokens = num_new_pages * self.logical_page_size
             self._merge_logical_release_pages_if_needed(num_new_pages)
         avail = self.logical_attn_allocator.available_size()
         if avail < required_tokens:
@@ -981,8 +995,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 f"{self._logical_allocator_page_state()}"
             )
 
+        state = None
         if backup_state:
-            return logical_indices, (logical_state, logical_indices.clone())
+            logical_pages = self._logical_pages(logical_indices)
+            state = (
+                self._LOGICAL_ONLY_STATE_TAG,
+                logical_state,
+                logical_indices.clone(),
+                logical_pages.clone(),
+                self._logical_full_page_live[logical_pages].clone(),
+            )
+        self._mark_logical_pages_allocated(logical_indices)
+        if backup_state:
+            return logical_indices, state
         return logical_indices
 
     def bind_device_mapping(
@@ -1059,7 +1084,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.page_size > 1
 
         num_new_pages_logical = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+            seq_lens=seq_lens_cpu,
+            page_size=self.logical_page_size,
+            prefix_lens=prefix_lens_cpu,
         )
         num_new_pages_hisparse = get_num_new_pages(
             seq_lens=seq_lens_cpu // self.compress_ratio,
@@ -1068,7 +1095,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if (
             num_new_pages_logical
-            > self.logical_attn_allocator.available_size() // self.page_size
+            > self.logical_attn_allocator.available_size() // self.logical_page_size
         ):
             return None
         if (
@@ -1086,6 +1113,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
         assert logical_indices is not None, "Logical allocation failed in alloc_extend"
+        self._mark_logical_pages_allocated(logical_indices)
 
         compressed_logical_indices = (
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
@@ -1114,9 +1142,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
-        return self.logical_attn_allocator.alloc_decode(
+        logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
+        if logical_indices is not None:
+            self._mark_logical_pages_allocated(logical_indices)
+        return logical_indices
 
     def free_compressed(self, compressed_indices: torch.Tensor):
         hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
@@ -1137,14 +1168,98 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.clear()
 
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
+        self._logical_full_page_live.fill_(False)
         self.is_not_in_free_group = True
         self.free_group = []
+
+    def backup_state(self):
+        return (
+            self._FULL_STATE_TAG,
+            self.logical_attn_allocator.backup_state(),
+            self.hisparse_attn_allocator.backup_state(),
+            self._logical_full_page_live.clone(),
+        )
+
+    def restore_state(self, state):
+        if (
+            isinstance(state, tuple)
+            and len(state) == 5
+            and state[0] == self._LOGICAL_ONLY_STATE_TAG
+        ):
+            _, logical_state, logical_indices, logical_pages, page_live = state
+            self.logical_attn_allocator.restore_state(logical_state)
+            self._logical_full_page_live[logical_pages] = page_live
+            self.clear_device_mapping(logical_indices)
+            return
+
+        if (
+            isinstance(state, tuple)
+            and len(state) == 4
+            and state[0] == self._FULL_STATE_TAG
+        ):
+            _, logical_state, hisparse_state, logical_page_live = state
+            self.logical_attn_allocator.restore_state(logical_state)
+            self.hisparse_attn_allocator.restore_state(hisparse_state)
+            self._logical_full_page_live.copy_(logical_page_live)
+            return
+
+        # Backward-compatible state shape used by older HiSparse draft helpers:
+        # (logical_allocator_state, logical_indices).  It is intentionally
+        # handled here because BaseTokenToKVPoolAllocator.restore_state() only
+        # updates wrapper fields and would leave inner allocators stale.
+        if isinstance(state, tuple) and len(state) == 2 and torch.is_tensor(state[1]):
+            logical_state, logical_indices = state
+            self.logical_attn_allocator.restore_state(logical_state)
+            self._rebuild_logical_full_page_live_from_allocator()
+            self.clear_device_mapping(logical_indices)
+            return
+
+        raise RuntimeError("Unsupported DeepSeek V4 HiSparse allocator state.")
+
+    def _logical_pages(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.numel() == 0:
+            return indices.new_empty((0,), dtype=torch.int64)
+        pages = torch.unique(indices.to(torch.int64) // self.logical_page_size)
+        return pages[pages > 0]
+
+    def _mark_logical_pages_allocated(self, indices: torch.Tensor) -> None:
+        pages = self._logical_pages(indices)
+        if pages.numel() > 0:
+            self._logical_full_page_live[pages] = True
+
+    def _rebuild_logical_full_page_live_from_allocator(self) -> None:
+        full_allocator = getattr(
+            self.logical_attn_allocator,
+            "full_attn_allocator",
+            self.logical_attn_allocator,
+        )
+        self._logical_full_page_live.fill_(True)
+        self._logical_full_page_live[0] = False
+        if full_allocator.free_pages.numel() > 0:
+            self._logical_full_page_live[full_allocator.free_pages] = False
+        if full_allocator.release_pages.numel() > 0:
+            self._logical_full_page_live[full_allocator.release_pages] = False
+
+    def _take_live_logical_free_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        pages = self._logical_pages(indices)
+        if pages.numel() == 0:
+            return indices.new_empty((0,), dtype=torch.int64)
+
+        live_pages = pages[self._logical_full_page_live[pages]]
+        if live_pages.numel() == 0:
+            return indices.new_empty((0,), dtype=torch.int64)
+
+        self._logical_full_page_live[live_pages] = False
+        return live_pages * self.logical_page_size
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
+            free_index = self._take_live_logical_free_indices(free_index)
+            if free_index.numel() == 0:
+                return
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)

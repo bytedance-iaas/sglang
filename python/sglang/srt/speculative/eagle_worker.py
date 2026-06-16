@@ -669,9 +669,10 @@ class EAGLEWorker(TpModelWorker):
             ):
                 batch.ensure_req_pool_indices()
                 allocator = self.token_to_kv_pool_allocator
+                page_size = getattr(allocator, "logical_page_size", allocator.page_size)
                 evict_from_tree_cache(
                     batch.tree_cache,
-                    extend_num_tokens + len(prefix_lens_cpu) * allocator.page_size,
+                    extend_num_tokens + len(prefix_lens_cpu) * page_size,
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots_variable(
                     batch.req_pool_indices,

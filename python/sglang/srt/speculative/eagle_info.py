@@ -152,9 +152,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             ):
                 batch.ensure_req_pool_indices()
                 allocator = batch.tree_cache.token_to_kv_pool_allocator
+                page_size = getattr(allocator, "logical_page_size", allocator.page_size)
                 evict_from_tree_cache(
                     batch.tree_cache,
-                    len(batch.input_ids) + len(prefix_lens_cpu) * allocator.page_size,
+                    len(batch.input_ids) + len(prefix_lens_cpu) * page_size,
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots(
                     batch.req_pool_indices,

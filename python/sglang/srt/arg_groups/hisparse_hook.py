@@ -46,6 +46,60 @@ def apply_hisparse_nsa_backend_defaults(
     return True
 
 
+def _validate_dsv4_hisparse_megamoe(server_args: "ServerArgs") -> None:
+    """Validate the DSV4 HiSparse + MegaMoE combination before graph capture."""
+    if server_args.moe_a2a_backend != "megamoe":
+        return
+
+    from sglang.srt.environ import envs
+
+    if server_args.moe_runner_backend != "deep_gemm":
+        raise ValueError(
+            "DSV4 HiSparse MegaMoE requires --moe-runner-backend deep_gemm. "
+            f"Got {server_args.moe_runner_backend!r}."
+        )
+
+    if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+        logger.warning(
+            "DSV4 HiSparse is using --moe-a2a-backend megamoe without "
+            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1. This is allowed, but the env "
+            "flag is the preferred way to keep MegaMoE defaults explicit."
+        )
+
+    if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        raise ValueError(
+            "DSV4 HiSparse MegaMoE requires SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1 "
+            "to avoid the high-pressure DeepGEMM masked-GEMM scratch path."
+        )
+
+    if server_args.speculative_algorithm == "EAGLE":
+        if server_args.speculative_moe_a2a_backend != "megamoe":
+            logger.warning(
+                "DSV4 HiSparse target is using MegaMoE, but the EAGLE draft "
+                "MoE A2A backend is %r. This is a fallback configuration, not "
+                "full MegaMoE draft coverage.",
+                server_args.speculative_moe_a2a_backend,
+            )
+
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        draft_tokens = max(int(server_args.speculative_num_draft_tokens or 1), 1)
+        graph_bs = (
+            0
+            if server_args.disable_cuda_graph
+            else int(server_args.cuda_graph_max_bs or 0)
+        )
+        required_cap = graph_bs * draft_tokens
+        if required_cap > cap:
+            raise ValueError(
+                "DSV4 HiSparse MegaMoE graph capture requires "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK >= "
+                f"cuda_graph_max_bs * speculative_num_draft_tokens "
+                f"({graph_bs} * {draft_tokens} = {required_cap}), but got {cap}. "
+                "Raise the env var or lower --cuda-graph-max-bs / "
+                "--speculative-num-draft-tokens."
+            )
+
+
 def validate_hisparse(server_args: "ServerArgs") -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, NSA backend)."""
     if not server_args.enable_hisparse:
@@ -68,6 +122,7 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
     # radix is still not used for DSV4 HiSparse; C4 prefix reuse is handled by
     # HiSparseCoordinator.
     if is_v4_hisparse:
+        _validate_dsv4_hisparse_megamoe(server_args)
         return
 
     if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):

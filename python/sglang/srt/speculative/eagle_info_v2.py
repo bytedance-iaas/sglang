@@ -119,7 +119,11 @@ class EagleDraftInputV2Mixin:
                 output_ids
             )
 
-        page_size = batch.token_to_kv_pool_allocator.page_size
+        page_size = getattr(
+            batch.token_to_kv_pool_allocator,
+            "logical_page_size",
+            batch.token_to_kv_pool_allocator.page_size,
+        )
         alloc_len_per_decode = get_alloc_len_per_decode()
         double_alloc = alloc_len_per_decode + alloc_len_per_decode
         topk = (
@@ -169,7 +173,7 @@ class EagleDraftInputV2Mixin:
                 allocator = batch.tree_cache.token_to_kv_pool_allocator
                 evict_from_tree_cache(
                     batch.tree_cache,
-                    num_needed_tokens + len(cur_kv_lens_cpu) * allocator.page_size,
+                    num_needed_tokens + len(cur_kv_lens_cpu) * page_size,
                 )
                 # Spec V2 over-allocates logical slots across iterations. Bind
                 # HiSparse device slots only for the active draft/verify window.

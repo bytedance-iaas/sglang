@@ -2353,11 +2353,48 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    def _max_accept_tokens_per_req_next_decode(self) -> int:
+        if self.spec_algorithm.is_none():
+            return 1
+
+        server_args = get_global_server_args()
+        draft_tokens = server_args.speculative_num_draft_tokens
+        if draft_tokens is None:
+            draft_tokens = server_args.speculative_num_steps
+        return max(1, int(draft_tokens or 1) + 1)
+
+    def _selected_reqs_for_decode_mem(
+        self, selected_indices: Optional[List[int]]
+    ) -> List[Req]:
+        if selected_indices is None:
+            return self.reqs
+        return [self.reqs[i] for i in selected_indices]
+
+    def _check_dsv4_hisparse_c4_host_decode_mem(
+        self, selected_indices: Optional[List[int]]
+    ) -> bool:
+        coordinator = self.hisparse_coordinator
+        if (
+            coordinator is None
+            or not getattr(coordinator, "is_dsv4_hisparse", False)
+            or self.forward_mode is None
+            or not self.forward_mode.is_decode()
+        ):
+            return True
+
+        reqs = self._selected_reqs_for_decode_mem(selected_indices)
+        required_tokens = coordinator.dsv4_c4_host_required_for_next_decode(
+            reqs, self._max_accept_tokens_per_req_next_decode()
+        )
+        if required_tokens <= 0:
+            return True
+        return coordinator.ensure_dsv4_c4_host_available(required_tokens)
+
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
         if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
-            return True
+            return self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices)
 
         # SWA eviction is normally done while preparing the next decode batch.
         # When SWA becomes the first limiting pool, the scheduler can reach this
@@ -2366,12 +2403,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if (
             self.forward_mode is not None
             and self.forward_mode.is_decode()
-            and self.tree_cache.supports_swa()
+            and (
+                self.tree_cache.supports_swa()
+                or (
+                    hasattr(self.token_to_kv_pool_allocator, "free_swa")
+                    and getattr(self.model_config, "sliding_window_size", None)
+                )
+            )
         ):
             self.maybe_evict_swa(force=True)
             evict_from_tree_cache(self.tree_cache, num_tokens)
 
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+            return False
+        return self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices)
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -2789,17 +2834,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self, force: bool = False):
-        if self.tree_cache.supports_swa():
-            sliding_window_size = self.tree_cache.sliding_window_size
+        supports_swa_cache = self.tree_cache.supports_swa()
+        supports_swa_allocator = hasattr(self.token_to_kv_pool_allocator, "free_swa")
+        sliding_window_size = (
+            self.tree_cache.sliding_window_size
+            if supports_swa_cache
+            else getattr(self.model_config, "sliding_window_size", None)
+        )
+        # DSV4 HiSparse keeps decode radix FULL-only, but its allocator still
+        # owns SWA tail pages. It must run the same sliding-window free path.
+        if supports_swa_cache or (supports_swa_allocator and sliding_window_size):
             server_args = get_global_server_args()
 
             release_leaf_lock = (
-                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
+                supports_swa_cache
+                and envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
 
             # Eviction_interval: trade-off between SWA token waste and eviction overhead
-            page_size = self.tree_cache.page_size
+            page_size = (
+                self.tree_cache.page_size
+                if supports_swa_cache
+                else getattr(
+                    self.token_to_kv_pool_allocator,
+                    "logical_page_size",
+                    self.tree_cache.page_size,
+                )
+            )
             eviction_interval = max(
                 page_size,
                 int(
@@ -2850,12 +2912,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
-        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
+        supports_swa_cache = self.tree_cache.supports_swa()
+        supports_swa_allocator = hasattr(self.token_to_kv_pool_allocator, "free_swa")
+        assert (
+            supports_swa_cache or supports_swa_allocator
+        ), "prefix cache or allocator must support swa"
+        sliding_window_size = (
+            self.tree_cache.sliding_window_size
+            if supports_swa_cache
+            else getattr(self.model_config, "sliding_window_size", None)
+        )
+        assert sliding_window_size is not None, "sliding_window_size must be set"
+        page_size = (
+            self.tree_cache.page_size
+            if supports_swa_cache
+            else getattr(
+                self.token_to_kv_pool_allocator,
+                "logical_page_size",
+                self.tree_cache.page_size,
+            )
+        )
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
         assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
+            req.cache_protected_len % page_size == 0
         ), "cache_protected_len must be page aligned"
         if not getattr(req, "skip_swa_radix_cache_insert", False):
             req.swa_evicted_seqlen = max(
@@ -2871,16 +2951,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
             evict_threshold = pre_len - sliding_window_size
         else:
-            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
+            evict_threshold = pre_len - sliding_window_size - page_size
         new_swa_evicted_seqlen = max(
             req.swa_evicted_seqlen,
             evict_threshold,
         )
 
-        if self.tree_cache.page_size > 1:
+        if page_size > 1:
             new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
+                new_swa_evicted_seqlen // page_size
+            ) * page_size
 
         if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[

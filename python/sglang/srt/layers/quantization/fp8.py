@@ -865,6 +865,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_megamoe()
             )
         return False
 
