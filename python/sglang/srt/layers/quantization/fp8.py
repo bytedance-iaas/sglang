@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -146,6 +147,76 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+
+_SM90_MXFP8_DENSE_DEBUG_SESSION = "sm90-mxfp8-precision"
+_SM90_MXFP8_DENSE_DEBUG_EVENTS = 0
+
+
+def _sm90_mxfp8_debug_enabled() -> bool:
+    import os
+
+    return os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
+
+
+def _sm90_mxfp8_debug_tensor_meta(t: Optional[torch.Tensor]) -> dict:
+    if t is None:
+        return {"is_none": True}
+    return {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "numel": t.numel(),
+        "device": str(t.device),
+    }
+
+
+def _sm90_mxfp8_debug_report(
+    hypothesis_id: str, location: str, msg: str, data: dict
+) -> None:
+    import os
+
+    global _SM90_MXFP8_DENSE_DEBUG_EVENTS
+    if not _sm90_mxfp8_debug_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
+    if _SM90_MXFP8_DENSE_DEBUG_EVENTS >= max_events:
+        return
+    _SM90_MXFP8_DENSE_DEBUG_EVENTS += 1
+    payload = {
+        "sessionId": _SM90_MXFP8_DENSE_DEBUG_SESSION,
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": f"[DEBUG] {msg}",
+        "data": data,
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
+
+
+def _infer_sm90_mxfp8_gran_k_from_scale(
+    scale: torch.Tensor,
+    k: int,
+    *,
+    preferred_gran_k: Optional[int] = None,
+) -> int:
+    def expected_last_dim(gran_k: int) -> int:
+        pack_factor = 4 if scale.dtype == torch.int32 else 1
+        return (k + gran_k * pack_factor - 1) // (gran_k * pack_factor)
+
+    candidates = (32, 128)
+    if preferred_gran_k in candidates and scale.shape[-1] == expected_last_dim(
+        preferred_gran_k
+    ):
+        return preferred_gran_k
+    for gran_k in candidates:
+        if scale.shape[-1] == expected_last_dim(gran_k):
+            return gran_k
+    raise RuntimeError(
+        "Unable to infer SM90 MXFP8 activation gran_k from scale shape: "
+        f"scale_dtype={scale.dtype}, scale_shape={tuple(scale.shape)}, K={k}."
+    )
 
 
 class Fp8Config(QuantizationConfig):
@@ -861,7 +932,9 @@ class Fp8LinearMethod(LinearMethodBase):
             x_data, x_scale = x
             output_shape = (*x_data.shape[:-1], layer.weight.shape[0])
             x_2d = x_data.reshape(-1, x_data.shape[-1]).contiguous()
-            x_scale_2d = x_scale.reshape(x_2d.shape[0], -1).contiguous()
+            x_scale_2d = x_scale.reshape(x_2d.shape[0], -1)
+            if x_scale_2d.dtype != torch.int32:
+                x_scale_2d = x_scale_2d.contiguous()
         else:
             output_shape = (*x.shape[:-1], layer.weight.shape[0])
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
@@ -869,18 +942,38 @@ class Fp8LinearMethod(LinearMethodBase):
 
         m = x_2d.shape[0]
         n = layer.weight.shape[0]
+        k = x_2d.shape[-1]
         out = torch.empty((m, n), device=x_2d.device, dtype=torch.bfloat16)
         if m == 0:
             return out.reshape(output_shape)
 
         weight = layer.weight.unsqueeze(0)
         weight_scale = layer.weight_scale_inv.unsqueeze(0)
+        recipe_a = (1, _infer_sm90_mxfp8_gran_k_from_scale(x_scale_2d, k))
+        recipe_b = (1, _infer_sm90_mxfp8_gran_k_from_scale(weight_scale, k))
 
         # Decode/low-latency shapes are small and benefit from the masked kernel.
         # Use contiguous only for block-aligned normal/prefill shapes; otherwise
         # the single dense group can still hit the contiguous scheduler's tail
         # assumptions and corrupt the prefill state.
         use_masked = m <= 64 or m % 128 != 0
+        _sm90_mxfp8_debug_report(
+            "H5",
+            "fp8.py:_apply_sm90_mxfp8_deepgemm_linear:input",
+            "SM90 dense MXFP8 linear metadata",
+            {
+                "m": m,
+                "n": n,
+                "k": k,
+                "use_masked": use_masked,
+                "recipe_a": recipe_a,
+                "recipe_b": recipe_b,
+                "x": _sm90_mxfp8_debug_tensor_meta(x_2d),
+                "x_scale": _sm90_mxfp8_debug_tensor_meta(x_scale_2d),
+                "weight": _sm90_mxfp8_debug_tensor_meta(weight),
+                "weight_scale": _sm90_mxfp8_debug_tensor_meta(weight_scale),
+            },
+        )
         if use_masked:
             masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
             masked_m.fill_(m)
@@ -890,8 +983,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 out.unsqueeze(0),
                 masked_m,
                 expected_m=m,
-                recipe_a=(1, 32),
-                recipe_b=(1, 32),
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
             )
         else:
             m_indices = torch.empty((m,), device=x_2d.device, dtype=torch.int32)
@@ -901,8 +994,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 (weight, weight_scale),
                 out,
                 m_indices,
-                recipe_a=(1, 32),
-                recipe_b=(1, 32),
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
             )
 
         if bias is not None:
