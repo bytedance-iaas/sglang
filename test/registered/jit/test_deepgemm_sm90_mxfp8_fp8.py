@@ -37,6 +37,23 @@ def _e8m0_to_fp32(sf: torch.Tensor) -> torch.Tensor:
     return (sf.to(torch.int32) << 23).view(torch.float32)
 
 
+def _pack_ue8m0_u8_to_i32(sf: torch.Tensor) -> torch.Tensor:
+    padded_k = ((sf.shape[-1] + 3) // 4) * 4
+    if padded_k != sf.shape[-1]:
+        padded = torch.zeros(
+            (*sf.shape[:-1], padded_k), device=sf.device, dtype=torch.uint8
+        )
+        padded[..., : sf.shape[-1]] = sf
+        sf = padded
+    sf_i32 = sf.to(torch.int32).reshape(*sf.shape[:-1], sf.shape[-1] // 4, 4)
+    return (
+        sf_i32[..., 0]
+        | (sf_i32[..., 1] << 8)
+        | (sf_i32[..., 2] << 16)
+        | (sf_i32[..., 3] << 24)
+    ).contiguous()
+
+
 def _unpack_ue8m0_i32_to_u8(sf: torch.Tensor) -> torch.Tensor:
     sf_i32 = sf.to(torch.int32)
     return torch.stack(
@@ -91,13 +108,13 @@ def test_sm90_mxfp8_grouped_contiguous_wrapper_accuracy():
 
     from deep_gemm.utils.math import per_token_cast_to_fp8
 
-    groups, m_per_group, n, k = 2, 128, 48, 128
+    groups, m_per_group, n, k = 2, 128, 48, 512
     m = groups * m_per_group
     a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
 
-    a_data, a_sf_fp32 = per_token_cast_to_fp8(a_ref, use_ue8m0=True, gran_k=32)
-    a = (a_data, _e8m0_from_fp32_pow2(a_sf_fp32))
+    a_data, a_sf_fp32 = per_token_cast_to_fp8(a_ref, use_ue8m0=True, gran_k=128)
+    a = (a_data, _pack_ue8m0_u8_to_i32(_e8m0_from_fp32_pow2(a_sf_fp32)))
     b_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     b_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
     for group_id in range(groups):
@@ -109,10 +126,15 @@ def test_sm90_mxfp8_grouped_contiguous_wrapper_accuracy():
     grouped_layout = grouped_layout.repeat_interleave(m_per_group)
     d = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
-        a, (b_data, _e8m0_from_fp32_pow2(b_sf_fp32)), d, grouped_layout
+        a,
+        (b_data, _e8m0_from_fp32_pow2(b_sf_fp32)),
+        d,
+        grouped_layout,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
     )
 
-    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=32)
+    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=128)
     ref = torch.empty_like(d)
     for group_id in range(groups):
         start = group_id * m_per_group
@@ -130,18 +152,20 @@ def test_sm90_mxfp8_grouped_masked_wrapper_accuracy():
 
     from deep_gemm.utils.math import per_token_cast_to_fp8
 
-    groups, max_m, n, k = 2, 32, 48, 128
+    groups, max_m, n, k = 2, 32, 48, 512
     masked_m = torch.tensor([7, 19], device="cuda", dtype=torch.int32)
     a_ref = torch.randn((groups, max_m, k), device="cuda", dtype=torch.bfloat16)
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
 
     a_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
-    a_sf_fp32 = torch.empty((groups, max_m, k // 32), device="cuda", dtype=torch.float32)
+    a_sf_fp32 = torch.empty(
+        (groups, max_m, k // 128), device="cuda", dtype=torch.float32
+    )
     b_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     b_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
     for group_id in range(groups):
         a_data[group_id], a_sf_fp32[group_id] = per_token_cast_to_fp8(
-            a_ref[group_id], use_ue8m0=True, gran_k=32
+            a_ref[group_id], use_ue8m0=True, gran_k=128
         )
         b_data[group_id], b_sf_fp32[group_id] = per_token_cast_to_fp8(
             b_ref[group_id], use_ue8m0=True, gran_k=32
@@ -149,14 +173,16 @@ def test_sm90_mxfp8_grouped_masked_wrapper_accuracy():
 
     d = torch.empty((groups, max_m, n), device="cuda", dtype=torch.bfloat16)
     deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
-        (a_data, _e8m0_from_fp32_pow2(a_sf_fp32)),
+        (a_data, _pack_ue8m0_u8_to_i32(_e8m0_from_fp32_pow2(a_sf_fp32))),
         (b_data, _e8m0_from_fp32_pow2(b_sf_fp32)),
         d,
         masked_m,
         expected_m=max_m,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
     )
 
-    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=32)
+    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=128)
     ref = torch.zeros_like(d)
     for group_id, valid_m in enumerate(masked_m.tolist()):
         b_dequant = _cast_back_from_fp8_1d(
