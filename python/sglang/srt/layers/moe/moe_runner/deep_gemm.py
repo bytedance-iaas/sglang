@@ -1001,8 +1001,14 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    is_fp8_input = (
+        hidden_states_scale is not None and hidden_states.dtype != torch.bfloat16
+    )
+    if is_fp8_input:
+        # ep_scatter only writes real routed tokens. Keep per-expert padded rows as
+        # zero activations so grouped GEMM never consumes uninitialized FP8 payloads.
+        input_tensor.zero_()
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or scale_ue8m0:
-        # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
@@ -1014,6 +1020,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device=hidden_states.device,
             dtype=torch.float32,
         )
+        if is_fp8_input:
+            input_tensor_scale.zero_()
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
