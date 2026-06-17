@@ -1051,6 +1051,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or scale_ue8m0,
         quant_block_size=128,
     )
+    valid_topk = topk_ids >= 0
+    m_indices.fill_(-1)
+    m_indices[output_index[valid_topk].to(torch.long)] = topk_ids[valid_topk].to(
+        torch.int32
+    )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
