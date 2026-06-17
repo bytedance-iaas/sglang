@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?([A-Za-z0-9_.-]*)?$")
+VLLM_UBUNTU2404_VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-ubuntu2404$")
 AUTO_TAG_SPECS = {"version", "today-nightly"}
 DEFAULT_VARIANT_RE = re.compile(r"^(latest|dev|nightly|nightly-[0-9a-f]{7,64}|nightly-dev-[0-9]{8}-[0-9a-f]{7,64}|v\d+\.\d+\.\d+(?:\.post\d+)?)$")
 
@@ -172,6 +173,58 @@ def resolve_tag_specs(
     return deduped
 
 
+def vllm_ubuntu2404_version_key(tag_name: str) -> tuple[int, int, int] | None:
+    match = VLLM_UBUNTU2404_VERSION_TAG_RE.fullmatch(tag_name)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return (int(major), int(minor), int(patch))
+
+
+def latest_vllm_ubuntu2404_version_tags(tags: Iterable[DockerTag]) -> list[str]:
+    names = {tag.name for tag in tags}
+    keyed_versions = [
+        (key, name)
+        for name in names
+        if (key := vllm_ubuntu2404_version_key(name)) is not None
+    ]
+    if not keyed_versions:
+        raise SystemExit("no vLLM ubuntu2404 version image tags found in source repository")
+
+    latest_key = max(key for key, _ in keyed_versions)
+    version_names = sorted(name for key, name in keyed_versions if key == latest_key)
+    latest_aliases = ["latest-ubuntu2404"] if "latest-ubuntu2404" in names else []
+    return sorted(set(latest_aliases + version_names))
+
+
+def resolve_vllm_tag_specs(
+    specs: Iterable[str],
+    docker_tags: Iterable[DockerTag],
+    *,
+    today: date,
+    timezone: ZoneInfo | None = None,
+) -> list[str]:
+    docker_tags = list(docker_tags)
+    resolved: list[str] = []
+    for spec in specs:
+        if spec == "version":
+            resolved.extend(latest_vllm_ubuntu2404_version_tags(docker_tags))
+        elif spec == "today-nightly":
+            # Docker Hub currently publishes vLLM nightly tags without an
+            # ubuntu2404 variant. Do not fall back to the default 22.04 nightly.
+            continue
+        else:
+            resolved.append(spec)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for tag in resolved:
+        if tag not in seen:
+            deduped.append(tag)
+            seen.add(tag)
+    return deduped
+
+
 def normalize_image_name(value: str, field_name: str) -> str:
     value = value.strip().rstrip("/")
     if not value:
@@ -283,10 +336,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--vllm-tags",
-        default="version,today-nightly",
+        default="version",
         help=(
             "Comma or newline separated vLLM tags to sync. Special values: "
-            "version, today-nightly."
+            "version, today-nightly. The automatic vLLM version selector uses "
+            "ubuntu2404 tags and does not fall back to 22.04 nightly tags."
         ),
     )
     parser.add_argument(
@@ -335,7 +389,7 @@ def main() -> None:
         ),
         vllm_source=args.vllm_source,
         vllm_repository=args.vllm_repository,
-        vllm_tags=resolve_tag_specs(
+        vllm_tags=resolve_vllm_tag_specs(
             vllm_tag_specs,
             vllm_docker_tags,
             today=today,

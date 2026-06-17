@@ -19,6 +19,7 @@ from sync_docker_images_to_volcengine import (
     build_imagetools_command,
     parse_tags,
     resolve_tag_specs,
+    resolve_vllm_tag_specs,
     tag_updated_date,
 )
 
@@ -114,6 +115,28 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
             [
                 "nightly",
                 "nightly-abcdef1",
+            ],
+        )
+
+    def test_resolves_vllm_ubuntu2404_version_tags_only(self) -> None:
+        tags = [
+            DockerTag("latest-ubuntu2404", "2026-06-13T01:49:50Z"),
+            DockerTag("v0.23.0-ubuntu2404", "2026-06-13T01:49:52Z"),
+            DockerTag("latest", "2026-06-13T00:36:44Z"),
+            DockerTag("v0.23.0", "2026-06-13T00:36:45Z"),
+            DockerTag("latest-x86_64-ubuntu2404", "2026-06-13T01:39:39Z"),
+            DockerTag("v0.23.0-x86_64-ubuntu2404", "2026-06-13T01:39:41Z"),
+            DockerTag("latest-cu129-ubuntu2404", "2026-06-13T02:30:42Z"),
+            DockerTag("v0.23.0-cu129-ubuntu2404", "2026-06-13T02:30:43Z"),
+            DockerTag("v0.22.1-ubuntu2404", "2026-06-05T08:34:55Z"),
+            DockerTag("nightly", "2026-06-17T06:16:46Z"),
+        ]
+
+        self.assertEqual(
+            resolve_vllm_tag_specs(["version"], tags, today=date(2026, 6, 17)),
+            [
+                "latest-ubuntu2404",
+                "v0.23.0-ubuntu2404",
             ],
         )
 
