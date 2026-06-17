@@ -284,6 +284,22 @@ class DSV4C4PrefixCache:
             device=self.device, non_blocking=True
         )
 
+    def reclaimable_tokens(self) -> int:
+        total = 0
+        referenced = set()
+        for key, _ in self.req_refs.values():
+            entry = self.cache.get(key)
+            if entry is not None:
+                referenced.update(int(x) for x in entry.host_indices.tolist() if x >= 0)
+
+        for entry in self.cache.values():
+            if entry.ref_count > 0:
+                continue
+            for idx in entry.host_indices.tolist():
+                if idx >= 0 and idx not in referenced:
+                    total += 1
+        return total
+
     def insert(
         self,
         req: Req,
@@ -550,6 +566,11 @@ class HiSparseCoordinator:
         evicted_indices = torch.unique(evicted_indices)
         self.mem_pool_host.free(evicted_indices)
         return int(evicted_indices.numel())
+
+    def dsv4_c4_host_reclaimable_tokens(self) -> Optional[int]:
+        if not self.is_dsv4_hisparse or self.host_radix_cache is not None:
+            return None
+        return self._c4_prefix_cache.reclaimable_tokens()
 
     def ensure_dsv4_c4_host_available(self, min_available_tokens: int) -> bool:
         """Try to make at least ``min_available_tokens`` C4 host slots available.

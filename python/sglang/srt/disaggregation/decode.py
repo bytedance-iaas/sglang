@@ -921,6 +921,12 @@ class DecodePreallocQueue:
             and hasattr(logical_allocator, "available_size")
             else None
         )
+        c4_host_reclaimable_tokens = (
+            coordinator.dsv4_c4_host_reclaimable_tokens()
+            if coordinator is not None
+            and hasattr(coordinator, "dsv4_c4_host_reclaimable_tokens")
+            else None
+        )
         eagle_draft_reserve_tokens = (
             self._hisparse_eagle_draft_logical_reserve_tokens()
         )
@@ -938,7 +944,8 @@ class DecodePreallocQueue:
             "full_evictable_tokens=%d, full_available_tokens=%s, "
             "logical_available_tokens=%s, swa_allocatable_tokens=%d, "
             "c4_host_allocatable_tokens=%s, c4_host_required_tokens=%d, "
-            "hisparse_req_budget=%s, eagle_draft_reserve_tokens=%d, "
+            "c4_host_reclaimable_tokens=%s, hisparse_req_budget=%s, "
+            "eagle_draft_reserve_tokens=%d, "
             "hisparse_avail=%s, hisparse_padded_buffer_size=%s, "
             "hisparse_top_k=%s, hisparse_device_buffer_size=%s, "
             "max_running_requests=%s, idle_admission_deadlock=%s, "
@@ -961,6 +968,7 @@ class DecodePreallocQueue:
             swa_allocatable_tokens,
             c4_host_allocatable_tokens,
             c4_host_required_tokens,
+            c4_host_reclaimable_tokens,
             hisparse_req_budget,
             eagle_draft_reserve_tokens,
             hisparse_avail,
@@ -1298,6 +1306,19 @@ class DecodePreallocQueue:
                         decode_req.req
                     )
                 )
+                if c4_host_required_tokens > c4_host_allocatable_tokens:
+                    c4_host_decode_reserve_tokens = (
+                        self._dsv4_c4_host_decode_reserve_tokens(
+                            c4_host_reserved_decode_reqs
+                        )
+                    )
+                    if self.scheduler.hisparse_coordinator.ensure_dsv4_c4_host_available(
+                        c4_host_required_tokens + c4_host_decode_reserve_tokens
+                    ):
+                        c4_host_allocatable_tokens = (
+                            self.scheduler.hisparse_coordinator.mem_pool_host.available_size()
+                            - c4_host_decode_reserve_tokens
+                        )
                 if c4_host_required_tokens > c4_host_allocatable_tokens:
                     if prefix_lock_acquired:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
