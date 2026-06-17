@@ -37,6 +37,55 @@ def _e8m0_to_fp32(sf: torch.Tensor) -> torch.Tensor:
     return (sf.to(torch.int32) << 23).view(torch.float32)
 
 
+def _unpack_ue8m0_i32_to_u8(sf: torch.Tensor) -> torch.Tensor:
+    sf_i32 = sf.to(torch.int32)
+    return torch.stack(
+        [
+            torch.bitwise_and(torch.bitwise_right_shift(sf_i32, shift), 0xFF).to(
+                torch.uint8
+            )
+            for shift in (0, 8, 16, 24)
+        ],
+        dim=-1,
+    ).reshape(*sf.shape[:-1], sf.shape[-1] * 4)
+
+
+def test_sm90_mxfp8_e8m0_rounding_helpers_match():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for SM90 MXFP8 rounding helper test")
+
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import _e8m0_fp32_to_u8
+    from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+        _cast_to_e8m0_with_rounding_up,
+    )
+
+    torch.manual_seed(0)
+    random_values = torch.exp2(
+        torch.empty((2, 3, 8), device="cuda", dtype=torch.float32).uniform_(-20, 20)
+    )
+    edge_values = torch.tensor(
+        [
+            0.0,
+            torch.finfo(torch.float32).tiny / 2,
+            torch.finfo(torch.float32).tiny,
+            1.0,
+            1.0 + 2**-24,
+            1.0 + 2**-10,
+            448.0,
+            57344.0,
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    ).reshape(1, 1, 8)
+    sf = torch.cat([random_values, edge_values.expand(2, 1, 8)], dim=1)
+
+    expected = _e8m0_fp32_to_u8(sf)
+    packed = _cast_to_e8m0_with_rounding_up(sf)
+    actual = _unpack_ue8m0_i32_to_u8(packed)[..., : sf.shape[-1]]
+
+    assert torch.equal(actual, expected)
+
+
 def test_sm90_mxfp8_grouped_contiguous_wrapper_accuracy():
     _require_sm90_mxfp8_grouped_gemm()
 
