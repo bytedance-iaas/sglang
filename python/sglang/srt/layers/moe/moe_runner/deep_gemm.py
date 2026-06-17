@@ -90,6 +90,23 @@ def _infer_mxfp8_gran_k_from_scale(
     )
 
 
+def _assert_mxfp8_scale_matches_recipe(
+    scale: torch.Tensor,
+    k: int,
+    recipe: Tuple[int, int],
+    location: str,
+) -> None:
+    gran_k = recipe[1]
+    pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+    expected_last_dim = ceil_div(k, gran_k * pack_factor)
+    assert scale.shape[-1] == expected_last_dim, (
+        f"MXFP8 scale/recipe mismatch at {location}: "
+        f"K={k}, recipe={recipe}, scale_dtype={scale.dtype}, "
+        f"scale_shape={tuple(scale.shape)}, scale_last_dim={scale.shape[-1]}, "
+        f"pack_factor={pack_factor}, expected_last_dim={expected_last_dim}"
+    )
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -359,13 +376,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
             )
 
+        recipe_a_down = (1, scale_block_size)
+        if use_sm90_mxfp8:
+            _assert_mxfp8_scale_matches_recipe(
+                down_input_scale,
+                down_input_fp8.shape[-1],
+                recipe_a_down,
+                "deep_gemm.py:_run_contiguous_gemm:down_input_scale",
+            )
+
         if use_sm90_mxfp8:
             deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
                 (down_input_fp8, down_input_scale),
                 w2_weight_fp8,
                 down_output,
                 m_indices,
-                recipe_a=(1, scale_block_size),
+                recipe_a=recipe_a_down,
                 recipe_b=recipe_b,
             )
         else:
@@ -634,6 +660,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
+        if use_mxfp8:
+            _assert_mxfp8_scale_matches_recipe(
+                down_input_scale,
+                down_input.shape[-1],
+                recipe_a_down,
+                "deep_gemm.py:_run_masked_gemm:down_input_scale",
+            )
+
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
@@ -661,7 +695,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_output,
                     masked_m,
                     expected_m,
-                    recipe_a=(1, scale_block_size),
+                    recipe_a=recipe_a_down,
                     recipe_b=recipe_b,
                 )
             )
