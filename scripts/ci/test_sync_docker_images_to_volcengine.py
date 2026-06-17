@@ -56,9 +56,9 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
             ["latest", "nightly", "latest-cu130"],
         )
 
-    def test_resolves_latest_version_family(self) -> None:
+    def test_resolves_default_latest_version_tags_only(self) -> None:
         tags = [
-            DockerTag("nightly-dev-20260616-abc", "2026-06-16T01:53:18Z"),
+            DockerTag("nightly-dev-20260616-abcdef1", "2026-06-16T01:53:18Z"),
             DockerTag("latest", "2026-06-15T08:39:02Z"),
             DockerTag("v0.5.13.post1", "2026-06-15T08:39:01Z"),
             DockerTag("latest-cu130", "2026-06-15T08:39:06Z"),
@@ -72,18 +72,14 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
             resolve_tag_specs(["version"], tags, today=date(2026, 6, 16)),
             [
                 "latest",
-                "latest-cu130",
-                "latest-runtime",
                 "v0.5.13.post1",
-                "v0.5.13.post1-cu130",
-                "v0.5.13.post1-runtime",
             ],
         )
 
-    def test_resolves_today_nightly_and_daily_alias_tags(self) -> None:
+    def test_resolves_default_today_nightly_tags_only(self) -> None:
         tags = [
-            DockerTag("nightly-dev-cu13-20260616-abc", "2026-06-16T01:53:20Z"),
-            DockerTag("nightly-dev-20260616-abc", "2026-06-16T01:53:18Z"),
+            DockerTag("nightly-dev-cu13-20260616-abcdef1", "2026-06-16T01:53:20Z"),
+            DockerTag("nightly-dev-20260616-abcdef1", "2026-06-16T01:53:18Z"),
             DockerTag("dev-cu13", "2026-06-16T01:53:17Z"),
             DockerTag("dev", "2026-06-16T01:53:15Z"),
             DockerTag("nightly-dev-cu12-20260615-old", "2026-06-15T01:53:12Z"),
@@ -95,13 +91,29 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
                 ["today-nightly"],
                 tags,
                 today=date(2026, 6, 16),
-                daily_aliases={"dev", "dev-cu12", "dev-cu13"},
+                daily_aliases={"dev"},
             ),
             [
                 "dev",
-                "dev-cu13",
-                "nightly-dev-20260616-abc",
-                "nightly-dev-cu13-20260616-abc",
+                "nightly-dev-20260616-abcdef1",
+            ],
+        )
+
+    def test_resolves_default_vllm_today_nightly_tags_only(self) -> None:
+        tags = [
+            DockerTag("cu129-nightly-abcdef1", "2026-06-16T06:28:48Z"),
+            DockerTag("cu129-nightly", "2026-06-16T06:28:46Z"),
+            DockerTag("nightly-abcdef1", "2026-06-16T06:15:25Z"),
+            DockerTag("nightly", "2026-06-16T06:15:24Z"),
+            DockerTag("nightly-aarch64", "2026-06-16T06:15:21Z"),
+            DockerTag("nightly-x86_64", "2026-06-16T06:05:25Z"),
+        ]
+
+        self.assertEqual(
+            resolve_tag_specs(["today-nightly"], tags, today=date(2026, 6, 16)),
+            [
+                "nightly",
+                "nightly-abcdef1",
             ],
         )
 

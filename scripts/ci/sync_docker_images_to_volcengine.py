@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?([A-Za-z0-9_.-]*)?$")
 AUTO_TAG_SPECS = {"version", "today-nightly"}
+DEFAULT_VARIANT_RE = re.compile(r"^(latest|dev|nightly|nightly-[0-9a-f]{7,64}|nightly-dev-[0-9]{8}-[0-9a-f]{7,64}|v\d+\.\d+\.\d+(?:\.post\d+)?)$")
 
 
 @dataclass(frozen=True)
@@ -87,20 +88,15 @@ def latest_version_tags(tags: Iterable[DockerTag]) -> list[str]:
     keyed_versions = [
         (key, name)
         for name in names
-        if (key := version_key(name.removesuffix(""))) is not None
+        if DEFAULT_VARIANT_RE.fullmatch(name)
+        and (key := version_key(name.removesuffix(""))) is not None
     ]
     if not keyed_versions:
         raise SystemExit("no version image tags found in source repository")
 
     latest_key = max(key for key, _ in keyed_versions)
     version_names = sorted(name for key, name in keyed_versions if key == latest_key)
-    version_prefix = min(version_names, key=len)
-    latest_aliases = []
-    for name in version_names:
-        suffix = name.removeprefix(version_prefix)
-        alias = f"latest{suffix}"
-        if alias in names:
-            latest_aliases.append(alias)
+    latest_aliases = ["latest"] if "latest" in names else []
     return sorted(set(latest_aliases + version_names))
 
 
@@ -135,6 +131,7 @@ def today_nightly_tags(
         for tag in tags
         if tag_updated_date(tag, timezone) == today
         and ("nightly" in tag.name or tag.name in daily_aliases)
+        and DEFAULT_VARIANT_RE.fullmatch(tag.name)
     }
     if not selected:
         raise SystemExit(f"no today-nightly image tags found for {today.isoformat()}")
