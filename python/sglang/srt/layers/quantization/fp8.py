@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -12,7 +14,11 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -146,6 +152,54 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+_SM90_MXFP8_WEIGHT_FORMAT_DEBUG_EVENTS = 0
+
+
+def _sm90_mxfp8_weight_format_debug_enabled() -> bool:
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG") != "1":
+        return False
+    try:
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_weight_format_tensor_meta(t: Optional[torch.Tensor]) -> dict:
+    if t is None:
+        return {"is_none": True}
+    if isinstance(t, Parameter):
+        t = t.data
+    return {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "device": str(t.device),
+        "numel": t.numel(),
+    }
+
+
+def _sm90_mxfp8_weight_format_debug_report(
+    location: str,
+    msg: str,
+    data: dict,
+) -> None:
+    global _SM90_MXFP8_WEIGHT_FORMAT_DEBUG_EVENTS
+    if not _sm90_mxfp8_weight_format_debug_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
+    if _SM90_MXFP8_WEIGHT_FORMAT_DEBUG_EVENTS >= max_events:
+        return
+    _SM90_MXFP8_WEIGHT_FORMAT_DEBUG_EVENTS += 1
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H7",
+        "location": location,
+        "msg": f"[DEBUG] {msg}",
+        "data": data,
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def _infer_sm90_mxfp8_gran_k_from_scale(
@@ -742,6 +796,20 @@ class Fp8LinearMethod(LinearMethodBase):
         else:
             # Triton path consumes canonical 2D UE8M0 uint8 scales directly.
             return
+        _sm90_mxfp8_weight_format_debug_report(
+            "fp8.py:Fp8LinearMethod._process_mxfp8_linear_weight_scale:weight_format",
+            "SM90 MXFP8 dense linear weight format after loading",
+            {
+                "layer_type": layer.__class__.__name__,
+                "weight": _sm90_mxfp8_weight_format_tensor_meta(layer.weight.data),
+                "weight_scale_inv": _sm90_mxfp8_weight_format_tensor_meta(
+                    layer.weight_scale_inv.data
+                ),
+                "weight_scale_inv_deepgemm": _sm90_mxfp8_weight_format_tensor_meta(
+                    getattr(layer, "weight_scale_inv_deepgemm", None)
+                ),
+            },
+        )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -1942,6 +2010,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv.format_ue8m0 = True
         layer.w13_input_scale = None
         layer.w2_input_scale = None
+        if self.use_mxfp8 and get_moe_runner_backend().is_deep_gemm():
+            _sm90_mxfp8_weight_format_debug_report(
+                "fp8.py:Fp8MoEMethod.process_weights_after_loading_block_quant:weight_format",
+                "SM90 MXFP8 MoE expert weight format after loading",
+                {
+                    "layer_type": layer.__class__.__name__,
+                    "w13_weight": _sm90_mxfp8_weight_format_tensor_meta(
+                        layer.w13_weight.data
+                    ),
+                    "w13_scale": _sm90_mxfp8_weight_format_tensor_meta(
+                        layer.w13_weight_scale_inv.data
+                    ),
+                    "w2_weight": _sm90_mxfp8_weight_format_tensor_meta(
+                        layer.w2_weight.data
+                    ),
+                    "w2_scale": _sm90_mxfp8_weight_format_tensor_meta(
+                        layer.w2_weight_scale_inv.data
+                    ),
+                    "use_sm90_deepgemm_mxfp8": use_sm90_deepgemm_mxfp8,
+                },
+            )
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
