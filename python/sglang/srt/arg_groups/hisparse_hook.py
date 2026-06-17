@@ -90,13 +90,13 @@ def _validate_dsv4_hisparse_megamoe(server_args: "ServerArgs") -> None:
         )
         required_cap = graph_bs * draft_tokens
         if required_cap > cap:
-            raise ValueError(
-                "DSV4 HiSparse MegaMoE graph capture requires "
+            logger.warning(
+                "DSV4 HiSparse MegaMoE graph capture may exceed "
                 "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK >= "
                 f"cuda_graph_max_bs * speculative_num_draft_tokens "
                 f"({graph_bs} * {draft_tokens} = {required_cap}), but got {cap}. "
-                "Raise the env var or lower --cuda-graph-max-bs / "
-                "--speculative-num-draft-tokens."
+                "MegaMoE will fall back at runtime when the per-rank token cap "
+                "is exceeded; raise the env var for full MegaMoE coverage."
             )
 
 
