@@ -148,7 +148,7 @@ class OfflinePPStateOffloadManager:
         self.prefetch_stream = device_module.Stream()
         self.device_module = device_module
 
-        self.layer_num = self.kv_cache.layer_num
+        self.layer_num = self._infer_layer_num()
 
         # Wave registry.
         self._next_wave_id = 0
@@ -169,6 +169,39 @@ class OfflinePPStateOffloadManager:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    def _infer_layer_num(self) -> int:
+        """Best-effort layer count for logging and future layer-wise hooks.
+
+        Most KV pools expose ``layer_num`` directly. Hybrid linear pools compose
+        full-attention KV layers with mamba state layers and expose the counts on
+        their sub-pools instead.
+        """
+        layer_num = getattr(self.kv_cache, "layer_num", None)
+        if layer_num is not None:
+            return layer_num
+
+        transfer_layer_num = getattr(self.kv_cache, "transfer_layer_num", None)
+        if transfer_layer_num is not None:
+            return transfer_layer_num
+
+        full_layer_num = getattr(self.kv_cache, "full_layer_nums", None)
+        mamba_pool = getattr(self.kv_cache, "mamba_pool", None)
+        mamba_layer_num = getattr(mamba_pool, "num_mamba_layers", None)
+        if full_layer_num is not None or mamba_layer_num is not None:
+            return (full_layer_num or 0) + (mamba_layer_num or 0)
+
+        full_kv_pool = getattr(self.kv_cache, "full_kv_pool", None)
+        layer_num = getattr(full_kv_pool, "layer_num", None)
+        if layer_num is not None:
+            return layer_num
+
+        logger.warning(
+            "Unable to infer KV cache layer count for offline PP offload "
+            "(kv_cache=%s); continuing with layer_num=0.",
+            type(self.kv_cache).__name__,
+        )
+        return 0
+
     def tick(self) -> None:
         """Advance the logical scheduler clock (called once per scheduler loop)."""
         self._tick += 1

@@ -126,6 +126,16 @@ def _manager(*, kv_allocator=None, req_pool=None):
     return mgr
 
 
+def test_infer_layer_num_from_hybrid_linear_pool_shape():
+    mgr = OfflinePPStateOffloadManager.__new__(OfflinePPStateOffloadManager)
+    mgr.kv_cache = SimpleNamespace(
+        full_layer_nums=12,
+        mamba_pool=SimpleNamespace(num_mamba_layers=16),
+    )
+
+    assert mgr._infer_layer_num() == 28
+
+
 def test_admit_wave_split_preserves_cpu_state():
     mgr = _manager(kv_allocator=_FakeKVAllocator(size=20))
     reqs = [_req("r0", 3), _req("r1", 3), _req("r2", 3)]
