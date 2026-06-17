@@ -209,3 +209,42 @@ def test_sm90_mxfp8_dense_linear_uses_grouped_kernel_accuracy(m):
     ref = (x_dequant @ w_dequant.t()).to(torch.bfloat16)
 
     assert _calc_diff(out, ref) < 0.03
+
+
+@pytest.mark.parametrize("m,n,k", [(65, 256, 7168), (181, 128, 7168)])
+def test_sm90_mxfp8_dense_linear_masked_large_k_accuracy(m, n, k):
+    _require_sm90_mxfp8_grouped_gemm()
+
+    from deep_gemm.utils.math import per_token_cast_to_fp8
+
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    w_ref = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    w_data, w_sf_fp32 = per_token_cast_to_fp8(w_ref, use_ue8m0=True, gran_k=32)
+
+    layer = nn.Module()
+    layer.weight = nn.Parameter(w_data, requires_grad=False)
+    layer.weight_scale_inv = nn.Parameter(
+        _e8m0_from_fp32_pow2(w_sf_fp32), requires_grad=False
+    )
+
+    config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[1, 32],
+        use_mxfp8=True,
+    )
+    quant_method = Fp8LinearMethod(config)
+    assert quant_method.use_sm90_mxfp8_deepgemm_linear
+    assert m <= 64 or m % 128 != 0
+
+    out = quant_method.apply(layer, x)
+
+    x_data, x_sf_u8 = mxfp8_group_quantize(x.contiguous())
+    x_dequant = _cast_back_from_fp8_1d(x_data, _e8m0_to_fp32(x_sf_u8), gran_k=32)
+    w_dequant = _cast_back_from_fp8_1d(w_data, w_sf_fp32, gran_k=32)
+    ref = (x_dequant @ w_dequant.t()).to(torch.bfloat16)
+
+    assert _calc_diff(out, ref) < 0.03
