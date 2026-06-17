@@ -2386,6 +2386,11 @@ class HiSparseCoordinator:
             )
         req_pool_indices = req_pool_indices[:num_reqs]
 
+        # Non-graph decode defers the C4 backup wait until the next real host
+        # read. CUDA graph replay still waits in ModelRunner before replay, so
+        # this is a no-op there unless a backup was posted after that point.
+        self.wait_for_pending_backup()
+
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
         self._maybe_log_c4_swap_in_sample(

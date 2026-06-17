@@ -3221,7 +3221,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.hisparse_coordinator is not None
         ):
             forward_batch.hisparse_coordinator = self.hisparse_coordinator
-            self.hisparse_coordinator.wait_for_pending_backup()
+            if can_run_graph:
+                self.hisparse_coordinator.wait_for_pending_backup()
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         # Replay cuda graph if applicable
