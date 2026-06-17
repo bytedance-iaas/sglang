@@ -1172,6 +1172,16 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.cat(self.free_group))
+            self.free_group = []
+
     def backup_state(self):
         return (
             self._FULL_STATE_TAG,
@@ -1252,6 +1262,16 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._logical_full_page_live[live_pages] = False
         return live_pages * self.logical_page_size
 
+    def _assert_allocator_accounting(self) -> None:
+        assert (
+            self.logical_attn_allocator.available_size()
+            <= self.logical_attn_allocator.size
+        )
+        assert (
+            self.hisparse_attn_allocator.available_size()
+            <= self.hisparse_attn_allocator.size
+        )
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -1263,11 +1283,4 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )
+        self._assert_allocator_accounting()
