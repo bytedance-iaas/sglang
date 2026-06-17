@@ -140,6 +140,53 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
             ],
         )
 
+    def test_resolves_vllm_default_version_tags_when_ubuntu2404_is_unavailable(
+        self,
+    ) -> None:
+        tags = [
+            DockerTag("latest", "2026-06-13T00:36:44Z"),
+            DockerTag("v0.23.0", "2026-06-13T00:36:45Z"),
+            DockerTag("latest-x86_64", "2026-06-13T01:39:39Z"),
+            DockerTag("v0.23.0-x86_64", "2026-06-13T01:39:41Z"),
+            DockerTag("latest-cu129", "2026-06-13T02:30:42Z"),
+            DockerTag("v0.23.0-cu129", "2026-06-13T02:30:43Z"),
+            DockerTag("v0.22.1", "2026-06-05T08:34:55Z"),
+        ]
+
+        self.assertEqual(
+            resolve_vllm_tag_specs(["version"], tags, today=date(2026, 6, 17)),
+            [
+                "latest",
+                "v0.23.0",
+            ],
+        )
+
+    def test_resolves_vllm_ubuntu2404_version_and_default_today_nightly_tags(self) -> None:
+        tags = [
+            DockerTag("latest-ubuntu2404", "2026-06-13T01:49:50Z"),
+            DockerTag("v0.23.0-ubuntu2404", "2026-06-13T01:49:52Z"),
+            DockerTag("latest", "2026-06-13T00:36:44Z"),
+            DockerTag("v0.23.0", "2026-06-13T00:36:45Z"),
+            DockerTag("cu129-nightly-abcdef1", "2026-06-17T06:28:48Z"),
+            DockerTag("cu129-nightly", "2026-06-17T06:28:46Z"),
+            DockerTag("nightly-abcdef1", "2026-06-17T06:15:25Z"),
+            DockerTag("nightly", "2026-06-17T06:15:24Z"),
+            DockerTag("nightly-aarch64", "2026-06-17T06:15:21Z"),
+            DockerTag("nightly-x86_64", "2026-06-17T06:05:25Z"),
+        ]
+
+        self.assertEqual(
+            resolve_vllm_tag_specs(
+                ["version", "today-nightly"], tags, today=date(2026, 6, 17)
+            ),
+            [
+                "latest-ubuntu2404",
+                "v0.23.0-ubuntu2404",
+                "nightly",
+                "nightly-abcdef1",
+            ],
+        )
+
     def test_tag_updated_date_accepts_non_six_digit_fraction(self) -> None:
         self.assertEqual(
             tag_updated_date(

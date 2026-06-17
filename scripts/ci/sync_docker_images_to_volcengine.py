@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?([A-Za-z0-9_.-]*)?$")
 VLLM_UBUNTU2404_VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-ubuntu2404$")
+VLLM_UBUNTU2404_NIGHTLY_TAG_RE = re.compile(
+    r"^(nightly|nightly-[0-9a-f]{7,64})-ubuntu2404$"
+)
 AUTO_TAG_SPECS = {"version", "today-nightly"}
 DEFAULT_VARIANT_RE = re.compile(r"^(latest|dev|nightly|nightly-[0-9a-f]{7,64}|nightly-dev-[0-9]{8}-[0-9a-f]{7,64}|v\d+\.\d+\.\d+(?:\.post\d+)?)$")
 
@@ -181,7 +184,7 @@ def vllm_ubuntu2404_version_key(tag_name: str) -> tuple[int, int, int] | None:
     return (int(major), int(minor), int(patch))
 
 
-def latest_vllm_ubuntu2404_version_tags(tags: Iterable[DockerTag]) -> list[str]:
+def latest_vllm_version_tags(tags: Iterable[DockerTag]) -> list[str]:
     names = {tag.name for tag in tags}
     keyed_versions = [
         (key, name)
@@ -189,12 +192,33 @@ def latest_vllm_ubuntu2404_version_tags(tags: Iterable[DockerTag]) -> list[str]:
         if (key := vllm_ubuntu2404_version_key(name)) is not None
     ]
     if not keyed_versions:
-        raise SystemExit("no vLLM ubuntu2404 version image tags found in source repository")
+        return latest_version_tags(tags)
 
     latest_key = max(key for key, _ in keyed_versions)
     version_names = sorted(name for key, name in keyed_versions if key == latest_key)
     latest_aliases = ["latest-ubuntu2404"] if "latest-ubuntu2404" in names else []
     return sorted(set(latest_aliases + version_names))
+
+
+def today_vllm_nightly_tags(
+    tags: Iterable[DockerTag],
+    *,
+    today: date,
+    timezone: ZoneInfo | None = None,
+) -> list[str]:
+    tags = list(tags)
+    timezone = timezone or ZoneInfo("Asia/Shanghai")
+    ubuntu2404_tags = sorted(
+        {
+            tag.name
+            for tag in tags
+            if tag_updated_date(tag, timezone) == today
+            and VLLM_UBUNTU2404_NIGHTLY_TAG_RE.fullmatch(tag.name)
+        }
+    )
+    if ubuntu2404_tags:
+        return ubuntu2404_tags
+    return today_nightly_tags(tags, today=today, timezone=timezone)
 
 
 def resolve_vllm_tag_specs(
@@ -208,11 +232,15 @@ def resolve_vllm_tag_specs(
     resolved: list[str] = []
     for spec in specs:
         if spec == "version":
-            resolved.extend(latest_vllm_ubuntu2404_version_tags(docker_tags))
+            resolved.extend(latest_vllm_version_tags(docker_tags))
         elif spec == "today-nightly":
-            # Docker Hub currently publishes vLLM nightly tags without an
-            # ubuntu2404 variant. Do not fall back to the default 22.04 nightly.
-            continue
+            resolved.extend(
+                today_vllm_nightly_tags(
+                    docker_tags,
+                    today=today,
+                    timezone=timezone,
+                )
+            )
         else:
             resolved.append(spec)
 
@@ -336,11 +364,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--vllm-tags",
-        default="version",
+        default="version,today-nightly",
         help=(
             "Comma or newline separated vLLM tags to sync. Special values: "
-            "version, today-nightly. The automatic vLLM version selector uses "
-            "ubuntu2404 tags and does not fall back to 22.04 nightly tags."
+            "version, today-nightly. The automatic vLLM selector prefers "
+            "ubuntu2404 tags and falls back to unsuffixed tags when no "
+            "ubuntu2404 tag exists for that image family."
         ),
     )
     parser.add_argument(

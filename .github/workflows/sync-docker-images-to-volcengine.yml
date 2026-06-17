@@ -20,9 +20,9 @@ on:
         required: false
         default: "docker.io/vllm/vllm-openai"
       vllm_tags:
-        description: "Comma or newline separated vLLM tags to sync. The automatic version selector uses Ubuntu 24.04 tags."
+        description: "Comma or newline separated vLLM tags to sync. Automatic selectors prefer Ubuntu 24.04 tags and fall back to unsuffixed tags when unavailable."
         required: false
-        default: "version"
+        default: "version,today-nightly"
       vllm_repository:
         description: "Destination vLLM repository inside the Volcengine CR namespace"
         required: false
@@ -56,7 +56,7 @@ jobs:
       SGLANG_TAGS: ${{ inputs.sglang_tags || 'version,today-nightly' }}
       SGLANG_REPOSITORY: ${{ inputs.sglang_repository || vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
       VLLM_SOURCE: ${{ inputs.vllm_source || 'docker.io/vllm/vllm-openai' }}
-      VLLM_TAGS: ${{ inputs.vllm_tags || 'version' }}
+      VLLM_TAGS: ${{ inputs.vllm_tags || 'version,today-nightly' }}
       VLLM_REPOSITORY: ${{ inputs.vllm_repository || vars.VOLCENGINE_CR_VLLM_REPOSITORY || 'vllm' }}
       SYNC_PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
     steps:
