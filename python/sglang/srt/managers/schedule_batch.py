@@ -1091,6 +1091,23 @@ class Req(ReqDllmMixin):
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
+        if envs.SGLANG_DEBUG_RADIX_PREFIX_HIT.get():
+            prefix_len = len(self.prefix_indices)
+            fill_len = len(self.fill_ids)
+            logger.warning(
+                "[radix-prefix-debug] init_next_round_input rid=%s prefix_len=%s "
+                "fill_len=%s extend_input_len=%s aligned64=%s "
+                "cache_protected_len=%s last_node=%s host_hit_length=%s",
+                getattr(self, "rid", None),
+                prefix_len,
+                fill_len,
+                self.extend_input_len,
+                prefix_len % 64 == 0,
+                getattr(self, "cache_protected_len", None),
+                id(self.last_node) if self.last_node is not None else None,
+                getattr(self, "host_hit_length", None),
+            )
+
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
@@ -1761,6 +1778,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+
+        if envs.SGLANG_DEBUG_RADIX_PREFIX_HIT.get():
+            for i, r in enumerate(reqs):
+                prefix_len = prefix_lens[i]
+                logger.warning(
+                    "[radix-prefix-debug] prepare_for_extend batch_size=%s idx=%s "
+                    "rid=%s prefix_len=%s fill_len=%s input_len=%s "
+                    "extend_len=%s req_extend_input_len=%s aligned64=%s "
+                    "cache_protected_len=%s last_node=%s",
+                    len(reqs),
+                    i,
+                    getattr(r, "rid", None),
+                    prefix_len,
+                    len(r.fill_ids),
+                    len(input_ids[i]),
+                    extend_lens[i],
+                    getattr(r, "extend_input_len", None),
+                    prefix_len % 64 == 0,
+                    getattr(r, "cache_protected_len", None),
+                    id(r.last_node) if r.last_node is not None else None,
+                )
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(

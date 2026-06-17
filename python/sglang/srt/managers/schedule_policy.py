@@ -118,6 +118,24 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
+
+    if envs.SGLANG_DEBUG_RADIX_PREFIX_HIT.get():
+        prefix_len = len(req.prefix_indices)
+        fill_len = len(token_ids)
+        logger.warning(
+            "[radix-prefix-debug] match_prefix_for_req rid=%s prefix_len=%s "
+            "fill_len=%s extend_len=%s aligned64=%s extra_key=%r "
+            "last_node=%s host_hit_length=%s cache_protected_len=%s",
+            getattr(req, "rid", None),
+            prefix_len,
+            fill_len,
+            fill_len - prefix_len,
+            prefix_len % 64 == 0,
+            getattr(req, "extra_key", None),
+            id(req.last_node) if req.last_node is not None else None,
+            getattr(req, "host_hit_length", None),
+            getattr(req, "cache_protected_len", None),
+        )
     return match_result
 
 
