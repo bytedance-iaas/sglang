@@ -1,13 +1,11 @@
-import json
 import logging
-import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
@@ -67,102 +65,6 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
-def _sm90_mxfp8_sampler_debug_enabled() -> bool:
-    return (
-        os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
-        and os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") == "1"
-        and get_tensor_model_parallel_rank() == 0
-    )
-
-
-def _sm90_mxfp8_sampler_debug_topk(logits: torch.Tensor, top_k: int = 10) -> dict:
-    meta = {
-        "shape": list(logits.shape),
-        "stride": list(logits.stride()),
-        "dtype": str(logits.dtype),
-        "is_contiguous": logits.is_contiguous(),
-        "numel": logits.numel(),
-        "device": str(logits.device),
-    }
-    if logits.is_cuda and torch.cuda.is_current_stream_capturing():
-        meta["topk_skipped"] = "cuda_graph_capture"
-        return meta
-    if logits.numel() == 0:
-        meta["topk_skipped"] = "empty"
-        return meta
-
-    logits_2d = (
-        logits.reshape(1, -1)
-        if logits.dim() == 1
-        else logits.reshape(-1, logits.shape[-1])
-    )
-    first_row = logits_2d[0].float()
-    k = min(top_k, first_row.numel())
-    values, indices = torch.topk(first_row, k=k)
-    top1_values, top1_indices = torch.topk(
-        logits_2d[: min(logits_2d.shape[0], 8)].float(), k=1, dim=-1
-    )
-    sample = logits.reshape(-1)[: min(logits.numel(), 4096)].float()
-    meta.update(
-        {
-            "sample_mean": float(sample.mean().item()),
-            "sample_absmax": float(sample.abs().max().item()),
-            "sample_isfinite": bool(torch.isfinite(sample).all().item()),
-            "row_count": logits_2d.shape[0],
-            "vocab_size": logits_2d.shape[-1],
-            "first_row_top_ids": [int(x) for x in indices.detach().cpu().tolist()],
-            "first_row_top_values": [
-                float(x) for x in values.detach().cpu().tolist()
-            ],
-            "first_rows_top1_ids": [
-                int(x) for x in top1_indices.reshape(-1).detach().cpu().tolist()
-            ],
-            "first_rows_top1_values": [
-                float(x) for x in top1_values.reshape(-1).detach().cpu().tolist()
-            ],
-        }
-    )
-    return meta
-
-
-def _sm90_mxfp8_sampler_debug_report(
-    location: str,
-    logits: torch.Tensor,
-    sampling_info: SamplingBatchInfo,
-    positions: torch.Tensor,
-    batch_next_token_ids: Optional[torch.Tensor] = None,
-) -> None:
-    if not _sm90_mxfp8_sampler_debug_enabled():
-        return
-
-    def _small_num_list(t: Optional[torch.Tensor], limit: int = 16):
-        if t is None:
-            return None
-        return [
-            float(x) if t.dtype.is_floating_point else int(x)
-            for x in t.reshape(-1)[: min(t.numel(), limit)].detach().cpu().tolist()
-        ]
-
-    payload = {
-        "sessionId": "sm90-mxfp8-precision",
-        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
-        "hypothesisId": "H6",
-        "location": location,
-        "msg": "[DEBUG] SM90 sampler logits and selected token",
-        "data": {
-            "is_all_greedy": sampling_info.is_all_greedy,
-            "need_top_p_sampling": sampling_info.need_top_p_sampling,
-            "need_top_k_sampling": sampling_info.need_top_k_sampling,
-            "need_min_p_sampling": sampling_info.need_min_p_sampling,
-            "temperatures": _small_num_list(sampling_info.temperatures),
-            "positions": _small_num_list(positions),
-            "batch_next_token_ids": _small_num_list(batch_next_token_ids),
-            "logits_topk": _sm90_mxfp8_sampler_debug_topk(logits),
-        },
-    }
-    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
-
-
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -215,12 +117,6 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
-        _sm90_mxfp8_sampler_debug_report(
-            "sampler.py:Sampler.forward:pre_sample",
-            logits,
-            sampling_info,
-            positions,
-        )
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -312,13 +208,6 @@ class Sampler(nn.Module):
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
-        _sm90_mxfp8_sampler_debug_report(
-            "sampler.py:Sampler.forward:post_sample",
-            logits,
-            sampling_info,
-            positions,
-            batch_next_token_ids,
-        )
 
         return batch_next_token_ids
 

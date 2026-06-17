@@ -24,7 +24,6 @@ if ENABLE_JIT_DEEPGEMM:
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
-_SM90_MXFP8_FORMAT_DEBUG_EVENTS = 0
 _SM90_MXFP8_LOCAL_DIFF_EVENTS = 0
 
 
@@ -104,53 +103,6 @@ def _assert_sm90_mxfp8_scale_matches_recipe(
             f"scale_shape={tuple(scale.shape)}, pack_factor={pack_factor}, "
             f"expected_last_dim={expected_last_dim}."
         )
-
-
-def _sm90_mxfp8_format_debug_report(
-    location: str,
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
-    *,
-    recipe_a: Optional[Tuple[int, int]],
-    recipe_b: Optional[Tuple[int, int]],
-    extra: Optional[dict] = None,
-) -> None:
-    global _SM90_MXFP8_FORMAT_DEBUG_EVENTS
-    if not _sm90_mxfp8_format_debug_enabled():
-        return
-    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MAX_EVENTS", "64"))
-    if _SM90_MXFP8_FORMAT_DEBUG_EVENTS >= max_events:
-        return
-    _SM90_MXFP8_FORMAT_DEBUG_EVENTS += 1
-
-    lhs_x, lhs_sf = lhs
-    rhs_x, rhs_sf = rhs
-    k = lhs_x.shape[-1]
-    data = {
-        "lhs": _sm90_mxfp8_tensor_meta(lhs_x),
-        "lhs_scale": _sm90_mxfp8_tensor_meta(lhs_sf),
-        "rhs": _sm90_mxfp8_tensor_meta(rhs_x),
-        "rhs_scale": _sm90_mxfp8_tensor_meta(rhs_sf),
-        "recipe_a": list(recipe_a) if recipe_a is not None else None,
-        "recipe_b": list(recipe_b) if recipe_b is not None else None,
-        "lhs_scale_expected_last_dim": _sm90_mxfp8_scale_expected_last_dim(
-            lhs_sf, k, recipe_a
-        ),
-        "rhs_scale_expected_last_dim": _sm90_mxfp8_scale_expected_last_dim(
-            rhs_sf, k, recipe_b
-        ),
-    }
-    if extra is not None:
-        data.update(extra)
-    payload = {
-        "sessionId": "sm90-mxfp8-precision",
-        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
-        "hypothesisId": "H7",
-        "location": location,
-        "msg": "[DEBUG] SM90 MXFP8 grouped GEMM input format",
-        "data": data,
-    }
-    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def _sm90_mxfp8_local_diff_enabled() -> bool:
@@ -493,17 +445,6 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
     _assert_sm90_mxfp8_scale_matches_recipe(
         rhs[1], k, recipe_b, role="rhs"
     )
-    _sm90_mxfp8_format_debug_report(
-        "entrypoint.py:grouped_gemm_nt_mxfp8_f8f8bf16_masked:input_format",
-        lhs,
-        rhs,
-        recipe_a=recipe_a,
-        recipe_b=recipe_b,
-        extra={
-            "expected_m": expected_m,
-            "masked_m_shape": list(masked_m.shape),
-        },
-    )
 
     padded_expected_m = _ceil_align(max(lhs[0].shape[-2], expected_m), 128)
     lhs = _pad_sm90_mxfp8_lhs(lhs, padded_expected_m)
@@ -632,16 +573,6 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
     )
     _assert_sm90_mxfp8_scale_matches_recipe(
         rhs[1], k, recipe_b, role="rhs"
-    )
-    _sm90_mxfp8_format_debug_report(
-        "entrypoint.py:grouped_gemm_nt_mxfp8_f8f8bf16_contig:input_format",
-        lhs,
-        rhs,
-        recipe_a=recipe_a,
-        recipe_b=recipe_b,
-        extra={
-            "m_indices_shape": list(m_indices.shape),
-        },
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
