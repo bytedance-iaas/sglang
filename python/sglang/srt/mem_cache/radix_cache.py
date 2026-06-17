@@ -226,6 +226,7 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        self.c128_partial_state = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -410,6 +411,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
+        self._maybe_restore_c128_partial_state(last_node, value)
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -468,6 +470,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            new_indices, new_last_node = self._lookup_prefix_no_c128_restore(radix_key)
+            self._maybe_capture_c128_partial_state(
+                new_last_node,
+                new_indices,
+            )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
@@ -515,11 +522,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
+        new_indices, new_last_node = self._lookup_prefix_no_c128_restore(radix_key)
+        self._maybe_capture_c128_partial_state(new_last_node, new_indices)
         assert len(new_indices) == len(
             radix_key
         ), f"{len(new_indices)=}, {len(radix_key)=}"
@@ -678,6 +682,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.c128_partial_state = None
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -689,6 +694,35 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         return new_node
+
+    def _maybe_capture_c128_partial_state(
+        self, node: TreeNode, prefix_indices: torch.Tensor
+    ) -> None:
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        capture = getattr(kvcache, "capture_online_c128_prefix_state", None)
+        if capture is None:
+            return
+        node.c128_partial_state = capture(prefix_indices)
+
+    def _maybe_restore_c128_partial_state(
+        self, node: TreeNode, prefix_indices: torch.Tensor
+    ) -> None:
+        snapshots = getattr(node, "c128_partial_state", None)
+        if snapshots is None:
+            return
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        restore = getattr(kvcache, "restore_online_c128_prefix_state", None)
+        if restore is None:
+            return
+        restore(prefix_indices, snapshots)
+
+    def _lookup_prefix_no_c128_restore(
+        self, key: RadixKey
+    ) -> Tuple[torch.Tensor, TreeNode]:
+        value, last_node = self._match_prefix_helper(self.root_node, key)
+        if value:
+            return torch.cat(value), last_node
+        return self._empty_match_result.device_indices, last_node
 
     def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
         # Skip the hit count update for chunked requests to avoid self-referencing

@@ -513,6 +513,58 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
+    def _online_c128_prefix_state_loc(
+        self, prefix_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not ONLINE_C128 or self.full_to_swa_index_mapping is None:
+            return None
+
+        prefix_len = int(prefix_indices.numel())
+        if prefix_len == 0 or prefix_len % 128 == 0:
+            return None
+
+        chunk_start = (prefix_len - 1) // 128 * 128
+        full_loc = prefix_indices[chunk_start].to(torch.int64)
+        swa_loc = self.full_to_swa_index_mapping[full_loc]
+        return swa_loc // self.swa_page_size
+
+    def capture_online_c128_prefix_state(
+        self, prefix_indices: torch.Tensor
+    ) -> Optional[List[Tuple[int, torch.Tensor]]]:
+        state_loc = self._online_c128_prefix_state_loc(prefix_indices)
+        if state_loc is None:
+            return None
+
+        snapshots: List[Tuple[int, torch.Tensor]] = []
+        for pool_idx, pool in enumerate(self.compress_state_pools):
+            if pool is None or pool.ratio != 128:
+                continue
+            snapshots.append(
+                (
+                    pool_idx,
+                    pool.kv_score_buffer.kv_score[state_loc].detach().clone(),
+                )
+            )
+        return snapshots or None
+
+    def restore_online_c128_prefix_state(
+        self,
+        prefix_indices: torch.Tensor,
+        snapshots: Optional[List[Tuple[int, torch.Tensor]]],
+    ) -> None:
+        if snapshots is None:
+            return
+
+        state_loc = self._online_c128_prefix_state_loc(prefix_indices)
+        if state_loc is None:
+            return
+
+        for pool_idx, snapshot in snapshots:
+            pool = self.compress_state_pools[pool_idx]
+            if pool is None:
+                continue
+            pool.kv_score_buffer.kv_score[state_loc].copy_(snapshot)
+
     def set_swa_loc(self, loc: torch.Tensor) -> None:
         # No-op: SWAKVPool's set_swa_loc precomputes SWA-translated loc once per
         # forward batch for set_kv_buffer to read via self.swa_loc. DSV4 has its

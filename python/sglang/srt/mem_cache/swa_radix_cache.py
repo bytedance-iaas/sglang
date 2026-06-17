@@ -80,6 +80,7 @@ class TreeNode:
         self.host_value = None
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
+        self.c128_partial_state = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -465,6 +466,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     swa_evicted_seqlen=req.swa_evicted_seqlen,
                 )
             )
+            new_indices, new_last_node = self._lookup_prefix_no_c128_restore(radix_key)
+            self._maybe_capture_c128_partial_state(
+                new_last_node,
+                new_indices,
+            )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len]
@@ -515,11 +521,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
+        new_indices, new_last_node = self._lookup_prefix_no_c128_restore(radix_key)
+        self._maybe_capture_c128_partial_state(new_last_node, new_indices)
 
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
@@ -956,6 +959,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._maybe_restore_c128_partial_state(last_node, value)
 
         return MatchResult(
             device_indices=value,
@@ -1058,6 +1062,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         assert len(new_node.key) > 0, f"new_node.key should not be empty"
         new_node.value = child.value[:split_len].clone()
+        new_node.c128_partial_state = None
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
         child.swa_uuid = None
@@ -1235,6 +1240,36 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             self.swa_evictable_size_ += len(value)
         self._record_store_event(new_node)
         return new_node
+
+    def _maybe_capture_c128_partial_state(
+        self, node: TreeNode, prefix_indices: torch.Tensor
+    ) -> None:
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        capture = getattr(kvcache, "capture_online_c128_prefix_state", None)
+        if capture is None:
+            return
+        node.c128_partial_state = capture(prefix_indices)
+
+    def _maybe_restore_c128_partial_state(
+        self, node: TreeNode, prefix_indices: torch.Tensor
+    ) -> None:
+        snapshots = getattr(node, "c128_partial_state", None)
+        if snapshots is None:
+            return
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        restore = getattr(kvcache, "restore_online_c128_prefix_state", None)
+        if restore is None:
+            return
+        restore(prefix_indices, snapshots)
+
+    def _lookup_prefix_no_c128_restore(
+        self, key: RadixKey
+    ) -> Tuple[torch.Tensor, TreeNode]:
+        value, last_node, best_value_len = self._match_prefix_helper(key)
+        value = value[:best_value_len]
+        if value:
+            return torch.cat(value), last_node
+        return torch.empty((0,), dtype=torch.int64, device=self.device), last_node
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
