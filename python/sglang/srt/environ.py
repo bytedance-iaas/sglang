@@ -631,8 +631,10 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-    # HiSparse still needs a separate swap-in pass after raw top-k output.
-    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(False)
+    # HiSparse still needs a separate swap-in pass after raw top-k output, but
+    # topk_v2 avoids the old fixed-512/1024 path and can write raw indices into
+    # the preallocated swap-in buffer.
+    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(True)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
