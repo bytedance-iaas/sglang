@@ -417,10 +417,51 @@ class DeepseekV4AttnBackend(
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
         self.online_c128_mtp = OnlineC128MTPController(self)
+        self._log_hisparse_online_c128_mtp_state(model_runner)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def _log_hisparse_online_c128_mtp_state(self, model_runner: ModelRunner) -> None:
+        if not model_runner.enable_hisparse or not self.online_c128_mtp.enabled():
+            return
+
+        c128_state_layers = sum(
+            1
+            for pool in self.token_to_kv_pool.compress_state_pools
+            if pool is not None and pool.ratio == 128
+        )
+        state_slot_offset = self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
+        max_draft_tokens = self.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
+
+        if getattr(model_runner, "is_draft_worker", False):
+            logger.info(
+                "DSV4 HiSparse online C128 MTP draft runner initialized: "
+                "c128_state_layers=%d, draft_banks=%d.",
+                c128_state_layers,
+                max_draft_tokens,
+            )
+            return
+
+        if c128_state_layers > 0 and state_slot_offset <= 0:
+            raise RuntimeError(
+                "DSV4 HiSparse online C128 MTP target runner has C128 state "
+                "layers but no pending state-bank offset."
+            )
+        if max_draft_tokens <= 0:
+            raise RuntimeError(
+                "DSV4 HiSparse online C128 MTP target runner has no draft banks."
+            )
+
+        logger.warning(
+            "DSV4 HiSparse online C128 MTP target runner initialized: "
+            "c128_state_layers=%d, state_slot_offset=%d, draft_banks=%d. "
+            "C4 host mirror remains handled by HiSparseCoordinator.",
+            c128_state_layers,
+            state_slot_offset,
+            max_draft_tokens,
+        )
 
     def _target_verify_lengths_cpu(
         self, seq_lens_cpu: List[int], num_draft_tokens: int

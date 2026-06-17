@@ -100,6 +100,47 @@ def _validate_dsv4_hisparse_megamoe(server_args: "ServerArgs") -> None:
             )
 
 
+def _validate_dsv4_hisparse_online_c128_mtp(server_args: "ServerArgs") -> None:
+    """Validate the DSV4 HiSparse + online C128 MTP combination early."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        return
+
+    if server_args.speculative_algorithm is None:
+        return
+
+    if not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+        raise ValueError(
+            "DSV4 HiSparse online C128 with speculative decode requires "
+            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+        )
+
+    if server_args.speculative_algorithm != "EAGLE":
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP is currently only validated for "
+            f"EAGLE, got {server_args.speculative_algorithm!r}."
+        )
+
+    if server_args.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP requires "
+            f"--speculative-eagle-topk 1, got {server_args.speculative_eagle_topk}."
+        )
+
+    if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP requires "
+            "SGLANG_OPT_USE_COMPRESSOR_V2=1 because the v2 compressor carries "
+            "online state-slot metadata."
+        )
+
+    logger.warning(
+        "DSV4 HiSparse online C128 MTP enabled: C4 stays on HiSparse host "
+        "mirror; C128 uses online EAGLE state banks."
+    )
+
+
 def validate_hisparse(server_args: "ServerArgs") -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, NSA backend)."""
     if not server_args.enable_hisparse:
@@ -122,6 +163,7 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
     # radix is still not used for DSV4 HiSparse; C4 prefix reuse is handled by
     # HiSparseCoordinator.
     if is_v4_hisparse:
+        _validate_dsv4_hisparse_online_c128_mtp(server_args)
         _validate_dsv4_hisparse_megamoe(server_args)
         return
 
