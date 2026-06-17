@@ -483,6 +483,42 @@ class EICCacheController(HiCacheController):
 
         return eic_prefix_len
 
+    def write(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
+        """
+        Back up KV caches from device memory to host memory.
+        """
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+        self.write_queue.put(
+            EICCacheOperation(host_indices, device_indices, node_id, None, priority)
+        )
+        return host_indices
+
+    def load(
+        self,
+        host_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
+        """
+        Load KV caches from host memory to device memory.
+        """
+        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if device_indices is None:
+            return None
+        # to ensure the device indices are ready before accessed by another CUDA stream
+        torch.cuda.current_stream().synchronize()
+        self.load_queue.put(
+            EICCacheOperation(host_indices, device_indices, node_id, None, priority)
+        )
+        return device_indices
+
     def write_page(
         self,
         device_indices: torch.Tensor,

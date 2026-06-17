@@ -1144,6 +1144,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
                 continue
             fill_ids = req.origin_input_ids + req.output_ids
             req_tokens = fill_ids[: len(fill_ids) - 1]
+            if len(req_tokens) == 0:
+                logger.debug(
+                    f"req {req.rid} skip loading from eic: no committed tokens"
+                )
+                continue
             req_key = RadixKey(req_tokens, req.extra_key)
             local_prefix_len, local_evict_len, last_node = self._match_for_remote_fetch(
                 self.root_node, req_key
