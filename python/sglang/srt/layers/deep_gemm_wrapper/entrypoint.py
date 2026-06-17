@@ -188,8 +188,9 @@ def _sm90_mxfp8_diff_entry(
     b_deq: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    extra: Optional[dict] = None,
 ) -> dict:
-    return {
+    entry = {
         "group": group,
         "row": row,
         "cols": sample_cols,
@@ -206,6 +207,53 @@ def _sm90_mxfp8_diff_entry(
         "a_scale_u8_stats": _sm90_mxfp8_scale_byte_stats(a_scale),
         "b_scale_u8_stats": _sm90_mxfp8_scale_byte_stats(b_scale),
     }
+    if extra is not None:
+        entry.update(extra)
+    return entry
+
+
+def _sm90_mxfp8_best_group_match(
+    *,
+    a_deq: torch.Tensor,
+    actual: torch.Tensor,
+    rhs_x: torch.Tensor,
+    rhs_sf: torch.Tensor,
+    rhs_cols: torch.Tensor,
+    gran_k_b: int,
+    k: int,
+) -> dict:
+    best = None
+    for candidate_group in range(rhs_x.shape[0]):
+        b_deq = torch.stack(
+            [
+                _dequant_sm90_mxfp8_vector(
+                    rhs_x[candidate_group, col],
+                    rhs_sf[candidate_group, col],
+                    gran_k=gran_k_b,
+                    k=k,
+                )
+                for col in rhs_cols.tolist()
+            ],
+            dim=0,
+        )
+        ref = torch.matmul(b_deq, a_deq).to(torch.float32)
+        diff = (actual - ref).abs()
+        finite_diff = diff[torch.isfinite(diff)]
+        if finite_diff.numel() == 0:
+            max_abs_diff = float("nan")
+            mean_abs_diff = float("nan")
+            score = float("inf")
+        else:
+            max_abs_diff = float(finite_diff.max().item())
+            mean_abs_diff = float(finite_diff.mean().item())
+            score = mean_abs_diff
+        if best is None or score < best["best_group_mean_abs_diff"]:
+            best = {
+                "best_group": candidate_group,
+                "best_group_max_abs_diff": max_abs_diff,
+                "best_group_mean_abs_diff": mean_abs_diff,
+            }
+    return best if best is not None else {}
 
 
 def _sm90_mxfp8_local_diff_report(
@@ -280,6 +328,15 @@ def _sm90_mxfp8_local_diff_report(
                 ref = torch.matmul(b_deq, a_deq).to(torch.float32)
                 actual = out[row, :sample_cols].to(torch.float32)
                 diff = (actual - ref).abs()
+                best_group_match = _sm90_mxfp8_best_group_match(
+                    a_deq=a_deq,
+                    actual=actual,
+                    rhs_x=rhs_x,
+                    rhs_sf=rhs_sf,
+                    rhs_cols=rhs_cols,
+                    gran_k_b=gran_k_b,
+                    k=k,
+                )
                 diffs.append(
                     _sm90_mxfp8_diff_entry(
                         group=group,
@@ -294,6 +351,7 @@ def _sm90_mxfp8_local_diff_report(
                         b_deq=b_deq,
                         a_scale=lhs_sf[row],
                         b_scale=rhs_sf[group, rhs_cols],
+                        extra=best_group_match,
                     )
                 )
         else:
