@@ -4,11 +4,61 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 from tvm_ffi.module import Module
 
 from sglang.jit_kernel.dsv4.utils import make_name
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.environ import envs
+
+
+@triton.jit
+def _online_c128_mtp_prepare_kernel(
+    seq_lens_ptr,
+    req_pool_indices_ptr,
+    req_to_token_ptr,
+    full_to_swa_ptr,
+    main_state_ptr,
+    req_to_token_stride_b: tl.constexpr,
+    main_state_stride_b: tl.constexpr,
+    bs,
+    swa_page_size: tl.constexpr,
+    temp_state_slot_offset: tl.constexpr,
+    state_width: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    if bid >= bs:
+        return
+
+    d = tl.arange(0, block_d)
+    d_mask = d < state_width
+    seq_len = tl.load(seq_lens_ptr + bid).to(tl.int64)
+    has_partial = (seq_len > 0) & ((seq_len % 128) != 0)
+
+    chunk_start = tl.where(has_partial, ((seq_len - 1) // 128) * 128, 0)
+    req_idx = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
+    full_loc = tl.load(
+        req_to_token_ptr + req_idx * req_to_token_stride_b + chunk_start,
+        mask=has_partial,
+        other=0,
+    )
+    swa_loc = tl.load(full_to_swa_ptr + full_loc, mask=has_partial, other=0).to(
+        tl.int64
+    )
+    slot = tl.where(has_partial, swa_loc // swa_page_size, 0)
+    temp_slot = slot + temp_state_slot_offset
+    value = tl.load(
+        main_state_ptr + slot * main_state_stride_b + d,
+        mask=d_mask & has_partial,
+        other=0.0,
+    )
+    tl.store(
+        main_state_ptr + temp_slot * main_state_stride_b + d,
+        value,
+        mask=d_mask & has_partial,
+    )
 
 
 @cache_once
@@ -20,10 +70,107 @@ def _jit_online_c128_mtp_module(head_dim: int) -> Module:
         cuda_files=["deepseek_v4/online_c128_mtp.cuh"],
         cuda_wrappers=[
             ("write_prefix_states", f"OnlineC128MTPWritePrefixKernel<{args}>::run"),
-            ("mark_pending", f"OnlineC128MTPMarkPendingKernel<{args}>::run"),
-            ("commit_pending", f"OnlineC128MTPCommitPendingKernel<{args}>::run"),
+            ("lazy_commit", f"OnlineC128MTPLazyCommitKernel<{args}>::run"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+def online_c128_mtp_write_prefix_states(
+    *,
+    kv_score_input: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+    ape: torch.Tensor,
+    state: torch.Tensor,
+    layer_bs: int,
+    swa_page_size: int,
+    num_verify_tokens: int,
+    state_slot_stride: int,
+    head_dim: int,
+) -> None:
+    if layer_bs <= 0:
+        return
+    _jit_online_c128_mtp_module(head_dim).write_prefix_states(
+        kv_score_input,
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        full_to_swa_index_mapping,
+        ape,
+        state,
+        layer_bs,
+        swa_page_size,
+        num_verify_tokens,
+        state_slot_stride,
+    )
+
+
+def online_c128_mtp_lazy_commit(
+    *,
+    old_seq_lens: torch.Tensor,
+    old_req_pool_indices: torch.Tensor,
+    cur_seq_lens: torch.Tensor,
+    cur_req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+    state: torch.Tensor,
+    old_bs: int,
+    cur_bs: int,
+    swa_page_size: int,
+    num_verify_tokens: int,
+    state_slot_stride: int,
+    head_dim: int,
+) -> None:
+    if old_bs <= 0 or cur_bs <= 0:
+        return
+    _jit_online_c128_mtp_module(head_dim).lazy_commit(
+        old_seq_lens,
+        old_req_pool_indices,
+        cur_seq_lens,
+        cur_req_pool_indices,
+        req_to_token,
+        full_to_swa_index_mapping,
+        state,
+        old_bs,
+        cur_bs,
+        swa_page_size,
+        num_verify_tokens,
+        state_slot_stride,
+    )
+
+
+def online_c128_mtp_prepare(
+    *,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+    main_state: torch.Tensor,
+    bs: int,
+    swa_page_size: int,
+    temp_state_slot_offset: int,
+    state_width: int,
+) -> None:
+    if bs <= 0:
+        return
+    assert state_width <= 2048
+    block_d = triton.next_power_of_2(state_width)
+    _online_c128_mtp_prepare_kernel[(bs,)](
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        full_to_swa_index_mapping,
+        main_state,
+        req_to_token.stride(0),
+        main_state.stride(0),
+        bs,
+        swa_page_size,
+        temp_state_slot_offset,
+        state_width,
+        block_d,
     )
 
 
@@ -32,6 +179,7 @@ class _OnlineC128LayerRuntime:
     head_dim: int
     main_state: torch.Tensor
     state_slot_offset: int
+    state_width: int
 
 
 @dataclass
@@ -71,17 +219,24 @@ class OnlineC128MTPController:
             req_pool_indices=req_pool_indices.detach(),
             seq_lens=seq_lens.detach(),
         )
-        head_dim = self._head_dim()
-        if head_dim is None or self._num_verify_tokens() == 0:
+        if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
+            return
+        if self._num_verify_tokens() == 0:
             return
         token_to_kv_pool = self.backend.token_to_kv_pool
-        _jit_online_c128_mtp_module(head_dim).mark_pending(
-            seq_lens,
-            req_pool_indices,
-            token_to_kv_pool.get_online_c128_mtp_pending_seq_lens(),
-            min(seq_lens.shape[0], req_pool_indices.shape[0]),
-            token_to_kv_pool.max_num_reqs,
-        )
+        bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
+        for runtime in self._iter_layer_runtimes():
+            online_c128_mtp_prepare(
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=self.backend.req_to_token,
+                full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+                main_state=runtime.main_state,
+                bs=bs,
+                swa_page_size=token_to_kv_pool.swa_page_size,
+                temp_state_slot_offset=runtime.state_slot_offset,
+                state_width=runtime.state_width,
+            )
 
     def clear(self) -> None:
         self._verify_ctx = None
@@ -154,18 +309,19 @@ class OnlineC128MTPController:
         if layer_bs <= 0:
             return
 
-        _jit_online_c128_mtp_module(head_dim).write_prefix_states(
-            kv_score_input,
-            ctx.seq_lens,
-            ctx.req_pool_indices,
-            self.backend.req_to_token,
-            token_to_kv_pool.full_to_swa_index_mapping,
-            compressor.ape.reshape(128, head_dim),
-            state_pool.kv_score_buffer.kv_score,
-            layer_bs,
-            token_to_kv_pool.swa_page_size,
-            num_verify_tokens,
-            state_pool.online_mtp_state_slot_offset,
+        online_c128_mtp_write_prefix_states(
+            kv_score_input=kv_score_input,
+            seq_lens=ctx.seq_lens,
+            req_pool_indices=ctx.req_pool_indices,
+            req_to_token=self.backend.req_to_token,
+            full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+            ape=compressor.ape.reshape(128, head_dim),
+            state=state_pool.kv_score_buffer.kv_score,
+            layer_bs=layer_bs,
+            swa_page_size=token_to_kv_pool.swa_page_size,
+            num_verify_tokens=num_verify_tokens,
+            state_slot_stride=state_pool.online_mtp_state_slot_offset,
+            head_dim=head_dim,
         )
 
     def commit_pending(
@@ -173,9 +329,13 @@ class OnlineC128MTPController:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> None:
-        if self._verify_ctx is None:
+        ctx = self._verify_ctx
+        if ctx is None:
             return
         if not self.enabled():
+            self.clear()
+            return
+        if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
             self.clear()
             return
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
@@ -188,22 +348,26 @@ class OnlineC128MTPController:
 
         backend = self.backend
         token_to_kv_pool = backend.token_to_kv_pool
-        pending_seq_lens = token_to_kv_pool.get_online_c128_mtp_pending_seq_lens()
-        cur_bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
+        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
+        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
+        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
+        cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
 
         for runtime in self._iter_layer_runtimes():
-            _jit_online_c128_mtp_module(runtime.head_dim).commit_pending(
-                seq_lens,
-                req_pool_indices,
-                backend.req_to_token,
-                token_to_kv_pool.full_to_swa_index_mapping,
-                pending_seq_lens,
-                runtime.main_state,
-                cur_bs,
-                token_to_kv_pool.swa_page_size,
-                num_verify_tokens,
-                runtime.state_slot_offset,
-                token_to_kv_pool.max_num_reqs,
+            online_c128_mtp_lazy_commit(
+                old_seq_lens=ctx.seq_lens,
+                old_req_pool_indices=ctx.req_pool_indices,
+                cur_seq_lens=cur_seq_lens,
+                cur_req_pool_indices=cur_req_pool_indices,
+                req_to_token=backend.req_to_token,
+                full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+                state=runtime.main_state,
+                old_bs=old_bs,
+                cur_bs=cur_bs,
+                swa_page_size=token_to_kv_pool.swa_page_size,
+                num_verify_tokens=num_verify_tokens,
+                state_slot_stride=runtime.state_slot_offset,
+                head_dim=runtime.head_dim,
             )
 
         self.clear()
@@ -249,6 +413,7 @@ class OnlineC128MTPController:
                         head_dim=compressor.head_dim,
                         main_state=state_pool.kv_score_buffer.kv_score,
                         state_slot_offset=state_pool.online_mtp_state_slot_offset,
+                        state_width=compressor.head_dim * 3,
                     )
                 )
             self._layer_runtimes = runtimes
