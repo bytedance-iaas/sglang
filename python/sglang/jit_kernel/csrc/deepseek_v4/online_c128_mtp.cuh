@@ -12,7 +12,7 @@
 
 namespace {
 
-SGL_DEVICE __forceinline__ int64_t clamp_accept_len(int64_t delta, int64_t max_accept) {
+SGL_DEVICE int64_t clamp_accept_len(int64_t delta, int64_t max_accept) {
   if (delta < 0) return 0;
   return delta < max_accept ? delta : max_accept;
 }
@@ -182,6 +182,8 @@ struct OnlineC128MTPWritePrefixKernel {
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
       DLDevice device) {
+    using namespace host;
+
     const auto params = OnlineC128MTPWritePrefixParams<TSeq, TReq>{
         .kv_score_input = static_cast<const float*>(kv_score_input.data_ptr()),
         .seq_lens = static_cast<const TSeq*>(seq_lens.data_ptr()),
@@ -280,6 +282,8 @@ struct OnlineC128MTPLazyCommitKernel {
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
       DLDevice device) {
+    using namespace host;
+
     const auto params = OnlineC128MTPLazyCommitParams<TOldSeq, TCurSeq, TOldReq, TCurReq>{
         .old_seq_lens = static_cast<const TOldSeq*>(old_seq_lens.data_ptr()),
         .old_req_pool_indices = static_cast<const TOldReq*>(old_req_pool_indices.data_ptr()),
