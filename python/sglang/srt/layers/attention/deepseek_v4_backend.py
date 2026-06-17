@@ -873,6 +873,17 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
+    @staticmethod
+    def _active_batch_size(
+        forward_batch: ForwardBatch,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> int:
+        # CUDA graph replay pads req/seq tensors to the captured bucket size.
+        # ForwardBatch.batch_size is the raw active batch size before padding.
+        raw_bs = int(forward_batch.batch_size)
+        return min(raw_bs, int(req_pool_indices.shape[0]), int(seq_lens.shape[0]))
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
@@ -887,11 +898,12 @@ class DeepseekV4AttnBackend(
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
+        active_bs = self._active_batch_size(forward_batch, req_pool_indices, seq_lens)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
             seq_lens,
-            verify_bs=forward_batch.batch_size_before_padding,
+            verify_bs=active_bs,
         )
 
         if logical_forward_mode.is_decode_or_idle():
@@ -1072,7 +1084,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            verify_bs = fb.batch_size_before_padding
+            verify_bs = self._active_batch_size(fb, req_pool_indices, seq_lens)
             if self.online_c128_mtp.enabled() and verify_bs == 0:
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
