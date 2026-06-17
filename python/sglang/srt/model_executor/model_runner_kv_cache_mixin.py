@@ -274,9 +274,15 @@ class ModelRunnerKVCacheMixin:
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
 
                 pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
-                )
+                if max_num_reqs <= 32:
+                    pre_alloc_size = max_num_reqs * 2
+                elif pre_alloc_size == 0 and self.enable_hisparse:
+                    # HiSparse decode can keep the running batch full while the
+                    # next requests are still waiting for PD metadata/transfer.
+                    # Reserve one extra running-batch worth of req slots by
+                    # default so admission does not stall on req_to_token_slots
+                    # unless the user explicitly configured a different value.
+                    pre_alloc_size = max_num_reqs
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,

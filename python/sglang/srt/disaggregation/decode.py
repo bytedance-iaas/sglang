@@ -924,26 +924,35 @@ class DecodePreallocQueue:
         eagle_draft_reserve_tokens = (
             self._hisparse_eagle_draft_logical_reserve_tokens()
         )
+        ready_reqs = sum(1 for req in self.queue if req.waiting_for_input)
+        running_reqs = len(self.scheduler.running_batch.reqs)
+        transfer_reqs = len(self.transfer_queue.queue)
+        idle_admission_deadlock = (
+            ready_reqs > 0 and running_reqs == 0 and transfer_reqs == 0
+        )
         logger.info(
             "Decode prealloc admission limited: reason=%s, queue=%d, "
             "ready=%d, pending=%d, transfer=%d, running=%d, retracted=%d, "
-            "req_slots=%d, metadata_slots=%d, full_allocatable_tokens=%d, "
+            "req_slots=%d, req_slot_capacity=%d, req_slot_prealloc_capacity=%d, "
+            "metadata_slots=%d, full_allocatable_tokens=%d, "
             "full_evictable_tokens=%d, full_available_tokens=%s, "
             "logical_available_tokens=%s, swa_allocatable_tokens=%d, "
             "c4_host_allocatable_tokens=%s, c4_host_required_tokens=%d, "
             "hisparse_req_budget=%s, eagle_draft_reserve_tokens=%d, "
             "hisparse_avail=%s, hisparse_padded_buffer_size=%s, "
             "hisparse_top_k=%s, hisparse_device_buffer_size=%s, "
-            "max_running_requests=%s, relaxed_output_reserve=%s, "
-            "decode_output_reserve_cap=%s",
+            "max_running_requests=%s, idle_admission_deadlock=%s, "
+            "relaxed_output_reserve=%s, decode_output_reserve_cap=%s",
             reason,
             len(self.queue),
-            sum(1 for req in self.queue if req.waiting_for_input),
+            ready_reqs,
             len(self.pending_reqs),
-            len(self.transfer_queue.queue),
-            len(self.scheduler.running_batch.reqs),
+            transfer_reqs,
+            running_reqs,
             len(self.retracted_queue),
             self.req_to_token_pool.available_size(),
+            self.req_to_token_pool.size,
+            getattr(self.req_to_token_pool, "pre_alloc_size", 0),
             self.req_to_metadata_buffer_idx_allocator.available_size(),
             full_allocatable_tokens,
             full_evictable_tokens,
@@ -959,6 +968,7 @@ class DecodePreallocQueue:
             getattr(coordinator, "top_k", None),
             getattr(coordinator, "device_buffer_size", None),
             getattr(self.scheduler, "max_running_requests", None),
+            idle_admission_deadlock,
             self._relax_decode_output_reserve,
             self.num_reserved_decode_tokens
             if self._relax_decode_output_reserve
