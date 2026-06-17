@@ -147,6 +147,63 @@ def _dequant_sm90_mxfp8_vector(
     return x[:k].to(torch.float32) * scale_per_k
 
 
+def _sm90_mxfp8_numeric_stats(t: torch.Tensor) -> dict:
+    flat = t.reshape(-1)
+    finite = torch.isfinite(flat)
+    finite_count = int(finite.sum().item())
+    stats = {
+        "numel": flat.numel(),
+        "finite_count": finite_count,
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "inf_count": int(torch.isinf(flat).sum().item()),
+        "isfinite": finite_count == flat.numel(),
+    }
+    if finite_count > 0:
+        stats["finite_absmax"] = float(flat[finite].abs().max().item())
+    return stats
+
+
+def _sm90_mxfp8_scale_byte_stats(scale: torch.Tensor) -> dict:
+    scale_bytes = _unpack_sm90_mxfp8_scale_bytes(scale)
+    return {
+        "numel": scale_bytes.numel(),
+        "min": int(scale_bytes.min().item()) if scale_bytes.numel() > 0 else None,
+        "max": int(scale_bytes.max().item()) if scale_bytes.numel() > 0 else None,
+        "zero_count": int((scale_bytes == 0).sum().item()),
+        "ff_count": int((scale_bytes == 0xFF).sum().item()),
+    }
+
+
+def _sm90_mxfp8_diff_entry(
+    *,
+    group: int,
+    row: int,
+    sample_cols: int,
+    diff: torch.Tensor,
+    ref: torch.Tensor,
+    actual: torch.Tensor,
+    a_deq: torch.Tensor,
+    b_deq: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> dict:
+    return {
+        "group": group,
+        "row": row,
+        "cols": sample_cols,
+        "max_abs_diff": float(diff.max().item()),
+        "mean_abs_diff": float(diff.mean().item()),
+        "ref_absmax": float(ref.abs().max().item()),
+        "actual_absmax": float(actual.abs().max().item()),
+        "ref_stats": _sm90_mxfp8_numeric_stats(ref),
+        "actual_stats": _sm90_mxfp8_numeric_stats(actual),
+        "a_deq_stats": _sm90_mxfp8_numeric_stats(a_deq),
+        "b_deq_stats": _sm90_mxfp8_numeric_stats(b_deq),
+        "a_scale_u8_stats": _sm90_mxfp8_scale_byte_stats(a_scale),
+        "b_scale_u8_stats": _sm90_mxfp8_scale_byte_stats(b_scale),
+    }
+
+
 def _sm90_mxfp8_local_diff_report(
     location: str,
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -220,15 +277,18 @@ def _sm90_mxfp8_local_diff_report(
                 actual = out[row, :sample_cols].to(torch.float32)
                 diff = (actual - ref).abs()
                 diffs.append(
-                    {
-                        "group": group,
-                        "row": row,
-                        "cols": sample_cols,
-                        "max_abs_diff": float(diff.max().item()),
-                        "mean_abs_diff": float(diff.mean().item()),
-                        "ref_absmax": float(ref.abs().max().item()),
-                        "actual_absmax": float(actual.abs().max().item()),
-                    }
+                    _sm90_mxfp8_diff_entry(
+                        group=group,
+                        row=row,
+                        sample_cols=sample_cols,
+                        diff=diff,
+                        ref=ref,
+                        actual=actual,
+                        a_deq=a_deq,
+                        b_deq=b_deq,
+                        a_scale=lhs_sf[row],
+                        b_scale=rhs_sf[group, rhs_cols],
+                    )
                 )
         else:
             if masked_m is None:
@@ -267,15 +327,18 @@ def _sm90_mxfp8_local_diff_report(
                     actual = out[group, row, :sample_cols].to(torch.float32)
                     diff = (actual - ref).abs()
                     diffs.append(
-                        {
-                            "group": group,
-                            "row": row,
-                            "cols": sample_cols,
-                            "max_abs_diff": float(diff.max().item()),
-                            "mean_abs_diff": float(diff.mean().item()),
-                            "ref_absmax": float(ref.abs().max().item()),
-                            "actual_absmax": float(actual.abs().max().item()),
-                        }
+                        _sm90_mxfp8_diff_entry(
+                            group=group,
+                            row=row,
+                            sample_cols=sample_cols,
+                            diff=diff,
+                            ref=ref,
+                            actual=actual,
+                            a_deq=a_deq,
+                            b_deq=b_deq,
+                            a_scale=lhs_sf[group, row],
+                            b_scale=rhs_sf[group, rhs_cols],
+                        )
                     )
 
     payload = {
