@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
@@ -39,8 +40,18 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
+
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_MEGA_MOE_STATE_LOGGED: set[str] = set()
+
+
+def _log_mega_moe_state_once(key: str, message: str, *args) -> None:
+    if key in _MEGA_MOE_STATE_LOGGED:
+        return
+    _MEGA_MOE_STATE_LOGGED.add(key)
+    logger.info(message, *args)
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -102,24 +113,59 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
+        _log_mega_moe_state_once(
+            "weights_not_built",
+            "MegaMoE requested but expert weights are not built yet; falling back "
+            "to the configured MoE runner.",
+        )
         return False
     if _device_sm is None or _device_sm < 90:
+        _log_mega_moe_state_once(
+            "unsupported_sm",
+            "MegaMoE requested but device SM %s is unsupported; falling back to "
+            "the configured MoE runner.",
+            _device_sm,
+        )
         return False
     try:
         import deep_gemm
     except ImportError:
+        _log_mega_moe_state_once(
+            "missing_deep_gemm",
+            "MegaMoE requested but deep_gemm is unavailable; falling back to the "
+            "configured MoE runner.",
+        )
         return False
     if _device_sm == 90:
         if not hasattr(deep_gemm, "fp8_mega_moe"):
+            _log_mega_moe_state_once(
+                "missing_sm90_kernel",
+                "MegaMoE requested on SM90 but deep_gemm.fp8_mega_moe is "
+                "unavailable; falling back to the configured MoE runner.",
+            )
             return False
         if not getattr(moe.experts, "_mega_moe_sm90_fp8_weights", False):
+            _log_mega_moe_state_once(
+                "missing_sm90_weights",
+                "MegaMoE requested on SM90 but SM90 FP8 expert weights are not "
+                "prepared; falling back to the configured MoE runner.",
+            )
             return False
     elif _device_sm >= 100:
         if not hasattr(deep_gemm, "fp8_fp4_mega_moe"):
+            _log_mega_moe_state_once(
+                "missing_sm100_kernel",
+                "MegaMoE requested on SM100+ but deep_gemm.fp8_fp4_mega_moe is "
+                "unavailable; falling back to the configured MoE runner.",
+            )
             return False
     else:
         return False
     if get_is_capture_mode():
+        _log_mega_moe_state_once(
+            "enabled_capture",
+            "MegaMoE is enabled during cuda graph capture.",
+        )
         return True
 
     try:
@@ -131,7 +177,24 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        _log_mega_moe_state_once(
+            "token_cap_exceeded",
+            "MegaMoE requested but max_tokens_per_rank=%d exceeds "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=%d; falling "
+            "back to the configured MoE runner.",
+            max_tokens_per_rank,
+            cap,
+        )
+        return False
+
+    _log_mega_moe_state_once(
+        "enabled_runtime",
+        "MegaMoE is enabled at runtime with max_tokens_per_rank=%d, cap=%d.",
+        max_tokens_per_rank,
+        cap,
+    )
+    return True
 
 
 def forward_mega_moe(
