@@ -60,14 +60,9 @@ def _e8m0_fp32_to_u8(sf: torch.Tensor) -> torch.Tensor:
     return torch.where(round_up, exp + 1, exp).to(torch.uint8).contiguous()
 
 
-def _unpack_ue8m0_i32_to_u8(sf: torch.Tensor) -> torch.Tensor:
-    return sf.contiguous().view(torch.uint8).view(*sf.shape[:-1], sf.shape[-1] * 4)
-
-
 def _normalize_sm90_mxfp8_pair(
     pair: Tuple[torch.Tensor, torch.Tensor],
     *,
-    allow_packed_scale: bool,
     scale_role: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x, sf = pair
@@ -78,17 +73,11 @@ def _normalize_sm90_mxfp8_pair(
         return x, sf.contiguous()
 
     if sf.dtype == torch.int32:
-        if allow_packed_scale and x.dtype == torch.float8_e4m3fn:
+        if x.dtype == torch.float8_e4m3fn:
             return x, sf
-        sf_u8 = _unpack_ue8m0_i32_to_u8(sf)
-        if sf_u8.shape[-1] >= k32 and x.dtype == torch.float8_e4m3fn:
-            return x, sf_u8[..., :k32].contiguous()
         raise RuntimeError(
             f"SM90 MXFP8 {scale_role} scale received packed UE8M0 scales "
-            f"that do not cover K/32: unpacked_scales={sf_u8.shape[-1]}, "
-            f"expected={k32}. "
-            "Do not requantize K/128 activations in SGLang; update the SM90 "
-            "kernel to consume packed int32 UE8M0 with recipe/gran_k support."
+            f"but activation dtype is {x.dtype}; expected torch.float8_e4m3fn."
         )
 
     if sf.dtype == torch.float32 and sf.shape[-1] == k32 and x.dtype == torch.float8_e4m3fn:
@@ -199,12 +188,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
         compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_MASKED
     )
 
-    lhs = _normalize_sm90_mxfp8_pair(
-        _ensure_cuda(lhs), allow_packed_scale=True, scale_role="lhs"
-    )
-    rhs = _normalize_sm90_mxfp8_pair(
-        _ensure_cuda(rhs), allow_packed_scale=True, scale_role="rhs"
-    )
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
 
     padded_expected_m = _ceil_align(max(lhs[0].shape[-2], expected_m), 128)
     lhs = _pad_sm90_mxfp8_lhs(lhs, padded_expected_m)
@@ -317,12 +302,8 @@ def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
     if m == 0:
         return
 
-    lhs = _normalize_sm90_mxfp8_pair(
-        _ensure_cuda(lhs), allow_packed_scale=True, scale_role="lhs"
-    )
-    rhs = _normalize_sm90_mxfp8_pair(
-        _ensure_cuda(rhs), allow_packed_scale=True, scale_role="rhs"
-    )
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
