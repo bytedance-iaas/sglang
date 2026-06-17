@@ -2414,6 +2414,7 @@ class Scheduler(
         )
         self.future_map.stash(batch.req_pool_indices, last_tokens)
         batch.input_ids = None
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -2523,6 +2524,7 @@ class Scheduler(
         )
         self.future_map.stash(batch.req_pool_indices, last_tokens)
         batch.input_ids = None
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]

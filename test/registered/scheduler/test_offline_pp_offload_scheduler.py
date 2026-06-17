@@ -20,6 +20,7 @@ class _FakeReq:
         self.return_hidden_states = False
         self.is_prefill_only = False
         self.grammar = None
+        self.multimodal_inputs = None
 
     def finished(self):
         return False
@@ -137,6 +138,7 @@ def test_decode_ready_wave_batch_stashes_last_token_and_prepares_decode(monkeypa
     assert batch.prepare_for_decode_called is True
     assert batch.out_cache_loc is not None
     assert batch.offline_pp_wave_id == 7
+    assert batch.multimodal_inputs == [None]
     assert batch.req_pool_indices_cpu.tolist() == [3]
     assert batch.seq_lens_cpu.tolist() == [4]
     assert future_map.stashes[0][1].tolist() == [42]
