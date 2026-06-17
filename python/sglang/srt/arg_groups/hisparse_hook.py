@@ -128,6 +128,15 @@ def _validate_dsv4_hisparse_online_c128_mtp(server_args: "ServerArgs") -> None:
             f"--speculative-eagle-topk 1, got {server_args.speculative_eagle_topk}."
         )
 
+    speculative_num_steps = int(server_args.speculative_num_steps or 0)
+    if speculative_num_steps > 2:
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP is currently validated only for "
+            f"EAGLE step1/step2, got speculative_num_steps={speculative_num_steps}. "
+            "Keep step3 disabled until SWA/C4 host/logical admission is validated "
+            "under pressure."
+        )
+
     if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
         raise ValueError(
             "DSV4 HiSparse online C128 MTP requires "
@@ -137,7 +146,10 @@ def _validate_dsv4_hisparse_online_c128_mtp(server_args: "ServerArgs") -> None:
 
     logger.warning(
         "DSV4 HiSparse online C128 MTP enabled: C4 stays on HiSparse host "
-        "mirror; C128 uses online EAGLE state banks."
+        "mirror; C128 uses online EAGLE state banks; eagle_steps=%d, "
+        "draft_tokens=%s.",
+        speculative_num_steps,
+        server_args.speculative_num_draft_tokens,
     )
 
 
