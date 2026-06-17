@@ -14,7 +14,9 @@
 """Logits processing."""
 
 import dataclasses
+import json
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -22,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -72,6 +75,119 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+
+
+def _sm90_mxfp8_logits_debug_enabled() -> bool:
+    return (
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG") == "1"
+        and os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") == "1"
+        and get_tensor_model_parallel_rank() == 0
+    )
+
+
+def _sm90_mxfp8_logits_debug_tensor_stats(t: Optional[torch.Tensor]) -> dict:
+    if t is None:
+        return {"is_none": True}
+    meta = {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "numel": t.numel(),
+        "device": str(t.device),
+    }
+    if t.is_cuda and torch.cuda.is_current_stream_capturing():
+        meta["stats_skipped"] = "cuda_graph_capture"
+        return meta
+    if t.numel() == 0:
+        meta["stats_skipped"] = "empty"
+        return meta
+    sample = t.reshape(-1)[: min(t.numel(), 4096)].float()
+    meta.update(
+        {
+            "sample_mean": float(sample.mean().item()),
+            "sample_absmax": float(sample.abs().max().item()),
+            "sample_isfinite": bool(torch.isfinite(sample).all().item()),
+        }
+    )
+    return meta
+
+
+def _sm90_mxfp8_logits_debug_topk(
+    logits: Optional[torch.Tensor], top_k: int = 10
+) -> dict:
+    meta = _sm90_mxfp8_logits_debug_tensor_stats(logits)
+    if logits is None:
+        return meta
+    if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+        meta["topk_skipped"] = "cuda_graph_capture"
+        return meta
+    if logits.numel() == 0:
+        meta["topk_skipped"] = "empty"
+        return meta
+
+    logits_2d = (
+        logits.reshape(1, -1)
+        if logits.dim() == 1
+        else logits.reshape(-1, logits.shape[-1])
+    )
+    first_row = logits_2d[0].float()
+    k = min(top_k, first_row.numel())
+    values, indices = torch.topk(first_row, k=k)
+    top1_values, top1_indices = torch.topk(
+        logits_2d[: min(logits_2d.shape[0], 8)].float(), k=1, dim=-1
+    )
+    meta.update(
+        {
+            "row_count": logits_2d.shape[0],
+            "vocab_size": logits_2d.shape[-1],
+            "first_row_top_ids": [int(x) for x in indices.detach().cpu().tolist()],
+            "first_row_top_values": [
+                float(x) for x in values.detach().cpu().tolist()
+            ],
+            "first_rows_top1_ids": [
+                int(x) for x in top1_indices.reshape(-1).detach().cpu().tolist()
+            ],
+            "first_rows_top1_values": [
+                float(x) for x in top1_values.reshape(-1).detach().cpu().tolist()
+            ],
+        }
+    )
+    return meta
+
+
+def _sm90_mxfp8_logits_debug_report(
+    sampled_logits: Optional[torch.Tensor],
+    logits_metadata: "LogitsMetadata",
+    sample_indices: Optional[torch.Tensor],
+) -> None:
+    if not _sm90_mxfp8_logits_debug_enabled():
+        return
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H6",
+        "location": "logits_processor.py:LogitsProcessor.forward:sampled_logits",
+        "msg": "[DEBUG] SM90 MiniMax sampled logits before sampler",
+        "data": {
+            "forward_mode": str(logits_metadata.forward_mode),
+            "sample_indices": (
+                None
+                if sample_indices is None
+                else [
+                    int(x)
+                    for x in sample_indices.reshape(-1)[
+                        : min(sample_indices.numel(), 16)
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+            ),
+            "sampled_logits_topk": _sm90_mxfp8_logits_debug_topk(sampled_logits),
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -374,6 +490,9 @@ class LogitsProcessor(nn.Module):
             )
 
             # Decode mode or extend mode without return_logprob.
+            _sm90_mxfp8_logits_debug_report(
+                sampled_logits, logits_metadata, sample_indices
+            )
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
@@ -415,6 +534,9 @@ class LogitsProcessor(nn.Module):
                 logits_metadata,
             )
 
+        _sm90_mxfp8_logits_debug_report(
+            sampled_logits, logits_metadata, sample_indices
+        )
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
