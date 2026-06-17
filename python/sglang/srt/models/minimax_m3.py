@@ -162,6 +162,90 @@ def _sm90_mxfp8_model_debug_stats(t: torch.Tensor) -> dict:
     return meta
 
 
+def _sm90_mxfp8_model_debug_topk(
+    logits: Optional[torch.Tensor], top_k: int = 10
+) -> dict:
+    if logits is None:
+        return {"is_none": True}
+    meta = _sm90_mxfp8_model_debug_stats(logits)
+    if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+        meta["topk_skipped"] = "cuda_graph_capture"
+        return meta
+    if logits.numel() == 0:
+        meta["topk_skipped"] = "empty"
+        return meta
+
+    logits_2d = (
+        logits.reshape(1, -1)
+        if logits.dim() == 1
+        else logits.reshape(-1, logits.shape[-1])
+    )
+    row = logits_2d[0].float()
+    k = min(top_k, row.numel())
+    values, indices = torch.topk(row, k=k)
+    top1_values, top1_indices = torch.topk(
+        logits_2d[: min(logits_2d.shape[0], 8)].float(), k=1, dim=-1
+    )
+    meta.update(
+        {
+            "row_count": logits_2d.shape[0],
+            "vocab_size": logits_2d.shape[-1],
+            "first_row_top_ids": [int(x) for x in indices.detach().cpu().tolist()],
+            "first_row_top_values": [
+                float(x) for x in values.detach().cpu().tolist()
+            ],
+            "first_rows_top1_ids": [
+                int(x) for x in top1_indices.reshape(-1).detach().cpu().tolist()
+            ],
+            "first_rows_top1_values": [
+                float(x) for x in top1_values.reshape(-1).detach().cpu().tolist()
+            ],
+        }
+    )
+    return meta
+
+
+def _sm90_mxfp8_model_debug_forward_meta(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> dict:
+    meta = {
+        "forward_mode": str(forward_batch.forward_mode),
+        "batch_size": forward_batch.batch_size,
+        "input_ids_shape": list(input_ids.shape),
+        "positions_shape": list(positions.shape),
+    }
+    if input_ids.is_cuda and torch.cuda.is_current_stream_capturing():
+        meta["values_skipped"] = "cuda_graph_capture"
+        return meta
+
+    def _small_list(t: Optional[torch.Tensor], limit: int = 16):
+        if t is None:
+            return None
+        return [
+            int(x)
+            for x in t.reshape(-1)[: min(t.numel(), limit)].detach().cpu().tolist()
+        ]
+
+    meta.update(
+        {
+            "input_ids_head": _small_list(input_ids),
+            "input_ids_tail": _small_list(
+                input_ids.reshape(-1)[-min(input_ids.numel(), 16) :]
+            ),
+            "positions_head": _small_list(positions),
+            "positions_tail": _small_list(
+                positions.reshape(-1)[-min(positions.numel(), 16) :]
+            ),
+            "seq_lens_head": _small_list(forward_batch.seq_lens),
+            "extend_seq_lens_head": _small_list(forward_batch.extend_seq_lens),
+            "extend_prefix_lens_head": _small_list(forward_batch.extend_prefix_lens),
+        }
+    )
+    return meta
+
+
 def _sm90_mxfp8_model_debug_report(location: str, msg: str, data: dict) -> None:
     global _SM90_MXFP8_MODEL_DEBUG_EVENTS
     if not _sm90_mxfp8_model_debug_enabled():
@@ -1898,6 +1982,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "minimax_m3.py:MiniMaxM3SparseForCausalLM.forward:after_logits",
                 "SM90 MiniMax logits processor output",
                 {
+                    "forward": _sm90_mxfp8_model_debug_forward_meta(
+                        input_ids, positions, forward_batch
+                    ),
                     "next_token_logits": (
                         _sm90_mxfp8_model_debug_stats(
                             logits_output.next_token_logits
@@ -1909,6 +1996,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                         _sm90_mxfp8_model_debug_stats(logits_output.full_logits)
                         if logits_output.full_logits is not None
                         else {"is_none": True}
+                    ),
+                    "next_token_logits_topk": _sm90_mxfp8_model_debug_topk(
+                        logits_output.next_token_logits
+                    ),
+                    "full_logits_topk": _sm90_mxfp8_model_debug_topk(
+                        logits_output.full_logits
                     ),
                 },
             )
