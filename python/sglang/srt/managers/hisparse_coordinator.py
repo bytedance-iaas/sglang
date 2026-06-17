@@ -43,6 +43,9 @@ class HiSparseTokenStats(NamedTuple):
     c4_swap_hit_tokens: Optional[int] = None
     c4_swap_miss_rate: Optional[float] = None
     c4_swap_h2d_bytes: Optional[int] = None
+    c4_backup_wait_count: Optional[int] = None
+    c4_backup_wait_enqueue_ms: Optional[float] = None
+    c4_backup_pending: Optional[bool] = None
 
 
 class HiSparseStagingBackup(NamedTuple):
@@ -467,6 +470,8 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._c4_backup_wait_count = 0
+        self._c4_backup_wait_enqueue_ms = 0.0
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -1060,11 +1065,17 @@ class HiSparseCoordinator:
                 else 0.0
             )
             c4_swap_h2d_bytes = self._c4_swap_h2d_bytes
+            c4_backup_wait_count = self._c4_backup_wait_count
+            c4_backup_wait_enqueue_ms = self._c4_backup_wait_enqueue_ms
+            c4_backup_pending = self._has_pending_backup
         else:
             c4_swap_miss_tokens = None
             c4_swap_hit_tokens = None
             c4_swap_miss_rate = None
             c4_swap_h2d_bytes = None
+            c4_backup_wait_count = None
+            c4_backup_wait_enqueue_ms = None
+            c4_backup_pending = None
         return HiSparseTokenStats(
             device_tokens=device_tokens,
             device_token_usage=(
@@ -1078,6 +1089,9 @@ class HiSparseCoordinator:
             c4_swap_hit_tokens=c4_swap_hit_tokens,
             c4_swap_miss_rate=c4_swap_miss_rate,
             c4_swap_h2d_bytes=c4_swap_h2d_bytes,
+            c4_backup_wait_count=c4_backup_wait_count,
+            c4_backup_wait_enqueue_ms=c4_backup_wait_enqueue_ms,
+            c4_backup_pending=c4_backup_pending,
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
@@ -1548,7 +1562,10 @@ class HiSparseCoordinator:
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
+        start = time.perf_counter()
         self._backup_done_event.wait(device_module.current_stream())
+        self._c4_backup_wait_enqueue_ms += (time.perf_counter() - start) * 1000.0
+        self._c4_backup_wait_count += 1
         self._has_pending_backup = False
 
     def _backup_accepted_device_locs(

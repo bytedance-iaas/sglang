@@ -53,6 +53,9 @@ class PoolStats:
     hisparse_c4_swap_hit_tokens: Optional[int] = None
     hisparse_c4_swap_miss_rate: Optional[float] = None
     hisparse_c4_swap_h2d_bytes: Optional[int] = None
+    hisparse_c4_backup_wait_count: Optional[int] = None
+    hisparse_c4_backup_wait_enqueue_ms: Optional[float] = None
+    hisparse_c4_backup_pending: Optional[bool] = None
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -120,6 +123,12 @@ class PoolStats:
                     f"#c4 miss token: {self.hisparse_c4_swap_miss_tokens}",
                     f"c4 miss rate: {self.hisparse_c4_swap_miss_rate:.2f}",
                     f"c4 h2d MB: {self.hisparse_c4_swap_h2d_bytes / (1024 * 1024):.2f}",
+                ]
+            if self.hisparse_c4_backup_wait_count is not None:
+                parts += [
+                    f"c4 backup wait count: {self.hisparse_c4_backup_wait_count}",
+                    f"c4 backup wait enqueue ms: {self.hisparse_c4_backup_wait_enqueue_ms:.3f}",
+                    f"c4 backup pending: {self.hisparse_c4_backup_pending}",
                 ]
         if not parts:
             parts.append(
@@ -249,6 +258,9 @@ class SchedulerPoolStatsObserver:
                 hisparse_c4_swap_hit_tokens=h.c4_swap_hit_tokens,
                 hisparse_c4_swap_miss_rate=h.c4_swap_miss_rate,
                 hisparse_c4_swap_h2d_bytes=h.c4_swap_h2d_bytes,
+                hisparse_c4_backup_wait_count=h.c4_backup_wait_count,
+                hisparse_c4_backup_wait_enqueue_ms=h.c4_backup_wait_enqueue_ms,
+                hisparse_c4_backup_pending=h.c4_backup_pending,
             )
         return pool_stats
 
