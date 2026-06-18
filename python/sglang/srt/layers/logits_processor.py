@@ -24,8 +24,6 @@ from torch import nn
 from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
-    get_dcp_rank,
-    get_dcp_world_size,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -64,60 +62,6 @@ from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-_DCP_LOGITS_LOG_COUNT = 0
-
-
-def _dcp_logits_should_log() -> bool:
-    global _DCP_LOGITS_LOG_COUNT
-    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
-    if limit <= 0 or _DCP_LOGITS_LOG_COUNT >= limit:
-        return False
-    _DCP_LOGITS_LOG_COUNT += 1
-    return get_dcp_world_size() > 1
-
-
-def _dcp_logits_tensor_summary(name: str, tensor: Optional[torch.Tensor]) -> str:
-    if tensor is None:
-        return f"{name}=None"
-
-    with torch.no_grad():
-        detached = tensor.detach()
-        summary = f"{name}.shape={tuple(detached.shape)} {name}.dtype={detached.dtype}"
-        if detached.numel() == 0:
-            return summary + " empty"
-
-        if detached.is_floating_point():
-            finite = torch.isfinite(detached)
-            finite_count = int(finite.sum().item())
-            summary += f" finite={finite_count}/{detached.numel()}"
-            if finite_count > 0:
-                values = detached[finite].float()
-                summary += (
-                    f" min={values.min().item():.6g}"
-                    f" max={values.max().item():.6g}"
-                    f" mean={values.mean().item():.6g}"
-                )
-            return summary
-
-        valid = detached >= 0
-        valid_count = int(valid.sum().item())
-        summary += f" valid={valid_count}/{detached.numel()}"
-        if valid_count > 0:
-            values = detached[valid]
-            summary += f" min={values.min().item()} max={values.max().item()}"
-        return summary
-
-
-def _dcp_logits_topk_summary(name: str, logits: torch.Tensor, k: int = 5) -> str:
-    if logits.numel() == 0 or logits.dim() < 2:
-        return f"{name}=empty"
-    with torch.no_grad():
-        row = logits.detach()[0].float()
-        top_vals, top_idx = torch.topk(row, k=min(k, row.numel()))
-        return (
-            f"{name}.top_idx0={top_idx.cpu().tolist()} "
-            f"{name}.top_val0={[round(float(v), 6) for v in top_vals.cpu().tolist()]}"
-        )
 
 
 @dataclasses.dataclass
@@ -938,24 +882,6 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
-
-        if _dcp_logits_should_log():
-            logger.warning(
-                "DSV4_DCP_ACC_DEBUG rank=%s/%s final_logits "
-                "attn_tp=%s/%s attn_dp=%s/%s use_attn_tp_lm_head=%s "
-                "dp_attn_logits_path=%s %s | %s | %s",
-                get_dcp_rank(),
-                get_dcp_world_size(),
-                get_attention_tp_rank(),
-                get_attention_tp_size(),
-                get_attention_dp_rank(),
-                get_attention_dp_size(),
-                self.use_attn_tp_group,
-                self.do_tensor_parallel_all_gather_dp_attn,
-                _dcp_logits_tensor_summary("local_hidden_states", local_hidden_states),
-                _dcp_logits_tensor_summary("logits", logits),
-                _dcp_logits_topk_summary("logits", logits),
-            )
 
         return logits
 
