@@ -35,6 +35,31 @@ logger = logging.getLogger(__name__)
 
 _UNIFIED_LAYER_ATTR = "_unified_asym_gemm_layer"
 
+# One AMX worker pool for the whole process, shared by every converted MoE
+# layer (mirrors KTransformers' single class-level CPUInfer). Without this each
+# layer would build its own _C.Runtime, multiplying the thread budget by the
+# MoE-layer count and oversubscribing the CPU. sglang owns the pool's
+# lifecycle and budget; AsymGEMM only consumes the injected runtime.
+_SHARED_CPU_RUNTIME = None
+
+
+def _get_cpu_runtime():
+    """Return the process-global AMX runtime, building it once on first use.
+
+    Sized by SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS as a *total* thread budget for
+    the shared pool (0 = library default = host hardware concurrency). The
+    value is read once, when the first convertible layer is built; all layers
+    then share that pool.
+    """
+    global _SHARED_CPU_RUNTIME
+    if _SHARED_CPU_RUNTIME is None:
+        from asym_gemm.unified_moe import _C
+
+        _SHARED_CPU_RUNTIME = _C.Runtime(
+            envs.SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS.get()
+        )
+    return _SHARED_CPU_RUNTIME
+
 
 def unified_asym_gemm_enabled() -> bool:
     return asym_gemm_wrapper.ASYMGEMM_UNIFIED_MOE
@@ -112,16 +137,15 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
     inter = w13.shape[1] // 2
 
     # sglang's silu_and_mul convention: first half of w13 is gate, second up.
-    # NOTE: asym_gemm.unified_moe.Layer.from_bf16 builds its own CPU AMX
-    # Runtime from `cpu_threads`; there is one thread pool per converted MoE
-    # layer. Sharing a single pool across layers is a planned follow-up.
+    # Inject the process-global AMX runtime so every converted MoE layer shares
+    # one worker pool (and one total thread budget) instead of building its own.
     unified_layer = UnifiedMoeLayer.from_bf16(
         gate=w13[:, :inter, :],
         up=w13[:, inter:, :],
         down=w2,
         top_k=layer.top_k,
         cuda_device=torch.cuda.current_device(),
-        cpu_threads=envs.SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS.get(),
+        runtime=_get_cpu_runtime(),
         m_cpu=envs.SGLANG_ASYMGEMM_UNIFIED_M_CPU.get(),
     )
     setattr(layer, _UNIFIED_LAYER_ATTR, unified_layer)

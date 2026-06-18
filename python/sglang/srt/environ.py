@@ -418,7 +418,9 @@ class Envs:
     # Per-expert dispatch threshold: experts with <= this many routed tokens
     # run on the CPU AMX bucket, the rest on the GPU INT8 grouped kernel.
     SGLANG_ASYMGEMM_UNIFIED_M_CPU = EnvInt(16)
-    # CPU worker threads for the AMX bucket (0 = library default).
+    # Total CPU worker threads for the AMX bucket. Sizes a single process-wide
+    # pool shared by every converted MoE layer (not per-layer), read once when
+    # the first layer is built. 0 = library default (host hardware concurrency).
     SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS = EnvInt(0)
 
     # DeepSeek MHA Optimization
