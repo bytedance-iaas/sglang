@@ -147,7 +147,6 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         req_to_token: torch.Tensor,
-        full_to_c128_state: torch.Tensor,
         state_slot_offset: int = 0,
     ) -> CompressorDecodePlan:
         batch_size = int(seq_lens.shape[0])
@@ -161,7 +160,6 @@ class CompressorDecodePlan(NamedTuple):
             seq_lens,
             req_pool_indices,
             req_to_token,
-            full_to_c128_state,
             plan_d,
             int(state_slot_offset),
         )
@@ -262,7 +260,6 @@ class CompressorPrefillPlan(NamedTuple):
         extend_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         req_to_token: torch.Tensor,
-        full_to_c128_state: torch.Tensor,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
         state_slot_offset: int = 0,
@@ -271,7 +268,6 @@ class CompressorPrefillPlan(NamedTuple):
         extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
         rid_i64 = req_pool_indices.to(torch.int64)
         r2t_i32 = req_to_token.to(torch.int32)
-        c128_state_i64 = full_to_c128_state.to(torch.int64)
         pin_buffer = torch.empty(
             (2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True
         )
@@ -285,7 +281,6 @@ class CompressorPrefillPlan(NamedTuple):
             extend_lens_cpu,
             rid_i64,
             r2t_i32,
-            c128_state_i64,
             plan_c_pin,
             plan_w_pin,
             plan_c_dev,
