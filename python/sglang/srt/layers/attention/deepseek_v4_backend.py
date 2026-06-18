@@ -70,24 +70,29 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
-# DCP merge 诊断日志：per-(layer, ratio) 限流计数；通过环境变量
-# SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS 控制每个 (layer, ratio) 打印的 step 上限。
-_DCP_MERGE_LOG_COUNT: Dict[Tuple[int, int], int] = {}
+# C4 DCP 诊断日志：per-(layer, stage) 限流计数；通过环境变量
+# SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS 控制每个 (layer, stage) 打印的 step 上限。
+_DCP_C4_LOG_COUNT: Dict[Tuple[int, str], int] = {}
 
 
-def _dcp_merge_should_log(layer_id: int, compress_ratio: int) -> bool:
+def _dcp_c4_should_log(layer_id: int, stage: str) -> bool:
     limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
     if limit <= 0:
         return False
-    key = (layer_id, compress_ratio)
-    cur = _DCP_MERGE_LOG_COUNT.get(key, 0)
+    key = (layer_id, stage)
+    cur = _DCP_C4_LOG_COUNT.get(key, 0)
     if cur >= limit:
         return False
-    _DCP_MERGE_LOG_COUNT[key] = cur + 1
+    _DCP_C4_LOG_COUNT[key] = cur + 1
     return True
 
 
-def _dcp_merge_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
+def _dcp_index_tensor_summary(
+    name: str,
+    x: Optional[torch.Tensor],
+    dcp_world_size: Optional[int] = None,
+    dcp_rank: Optional[int] = None,
+) -> str:
     if x is None:
         return f"{name}=None"
     with torch.no_grad():
@@ -96,23 +101,26 @@ def _dcp_merge_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
             parts.append("empty")
         elif x.dtype == torch.bool:
             parts.append(f"true={int(x.sum().item())}/{x.numel()}")
-        elif x.is_floating_point():
-            xf = x.float()
-            finite = torch.isfinite(xf)
-            n_finite = int(finite.sum().item())
-            parts.append(f"finite={n_finite}/{x.numel()}")
-            parts.append(f"neginf={int(torch.isneginf(xf).sum().item())}")
-            parts.append(f"posinf={int(torch.isposinf(xf).sum().item())}")
-            parts.append(f"nan={int(torch.isnan(xf).sum().item())}")
-            if n_finite > 0:
-                xv = xf[finite]
-                parts.append(f"min={float(xv.min().item()):.6g}")
-                parts.append(f"max={float(xv.max().item()):.6g}")
-                parts.append(f"mean={float(xv.mean().item()):.6g}")
-                parts.append(f"absmean={float(xv.abs().mean().item()):.6g}")
         else:
-            parts.append(f"min={int(x.min().item())}")
-            parts.append(f"max={int(x.max().item())}")
+            valid = x >= 0
+            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
+            if torch.any(valid):
+                xv = x[valid]
+                parts.append(f"min={int(xv.min().item())}")
+                parts.append(f"max={int(xv.max().item())}")
+                if dcp_world_size is not None and dcp_world_size > 1:
+                    mods = (xv % dcp_world_size).to(torch.int64)
+                    hist = torch.bincount(mods, minlength=dcp_world_size)
+                    parts.append(
+                        "mod_hist="
+                        + ",".join(
+                            str(int(v.item())) for v in hist[:dcp_world_size]
+                        )
+                    )
+                    if dcp_rank is not None:
+                        parts.append(
+                            f"rank_local={int((mods == dcp_rank).sum().item())}"
+                        )
         return " ".join(parts)
 
 
@@ -1310,9 +1318,30 @@ class DeepseekV4AttnBackend(
                 and compress_ratio == 4
                 and extra_indices is not None
             ):
+                dcp_world_size = get_dcp_world_size()
+                dcp_rank = get_dcp_rank()
+                c4_log_enabled = _dcp_c4_should_log(layer_id, "attn_extra_compact")
+                if c4_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
+                        "stage=attn_extra_compact_pre | %s | %s",
+                        layer_id,
+                        dcp_rank,
+                        dcp_world_size,
+                        _dcp_index_tensor_summary(
+                            "extra_indices",
+                            extra_indices,
+                            dcp_world_size,
+                            dcp_rank,
+                        ),
+                        _dcp_index_tensor_summary(
+                            "extra_topk_lengths",
+                            extra_topk_lengths,
+                        ),
+                    )
                 extra_indices, c4_local_lengths = (
                     core_attn_metadata._compact_dcp_local_indices(
-                        extra_indices, get_dcp_world_size(), get_dcp_rank()
+                        extra_indices, dcp_world_size, dcp_rank
                     )
                 )
                 # Same rule as C128: C4 is an optional extra source, so a
@@ -1320,6 +1349,25 @@ class DeepseekV4AttnBackend(
                 # than a dummy key.
                 extra_topk_lengths = c4_local_lengths
                 c4_has_local_kv = c4_local_lengths > 0
+                if c4_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
+                        "stage=attn_extra_compact_post | %s | %s | %s",
+                        layer_id,
+                        dcp_rank,
+                        dcp_world_size,
+                        _dcp_index_tensor_summary(
+                            "extra_indices",
+                            extra_indices,
+                            dcp_world_size,
+                            dcp_rank,
+                        ),
+                        _dcp_index_tensor_summary(
+                            "c4_local_lengths",
+                            c4_local_lengths,
+                        ),
+                        _dcp_index_tensor_summary("c4_has_local_kv", c4_has_local_kv),
+                    )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -1392,22 +1440,6 @@ class DeepseekV4AttnBackend(
                 # the TP-local head slice.
                 o, lse = mla_result[0], mla_result[1]
                 B, S_q, H_q, D_v = o.shape
-                _dcp_log_enabled = _dcp_merge_should_log(layer_id, compress_ratio)
-                if _dcp_log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
-                        "stage=per_rank_pre_mask B=%d S_q=%d H_q=%d D_v=%d | %s | %s",
-                        layer_id,
-                        compress_ratio,
-                        dcp_group.rank_in_group,
-                        dcp_group.world_size,
-                        B,
-                        S_q,
-                        H_q,
-                        D_v,
-                        _dcp_merge_tensor_summary("o", o),
-                        _dcp_merge_tensor_summary("lse", lse),
-                    )
                 dcp_has_local_kv = active_dcp_has_local_kv
                 if dcp_has_local_kv is not None:
                     has_local_kv = dcp_has_local_kv[: B * S_q]
@@ -1422,20 +1454,6 @@ class DeepseekV4AttnBackend(
                     )
                 o_flat = o.reshape(B * S_q, H_q, D_v).to(torch.float32)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
-                if _dcp_log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
-                        "stage=per_rank_post_mask | %s | %s | %s",
-                        layer_id,
-                        compress_ratio,
-                        dcp_group.rank_in_group,
-                        dcp_group.world_size,
-                        _dcp_merge_tensor_summary("o_flat", o_flat),
-                        _dcp_merge_tensor_summary("lse_flat", lse_flat),
-                        _dcp_merge_tensor_summary(
-                            "dcp_has_local_kv", dcp_has_local_kv
-                        ),
-                    )
                 merged, merged_lse = cp_lse_ag_out_rs(
                     o_flat, lse_flat, dcp_group, return_lse=True
                 )
@@ -1454,7 +1472,6 @@ class DeepseekV4AttnBackend(
                 )
                 # ``merged`` and ``sink_scale`` are both fp32 here; keep the fold
                 # in fp32 and only cast back to the model dtype after the fold.
-                merged_pre_sink = merged
                 merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1)
                 o = (
                     merged.transpose(0, 1)
@@ -1462,25 +1479,6 @@ class DeepseekV4AttnBackend(
                     .reshape(B, S_q, -1, D_v)
                     .to(q.dtype)
                 )
-                if _dcp_log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
-                        "stage=after_merge local_heads=%d sink_range=[%d,%d) | "
-                        "%s | %s | %s | %s | %s | %s",
-                        layer_id,
-                        compress_ratio,
-                        dcp_group.rank_in_group,
-                        dcp_group.world_size,
-                        local_heads,
-                        sink_start,
-                        sink_end,
-                        _dcp_merge_tensor_summary("merged_pre_sink", merged_pre_sink),
-                        _dcp_merge_tensor_summary("merged_lse", merged_lse),
-                        _dcp_merge_tensor_summary("local_attn_sink", local_attn_sink),
-                        _dcp_merge_tensor_summary("sink_scale", sink_scale),
-                        _dcp_merge_tensor_summary("merged_post_sink", merged),
-                        _dcp_merge_tensor_summary("o_final", o),
-                    )
             else:
                 mla_result = flash_mla.flash_mla_with_kvcache(
                     q=q,
@@ -1499,16 +1497,6 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )
                 o = mla_result[0]
-                if _dcp_merge_should_log(layer_id, compress_ratio):
-                    _lse = mla_result[1] if len(mla_result) > 1 else None
-                    logger.warning(
-                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d single_rank "
-                        "stage=flashmla_out | %s | %s",
-                        layer_id,
-                        compress_ratio,
-                        _dcp_merge_tensor_summary("o", o),
-                        _dcp_merge_tensor_summary("lse", _lse),
-                    )
 
             o = o.squeeze(1)
             return o
