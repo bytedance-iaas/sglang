@@ -687,20 +687,9 @@ class SchedulerMetricsReporter:
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
             if self.scheduler.enable_hisparse and hasattr(
-                self.scheduler, "pop_disagg_decode_pipeline_stats"
+                self.scheduler, "pop_disagg_decode_pipeline_stats_msg"
             ):
-                pipeline_stats = self.scheduler.pop_disagg_decode_pipeline_stats()
-                msg += (
-                    f"avg running bs: {pipeline_stats['avg_running_bs']:.2f}, "
-                    f"target bs: {pipeline_stats['target_bs']}, "
-                    f"underfed cycles: {pipeline_stats['underfed_cycles']}, "
-                    f"adaptive polls: {pipeline_stats['adaptive_polls']}, "
-                    f"interval polls: {pipeline_stats['interval_polls']}, "
-                    f"poll skips: {pipeline_stats['poll_skips']}, "
-                    f"prealloc oldest ms: {pipeline_stats['prealloc_oldest_ms']:.1f}, "
-                    f"transfer oldest ms: {pipeline_stats['transfer_oldest_ms']:.1f}, "
-                    f"waiting oldest ms: {pipeline_stats['waiting_oldest_ms']:.1f}, "
-                )
+                msg += self.scheduler.pop_disagg_decode_pipeline_stats_msg()
 
         if (
             self.scheduler.server_args.language_only

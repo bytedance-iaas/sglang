@@ -251,8 +251,6 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
-    prealloc_queue_entry_time: float = 0.0
-    transfer_queue_entry_time: float = 0.0
 
     @property
     def seqlen(self) -> int:
@@ -261,6 +259,66 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+@dataclass
+class DisaggDecodePipelineStats:
+    samples: int = 0
+    running_bs_sum: int = 0
+    underfed_cycles: int = 0
+    interval_polls: int = 0
+    adaptive_polls: int = 0
+    poll_skips: int = 0
+    prealloc_oldest_ms: float = 0.0
+    transfer_oldest_ms: float = 0.0
+    waiting_oldest_ms: float = 0.0
+
+    def record_sample(
+        self,
+        *,
+        running: int,
+        waiting: int,
+        transfer: int,
+        prealloc: int,
+        target_bs: int,
+        prealloc_oldest_ms: float,
+        transfer_oldest_ms: float,
+        waiting_oldest_ms: float,
+    ) -> None:
+        self.samples += 1
+        self.running_bs_sum += running
+        if running + waiting < target_bs and (prealloc > 0 or transfer > 0):
+            self.underfed_cycles += 1
+        self.prealloc_oldest_ms = max(
+            self.prealloc_oldest_ms, prealloc_oldest_ms
+        )
+        self.transfer_oldest_ms = max(
+            self.transfer_oldest_ms, transfer_oldest_ms
+        )
+        self.waiting_oldest_ms = max(self.waiting_oldest_ms, waiting_oldest_ms)
+
+    def record_poll(self, *, interval_due: bool) -> None:
+        if interval_due:
+            self.interval_polls += 1
+        else:
+            self.adaptive_polls += 1
+
+    def record_poll_skip(self) -> None:
+        self.poll_skips += 1
+
+    def format_log_message(self, *, target_bs: int) -> str:
+        samples = max(1, self.samples)
+        return (
+            f"avg running bs: {self.running_bs_sum / samples:.2f}, "
+            f"target bs: {target_bs}, "
+            f"underfed cycles: {self.underfed_cycles}, "
+            f"adaptive polls: {self.adaptive_polls}, "
+            f"interval polls: {self.interval_polls}, "
+            f"poll skips: {self.poll_skips}, "
+            f"prealloc oldest ms: {self.prealloc_oldest_ms:.1f}, "
+            f"transfer oldest ms: {self.transfer_oldest_ms:.1f}, "
+            f"waiting oldest ms: {self.waiting_oldest_ms:.1f}, "
+        )
 
 
 class DecodePreallocQueue:
@@ -718,7 +776,6 @@ class DecodePreallocQueue:
         )
 
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
-        decode_req.prealloc_queue_entry_time = time.monotonic()
         self.queue.append(decode_req)
         return decode_req
 
@@ -2061,13 +2118,9 @@ class DecodeTransferQueue:
         self.staging_handler = None
 
     def add(self, decode_req: DecodeRequest) -> None:
-        decode_req.transfer_queue_entry_time = time.monotonic()
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
-        now = time.monotonic()
-        for dr in decode_reqs:
-            dr.transfer_queue_entry_time = now
         self.queue.extend(decode_reqs)
         if self.enable_staging:
             for dr in decode_reqs:
@@ -2370,44 +2423,20 @@ class SchedulerDisaggregationDecodeMixin:
     def _disagg_decode_target_backlog(self: Scheduler, target_bs: int) -> int:
         return min(16, max(4, target_bs // 4))
 
-    def _oldest_decode_req_age_ms(
-        self: Scheduler, decode_reqs: List[DecodeRequest], attr: str
-    ) -> float:
-        now = time.monotonic()
+    def _oldest_req_time_stat_age_ms(self: Scheduler, reqs, attr: str) -> float:
+        now = time.perf_counter()
         oldest = 0.0
-        for decode_req in decode_reqs:
-            ts = getattr(decode_req, attr, 0.0)
+        for req in reqs:
+            ts = getattr(req.time_stats, attr, 0.0)
             if ts > 0:
                 oldest = max(oldest, now - ts)
         return oldest * 1000
 
-    def _oldest_waiting_req_age_ms(self: Scheduler) -> float:
-        now = time.monotonic()
-        oldest = 0.0
-        for req in self.waiting_queue:
-            ts = getattr(req.time_stats, "wait_queue_entry_time", 0.0)
-            if ts > 0:
-                oldest = max(oldest, now - ts)
-        return oldest * 1000
-
-    def _new_disagg_decode_pipeline_stats(self: Scheduler) -> Dict[str, float]:
-        return {
-            "samples": 0,
-            "running_bs_sum": 0,
-            "underfed_cycles": 0,
-            "interval_polls": 0,
-            "adaptive_polls": 0,
-            "poll_skips": 0,
-            "prealloc_oldest_ms": 0.0,
-            "transfer_oldest_ms": 0.0,
-            "waiting_oldest_ms": 0.0,
-        }
-
-    def _get_disagg_decode_pipeline_stats(self: Scheduler) -> Dict[str, float]:
+    def _get_disagg_decode_pipeline_stats(
+        self: Scheduler,
+    ) -> DisaggDecodePipelineStats:
         if not hasattr(self, "_disagg_decode_pipeline_stats"):
-            self._disagg_decode_pipeline_stats = (
-                self._new_disagg_decode_pipeline_stats()
-            )
+            self._disagg_decode_pipeline_stats = DisaggDecodePipelineStats()
         return self._disagg_decode_pipeline_stats
 
     def _record_disagg_decode_pipeline_sample(self: Scheduler) -> None:
@@ -2421,46 +2450,37 @@ class SchedulerDisaggregationDecodeMixin:
         prealloc = len(self.disagg_decode_prealloc_queue.queue)
         target_bs = self._disagg_decode_target_bs()
 
-        stats["samples"] += 1
-        stats["running_bs_sum"] += running
-        if running + waiting < target_bs and (prealloc > 0 or transfer > 0):
-            stats["underfed_cycles"] += 1
-
-        stats["prealloc_oldest_ms"] = max(
-            stats["prealloc_oldest_ms"],
-            self._oldest_decode_req_age_ms(
-                self.disagg_decode_prealloc_queue.queue,
-                "prealloc_queue_entry_time",
+        stats.record_sample(
+            running=running,
+            waiting=waiting,
+            transfer=transfer,
+            prealloc=prealloc,
+            target_bs=target_bs,
+            prealloc_oldest_ms=self._oldest_req_time_stat_age_ms(
+                (
+                    decode_req.req
+                    for decode_req in self.disagg_decode_prealloc_queue.queue
+                ),
+                "decode_prealloc_queue_entry_time",
+            ),
+            transfer_oldest_ms=self._oldest_req_time_stat_age_ms(
+                (
+                    decode_req.req
+                    for decode_req in self.disagg_decode_transfer_queue.queue
+                ),
+                "decode_transfer_queue_entry_time",
+            ),
+            waiting_oldest_ms=self._oldest_req_time_stat_age_ms(
+                self.waiting_queue,
+                "wait_queue_entry_time",
             ),
         )
-        stats["transfer_oldest_ms"] = max(
-            stats["transfer_oldest_ms"],
-            self._oldest_decode_req_age_ms(
-                self.disagg_decode_transfer_queue.queue,
-                "transfer_queue_entry_time",
-            ),
-        )
-        stats["waiting_oldest_ms"] = max(
-            stats["waiting_oldest_ms"],
-            self._oldest_waiting_req_age_ms(),
-        )
 
-    def pop_disagg_decode_pipeline_stats(self: Scheduler) -> Dict[str, float]:
+    def pop_disagg_decode_pipeline_stats_msg(self: Scheduler) -> str:
         stats = self._get_disagg_decode_pipeline_stats()
-        samples = max(1, int(stats["samples"]))
-        summary = {
-            "avg_running_bs": stats["running_bs_sum"] / samples,
-            "underfed_cycles": int(stats["underfed_cycles"]),
-            "interval_polls": int(stats["interval_polls"]),
-            "adaptive_polls": int(stats["adaptive_polls"]),
-            "poll_skips": int(stats["poll_skips"]),
-            "prealloc_oldest_ms": stats["prealloc_oldest_ms"],
-            "transfer_oldest_ms": stats["transfer_oldest_ms"],
-            "waiting_oldest_ms": stats["waiting_oldest_ms"],
-            "target_bs": self._disagg_decode_target_bs(),
-        }
-        self._disagg_decode_pipeline_stats = self._new_disagg_decode_pipeline_stats()
-        return summary
+        msg = stats.format_log_message(target_bs=self._disagg_decode_target_bs())
+        self._disagg_decode_pipeline_stats = DisaggDecodePipelineStats()
+        return msg
 
     def _should_adaptive_poll_disagg_decode(
         self: Scheduler, *, target_bs: int, target_backlog: int
@@ -2725,10 +2745,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         if should_pop_prealloc or should_poll_transfer:
             if stats is not None:
-                if interval_due:
-                    stats["interval_polls"] += 1
-                else:
-                    stats["adaptive_polls"] += 1
+                stats.record_poll(interval_due=interval_due)
 
         if should_pop_prealloc:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
@@ -2747,4 +2764,4 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 self.waiting_queue.extend(transferred_reqs)
         elif stats is not None:
-            stats["poll_skips"] += 1
+            stats.record_poll_skip()
