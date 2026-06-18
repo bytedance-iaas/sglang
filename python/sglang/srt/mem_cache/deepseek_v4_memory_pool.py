@@ -25,6 +25,50 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+_DCP_SWA_TRANSLATION_LOG_COUNT: dict[Tuple[int, str], int] = {}
+
+
+def _dcp_swa_translation_should_log(layer_id: int, tag: str) -> bool:
+    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
+    if limit <= 0:
+        return False
+    key = (layer_id, tag)
+    cur = _DCP_SWA_TRANSLATION_LOG_COUNT.get(key, 0)
+    if cur >= limit:
+        return False
+    _DCP_SWA_TRANSLATION_LOG_COUNT[key] = cur + 1
+    return True
+
+
+def _log_dcp_swa_translation(
+    *,
+    tag: str,
+    layer_id: int,
+    raw_loc: torch.Tensor,
+    swa_loc: torch.Tensor,
+    dcp_world_size: int,
+    dcp_rank: int,
+) -> None:
+    if not _dcp_swa_translation_should_log(layer_id, tag):
+        return
+    with torch.no_grad():
+        valid = (raw_loc >= 0) & (swa_loc >= 0)
+        raw_local = valid & ((raw_loc % dcp_world_size) == dcp_rank)
+        swa_local = valid & ((swa_loc % dcp_world_size) == dcp_rank)
+        mismatch = valid & (raw_local != swa_local)
+        logger.warning(
+            "DSV4_DCP_SWA_TRANSLATION_DEBUG tag=%s layer=%d rank=%d/%d "
+            "shape=%s valid=%d raw_local=%d swa_local=%d raw_swa_rank_mismatch=%d",
+            tag,
+            layer_id,
+            dcp_rank,
+            dcp_world_size,
+            tuple(raw_loc.shape),
+            int(valid.sum().item()),
+            int(raw_local.sum().item()),
+            int(swa_local.sum().item()),
+            int(mismatch.sum().item()),
+        )
 
 
 def get_compress_state_ring_size(
@@ -902,6 +946,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             dcp_world_size, dcp_rank = 1, 0
         swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if dcp_kv_mask is not None:
+            _log_dcp_swa_translation(
+                tag="set_swa_key_buffer_radix",
+                layer_id=layer_id,
+                raw_loc=raw_loc,
+                swa_loc=swa_loc,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id),
             swa_loc,
@@ -932,6 +985,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # dcp_world_size/dcp_rank. The fused C++ store kernel is not
             # yet DCP-aware.
             dcp_world_size, dcp_rank = self._dcp_world_rank()
+            _log_dcp_swa_translation(
+                tag="set_swa_key_buffer_radix_fused",
+                layer_id=layer_id,
+                raw_loc=raw_loc,
+                swa_loc=swa_loc,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
             return self.swa_kv_pool.set_key_buffer_fused_fallback_triton(
                 self._swa_local_layer_id(layer_id),
                 swa_loc,
@@ -970,6 +1031,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             kv = kv.contiguous()
             fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
             dcp_world_size, dcp_rank = self._dcp_world_rank()
+            _log_dcp_swa_translation(
+                tag="set_swa_key_buffer_radix_fused_norm_rope",
+                layer_id=layer_id,
+                raw_loc=raw_loc,
+                swa_loc=swa_loc,
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+            )
             return self.swa_kv_pool.set_key_buffer_fused_fallback_triton(
                 self._swa_local_layer_id(layer_id),
                 swa_loc,
