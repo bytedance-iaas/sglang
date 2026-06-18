@@ -371,9 +371,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._kvcache = kvcache
 
         self.clear()
-        self._kvcache = kvcache
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
@@ -433,6 +433,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        set_c128_mapping = getattr(self._kvcache, "set_c128_state_mapping", None)
+        if set_c128_mapping is not None:
+            set_c128_mapping(alloc_full_indices)
         return alloc_full_indices
 
     def alloc_extend(
@@ -483,6 +486,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        set_c128_mapping = getattr(self._kvcache, "set_c128_state_mapping", None)
+        if set_c128_mapping is not None:
+            set_c128_mapping(alloc_full_indices)
 
         return alloc_full_indices
 
@@ -551,6 +557,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if swa_tail_len < extend_num_tokens:
             self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
+        set_c128_mapping = getattr(self._kvcache, "set_c128_state_mapping", None)
+        if set_c128_mapping is not None:
+            set_c128_mapping(alloc_full_indices)
         return alloc_full_indices
 
     def alloc_decode(
@@ -578,6 +587,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        set_c128_mapping = getattr(self._kvcache, "set_c128_state_mapping", None)
+        if set_c128_mapping is not None:
+            set_c128_mapping(alloc_full_indices)
 
         return alloc_full_indices
 
@@ -588,6 +600,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
+            clear_c128_mapping = getattr(
+                self._kvcache, "clear_c128_state_mapping", None
+            )
+            if clear_c128_mapping is not None:
+                clear_c128_mapping(free_index)
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
@@ -612,6 +629,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
+        set_c128_mapping = getattr(self._kvcache, "set_c128_state_mapping", None)
+        if set_c128_mapping is not None:
+            set_c128_mapping(full_indices)
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -659,6 +679,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        c128_mapping = getattr(self._kvcache, "full_to_c128_state_index_mapping", None)
+        if c128_mapping is not None:
+            c128_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
 
