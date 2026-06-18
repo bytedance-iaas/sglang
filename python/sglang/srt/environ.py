@@ -201,6 +201,7 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -586,6 +587,11 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    # Master gate for DeepSeek V4 Decode Context Parallel (DCP). When False
+    # (default), DSv4 hook rejects --dcp-size > 1 with a clear error so users
+    # cannot enable an unvalidated combination by accident. Flip to 1 once
+    # numerical-equivalence regression has been verified on the target cluster.
+    SGLANG_DSV4_ENABLE_DCP = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

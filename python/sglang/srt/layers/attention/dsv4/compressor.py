@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
@@ -14,6 +15,7 @@ from sglang.jit_kernel.deepseek_v4 import (
     triton_create_paged_compress_data,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -35,6 +37,66 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+_DCP_COMPRESSOR_LOG_COUNT = 0
+
+
+def _dcp_compressor_should_log() -> bool:
+    global _DCP_COMPRESSOR_LOG_COUNT
+    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
+    if limit <= 0 or _DCP_COMPRESSOR_LOG_COUNT >= limit:
+        return False
+    _DCP_COMPRESSOR_LOG_COUNT += 1
+    return True
+
+
+def _dcp_compressor_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
+    if x is None:
+        return f"{name}=None"
+    with torch.no_grad():
+        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
+        if x.numel() == 0:
+            parts.append("empty")
+        elif x.dtype == torch.bool:
+            parts.append(f"true={int(x.sum().item())}/{x.numel()}")
+        elif x.is_floating_point():
+            finite = torch.isfinite(x)
+            parts.append(f"finite={int(finite.sum().item())}/{x.numel()}")
+            if finite.any():
+                xf = x[finite].float()
+                parts.append(f"min={float(xf.min().item()):.6g}")
+                parts.append(f"max={float(xf.max().item()):.6g}")
+        else:
+            valid = x >= 0
+            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
+            if valid.any():
+                xv = x[valid]
+                parts.append(f"min={int(xv.min().item())}")
+                parts.append(f"max={int(xv.max().item())}")
+                dcp_world_size = get_dcp_world_size()
+                if dcp_world_size > 1:
+                    hist = torch.bincount(
+                        (xv % dcp_world_size).to(torch.int64),
+                        minlength=dcp_world_size,
+                    )
+                    parts.append(
+                        "mod_hist="
+                        + ",".join(str(int(v.item())) for v in hist[:dcp_world_size])
+                    )
+        return " ".join(parts)
+
+
+def _dcp_compressor_log(message: str, *summaries: str) -> None:
+    if not _dcp_compressor_should_log():
+        return
+    logger.warning(
+        "DSV4_DCP_ACC_DEBUG rank=%s/%s %s %s",
+        get_dcp_rank(),
+        get_dcp_world_size(),
+        message,
+        " | ".join(summaries),
+    )
 
 
 class FusedCompressMetadata(NamedTuple):
@@ -135,15 +197,24 @@ class CompressorBackendMixin:
             if compressor.ratio == 4
             else core_metadata.c128_out_loc
         )
+        _dcp_compressor_log(
+            f"extra_kv_store layer={layer_id} ratio={compressor.ratio}",
+            _dcp_compressor_tensor_summary("out_loc", out_loc),
+            _dcp_compressor_tensor_summary("dcp_kv_mask", forward_batch.dcp_kv_mask),
+            _dcp_compressor_tensor_summary("new_compressed_kv", new_compressed_kv),
+        )
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+            token_to_kv_pool.set_extra_key_buffer(
+                layer_id, out_loc, pack, dcp_kv_mask=forward_batch.dcp_kv_mask
+            )
 
     def forward_indexer_compressor(
         self,
@@ -160,6 +231,14 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
+        _dcp_compressor_log(
+            f"indexer_k_store layer={layer_id} ratio={compressor.ratio}",
+            _dcp_compressor_tensor_summary(
+                "c4_out_loc", self.forward_metadata.core_metadata.c4_out_loc
+            ),
+            _dcp_compressor_tensor_summary("dcp_kv_mask", forward_batch.dcp_kv_mask),
+            _dcp_compressor_tensor_summary("new_compressed_kv", new_compressed_kv),
+        )
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,

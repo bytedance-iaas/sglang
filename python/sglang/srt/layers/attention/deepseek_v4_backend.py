@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -68,6 +69,51 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+# DCP merge 诊断日志：per-(layer, ratio) 限流计数；通过环境变量
+# SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS 控制每个 (layer, ratio) 打印的 step 上限。
+_DCP_MERGE_LOG_COUNT: Dict[Tuple[int, int], int] = {}
+
+
+def _dcp_merge_should_log(layer_id: int, compress_ratio: int) -> bool:
+    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
+    if limit <= 0:
+        return False
+    key = (layer_id, compress_ratio)
+    cur = _DCP_MERGE_LOG_COUNT.get(key, 0)
+    if cur >= limit:
+        return False
+    _DCP_MERGE_LOG_COUNT[key] = cur + 1
+    return True
+
+
+def _dcp_merge_tensor_summary(name: str, x: Optional[torch.Tensor]) -> str:
+    if x is None:
+        return f"{name}=None"
+    with torch.no_grad():
+        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
+        if x.numel() == 0:
+            parts.append("empty")
+        elif x.dtype == torch.bool:
+            parts.append(f"true={int(x.sum().item())}/{x.numel()}")
+        elif x.is_floating_point():
+            xf = x.float()
+            finite = torch.isfinite(xf)
+            n_finite = int(finite.sum().item())
+            parts.append(f"finite={n_finite}/{x.numel()}")
+            parts.append(f"neginf={int(torch.isneginf(xf).sum().item())}")
+            parts.append(f"posinf={int(torch.isposinf(xf).sum().item())}")
+            parts.append(f"nan={int(torch.isnan(xf).sum().item())}")
+            if n_finite > 0:
+                xv = xf[finite]
+                parts.append(f"min={float(xv.min().item()):.6g}")
+                parts.append(f"max={float(xv.max().item()):.6g}")
+                parts.append(f"mean={float(xv.mean().item()):.6g}")
+                parts.append(f"absmean={float(xv.abs().mean().item()):.6g}")
+        else:
+            parts.append(f"min={int(x.min().item())}")
+            parts.append(f"max={int(x.max().item())}")
+        return " ".join(parts)
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -127,6 +173,9 @@ class DSV4AttnMetadata:
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    dcp_swa_has_local_kv: Optional[torch.Tensor] = None
+    dcp_c128_has_local_kv: Optional[torch.Tensor] = None
+    dcp_has_local_kv: Optional[torch.Tensor] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -170,6 +219,9 @@ class DSV4AttnMetadata:
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
+                "dcp_swa_has_local_kv",
+                "dcp_c128_has_local_kv",
+                "dcp_has_local_kv",
             ],
             assign_fields=[
                 "c1_flashmla_metadata",
@@ -202,8 +254,86 @@ class DSV4AttnMetadata:
             compute_page_indices=True,
         )
 
+        self.apply_dcp_local_kv_indices()
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+
+    @staticmethod
+    def _compact_dcp_local_indices(
+        indices: torch.Tensor,
+        dcp_world_size: int,
+        dcp_rank: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid_mask = indices >= 0
+        local_mask = valid_mask & ((indices % dcp_world_size) == dcp_rank)
+        physical_indices = torch.where(
+            local_mask, indices // dcp_world_size, torch.full_like(indices, -1)
+        )
+
+        col = torch.arange(indices.shape[-1], device=indices.device).view(
+            *([1] * (indices.dim() - 1)), -1
+        )
+        order_key = torch.where(local_mask, col, col + indices.shape[-1])
+        order = torch.argsort(order_key, dim=-1)
+        compacted = torch.gather(physical_indices, dim=-1, index=order)
+
+        local_lengths = local_mask.sum(dim=-1).to(torch.int32)
+        compact_mask = col < local_lengths.unsqueeze(-1)
+        compacted = torch.where(
+            compact_mask, compacted, torch.full_like(compacted, -1)
+        )
+        # FlashMLA's sm90 sparse_fp8 MODEL1 kernel handles topk_length=0
+        # correctly: its mainloop forces ``orig_topk_padded >= TOPK_BLOCK_SIZE``
+        # but masks every column via ``rel_block_idx*TOPK_BLOCK_SIZE + col <
+        # topk_length`` and ``index != -1``, so all logits become -inf, rL
+        # collapses to 0, ``o_scales`` is forced to 0 and the kernel writes
+        # ``o=0, lse=+inf`` -- exactly the "no contribution" signal the DCP
+        # merge expects (``cp_lse_ag_out_rs`` already maps +inf/NaN to -inf).
+        # Leaving the empty-row indices at -1 keeps that path active. We
+        # used to substitute a dummy ``index=0`` here, which combined with
+        # the caller's ``clamp(swa_topk_lengths, min=1)`` made FlashMLA
+        # treat the row as if it had 1 valid KV (page 0 / token 0) and
+        # poisoned the cross-rank LSE merge.
+        return compacted.to(torch.int32), local_lengths
+
+    def apply_dcp_local_kv_indices(self) -> None:
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size == 1 or self.dcp_swa_has_local_kv is not None:
+            return
+
+        dcp_rank = get_dcp_rank()
+        self.swa_page_indices, swa_local_lengths = (
+            self._compact_dcp_local_indices(
+                self.swa_page_indices, dcp_world_size, dcp_rank
+            )
+        )
+        self.dcp_swa_has_local_kv = swa_local_lengths > 0
+        # Do not clamp swa lengths to 1: FlashMLA correctly emits
+        # ``o=0, lse=+inf`` for topk_length=0 rows (see the comment in
+        # ``_compact_dcp_local_indices``); a clamp would force a dummy KV
+        # into the row's softmax and pollute the cross-rank LSE merge.
+        self.swa_topk_lengths = swa_local_lengths
+        if self.c128_page_indices is not None:
+            self.c128_page_indices, c128_local_lengths = (
+                self._compact_dcp_local_indices(
+                    self.c128_page_indices, dcp_world_size, dcp_rank
+                )
+            )
+            self.dcp_c128_has_local_kv = c128_local_lengths > 0
+            # Extra KV sources may be empty while SWA still has local KV for
+            # this row. Do not clamp extra lengths to 1, otherwise the dummy
+            # index participates in FlashMLA and pollutes DCP LSE merging.
+            self.c128_topk_lengths_clamp1 = c128_local_lengths
+        # Backward-compatible alias for existing metadata copy/replay paths.
+        # Forward must use the compress-ratio-specific mask below instead.
+        self.dcp_has_local_kv = self.dcp_swa_has_local_kv
+
+    def get_dcp_has_local_kv(self, compress_ratio: Literal[0, 4, 128]):
+        if self.dcp_swa_has_local_kv is None:
+            return self.dcp_has_local_kv
+        if compress_ratio == 128 and self.dcp_c128_has_local_kv is not None:
+            return self.dcp_swa_has_local_kv | self.dcp_c128_has_local_kv
+        return self.dcp_swa_has_local_kv
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -215,6 +345,9 @@ class DSV4AttnMetadata:
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
+        "dcp_swa_has_local_kv",
+        "dcp_c128_has_local_kv",
+        "dcp_has_local_kv",
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
@@ -234,13 +367,17 @@ class DSV4AttnMetadata:
         expected_local_len = pre_global_len // cp_size
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
+            if val is None:
+                continue
             assert isinstance(
                 val, torch.Tensor
             ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name)
+            val = getattr(self, field_name, None)
+            if val is None:
+                continue
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
                 f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
@@ -648,7 +785,11 @@ class DeepseekV4AttnBackend(
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices
+                bs,
+                num_draft_tokens,
+                seq_lens,
+                req_pool_indices,
+                padded_num_tokens=out_cache_loc.shape[0],
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -1040,6 +1181,7 @@ class DeepseekV4AttnBackend(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
                 cache_k=swa_k,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
@@ -1047,6 +1189,7 @@ class DeepseekV4AttnBackend(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
 
     def _maybe_upgrade_forward_metadata(self) -> None:
@@ -1142,6 +1285,41 @@ class DeepseekV4AttnBackend(
                     swa_topk_lengths = _pad_tensor_to_size(
                         swa_topk_lengths, q.shape[0], value=1
                     )
+                if (
+                    core_attn_metadata.dcp_has_local_kv is not None
+                    and core_attn_metadata.dcp_has_local_kv.shape[0] != q.shape[0]
+                ):
+                    core_attn_metadata.dcp_has_local_kv = _pad_tensor_to_size(
+                        core_attn_metadata.dcp_has_local_kv, q.shape[0], value=False
+                    )
+                for field_name in (
+                    "dcp_swa_has_local_kv",
+                    "dcp_c128_has_local_kv",
+                ):
+                    val = getattr(core_attn_metadata, field_name, None)
+                    if val is not None and val.shape[0] != q.shape[0]:
+                        setattr(
+                            core_attn_metadata,
+                            field_name,
+                            _pad_tensor_to_size(val, q.shape[0], value=False),
+                        )
+
+            c4_has_local_kv = None
+            if (
+                get_dcp_world_size() > 1
+                and compress_ratio == 4
+                and extra_indices is not None
+            ):
+                extra_indices, c4_local_lengths = (
+                    core_attn_metadata._compact_dcp_local_indices(
+                        extra_indices, get_dcp_world_size(), get_dcp_rank()
+                    )
+                )
+                # Same rule as C128: C4 is an optional extra source, so a
+                # per-rank empty C4 shard should contribute zero keys rather
+                # than a dummy key.
+                extra_topk_lengths = c4_local_lengths
+                c4_has_local_kv = c4_local_lengths > 0
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -1164,22 +1342,201 @@ class DeepseekV4AttnBackend(
 
             import flash_mla
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+            from sglang.srt.distributed.parallel_state import (
+                get_dcp_group_no_assert,
+            )
+
+            dcp_group = get_dcp_group_no_assert()
+            use_dcp = dcp_group is not None and dcp_group.world_size > 1
+
+            if use_dcp:
+                from sglang.srt.layers.utils.dcp_utils import cp_lse_ag_out_rs
+
+                # Attention sink is a global softmax term with zero value. Do
+                # not pass it into per-rank FlashMLA partials: rows with no
+                # local KV use dummy index 0/length 1, and an in-kernel sink
+                # would prevent the post-mask from removing that dummy KV. We
+                # merge KV-only attention first and fold the sink denominator
+                # into the merged local head slice below.
+                dcp_attn_sink = torch.full_like(attn_sink, float("-inf"))
+                active_dcp_has_local_kv = core_attn_metadata.get_dcp_has_local_kv(
+                    compress_ratio
+                )
+                if c4_has_local_kv is not None:
+                    if active_dcp_has_local_kv is None:
+                        active_dcp_has_local_kv = c4_has_local_kv
+                    else:
+                        active_dcp_has_local_kv = (
+                            active_dcp_has_local_kv | c4_has_local_kv
+                        )
+
+                # Instrumentation: count rows where SWA shard is empty but the
+                # extra (C4/C128) shard is non-empty. Such rows keep a dummy
+                # SWA page-0 (clamp(min=1)) that pollutes the per-rank o/lse.
+                # Scalar reduces only -- no boolean-index materialisation.
+                _swa_mask = core_attn_metadata.dcp_swa_has_local_kv
+                if _swa_mask is not None:
+                    if compress_ratio == 4:
+                        _extra_mask = c4_has_local_kv
+                    elif compress_ratio == 128:
+                        _extra_mask = core_attn_metadata.dcp_c128_has_local_kv
+                    else:
+                        _extra_mask = None
+                    if _extra_mask is not None:
+                        _n = _swa_mask.shape[0]
+                        _em = _extra_mask[:_n]
+                        _swa_empty = (~_swa_mask).sum().item()
+                        _poison = ((~_swa_mask) & _em).sum().item()
+                        logger.info(
+                            "DCP_SWA_DUMMY_POISON layer=%d ratio=%d rank=%d "
+                            "rows=%d swa_empty=%d swa_empty_extra_nonempty=%d",
+                            layer_id,
+                            compress_ratio,
+                            dcp_group.rank_in_group,
+                            _n,
+                            int(_swa_empty),
+                            int(_poison),
+                        )
+
+                mla_result = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=dcp_attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
+                # DCP shards KV/sequence, not heads. Compute partial attention
+                # for the full gathered query heads on each KV shard, then
+                # combine shards with LSE correction and reduce-scatter back to
+                # the TP-local head slice.
+                o, lse = mla_result[0], mla_result[1]
+                B, S_q, H_q, D_v = o.shape
+                _dcp_log_enabled = _dcp_merge_should_log(layer_id, compress_ratio)
+                if _dcp_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
+                        "stage=per_rank_pre_mask B=%d S_q=%d H_q=%d D_v=%d | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        dcp_group.rank_in_group,
+                        dcp_group.world_size,
+                        B,
+                        S_q,
+                        H_q,
+                        D_v,
+                        _dcp_merge_tensor_summary("o", o),
+                        _dcp_merge_tensor_summary("lse", lse),
+                    )
+                dcp_has_local_kv = active_dcp_has_local_kv
+                if dcp_has_local_kv is not None:
+                    has_local_kv = dcp_has_local_kv[: B * S_q]
+                    has_local_kv = has_local_kv.reshape(B, S_q)
+                    o = torch.where(
+                        has_local_kv[:, :, None, None], o, torch.zeros_like(o)
+                    )
+                    lse = torch.where(
+                        has_local_kv[:, None, :],
+                        lse,
+                        torch.full_like(lse, float("-inf")),
+                    )
+                o_flat = o.reshape(B * S_q, H_q, D_v).to(torch.float32)
+                lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
+                if _dcp_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
+                        "stage=per_rank_post_mask | %s | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        dcp_group.rank_in_group,
+                        dcp_group.world_size,
+                        _dcp_merge_tensor_summary("o_flat", o_flat),
+                        _dcp_merge_tensor_summary("lse_flat", lse_flat),
+                        _dcp_merge_tensor_summary(
+                            "dcp_has_local_kv", dcp_has_local_kv
+                        ),
+                    )
+                merged, merged_lse = cp_lse_ag_out_rs(
+                    o_flat, lse_flat, dcp_group, return_lse=True
+                )
+                local_heads = H_q // dcp_group.world_size
+                sink_start = dcp_group.rank_in_group * local_heads
+                sink_end = sink_start + local_heads
+                local_attn_sink = attn_sink[sink_start:sink_end].to(torch.float32)
+                sink_scale = torch.where(
+                    torch.isneginf(merged_lse),
+                    torch.zeros_like(merged_lse),
+                    1.0
+                    / (
+                        1.0
+                        + torch.exp(local_attn_sink[None, :] - merged_lse)
+                    ),
+                )
+                # ``merged`` and ``sink_scale`` are both fp32 here; keep the fold
+                # in fp32 and only cast back to the model dtype after the fold.
+                merged_pre_sink = merged
+                merged = merged * sink_scale.transpose(0, 1).unsqueeze(-1)
+                o = (
+                    merged.transpose(0, 1)
+                    .contiguous()
+                    .reshape(B, S_q, -1, D_v)
+                    .to(q.dtype)
+                )
+                if _dcp_log_enabled:
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d rank=%d/%d "
+                        "stage=after_merge local_heads=%d sink_range=[%d,%d) | "
+                        "%s | %s | %s | %s | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        dcp_group.rank_in_group,
+                        dcp_group.world_size,
+                        local_heads,
+                        sink_start,
+                        sink_end,
+                        _dcp_merge_tensor_summary("merged_pre_sink", merged_pre_sink),
+                        _dcp_merge_tensor_summary("merged_lse", merged_lse),
+                        _dcp_merge_tensor_summary("local_attn_sink", local_attn_sink),
+                        _dcp_merge_tensor_summary("sink_scale", sink_scale),
+                        _dcp_merge_tensor_summary("merged_post_sink", merged),
+                        _dcp_merge_tensor_summary("o_final", o),
+                    )
+            else:
+                mla_result = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
+                o = mla_result[0]
+                if _dcp_merge_should_log(layer_id, compress_ratio):
+                    _lse = mla_result[1] if len(mla_result) > 1 else None
+                    logger.warning(
+                        "DSV4_DCP_MERGE_DEBUG layer=%d ratio=%d single_rank "
+                        "stage=flashmla_out | %s | %s",
+                        layer_id,
+                        compress_ratio,
+                        _dcp_merge_tensor_summary("o", o),
+                        _dcp_merge_tensor_summary("lse", _lse),
+                    )
 
             o = o.squeeze(1)
             return o
@@ -1227,6 +1584,7 @@ class DeepseekV4AttnBackend(
         qo_len: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        padded_num_tokens: Optional[int] = None,
     ):
         seq_lens_casual = seq_lens[:, None] + torch.arange(
             -qo_len + 1, 1, **self.cuda_int32_kwargs
@@ -1236,6 +1594,19 @@ class DeepseekV4AttnBackend(
             bs, **self.cuda_int32_kwargs
         ).repeat_interleave(qo_len)
         req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
+        num_tokens = seq_lens_casual.shape[0]
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
+            pad_size = padded_num_tokens - num_tokens
+            seq_lens_casual = torch.nn.functional.pad(
+                seq_lens_casual,
+                (0, pad_size),
+                value=1,
+            )
+            req_pool_indices_repeated = torch.nn.functional.pad(
+                req_pool_indices_repeated,
+                (0, pad_size),
+                value=req_pool_indices_repeated[-1].item(),
+            )
         return seq_lens_casual, req_pool_indices_repeated
 
     def make_core_attn_metadata(
@@ -1283,6 +1654,7 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.init_compression_metadata()
             core_attn_metadata.init_flashmla_related()
         else:
+            core_attn_metadata.apply_dcp_local_kv_indices()
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()

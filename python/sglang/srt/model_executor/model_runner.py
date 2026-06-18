@@ -369,6 +369,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attn_cp_size = server_args.attn_cp_size
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
+        # Decode Context Parallel (DCP) topology. Each tp rank belongs to
+        # exactly one dcp group of size ``server_args.dcp_size`` consisting of
+        # ``dcp_size`` consecutive tp ranks. ``dcp_rank`` is this rank's index
+        # inside that group.
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = (
+            tp_rank % server_args.dcp_size if server_args.dcp_size > 1 else 0
+        )
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -1109,6 +1117,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
+                decode_context_parallel_size=self.server_args.dcp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
@@ -2481,6 +2490,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
             hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
+            dcp_size=self.dcp_size,
         )
         buffers.num_token_non_padded[...] = num_tokens
 

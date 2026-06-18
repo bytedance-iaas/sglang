@@ -51,6 +51,64 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
+    validate_deepseek_v4_dcp(server_args)
+
+
+def validate_deepseek_v4_dcp(server_args: "ServerArgs") -> None:
+    """Validate DeepSeek V4 DCP (decode context parallel) compatibility.
+
+    server_args.py already enforces ``tp_size % dcp_size == 0`` and disables
+    piecewise cuda graph for ``dcp_size > 1``. This hook adds the DSV4-specific
+    finer-grained checks: attn_tp divisibility and combo warnings for
+    HiSparse / online c128.
+    """
+    if server_args.dcp_size <= 1:
+        return
+
+    # Phase 7 master gate: DCP path is implemented but not yet numerically
+    # validated against dcp_size=1 baseline. Require explicit env opt-in so
+    # accidental --dcp-size > 1 fails fast with a clear error.
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DSV4_ENABLE_DCP.get():
+        raise ValueError(
+            "DeepSeekV4 DCP (--dcp-size > 1) is gated behind "
+            "SGLANG_DSV4_ENABLE_DCP=1. Set the env var explicitly after "
+            "verifying numerical equivalence vs. dcp_size=1 on your cluster."
+        )
+
+    # Current DSv4 DCP implementation reduce-scatters attention output across
+    # the attention-TP head dimension. This is only valid when the DCP group is
+    # exactly the attention-TP group; smaller DCP subgroups would produce a
+    # larger-than-local head shard that the caller cannot map back correctly.
+    attn_tp = server_args.tp_size // max(server_args.dp_size, 1)
+    if attn_tp != server_args.dcp_size:
+        raise ValueError(
+            f"DeepSeekV4 DCP currently requires dcp_size ({server_args.dcp_size}) "
+            f"== attn_tp ({attn_tp}); configure tp/dp_size/dcp_size accordingly."
+        )
+
+    # Online c128 + DCP: untested combination; warn but allow.
+    if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        logger.warning(
+            "DeepSeekV4 DCP + SGLANG_OPT_USE_ONLINE_COMPRESS combo is "
+            "experimental; numerical correctness has not been validated."
+        )
+
+    # HiSparse + DCP: HiSparse C4 device pool uses index translation that is
+    # not yet DCP-aware in the fused C++ kernels; only the Triton fallback
+    # write path supports DCP.
+    if server_args.enable_hisparse:
+        logger.warning(
+            "DeepSeekV4 DCP + enable_hisparse falls back to Triton write "
+            "path for KV writes; expect throughput regression vs. fused C++."
+        )
+
+    logger.info(
+        f"DeepSeekV4 DCP enabled: dcp_size={server_args.dcp_size}, "
+        f"attn_tp={attn_tp}"
+    )
+
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""

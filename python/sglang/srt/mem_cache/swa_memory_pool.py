@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
@@ -305,6 +306,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: BaseSWAKVPool,
         need_sort: bool,
+        dcp_rank: int = 0,
+        dcp_world_size: int = 1,
     ):
         assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
@@ -332,26 +335,44 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            if _is_npu:
-                PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
+            if dcp_world_size > 1:
+                # DCP keeps allocation/free bookkeeping in logical token-index
+                # space; KV writers map logical locs to rank-local storage.
+                def _make_paged(pool_size, kv_pool):
+                    return DcpTokenToKVPoolAllocator(
+                        pool_size,
+                        page_size,
+                        dtype,
+                        device,
+                        kv_pool,
+                        need_sort,
+                        dcp_rank=dcp_rank,
+                        dcp_world_size=dcp_world_size,
+                    )
+
+                self.full_attn_allocator = _make_paged(size, full_kv_pool)
+                self.swa_attn_allocator = _make_paged(size_swa, swa_kv_pool)
             else:
-                PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
-            self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
-                size,
-                page_size,
-                dtype,
-                device,
-                full_kv_pool,
-                need_sort,
-            )
-            self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
-                size_swa,
-                page_size,
-                dtype,
-                device,
-                swa_kv_pool,
-                need_sort,
-            )
+                if _is_npu:
+                    PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
+                else:
+                    PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
+                self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
+                    size,
+                    page_size,
+                    dtype,
+                    device,
+                    full_kv_pool,
+                    need_sort,
+                )
+                self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
+                    size_swa,
+                    page_size,
+                    dtype,
+                    device,
+                    swa_kv_pool,
+                    need_sort,
+                )
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
         # is -1, and we need to map it to swa_last_loc -1 as well.

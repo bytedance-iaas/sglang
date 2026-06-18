@@ -27,6 +27,7 @@ from sglang.jit_kernel.deepseek_v4 import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
+    get_dcp_group_no_assert,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -414,6 +415,7 @@ class MQALayer(nn.Module):
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
+            dcp_kv_mask=forward_batch.dcp_kv_mask,
         )
 
     def _compute_kv_bf16(
@@ -592,13 +594,24 @@ class MQALayer(nn.Module):
                 x, positions, forward_batch, attn_backend, q_out
             )
 
+        dcp_group = get_dcp_group_no_assert()
+        use_dcp = dcp_group is not None and dcp_group.world_size > 1
+        if use_dcp:
+            # DCP shards KV tokens across ranks, but every rank must evaluate
+            # attention for the same full set of query heads before the backend
+            # LSE-merge/reduce-scatter step. ``q_padded`` only has this rank's
+            # TP slice initialized, so gather local heads from the DCP group.
+            q_for_attn = dcp_group.all_gather(q.contiguous(), dim=1)
+        else:
+            q_for_attn = q_padded if q_padded is not None else q
+
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
         o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
+            q=q_for_attn,
             k=attn_k,
             v=attn_k,
             layer=self.attn_mqa,
@@ -607,7 +620,16 @@ class MQALayer(nn.Module):
             attn_sink=self.attn_sink,
             save_kv_cache=False,
         )
-        o = o[:, tp_slice, :]
+        if self.tp_size > 1:
+            if o.shape[1] == self.n_heads:
+                o = o[:, tp_slice, :]
+            elif o.shape[1] != self.n_local_heads:
+                raise RuntimeError(
+                    "Unexpected DSv4 attention output head count: "
+                    f"got {o.shape[1]}, expected full heads {self.n_heads} "
+                    f"or local heads {self.n_local_heads}. This usually "
+                    "indicates an unsupported DCP/attention-TP layout."
+                )
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
