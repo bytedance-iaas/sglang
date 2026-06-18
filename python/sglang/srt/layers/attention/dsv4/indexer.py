@@ -15,7 +15,6 @@ from sglang.jit_kernel.deepseek_v4 import (
     topk_transform_512_v2,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -32,46 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
-_DCP_C4_INDEXER_LOG_COUNT: dict[Tuple[int, str], int] = {}
-
-
-def _dcp_c4_indexer_should_log(layer_id: int, stage: str) -> bool:
-    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
-    if limit <= 0:
-        return False
-    key = (layer_id, stage)
-    cur = _DCP_C4_INDEXER_LOG_COUNT.get(key, 0)
-    if cur >= limit:
-        return False
-    _DCP_C4_INDEXER_LOG_COUNT[key] = cur + 1
-    return True
-
-
-def _dcp_c4_index_summary(name: str, x: Optional[torch.Tensor]) -> str:
-    if x is None:
-        return f"{name}=None"
-    with torch.no_grad():
-        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
-        if x.numel() == 0:
-            parts.append("empty")
-        else:
-            valid = x >= 0
-            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
-            if torch.any(valid):
-                xv = x[valid]
-                parts.append(f"min={int(xv.min().item())}")
-                parts.append(f"max={int(xv.max().item())}")
-                dcp_world_size = get_dcp_world_size()
-                if dcp_world_size > 1:
-                    mods = (xv % dcp_world_size).to(torch.int64)
-                    hist = torch.bincount(mods, minlength=dcp_world_size)
-                    parts.append(
-                        "mod_hist="
-                        + ",".join(
-                            str(int(v.item())) for v in hist[:dcp_world_size]
-                        )
-                    )
-        return " ".join(parts)
 
 
 if is_hip():
@@ -487,25 +446,6 @@ class C4IndexerBackendMixin:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                log_enabled = _dcp_c4_indexer_should_log(
-                    c4_indexer.layer_id, "hisparse_swap_in"
-                )
-                if log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
-                        "stage=hisparse_swap_in_pre | %s | %s",
-                        c4_indexer.layer_id,
-                        get_dcp_rank(),
-                        get_dcp_world_size(),
-                        _dcp_c4_index_summary(
-                            "raw_indices",
-                            raw_indices,
-                        ),
-                        _dcp_c4_index_summary(
-                            "c4_sparse_page_indices",
-                            core_metadata.c4_sparse_page_indices,
-                        ),
-                    )
                 core_metadata.c4_sparse_page_indices = (
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
@@ -514,65 +454,12 @@ class C4IndexerBackendMixin:
                         layer_id=compress_layer_id,
                     )
                 )
-                if log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
-                        "stage=hisparse_swap_in_post | %s",
-                        c4_indexer.layer_id,
-                        get_dcp_rank(),
-                        get_dcp_world_size(),
-                        _dcp_c4_index_summary(
-                            "c4_sparse_page_indices",
-                            core_metadata.c4_sparse_page_indices,
-                        ),
-                    )
             else:
-                log_enabled = _dcp_c4_indexer_should_log(
-                    c4_indexer.layer_id, "hisparse_translate"
-                )
-                pre_translate = core_metadata.c4_sparse_page_indices
-                if log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
-                        "stage=hisparse_translate_pre | %s",
-                        c4_indexer.layer_id,
-                        get_dcp_rank(),
-                        get_dcp_world_size(),
-                        _dcp_c4_index_summary(
-                            "c4_sparse_page_indices",
-                            pre_translate,
-                        ),
-                    )
                 core_metadata.c4_sparse_page_indices = (
                     token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
                         core_metadata.c4_sparse_page_indices
                     )
                 )
-                if log_enabled:
-                    post_translate = core_metadata.c4_sparse_page_indices
-                    valid = (pre_translate >= 0) & (post_translate >= 0)
-                    mismatch = None
-                    if get_dcp_world_size() > 1:
-                        mismatch = valid & (
-                            (pre_translate % get_dcp_world_size())
-                            != (post_translate % get_dcp_world_size())
-                        )
-                    logger.warning(
-                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
-                        "stage=hisparse_translate_post rank_mod_mismatch=%s | %s",
-                        c4_indexer.layer_id,
-                        get_dcp_rank(),
-                        get_dcp_world_size(),
-                        (
-                            "None"
-                            if mismatch is None
-                            else str(int(mismatch.sum().item()))
-                        ),
-                        _dcp_c4_index_summary(
-                            "c4_sparse_page_indices",
-                            post_translate,
-                        ),
-                    )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[
