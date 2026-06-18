@@ -53,28 +53,50 @@ def _validate_dsv4_hisparse_megamoe(server_args: "ServerArgs") -> None:
 
     from sglang.srt.environ import envs
 
+    strict = envs.SGLANG_REQUIRE_MEGAMOE.get()
+
+    def warn_or_raise(message: str, *args) -> None:
+        if strict:
+            raise ValueError(message % args if args else message)
+        logger.warning(message, *args)
+
     if server_args.moe_runner_backend != "deep_gemm":
-        raise ValueError(
+        warn_or_raise(
             "DSV4 HiSparse MegaMoE requires --moe-runner-backend deep_gemm. "
-            f"Got {server_args.moe_runner_backend!r}."
+            "Got %r. MegaMoE will not be required unless "
+            "SGLANG_REQUIRE_MEGAMOE=1.",
+            server_args.moe_runner_backend,
         )
 
     if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
-        logger.warning(
+        warn_or_raise(
             "DSV4 HiSparse is using --moe-a2a-backend megamoe without "
-            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1. This is allowed, but the env "
-            "flag is the preferred way to keep MegaMoE defaults explicit."
+            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1. This is allowed in fallback "
+            "mode, but strict MegaMoE requires the env flag."
         )
 
     if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        raise ValueError(
+        warn_or_raise(
             "DSV4 HiSparse MegaMoE requires SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1 "
-            "to avoid the high-pressure DeepGEMM masked-GEMM scratch path."
+            "to avoid the high-pressure DeepGEMM masked-GEMM scratch path. "
+            "MegaMoE will not be required unless SGLANG_REQUIRE_MEGAMOE=1."
+        )
+
+    if not envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+        warn_or_raise(
+            "DSV4 HiSparse MegaMoE requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=1 "
+            "when SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1."
+        )
+
+    if not envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+        warn_or_raise(
+            "DSV4 HiSparse MegaMoE requires SGLANG_OPT_SWIGLU_CLAMP_FUSION=1 "
+            "for the DeepSeek V4 swiglu_limit DeepGEMM path."
         )
 
     if server_args.speculative_algorithm == "EAGLE":
         if server_args.speculative_moe_a2a_backend != "megamoe":
-            logger.warning(
+            warn_or_raise(
                 "DSV4 HiSparse target is using MegaMoE, but the EAGLE draft "
                 "MoE A2A backend is %r. This is a fallback configuration, not "
                 "full MegaMoE draft coverage.",
@@ -90,7 +112,7 @@ def _validate_dsv4_hisparse_megamoe(server_args: "ServerArgs") -> None:
         )
         required_cap = graph_bs * draft_tokens
         if required_cap > cap:
-            logger.warning(
+            warn_or_raise(
                 "DSV4 HiSparse MegaMoE graph capture may exceed "
                 "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK >= "
                 f"cuda_graph_max_bs * speculative_num_draft_tokens "
