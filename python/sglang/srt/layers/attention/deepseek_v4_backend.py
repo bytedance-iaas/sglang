@@ -70,60 +70,6 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
-# C4 DCP 诊断日志：per-(layer, stage) 限流计数；通过环境变量
-# SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS 控制每个 (layer, stage) 打印的 step 上限。
-_DCP_C4_LOG_COUNT: Dict[Tuple[int, str], int] = {}
-
-
-def _dcp_c4_should_log(layer_id: int, stage: str) -> bool:
-    limit = envs.SGLANG_DEBUG_DSV4_DCP_ACCURACY_LOG_STEPS.get()
-    if limit <= 0:
-        return False
-    key = (layer_id, stage)
-    cur = _DCP_C4_LOG_COUNT.get(key, 0)
-    if cur >= limit:
-        return False
-    _DCP_C4_LOG_COUNT[key] = cur + 1
-    return True
-
-
-def _dcp_index_tensor_summary(
-    name: str,
-    x: Optional[torch.Tensor],
-    dcp_world_size: Optional[int] = None,
-    dcp_rank: Optional[int] = None,
-) -> str:
-    if x is None:
-        return f"{name}=None"
-    with torch.no_grad():
-        parts = [f"{name}.shape={tuple(x.shape)}", f"{name}.dtype={x.dtype}"]
-        if x.numel() == 0:
-            parts.append("empty")
-        elif x.dtype == torch.bool:
-            parts.append(f"true={int(x.sum().item())}/{x.numel()}")
-        else:
-            valid = x >= 0
-            parts.append(f"valid={int(valid.sum().item())}/{x.numel()}")
-            if torch.any(valid):
-                xv = x[valid]
-                parts.append(f"min={int(xv.min().item())}")
-                parts.append(f"max={int(xv.max().item())}")
-                if dcp_world_size is not None and dcp_world_size > 1:
-                    mods = (xv % dcp_world_size).to(torch.int64)
-                    hist = torch.bincount(mods, minlength=dcp_world_size)
-                    parts.append(
-                        "mod_hist="
-                        + ",".join(
-                            str(int(v.item())) for v in hist[:dcp_world_size]
-                        )
-                    )
-                    if dcp_rank is not None:
-                        parts.append(
-                            f"rank_local={int((mods == dcp_rank).sum().item())}"
-                        )
-        return " ".join(parts)
-
-
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     if forward_batch.forward_mode.is_idle():
         return forward_batch.forward_mode
@@ -1320,25 +1266,6 @@ class DeepseekV4AttnBackend(
             ):
                 dcp_world_size = get_dcp_world_size()
                 dcp_rank = get_dcp_rank()
-                c4_log_enabled = _dcp_c4_should_log(layer_id, "attn_extra_compact")
-                if c4_log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
-                        "stage=attn_extra_compact_pre | %s | %s",
-                        layer_id,
-                        dcp_rank,
-                        dcp_world_size,
-                        _dcp_index_tensor_summary(
-                            "extra_indices",
-                            extra_indices,
-                            dcp_world_size,
-                            dcp_rank,
-                        ),
-                        _dcp_index_tensor_summary(
-                            "extra_topk_lengths",
-                            extra_topk_lengths,
-                        ),
-                    )
                 extra_indices, c4_local_lengths = (
                     core_attn_metadata._compact_dcp_local_indices(
                         extra_indices, dcp_world_size, dcp_rank
@@ -1349,25 +1276,6 @@ class DeepseekV4AttnBackend(
                 # than a dummy key.
                 extra_topk_lengths = c4_local_lengths
                 c4_has_local_kv = c4_local_lengths > 0
-                if c4_log_enabled:
-                    logger.warning(
-                        "DSV4_DCP_C4_DEBUG layer=%d rank=%d/%d "
-                        "stage=attn_extra_compact_post | %s | %s | %s",
-                        layer_id,
-                        dcp_rank,
-                        dcp_world_size,
-                        _dcp_index_tensor_summary(
-                            "extra_indices",
-                            extra_indices,
-                            dcp_world_size,
-                            dcp_rank,
-                        ),
-                        _dcp_index_tensor_summary(
-                            "c4_local_lengths",
-                            c4_local_lengths,
-                        ),
-                        _dcp_index_tensor_summary("c4_has_local_kv", c4_has_local_kv),
-                    )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
