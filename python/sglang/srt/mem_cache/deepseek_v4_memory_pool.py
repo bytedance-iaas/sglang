@@ -494,12 +494,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        if ONLINE_C128:
+            # Request-scoped online C128 state is indexed by req_pool_idx.
+            # PD decode can allocate pre-transfer slots beyond
+            # max_num_reqs, so size to the actual req_to_token row count.
+            c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
         self.c128_state_pool_size = c128_state_pool_size
         self.c4_state_dtype = c4_state_dtype
         self.c128_state_dtype = c128_state_dtype
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
-        self.online_c128_state_num_req_slots = max_num_reqs + 1
+        self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             self.online_c128_mtp_pending_seq_lens = torch.empty(
@@ -734,12 +739,32 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if ONLINE_C128 and pool.ratio == 128:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.nbytes)
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
+        return data_ptrs, data_lens, item_lens
+
+    def get_online_c128_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        if not ONLINE_C128:
+            return data_ptrs, data_lens, item_lens
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            t = pool.kv_score_buffer.kv_score
+            assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
+            data_ptrs.append(t.data_ptr())
+            data_lens.append(t.nbytes)
+            item_lens.append(t[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
