@@ -455,10 +455,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
-        # Offline C128 stores one raw state row per full token. Online C128 is
-        # request-scoped and is finalized after max_running_requests is known,
-        # so it should not scale with full-token capacity here.
-        c128_state_ratio = 0 if c128_online else 1
+        # C128 state is request-scoped and is finalized after
+        # max_running_requests is known, so it should not scale with
+        # full-token capacity here.
+        c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
@@ -477,15 +477,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
-        c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        c128_state_pool_size = 0 if c128_online else full_token
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
-            c128_state_pool_size=c128_state_pool_size,
+            c128_state_pool_size=0,
         )
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
@@ -514,6 +512,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             assert config.max_running_requests is not None
             config.c128_state_pool_size = config.max_running_requests + 1
+        else:
+            assert config.max_running_requests is not None
+            config.c128_state_pool_size = (
+                config.max_running_requests + 1
+            ) * self.c128_ring_size
         return config
 
     def calculate_pool_sizes(

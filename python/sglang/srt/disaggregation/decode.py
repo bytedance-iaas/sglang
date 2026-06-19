@@ -1038,7 +1038,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                return np.array([int(decode_req.req.req_pool_idx)], dtype=np.int32)
+                if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                    return np.array([int(decode_req.req.req_pool_idx)], dtype=np.int32)
+                if seq_len == 0 or seq_len % 128 == 0:
+                    return np.empty((0,), dtype=np.int32)
+                ring_size = self.token_to_kv_pool.get_ring_size(128)
+                pages_per_req = ring_size // 128
+                page = (
+                    int(decode_req.req.req_pool_idx) * pages_per_req
+                    + ((seq_len - 1) % ring_size) // 128
+                )
+                return np.array([page], dtype=np.int32)
 
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
