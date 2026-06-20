@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -217,9 +218,23 @@ class DSV4AttnMetadata:
         indices: torch.Tensor,
         dcp_world_size: int,
         dcp_rank: int,
+        _debug_tag: str = "",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         valid_mask = indices >= 0
         local_mask = valid_mask & ((indices % dcp_world_size) == dcp_rank)
+        if os.environ.get("SGLANG_DEBUG_DSV4_DCP_ATTENTION") == "1" and _debug_tag:
+            v = indices[valid_mask]
+            n_local = int(local_mask.sum().item())
+            n_valid = int(valid_mask.sum().item())
+            logger.info(
+                "[DCP-COMPACT %s] rank=%d ws=%d valid=%d local=%d "
+                "idx_min=%s idx_max=%s parity0=%d parity1=%d",
+                _debug_tag, dcp_rank, dcp_world_size, n_valid, n_local,
+                int(v.min().item()) if v.numel() else -1,
+                int(v.max().item()) if v.numel() else -1,
+                int((v % 2 == 0).sum().item()) if v.numel() else 0,
+                int((v % 2 == 1).sum().item()) if v.numel() else 0,
+            )
         physical_indices = torch.where(
             local_mask, indices // dcp_world_size, torch.full_like(indices, -1)
         )
@@ -258,7 +273,8 @@ class DSV4AttnMetadata:
         dcp_rank = get_dcp_rank()
         self.swa_page_indices, swa_local_lengths = (
             self._compact_dcp_local_indices(
-                self.swa_page_indices, dcp_world_size, dcp_rank
+                self.swa_page_indices, dcp_world_size, dcp_rank,
+                _debug_tag="swa",
             )
         )
         self.dcp_swa_has_local_kv = swa_local_lengths > 0
@@ -270,7 +286,8 @@ class DSV4AttnMetadata:
         if self.c128_page_indices is not None:
             self.c128_page_indices, c128_local_lengths = (
                 self._compact_dcp_local_indices(
-                    self.c128_page_indices, dcp_world_size, dcp_rank
+                    self.c128_page_indices, dcp_world_size, dcp_rank,
+                    _debug_tag="c128",
                 )
             )
             self.dcp_c128_has_local_kv = c128_local_lengths > 0
