@@ -213,6 +213,51 @@ class DSV4AttnMetadata:
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
+        if os.environ.get("SGLANG_DEBUG_DSV4_DCP_ATTENTION") == "1":
+            try:
+                ws = get_dcp_world_size()
+                if ws > 1:
+                    rank = get_dcp_rank()
+                    raw = self.raw_out_loc.detach().to(torch.int64)
+                    col = self.c128_out_loc.detach().to(torch.int64)
+                    # raw_out_loc is the logical full-pool token slot; the v2
+                    # writer stores c128 entry at index col == raw // 128.
+                    # The reader uses c128_page_indices = page_table*2 +
+                    # offset_in_page (a physical-page-id-based id). If those
+                    # two encodings disagree on parity, DCP filter -> read
+                    # location mismatch.
+                    pt = self.page_table.detach().to(torch.int64)
+                    # Recompute reader-side idx for the *last* c128 page of
+                    # each batch row to compare with col.
+                    bs = pt.shape[0]
+                    seq_lens_c128 = (self.seq_lens_casual.detach().to(torch.int64) // 128)
+                    # For each row that has at least 1 c128 entry, take the
+                    # max valid reader-side idx
+                    last_idx = torch.clamp(seq_lens_c128 - 1, min=0)
+                    page_size_c128 = self.page_size // 128
+                    page_idx = last_idx // page_size_c128
+                    offset_in_page = last_idx % page_size_c128
+                    reader_idx = pt.gather(1, page_idx.unsqueeze(1)).squeeze(1) * page_size_c128 + offset_in_page
+                    has_c128 = seq_lens_c128 > 0
+                    if has_c128.any():
+                        rd = reader_idx[has_c128]
+                        wr = col[has_c128]
+                        raw_full = raw[has_c128]
+                        match = int((rd == wr).sum().item())
+                        total = int(has_c128.sum().item())
+                        logger.warning(
+                            "[DCP-WRITEvsREAD c128] rank=%d ws=%d bs_with_c128=%d match=%d "
+                            "wr_head=%s rd_head=%s raw_head=%s wr_par0=%d wr_par1=%d rd_par0=%d rd_par1=%d",
+                            rank, ws, total, match,
+                            wr[:6].tolist(), rd[:6].tolist(), raw_full[:6].tolist(),
+                            int((wr % 2 == 0).sum().item()),
+                            int((wr % 2 == 1).sum().item()),
+                            int((rd % 2 == 0).sum().item()),
+                            int((rd % 2 == 1).sum().item()),
+                        )
+            except Exception as _e:
+                logger.warning("[DCP-WRITEvsREAD] failed: %s", _e)
+
     @staticmethod
     def _compact_dcp_local_indices(
         indices: torch.Tensor,
