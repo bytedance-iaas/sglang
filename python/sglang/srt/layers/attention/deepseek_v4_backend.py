@@ -220,41 +220,70 @@ class DSV4AttnMetadata:
                     rank = get_dcp_rank()
                     raw = self.raw_out_loc.detach().to(torch.int64)
                     col = self.c128_out_loc.detach().to(torch.int64)
-                    # raw_out_loc is the logical full-pool token slot; the v2
-                    # writer stores c128 entry at index col == raw // 128.
-                    # The reader uses c128_page_indices = page_table*2 +
-                    # offset_in_page (a physical-page-id-based id). If those
-                    # two encodings disagree on parity, DCP filter -> read
-                    # location mismatch.
                     pt = self.page_table.detach().to(torch.int64)
-                    # Recompute reader-side idx for the *last* c128 page of
-                    # each batch row to compare with col.
-                    bs = pt.shape[0]
-                    seq_lens_c128 = (self.seq_lens_casual.detach().to(torch.int64) // 128)
-                    # For each row that has at least 1 c128 entry, take the
-                    # max valid reader-side idx
-                    last_idx = torch.clamp(seq_lens_c128 - 1, min=0)
+                    seq_lens_full = self.seq_lens_casual.detach().to(torch.int64)
+                    seq_lens_c128 = seq_lens_full // 128
                     page_size_c128 = self.page_size // 128
-                    page_idx = last_idx // page_size_c128
-                    offset_in_page = last_idx % page_size_c128
-                    reader_idx = pt.gather(1, page_idx.unsqueeze(1)).squeeze(1) * page_size_c128 + offset_in_page
-                    has_c128 = seq_lens_c128 > 0
-                    if has_c128.any():
-                        rd = reader_idx[has_c128]
-                        wr = col[has_c128]
-                        raw_full = raw[has_c128]
-                        match = int((rd == wr).sum().item())
-                        total = int(has_c128.sum().item())
-                        logger.warning(
-                            "[DCP-WRITEvsREAD c128] rank=%d ws=%d bs_with_c128=%d match=%d "
-                            "wr_head=%s rd_head=%s raw_head=%s wr_par0=%d wr_par1=%d rd_par0=%d rd_par1=%d",
-                            rank, ws, total, match,
-                            wr[:6].tolist(), rd[:6].tolist(), raw_full[:6].tolist(),
-                            int((wr % 2 == 0).sum().item()),
-                            int((wr % 2 == 1).sum().item()),
-                            int((rd % 2 == 0).sum().item()),
-                            int((rd % 2 == 1).sum().item()),
+
+                    # Only batch rows where this step is *actually writing*
+                    # a c128 entry (i.e. seq_len % 128 == 0). c128_out_loc is
+                    # a sentinel 0 otherwise, which made the previous compare
+                    # meaningless.
+                    is_writing = (seq_lens_full % 128) == 0
+                    if is_writing.any():
+                        wr_idx_now = col[is_writing]
+                        # When writing the i-th entry (i = seq_len_c128 - 1),
+                        # reader fetches it as page_table[row, i // pgc] * pgc
+                        #   + (i % pgc).
+                        i_now = (seq_lens_c128[is_writing] - 1).clamp(min=0)
+                        page_idx_now = i_now // page_size_c128
+                        offset_now = i_now % page_size_c128
+                        rd_idx_now = (
+                            pt[is_writing].gather(1, page_idx_now.unsqueeze(1)).squeeze(1)
+                            * page_size_c128
+                            + offset_now
                         )
+                        match_now = int((wr_idx_now == rd_idx_now).sum().item())
+                        total_now = int(is_writing.sum().item())
+                        logger.warning(
+                            "[DCP-WRITEvsREAD c128 STEP] rank=%d ws=%d writing_rows=%d match=%d "
+                            "wr=%s rd=%s raw=%s seq=%s wr_par0=%d wr_par1=%d rd_par0=%d rd_par1=%d",
+                            rank, ws, total_now, match_now,
+                            wr_idx_now[:6].tolist(), rd_idx_now[:6].tolist(),
+                            raw[is_writing][:6].tolist(),
+                            seq_lens_full[is_writing][:6].tolist(),
+                            int((wr_idx_now % 2 == 0).sum().item()),
+                            int((wr_idx_now % 2 == 1).sum().item()),
+                            int((rd_idx_now % 2 == 0).sum().item()),
+                            int((rd_idx_now % 2 == 1).sum().item()),
+                        )
+
+                    # Independently: enumerate ALL existing c128 entries for
+                    # the first batch row and compare reader-computed idx
+                    # parity to writer's would-be parity. The writer-side
+                    # reconstruction needs req_to_token, which we don't have
+                    # here, so instead we just dump the per-entry reader idx
+                    # for visual inspection.
+                    if seq_lens_c128.max().item() > 0:
+                        first_row = int(torch.argmax(seq_lens_c128).item())
+                        n_entries = int(seq_lens_c128[first_row].item())
+                        if n_entries > 0:
+                            entries = torch.arange(
+                                n_entries, device=pt.device, dtype=torch.int64
+                            )
+                            pgi = entries // page_size_c128
+                            ofs = entries % page_size_c128
+                            rds = pt[first_row, pgi] * page_size_c128 + ofs
+                            rd_p0 = int((rds % 2 == 0).sum().item())
+                            rd_p1 = int((rds % 2 == 1).sum().item())
+                            logger.warning(
+                                "[DCP-READ-ALL c128] rank=%d row=%d n_entries=%d "
+                                "rd_first8=%s rd_last8=%s par0=%d par1=%d",
+                                rank, first_row, n_entries,
+                                rds[:8].tolist(),
+                                rds[-8:].tolist(),
+                                rd_p0, rd_p1,
+                            )
             except Exception as _e:
                 logger.warning("[DCP-WRITEvsREAD] failed: %s", _e)
 
