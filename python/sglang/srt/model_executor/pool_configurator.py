@@ -580,16 +580,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
-        full_token = int(available_bytes / self.bytes_per_full_token)
-        c128_state_fixed_bytes = 0
-        for _ in range(2):
+        if self.requested_max_running_requests_per_worker is not None:
+            c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
+                self.requested_max_running_requests_per_worker
+            )
+        else:
+            full_token = int(available_bytes / self.bytes_per_full_token)
             c128_state_fixed_bytes = (
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
-            available_bytes_for_tokens = max(
-                available_bytes - c128_state_fixed_bytes, 0
-            )
-            full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
+
+        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
