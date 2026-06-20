@@ -297,10 +297,6 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
-  const auto compute_c128_page = [&](int64_t rid, int32_t position) {
-    const auto ring_pos = position % params.ring_size;
-    return static_cast<int32_t>(rid * (params.ring_size / 128) + ring_pos / 128);
-  };
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
@@ -315,8 +311,8 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       // only used for c4, harmless for c128
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
       if (params.compress_ratio == 128) {
-        plan_c.read_page_0 = compute_c128_page(rid, position_0);
-        plan_c.read_page_1 = compute_c128_page(rid, position_1);
+        plan_c.read_page_0 = compute_c128_loc(rid, position_0) / 128;
+        plan_c.read_page_1 = compute_c128_loc(rid, position_1) / 128;
       } else {
         const auto raw_loc_0 = mapping[position_0];
         const auto raw_loc_1 = mapping[position_1];
@@ -360,10 +356,6 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
-  const auto compute_c128_page = [&](int64_t rid, int32_t position) {
-    const auto ring_pos = position % params.ring_size;
-    return static_cast<int32_t>(rid * (params.ring_size / 128) + ring_pos / 128);
-  };
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
@@ -375,8 +367,8 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   int32_t read_page_1;
   if (params.compress_ratio == 128) {
     write_loc = compute_c128_loc(rid, position_1);
-    read_page_0 = compute_c128_page(rid, position_0);
-    read_page_1 = compute_c128_page(rid, position_1);
+    read_page_0 = compute_c128_loc(rid, position_0) / 128;
+    read_page_1 = compute_c128_loc(rid, position_1) / 128;
   } else {
     const auto raw_loc_0 = mapping[position_0];
     const auto raw_loc_1 = mapping[position_1];
