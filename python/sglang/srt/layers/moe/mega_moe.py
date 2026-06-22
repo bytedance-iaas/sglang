@@ -142,7 +142,17 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_memory_shared", False):
+            raise RuntimeError(
+                "SM90 FP4 MegaMOE memory sharing replaced the fallback FP4 expert "
+                "layout, so requests cannot fall back to the non-MegaMOE path. "
+                f"max_tokens_per_rank={max_tokens_per_rank} exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+                f"{cap}; raise the env var or reduce chunked/cuda-graph batch size."
+            )
+        return False
+    return True
 
 
 def forward_mega_moe(
@@ -481,8 +491,33 @@ def build_mega_moe_experts_weights(experts) -> None:
         l1_pair, l2_pair = transform_weights_for_mega_moe_sm90_fp4(
             (w13, w13_sf_fp32), (w2, w2_sf_fp32)
         )
-        experts.mega_l1_weights = l1_pair
-        experts.mega_l2_weights = l2_pair
+        if fix_mega_moe_memory:
+            # The SM90 FP4 MegaMOE kernel consumes an interleaved L1 FP4 tensor
+            # and packed UE8M0 scales. The non-MegaMOE FP4 runners consume the
+            # checkpoint layout, so there is no single layout that supports both
+            # paths. In memory-fix mode, prefer the intended MegaMOE path and
+            # replace the original parameters so the old checkpoint-layout
+            # tensors can be released before KV-pool sizing.
+            experts.w13_weight.data = l1_pair[0]
+            experts.w2_weight.data = l2_pair[0]
+            experts.w13_weight_scale_inv.data = l1_pair[1]
+            experts.w2_weight_scale_inv.data = l2_pair[1]
+            experts.w13_weight_scale_inv.format_ue8m0 = True
+            experts.w2_weight_scale_inv.format_ue8m0 = True
+
+            experts.mega_l1_weights = (
+                experts.w13_weight.data,
+                experts.w13_weight_scale_inv.data,
+            )
+            experts.mega_l2_weights = (
+                experts.w2_weight.data,
+                experts.w2_weight_scale_inv.data,
+            )
+            experts._mega_moe_sm90_fp4_memory_shared = True
+        else:
+            experts.mega_l1_weights = l1_pair
+            experts.mega_l2_weights = l2_pair
+            experts._mega_moe_sm90_fp4_memory_shared = False
     else:
         w13_sf = transform_sf_into_required_layout(
             w13_sf_fp32,
