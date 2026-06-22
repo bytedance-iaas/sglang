@@ -1628,6 +1628,8 @@ class NixlKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
+                if st == StateType.C128_STATE and len(dst_indices) == 0:
+                    continue
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "

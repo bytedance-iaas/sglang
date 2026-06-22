@@ -1018,6 +1018,13 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.C128_STATE and len(dst_indices_local) == 0:
+                    # Decode decides whether a request has a partial C128 state
+                    # to receive. At 128-aligned boundaries it intentionally
+                    # registers no C128 dst row and clears the request-scoped
+                    # state locally; a stale prefill-side source row must not
+                    # keep the transfer thread alive or corrupt the next request.
+                    continue
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
