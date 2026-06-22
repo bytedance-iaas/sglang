@@ -158,7 +158,31 @@ def main(args):
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
     # Dump results
-    dump_state_text(f"tmp_output_{args.backend}.txt", states)
+    suffix = f"_{args.output_suffix}" if args.output_suffix else ""
+    dump_state_text(f"tmp_output_{args.backend}{suffix}.txt", states)
+
+    if args.dump_answers:
+        # One-line-per-question dump for easy diff between two runs (e.g.
+        # CP=1 vs CP=2). Includes the question index, the predicted final
+        # numeric answer, the full generated answer text, and a stable
+        # hash of the answer text so a quick `diff -y` shows divergence
+        # immediately even when --question-index is used.
+        import hashlib
+
+        answers_path = f"tmp_answers_{args.backend}{suffix}.txt"
+        with open(answers_path, "w") as fout:
+            for idx, state, pred, label in zip(
+                target_indices, states, preds, labels
+            ):
+                ans_text = state["answer"]
+                ans_hash = hashlib.sha1(ans_text.encode("utf-8")).hexdigest()[:12]
+                fout.write(
+                    f"--- q{idx} pred={pred} label={label} hash={ans_hash}\n"
+                )
+                fout.write(ans_text)
+                fout.write("\n--- end q{}\n\n".format(idx))
+        print(f"Per-question answers dumped to {answers_path}")
+
     dump_bench_raw_result(
         path=args.raw_result_file,
         states=states,
@@ -193,6 +217,20 @@ if __name__ == "__main__":
         default=None,
         help="Run only the single question at this 0-based index (after the "
         "first --num-shots few-shot examples). Overrides --num-questions.",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        type=str,
+        default=None,
+        help="Suffix appended to the dumped output / answers file names "
+        "(e.g. cp1, cp2). Lets two runs over the same --question-index "
+        "land in different files for diff'ing.",
+    )
+    parser.add_argument(
+        "--dump-answers",
+        action="store_true",
+        help="Also dump a per-question answer text + sha1 hash file "
+        "(tmp_answers_<backend><suffix>.txt) for easy diff between runs.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
