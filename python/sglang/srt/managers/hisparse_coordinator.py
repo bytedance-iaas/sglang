@@ -1564,9 +1564,14 @@ class HiSparseCoordinator:
             return
         start = time.perf_counter()
         self._backup_done_event.wait(device_module.current_stream())
-        self._c4_backup_wait_enqueue_ms += (time.perf_counter() - start) * 1000.0
-        self._c4_backup_wait_count += 1
+        self._record_c4_backup_wait(start)
         self._has_pending_backup = False
+
+    def _record_c4_backup_wait(self, start_time: float) -> None:
+        self._c4_backup_wait_enqueue_ms += (
+            time.perf_counter() - start_time
+        ) * 1000.0
+        self._c4_backup_wait_count += 1
 
     def _backup_accepted_device_locs(
         self, host_locs: torch.Tensor, device_locs: torch.Tensor
