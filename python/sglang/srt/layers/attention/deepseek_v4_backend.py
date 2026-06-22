@@ -213,102 +213,14 @@ class DSV4AttnMetadata:
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
-        if os.environ.get("SGLANG_DEBUG_DSV4_DCP_ATTENTION") == "1":
-            try:
-                ws = get_dcp_world_size()
-                if ws > 1:
-                    rank = get_dcp_rank()
-                    raw = self.raw_out_loc.detach().to(torch.int64)
-                    col = self.c128_out_loc.detach().to(torch.int64)
-                    pt = self.page_table.detach().to(torch.int64)
-                    seq_lens_full = self.seq_lens_casual.detach().to(torch.int64)
-                    seq_lens_c128 = seq_lens_full // 128
-                    page_size_c128 = self.page_size // 128
-
-                    # Only batch rows where this step is *actually writing*
-                    # a c128 entry (i.e. seq_len % 128 == 0). c128_out_loc is
-                    # a sentinel 0 otherwise, which made the previous compare
-                    # meaningless.
-                    is_writing = (seq_lens_full % 128) == 0
-                    if is_writing.any():
-                        wr_idx_now = col[is_writing]
-                        # When writing the i-th entry (i = seq_len_c128 - 1),
-                        # reader fetches it as page_table[row, i // pgc] * pgc
-                        #   + (i % pgc).
-                        i_now = (seq_lens_c128[is_writing] - 1).clamp(min=0)
-                        page_idx_now = i_now // page_size_c128
-                        offset_now = i_now % page_size_c128
-                        rd_idx_now = (
-                            pt[is_writing].gather(1, page_idx_now.unsqueeze(1)).squeeze(1)
-                            * page_size_c128
-                            + offset_now
-                        )
-                        match_now = int((wr_idx_now == rd_idx_now).sum().item())
-                        total_now = int(is_writing.sum().item())
-                        logger.warning(
-                            "[DCP-WRITEvsREAD c128 STEP] rank=%d ws=%d writing_rows=%d match=%d "
-                            "wr=%s rd=%s raw=%s seq=%s wr_par0=%d wr_par1=%d rd_par0=%d rd_par1=%d",
-                            rank, ws, total_now, match_now,
-                            wr_idx_now[:6].tolist(), rd_idx_now[:6].tolist(),
-                            raw[is_writing][:6].tolist(),
-                            seq_lens_full[is_writing][:6].tolist(),
-                            int((wr_idx_now % 2 == 0).sum().item()),
-                            int((wr_idx_now % 2 == 1).sum().item()),
-                            int((rd_idx_now % 2 == 0).sum().item()),
-                            int((rd_idx_now % 2 == 1).sum().item()),
-                        )
-
-                    # Independently: enumerate ALL existing c128 entries for
-                    # the first batch row and compare reader-computed idx
-                    # parity to writer's would-be parity. The writer-side
-                    # reconstruction needs req_to_token, which we don't have
-                    # here, so instead we just dump the per-entry reader idx
-                    # for visual inspection.
-                    if seq_lens_c128.max().item() > 0:
-                        first_row = int(torch.argmax(seq_lens_c128).item())
-                        n_entries = int(seq_lens_c128[first_row].item())
-                        if n_entries > 0:
-                            entries = torch.arange(
-                                n_entries, device=pt.device, dtype=torch.int64
-                            )
-                            pgi = entries // page_size_c128
-                            ofs = entries % page_size_c128
-                            rds = pt[first_row, pgi] * page_size_c128 + ofs
-                            rd_p0 = int((rds % 2 == 0).sum().item())
-                            rd_p1 = int((rds % 2 == 1).sum().item())
-                            logger.warning(
-                                "[DCP-READ-ALL c128] rank=%d row=%d n_entries=%d "
-                                "rd_first8=%s rd_last8=%s par0=%d par1=%d",
-                                rank, first_row, n_entries,
-                                rds[:8].tolist(),
-                                rds[-8:].tolist(),
-                                rd_p0, rd_p1,
-                            )
-            except Exception as _e:
-                logger.warning("[DCP-WRITEvsREAD] failed: %s", _e)
-
     @staticmethod
     def _compact_dcp_local_indices(
         indices: torch.Tensor,
         dcp_world_size: int,
         dcp_rank: int,
-        _debug_tag: str = "",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         valid_mask = indices >= 0
         local_mask = valid_mask & ((indices % dcp_world_size) == dcp_rank)
-        if os.environ.get("SGLANG_DEBUG_DSV4_DCP_ATTENTION") == "1" and _debug_tag:
-            v = indices[valid_mask]
-            n_local = int(local_mask.sum().item())
-            n_valid = int(valid_mask.sum().item())
-            logger.info(
-                "[DCP-COMPACT %s] rank=%d ws=%d valid=%d local=%d "
-                "idx_min=%s idx_max=%s parity0=%d parity1=%d",
-                _debug_tag, dcp_rank, dcp_world_size, n_valid, n_local,
-                int(v.min().item()) if v.numel() else -1,
-                int(v.max().item()) if v.numel() else -1,
-                int((v % 2 == 0).sum().item()) if v.numel() else 0,
-                int((v % 2 == 1).sum().item()) if v.numel() else 0,
-            )
         physical_indices = torch.where(
             local_mask, indices // dcp_world_size, torch.full_like(indices, -1)
         )
@@ -348,7 +260,6 @@ class DSV4AttnMetadata:
         self.swa_page_indices, swa_local_lengths = (
             self._compact_dcp_local_indices(
                 self.swa_page_indices, dcp_world_size, dcp_rank,
-                _debug_tag="swa",
             )
         )
         self.dcp_swa_has_local_kv = swa_local_lengths > 0
@@ -361,7 +272,6 @@ class DSV4AttnMetadata:
             self.c128_page_indices, c128_local_lengths = (
                 self._compact_dcp_local_indices(
                     self.c128_page_indices, dcp_world_size, dcp_rank,
-                    _debug_tag="c128",
                 )
             )
             self.dcp_c128_has_local_kv = c128_local_lengths > 0
@@ -1453,6 +1363,61 @@ class DeepseekV4AttnBackend(
                     )
                 o_flat = o.reshape(B * S_q, H_q, D_v).to(torch.float32)
                 lse_flat = lse.permute(0, 2, 1).reshape(B * S_q, H_q).contiguous()
+
+                if (
+                    os.environ.get("SGLANG_DEBUG_DSV4_DCP_ATTENTION") == "1"
+                    and compress_ratio == 4
+                    and c4_has_local_kv is not None
+                ):
+                    # Corner case (d): rows with empty SWA shard but non-empty
+                    # c4 extra. FlashMLA must combine swa(empty)+extra(non-empty)
+                    # correctly; if it returns lse=+inf because the SWA partition
+                    # is empty, this rank silently drops the c4 contribution and
+                    # cp_lse_ag_out_rs treats the row as "no local KV".
+                    swa_mask = (
+                        core_attn_metadata.dcp_swa_has_local_kv[: B * S_q]
+                        if core_attn_metadata.dcp_swa_has_local_kv is not None
+                        else torch.zeros(B * S_q, dtype=torch.bool, device=o.device)
+                    )
+                    c4_mask = c4_has_local_kv[: B * S_q]
+                    swa_only = swa_mask & ~c4_mask
+                    c4_only = ~swa_mask & c4_mask
+                    both = swa_mask & c4_mask
+                    none = ~swa_mask & ~c4_mask
+                    # Per-row LSE finite-ness right after FlashMLA returned:
+                    # take per-row mean across heads to summarise.
+                    lse_row = lse_flat  # [B*S_q, H_q]
+                    finite_mask = torch.isfinite(lse_row)
+                    finite_per_row = finite_mask.any(dim=1)
+                    o_norm = o_flat.float().norm(dim=-1).max(dim=-1).values  # [B*S_q]
+                    rank_dbg = dcp_group.rank_in_group
+                    n_c4_only = int(c4_only.sum().item())
+                    n_swa_only = int(swa_only.sum().item())
+                    n_both = int(both.sum().item())
+                    n_none = int(none.sum().item())
+                    if c4_only.any():
+                        finite_in_c4_only = int(
+                            (finite_per_row & c4_only).sum().item()
+                        )
+                        nonzero_o_in_c4_only = int(
+                            ((o_norm > 0) & c4_only).sum().item()
+                        )
+                        logger.warning(
+                            "[DCP-MIXED c4] rank=%d ws=%d c4_only=%d "
+                            "swa_only=%d both=%d none=%d "
+                            "finite_lse_in_c4_only=%d nonzero_o_in_c4_only=%d",
+                            rank_dbg, dcp_group.world_size,
+                            n_c4_only, n_swa_only, n_both, n_none,
+                            finite_in_c4_only, nonzero_o_in_c4_only,
+                        )
+                    else:
+                        logger.warning(
+                            "[DCP-MIXED c4] rank=%d ws=%d c4_only=0 "
+                            "swa_only=%d both=%d none=%d (no edge-d rows)",
+                            rank_dbg, dcp_group.world_size,
+                            n_swa_only, n_both, n_none,
+                        )
+
                 merged, merged_lse = cp_lse_ag_out_rs(
                     o_flat, lse_flat, dcp_group, return_lse=True
                 )
