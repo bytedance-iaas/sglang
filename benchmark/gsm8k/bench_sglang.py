@@ -79,9 +79,20 @@ def main(args):
     num_shots = args.num_shots
     few_shot_examples = get_few_shot_examples(lines, num_shots)
 
+    if args.question_index is not None:
+        target_indices = [args.question_index]
+        if args.question_index < num_shots:
+            print(
+                f"WARNING: --question-index {args.question_index} overlaps the "
+                f"first {num_shots} few-shot examples; the model will see this "
+                "question's answer in its prompt."
+            )
+    else:
+        target_indices = list(range(min(num_questions, len(lines))))
+
     questions = []
     labels = []
-    for i in range(len(lines[:num_questions])):
+    for i in target_indices:
         raw_question = few_shot_examples + get_one_example(lines, i, False)
         if tokenizer is not None:
             messages = [{"role": "user", "content": raw_question}]
@@ -176,6 +187,13 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument(
+        "--question-index",
+        type=int,
+        default=None,
+        help="Run only the single question at this 0-based index (after the "
+        "first --num-shots few-shot examples). Overrides --num-questions.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
