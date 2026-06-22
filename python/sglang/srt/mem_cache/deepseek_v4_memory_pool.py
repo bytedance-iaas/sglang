@@ -958,7 +958,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 snapshots.append(state[req_pool_idx : req_pool_idx + 1].clone())
             else:
                 start = req_pool_idx * pool.ring_size
-                state_len = seq_len % pool.ring_size
+                state_len = seq_len % 128
                 if state_len == 0:
                     continue
                 snapshot = state.new_empty((pool.ring_size, state.shape[-1]))
