@@ -248,6 +248,7 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
+        req.disagg_transfer_input_len = len(req.origin_input_ids)
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -270,7 +271,9 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        num_kv_indices = len(req.origin_input_ids)
+        num_kv_indices = getattr(
+            req, "disagg_transfer_input_len", len(req.origin_input_ids)
+        )
 
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         req.start_send_idx = decode_prefix_len
@@ -967,10 +970,13 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
+        transfer_input_len = getattr(
+            req, "disagg_transfer_input_len", len(req.origin_input_ids)
+        )
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(req.fill_len, len(req.origin_input_ids))
+            else min(req.fill_len, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1001,7 +1007,7 @@ class SchedulerDisaggregationPrefillMixin:
             # length here avoids emitting an extra state page when the sampled
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
-            seq_len = min(req.fill_len, len(req.origin_input_ids))
+            seq_len = min(req.fill_len, transfer_input_len)
 
             def _mamba_payload():
                 return [
