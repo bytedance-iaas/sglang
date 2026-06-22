@@ -41,6 +41,48 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_MEGA_MOE_SHAPE_DEBUG_SEEN: set = set()
+
+
+def _mega_moe_profile_span(name: str):
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
+def _maybe_log_mega_moe_shape(
+    forward_batch: Optional["ForwardBatch"],
+    num_tokens: int,
+) -> None:
+    if os.getenv("SGLANG_MEGAMOE_SHAPE_DEBUG", "0").lower() not in ("1", "true"):
+        return
+
+    mode = getattr(getattr(forward_batch, "forward_mode", None), "name", None)
+    batch_size = getattr(forward_batch, "batch_size", None)
+    split_index = getattr(forward_batch, "split_index", None)
+    try:
+        global_num_tokens = tuple(int(x) for x in get_dp_global_num_tokens())
+    except Exception:
+        global_num_tokens = None
+
+    key = (
+        mode,
+        batch_size,
+        split_index,
+        num_tokens,
+        global_num_tokens,
+        get_is_capture_mode(),
+    )
+    if key in _MEGA_MOE_SHAPE_DEBUG_SEEN or len(_MEGA_MOE_SHAPE_DEBUG_SEEN) >= 128:
+        return
+    _MEGA_MOE_SHAPE_DEBUG_SEEN.add(key)
+    print(
+        "[MegaMOEShapeDebug] "
+        f"mode={mode} batch_size={batch_size} split_index={split_index} "
+        f"num_tokens={num_tokens} global_num_tokens={global_num_tokens} "
+        f"capture={get_is_capture_mode()}",
+        flush=True,
+    )
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -142,7 +184,17 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_memory_shared", False):
+            raise RuntimeError(
+                "SM90 FP4 MegaMOE memory sharing replaced the fallback FP4 expert "
+                "layout, so requests cannot fall back to the non-MegaMOE path. "
+                f"max_tokens_per_rank={max_tokens_per_rank} exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+                f"{cap}; raise the env var or reduce chunked/cuda-graph batch size."
+            )
+        return False
+    return True
 
 
 def forward_mega_moe(
@@ -152,6 +204,7 @@ def forward_mega_moe(
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
+    _maybe_log_mega_moe_shape(forward_batch, num_tokens)
 
     sbo_overlap_flag = (
         moe.alt_stream is not None
@@ -196,21 +249,23 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        with _mega_moe_profile_span("mega_moe.gate"):
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
-        )
+        with _mega_moe_profile_span("mega_moe.topk"):
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=moe.layer_id,
+                ),
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -231,18 +286,20 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
-    buf = _get_mega_moe_symm_buffer(
-        ep_group,
-        num_experts=num_experts,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_topk=top_k,
-        hidden=hidden_size,
-        intermediate_hidden=intermediate_size,
-    )
+    with _mega_moe_profile_span("mega_moe.get_symm_buffer"):
+        buf = _get_mega_moe_symm_buffer(
+            ep_group,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=top_k,
+            hidden=hidden_size,
+            intermediate_hidden=intermediate_size,
+        )
 
     if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
-        topk_weights_in = topk_weights.to(torch.float32)
+        with _mega_moe_profile_span("mega_moe.topk_cast"):
+            topk_ids_in = topk_ids.to(torch.int32)
+            topk_weights_in = topk_weights.to(torch.float32)
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
@@ -276,85 +333,93 @@ def _run_mega_routed(
         else:
             scale = float(moe.routed_scaling_factor)
             fused_routed_scaling = True
-        mega_moe_pre_dispatch_sm90(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            routed_scaling_factor=scale,
-            quant_group_size=128,
-        )
+        with _mega_moe_profile_span("mega_moe.pre_dispatch_sm90"):
+            mega_moe_pre_dispatch_sm90(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                routed_scaling_factor=scale,
+                quant_group_size=128,
+            )
     elif envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
-        deep_gemm.mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            num_tokens=num_tokens,
-            group_size=32,
-            use_fp4_acts=True,
-        )
+        with _mega_moe_profile_span("mega_moe.pre_dispatch_fp4_acts"):
+            deep_gemm.mega_moe_pre_dispatch(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                num_tokens=num_tokens,
+                group_size=32,
+                use_fp4_acts=True,
+            )
     else:
-        mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-        )
+        with _mega_moe_profile_span("mega_moe.pre_dispatch"):
+            mega_moe_pre_dispatch(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+            )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
-    y = torch.empty(
-        (max(num_tokens, 1), hidden_size),
-        dtype=torch.bfloat16,
-        device=hidden_states.device,
-    )
+    with _mega_moe_profile_span("mega_moe.alloc_output"):
+        y = torch.empty(
+            (max(num_tokens, 1), hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
     if use_sm90_fp8_mega:
-        deep_gemm.fp8_mega_moe(
-            y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
-            buf,
-            recipe=(128, 128, 128),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
+        with _mega_moe_profile_span("mega_moe.fp8_kernel"):
+            deep_gemm.fp8_mega_moe(
+                y,
+                moe.experts.mega_l1_weights,
+                moe.experts.mega_l2_weights,
+                buf,
+                recipe=(128, 128, 128),
+                activation="swiglu",
+                activation_clamp=swiglu_limit,
+                fast_math=True,
+            )
     else:
         # SM90 FP4 + SM100 FP4/FP8 paths share the `fp8_fp4_mega_moe` entry;
         # the C++ binding (mega.hpp) dispatches on `arch_major` and the FP4
         # weight tensors carry their per-32 UE8M0 SF.
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
-    y = y[:num_tokens]
+        with _mega_moe_profile_span("mega_moe.fp8_fp4_kernel"):
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                moe.experts.mega_l1_weights,
+                moe.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="swiglu",
+                activation_clamp=swiglu_limit,
+                fast_math=True,
+            )
+    with _mega_moe_profile_span("mega_moe.output_slice"):
+        y = y[:num_tokens]
 
     if (
         not moe.experts.should_fuse_routed_scaling_factor_in_topk
         and not fused_routed_scaling
     ):
-        y.mul_(moe.routed_scaling_factor)
+        with _mega_moe_profile_span("mega_moe.output_scale"):
+            y.mul_(moe.routed_scaling_factor)
     return y
 
 
@@ -481,8 +546,33 @@ def build_mega_moe_experts_weights(experts) -> None:
         l1_pair, l2_pair = transform_weights_for_mega_moe_sm90_fp4(
             (w13, w13_sf_fp32), (w2, w2_sf_fp32)
         )
-        experts.mega_l1_weights = l1_pair
-        experts.mega_l2_weights = l2_pair
+        if fix_mega_moe_memory:
+            # The SM90 FP4 MegaMOE kernel consumes an interleaved L1 FP4 tensor
+            # and packed UE8M0 scales. The non-MegaMOE FP4 runners consume the
+            # checkpoint layout, so there is no single layout that supports both
+            # paths. In memory-fix mode, prefer the intended MegaMOE path and
+            # replace the original parameters so the old checkpoint-layout
+            # tensors can be released before KV-pool sizing.
+            experts.w13_weight.data = l1_pair[0]
+            experts.w2_weight.data = l2_pair[0]
+            experts.w13_weight_scale_inv.data = l1_pair[1]
+            experts.w2_weight_scale_inv.data = l2_pair[1]
+            experts.w13_weight_scale_inv.format_ue8m0 = True
+            experts.w2_weight_scale_inv.format_ue8m0 = True
+
+            experts.mega_l1_weights = (
+                experts.w13_weight.data,
+                experts.w13_weight_scale_inv.data,
+            )
+            experts.mega_l2_weights = (
+                experts.w2_weight.data,
+                experts.w2_weight_scale_inv.data,
+            )
+            experts._mega_moe_sm90_fp4_memory_shared = True
+        else:
+            experts.mega_l1_weights = l1_pair
+            experts.mega_l2_weights = l2_pair
+            experts._mega_moe_sm90_fp4_memory_shared = False
     else:
         w13_sf = transform_sf_into_required_layout(
             w13_sf_fp32,

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -203,6 +204,77 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+_MOE_SHAPE_PROBE_COUNTS: Dict[Tuple[int, str], int] = {}
+
+
+def _maybe_log_moe_shape_probe(
+    moe: "DeepseekV2MoE",
+    hidden_states: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+    branch: str,
+) -> None:
+    if os.environ.get("SGLANG_MOE_SHAPE_PROBE", "0") not in ("1", "true", "True"):
+        return
+
+    rank = -1
+    world_size = -1
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+    except Exception:
+        pass
+
+    key = (rank, branch)
+    limit = int(os.environ.get("SGLANG_MOE_SHAPE_PROBE_LIMIT", "12"))
+    count = _MOE_SHAPE_PROBE_COUNTS.get(key, 0)
+    if count >= limit:
+        return
+    _MOE_SHAPE_PROBE_COUNTS[key] = count + 1
+
+    fb_mode = None
+    fb_batch_size = None
+    fb_batch_size_before_padding = None
+    fb_num_token_non_padded_cpu = None
+    if forward_batch is not None:
+        fb_mode = getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode))
+        fb_batch_size = getattr(forward_batch, "batch_size", None)
+        fb_batch_size_before_padding = getattr(
+            forward_batch, "batch_size_before_padding", None
+        )
+        fb_num_token_non_padded_cpu = getattr(
+            forward_batch, "num_token_non_padded_cpu", None
+        )
+
+    try:
+        runner_backend = get_moe_runner_backend().value
+    except Exception:
+        runner_backend = str(get_moe_runner_backend())
+    try:
+        a2a_backend = get_moe_a2a_backend().value
+    except Exception:
+        a2a_backend = str(get_moe_a2a_backend())
+
+    print(
+        "[MOE_SHAPE_PROBE] "
+        f"rank={rank}/{world_size} "
+        f"cuda_device={torch.cuda.current_device() if torch.cuda.is_available() else -1} "
+        f"layer={getattr(moe, 'layer_id', None)} "
+        f"branch={branch} "
+        f"runner_backend={runner_backend} "
+        f"a2a_backend={a2a_backend} "
+        f"forward_mode={fb_mode} "
+        f"fb_batch_size={fb_batch_size} "
+        f"fb_batch_size_before_padding={fb_batch_size_before_padding} "
+        f"fb_num_token_non_padded_cpu={fb_num_token_non_padded_cpu} "
+        f"hidden_tokens={hidden_states.shape[0]} "
+        f"hidden_shape={tuple(hidden_states.shape)} "
+        f"attn_cp={get_attention_cp_rank()}/{get_attention_cp_size()} "
+        f"attn_tp={get_attention_tp_rank()}/{get_attention_tp_size()} "
+        f"moe_ep_size={get_moe_expert_parallel_world_size()}",
+        flush=True,
+    )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -709,7 +781,9 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
-        if should_use_mega_moe(self, hidden_states):
+        use_mega_moe = should_use_mega_moe(self, hidden_states)
+        if use_mega_moe:
+            _maybe_log_moe_shape_probe(self, hidden_states, forward_batch, "mega_moe")
             return forward_mega_moe(
                 self,
                 hidden_states,
@@ -718,6 +792,12 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
+            branch = (
+                "marlin"
+                if get_moe_runner_backend().is_marlin()
+                else "normal_no_a2a"
+            )
+            _maybe_log_moe_shape_probe(self, hidden_states, forward_batch, branch)
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
@@ -748,6 +828,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global=input_ids_global,
                 )
         else:
+            _maybe_log_moe_shape_probe(self, hidden_states, forward_batch, "a2a")
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )

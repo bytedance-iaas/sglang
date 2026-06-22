@@ -103,6 +103,27 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_nsys_cuda_graph_replay_count = 0
+
+
+def _enable_cuda_graph_replay_nvtx() -> bool:
+    return os.getenv("SGLANG_NSYS_CUDA_GRAPH_REPLAY_NVTX", "0").lower() in (
+        "1",
+        "true",
+    )
+
+
+def _should_mark_cuda_graph_replay_nvtx() -> bool:
+    global _nsys_cuda_graph_replay_count
+
+    if not _enable_cuda_graph_replay_nvtx():
+        return False
+
+    _nsys_cuda_graph_replay_count += 1
+    skip = int(os.getenv("SGLANG_NSYS_CUDA_GRAPH_REPLAY_SKIP", "0"))
+    limit = int(os.getenv("SGLANG_NSYS_CUDA_GRAPH_REPLAY_LIMIT", "0"))
+    marked = _nsys_cuda_graph_replay_count - skip
+    return marked > 0 and (limit <= 0 or marked <= limit)
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -1299,8 +1320,30 @@ class CudaGraphRunner:
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
-        with ctx:
-            self.graphs[graph_key].replay()
+        if (
+            forward_batch.forward_mode == ForwardMode.TARGET_VERIFY
+            and _should_mark_cuda_graph_replay_nvtx()
+        ):
+            replay_name = (
+                "sglang_cuda_graph_replay "
+                f"mode={forward_batch.forward_mode.name} "
+                f"capture_mode={self.capture_forward_mode.name} "
+                f"raw_bs={self.raw_bs} graph_bs={self.bs} "
+                f"raw_tokens={self.raw_num_token} "
+                f"graph_tokens={self.bs * self.num_tokens_per_bs} "
+                f"graph_key={graph_key}"
+            )
+            torch.cuda.nvtx.range_push("sglang_target_verify_graph_replay")
+            torch.cuda.nvtx.range_push(replay_name)
+            try:
+                with ctx:
+                    self.graphs[graph_key].replay()
+            finally:
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_pop()
+        else:
+            with ctx:
+                self.graphs[graph_key].replay()
 
         output = self.output_buffers[graph_key]
 
