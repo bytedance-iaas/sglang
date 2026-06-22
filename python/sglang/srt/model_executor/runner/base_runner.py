@@ -256,6 +256,13 @@ class BaseRunner(ABC):
         if mr.server_args.disable_flashinfer_autotune:
             return False
 
+        if mr.server_args.disaggregation_mode == "prefill":
+            # FlashInfer autotune currently reuses _dummy_run(), which builds a
+            # decode-shaped dummy forward for generation models. Prefill-only
+            # disaggregation workers never serve that path, and DSV4 PP/CP can
+            # hit invalid decode metadata during this startup-only warmup.
+            return False
+
         # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
         # be autotuned -- its _dummy_run would dispatch more tokens per rank than
         # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
