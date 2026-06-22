@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    filter_kv_indices_for_dcp_rank,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -785,6 +786,18 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
+        # DCP: req_to_token stores cluster-wide global token loc; the
+        # transfer layer addresses GPU buffers using per-rank physical
+        # offsets. Convert here before the kv_indices flow into both
+        # ``kv_to_page_indices`` below and the SWA/NSA state payloads.
+        # When dcp_size == 1 this is a no-op.
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        dcp_size_local = getattr(kv_mgr, "dcp_size", 1) or 1
+        dcp_rank_local = getattr(kv_mgr, "dcp_rank", 0) or 0
+        if dcp_size_local > 1:
+            kv_indices = filter_kv_indices_for_dcp_rank(
+                kv_indices, dcp_size_local, dcp_rank_local
+            )
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -837,6 +850,14 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
+        if dcp_size_local > 1:
+            # DCP rerouting: page granularity does not divide cleanly under
+            # DCP (logical pages from the cluster-wide loc space scatter
+            # into partial local pages on each rank). Send the rank-local
+            # token-loc array unchanged and let the transfer backend issue
+            # token-level RDMA. The arg name stays ``page_indices`` to
+            # keep the MooncakeKVSender / NixlKVSender contract stable.
+            page_indices = kv_indices
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)

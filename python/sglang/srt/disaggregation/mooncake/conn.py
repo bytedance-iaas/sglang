@@ -191,6 +191,22 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # Mooncake's RDMA path (``_send_kvcache_generic``) addresses GPU
+        # buffers with ``ptr + index * item_len``. In DCP mode the transfer
+        # path passes rank-local token-loc arrays and switches ``item_len``
+        # from per-page to per-token (see ``send_kvcache``), so the
+        # backend supports DCP without protocol changes.
+        #
+        # Limit DCP support to the standard MLA/MHA single-pool path:
+        # DSV4's multi-bucket pool layout (``mla_compression_ratios``)
+        # and HiSparse's host-pool path both need their own DCP-aware
+        # transfer routines, which are not part of this commit.
+        dcp_size_init = getattr(args, "dcp_size", 1) or 1
+        is_dsv4_pool = bool(getattr(args, "mla_compression_ratios", None))
+        is_hisparse = bool(getattr(server_args, "enable_hisparse", False))
+        self.supports_dcp_transfer = dcp_size_init <= 1 or not (
+            is_dsv4_pool or is_hisparse
+        )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -694,11 +710,22 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        item_lens = self.kv_args.kv_item_lens
+        if self.dcp_size > 1:
+            # DCP path: caller passes rank-local *token* loc arrays
+            # instead of page-level page-id arrays. Switch ``item_len``
+            # from per-page bytes to per-token bytes so ``ptr + idx *
+            # item_len`` lands on the right slot. ``kv_item_lens`` is
+            # populated as ``per_token_bytes * page_size`` (see
+            # MHATokenToKVPool.get_contiguous_buf_infos), so dividing by
+            # ``page_size`` recovers the per-token stride.
+            page_size = max(self.kv_args.page_size, 1)
+            item_lens = [il // page_size for il in item_lens]
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
-            item_lens=self.kv_args.kv_item_lens,
+            item_lens=item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,

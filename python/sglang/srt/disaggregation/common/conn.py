@@ -117,9 +117,11 @@ class CommonKVManager(BaseKVManager):
         self.dcp_size = getattr(self.kv_args, "dcp_size", 1) or 1
         self.dcp_rank = getattr(self.kv_args, "dcp_rank", 0) or 0
         # Backends that have a DCP-aware transfer path must override this
-        # to True. Defaults to False so that any currently unsupported
-        # backend triggers the guard below when dcp_size > 1.
-        self.supports_dcp_transfer = False
+        # to True. Subclasses are expected to set the attribute *before*
+        # calling ``super().__init__`` so we don't clobber it; only set
+        # the default when the subclass hasn't already declared support.
+        if not hasattr(self, "supports_dcp_transfer"):
+            self.supports_dcp_transfer = False
         self.system_dp_size = (
             1 if server_args.enable_dp_attention else server_args.dp_size
         )
