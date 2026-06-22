@@ -407,7 +407,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_pool = self._dsv4_kv_pool()
         if kv_pool is None or req.req_pool_idx is None or seq_len <= 0:
             return None
-        return kv_pool.snapshot_c128_radix_state(int(req.req_pool_idx))
+        return kv_pool.snapshot_c128_radix_state(int(req.req_pool_idx), seq_len)
 
     def _node_prefix_len(self, node: TreeNode) -> int:
         prefix_len = 0
@@ -430,14 +430,37 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             return True
         return self._node_prefix_len(node) % 128 == 0
 
-    def _store_c128_snapshot_at_node_end(
-        self, node: TreeNode, snapshot: Optional[List[torch.Tensor]]
+    def _store_c128_snapshot_at_prefix_len(
+        self,
+        node: TreeNode,
+        prefix_len: int,
+        snapshot: Optional[List[torch.Tensor]],
     ) -> None:
-        if snapshot is None:
+        if snapshot is None or prefix_len <= 0:
             return
-        if node.c128_state_snapshots is None:
-            node.c128_state_snapshots = {}
-        node.c128_state_snapshots[len(node.value)] = snapshot
+
+        path: List[TreeNode] = []
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            path.append(cur)
+            cur = cur.parent
+
+        remaining = prefix_len
+        for cur in reversed(path):
+            if remaining <= len(cur.value):
+                if cur.c128_state_snapshots is None:
+                    cur.c128_state_snapshots = {}
+                cur.c128_state_snapshots[remaining] = snapshot
+                return
+            remaining -= len(cur.value)
+
+    def _store_c128_partial_snapshot_for_req(
+        self, req: Req, node: TreeNode, prefix_len: int
+    ) -> None:
+        if prefix_len % 128 == 0:
+            return
+        snapshot = self._snapshot_c128_state_for_req(req, prefix_len)
+        self._store_c128_snapshot_at_prefix_len(node, prefix_len, snapshot)
 
     def _find_c128_restorable_node(self, node: TreeNode) -> TreeNode:
         if self._dsv4_kv_pool() is None:
@@ -547,8 +570,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
             if len(match_result.device_indices) == page_aligned_len:
                 last_node = match_result.last_device_node
-                snapshot = self._snapshot_c128_state_for_req(req, page_aligned_len)
-                self._store_c128_snapshot_at_node_end(last_node, snapshot)
+                self._store_c128_partial_snapshot_for_req(
+                    req, last_node, page_aligned_len
+                )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len]
@@ -632,8 +656,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
-        snapshot = self._snapshot_c128_state_for_req(req, len(new_indices))
-        self._store_c128_snapshot_at_node_end(new_last_node, snapshot)
+        self._store_c128_partial_snapshot_for_req(
+            req, new_last_node, len(new_indices)
+        )
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
