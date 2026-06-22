@@ -269,7 +269,7 @@ class DisaggDecodePipelineStats:
     interval_polls: int = 0
     adaptive_polls: int = 0
     poll_skips: int = 0
-    staging_throttle_count: int = 0
+    hard_limit_block_count: int = 0
     staging_full_tokens: int = 0
     staging_headroom_tokens: int = 0
     staging_reclaimable_tokens: int = 0
@@ -277,7 +277,7 @@ class DisaggDecodePipelineStats:
     full_usage_target: float = 0.0
     max_new_prealloc_reqs: int = -1
     governor_action: str = "not_checked"
-    staging_skip_reason: str = "not_checked"
+    governor_reason: str = "not_checked"
     safe_prefix_len: int = 0
     full_tokens_saved: int = 0
     c4_host_tokens_saved: int = 0
@@ -328,8 +328,8 @@ class DisaggDecodePipelineStats:
         full_usage_target: float,
         max_new_prealloc_reqs: Optional[int],
         governor_action: str,
-        throttle_active: bool,
-        skip_reason: str,
+        hard_limit_blocked: bool,
+        governor_reason: str,
     ) -> None:
         self.staging_full_tokens = max(
             self.staging_full_tokens, staging_full_tokens
@@ -351,9 +351,9 @@ class DisaggDecodePipelineStats:
                 self.max_new_prealloc_reqs, max_new_prealloc_reqs
             )
         self.governor_action = governor_action
-        self.staging_skip_reason = skip_reason
-        if throttle_active:
-            self.staging_throttle_count += 1
+        self.governor_reason = governor_reason
+        if hard_limit_blocked:
+            self.hard_limit_block_count += 1
 
     def record_prefix_reuse_savings(
         self,
@@ -382,8 +382,8 @@ class DisaggDecodePipelineStats:
             f"full headroom tokens: {self.full_headroom_tokens}, "
             f"governor action: {self.governor_action}, "
             f"max new prealloc: {self.max_new_prealloc_reqs}, "
-            f"staging throttle count: {self.staging_throttle_count}, "
-            f"staging skip reason: {self.staging_skip_reason}, "
+            f"hard limit block count: {self.hard_limit_block_count}, "
+            f"governor reason: {self.governor_reason}, "
             f"safe prefix len: {self.safe_prefix_len}, "
             f"full tokens saved: {self.full_tokens_saved}, "
             f"c4 host tokens saved: {self.c4_host_tokens_saved}, "
@@ -3086,7 +3086,7 @@ class SchedulerDisaggregationDecodeMixin:
             should_poll_transfer = interval_due or adaptive_transfer
             if should_pop_prealloc:
                 (
-                    staging_throttle,
+                    hard_limit_blocked,
                     max_new_prealloc_reqs,
                     staging_full_tokens,
                     staging_headroom_tokens,
@@ -3094,7 +3094,7 @@ class SchedulerDisaggregationDecodeMixin:
                     full_headroom_tokens,
                     full_usage_target,
                     governor_action,
-                    staging_skip_reason,
+                    governor_reason,
                 ) = self._disagg_decode_utilization_governor_decision(
                     target_bs=target_bs,
                     target_backlog=target_backlog,
@@ -3107,10 +3107,10 @@ class SchedulerDisaggregationDecodeMixin:
                     full_usage_target=full_usage_target,
                     max_new_prealloc_reqs=max_new_prealloc_reqs,
                     governor_action=governor_action,
-                    throttle_active=staging_throttle,
-                    skip_reason=staging_skip_reason,
+                    hard_limit_blocked=hard_limit_blocked,
+                    governor_reason=governor_reason,
                 )
-                if staging_throttle:
+                if hard_limit_blocked:
                     should_pop_prealloc = False
 
         if should_pop_prealloc or should_poll_transfer:
