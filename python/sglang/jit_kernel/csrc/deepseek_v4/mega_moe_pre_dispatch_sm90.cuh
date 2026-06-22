@@ -183,8 +183,11 @@ struct MegaMoEPreDispatchSM90Kernel {
         .with_dtype<float>()
         .with_device(device)
         .verify(topk_weights);
+    // DeepGEMM's SymmBuffer exposes FP8 storage through an int8 DLPack view.
+    // Direct unit tests may still pass a torch.float8_e4m3fn tensor, so accept
+    // either dtype and write the storage as E4M3 below.
     TensorMatcher({P, H})  // buf.x
-        .with_dtype<fp8_e4m3_t>()
+        .with_dtype<fp8_e4m3_t, int8_t>()
         .with_device(device)
         .verify(buf_x);
     // buf.x_sf is the contiguous row-major fp32 view from DeepGEMM's mega
