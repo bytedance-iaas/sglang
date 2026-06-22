@@ -393,6 +393,22 @@ class DisaggDecodePipelineStats:
         )
 
 
+@dataclass
+class HiSparseDecodeBudgetSnapshot:
+    target_bs: int
+    target_backlog: int
+    page_size: int
+    capacity: int
+    available: int
+    evictable: int
+    staging_full_tokens: int
+    target_usage: float
+    hard_limit: float
+    target_headroom: int
+    hard_headroom: int
+    per_req_prealloc_estimate: int
+
+
 class DecodePreallocQueue:
     """
     Store the requests that are preallocating.
@@ -1081,28 +1097,22 @@ class DecodePreallocQueue:
         eagle_draft_reserve_tokens = (
             self._hisparse_eagle_draft_logical_reserve_tokens()
         )
-        staging_full_tokens = (
-            self.scheduler._disagg_decode_staging_full_tokens()
-            if self.scheduler.enable_hisparse
-            and hasattr(self.scheduler, "_disagg_decode_staging_full_tokens")
-            else 0
-        )
-        staging_headroom_tokens = 0
         if self.scheduler.enable_hisparse and hasattr(
-            self.scheduler, "_disagg_decode_full_usage_limits"
+            self.scheduler, "_disagg_decode_budget_snapshot"
         ):
-            full_usage_target = self.scheduler._disagg_decode_full_usage_limits()[0]
-            staging_headroom_tokens = self.scheduler._disagg_decode_full_headroom_tokens(
-                full_usage_target
-            )[0]
+            budget = self.scheduler._disagg_decode_budget_snapshot(
+                target_bs=self.scheduler._disagg_decode_target_bs(),
+                target_backlog=0,
+            )
+            staging_full_tokens = budget.staging_full_tokens
+            staging_headroom_tokens = budget.target_headroom
+            staging_reclaimable_tokens = budget.evictable
+            full_usage_target = budget.target_usage
         else:
+            staging_full_tokens = 0
+            staging_headroom_tokens = 0
+            staging_reclaimable_tokens = 0
             full_usage_target = 0.0
-        staging_reclaimable_tokens = (
-            self.scheduler._disagg_decode_full_evictable_tokens()
-            if self.scheduler.enable_hisparse
-            and hasattr(self.scheduler, "_disagg_decode_full_evictable_tokens")
-            else 0
-        )
         log_fn = logger.warning if idle_admission_deadlock else logger.info
         log_fn(
             "Decode prealloc admission limited: reason=%s, queue=%d, "
@@ -2558,12 +2568,16 @@ class SchedulerDisaggregationDecodeMixin:
         )
         return max(1, int(page_size or 1))
 
-    def _disagg_decode_full_capacity_tokens(self: Scheduler) -> int:
+    def _disagg_decode_budget_snapshot(
+        self: Scheduler, *, target_bs: int, target_backlog: int
+    ) -> HiSparseDecodeBudgetSnapshot:
+        page_size = self._disagg_decode_logical_page_size()
         allocator = self.token_to_kv_pool_allocator
         candidates = (
             getattr(allocator, "logical_attn_allocator", None),
             allocator,
         )
+        capacity = None
         for candidate in candidates:
             if candidate is None:
                 continue
@@ -2572,101 +2586,100 @@ class SchedulerDisaggregationDecodeMixin:
                 if callable(value):
                     value = value()
                 if value is not None:
-                    return max(1, int(value))
-        return max(
-            1,
-            self._disagg_decode_target_bs()
-            * self._disagg_decode_logical_page_size(),
-        )
+                    capacity = max(1, int(value))
+                    break
+            if capacity is not None:
+                break
+        if capacity is None:
+            capacity = max(1, target_bs * page_size)
 
-    def _disagg_decode_full_available_tokens(self: Scheduler) -> int:
-        allocator = self.token_to_kv_pool_allocator
-        candidates = (
-            getattr(allocator, "logical_attn_allocator", None),
-            allocator,
-        )
+        available = None
         for candidate in candidates:
             if candidate is None:
                 continue
             for method_name in ("full_available_size", "available_size"):
                 method = getattr(candidate, method_name, None)
                 if method is not None:
-                    return max(0, int(method()))
-        return self._disagg_decode_full_capacity_tokens()
+                    available = max(0, int(method()))
+                    break
+            if available is not None:
+                break
+        if available is None:
+            available = capacity
 
-    def _disagg_decode_req_staging_full_tokens(self: Scheduler, req: Req) -> int:
-        allocated_len = int(getattr(req, "kv_allocated_len", 0) or 0)
-        protected_len = int(getattr(req, "cache_protected_len", 0) or 0)
-        tokens = max(0, allocated_len - protected_len)
-        if tokens == 0:
-            return 0
-        page_size = self._disagg_decode_logical_page_size()
-        return ((tokens + page_size - 1) // page_size) * page_size
-
-    def _disagg_decode_staging_full_tokens(self: Scheduler) -> int:
         seen = set()
-        total = 0
+        staging_full_tokens = 0
 
         def add_req(req: Req) -> None:
-            nonlocal total
+            nonlocal staging_full_tokens
             key = getattr(req, "rid", None) or id(req)
             if key in seen:
                 return
             seen.add(key)
-            total += self._disagg_decode_req_staging_full_tokens(req)
+            allocated_len = int(getattr(req, "kv_allocated_len", 0) or 0)
+            protected_len = int(getattr(req, "cache_protected_len", 0) or 0)
+            tokens = max(0, allocated_len - protected_len)
+            if tokens > 0:
+                staging_full_tokens += (
+                    (tokens + page_size - 1) // page_size
+                ) * page_size
 
         for decode_req in self.disagg_decode_transfer_queue.queue:
             add_req(decode_req.req)
         for req in self.waiting_queue:
             add_req(req)
-        return total
 
-    def _disagg_decode_full_usage_limits(self: Scheduler) -> Tuple[float, float]:
         target = envs.SGLANG_HISPARSE_DECODE_FULL_USAGE_TARGET.get()
         hard_limit = envs.SGLANG_HISPARSE_DECODE_FULL_USAGE_HARD_LIMIT.get()
         target = min(max(float(target), 0.5), 0.995)
         hard_limit = min(max(float(hard_limit), target), 0.999)
-        return target, hard_limit
 
-    def _disagg_decode_full_evictable_tokens(self: Scheduler) -> int:
+        evictable = 0
         method = getattr(self.tree_cache, "full_evictable_size", None)
-        if method is None:
-            return 0
-        try:
-            return max(0, int(method()))
-        except Exception:
-            return 0
+        if method is not None:
+            try:
+                evictable = max(0, int(method()))
+            except Exception:
+                evictable = 0
 
-    def _disagg_decode_full_headroom_tokens(
-        self: Scheduler, usage_limit: float
-    ) -> Tuple[int, int]:
-        capacity = self._disagg_decode_full_capacity_tokens()
-        available = self._disagg_decode_full_available_tokens()
-        evictable = self._disagg_decode_full_evictable_tokens()
-        reserved_to_limit = max(0, capacity - int(capacity * usage_limit))
-        headroom = max(0, available + evictable - reserved_to_limit)
-        return headroom, evictable
+        target_reserved = max(0, capacity - int(capacity * target))
+        hard_reserved = max(0, capacity - int(capacity * hard_limit))
+        target_headroom = max(0, available + evictable - target_reserved)
+        hard_headroom = max(0, available + evictable - hard_reserved)
 
-    def _disagg_decode_estimated_prealloc_full_tokens(self: Scheduler) -> int:
-        staging_full_tokens = self._disagg_decode_staging_full_tokens()
         staged_reqs = len(self.disagg_decode_transfer_queue.queue) + len(
             self.waiting_queue
         )
-        page_size = self._disagg_decode_logical_page_size()
         if staged_reqs > 0 and staging_full_tokens > 0:
-            return max(page_size, (staging_full_tokens + staged_reqs - 1) // staged_reqs)
+            per_req_estimate = max(
+                page_size, (staging_full_tokens + staged_reqs - 1) // staged_reqs
+            )
+        else:
+            per_req_cap = max(page_size, capacity // max(1, target_bs))
+            per_req_estimate = page_size
+            for decode_req in self.disagg_decode_prealloc_queue.queue:
+                if not decode_req.waiting_for_input:
+                    continue
+                reserve = self.disagg_decode_prealloc_queue.num_reserved_decode_tokens
+                estimate = len(decode_req.req.origin_input_ids) + reserve
+                estimate = ((estimate + page_size - 1) // page_size) * page_size
+                per_req_estimate = max(page_size, min(estimate, per_req_cap))
+                break
 
-        capacity = self._disagg_decode_full_capacity_tokens()
-        target_bs = self._disagg_decode_target_bs()
-        per_req_cap = max(page_size, capacity // max(1, target_bs))
-        for decode_req in self.disagg_decode_prealloc_queue.queue:
-            if not decode_req.waiting_for_input:
-                continue
-            reserve = self.disagg_decode_prealloc_queue.num_reserved_decode_tokens
-            estimate = len(decode_req.req.origin_input_ids) + reserve
-            estimate = ((estimate + page_size - 1) // page_size) * page_size
-            return max(page_size, min(estimate, per_req_cap))
-        return page_size
+        return HiSparseDecodeBudgetSnapshot(
+            target_bs=target_bs,
+            target_backlog=target_backlog,
+            page_size=page_size,
+            capacity=capacity,
+            available=available,
+            evictable=evictable,
+            staging_full_tokens=staging_full_tokens,
+            target_usage=target,
+            hard_limit=hard_limit,
+            target_headroom=target_headroom,
+            hard_headroom=hard_headroom,
+            per_req_prealloc_estimate=per_req_estimate,
+        )
 
     def _disagg_decode_utilization_governor_decision(
         self: Scheduler, *, target_bs: int, target_backlog: int
@@ -2683,12 +2696,11 @@ class SchedulerDisaggregationDecodeMixin:
         transfer = len(self.disagg_decode_transfer_queue.queue)
         active_pipeline_reqs = running + waiting + transfer
         pipeline_slots = max(0, target_bs + target_backlog - active_pipeline_reqs)
-        staging_full_tokens = self._disagg_decode_staging_full_tokens()
-        target, hard_limit = self._disagg_decode_full_usage_limits()
-        target_headroom, evictable = self._disagg_decode_full_headroom_tokens(target)
-        hard_headroom, _ = self._disagg_decode_full_headroom_tokens(hard_limit)
+        budget = self._disagg_decode_budget_snapshot(
+            target_bs=target_bs, target_backlog=target_backlog
+        )
 
-        if hard_headroom <= 0:
+        if budget.hard_headroom <= 0:
             action = (
                 "drain_staged_reqs"
                 if waiting + transfer > 0 and running < target_bs
@@ -2697,11 +2709,11 @@ class SchedulerDisaggregationDecodeMixin:
             return (
                 True,
                 0,
-                staging_full_tokens,
-                target_headroom,
-                evictable,
-                hard_headroom,
-                target,
+                budget.staging_full_tokens,
+                budget.target_headroom,
+                budget.evictable,
+                budget.hard_headroom,
+                budget.target_usage,
                 action,
                 "hard_limit",
             )
@@ -2714,40 +2726,41 @@ class SchedulerDisaggregationDecodeMixin:
             return (
                 False,
                 None,
-                staging_full_tokens,
-                target_headroom,
-                evictable,
-                hard_headroom,
-                target,
+                budget.staging_full_tokens,
+                budget.target_headroom,
+                budget.evictable,
+                budget.hard_headroom,
+                budget.target_usage,
                 "backlog_full_diagnostic",
                 "admit",
             )
 
-        if target_headroom <= 0:
+        if budget.target_headroom <= 0:
             return (
                 False,
                 None,
-                staging_full_tokens,
-                target_headroom,
-                evictable,
-                hard_headroom,
-                target,
+                budget.staging_full_tokens,
+                budget.target_headroom,
+                budget.evictable,
+                budget.hard_headroom,
+                budget.target_usage,
                 "above_target_diagnostic",
                 "admit",
             )
 
-        per_req_estimate = self._disagg_decode_estimated_prealloc_full_tokens()
-        max_new_reqs = max(1, hard_headroom // max(1, per_req_estimate))
+        max_new_reqs = max(
+            1, budget.hard_headroom // max(1, budget.per_req_prealloc_estimate)
+        )
         max_new_reqs = min(pipeline_slots, max_new_reqs)
         if max_new_reqs <= 0:
             return (
                 True,
                 0,
-                staging_full_tokens,
-                target_headroom,
-                evictable,
-                hard_headroom,
-                target,
+                budget.staging_full_tokens,
+                budget.target_headroom,
+                budget.evictable,
+                budget.hard_headroom,
+                budget.target_usage,
                 "hard_headroom",
                 "no_hard_headroom",
             )
@@ -2755,11 +2768,11 @@ class SchedulerDisaggregationDecodeMixin:
         return (
             False,
             max_new_reqs,
-            staging_full_tokens,
-            target_headroom,
-            evictable,
-            hard_headroom,
-            target,
+            budget.staging_full_tokens,
+            budget.target_headroom,
+            budget.evictable,
+            budget.hard_headroom,
+            budget.target_usage,
             "hard_headroom",
             "admit",
         )
