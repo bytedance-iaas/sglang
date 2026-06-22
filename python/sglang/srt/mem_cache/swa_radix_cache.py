@@ -466,6 +466,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self._dsv4_kv_pool() is None:
             return node
         while node is not self.root_node and not self._is_c128_restorable_node(node):
+            prefix_len = self._node_prefix_len(node)
+            aligned_prefix_len = prefix_len // 128 * 128
+            parent_prefix_len = prefix_len - len(node.value)
+            if aligned_prefix_len > parent_prefix_len:
+                split_len = aligned_prefix_len - parent_prefix_len
+                return self._split_node(node.key, node, split_len)
             node = node.parent
         return node
 

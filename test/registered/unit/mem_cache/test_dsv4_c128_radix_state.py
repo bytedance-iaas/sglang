@@ -19,6 +19,7 @@ class FakeDSV4KVPool(BaseSWAKVPool):
         self.full_kv_pool = None
         self.swa_kv_pool = None
         self.restored = []
+        self.snapshotted = []
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError
@@ -42,6 +43,7 @@ class FakeDSV4KVPool(BaseSWAKVPool):
         return [], [], []
 
     def snapshot_c128_radix_state(self, req_pool_idx: int, seq_len: int):
+        self.snapshotted.append((req_pool_idx, seq_len))
         return [torch.tensor([req_pool_idx, seq_len], dtype=torch.int64)]
 
     def restore_c128_radix_state(self, req_pool_idx: int, snapshots):
@@ -132,6 +134,43 @@ class TestDSV4C128RadixState(unittest.TestCase):
         restored_req_pool_idx, restored_snapshot = kv_pool.restored[0]
         self.assertEqual(restored_req_pool_idx, 3)
         self.assertIs(restored_snapshot, snapshot)
+
+    def test_missing_partial_snapshot_falls_back_to_aligned_boundary(self):
+        cache, kv_pool = self._make_cache()
+        self._insert_tokens(cache, 260)
+
+        req = FakeReq(req_pool_idx=3)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(130))), req=req)
+        )
+
+        self.assertEqual(len(match.device_indices), 128)
+        self.assertEqual(cache._node_prefix_len(match.last_device_node), 128)
+
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        cache.restore_c128_state_for_reqs([req])
+        self.assertEqual(kv_pool.restored, [])
+
+    def test_store_partial_snapshot_uses_requested_prefix_length(self):
+        cache, kv_pool = self._make_cache()
+        leaf = self._insert_tokens(cache, 260)
+        req = FakeReq(req_pool_idx=4)
+
+        cache._store_c128_partial_snapshot_for_req(req, leaf, 130)
+
+        self.assertEqual(kv_pool.snapshotted, [(4, 130)])
+        self.assertIn(130, leaf.c128_state_snapshots)
+
+    def test_store_aligned_boundary_skips_snapshot(self):
+        cache, kv_pool = self._make_cache()
+        leaf = self._insert_tokens(cache, 260)
+        req = FakeReq(req_pool_idx=4)
+
+        cache._store_c128_partial_snapshot_for_req(req, leaf, 128)
+
+        self.assertEqual(kv_pool.snapshotted, [])
+        self.assertIsNone(leaf.c128_state_snapshots)
 
 
 if __name__ == "__main__":
