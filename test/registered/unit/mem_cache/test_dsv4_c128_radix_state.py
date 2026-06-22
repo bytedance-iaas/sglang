@@ -19,6 +19,7 @@ class FakeDSV4KVPool(BaseSWAKVPool):
         self.full_kv_pool = None
         self.swa_kv_pool = None
         self.restored = []
+        self.cleared = []
         self.snapshotted = []
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -48,6 +49,9 @@ class FakeDSV4KVPool(BaseSWAKVPool):
 
     def restore_c128_radix_state(self, req_pool_idx: int, snapshots):
         self.restored.append((req_pool_idx, snapshots))
+
+    def clear_c128_radix_state(self, req_pool_idx: int):
+        self.cleared.append(req_pool_idx)
 
 
 class FakeReq:
@@ -107,6 +111,7 @@ class TestDSV4C128RadixState(unittest.TestCase):
         req.last_node = match.last_device_node
         cache.restore_c128_state_for_reqs([req])
         self.assertEqual(kv_pool.restored, [])
+        self.assertEqual(kv_pool.cleared, [2])
 
     def test_partial_c128_snapshot_moves_to_split_node_and_restores(self):
         cache, kv_pool = self._make_cache()
@@ -151,6 +156,7 @@ class TestDSV4C128RadixState(unittest.TestCase):
         req.last_node = match.last_device_node
         cache.restore_c128_state_for_reqs([req])
         self.assertEqual(kv_pool.restored, [])
+        self.assertEqual(kv_pool.cleared, [3])
 
     def test_store_partial_snapshot_uses_requested_prefix_length(self):
         cache, kv_pool = self._make_cache()
