@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
@@ -488,6 +489,8 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.dcp_size = get_dcp_world_size()
+        kv_args.dcp_rank = get_dcp_rank()
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host

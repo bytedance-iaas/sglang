@@ -6932,6 +6932,22 @@ class ServerArgs:
             assert (
                 self.pp_size == 1
             ), "Decode context parallelism is not compatible with pipeline parallelism"
+            # PD disaggregation transfer paths do not yet remap logical
+            # token loc -> per-rank physical offset (DCP storage rule:
+            # token i lives on rank i % dcp_size at offset i // dcp_size).
+            # Running PD + DCP without that remap silently corrupts every
+            # KV transfer and produces totally wrong outputs. Block the
+            # combination at startup until the transfer layer learns about
+            # DCP. Track work in `python/sglang/srt/disaggregation/`.
+            assert self.disaggregation_mode == "null", (
+                "Decode context parallelism (--dcp-size > 1) is not yet "
+                "supported together with PD disaggregation "
+                f"(--disaggregation-mode={self.disaggregation_mode}). "
+                "The KV transfer layer does not remap logical token loc to "
+                "per-rank physical offset under DCP, which silently "
+                "corrupts the transferred KV cache. Use --dcp-size 1 on the "
+                "disaggregated engine for now."
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
