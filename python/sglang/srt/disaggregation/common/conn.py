@@ -111,6 +111,15 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = get_attention_cp_rank()
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
+        # DCP topology of this engine. Sourced from KVArgs (filled by
+        # prefill/decode side at init); falls back to 1/0 for backward
+        # compatibility when the field is missing.
+        self.dcp_size = getattr(self.kv_args, "dcp_size", 1) or 1
+        self.dcp_rank = getattr(self.kv_args, "dcp_rank", 0) or 0
+        # Backends that have a DCP-aware transfer path must override this
+        # to True. Defaults to False so that any currently unsupported
+        # backend triggers the guard below when dcp_size > 1.
+        self.supports_dcp_transfer = False
         self.system_dp_size = (
             1 if server_args.enable_dp_attention else server_args.dp_size
         )
@@ -123,6 +132,7 @@ class CommonKVManager(BaseKVManager):
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
+        self._check_dcp_compat()
 
         # bind zmq socket
         context = zmq.Context()
@@ -185,6 +195,29 @@ class CommonKVManager(BaseKVManager):
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
+            )
+
+    def _check_dcp_compat(self) -> None:
+        """Refuse to start if this engine is configured with DCP but the
+        backend's transfer path has not declared explicit DCP support.
+
+        ``supports_dcp_transfer`` defaults to ``False`` in CommonKVManager.
+        Any backend that has been adapted to honor the
+        ``loc % dcp_size == dcp_rank`` storage rule must override it to
+        ``True`` before this check runs (i.e. set the flag in __init__
+        before calling super().__init__, or re-call the check after).
+        """
+        if self.dcp_size > 1 and not self.supports_dcp_transfer:
+            backend = type(self).__name__
+            raise RuntimeError(
+                f"{backend} does not yet implement DCP-aware KV transfer, "
+                f"but engine is configured with dcp_size={self.dcp_size}. "
+                "PD disaggregation under DCP requires the transfer layer "
+                "to remap logical token loc -> per-rank physical offset; "
+                "running without that remap would silently corrupt the "
+                "transferred KV cache. Use --dcp-size 1 on the "
+                "disaggregated engine, or pick a backend that has been "
+                "adapted for DCP."
             )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:

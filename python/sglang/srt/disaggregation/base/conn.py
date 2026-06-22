@@ -66,6 +66,14 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Decode-Context-Parallel topology of *this* engine. Required so the
+    # transfer layer can convert the logical token loc carried in KV
+    # indices into the per-rank physical offset that the underlying buffer
+    # actually uses (DCP storage rule: token loc i lives on rank
+    # ``i % dcp_size`` at local offset ``i // dcp_size``). Defaults to a
+    # no-DCP topology so non-DCP backends remain bit-identical.
+    dcp_size: int = 1
+    dcp_rank: int = 0
 
 
 class KVPoll:
