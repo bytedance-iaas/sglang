@@ -3,6 +3,7 @@ from array import array
 
 import torch
 
+from sglang.srt.mem_cache import deepseek_v4_memory_pool as dsv4_memory_pool
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -59,6 +60,19 @@ class FakeReq:
         self.req_pool_idx = req_pool_idx
         self.prefix_indices = []
         self.last_node = None
+
+
+class FakeKVScoreBuffer:
+    def __init__(self, kv_score: torch.Tensor):
+        self.kv_score = kv_score
+
+
+class FakeCompressStatePool:
+    ratio = 128
+
+    def __init__(self, ring_size: int, kv_score: torch.Tensor):
+        self.ring_size = ring_size
+        self.kv_score_buffer = FakeKVScoreBuffer(kv_score)
 
 
 class TestDSV4C128RadixState(unittest.TestCase):
@@ -177,6 +191,29 @@ class TestDSV4C128RadixState(unittest.TestCase):
 
         self.assertEqual(kv_pool.snapshotted, [])
         self.assertIsNone(leaf.c128_state_snapshots)
+
+    def test_offline_snapshot_only_copies_current_c128_block(self):
+        kv_score = torch.arange(512 * 4, dtype=torch.float32).reshape(512, 4)
+        kv_pool = dsv4_memory_pool.DeepSeekV4TokenToKVPool.__new__(
+            dsv4_memory_pool.DeepSeekV4TokenToKVPool
+        )
+        kv_pool.compress_state_pools = [FakeCompressStatePool(256, kv_score)]
+
+        old_online_c128 = dsv4_memory_pool.ONLINE_C128
+        dsv4_memory_pool.ONLINE_C128 = False
+        try:
+            snapshot = kv_pool.snapshot_c128_radix_state(req_pool_idx=1, seq_len=130)[
+                0
+            ]
+        finally:
+            dsv4_memory_pool.ONLINE_C128 = old_online_c128
+
+        start = 256
+        expected = kv_score.new_empty((256, 4))
+        expected[:, :2].zero_()
+        expected[:, 2:].fill_(float("-inf"))
+        expected[128:130] = kv_score[start + 128 : start + 130]
+        torch.testing.assert_close(snapshot, expected)
 
 
 if __name__ == "__main__":
