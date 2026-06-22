@@ -253,6 +253,10 @@ class Envs:
     # DSV4 HiSparse keeps C4 KV compressed/host-backed on decode, so reserving
     # the full clipped output length during PD preallocation is too conservative.
     SGLANG_HISPARSE_RELAX_DECODE_OUTPUT_RESERVE = EnvBool(True)
+    SGLANG_HISPARSE_DECODE_UTILIZATION_GOVERNOR = EnvBool(True)
+    SGLANG_HISPARSE_DECODE_FULL_USAGE_TARGET = EnvFloat(0.92)
+    SGLANG_HISPARSE_DECODE_FULL_USAGE_HARD_LIMIT = EnvFloat(0.98)
+    SGLANG_HISPARSE_DECODE_SAFE_PREFIX_REUSE = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

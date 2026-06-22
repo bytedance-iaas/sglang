@@ -269,6 +269,18 @@ class DisaggDecodePipelineStats:
     interval_polls: int = 0
     adaptive_polls: int = 0
     poll_skips: int = 0
+    staging_throttle_count: int = 0
+    staging_full_tokens: int = 0
+    staging_headroom_tokens: int = 0
+    staging_reclaimable_tokens: int = 0
+    full_headroom_tokens: int = 0
+    full_usage_target: float = 0.0
+    max_new_prealloc_reqs: int = -1
+    governor_action: str = "not_checked"
+    staging_skip_reason: str = "not_checked"
+    safe_prefix_len: int = 0
+    full_tokens_saved: int = 0
+    c4_host_tokens_saved: int = 0
     prealloc_oldest_ms: float = 0.0
     transfer_oldest_ms: float = 0.0
     waiting_oldest_ms: float = 0.0
@@ -306,6 +318,54 @@ class DisaggDecodePipelineStats:
     def record_poll_skip(self) -> None:
         self.poll_skips += 1
 
+    def record_staging_diagnostics(
+        self,
+        *,
+        staging_full_tokens: int,
+        staging_headroom_tokens: int,
+        staging_reclaimable_tokens: int,
+        full_headroom_tokens: int,
+        full_usage_target: float,
+        max_new_prealloc_reqs: Optional[int],
+        governor_action: str,
+        throttle_active: bool,
+        skip_reason: str,
+    ) -> None:
+        self.staging_full_tokens = max(
+            self.staging_full_tokens, staging_full_tokens
+        )
+        self.staging_headroom_tokens = max(
+            self.staging_headroom_tokens, staging_headroom_tokens
+        )
+        self.staging_reclaimable_tokens = max(
+            self.staging_reclaimable_tokens, staging_reclaimable_tokens
+        )
+        self.full_headroom_tokens = max(
+            self.full_headroom_tokens, full_headroom_tokens
+        )
+        self.full_usage_target = max(self.full_usage_target, full_usage_target)
+        if max_new_prealloc_reqs is None:
+            self.max_new_prealloc_reqs = -1
+        else:
+            self.max_new_prealloc_reqs = max(
+                self.max_new_prealloc_reqs, max_new_prealloc_reqs
+            )
+        self.governor_action = governor_action
+        self.staging_skip_reason = skip_reason
+        if throttle_active:
+            self.staging_throttle_count += 1
+
+    def record_prefix_reuse_savings(
+        self,
+        *,
+        safe_prefix_len: int,
+        full_tokens_saved: int,
+        c4_host_tokens_saved: int,
+    ) -> None:
+        self.safe_prefix_len = max(self.safe_prefix_len, safe_prefix_len)
+        self.full_tokens_saved += max(0, full_tokens_saved)
+        self.c4_host_tokens_saved += max(0, c4_host_tokens_saved)
+
     def format_log_message(self, *, target_bs: int) -> str:
         samples = max(1, self.samples)
         return (
@@ -315,6 +375,18 @@ class DisaggDecodePipelineStats:
             f"adaptive polls: {self.adaptive_polls}, "
             f"interval polls: {self.interval_polls}, "
             f"poll skips: {self.poll_skips}, "
+            f"staging full tokens: {self.staging_full_tokens}, "
+            f"staging headroom tokens: {self.staging_headroom_tokens}, "
+            f"staging reclaimable tokens: {self.staging_reclaimable_tokens}, "
+            f"full usage target: {self.full_usage_target:.3f}, "
+            f"full headroom tokens: {self.full_headroom_tokens}, "
+            f"governor action: {self.governor_action}, "
+            f"max new prealloc: {self.max_new_prealloc_reqs}, "
+            f"staging throttle count: {self.staging_throttle_count}, "
+            f"staging skip reason: {self.staging_skip_reason}, "
+            f"safe prefix len: {self.safe_prefix_len}, "
+            f"full tokens saved: {self.full_tokens_saved}, "
+            f"c4 host tokens saved: {self.c4_host_tokens_saved}, "
             f"prealloc oldest ms: {self.prealloc_oldest_ms:.1f}, "
             f"transfer oldest ms: {self.transfer_oldest_ms:.1f}, "
             f"waiting oldest ms: {self.waiting_oldest_ms:.1f}, "
@@ -478,6 +550,8 @@ class DecodePreallocQueue:
             return False
         if not self._is_dsv4_hisparse_swa_tail_prealloc():
             return True
+        if not envs.SGLANG_HISPARSE_DECODE_SAFE_PREFIX_REUSE.get():
+            return False
 
         # DSV4 HiSparse can safely reuse decode-side full logical pages only in
         # the C4 host-prefix-cache mode.  The matched prefix is capped later so
@@ -953,9 +1027,22 @@ class DecodePreallocQueue:
         hisparse_avail: Optional[int],
     ) -> None:
         now = time.monotonic()
+        self.scheduler._last_disagg_decode_prealloc_block_reason = reason
+        self.scheduler._last_disagg_decode_prealloc_block_time = now
+        ready_reqs = sum(1 for req in self.queue if req.waiting_for_input)
+        running_reqs = len(self.scheduler.running_batch.reqs)
+        transfer_reqs = len(self.transfer_queue.queue)
+        idle_admission_deadlock = (
+            ready_reqs > 0 and running_reqs == 0 and transfer_reqs == 0
+        )
+        min_log_interval = (
+            min(1.0, self._prealloc_admission_log_interval)
+            if idle_admission_deadlock
+            else self._prealloc_admission_log_interval
+        )
         if (
             now - self._last_prealloc_admission_log_time
-            < self._prealloc_admission_log_interval
+            < min_log_interval
         ):
             return
         self._last_prealloc_admission_log_time = now
@@ -990,13 +1077,30 @@ class DecodePreallocQueue:
         eagle_draft_reserve_tokens = (
             self._hisparse_eagle_draft_logical_reserve_tokens()
         )
-        ready_reqs = sum(1 for req in self.queue if req.waiting_for_input)
-        running_reqs = len(self.scheduler.running_batch.reqs)
-        transfer_reqs = len(self.transfer_queue.queue)
-        idle_admission_deadlock = (
-            ready_reqs > 0 and running_reqs == 0 and transfer_reqs == 0
+        staging_full_tokens = (
+            self.scheduler._disagg_decode_staging_full_tokens()
+            if self.scheduler.enable_hisparse
+            and hasattr(self.scheduler, "_disagg_decode_staging_full_tokens")
+            else 0
         )
-        logger.info(
+        staging_headroom_tokens = 0
+        if self.scheduler.enable_hisparse and hasattr(
+            self.scheduler, "_disagg_decode_full_usage_limits"
+        ):
+            full_usage_target = self.scheduler._disagg_decode_full_usage_limits()[0]
+            staging_headroom_tokens = self.scheduler._disagg_decode_full_headroom_tokens(
+                full_usage_target
+            )[0]
+        else:
+            full_usage_target = 0.0
+        staging_reclaimable_tokens = (
+            self.scheduler._disagg_decode_full_evictable_tokens()
+            if self.scheduler.enable_hisparse
+            and hasattr(self.scheduler, "_disagg_decode_full_evictable_tokens")
+            else 0
+        )
+        log_fn = logger.warning if idle_admission_deadlock else logger.info
+        log_fn(
             "Decode prealloc admission limited: reason=%s, queue=%d, "
             "ready=%d, pending=%d, transfer=%d, running=%d, retracted=%d, "
             "req_slots=%d, req_slot_capacity=%d, req_slot_prealloc_capacity=%d, "
@@ -1006,6 +1110,8 @@ class DecodePreallocQueue:
             "c4_host_allocatable_tokens=%s, c4_host_required_tokens=%d, "
             "c4_host_reclaimable_tokens=%s, hisparse_req_budget=%s, "
             "eagle_draft_reserve_tokens=%d, "
+            "staging_full_tokens=%d, staging_headroom_tokens=%d, "
+            "staging_reclaimable_tokens=%d, full_usage_target=%.3f, "
             "hisparse_avail=%s, hisparse_padded_buffer_size=%s, "
             "hisparse_top_k=%s, hisparse_device_buffer_size=%s, "
             "max_running_requests=%s, idle_admission_deadlock=%s, "
@@ -1031,6 +1137,10 @@ class DecodePreallocQueue:
             c4_host_reclaimable_tokens,
             hisparse_req_budget,
             eagle_draft_reserve_tokens,
+            staging_full_tokens,
+            staging_headroom_tokens,
+            staging_reclaimable_tokens,
+            full_usage_target,
             hisparse_avail,
             getattr(coordinator, "padded_buffer_size", None),
             getattr(coordinator, "top_k", None),
@@ -1130,7 +1240,9 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        max_new_reqs: Optional[int] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._resolve_pending_reqs()
@@ -1211,9 +1323,6 @@ class DecodePreallocQueue:
                 c4_host_decode_reserve_tokens = (
                     self._dsv4_c4_host_decode_reserve_tokens()
                 )
-                self.scheduler.hisparse_coordinator.reclaim_dsv4_c4_host_prefix_cache(
-                    c4_host_decode_reserve_tokens
-                )
                 c4_host_allocatable_tokens = (
                     self.scheduler.hisparse_coordinator.mem_pool_host.available_size()
                     - c4_host_decode_reserve_tokens
@@ -1290,6 +1399,14 @@ class DecodePreallocQueue:
                             c4_host_prefix_len,
                             self._swa_tail_len(fill_len),
                             fill_len,
+                        )
+
+                    if prefix_len > 0:
+                        stats = self.scheduler._get_disagg_decode_pipeline_stats()
+                        stats.record_prefix_reuse_savings(
+                            safe_prefix_len=prefix_len,
+                            full_tokens_saved=prefix_len,
+                            c4_host_tokens_saved=c4_host_prefix_len or 0,
                         )
 
                 required_alloc_tokens = self._required_alloc_tokens(
@@ -1601,6 +1718,11 @@ class DecodePreallocQueue:
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            if (
+                max_new_reqs is not None
+                and len(preallocated_reqs) >= max_new_reqs
+            ):
+                break
 
         if blocked_reason is not None:
             self._maybe_log_prealloc_admission_blocked(
@@ -2423,6 +2545,221 @@ class SchedulerDisaggregationDecodeMixin:
     def _disagg_decode_target_backlog(self: Scheduler, target_bs: int) -> int:
         return min(16, max(4, target_bs // 4))
 
+    def _disagg_decode_logical_page_size(self: Scheduler) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        page_size = getattr(
+            allocator,
+            "logical_page_size",
+            getattr(allocator, "page_size", 1),
+        )
+        return max(1, int(page_size or 1))
+
+    def _disagg_decode_full_capacity_tokens(self: Scheduler) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        candidates = (
+            getattr(allocator, "logical_attn_allocator", None),
+            allocator,
+        )
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for attr in ("size_full", "_size_full", "size"):
+                value = getattr(candidate, attr, None)
+                if callable(value):
+                    value = value()
+                if value is not None:
+                    return max(1, int(value))
+        return max(
+            1,
+            self._disagg_decode_target_bs()
+            * self._disagg_decode_logical_page_size(),
+        )
+
+    def _disagg_decode_full_available_tokens(self: Scheduler) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        candidates = (
+            getattr(allocator, "logical_attn_allocator", None),
+            allocator,
+        )
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for method_name in ("full_available_size", "available_size"):
+                method = getattr(candidate, method_name, None)
+                if method is not None:
+                    return max(0, int(method()))
+        return self._disagg_decode_full_capacity_tokens()
+
+    def _disagg_decode_req_staging_full_tokens(self: Scheduler, req: Req) -> int:
+        allocated_len = int(getattr(req, "kv_allocated_len", 0) or 0)
+        protected_len = int(getattr(req, "cache_protected_len", 0) or 0)
+        tokens = max(0, allocated_len - protected_len)
+        if tokens == 0:
+            return 0
+        page_size = self._disagg_decode_logical_page_size()
+        return ((tokens + page_size - 1) // page_size) * page_size
+
+    def _disagg_decode_staging_full_tokens(self: Scheduler) -> int:
+        seen = set()
+        total = 0
+
+        def add_req(req: Req) -> None:
+            nonlocal total
+            key = getattr(req, "rid", None) or id(req)
+            if key in seen:
+                return
+            seen.add(key)
+            total += self._disagg_decode_req_staging_full_tokens(req)
+
+        for decode_req in self.disagg_decode_transfer_queue.queue:
+            add_req(decode_req.req)
+        for req in self.waiting_queue:
+            add_req(req)
+        return total
+
+    def _disagg_decode_full_usage_limits(self: Scheduler) -> Tuple[float, float]:
+        target = envs.SGLANG_HISPARSE_DECODE_FULL_USAGE_TARGET.get()
+        hard_limit = envs.SGLANG_HISPARSE_DECODE_FULL_USAGE_HARD_LIMIT.get()
+        target = min(max(float(target), 0.5), 0.995)
+        hard_limit = min(max(float(hard_limit), target), 0.999)
+        return target, hard_limit
+
+    def _disagg_decode_full_evictable_tokens(self: Scheduler) -> int:
+        method = getattr(self.tree_cache, "full_evictable_size", None)
+        if method is None:
+            return 0
+        try:
+            return max(0, int(method()))
+        except Exception:
+            return 0
+
+    def _disagg_decode_full_headroom_tokens(
+        self: Scheduler, usage_limit: float
+    ) -> Tuple[int, int]:
+        capacity = self._disagg_decode_full_capacity_tokens()
+        available = self._disagg_decode_full_available_tokens()
+        evictable = self._disagg_decode_full_evictable_tokens()
+        reserved_to_limit = max(0, capacity - int(capacity * usage_limit))
+        headroom = max(0, available + evictable - reserved_to_limit)
+        return headroom, evictable
+
+    def _disagg_decode_estimated_prealloc_full_tokens(self: Scheduler) -> int:
+        staging_full_tokens = self._disagg_decode_staging_full_tokens()
+        staged_reqs = len(self.disagg_decode_transfer_queue.queue) + len(
+            self.waiting_queue
+        )
+        page_size = self._disagg_decode_logical_page_size()
+        if staged_reqs > 0 and staging_full_tokens > 0:
+            return max(page_size, (staging_full_tokens + staged_reqs - 1) // staged_reqs)
+
+        capacity = self._disagg_decode_full_capacity_tokens()
+        target_bs = self._disagg_decode_target_bs()
+        per_req_cap = max(page_size, capacity // max(1, target_bs))
+        for decode_req in self.disagg_decode_prealloc_queue.queue:
+            if not decode_req.waiting_for_input:
+                continue
+            reserve = self.disagg_decode_prealloc_queue.num_reserved_decode_tokens
+            estimate = len(decode_req.req.origin_input_ids) + reserve
+            estimate = ((estimate + page_size - 1) // page_size) * page_size
+            return max(page_size, min(estimate, per_req_cap))
+        return page_size
+
+    def _disagg_decode_utilization_governor_decision(
+        self: Scheduler, *, target_bs: int, target_backlog: int
+    ) -> Tuple[bool, Optional[int], int, int, int, int, float, str, str]:
+        if not envs.SGLANG_HISPARSE_DECODE_UTILIZATION_GOVERNOR.get():
+            return False, None, 0, 0, 0, 0, 0.0, "disabled", "disabled"
+        if not self.enable_hisparse:
+            return False, None, 0, 0, 0, 0, 0.0, "non_hisparse", "non_hisparse"
+        if len(self.disagg_decode_prealloc_queue.queue) == 0:
+            return False, 0, 0, 0, 0, 0, 0.0, "no_prealloc", "no_prealloc"
+
+        running = self._disagg_decode_running_bs()
+        waiting = len(self.waiting_queue)
+        transfer = len(self.disagg_decode_transfer_queue.queue)
+        active_pipeline_reqs = running + waiting + transfer
+        pipeline_slots = max(0, target_bs + target_backlog - active_pipeline_reqs)
+        staging_full_tokens = self._disagg_decode_staging_full_tokens()
+        target, hard_limit = self._disagg_decode_full_usage_limits()
+        target_headroom, evictable = self._disagg_decode_full_headroom_tokens(target)
+        hard_headroom, _ = self._disagg_decode_full_headroom_tokens(hard_limit)
+
+        if hard_headroom <= 0:
+            action = (
+                "drain_staged_reqs"
+                if waiting + transfer > 0 and running < target_bs
+                else "hard_limit"
+            )
+            return (
+                True,
+                0,
+                staging_full_tokens,
+                target_headroom,
+                evictable,
+                hard_headroom,
+                target,
+                action,
+                "hard_limit",
+            )
+
+        if pipeline_slots <= 0:
+            # The backlog watermark is diagnostic only.  Do not throttle here:
+            # doing so can strand decode with low running BS while transfer /
+            # waiting requests are still draining.  Admission budgets below
+            # remain the authoritative safety checks.
+            return (
+                False,
+                None,
+                staging_full_tokens,
+                target_headroom,
+                evictable,
+                hard_headroom,
+                target,
+                "backlog_full_diagnostic",
+                "admit",
+            )
+
+        if target_headroom <= 0:
+            return (
+                False,
+                None,
+                staging_full_tokens,
+                target_headroom,
+                evictable,
+                hard_headroom,
+                target,
+                "above_target_diagnostic",
+                "admit",
+            )
+
+        per_req_estimate = self._disagg_decode_estimated_prealloc_full_tokens()
+        max_new_reqs = max(1, hard_headroom // max(1, per_req_estimate))
+        max_new_reqs = min(pipeline_slots, max_new_reqs)
+        if max_new_reqs <= 0:
+            return (
+                True,
+                0,
+                staging_full_tokens,
+                target_headroom,
+                evictable,
+                hard_headroom,
+                target,
+                "hard_headroom",
+                "no_hard_headroom",
+            )
+
+        return (
+            False,
+            max_new_reqs,
+            staging_full_tokens,
+            target_headroom,
+            evictable,
+            hard_headroom,
+            target,
+            "hard_headroom",
+            "admit",
+        )
+
     def _oldest_req_time_stat_age_ms(self: Scheduler, reqs, attr: str) -> float:
         now = time.perf_counter()
         oldest = 0.0
@@ -2729,6 +3066,7 @@ class SchedulerDisaggregationDecodeMixin:
         should_pop_prealloc = interval_due
         should_poll_transfer = interval_due
         stats = None
+        max_new_prealloc_reqs = None
 
         if self.enable_hisparse:
             stats = self._get_disagg_decode_pipeline_stats()
@@ -2742,13 +3080,43 @@ class SchedulerDisaggregationDecodeMixin:
             )
             should_pop_prealloc = interval_due or adaptive_prealloc
             should_poll_transfer = interval_due or adaptive_transfer
+            if should_pop_prealloc:
+                (
+                    staging_throttle,
+                    max_new_prealloc_reqs,
+                    staging_full_tokens,
+                    staging_headroom_tokens,
+                    staging_reclaimable_tokens,
+                    full_headroom_tokens,
+                    full_usage_target,
+                    governor_action,
+                    staging_skip_reason,
+                ) = self._disagg_decode_utilization_governor_decision(
+                    target_bs=target_bs,
+                    target_backlog=target_backlog,
+                )
+                stats.record_staging_diagnostics(
+                    staging_full_tokens=staging_full_tokens,
+                    staging_headroom_tokens=staging_headroom_tokens,
+                    staging_reclaimable_tokens=staging_reclaimable_tokens,
+                    full_headroom_tokens=full_headroom_tokens,
+                    full_usage_target=full_usage_target,
+                    max_new_prealloc_reqs=max_new_prealloc_reqs,
+                    governor_action=governor_action,
+                    throttle_active=staging_throttle,
+                    skip_reason=staging_skip_reason,
+                )
+                if staging_throttle:
+                    should_pop_prealloc = False
 
         if should_pop_prealloc or should_poll_transfer:
             if stats is not None:
                 stats.record_poll(interval_due=interval_due)
 
         if should_pop_prealloc:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                max_new_reqs=max_new_prealloc_reqs
+            )
             self.disagg_decode_transfer_queue.extend(req_conns)
             should_poll_transfer = should_poll_transfer or bool(req_conns)
 
