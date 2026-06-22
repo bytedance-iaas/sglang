@@ -662,9 +662,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
-        self._store_c128_partial_snapshot_for_req(
-            req, new_last_node, len(new_indices)
-        )
+        self._store_c128_partial_snapshot_for_req(req, new_last_node, len(new_indices))
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
