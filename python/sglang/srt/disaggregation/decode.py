@@ -1083,6 +1083,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
+                transfer_input_len=seq_len,
             )
             if (
                 self.transfer_queue.enable_staging

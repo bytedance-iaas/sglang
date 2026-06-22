@@ -271,11 +271,14 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        num_kv_indices = getattr(
-            req, "disagg_transfer_input_len", len(req.origin_input_ids)
-        )
-
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+        transfer_input_len = req.disagg_kv_sender.pop_transfer_input_len()
+        if transfer_input_len is None:
+            transfer_input_len = getattr(
+                req, "disagg_transfer_input_len", len(req.origin_input_ids)
+            )
+        req.disagg_transfer_input_len = transfer_input_len
+        num_kv_indices = transfer_input_len
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
