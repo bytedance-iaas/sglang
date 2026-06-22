@@ -59,20 +59,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
-    if not server_args.disable_radix_cache:
-        logger.warning(
-            "Radix cache is disabled for DeepSeekV4 because request-scoped C128 "
-            "state is not restored from radix-cached prefixes."
-        )
-        server_args.disable_radix_cache = True
-
-    if server_args.disaggregation_decode_enable_radix_cache:
-        logger.warning(
-            "PD decode radix cache is disabled for DeepSeekV4 because "
-            "request-scoped C128 state is not restored from radix-cached prefixes."
-        )
-        server_args.disaggregation_decode_enable_radix_cache = False
-
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
