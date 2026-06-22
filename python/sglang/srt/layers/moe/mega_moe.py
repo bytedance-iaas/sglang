@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
 _MEGA_MOE_STATE_LOGGED: set[str] = set()
+_DEEP_GEMM_MODULE = None
+_DEEP_GEMM_IMPORT_TRIED = False
 
 
 def _format_log_message(message: str, args: tuple) -> str:
@@ -107,10 +109,15 @@ def _handle_mega_moe_unavailable(
 
 
 def _try_import_deep_gemm():
+    global _DEEP_GEMM_MODULE, _DEEP_GEMM_IMPORT_TRIED
+    if _DEEP_GEMM_IMPORT_TRIED:
+        return _DEEP_GEMM_MODULE
+    _DEEP_GEMM_IMPORT_TRIED = True
     try:
         import deep_gemm
     except ImportError:
         return None
+    _DEEP_GEMM_MODULE = deep_gemm
     return deep_gemm
 
 
