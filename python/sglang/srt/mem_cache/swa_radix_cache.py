@@ -80,6 +80,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
+        self.c128_state_snapshot: Optional[List[torch.Tensor]] = None
+        self.c128_state_len: Optional[int] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -386,6 +388,63 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.swa_lru_list = LRUList(is_swa_list=True)
         self._record_all_cleared_event()
 
+    def _dsv4_kv_pool(self):
+        if self.token_to_kv_pool_allocator is None:
+            return None
+        get_kvcache = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return None
+        kv_pool = get_kvcache()
+        if not hasattr(kv_pool, "snapshot_c128_radix_state") or not hasattr(
+            kv_pool, "restore_c128_radix_state"
+        ):
+            return None
+        return kv_pool
+
+    def _snapshot_c128_state_for_req(
+        self, req: Req, seq_len: int
+    ) -> Optional[List[torch.Tensor]]:
+        kv_pool = self._dsv4_kv_pool()
+        if kv_pool is None or req.req_pool_idx is None or seq_len <= 0:
+            return None
+        return kv_pool.snapshot_c128_radix_state(int(req.req_pool_idx))
+
+    def _node_prefix_len(self, node: TreeNode) -> int:
+        prefix_len = 0
+        while node is not None and node is not self.root_node:
+            prefix_len += len(node.value)
+            node = node.parent
+        return prefix_len
+
+    def _find_c128_restorable_node(self, node: TreeNode) -> TreeNode:
+        if self._dsv4_kv_pool() is None:
+            return node
+        while (
+            node is not self.root_node
+            and (node.c128_state_snapshot is None or node.c128_state_len is None)
+        ):
+            node = node.parent
+        return node
+
+    def restore_c128_state_for_reqs(self, reqs: List[Req]) -> None:
+        kv_pool = self._dsv4_kv_pool()
+        if kv_pool is None:
+            return
+        for req in reqs:
+            if req.req_pool_idx is None:
+                continue
+            node = getattr(req, "last_node", self.root_node)
+            prefix_len = len(getattr(req, "prefix_indices", []))
+            if (
+                node is self.root_node
+                or node.c128_state_snapshot is None
+                or node.c128_state_len != prefix_len
+            ):
+                continue
+            kv_pool.restore_c128_radix_state(
+                int(req.req_pool_idx), node.c128_state_snapshot
+            )
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
@@ -468,6 +527,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     swa_evicted_seqlen=req.swa_evicted_seqlen,
                 )
             )
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            if len(match_result.device_indices) == page_aligned_len:
+                last_node = match_result.last_device_node
+                snapshot = self._snapshot_c128_state_for_req(req, page_aligned_len)
+                if snapshot is not None:
+                    last_node.c128_state_snapshot = snapshot
+                    last_node.c128_state_len = page_aligned_len
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len]
@@ -551,6 +617,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
+        snapshot = self._snapshot_c128_state_for_req(req, len(new_indices))
+        if snapshot is not None:
+            new_last_node.c128_state_snapshot = snapshot
+            new_last_node.c128_state_len = len(new_indices)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -960,6 +1030,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
+        if params.req is not None and len(value) > 0:
+            last_node = self._find_c128_restorable_node(last_node)
+            c128_prefix_len = self._node_prefix_len(last_node)
+            if c128_prefix_len < len(value):
+                value = value[:c128_prefix_len]
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -997,6 +1073,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 is_bigram=node.key.is_bigram,
             )
             node.value = torch.cat([node.value, child.value])
+            node.c128_state_snapshot = child.c128_state_snapshot
+            node.c128_state_len = child.c128_state_len
             node.children = child.children
             for grandchild in node.children.values():
                 grandchild.parent = node
