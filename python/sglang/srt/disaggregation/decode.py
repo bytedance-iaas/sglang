@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    filter_kv_indices_for_dcp_rank,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce,
@@ -1105,6 +1106,18 @@ class DecodePreallocQueue:
                 )
                 page_size = self.token_to_kv_pool_allocator.page_size
 
+            # DCP: ``req_to_token`` (and the hisparse host pool too, when
+            # used as the RDMA destination) stores cluster-wide global
+            # token loc. The transfer layer addresses GPU buffers using
+            # per-rank physical offsets, so convert before
+            # ``kv_to_page_indices``. No-op when dcp_size == 1.
+            dcp_size_local = getattr(self.kv_manager, "dcp_size", 1) or 1
+            dcp_rank_local = getattr(self.kv_manager, "dcp_rank", 0) or 0
+            if dcp_size_local > 1:
+                kv_indices = filter_kv_indices_for_dcp_rank(
+                    kv_indices, dcp_size_local, dcp_rank_local
+                )
+
             seq_len = len(decode_req.req.origin_input_ids)
 
             def _mamba_payload():
@@ -1159,6 +1172,11 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            if dcp_size_local > 1:
+                # DCP rerouting: send rank-local token-loc array unchanged
+                # so the transfer backend can issue token-level RDMA. See
+                # the matching comment in disaggregation/prefill.py.
+                page_indices = kv_indices
             if (
                 self._uses_dsv4_decode_radix_cache()
                 and envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get()
