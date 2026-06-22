@@ -113,14 +113,21 @@ def main(args):
 
     import sglang as sgl
 
+    gen_kwargs = dict(
+        max_tokens=args.max_new_tokens,
+        stop=["Question", "Assistant:", "<|separator|>"],
+    )
+    if args.dump_logprobs:
+        gen_kwargs.update(
+            return_logprob=True,
+            top_logprobs_num=args.top_logprobs,
+            return_text_in_logprobs=True,
+        )
+
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += question
-        s += sgl.gen(
-            "answer",
-            max_tokens=args.max_new_tokens,
-            stop=["Question", "Assistant:", "<|separator|>"],
-        )
+        s += sgl.gen("answer", **gen_kwargs)
 
     #####################################
     ########## SGL Program End ##########
@@ -183,6 +190,42 @@ def main(args):
                 fout.write("\n--- end q{}\n\n".format(idx))
         print(f"Per-question answers dumped to {answers_path}")
 
+    if args.dump_logprobs:
+        # Per-step token + top-K logprobs dump for diff'ing two runs (e.g.
+        # CP=1 vs CP=2). Each line is one decode step:
+        #   q<idx> step=<i> picked=<token_id> "<text>" lp=<logprob>
+        #     top: [(token_id, "text", logprob), ...]
+        # Diff'ing two such files (e.g. tmp_logprobs_srt_cp1.txt vs
+        # tmp_logprobs_srt_cp2.txt) lands you on the first divergent token
+        # and immediately shows the top-K next-token distribution at that
+        # step on both sides, which makes attention-retrieval bugs (where
+        # one side's top-1 swaps to a different surface form like
+        # "60" vs "80") visible in seconds.
+        logprobs_path = f"tmp_logprobs_{args.backend}{suffix}.txt"
+        with open(logprobs_path, "w") as fout:
+            for idx, state in zip(target_indices, states):
+                meta = state.get_meta_info("answer") or {}
+                token_lp = meta.get("output_token_logprobs") or []
+                top_lp = meta.get("output_top_logprobs") or []
+                fout.write(
+                    f"=== q{idx} steps={len(token_lp)} top_k={args.top_logprobs}\n"
+                )
+                for step, picked in enumerate(token_lp):
+                    p_lp, p_id, p_txt = picked
+                    p_txt_repr = repr(p_txt)
+                    fout.write(
+                        f"q{idx} step={step} picked={p_id} {p_txt_repr} "
+                        f"lp={p_lp:.6f}\n"
+                    )
+                    if step < len(top_lp) and top_lp[step]:
+                        for t_lp, t_id, t_txt in top_lp[step]:
+                            t_txt_repr = repr(t_txt)
+                            fout.write(
+                                f"    top: {t_id} {t_txt_repr} lp={t_lp:.6f}\n"
+                            )
+                fout.write(f"=== end q{idx}\n\n")
+        print(f"Per-step logprobs dumped to {logprobs_path}")
+
     dump_bench_raw_result(
         path=args.raw_result_file,
         states=states,
@@ -231,6 +274,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Also dump a per-question answer text + sha1 hash file "
         "(tmp_answers_<backend><suffix>.txt) for easy diff between runs.",
+    )
+    parser.add_argument(
+        "--dump-logprobs",
+        action="store_true",
+        help="Also dump per-step picked-token + top-K logprobs to "
+        "tmp_logprobs_<backend><suffix>.txt for diff'ing two runs to "
+        "locate the first divergent decode step.",
+    )
+    parser.add_argument(
+        "--top-logprobs",
+        type=int,
+        default=10,
+        help="K for --dump-logprobs (top-K next-token distribution per step).",
     )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
