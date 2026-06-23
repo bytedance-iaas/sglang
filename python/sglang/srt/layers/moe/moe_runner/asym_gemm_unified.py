@@ -162,28 +162,51 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
     _maybe_warm_bf16_fallback_kernels(w13.shape[0], w13.shape[2], inter)
 
 
+# Largest decode batch the capturable (all-CPU) path pre-allocates and captures.
+# Above this the eager path's GPU expert offload wins, so leave those batches to
+# eager by keeping --cuda-graph-max-bs <= this value. Capture batch sizes beyond
+# this raise a clear error in unified_asym_gemm_forward.
+CAPTURE_MAX_BS = 64
+
+
 def _maybe_init_capturable_decode(unified_layer) -> None:
-    """Pre-allocate the CUDA-graph-capturable single-token decode buffers.
+    """Pre-allocate the CUDA-graph-capturable decode buffers.
 
     The capturable path expresses the CPU MoE bucket as a stream-ordered
     cudaLaunchHostFunc host node over fixed pinned buffers, so the decode graph
-    captures/replays without --disable-cuda-graph. Scope is the all-CPU T=1
-    regime (SUPPORTED_BATCH); other batch sizes still fall back to the BF16
-    masters under capture. Allocating here (outside capture) is required — the
-    host node and buffers must exist before any graph records them. Capture only
-    batch size 1 (launch with --cuda-graph-bs 1) so every captured graph is
-    supported.
+    captures/replays without --disable-cuda-graph. It is all-CPU for any batch
+    size; we pre-allocate for the CUDA-graph capture batch sizes (server_args
+    .cuda_graph_bs) up to CAPTURE_MAX_BS. Allocating here (outside capture) is
+    required — the host node and buffers must exist before any graph records
+    them. Launch with --cuda-graph-max-bs <= CAPTURE_MAX_BS so every captured
+    graph is supported; larger batches are left to the eager path.
     """
     try:
-        from asym_gemm.unified_moe.capturable import (
-            SUPPORTED_BATCH,
-            init_capturable_decode,
-        )
+        from asym_gemm.unified_moe.capturable import init_capturable_decode
     except Exception as e:  # pragma: no cover - capturable path optional
         logger.warning("AsymGEMM unified MoE: capturable decode unavailable (%s)", e)
         return
+
+    from sglang.srt.server_args import get_global_server_args
+
     try:
-        init_capturable_decode(unified_layer, list(SUPPORTED_BATCH))
+        server_args = get_global_server_args()
+    except ValueError:
+        server_args = None
+    if server_args is not None and getattr(server_args, "disable_cuda_graph", False):
+        return  # CUDA graph disabled — nothing to capture
+
+    batch_sizes = None
+    if server_args is not None:
+        batch_sizes = getattr(server_args, "cuda_graph_bs", None)
+    if not batch_sizes:
+        batch_sizes = [1]
+    batch_sizes = sorted({int(b) for b in batch_sizes if 1 <= int(b) <= CAPTURE_MAX_BS})
+    if not batch_sizes:
+        batch_sizes = [1]
+
+    try:
+        init_capturable_decode(unified_layer, batch_sizes)
     except Exception as e:  # pragma: no cover
         logger.warning(
             "AsymGEMM unified MoE: capturable decode init failed (%s); "
@@ -309,9 +332,9 @@ def unified_asym_gemm_forward(
             raise RuntimeError(
                 "AsymGEMM unified MoE: CUDA graph capture at batch size "
                 f"{T} is not supported by the capturable decode path "
-                "(supported sizes are pre-allocated from SUPPORTED_BATCH). "
-                "Launch with --cuda-graph-bs 1 so only batch size 1 is "
-                "captured, or --disable-cuda-graph."
+                f"(pre-allocated up to CAPTURE_MAX_BS={CAPTURE_MAX_BS}). "
+                f"Launch with --cuda-graph-max-bs {CAPTURE_MAX_BS} (or lower) "
+                "so larger batches use the eager path, or --disable-cuda-graph."
             )
         output = capturable_decode_forward(unified_layer, x, expert_ids, route_w)
     else:
