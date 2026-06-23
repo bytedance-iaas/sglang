@@ -1927,6 +1927,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        decode_c4_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
