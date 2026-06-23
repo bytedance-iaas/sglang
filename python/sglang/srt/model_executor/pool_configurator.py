@@ -333,22 +333,39 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, mr: ModelRunner):
         cfg = mr.model_config
+        server_args = mr.server_args
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.compression_ratios = cfg.compress_ratios
         self.swa_page_size = cfg.window_size
-        self.swa_ratio = mr.server_args.swa_full_tokens_ratio
-        self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.swa_ratio = server_args.swa_full_tokens_ratio
+        self.is_speculative = server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
-            mr.server_args.max_speculative_num_draft_tokens or 0
+            getattr(server_args, "max_speculative_num_draft_tokens", None)
+            or server_args.speculative_num_draft_tokens
+            or 0
         )
+        self.enable_hisparse = mr.enable_hisparse
+        self.context_len = cfg.context_len
+        self.extra_context_len = 4 + int(server_args.speculative_num_draft_tokens or 0)
+        self.dp_size = mr.dp_size
+        self.disaggregation_mode = server_args.disaggregation_mode
+        self.max_running_requests = server_args.max_running_requests
+        self.hisparse_top_k = 0
+        self.hisparse_device_buffer_size = 0
         if mr.enable_hisparse:
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+            from sglang.srt.mem_cache.sparsity import (
+                parse_hisparse_config,
+                resolve_hisparse_top_k,
+            )
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                mr.server_args
-            ).host_to_device_ratio
+            hisparse_cfg = parse_hisparse_config(server_args)
+            self.c4_shrink_factor = hisparse_cfg.host_to_device_ratio
+            self.hisparse_top_k = resolve_hisparse_top_k(
+                server_args, cfg.hf_text_config
+            )
+            self.hisparse_device_buffer_size = hisparse_cfg.device_buffer_size
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -372,18 +389,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 
-        # Online c128 keeps a single in-progress (max, sum, kv) state per index
-        # and assumes a strict forward-only schedule. Speculative decode (MTP)
-        # would need rollback / replay across draft and verify, which the
-        # online path doesn't support yet.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             allow_experimental_online_c128_mtp = (
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
                 and mr.spec_algorithm.is_eagle()
             )
             assert mr.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
-                "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
-                "(MTP) yet, except the experimental EAGLE topk=1 path gated by "
+                "Online C128 speculative decode requires the experimental "
+                "EAGLE topk=1 path gated by "
                 "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
             )
             if allow_experimental_online_c128_mtp:
@@ -392,10 +405,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "speculative_num_draft_tokens to be set."
                 )
                 logger.warning(
-                    "DSV4 compressed attention: experimental online c128 + MTP enabled "
-                    f"(EAGLE topk=1 only, "
-                    f"draft_banks={self.online_c128_mtp_max_draft_tokens}). "
-                    "Validate correctness carefully."
+                    "DSV4 compressed attention: experimental online c128 + MTP "
+                    "enabled (EAGLE topk=1 only, draft_banks=%d). "
+                    "Validate correctness carefully.",
+                    self.online_c128_mtp_max_draft_tokens,
                 )
             else:
                 logger.info(
@@ -429,11 +442,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # C128 stores one raw state row per full token; online C128 stores one
         # running state per 128-token chunk.
         c128_state_ratio = 1 / 128 if c128_online else 1
-        if c128_online and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+        if (
+            c128_online
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            and self.online_c128_mtp_max_draft_tokens > 0
+        ):
             c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
-        return (
+        bytes_per_full_token = (
             self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
@@ -445,6 +462,63 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * c4_indexer_state_bytes
             * self.num_layers_ca4
         )
+        if self.enable_hisparse:
+            # HiSparse maps every C4 logical slot back to a hot-buffer device
+            # slot.  That mapping scales with full-token capacity and is
+            # allocated after the base DSV4 pools, so include it in the token
+            # coefficient instead of over-allocating the token pool and OOMing
+            # during coordinator/allocator setup.
+            bytes_per_full_token += 8 / 4
+            bytes_per_full_token += 1 / max(1, self.swa_page_size)
+        return bytes_per_full_token
+
+    def _estimate_hisparse_req_slots(self) -> int:
+        max_num_reqs = self.max_running_requests
+        if max_num_reqs is not None:
+            max_num_reqs = max(1, int(max_num_reqs) // max(1, int(self.dp_size)))
+        else:
+            # Matches the lower bound used by ModelRunnerKVCacheMixin when the
+            # final token capacity is not known yet.
+            max_num_reqs = 2048
+
+        pre_alloc_size = 0
+        if self.disaggregation_mode == "decode":
+            pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+            if max_num_reqs <= 32:
+                pre_alloc_size = max_num_reqs * 2
+            elif pre_alloc_size == 0 and self.enable_hisparse:
+                pre_alloc_size = max_num_reqs
+
+        return max_num_reqs + int(pre_alloc_size) + 1
+
+    def _estimate_hisparse_fixed_overhead_bytes(self, page_size: int) -> int:
+        if not self.enable_hisparse:
+            return 0
+
+        req_slots = self._estimate_hisparse_req_slots()
+        c4_page_size = max(1, page_size // 4)
+        padded_buffer_size = self.hisparse_device_buffer_size + c4_page_size
+        max_context_len = self.context_len + self.extra_context_len
+        max_compressed_context_len = (max_context_len + 3) // 4
+        c4_layers = self.num_layers_ca4
+
+        int64_bytes = 8
+        int32_bytes = 4
+        int16_bytes = 2
+        uint64_bytes = 8
+
+        overhead = 0
+        overhead += req_slots * max_context_len * int32_bytes
+        overhead += req_slots * padded_buffer_size * int64_bytes
+        overhead += req_slots * (max_compressed_context_len + 1) * int64_bytes
+        overhead += 2 * c4_layers * req_slots * padded_buffer_size * int32_bytes
+        overhead += c4_layers * req_slots * self.hisparse_device_buffer_size * int16_bytes
+        overhead += self.hisparse_device_buffer_size * int16_bytes
+        overhead += padded_buffer_size * int32_bytes
+        overhead += 2 * req_slots * self.hisparse_top_k * int32_bytes
+        overhead += c4_layers * uint64_bytes
+        overhead += (c4_page_size + 1) * int64_bytes
+        return int(overhead)
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
@@ -487,14 +561,49 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
-        full_token = int(available_bytes / self.bytes_per_full_token)
-        sizes = self._compute_dsv4_sizes(full_token, page_size)
-        logger.info(
-            f"DSV4 memory calculation: "
-            f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
-            f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
-            f"full_token={sizes.full_max_total_num_tokens}"
+        hisparse_fixed_overhead_bytes = self._estimate_hisparse_fixed_overhead_bytes(
+            page_size
         )
+        effective_available_bytes = available_bytes - hisparse_fixed_overhead_bytes
+        if effective_available_bytes <= 0:
+            logger.warning(
+                "DSV4 HiSparse fixed overhead exceeds available KV pool bytes: "
+                "raw_available_bytes=%.2f GB, hisparse_fixed_overhead=%.2f GB. "
+                "Clamping effective pool bytes to zero; lower mem_fraction_static, "
+                "max_running_requests, top_k, or device_buffer_size.",
+                available_bytes / (1 << 30),
+                hisparse_fixed_overhead_bytes / (1 << 30),
+            )
+            effective_available_bytes = 0
+        full_token = int(effective_available_bytes / self.bytes_per_full_token)
+        sizes = self._compute_dsv4_sizes(full_token, page_size)
+        if hisparse_fixed_overhead_bytes > 0:
+            logger.info(
+                "DSV4 memory calculation: "
+                "bytes_per_full_token=%.2f, raw_available_bytes=%.2f GB, "
+                "hisparse_fixed_overhead=%.2f GB, effective_available_bytes=%.2f GB, "
+                "full_token=%d, c4_shrink_factor=%s, req_slots=%d, "
+                "padded_buffer_size=%d, top_k=%d, device_buffer_size=%d, "
+                "online_c128_mtp_max_draft_tokens=%d",
+                self.bytes_per_full_token,
+                available_bytes / (1 << 30),
+                hisparse_fixed_overhead_bytes / (1 << 30),
+                effective_available_bytes / (1 << 30),
+                sizes.full_max_total_num_tokens,
+                self.c4_shrink_factor,
+                self._estimate_hisparse_req_slots(),
+                self.hisparse_device_buffer_size + max(1, page_size // 4),
+                self.hisparse_top_k,
+                self.hisparse_device_buffer_size,
+                self.online_c128_mtp_max_draft_tokens,
+            )
+        else:
+            logger.info(
+                f"DSV4 memory calculation: "
+                f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
+                f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
+                f"full_token={sizes.full_max_total_num_tokens}"
+            )
         return self._to_config(sizes)
 
     def calculate_pool_sizes_from_max_tokens(
