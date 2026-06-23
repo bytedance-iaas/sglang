@@ -12,15 +12,15 @@ on:
         required: true
         type: string
       cuda_key:
-        description: "Logical CUDA tag key, e.g. cu129 or cu130"
+        description: "Logical CUDA tag key, e.g. cu130"
         required: false
         type: string
-        default: "cu129"
+        default: "cu130"
       cuda_version:
         description: "CUDA_VERSION build arg"
         required: false
         type: string
-        default: "12.9.1"
+        default: "13.0.1"
       sgl_version:
         description: "Version string passed as SGL_VERSION build arg"
         required: false

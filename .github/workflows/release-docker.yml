@@ -3,8 +3,7 @@ name: Release Docker Images
 # Builds and publishes framework Docker images to Volcengine CR:
 #   - v{sglang}.byted.{internal_release}.{timestamp} (CUDA 13)
 #   - v{sglang}.byted.{internal_release}.{timestamp}-cu130
-#   - v{sglang}.byted.{internal_release}.{timestamp}-cu129
-#   - v{sglang}.byted.{internal_release}.{timestamp}-{sbo,w4a8}[-cu130|-cu129]
+#   - v{sglang}.byted.{internal_release}.{timestamp}-{sbo,w4a8}[-cu130]
 #
 on:
   push:
@@ -52,8 +51,7 @@ jobs:
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
       tag_config: |
         [
-          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest", "v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]},
-          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129", "latest-cu129"]}
+          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest", "v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]}
         ]
     secrets: inherit
 
@@ -115,27 +113,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda_key: cu129
-            cuda_version: 12.9.1
-            cuda_suffix: cu129
-            publish_default_cuda_alias: false
-            hopper_sbo: 0
-            w4a8_per_tensor_transfer: 0
-            variant_suffix: ""
-          - cuda_key: cu129
-            cuda_version: 12.9.1
-            cuda_suffix: cu129
-            publish_default_cuda_alias: false
-            hopper_sbo: 1
-            w4a8_per_tensor_transfer: 0
-            variant_suffix: sbo
-          - cuda_key: cu129
-            cuda_version: 12.9.1
-            cuda_suffix: cu129
-            publish_default_cuda_alias: false
-            hopper_sbo: 0
-            w4a8_per_tensor_transfer: 1
-            variant_suffix: w4a8
           - cuda_key: cu130
             cuda_version: 13.0.1
             cuda_suffix: cu130

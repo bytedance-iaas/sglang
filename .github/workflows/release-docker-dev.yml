@@ -61,14 +61,12 @@ jobs:
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
-          # Build tag config. dev-cu13 / nightly-dev-cu13 are published as
-          # aliases on the cu130 image for backwards compatibility with
-          # consumers pinned to the pre-flip names.
+          # Build tag config. Development images are CUDA 13 only.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
@@ -89,7 +87,7 @@ jobs:
     if: ${{ github.repository == 'sgl-project/sglang' && !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 
@@ -99,8 +97,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch_tag: x86
-            cuda_version: "12.9"
           - arch_tag: x86-cu13
             cuda_version: "13.0"
     uses: ./.github/workflows/release-whl-kernel.yml
@@ -116,30 +112,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda_key: cu129
-            cuda_version: 12.9.1
-            cuda_suffix: cu129
-            publish_default_cuda_alias: false
-            hopper_sbo: 0
-            w4a8_per_tensor_transfer: 0
-            variant_suffix: ""
-            artifact_name: sgl-kernel-x86
-          - cuda_key: cu129
-            cuda_version: 12.9.1
-            cuda_suffix: cu129
-            publish_default_cuda_alias: false
-            hopper_sbo: 1
-            w4a8_per_tensor_transfer: 0
-            variant_suffix: sbo
-            artifact_name: sgl-kernel-x86
-          - cuda_key: cu129
-            cuda_version: 12.9.1
-            cuda_suffix: cu129
-            publish_default_cuda_alias: false
-            hopper_sbo: 0
-            w4a8_per_tensor_transfer: 1
-            variant_suffix: w4a8
-            artifact_name: sgl-kernel-x86
           - cuda_key: cu130
             cuda_version: 13.0.1
             cuda_suffix: cu130
