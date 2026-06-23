@@ -409,6 +409,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states_device = running_state["hidden_states_device"]
 
+        if expected_m is not None and expected_m <= 0:
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            return torch.empty(
+                (num_groups, m, w2_weight.shape[1]),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+
         # GroupGemm-0
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not is_fp4_experts:
             if hidden_states_scale.dtype != torch.int:
@@ -593,8 +602,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states_device = running_state["hidden_states_device"]
 
-        # GroupGemm-0
         num_groups, m, k = hidden_states.shape
+        if expected_m is not None and expected_m <= 0:
+            dispose_tensor(hidden_states)
+            return torch.empty(
+                (num_groups, m, w2_weight.shape[1]),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+
+        # GroupGemm-0
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
