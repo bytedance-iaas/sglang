@@ -88,6 +88,7 @@ def match_prefix_for_req(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    ignore_component_types=(),
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
@@ -95,6 +96,7 @@ def match_prefix_for_req(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            ignore_component_types=ignore_component_types,
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
