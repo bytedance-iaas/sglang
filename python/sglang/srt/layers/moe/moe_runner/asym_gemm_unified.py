@@ -158,7 +158,38 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
         inter,
         unified_layer.m_cpu,
     )
+    _maybe_init_capturable_decode(unified_layer)
     _maybe_warm_bf16_fallback_kernels(w13.shape[0], w13.shape[2], inter)
+
+
+def _maybe_init_capturable_decode(unified_layer) -> None:
+    """Pre-allocate the CUDA-graph-capturable single-token decode buffers.
+
+    The capturable path expresses the CPU MoE bucket as a stream-ordered
+    cudaLaunchHostFunc host node over fixed pinned buffers, so the decode graph
+    captures/replays without --disable-cuda-graph. Scope is the all-CPU T=1
+    regime (SUPPORTED_BATCH); other batch sizes still fall back to the BF16
+    masters under capture. Allocating here (outside capture) is required — the
+    host node and buffers must exist before any graph records them. Capture only
+    batch size 1 (launch with --cuda-graph-bs 1) so every captured graph is
+    supported.
+    """
+    try:
+        from asym_gemm.unified_moe.capturable import (
+            SUPPORTED_BATCH,
+            init_capturable_decode,
+        )
+    except Exception as e:  # pragma: no cover - capturable path optional
+        logger.warning("AsymGEMM unified MoE: capturable decode unavailable (%s)", e)
+        return
+    try:
+        init_capturable_decode(unified_layer, list(SUPPORTED_BATCH))
+    except Exception as e:  # pragma: no cover
+        logger.warning(
+            "AsymGEMM unified MoE: capturable decode init failed (%s); "
+            "captured graphs will use the BF16 fallback path",
+            e,
+        )
 
 
 _warmed_fallback_shapes = set()
@@ -206,10 +237,16 @@ def should_use_unified_asym_gemm_forward(layer: torch.nn.Module) -> bool:
     """Early-return guard for UnquantizedFusedMoEMethod.forward_cuda."""
     if not has_unified_asym_gemm_layer(layer):
         return False
-    # The CPU bucket does host-side work and device syncs, which cannot be
-    # captured into a CUDA graph. Fall back to the existing asym_gemm path
-    # (the BF16 masters are kept for exactly this) instead of crashing.
+    # Under CUDA graph capture the imperative CPU bucket (host work + device
+    # syncs) is illegal. If the capturable single-token decode path is
+    # initialized for this layer, take over capture with it (it records the CPU
+    # MoE as a cudaLaunchHostFunc host node over fixed pinned buffers). Else
+    # fall back to the existing BF16 asym_gemm path (the masters are kept for
+    # exactly this) instead of crashing.
     if torch.cuda.is_current_stream_capturing():
+        unified_layer = getattr(layer, _UNIFIED_LAYER_ATTR)
+        if getattr(unified_layer, "_capturable", None):
+            return True
         global _warned_graph_capture
         if not _warned_graph_capture:
             _warned_graph_capture = True
@@ -254,11 +291,37 @@ def unified_asym_gemm_forward(
     )
 
     unified_layer = getattr(layer, _UNIFIED_LAYER_ATTR)
-    output = unified_layer.forward(x, expert_ids, route_w)
+
+    # Under CUDA graph capture, route through the capturable host-node chain
+    # (D2H -> cudaLaunchHostFunc(CPU MoE) -> H2D over fixed pinned buffers) so
+    # the decode step records into the graph. The imperative forward's host
+    # work / device syncs would be illegal mid-capture. Only batch sizes in
+    # SUPPORTED_BATCH are capturable; capture must be limited to those
+    # (launch with --cuda-graph-bs 1).
+    if torch.cuda.is_current_stream_capturing():
+        from asym_gemm.unified_moe.capturable import (
+            capturable_decode_forward,
+            capturable_decode_supported,
+        )
+
+        T = x.shape[0]
+        if not capturable_decode_supported(unified_layer, T):
+            raise RuntimeError(
+                "AsymGEMM unified MoE: CUDA graph capture at batch size "
+                f"{T} is not supported by the capturable decode path "
+                "(supported sizes are pre-allocated from SUPPORTED_BATCH). "
+                "Launch with --cuda-graph-bs 1 so only batch size 1 is "
+                "captured, or --disable-cuda-graph."
+            )
+        output = capturable_decode_forward(unified_layer, x, expert_ids, route_w)
+    else:
+        output = unified_layer.forward(x, expert_ids, route_w)
 
     routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
     if routed_scaling_factor is not None:
-        output *= routed_scaling_factor
+        # Out-of-place: the capturable path returns a fixed per-layer device
+        # buffer that must not be mutated in place under graph replay.
+        output = output * routed_scaling_factor
     if output.dtype != hidden_states.dtype:
         output = output.to(hidden_states.dtype)
     return StandardCombineInput(hidden_states=output)
