@@ -226,6 +226,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components.values()
         )
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
+        self._last_detached_lock_node_log_time = 0.0
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -258,6 +259,76 @@ class UnifiedRadixCache(BasePrefixCache):
         changing generic radix behavior.
         """
         self.hisparse_mode = True
+
+    def _find_detached_lock_node(self, node: Any) -> Optional[Any]:
+        """Return the first node proving this lock path is detached.
+
+        Unified cache component unlockers assume the request's last_node still
+        has a parent chain that reaches this cache's root. Decode-side
+        retract/finish paths can hand back a stale node from an older tree state;
+        detect that once at the public dec_lock_ref boundary instead of letting
+        individual components crash while walking parent pointers.
+        """
+        if node is None:
+            return None
+        if node is self.root_node:
+            return None
+
+        cur = node
+        visited: set[int] = set()
+        while cur is not self.root_node:
+            if cur is None:
+                return None
+            cur_identity = id(cur)
+            if cur_identity in visited:
+                return cur
+            visited.add(cur_identity)
+            parent = getattr(cur, "parent", None)
+            if parent is None:
+                return cur
+            cur = parent
+        return None
+
+    def _maybe_log_detached_lock_node(
+        self,
+        node: Any,
+        detached_node: Any,
+        debug_context: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if node is None or detached_node is None:
+            return
+        now = time.monotonic()
+        if now - self._last_detached_lock_node_log_time < 30.0:
+            return
+        self._last_detached_lock_node_log_time = now
+
+        context = debug_context or {}
+        component_lock_refs = {}
+        component_data = getattr(detached_node, "component_data", None)
+        if component_data is not None:
+            for component_type in self.tree_components:
+                try:
+                    component_lock_refs[component_type.name] = component_data[
+                        component_type
+                    ].lock_ref
+                except Exception:
+                    component_lock_refs[component_type.name] = "unavailable"
+
+        logger.error(
+            "UnifiedRadixCache skipping dec_lock_ref for detached node: "
+            "op=%s, rid=%s, is_insert=%s, finished_reason=%s, node_id=%s, "
+            "detached_node_id=%s, detached_parent_id=%s, root_id=%s, "
+            "component_lock_refs=%s",
+            context.get("op", "dec_lock_ref"),
+            context.get("rid"),
+            context.get("is_insert"),
+            context.get("finished_reason"),
+            getattr(node, "id", None),
+            getattr(detached_node, "id", None),
+            getattr(getattr(detached_node, "parent", None), "id", None),
+            getattr(self.root_node, "id", None),
+            component_lock_refs,
+        )
 
     def reset(self) -> None:
         self._reset_full()
@@ -428,13 +499,24 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
+        self,
+        node: Any,
+        params: Optional[DecLockRefParams] = None,
+        *,
+        debug_context: Optional[dict[str, Any]] = None,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
             return result
-        if self.disable:
+        if self.disable or node is None:
             return DecLockRefResult()
+        if debug_context is not None:
+            detached_node = self._find_detached_lock_node(node)
+            if detached_node is not None:
+                self._maybe_log_detached_lock_node(
+                    node, detached_node, debug_context
+                )
+                return DecLockRefResult()
         for component in self._components_tuple:
             component.release_component_lock(node=node, params=params)
 
@@ -516,6 +598,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            debug_context={
+                "op": "cache_finished_req",
+                "rid": getattr(req, "rid", None),
+                "is_insert": is_insert,
+                "finished_reason": getattr(req, "finished_reason", None),
+            },
         )
 
         # cleanup
@@ -606,6 +694,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            debug_context={
+                "op": "cache_unfinished_req",
+                "rid": getattr(req, "rid", None),
+                "is_insert": None,
+                "finished_reason": getattr(req, "finished_reason", None),
+            },
         )
         lock_result = self.inc_lock_ref(new_last_node)
 

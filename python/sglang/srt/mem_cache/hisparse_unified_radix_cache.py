@@ -244,10 +244,21 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         return IncLockRefResult(delta=0)
 
     def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
+        self,
+        node: Any,
+        params: Optional[DecLockRefParams] = None,
+        *,
+        debug_context: Optional[dict[str, Any]] = None,
     ) -> DecLockRefResult:
         if self.disable or node is None:
             return DecLockRefResult(delta=0)
+        if debug_context is not None:
+            detached_node = self._find_detached_lock_node(node)
+            if detached_node is not None:
+                self._maybe_log_detached_lock_node(
+                    node, detached_node, debug_context
+                )
+                return DecLockRefResult(delta=0)
         while node is not self.root_node:
             cd = node.component_data[BASE_COMPONENT_TYPE]
             if cd.host_value is not None:
@@ -263,7 +274,15 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
-        self.dec_lock_ref(req.last_node)
+        self.dec_lock_ref(
+            req.last_node,
+            debug_context={
+                "op": "hisparse_cache_finished_req",
+                "rid": getattr(req, "rid", None),
+                "is_insert": is_insert,
+                "finished_reason": getattr(req, "finished_reason", None),
+            },
+        )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         kv_indices = self.req_to_token_pool.req_to_token[
