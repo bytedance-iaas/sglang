@@ -518,6 +518,12 @@ class DecodePreallocQueue:
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _running_reqs(self) -> List[Req]:
+        running_batch = getattr(self.scheduler, "running_batch", None)
+        if running_batch is None:
+            return []
+        return running_batch.reqs
+
     def _uses_dsv4_decode_radix_cache(self) -> bool:
         return (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
@@ -563,7 +569,7 @@ class DecodePreallocQueue:
         ]
         inflight_reqs.extend(
             req
-            for req in self.scheduler.running_batch.reqs
+            for req in self._running_reqs()
             if getattr(req, "dsv4_decode_radix_cache_prompt_once", False)
         )
         inflight_reqs.extend(
@@ -879,7 +885,7 @@ class DecodePreallocQueue:
             return 0
 
         reqs: List[Req] = []
-        reqs.extend(self.scheduler.running_batch.reqs)
+        reqs.extend(self._running_reqs())
         reqs.extend(decode_req.req for decode_req in self.transfer_queue.queue)
         reqs.extend(self.scheduler.waiting_queue)
         if extra_decode_reqs:
@@ -1297,7 +1303,7 @@ class DecodePreallocQueue:
         self.scheduler._last_disagg_decode_prealloc_block_reason = reason
         self.scheduler._last_disagg_decode_prealloc_block_time = now
         ready_reqs = sum(1 for req in self.queue if req.waiting_for_input)
-        running_reqs = len(self.scheduler.running_batch.reqs)
+        running_reqs = len(self._running_reqs())
         transfer_reqs = len(self.transfer_queue.queue)
         idle_admission_deadlock = (
             ready_reqs > 0 and running_reqs == 0 and transfer_reqs == 0
@@ -1417,7 +1423,7 @@ class DecodePreallocQueue:
             self._maybe_log_idle_deadlock_prefix_probe(
                 retractable_tokens=sum(
                     len(r.origin_input_ids) + len(r.output_ids)
-                    for r in self.scheduler.running_batch.reqs
+                    for r in self._running_reqs()
                 )
             )
 
@@ -1576,15 +1582,14 @@ class DecodePreallocQueue:
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
+            len(r.origin_input_ids) + len(r.output_ids) for r in self._running_reqs()
         )
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         swa_allocatable_tokens = 0
         if uses_swa_tail_prealloc:
             retractable_swa_tokens = sum(
-                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
+                self._swa_retractable_len(r) for r in self._running_reqs()
             )
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(
@@ -1655,7 +1660,7 @@ class DecodePreallocQueue:
         bounded_full_scan_skips = 0
         if (
             self.scheduler.enable_hisparse
-            and len(self.scheduler.running_batch.reqs) == 0
+            and len(self._running_reqs()) == 0
             and len(self.transfer_queue.queue) == 0
         ):
             ready_reqs = sum(1 for entry in self.queue if entry.waiting_for_input)
@@ -2135,18 +2140,18 @@ class DecodePreallocQueue:
                     self._output_reserve_tokens_for_admission(x)
                     + len(x.origin_input_ids)
                     - retractable_tokens
-                    for x in self.scheduler.running_batch.reqs
+                    for x in self._running_reqs()
                 ]
             )
             if retractable_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
+            and len(self._running_reqs()) > 0
             else 0
         )
         return need_space_for_single_req
 
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
         return (
-            len(self.scheduler.running_batch.reqs)
+            len(self._running_reqs())
             + len(self.transfer_queue.queue)
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
@@ -2251,13 +2256,13 @@ class DecodePreallocQueue:
         )
         if (
             retractable_swa_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
+            and len(self._running_reqs()) > 0
         ):
             need_swa_space_for_single_req = max(
                 self._swa_tail_len(len(x.origin_input_ids))
                 + self._output_reserve_tokens_for_admission(x)
                 - retractable_swa_tokens
-                for x in self.scheduler.running_batch.reqs
+                for x in self._running_reqs()
             )
 
         if n_active is None:

@@ -810,9 +810,10 @@ class MooncakeKVManager(CommonKVManager):
         src_indices = np.repeat(src_pages * c4_page_size, c4_page_size) + c4_offsets
 
         first_full_page = decode_prefix_len // full_page_size
+        page_slice_start = page_index_slice.start or 0
         logical_pages = np.arange(
-            first_full_page + page_index_slice.start,
-            first_full_page + page_index_slice.start + len(src_pages),
+            first_full_page + page_slice_start,
+            first_full_page + page_slice_start + len(src_pages),
             dtype=np.int64,
         )
         global_c4_indices = (
@@ -1045,9 +1046,18 @@ class MooncakeKVManager(CommonKVManager):
         offsets = np.tile(np.arange(page_size, dtype=np.int32), len(prefill_kv_indices))
         expanded_src = base + offsets
 
-        # Expand page-level index_slice to token-level for dst
-        token_start = page_index_slice.start * page_size
-        token_end = min(page_index_slice.stop * page_size, len(dst_kv_indices))
+        # Expand page-level index_slice to token-level for dst.
+        # A None start follows Python slice semantics and means the first page.
+        # A None stop means this transfer's source-page window, not the full dst.
+        page_slice_start = page_index_slice.start or 0
+        page_slice_stop = page_index_slice.stop
+        token_start = page_slice_start * page_size
+        token_stop = (
+            page_slice_stop * page_size
+            if page_slice_stop is not None
+            else token_start + len(prefill_kv_indices) * page_size
+        )
+        token_end = min(token_stop, len(dst_kv_indices))
         expanded_dst = dst_kv_indices[token_start:token_end]
 
         # Clip src to match dst length (last page may be partial)

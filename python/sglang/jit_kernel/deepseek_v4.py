@@ -423,6 +423,10 @@ def topk_transform_512_v2(
     if workspace is None:
         workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
     else:
+        assert workspace.shape[0] >= bs, (
+            f"topk v2 workspace size {workspace.shape[0]} is smaller "
+            f"than batch size {bs}"
+        )
         workspace = workspace[:bs]
     module.topk_transform(
         scores,
