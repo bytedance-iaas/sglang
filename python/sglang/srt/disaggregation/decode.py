@@ -56,7 +56,11 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     maybe_cache_unfinished_req,
@@ -70,6 +74,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.observability.req_time_stats import (
@@ -409,6 +414,15 @@ class HiSparseDecodeBudgetSnapshot:
     per_req_prealloc_estimate: int
 
 
+@dataclass(frozen=True)
+class DSV4HiSparseSafePrefixProbe:
+    matched_prefix_len: int = 0
+    safe_prefix_len: int = 0
+    c4_host_ready_prefix_len: int = 0
+    required_full_tokens_after_prefix: int = 0
+    cold_prefix_or_routing_key_miss: bool = False
+
+
 class DecodePreallocQueue:
     """
     Store the requests that are preallocating.
@@ -465,6 +479,7 @@ class DecodePreallocQueue:
         self._ensure_retry_interval: float = 1.0  # seconds
         self._last_prealloc_admission_log_time: float = 0.0
         self._prealloc_admission_log_interval: float = 5.0
+        self._last_idle_deadlock_prefix_probe_log_time: float = 0.0
         hisparse_coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
         self._relax_decode_output_reserve = (
             envs.SGLANG_HISPARSE_RELAX_DECODE_OUTPUT_RESERVE.get()
@@ -578,6 +593,98 @@ class DecodePreallocQueue:
             coordinator is not None
             and coordinator.is_dsv4_hisparse
             and coordinator.host_radix_cache is None
+        )
+
+    def _can_probe_dsv4_safe_prefix(self) -> bool:
+        if not self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            return False
+        coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+        return (
+            self._is_dsv4_hisparse_swa_tail_prealloc()
+            and coordinator is not None
+            and coordinator.host_radix_cache is None
+        )
+
+    def _probe_decode_radix_prefix_len(self, req: Req) -> int:
+        if not self._can_probe_dsv4_safe_prefix():
+            return 0
+        if envs.SGLANG_RADIX_FORCE_MISS.get():
+            return 0
+
+        try:
+            result = self.tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        token_ids=req.origin_input_ids,
+                        extra_key=req.extra_key,
+                    ),
+                    ignore_component_types=(ComponentType.SWA,),
+                    req=req,
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Failed to probe DSV4 HiSparse decode radix prefix for req=%s",
+                getattr(req, "rid", None),
+                exc_info=True,
+            )
+            return 0
+
+        prefix_len = len(result.device_indices)
+        page_size = self._logical_kv_page_size()
+        if page_size > 1:
+            prefix_len = page_align_floor(prefix_len, page_size)
+        return max(0, prefix_len)
+
+    def _probe_dsv4_safe_prefix_for_req(
+        self, req: Req, *, fill_len: int, retractable_tokens: int = 0
+    ) -> DSV4HiSparseSafePrefixProbe:
+        if not self._can_probe_dsv4_safe_prefix():
+            return DSV4HiSparseSafePrefixProbe()
+
+        matched_prefix_len = self._probe_decode_radix_prefix_len(req)
+        c4_host_ready_prefix_len = 0
+        coordinator = self.scheduler.hisparse_coordinator
+        try:
+            host_c4_len = self.token_to_kv_pool_allocator.c4_tokens_for_full_tokens(
+                fill_len
+            )
+            c4_host_ready_prefix_len, _, _ = coordinator._match_c4_host_prefix(
+                req, host_c4_len
+            )
+            c4_host_ready_prefix_len = min(c4_host_ready_prefix_len, host_c4_len)
+        except Exception:
+            logger.debug(
+                "Failed to probe DSV4 HiSparse C4 host prefix for req=%s",
+                getattr(req, "rid", None),
+                exc_info=True,
+            )
+            c4_host_ready_prefix_len = 0
+
+        safe_prefix_len = self._dsv4_hisparse_safe_logical_prefix_len(
+            fill_len=fill_len,
+            matched_prefix_len=matched_prefix_len,
+            c4_prefix_len=c4_host_ready_prefix_len,
+        )
+        required_full_tokens_after_prefix = max(
+            self._required_alloc_tokens(fill_len=fill_len, prefix_len=safe_prefix_len)
+            + self.num_reserved_decode_tokens,
+            self._future_full_tokens_for_admission(
+                req,
+                origin_input_len=len(req.origin_input_ids),
+                prefix_len=safe_prefix_len,
+                retractable_tokens=retractable_tokens,
+            ),
+        )
+
+        return DSV4HiSparseSafePrefixProbe(
+            matched_prefix_len=matched_prefix_len,
+            safe_prefix_len=safe_prefix_len,
+            c4_host_ready_prefix_len=c4_host_ready_prefix_len,
+            required_full_tokens_after_prefix=required_full_tokens_after_prefix,
+            cold_prefix_or_routing_key_miss=(
+                matched_prefix_len <= 0 or c4_host_ready_prefix_len <= 0
+            ),
         )
 
     def _dsv4_hisparse_safe_logical_prefix_len(
@@ -1166,6 +1273,66 @@ class DecodePreallocQueue:
             if self._relax_decode_output_reserve
             else CLIP_MAX_NEW_TOKEN,
         )
+        if idle_admission_deadlock and reason == "full_allocatable_tokens":
+            self._maybe_log_idle_deadlock_prefix_probe(
+                retractable_tokens=sum(
+                    len(r.origin_input_ids) + len(r.output_ids)
+                    for r in self.scheduler.running_batch.reqs
+                )
+            )
+
+    def _maybe_log_idle_deadlock_prefix_probe(
+        self, *, retractable_tokens: int = 0
+    ) -> None:
+        if not self._can_probe_dsv4_safe_prefix():
+            return
+
+        now = time.monotonic()
+        if now - self._last_idle_deadlock_prefix_probe_log_time < 10.0:
+            return
+        self._last_idle_deadlock_prefix_probe_log_time = now
+
+        decode_req = next(
+            (entry for entry in self.queue if entry.waiting_for_input),
+            None,
+        )
+        if decode_req is None:
+            return
+
+        req = decode_req.req
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        probe = self._probe_dsv4_safe_prefix_for_req(
+            req, fill_len=fill_len, retractable_tokens=retractable_tokens
+        )
+        safe_prefix_reuse_enabled = self._enable_decode_radix_prefix_reuse()
+        if not envs.SGLANG_HISPARSE_DECODE_SAFE_PREFIX_REUSE.get():
+            safe_prefix_reuse_state = "env_disabled"
+        elif probe.matched_prefix_len <= 0:
+            safe_prefix_reuse_state = "radix_prefix_miss"
+        elif probe.c4_host_ready_prefix_len <= 0:
+            safe_prefix_reuse_state = "c4_host_prefix_miss"
+        elif probe.safe_prefix_len < probe.matched_prefix_len:
+            safe_prefix_reuse_state = "capped_by_swa_tail_or_c4_host_prefix"
+        else:
+            safe_prefix_reuse_state = "usable"
+        logger.warning(
+            "DSV4 HiSparse idle admission prefix probe: req=%s, "
+            "origin_input_len=%d, fill_len=%d, matched_prefix_len=%d, "
+            "safe_prefix_len=%d, c4_host_ready_prefix_len=%d, "
+            "required_full_tokens_after_prefix=%d, "
+            "cold_prefix_or_routing_key_miss=%s, safe_prefix_reuse_enabled=%s, "
+            "safe_prefix_reuse_state=%s",
+            getattr(req, "rid", None),
+            len(req.origin_input_ids),
+            fill_len,
+            probe.matched_prefix_len,
+            probe.safe_prefix_len,
+            probe.c4_host_ready_prefix_len,
+            probe.required_full_tokens_after_prefix,
+            probe.cold_prefix_or_routing_key_miss,
+            safe_prefix_reuse_enabled,
+            safe_prefix_reuse_state,
+        )
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -1344,6 +1511,15 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         blocked_reason = None
+        bounded_full_scan_limit = 0
+        bounded_full_scan_skips = 0
+        if (
+            self.scheduler.enable_hisparse
+            and len(self.scheduler.running_batch.reqs) == 0
+            and len(self.transfer_queue.queue) == 0
+        ):
+            ready_reqs = sum(1 for entry in self.queue if entry.waiting_for_input)
+            bounded_full_scan_limit = min(8, ready_reqs)
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1458,6 +1634,9 @@ class DecodePreallocQueue:
                 if prefix_lock_acquired:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 blocked_reason = "full_allocatable_tokens"
+                if bounded_full_scan_skips < bounded_full_scan_limit - 1:
+                    bounded_full_scan_skips += 1
+                    continue
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_lock_acquired:
@@ -1537,6 +1716,7 @@ class DecodePreallocQueue:
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
+            blocked_reason = None
             decode_req.req.cache_protected_len = prefix_len
 
             metadata_decode_prefix_len = prefix_len

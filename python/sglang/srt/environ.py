@@ -256,6 +256,8 @@ class Envs:
     SGLANG_HISPARSE_DECODE_UTILIZATION_GOVERNOR = EnvBool(True)
     SGLANG_HISPARSE_DECODE_FULL_USAGE_TARGET = EnvFloat(0.92)
     SGLANG_HISPARSE_DECODE_FULL_USAGE_HARD_LIMIT = EnvFloat(0.98)
+    # Opt in to reuse full logical prefix pages for the validated DSV4
+    # HiSparse C4 host-mirror path.
     SGLANG_HISPARSE_DECODE_SAFE_PREFIX_REUSE = EnvBool(False)
 
     # Scheduler: others:
