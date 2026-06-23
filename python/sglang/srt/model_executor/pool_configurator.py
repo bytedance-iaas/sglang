@@ -581,7 +581,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "bytes_per_full_token=%.2f, raw_available_bytes=%.2f GB, "
                 "hisparse_fixed_overhead=%.2f GB, effective_available_bytes=%.2f GB, "
                 "full_token=%d, c4_shrink_factor=%s, req_slots=%d, "
-                "padded_buffer_size=%d, top_k=%d, device_buffer_size=%d",
+                "padded_buffer_size=%d, top_k=%d, device_buffer_size=%d, "
+                "online_c128_mtp_max_draft_tokens=%d",
                 self.bytes_per_full_token,
                 available_bytes / (1 << 30),
                 hisparse_fixed_overhead_bytes / (1 << 30),
@@ -592,6 +593,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self.hisparse_device_buffer_size + max(1, page_size // 4),
                 self.hisparse_top_k,
                 self.hisparse_device_buffer_size,
+                self.online_c128_mtp_max_draft_tokens,
             )
         else:
             logger.info(
