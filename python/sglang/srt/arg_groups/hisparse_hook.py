@@ -46,6 +46,135 @@ def apply_hisparse_nsa_backend_defaults(
     return True
 
 
+def _validate_dsv4_hisparse_megamoe(server_args: "ServerArgs") -> None:
+    """Validate the DSV4 HiSparse + MegaMoE combination before graph capture."""
+    if server_args.moe_a2a_backend != "megamoe":
+        return
+
+    from sglang.srt.environ import envs
+
+    strict = envs.SGLANG_REQUIRE_MEGAMOE.get()
+
+    def warn_or_raise(message: str, *args) -> None:
+        if strict:
+            raise ValueError(message % args if args else message)
+        logger.warning(message, *args)
+
+    if server_args.moe_runner_backend != "deep_gemm":
+        warn_or_raise(
+            "DSV4 HiSparse MegaMoE requires --moe-runner-backend deep_gemm. "
+            "Got %r. MegaMoE will not be required unless "
+            "SGLANG_REQUIRE_MEGAMOE=1.",
+            server_args.moe_runner_backend,
+        )
+
+    if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+        warn_or_raise(
+            "DSV4 HiSparse is using --moe-a2a-backend megamoe without "
+            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1. This is allowed in fallback "
+            "mode, but strict MegaMoE requires the env flag."
+        )
+
+    if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        warn_or_raise(
+            "DSV4 HiSparse MegaMoE requires SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1 "
+            "to avoid the high-pressure DeepGEMM masked-GEMM scratch path. "
+            "MegaMoE will not be required unless SGLANG_REQUIRE_MEGAMOE=1."
+        )
+
+    if not envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+        warn_or_raise(
+            "DSV4 HiSparse MegaMoE requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=1 "
+            "when SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1."
+        )
+
+    if not envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+        warn_or_raise(
+            "DSV4 HiSparse MegaMoE requires SGLANG_OPT_SWIGLU_CLAMP_FUSION=1 "
+            "for the DeepSeek V4 swiglu_limit DeepGEMM path."
+        )
+
+    if server_args.speculative_algorithm == "EAGLE":
+        if server_args.speculative_moe_a2a_backend != "megamoe":
+            warn_or_raise(
+                "DSV4 HiSparse target is using MegaMoE, but the EAGLE draft "
+                "MoE A2A backend is %r. This is a fallback configuration, not "
+                "full MegaMoE draft coverage.",
+                server_args.speculative_moe_a2a_backend,
+            )
+
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        draft_tokens = max(int(server_args.speculative_num_draft_tokens or 1), 1)
+        graph_bs = (
+            0
+            if server_args.disable_cuda_graph
+            else int(server_args.cuda_graph_max_bs or 0)
+        )
+        required_cap = graph_bs * draft_tokens
+        if required_cap > cap:
+            warn_or_raise(
+                "DSV4 HiSparse MegaMoE graph capture may exceed "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK >= "
+                f"cuda_graph_max_bs * speculative_num_draft_tokens "
+                f"({graph_bs} * {draft_tokens} = {required_cap}), but got {cap}. "
+                "MegaMoE will fall back at runtime when the per-rank token cap "
+                "is exceeded; raise the env var for full MegaMoE coverage."
+            )
+
+
+def _validate_dsv4_hisparse_online_c128_mtp(server_args: "ServerArgs") -> None:
+    """Validate the DSV4 HiSparse + online C128 MTP combination early."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        return
+
+    if server_args.speculative_algorithm is None:
+        return
+
+    if not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+        raise ValueError(
+            "DSV4 HiSparse online C128 with speculative decode requires "
+            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+        )
+
+    if server_args.speculative_algorithm != "EAGLE":
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP is currently only validated for "
+            f"EAGLE, got {server_args.speculative_algorithm!r}."
+        )
+
+    if server_args.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP requires "
+            f"--speculative-eagle-topk 1, got {server_args.speculative_eagle_topk}."
+        )
+
+    speculative_num_steps = int(server_args.speculative_num_steps or 0)
+    if speculative_num_steps > 2:
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP is currently validated only for "
+            f"EAGLE step1/step2, got speculative_num_steps={speculative_num_steps}. "
+            "Keep step3 disabled until SWA/C4 host/logical admission is validated "
+            "under pressure."
+        )
+
+    if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+        raise ValueError(
+            "DSV4 HiSparse online C128 MTP requires "
+            "SGLANG_OPT_USE_COMPRESSOR_V2=1 because the v2 compressor carries "
+            "online state-slot metadata."
+        )
+
+    logger.warning(
+        "DSV4 HiSparse online C128 MTP enabled: C4 stays on HiSparse host "
+        "mirror; C128 uses online EAGLE state banks; eagle_steps=%d, "
+        "draft_tokens=%s.",
+        speculative_num_steps,
+        server_args.speculative_num_draft_tokens,
+    )
+
+
 def validate_hisparse(server_args: "ServerArgs") -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, NSA backend)."""
     if not server_args.enable_hisparse:
@@ -63,13 +192,13 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
-    # aware checks below only apply to the DSA hisparse path.
+    # aware checks below only apply to the DSA hisparse path.  Normal scheduler
+    # radix is still not used for DSV4 HiSparse; C4 prefix reuse is handled by
+    # HiSparseCoordinator.
     if is_v4_hisparse:
+        _validate_dsv4_hisparse_online_c128_mtp(server_args)
+        _validate_dsv4_hisparse_megamoe(server_args)
         return
 
     if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):

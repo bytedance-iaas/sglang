@@ -56,6 +56,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_moe_runner_backend is None:
         server_args.speculative_moe_runner_backend = server_args.moe_runner_backend
+    if (
+        server_args.speculative_moe_a2a_backend is None
+        and server_args.moe_a2a_backend == "megamoe"
+    ):
+        server_args.speculative_moe_a2a_backend = "megamoe"
+        logger.info(
+            "Mega MoE is enabled, auto-configuring "
+            "--speculative-moe-a2a-backend megamoe."
+        )
 
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
