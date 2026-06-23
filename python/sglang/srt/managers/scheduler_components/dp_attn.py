@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -25,6 +26,12 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+logger = logging.getLogger(__name__)
+_logged_dsv4_dp_sync_cpu_fallback = False
+
+
+def _is_cuda_sync_device(device) -> bool:
+    return str(device).startswith("cuda")
 
 
 @dataclass
@@ -77,6 +84,11 @@ class MLPSyncBatchInfo:
         )
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
+        if (
+            _is_cuda_sync_device(device)
+            and envs.SGLANG_DSV4_PREFILL_DP_SYNC_DEBUG.get()
+        ):
+            torch.cuda.synchronize(device)
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
             (self.dp_size, self.tp_size * self.cp_size, 6),
@@ -89,6 +101,11 @@ class MLPSyncBatchInfo:
             local_info_tensor,
             group=group,
         )
+        if (
+            _is_cuda_sync_device(device)
+            and envs.SGLANG_DSV4_PREFILL_DP_SYNC_DEBUG.get()
+        ):
+            torch.cuda.synchronize(device)
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
@@ -180,7 +197,18 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
+    force_cpu_sync = envs.SGLANG_DSV4_PREFILL_DP_SYNC_CPU_FALLBACK.get()
+    if force_cpu_sync:
+        global _logged_dsv4_dp_sync_cpu_fallback
+        if not _logged_dsv4_dp_sync_cpu_fallback:
+            logger.warning(
+                "Using CPU fallback for DSV4 prefill DP MLP sync because "
+                "SGLANG_DSV4_PREFILL_DP_SYNC_CPU_FALLBACK=1. This is a "
+                "diagnostic fallback and may reduce performance."
+            )
+            _logged_dsv4_dp_sync_cpu_fallback = True
+
+    if not force_cpu_sync and len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
