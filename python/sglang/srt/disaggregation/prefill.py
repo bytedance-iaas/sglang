@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
@@ -973,9 +974,7 @@ class SchedulerDisaggregationPrefillMixin:
             req, "disagg_transfer_input_len", len(req.origin_input_ids)
         )
         end_idx = (
-            end_idx
-            if end_idx is not None
-            else min(req.fill_len, transfer_input_len)
+            end_idx if end_idx is not None else min(req.fill_len, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1004,7 +1003,7 @@ class SchedulerDisaggregationPrefillMixin:
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            materialized_seq_len = min(req.fill_len, transfer_input_len)
+            seq_len = min(req.fill_len, transfer_input_len)
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
@@ -1018,10 +1017,10 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(0, materialized_seq_len - window_size)
+                window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:materialized_seq_len
+                    req.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1034,7 +1033,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :materialized_seq_len
+                    req.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
@@ -1045,16 +1044,14 @@ class SchedulerDisaggregationPrefillMixin:
                 _pool = self.token_to_kv_pool_allocator.get_kvcache()
                 ring_stride = _pool.unified_swa_ring_size
                 window_size = _pool.unified_swa_window
-                window_start = max(0, materialized_seq_len - window_size)
-                positions = np.arange(
-                    window_start, materialized_seq_len, dtype=np.int64
-                )
+                window_start = max(0, seq_len - window_size)
+                positions = np.arange(window_start, seq_len, dtype=np.int64)
                 state_slot = int(req.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                online = is_dsv4_c128_online_enabled()
                 ring_size = (
                     1
                     if online
@@ -1062,36 +1059,12 @@ class SchedulerDisaggregationPrefillMixin:
                         128
                     )
                 )
-                indices = get_dsv4_c128_state_indices(
+                return get_dsv4_c128_state_indices(
                     int(req.req_pool_idx),
                     c128_seq_len,
                     online=online,
                     ring_size=ring_size,
                 )
-                logger.info(
-                    "DSV4 C128 PD prefill indices: room=%s rid=%s "
-                    "req_pool_idx=%s origin_len=%s initial_len=%s "
-                    "transfer_len=%s fill_len=%s output_len=%s "
-                    "kv_committed_len=%s materialized_seq_len=%s "
-                    "c128_seq_len=%s c128_mod=%s online=%s ring_size=%s "
-                    "indices=%s",
-                    getattr(req, "bootstrap_room", None),
-                    getattr(req, "rid", None),
-                    req.req_pool_idx,
-                    len(req.origin_input_ids),
-                    getattr(req, "initial_origin_input_len", None),
-                    transfer_input_len,
-                    req.fill_len,
-                    len(req.output_ids),
-                    getattr(req, "kv_committed_len", None),
-                    materialized_seq_len,
-                    c128_seq_len,
-                    c128_seq_len % 128,
-                    online,
-                    ring_size,
-                    indices.tolist(),
-                )
-                return indices
 
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
