@@ -40,6 +40,7 @@ class MatchPrefixParams:
     """Unified parameters for match_prefix across different cache types"""
 
     key: RadixKey
+    ignore_component_types: Tuple[Any, ...] = dataclasses.field(default_factory=tuple)
 
     # Mamba specific
     cow_mamba: bool = False
@@ -64,6 +65,7 @@ class InsertParams:
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
     force_leaf_creation: bool = False
+    skip_swa_component: bool = False
 
     # General
     chunked: bool = False

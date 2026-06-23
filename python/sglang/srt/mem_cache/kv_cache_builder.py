@@ -23,7 +23,7 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.configs.model_config import ModelImpl, is_deepseek_v4
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -184,6 +184,9 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    is_dsv4_hisparse = server_args.enable_hisparse and is_deepseek_v4(
+        model_config.hf_config
+    )
 
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
@@ -202,43 +205,46 @@ def build_kv_cache(
         and server_args.disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models requires the unified radix "
-                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
-                )
-            # Compressed-KV SWA variants need model-specific sidecar guarantees.
-            # DSV4 has a conservative experimental L1-only path below.
-            if getattr(model_config, "is_deepseek_v4_arch", False):
-                if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+            if is_dsv4_hisparse:
+                pass
+            else:
+                if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
                     raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache with "
-                        "DeepSeek-V4 (DSA compressed KV) is experimental. Set "
-                        "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1 to enable "
-                        "the conservative L1-only path."
+                        "--disaggregation-decode-enable-radix-cache with sliding "
+                        "window attention (SWA) models requires the unified radix "
+                        "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
                     )
-                if enable_hierarchical_cache:
-                    raise ValueError(
-                        "DeepSeek-V4 decode-side radix cache currently supports "
-                        "only device-resident L1 cache. Disable hierarchical "
-                        "cache / HiCache storage for this experimental path."
-                    )
-                if not spec_algorithm.is_none():
-                    if not is_supported_dsv4_decode_radix_mtp(
-                        spec_algorithm=spec_algorithm, server_args=server_args
-                    ):
+                # Compressed-KV SWA variants need model-specific sidecar guarantees.
+                # DSV4 has a conservative experimental L1-only path below.
+                if getattr(model_config, "is_deepseek_v4_arch", False):
+                    if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+                        raise ValueError(
+                            "--disaggregation-decode-enable-radix-cache with "
+                            "DeepSeek-V4 (DSA compressed KV) is experimental. Set "
+                            "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1 to enable "
+                            "the conservative L1-only path."
+                        )
+                    if enable_hierarchical_cache:
                         raise ValueError(
                             "DeepSeek-V4 decode-side radix cache currently supports "
-                            "only the experimental EAGLE topk=1 online c128 MTP "
-                            "path. Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
-                            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+                            "only device-resident L1 cache. Disable hierarchical "
+                            "cache / HiCache storage for this experimental path."
                         )
-            if getattr(model_config, "is_hybrid_swa_compress", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
-                )
+                    if not spec_algorithm.is_none():
+                        if not is_supported_dsv4_decode_radix_mtp(
+                            spec_algorithm=spec_algorithm, server_args=server_args
+                        ):
+                            raise ValueError(
+                                "DeepSeek-V4 decode-side radix cache currently supports "
+                                "only the experimental EAGLE topk=1 online c128 MTP "
+                                "path. Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
+                                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+                            )
+                if getattr(model_config, "is_hybrid_swa_compress", False):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache does not support "
+                        "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                    )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -248,6 +254,11 @@ def build_kv_cache(
     effective_chunked_prefill_size = server_args.chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
+    enable_hisparse_unified_radix = (
+        server_args.enable_hisparse
+        and not disable_radix_cache
+        and getattr(token_to_kv_pool_allocator, "compress_ratio", 1) == 1
+    )
 
     params = CacheInitParams(
         disable=disable_radix_cache,
@@ -270,7 +281,38 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
     )
 
-    if effective_chunked_prefill_size is not None and disable_radix_cache:
+    if enable_hisparse_unified_radix:
+        from sglang.srt.mem_cache.unified_cache_components import (
+            ComponentType,
+        )
+
+        params.tree_components = (ComponentType.FULL,)
+        from sglang.srt.mem_cache.hisparse_unified_radix_cache import (
+            HiSparseUnifiedRadixCache,
+        )
+
+        tree_cache = HiSparseUnifiedRadixCache(params)
+        if hasattr(tree_cache, "enable_hisparse_mode"):
+            tree_cache.enable_hisparse_mode()
+        else:
+            # Keep startup robust when the HiSparse builder path is combined
+            # with an older UnifiedRadixCache implementation in an image layer.
+            tree_cache.hisparse_mode = True
+    elif is_dsv4_hisparse:
+        from sglang.srt.mem_cache.unified_cache_components import (
+            ComponentType,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import (
+            UnifiedRadixCache,
+        )
+
+        params.tree_components = (ComponentType.FULL,)
+        tree_cache = UnifiedRadixCache(params)
+        if hasattr(tree_cache, "enable_hisparse_mode"):
+            tree_cache.enable_hisparse_mode()
+        else:
+            tree_cache.hisparse_mode = True
+    elif effective_chunked_prefill_size is not None and disable_radix_cache:
         if not is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 

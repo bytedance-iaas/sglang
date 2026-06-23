@@ -121,6 +121,9 @@ class SWAComponent(TreeComponent):
         value_slice: torch.Tensor,
         params: InsertParams,
     ) -> int:
+        if params.skip_swa_component:
+            return prefix_len
+
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
@@ -169,7 +172,7 @@ class SWAComponent(TreeComponent):
     def should_skip_leaf_creation(
         self, total_prefix_len: int, key_len: int, params: InsertParams
     ) -> bool:
-        if params.force_leaf_creation:
+        if params.force_leaf_creation or params.skip_swa_component:
             return False
         return params.swa_evicted_seqlen >= total_prefix_len + key_len
 
@@ -180,6 +183,9 @@ class SWAComponent(TreeComponent):
         total_prefix_len: int,
         params: InsertParams,
     ) -> None:
+        if params.skip_swa_component:
+            return
+
         # _unevict_node_on_insert already wrote the request's fresh KV slice
         # into the base value. We just need to rebuild SWA from that slice for
         # the in-window portion. There is no old SWA slot to free here.
@@ -213,6 +219,8 @@ class SWAComponent(TreeComponent):
         params: InsertParams,
         result: InsertResult,
     ) -> None:
+        if params.skip_swa_component:
+            return
         if not is_new_leaf:
             return
 

@@ -248,6 +248,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components.values()
         )
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
+        self._last_detached_lock_node_log_time = 0.0
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -271,9 +272,90 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self.hisparse_mode = False
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+
+    def enable_hisparse_mode(self) -> None:
+        """Mark this tree as the DSV4 HiSparse companion cache.
+
+        DSV4 HiSparse keeps C4 residency in HiSparseCoordinator rather than in
+        the normal radix device values. The builder still uses UnifiedRadixCache
+        as the tree-cache object, so expose the mode switch it expects without
+        changing generic radix behavior.
+        """
+        self.hisparse_mode = True
+
+    def _find_detached_lock_node(self, node: Any) -> Optional[Any]:
+        """Return the first node proving this lock path is detached.
+
+        Unified cache component unlockers assume the request's last_node still
+        has a parent chain that reaches this cache's root. Decode-side
+        retract/finish paths can hand back a stale node from an older tree state;
+        detect that once at the public dec_lock_ref boundary instead of letting
+        individual components crash while walking parent pointers.
+        """
+        if node is None:
+            return None
+        if node is self.root_node:
+            return None
+
+        cur = node
+        visited: set[int] = set()
+        while cur is not self.root_node:
+            if cur is None:
+                return None
+            cur_identity = id(cur)
+            if cur_identity in visited:
+                return cur
+            visited.add(cur_identity)
+            parent = getattr(cur, "parent", None)
+            if parent is None:
+                return cur
+            cur = parent
+        return None
+
+    def _maybe_log_detached_lock_node(
+        self,
+        node: Any,
+        detached_node: Any,
+        debug_context: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if node is None or detached_node is None:
+            return
+        now = time.monotonic()
+        if now - self._last_detached_lock_node_log_time < 30.0:
+            return
+        self._last_detached_lock_node_log_time = now
+
+        context = debug_context or {}
+        component_lock_refs = {}
+        component_data = getattr(detached_node, "component_data", None)
+        if component_data is not None:
+            for component_type in self.tree_components:
+                try:
+                    component_lock_refs[component_type.name] = component_data[
+                        component_type
+                    ].lock_ref
+                except Exception:
+                    component_lock_refs[component_type.name] = "unavailable"
+
+        logger.error(
+            "UnifiedRadixCache skipping dec_lock_ref for detached node: "
+            "op=%s, rid=%s, is_insert=%s, finished_reason=%s, node_id=%s, "
+            "detached_node_id=%s, detached_parent_id=%s, root_id=%s, "
+            "component_lock_refs=%s",
+            context.get("op", "dec_lock_ref"),
+            context.get("rid"),
+            context.get("is_insert"),
+            context.get("finished_reason"),
+            getattr(node, "id", None),
+            getattr(detached_node, "id", None),
+            getattr(getattr(detached_node, "parent", None), "id", None),
+            getattr(self.root_node, "id", None),
+            component_lock_refs,
+        )
 
     def reset(self) -> None:
         self._reset_full()
@@ -415,7 +497,7 @@ class UnifiedRadixCache(BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
             full_last_device_node,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, params)
         return self._match_post_processor(
             params,
             value,
@@ -477,13 +559,24 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
+        self,
+        node: Any,
+        params: Optional[DecLockRefParams] = None,
+        *,
+        debug_context: Optional[dict[str, Any]] = None,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
             return result
-        if self.disable:
+        if self.disable or node is None:
             return DecLockRefResult()
+        if debug_context is not None:
+            detached_node = self._find_detached_lock_node(node)
+            if detached_node is not None:
+                self._maybe_log_detached_lock_node(
+                    node, detached_node, debug_context
+                )
+                return DecLockRefResult()
         for component in self._components_tuple:
             component.release_component_lock(node=node, params=params)
 
@@ -538,7 +631,12 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = None
 
         if is_insert:
-            insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+            insert_params = InsertParams(
+                prev_prefix_len=req.cache_protected_len,
+                skip_swa_component=getattr(
+                    req, "skip_swa_radix_cache_insert", False
+                ),
+            )
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -568,15 +666,27 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+            if insert_params.skip_swa_component:
+                self.token_to_kv_pool_allocator.free_swa(values)
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
+            if getattr(req, "skip_swa_radix_cache_insert", False):
+                self.token_to_kv_pool_allocator.free_swa(
+                    kv_indices[: req.cache_protected_len]
+                )
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            debug_context={
+                "op": "cache_finished_req",
+                "rid": getattr(req, "rid", None),
+                "is_insert": is_insert,
+                "finished_reason": getattr(req, "finished_reason", None),
+            },
         )
 
         # cleanup
@@ -604,7 +714,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len, chunked=chunked
+            prev_prefix_len=req.cache_protected_len,
+            chunked=chunked,
+            skip_swa_component=getattr(req, "skip_swa_radix_cache_insert", False),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -646,7 +758,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # while the cards to repoint number in the hundreds — which would trip the
         # assert below. inc_lock_ref's SWA walk already stops at the tombstone.
         match_result = self.match_prefix(
-            MatchPrefixParams(key=radix_key, return_full_match=True)
+            MatchPrefixParams(
+                key=radix_key,
+                return_full_match=True,
+                ignore_component_types=(
+                    (ComponentType.SWA,) if insert_params.skip_swa_component else ()
+                ),
+            )
         )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
@@ -665,6 +783,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            debug_context={
+                "op": "cache_unfinished_req",
+                "rid": getattr(req, "rid", None),
+                "is_insert": None,
+                "finished_reason": getattr(req, "finished_reason", None),
+            },
         )
         lock_result = self.inc_lock_ref(new_last_node)
 
@@ -691,7 +815,7 @@ class UnifiedRadixCache(BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, params: MatchPrefixParams
     ) -> tuple[
         list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, UnifiedTreeNode
     ]:
@@ -710,18 +834,24 @@ class UnifiedRadixCache(BasePrefixCache):
         # even when SWA is tombstoned. Used by return_full_match.
         full_last_device_node = node
         separate_device_match = self.cache_controller is not None
+        ignored_components = set(params.ignore_component_types)
+        components = tuple(
+            comp
+            for comp in self._components_tuple
+            if comp.component_type not in ignored_components
+        )
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in self._components_tuple
+                comp.create_match_validator() for comp in components
             )
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self._components_tuple
+                for comp in components
             )
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self._components_tuple
+                for comp in components
             )
 
         def _all_valid(validators, node):
@@ -786,7 +916,10 @@ class UnifiedRadixCache(BasePrefixCache):
         full_last_device_node: UnifiedTreeNode,
     ) -> MatchResult:
         node_update = best_match_node
+        ignored_components = set(params.ignore_component_types)
         for comp in self._components_tuple:
+            if comp.component_type in ignored_components:
+                continue
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
             self.lru_lists[comp.component_type].reset_node_and_parents_mru(
@@ -835,6 +968,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         for component in self._components_tuple:
+            if component.component_type in ignored_components:
+                continue
             result = component.finalize_match_result(
                 result=result,
                 params=params,
