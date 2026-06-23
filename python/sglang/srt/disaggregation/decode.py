@@ -1044,12 +1044,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _c128_state_payload():
                 online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
                 ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
+                indices = get_dsv4_c128_state_indices(
                     int(decode_req.req.req_pool_idx),
                     seq_len,
                     online=online,
                     ring_size=ring_size,
                 )
+                logger.info(
+                    "DSV4 C128 PD decode indices: room=%s rid=%s "
+                    "req_pool_idx=%s origin_len=%s initial_len=%s "
+                    "transfer_len=%s output_len=%s kv_committed_len=%s "
+                    "total_prefix_len=%s seq_len=%s c128_mod=%s online=%s "
+                    "ring_size=%s indices=%s",
+                    getattr(decode_req.req, "bootstrap_room", None),
+                    getattr(decode_req.req, "rid", None),
+                    decode_req.req.req_pool_idx,
+                    len(decode_req.req.origin_input_ids),
+                    getattr(decode_req.req, "initial_origin_input_len", None),
+                    seq_len,
+                    len(decode_req.req.output_ids),
+                    getattr(decode_req.req, "kv_committed_len", None),
+                    total_prefix_len,
+                    seq_len,
+                    seq_len % 128,
+                    online,
+                    ring_size,
+                    indices.tolist(),
+                )
+                return indices
 
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
@@ -1083,7 +1105,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
-                transfer_input_len=seq_len,
             )
             if (
                 self.transfer_queue.enable_staging
