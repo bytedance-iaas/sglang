@@ -781,6 +781,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # DSV4 HiSparse decode can reuse full radix pages while keeping SWA as
+        # a request-local sliding tail.
+        self.skip_swa_radix_cache_insert: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -931,6 +934,9 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_shared_prefix_len = 0
+        self.hisparse_cache_owned_prefix_len = 0
+        self.hisparse_prefix_entry = None
 
     @property
     def seqlen(self) -> int:
@@ -1273,6 +1279,7 @@ class Req(ReqDllmMixin):
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.skip_swa_radix_cache_insert = False
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -1293,6 +1300,9 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.hisparse_shared_prefix_len = 0
+        self.hisparse_cache_owned_prefix_len = 0
+        self.hisparse_prefix_entry = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1459,6 +1469,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
+    req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
@@ -1627,6 +1638,116 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_dllm(self):
         return self.dllm_config is not None
+
+    def set_req_pool_indices(
+        self,
+        req_pool_indices_cpu: Union[List[int], torch.Tensor],
+        req_pool_indices: Optional[torch.Tensor] = None,
+    ):
+        target_device = torch.device(self.device)
+        if not isinstance(req_pool_indices_cpu, torch.Tensor):
+            req_pool_indices_cpu = torch.tensor(req_pool_indices_cpu, dtype=torch.int64)
+        elif req_pool_indices_cpu.device.type != "cpu":
+            req_pool_indices_cpu = req_pool_indices_cpu.cpu()
+
+        if req_pool_indices_cpu.dtype != torch.int64:
+            req_pool_indices_cpu = req_pool_indices_cpu.to(dtype=torch.int64)
+
+        if req_pool_indices is None:
+            req_pool_indices = req_pool_indices_cpu.to(
+                target_device, non_blocking=True
+            )
+        elif req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(dtype=torch.int64)
+
+        if req_pool_indices.device != target_device:
+            req_pool_indices = req_pool_indices.to(target_device, non_blocking=True)
+
+        self.req_pool_indices_cpu = req_pool_indices_cpu
+        self.req_pool_indices = req_pool_indices
+        self.ensure_req_pool_indices()
+
+    def set_req_pool_indices_from_reqs(self):
+        req_pool_indices = []
+        for req in self.reqs:
+            if req.req_pool_idx is None:
+                raise RuntimeError(
+                    "ScheduleBatch request "
+                    f"{getattr(req, 'rid', '<unknown>')} has no req_pool_idx."
+                )
+            req_pool_indices.append(req.req_pool_idx)
+        self.set_req_pool_indices(req_pool_indices)
+
+    def ensure_req_pool_indices(self):
+        if len(self.reqs) == 0:
+            if (
+                self.req_pool_indices_cpu is None
+                or not isinstance(self.req_pool_indices_cpu, torch.Tensor)
+                or self.req_pool_indices_cpu.device.type != "cpu"
+                or self.req_pool_indices_cpu.dtype != torch.int64
+                or self.req_pool_indices_cpu.numel() != 0
+            ):
+                self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
+            if (
+                self.req_pool_indices is None
+                or not isinstance(self.req_pool_indices, torch.Tensor)
+                or self.req_pool_indices.device != torch.device(self.device)
+                or self.req_pool_indices.dtype != torch.int64
+                or self.req_pool_indices.numel() != 0
+            ):
+                self.req_pool_indices = torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                )
+            return
+
+        if self.req_pool_indices is None and self.req_pool_indices_cpu is None:
+            raise RuntimeError(
+                "ScheduleBatch has requests but no req_pool_indices or "
+                "req_pool_indices_cpu."
+            )
+
+        if self.req_pool_indices_cpu is None:
+            self.req_pool_indices_cpu = self.req_pool_indices.detach().cpu().to(
+                dtype=torch.int64
+            )
+        elif not isinstance(self.req_pool_indices_cpu, torch.Tensor):
+            self.req_pool_indices_cpu = torch.tensor(
+                self.req_pool_indices_cpu, dtype=torch.int64
+            )
+        elif self.req_pool_indices_cpu.device.type != "cpu":
+            self.req_pool_indices_cpu = self.req_pool_indices_cpu.cpu()
+
+        if self.req_pool_indices_cpu.dtype != torch.int64:
+            self.req_pool_indices_cpu = self.req_pool_indices_cpu.to(dtype=torch.int64)
+
+        if self.req_pool_indices is None:
+            self.req_pool_indices = self.req_pool_indices_cpu.to(
+                self.device, non_blocking=True
+            )
+        elif not isinstance(self.req_pool_indices, torch.Tensor):
+            self.req_pool_indices = torch.tensor(
+                self.req_pool_indices, dtype=torch.int64, device=self.device
+            )
+        elif self.req_pool_indices.dtype != torch.int64:
+            self.req_pool_indices = self.req_pool_indices.to(dtype=torch.int64)
+        if self.req_pool_indices.device != torch.device(self.device):
+            self.req_pool_indices = self.req_pool_indices.to(
+                self.device, non_blocking=True
+            )
+
+        if self.req_pool_indices_cpu.numel() != len(self.reqs):
+            raise RuntimeError(
+                "ScheduleBatch req_pool_indices_cpu length mismatch: "
+                f"{self.req_pool_indices_cpu.numel()} vs {len(self.reqs)}."
+            )
+        if self.req_pool_indices.numel() != len(self.reqs):
+            raise RuntimeError(
+                "ScheduleBatch req_pool_indices length mismatch: "
+                f"{self.req_pool_indices.numel()} vs {len(self.reqs)}."
+            )
+
+    def ensure_req_pool_indices_cpu(self):
+        self.ensure_req_pool_indices()
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         _pin = is_pin_memory_available(self.device)
@@ -1807,7 +1928,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, _ = alloc_for_extend(self)
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+            alloc_for_extend(self)
+        )
 
         # Set fields
         input_embeds = []
@@ -1965,7 +2088,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_positions_tensor = None
 
         self.input_ids = input_ids_tensor
-        self.req_pool_indices = req_pool_indices_tensor
+        self.set_req_pool_indices(req_pool_indices_cpu, req_pool_indices_tensor)
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -2230,10 +2353,70 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    def _max_accept_tokens_per_req_next_decode(self) -> int:
+        if self.spec_algorithm.is_none():
+            return 1
+
+        server_args = get_global_server_args()
+        draft_tokens = server_args.speculative_num_draft_tokens
+        if draft_tokens is None:
+            draft_tokens = server_args.speculative_num_steps
+        return max(1, int(draft_tokens or 1) + 1)
+
+    def _selected_reqs_for_decode_mem(
+        self, selected_indices: Optional[List[int]]
+    ) -> List[Req]:
+        if selected_indices is None:
+            return self.reqs
+        return [self.reqs[i] for i in selected_indices]
+
+    def _check_dsv4_hisparse_c4_host_decode_mem(
+        self, selected_indices: Optional[List[int]]
+    ) -> bool:
+        coordinator = self.hisparse_coordinator
+        if (
+            coordinator is None
+            or not getattr(coordinator, "is_dsv4_hisparse", False)
+            or self.forward_mode is None
+            or not self.forward_mode.is_decode()
+        ):
+            return True
+
+        reqs = self._selected_reqs_for_decode_mem(selected_indices)
+        required_tokens = coordinator.dsv4_c4_host_required_for_next_decode(
+            reqs, self._max_accept_tokens_per_req_next_decode()
+        )
+        if required_tokens <= 0:
+            return True
+        return coordinator.ensure_dsv4_c4_host_available(required_tokens)
+
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
+            return self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices)
+
+        # SWA eviction is normally done while preparing the next decode batch.
+        # When SWA becomes the first limiting pool, the scheduler can reach this
+        # OOM check before prepare_for_decode() gets a chance to release
+        # out-of-window SWA pages. Try that cheap cleanup once before retracting.
+        if (
+            self.forward_mode is not None
+            and self.forward_mode.is_decode()
+            and (
+                self.tree_cache.supports_swa()
+                or (
+                    hasattr(self.token_to_kv_pool_allocator, "free_swa")
+                    and getattr(self.model_config, "sliding_window_size", None)
+                )
+            )
+        ):
+            self.maybe_evict_swa(force=True)
+            evict_from_tree_cache(self.tree_cache, num_tokens)
+
+        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+            return False
+        return self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices)
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -2311,7 +2494,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
-            self.hisparse_coordinator.retract_req(req)
+            if (
+                server_args.disaggregation_mode == "decode"
+                and self.hisparse_coordinator.is_dsv4_hisparse
+            ):
+                self.hisparse_coordinator.retract_decode_req(req)
+            else:
+                self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
@@ -2336,7 +2525,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.set_req_pool_indices([])
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2354,6 +2543,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        self.ensure_req_pool_indices()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2432,6 +2622,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.seq_lens,
                 self.out_cache_loc,
                 self.req_pool_indices,
+                self.req_pool_indices_cpu,
                 self.seq_lens_cpu,
             )
 
@@ -2482,7 +2673,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.set_req_pool_indices([])
+            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.out_cache_loc = None
+            if self.output_ids is not None:
+                self.output_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_sum = 0
             return
+
+        self.ensure_req_pool_indices()
 
         if len(keep_indices) == len(self.reqs):
             # No need to filter
@@ -2502,6 +2703,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
@@ -2549,6 +2751,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
+        self.ensure_req_pool_indices()
+        other.ensure_req_pool_indices()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2561,6 +2765,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.req_pool_indices_cpu = torch.cat(
+            [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
@@ -2602,6 +2809,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
@@ -2625,18 +2833,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
         )
 
-    def maybe_evict_swa(self):
-        if self.tree_cache.supports_swa():
-            sliding_window_size = self.tree_cache.sliding_window_size
+    def maybe_evict_swa(self, force: bool = False):
+        supports_swa_cache = self.tree_cache.supports_swa()
+        supports_swa_allocator = hasattr(self.token_to_kv_pool_allocator, "free_swa")
+        sliding_window_size = (
+            self.tree_cache.sliding_window_size
+            if supports_swa_cache
+            else getattr(self.model_config, "sliding_window_size", None)
+        )
+        # DSV4 HiSparse keeps decode radix FULL-only, but its allocator still
+        # owns SWA tail pages. It must run the same sliding-window free path.
+        if supports_swa_cache or (supports_swa_allocator and sliding_window_size):
             server_args = get_global_server_args()
 
             release_leaf_lock = (
-                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
+                supports_swa_cache
+                and envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
 
             # Eviction_interval: trade-off between SWA token waste and eviction overhead
-            page_size = self.tree_cache.page_size
+            page_size = (
+                self.tree_cache.page_size
+                if supports_swa_cache
+                else getattr(
+                    self.token_to_kv_pool_allocator,
+                    "logical_page_size",
+                    self.tree_cache.page_size,
+                )
+            )
             eviction_interval = max(
                 page_size,
                 int(
@@ -2650,7 +2875,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
                     # 2. Evict swa every eviction_interval tokens to reduce the overhead.
-                    if req.decode_batch_idx % eviction_interval == 1:
+                    if req.decode_batch_idx > 0 and (
+                        force or req.decode_batch_idx % eviction_interval == 1
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
@@ -2685,14 +2912,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
-        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
+        supports_swa_cache = self.tree_cache.supports_swa()
+        supports_swa_allocator = hasattr(self.token_to_kv_pool_allocator, "free_swa")
+        assert (
+            supports_swa_cache or supports_swa_allocator
+        ), "prefix cache or allocator must support swa"
+        sliding_window_size = (
+            self.tree_cache.sliding_window_size
+            if supports_swa_cache
+            else getattr(self.model_config, "sliding_window_size", None)
+        )
+        assert sliding_window_size is not None, "sliding_window_size must be set"
+        page_size = (
+            self.tree_cache.page_size
+            if supports_swa_cache
+            else getattr(
+                self.token_to_kv_pool_allocator,
+                "logical_page_size",
+                self.tree_cache.page_size,
+            )
+        )
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
         assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
+            req.cache_protected_len % page_size == 0
         ), "cache_protected_len must be page aligned"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+        if not getattr(req, "skip_swa_radix_cache_insert", False):
+            req.swa_evicted_seqlen = max(
+                req.swa_evicted_seqlen, req.cache_protected_len
+            )
 
         # Subtract an extra page_size so the eviction frontier never reaches the
         # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
@@ -2703,16 +2951,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
             evict_threshold = pre_len - sliding_window_size
         else:
-            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
+            evict_threshold = pre_len - sliding_window_size - page_size
         new_swa_evicted_seqlen = max(
             req.swa_evicted_seqlen,
             evict_threshold,
         )
 
-        if self.tree_cache.page_size > 1:
+        if page_size > 1:
             new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
+                new_swa_evicted_seqlen // page_size
+            ) * page_size
 
         if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[

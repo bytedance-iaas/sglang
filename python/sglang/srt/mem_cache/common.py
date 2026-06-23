@@ -39,6 +39,18 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
 
+def state_page_size_from_allocator(token_to_kv_pool_allocator) -> int:
+    logical_allocator = getattr(
+        token_to_kv_pool_allocator,
+        "logical_attn_allocator",
+        token_to_kv_pool_allocator,
+    )
+    kvcache = getattr(logical_allocator, "_kvcache", None)
+    if kvcache is not None and hasattr(kvcache, "swa_page_size"):
+        return kvcache.swa_page_size
+    return logical_allocator.page_size
+
+
 def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
@@ -431,14 +443,14 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
     Returns:
         out_cache_loc: allocated cache locations
         req_pool_indices_device: request pool indices at a device tensor
-        req_pool_indices: request pool indices as list
+        req_pool_indices_cpu: request pool indices as a CPU tensor
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -492,7 +504,7 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
 def alloc_paged_token_slots_decode(

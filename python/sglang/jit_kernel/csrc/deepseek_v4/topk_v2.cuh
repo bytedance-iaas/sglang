@@ -75,6 +75,7 @@ struct TopKParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
+  int32_t* __restrict__ raw_indices;
   int64_t score_stride;
   int64_t page_table_stride;
   uint8_t* __restrict__ workspace;  // [batch, kWorkspaceBytes] -- internally allocated
@@ -88,11 +89,15 @@ struct TopKParams {
   SGL_DEVICE const float* get_scores(const uint32_t batch_id) const {
     return scores + batch_id * score_stride;
   }
-  SGL_DEVICE impl::TransformParams get_transform(const uint32_t batch_id, int32_t* indices) const {
+  SGL_DEVICE impl::TransformParams get_transform(const uint32_t batch_id,
+                                                 int32_t* indices) const {
+    auto* raw_indices_out =
+        raw_indices == nullptr ? nullptr : raw_indices + batch_id * K;
     return {
         .page_table = page_table + batch_id * page_table_stride,
         .indices_in = indices,
         .indices_out = page_indices + batch_id * K,
+        .raw_indices_out = raw_indices_out,
         .page_bits = page_bits,
     };
   }
@@ -392,7 +397,8 @@ struct CombinedTopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView workspace,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -431,6 +437,14 @@ struct CombinedTopKKernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(metadata);
+    int32_t* raw_indices_ptr = nullptr;
+    if (raw_indices.has_value()) {
+      TensorMatcher({B, K})  //
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(raw_indices.value());
+      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
+    }
 
     const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
@@ -448,6 +462,7 @@ struct CombinedTopKKernel {
         .scores = static_cast<float*>(scores.data_ptr()),
         .page_table = static_cast<int32_t*>(page_table.data_ptr()),
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
+        .raw_indices = raw_indices_ptr,
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
         .workspace = static_cast<uint8_t*>(workspace.data_ptr()),

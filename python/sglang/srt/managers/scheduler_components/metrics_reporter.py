@@ -686,6 +686,10 @@ class SchedulerMetricsReporter:
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            if self.scheduler.enable_hisparse and hasattr(
+                self.scheduler, "pop_disagg_decode_pipeline_stats_msg"
+            ):
+                msg += self.scheduler.pop_disagg_decode_pipeline_stats_msg()
 
         if (
             self.scheduler.server_args.language_only

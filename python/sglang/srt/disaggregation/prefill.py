@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_num,
     maybe_cache_unfinished_req,
     release_kv_cache,
+    state_page_size_from_allocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -124,6 +125,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        self.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.max_token_pool_size
         )
@@ -144,6 +146,7 @@ class PrefillBootstrapQueue:
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
         kv_args.mla_compression_ratios = None
+        kv_args.dsv4_hisparse_c4_mapping = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -188,6 +191,11 @@ class PrefillBootstrapQueue:
             # buckets rather than by layer.
             kv_args.mla_compression_ratios = list(
                 self.token_to_kv_pool.compression_ratios
+            )
+            kv_args.dsv4_hisparse_c4_mapping = getattr(
+                self.token_to_kv_pool_allocator,
+                "full_to_hisparse_device_index_mapping",
+                None,
             )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -329,6 +337,15 @@ class PrefillBootstrapQueue:
             # if decode has a cached prefix, we need to send the delta indices
             # otherwise, send the entire request
             decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            if decode_prefix_len < 0 or decode_prefix_len > num_kv_indices:
+                logger.warning(
+                    "Clamping invalid decode_prefix_len for req %s: "
+                    "decode_prefix_len=%d, num_kv_indices=%d",
+                    req.rid,
+                    decode_prefix_len,
+                    num_kv_indices,
+                )
+                decode_prefix_len = min(max(decode_prefix_len, 0), num_kv_indices)
             req.start_send_idx = decode_prefix_len
             num_kv_indices_to_send = num_kv_indices - decode_prefix_len
             num_pages = kv_to_page_num(
@@ -550,7 +567,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
                         prepare_abort(
                             req,
                             error_message,
@@ -649,7 +666,7 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                release_kv_cache(req, self.tree_cache, is_insert=False)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -756,7 +773,11 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        page_size = self.token_to_kv_pool_allocator.page_size
+        # PD sends source KV pages. For DSV4 HiSparse the allocator wrapper's
+        # page_size is the C4 device page, while the source KV transfer still
+        # uses the underlying DeepSeekV4TokenToKVPool page size.
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = token_to_kv_pool.page_size
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -787,6 +808,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_metadata_buffers.set_buf(req)
 
             seq_len = len(req.fill_ids)
+            swa_state_page_size = state_page_size_from_allocator(
+                self.token_to_kv_pool_allocator
+            )
 
             def _mamba_payload():
                 return [
@@ -800,7 +824,9 @@ class SchedulerDisaggregationPrefillMixin:
             def _swa_payload():
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
+                window_start = (window_start // swa_state_page_size) * (
+                    swa_state_page_size
+                )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
@@ -810,14 +836,17 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), swa_state_page_size
                 )
 
             def _nsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                device_page_size = token_to_kv_pool.page_size
+                return kv_to_page_indices(
+                    kv_indices_full.cpu().numpy(), device_page_size
+                )
 
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types

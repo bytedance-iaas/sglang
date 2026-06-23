@@ -448,11 +448,31 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            self.enable_hisparse_radix_cache = False
+            if hasattr(self.tree_cache, "init_hisparse_radix_cache"):
+                self.enable_hisparse_radix_cache = (
+                    self.tree_cache.init_hisparse_radix_cache(
+                        self.hisparse_coordinator.mem_pool_host,
+                        self.server_args,
+                    )
+                )
+                if self.enable_hisparse_radix_cache:
+                    self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
+            self.enable_hisparse_c4_prefix_cache = False
+            if not self.enable_hisparse_radix_cache:
+                self.enable_hisparse_c4_prefix_cache = (
+                    self.hisparse_coordinator.enable_c4_host_prefix_cache()
+                )
+        else:
+            self.enable_hisparse_radix_cache = False
+            self.enable_hisparse_c4_prefix_cache = False
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -2237,9 +2257,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        batch.req_pool_indices = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
-        )
+        batch.set_req_pool_indices_from_reqs()
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
@@ -2416,7 +2434,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -2599,7 +2617,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -2682,7 +2700,7 @@ class Scheduler(
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
@@ -3119,6 +3137,7 @@ class Scheduler(
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
@@ -3390,7 +3409,10 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
+                if self.enable_hisparse and self.hisparse_coordinator is not None:
+                    req.finished_reason = req.finished_reason or FINISH_ABORT()
+                    self.hisparse_coordinator.request_finished(req)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
@@ -3429,20 +3451,14 @@ class Scheduler(
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        decode_req.req.finished_reason = FINISH_ABORT()
+            self.disagg_decode_prealloc_queue.abort_requests(
+                recv_req.rid, recv_req.abort_all
+            )
 
             # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        decode_req.req.finished_reason = FINISH_ABORT()
+            self.disagg_decode_transfer_queue.abort_requests(
+                recv_req.rid, recv_req.abort_all
+            )
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
@@ -3451,6 +3467,10 @@ class Scheduler(
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
+                        if self.enable_hisparse and self.hisparse_coordinator:
+                            self.hisparse_coordinator.release_retracted_decode_req(
+                                decode_req
+                            )
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )

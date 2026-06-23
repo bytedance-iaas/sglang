@@ -250,6 +250,15 @@ class Envs:
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
     SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
+    # DSV4 HiSparse keeps C4 KV compressed/host-backed on decode, so reserving
+    # the full clipped output length during PD preallocation is too conservative.
+    SGLANG_HISPARSE_RELAX_DECODE_OUTPUT_RESERVE = EnvBool(True)
+    SGLANG_HISPARSE_DECODE_UTILIZATION_GOVERNOR = EnvBool(True)
+    SGLANG_HISPARSE_DECODE_FULL_USAGE_TARGET = EnvFloat(0.92)
+    SGLANG_HISPARSE_DECODE_FULL_USAGE_HARD_LIMIT = EnvFloat(0.98)
+    # Opt in to reuse full logical prefix pages for the validated DSV4
+    # HiSparse C4 host-mirror path.
+    SGLANG_HISPARSE_DECODE_SAFE_PREFIX_REUSE = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -265,6 +274,8 @@ class Envs:
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    SGLANG_DSV4_PREFILL_DP_SYNC_DEBUG = EnvBool(False)
+    SGLANG_DSV4_PREFILL_DP_SYNC_CPU_FALLBACK = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
@@ -613,6 +624,7 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_REQUIRE_MEGAMOE = EnvBool(False)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
@@ -630,6 +642,10 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # HiSparse still needs a separate swap-in pass after raw top-k output, but
+    # topk_v2 avoids the old fixed-512/1024 path and can write raw indices into
+    # the preallocated swap-in buffer.
+    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(True)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

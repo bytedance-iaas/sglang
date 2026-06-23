@@ -25,7 +25,6 @@ import logging
 import os
 import random
 import tempfile
-from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -403,6 +402,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
+    _swa_full_tokens_ratio_specified: bool = False
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -566,25 +566,6 @@ class ServerArgs:
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
-
-    @cached_property
-    def max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count speculative decoding may use."""
-        if self.speculative_num_draft_tokens is None:
-            return None
-        if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
-
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
-
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=self.speculative_adaptive_config,
-        )
-        # Adaptive spec currently requires topk=1, so each runtime state needs
-        # steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-        return max(candidate_steps) + 1
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -3220,6 +3201,12 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "deep_gemm"
+                logger.info(
+                    "Mega MoE is enabled, auto-configuring "
+                    "--moe-runner-backend deep_gemm."
+                )
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(
@@ -3676,21 +3663,35 @@ class ServerArgs:
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
+                is_dsv4_hisparse_decode = False
                 if self.enable_hisparse:
+                    try:
+                        from sglang.srt.configs.model_config import is_deepseek_v4
+
+                        hf_config = self.get_model_config().hf_config
+                        is_dsv4_hisparse_decode = is_deepseek_v4(hf_config)
+                    except Exception:
+                        is_dsv4_hisparse_decode = False
+                if self.enable_hisparse and not is_dsv4_hisparse_decode:
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with --enable-hisparse"
                     )
-                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+                if is_dsv4_hisparse_decode:
+                    supported_transfer_backends = ("mooncake",)
+                else:
+                    supported_transfer_backends = ("nixl", "mooncake")
+                if self.disaggregation_transfer_backend not in supported_transfer_backends:
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache currently "
                         "requires --disaggregation-transfer-backend in "
-                        "('nixl', 'mooncake'), but got "
+                        f"{supported_transfer_backends}, but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
                 if (
                     self.speculative_algorithm is not None
                     and not self._allow_dsv4_decode_radix_speculative()
+                    and not is_dsv4_hisparse_decode
                 ):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -4611,7 +4612,7 @@ class ServerArgs:
         parser.add_argument(
             "--swa-full-tokens-ratio",
             type=float,
-            default=ServerArgs.swa_full_tokens_ratio,
+            default=None,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
         )
@@ -6552,7 +6553,13 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
-            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
+            help=(
+                "Enable radix cache on decode server (PD mode). Caches KV "
+                "prefixes to avoid redundant transfers. Requires "
+                "--disaggregation-transfer-backend nixl or mooncake. "
+                "For --enable-hisparse, only DeepSeek V4 HiSparse with "
+                "mooncake is supported."
+            ),
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
@@ -6792,8 +6799,14 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
+        if args.swa_full_tokens_ratio is None:
+            args.swa_full_tokens_ratio = ServerArgs.swa_full_tokens_ratio
+            args._swa_full_tokens_ratio_specified = False
+        else:
+            args._swa_full_tokens_ratio_specified = True
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        return cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"

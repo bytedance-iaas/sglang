@@ -27,13 +27,19 @@ struct TransformParams {
   const int32_t* __restrict__ page_table;
   const int32_t* __restrict__ indices_in;
   int32_t* __restrict__ indices_out;
+  int32_t* __restrict__ raw_indices_out;
   uint32_t page_bits;
 
   SGL_DEVICE void transform(const uint32_t idx) const {
-    indices_out[idx] = page_to_indices(page_table, indices_in[idx], page_bits);
+    write(idx, indices_in[idx]);
   }
   SGL_DEVICE void write(const uint32_t dst, const uint32_t src) const {
     indices_out[dst] = page_to_indices(page_table, src, page_bits);
+    if (raw_indices_out != nullptr) raw_indices_out[dst] = src;
+  }
+  SGL_DEVICE void write_invalid(const uint32_t dst) const {
+    indices_out[dst] = -1;
+    if (raw_indices_out != nullptr) raw_indices_out[dst] = -1;
   }
 };
 
@@ -84,7 +90,7 @@ SGL_DEVICE void trivial_transform(const TransformParams& params, uint32_t length
   if (const auto tx = threadIdx.x; tx < length) {
     params.write(tx, tx);
   } else if (tx < K) {
-    params.indices_out[tx] = -1;
+    params.write_invalid(tx);
   }
 }
 

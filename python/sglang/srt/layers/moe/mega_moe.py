@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
@@ -39,8 +40,85 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
+
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_MEGA_MOE_STATE_LOGGED: set[str] = set()
+_DEEP_GEMM_MODULE = None
+_DEEP_GEMM_IMPORT_TRIED = False
+
+
+def _format_log_message(message: str, args: tuple) -> str:
+    return message % args if args else message
+
+
+def _log_mega_moe_state_once(key: str, message: str, *args) -> None:
+    if key in _MEGA_MOE_STATE_LOGGED:
+        return
+    _MEGA_MOE_STATE_LOGGED.add(key)
+    logger.info(message, *args)
+
+
+def _log_mega_moe_runtime_summary_once(
+    moe: "DeepseekV2MoE", deep_gemm_module, reason: str
+) -> None:
+    if "runtime_summary" in _MEGA_MOE_STATE_LOGGED:
+        return
+    _MEGA_MOE_STATE_LOGGED.add("runtime_summary")
+    logger.info(
+        "MegaMoE runtime summary: reason=%s, deep_gemm_file=%s, "
+        "has_fp8_mega_moe=%s, has_fp8_fp4_mega_moe=%s, "
+        "has_get_symm_buffer_for_mega_moe=%s, device_sm=%s, "
+        "weights_built=%s, sm90_fp8_weights=%s, token_cap=%d, "
+        "require_megamoe=%s.",
+        reason,
+        getattr(deep_gemm_module, "__file__", None),
+        bool(
+            deep_gemm_module is not None
+            and hasattr(deep_gemm_module, "fp8_mega_moe")
+        ),
+        bool(
+            deep_gemm_module is not None
+            and hasattr(deep_gemm_module, "fp8_fp4_mega_moe")
+        ),
+        bool(
+            deep_gemm_module is not None
+            and hasattr(deep_gemm_module, "get_symm_buffer_for_mega_moe")
+        ),
+        _device_sm,
+        bool(getattr(moe.experts, "_mega_moe_weights_built", False)),
+        bool(getattr(moe.experts, "_mega_moe_sm90_fp8_weights", False)),
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get(),
+        envs.SGLANG_REQUIRE_MEGAMOE.get(),
+    )
+
+
+def _handle_mega_moe_unavailable(
+    key: str,
+    message: str,
+    *args,
+) -> bool:
+    if envs.SGLANG_REQUIRE_MEGAMOE.get():
+        raise RuntimeError(
+            _format_log_message(message, args)
+            + " SGLANG_REQUIRE_MEGAMOE=1 forbids MegaMoE fallback."
+        )
+    _log_mega_moe_state_once(key, message, *args)
+    return False
+
+
+def _try_import_deep_gemm():
+    global _DEEP_GEMM_MODULE, _DEEP_GEMM_IMPORT_TRIED
+    if _DEEP_GEMM_IMPORT_TRIED:
+        return _DEEP_GEMM_MODULE
+    _DEEP_GEMM_IMPORT_TRIED = True
+    try:
+        import deep_gemm
+    except ImportError:
+        return None
+    _DEEP_GEMM_MODULE = deep_gemm
+    return deep_gemm
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -101,25 +179,64 @@ def _get_mega_moe_symm_buffer(
 def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
+    deep_gemm = _try_import_deep_gemm()
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
-        return False
+        _log_mega_moe_runtime_summary_once(moe, deep_gemm, "weights_not_built")
+        return _handle_mega_moe_unavailable(
+            "weights_not_built",
+            "MegaMoE requested but expert weights are not built yet; falling back "
+            "to the configured MoE runner.",
+        )
     if _device_sm is None or _device_sm < 90:
-        return False
-    try:
-        import deep_gemm
-    except ImportError:
-        return False
+        _log_mega_moe_runtime_summary_once(moe, deep_gemm, "unsupported_sm")
+        return _handle_mega_moe_unavailable(
+            "unsupported_sm",
+            "MegaMoE requested but device SM %s is unsupported; falling back to "
+            "the configured MoE runner.",
+            _device_sm,
+        )
+    if deep_gemm is None:
+        _log_mega_moe_runtime_summary_once(moe, deep_gemm, "missing_deep_gemm")
+        return _handle_mega_moe_unavailable(
+            "missing_deep_gemm",
+            "MegaMoE requested but deep_gemm is unavailable; falling back to the "
+            "configured MoE runner.",
+        )
     if _device_sm == 90:
         if not hasattr(deep_gemm, "fp8_mega_moe"):
-            return False
+            _log_mega_moe_runtime_summary_once(
+                moe, deep_gemm, "runtime_mismatch_missing_sm90_kernel"
+            )
+            return _handle_mega_moe_unavailable(
+                "runtime_mismatch_missing_sm90_kernel",
+                "MegaMoE requested on SM90 but deep_gemm.fp8_mega_moe is "
+                "unavailable. This indicates the deep_gemm runtime does not "
+                "match the DeepSeek V4 MegaMoE-capable environment; falling "
+                "back to the configured MoE runner.",
+            )
         if not getattr(moe.experts, "_mega_moe_sm90_fp8_weights", False):
-            return False
+            _log_mega_moe_runtime_summary_once(moe, deep_gemm, "missing_sm90_weights")
+            return _handle_mega_moe_unavailable(
+                "missing_sm90_weights",
+                "MegaMoE requested on SM90 but SM90 FP8 expert weights are not "
+                "prepared; falling back to the configured MoE runner.",
+            )
     elif _device_sm >= 100:
         if not hasattr(deep_gemm, "fp8_fp4_mega_moe"):
-            return False
+            _log_mega_moe_runtime_summary_once(moe, deep_gemm, "missing_sm100_kernel")
+            return _handle_mega_moe_unavailable(
+                "missing_sm100_kernel",
+                "MegaMoE requested on SM100+ but deep_gemm.fp8_fp4_mega_moe is "
+                "unavailable; falling back to the configured MoE runner.",
+            )
     else:
         return False
     if get_is_capture_mode():
+        _log_mega_moe_runtime_summary_once(moe, deep_gemm, "enabled_capture")
+        _log_mega_moe_state_once(
+            "enabled_capture",
+            "MegaMoE is enabled during cuda graph capture.",
+        )
         return True
 
     try:
@@ -131,7 +248,25 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        _log_mega_moe_runtime_summary_once(moe, deep_gemm, "token_cap_exceeded")
+        return _handle_mega_moe_unavailable(
+            "token_cap_exceeded",
+            "MegaMoE requested but max_tokens_per_rank=%d exceeds "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=%d; falling "
+            "back to the configured MoE runner.",
+            max_tokens_per_rank,
+            cap,
+        )
+
+    _log_mega_moe_runtime_summary_once(moe, deep_gemm, "enabled_runtime")
+    _log_mega_moe_state_once(
+        "enabled_runtime",
+        "MegaMoE is enabled at runtime with max_tokens_per_rank=%d, cap=%d.",
+        max_tokens_per_rank,
+        cap,
+    )
+    return True
 
 
 def forward_mega_moe(

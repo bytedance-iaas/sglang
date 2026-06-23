@@ -45,8 +45,17 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             envs.SGLANG_ENABLE_SPEC_V2.set(True)
             logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
 
-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        server_args.swa_full_tokens_ratio = 0.1
+    if (
+        not getattr(server_args, "_swa_full_tokens_ratio_specified", False)
+        and server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio
+    ):
+        # DSV4 normally uses a compact SWA pool.  HiSparse decode keeps a large
+        # C4 host mirror and can reach higher BS, so leave more SWA tail headroom
+        # by default to avoid retraction at the throughput knee.
+        if server_args.enable_hisparse and server_args.disaggregation_mode == "decode":
+            server_args.swa_full_tokens_ratio = 0.15
+        else:
+            server_args.swa_full_tokens_ratio = 0.1
         logger.info(
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )

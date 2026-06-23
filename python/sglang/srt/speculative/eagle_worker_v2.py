@@ -168,6 +168,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # HiSparse request admission and side-buffer state live on the target
+        # runner. Draft-extend reuses that coordinator when binding speculative
+        # cache locs to device slots.
+        self.draft_runner._target_model_runner = self.target_worker.model_runner
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -346,6 +350,7 @@ class EagleDraftWorker(BaseDraftWorker):
             batch,
             self.cuda_graph_runner,
             self.draft_runner,
+            self.target_worker.model_runner,
             self.topk,
             self.speculative_num_steps,
         )
@@ -421,7 +426,11 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
-        out_cache_loc = forward_batch.out_cache_loc
+        out_cache_loc = (
+            spec_info.draft_cache_locs
+            if spec_info.draft_cache_locs is not None
+            else forward_batch.out_cache_loc
+        )
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -1035,7 +1044,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
@@ -1067,6 +1076,34 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+
+        hisparse_coordinator = getattr(
+            self.target_worker.model_runner, "hisparse_coordinator", None
+        )
+        if (
+            verify_input.topk == 1
+            and hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and not batch.forward_mode.is_idle()
+        ):
+            accept_index_flat = accept_index[accept_index != -1]
+            if accept_index_flat.numel() > batch.out_cache_loc.numel():
+                raise RuntimeError(
+                    "EAGLE HiSparse accepted-token bookkeeping mismatch: "
+                    f"{accept_index_flat.numel()} accepted indices for "
+                    f"{batch.out_cache_loc.numel()} draft cache locs."
+            )
+            num_correct_drafts = accept_lens - 1
+            batch.ensure_req_pool_indices()
+            hisparse_coordinator.finalize_accepted_tokens(
+                batch.req_pool_indices,
+                batch.req_pool_indices_cpu,
+                batch.out_cache_loc[accept_index_flat],
+                batch.out_cache_loc,
+                num_correct_drafts,
+                num_correct_drafts.cpu(),
+                new_seq_lens,
+            )
 
         # Update mamba state for hybrid GDN models after verification
         if (

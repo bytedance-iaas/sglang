@@ -16,28 +16,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: add step=0 (nospec fallback) for BS>=8 once supported.
-DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
-    "1": {
-        "candidate_steps": [1, 3, 7],
-        "up_hysteresis": 0.0,
-        "down_hysteresis": -0.25,
-        "ceiling_coeff": 0,
-    },
-    "8": {
-        "candidate_steps": [1, 3],
-        "up_hysteresis": 0.0,
-        "down_hysteresis": 0.0,
-        "ceiling_coeff": 0,
-    },
-    "32": {
-        "candidate_steps": [1],
-        "up_hysteresis": 0.0,
-        "down_hysteresis": 0.0,
-        "ceiling_coeff": 0,
-    },
-}
-
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
@@ -74,44 +52,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def _load_adaptive_config(
-    cfg_path: str | None,
-) -> tuple[dict, dict[int, dict]]:
-    """Load and validate adaptive config.
-
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
-    """
-    if cfg_path is not None:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-    else:
-        cfg = DEFAULT_ADAPTIVE_CONFIG
-
-    bs_entries: dict[int, dict] = {}
-    for key, entry in cfg.items():
-        if not key.isdigit():
-            continue
-
-        steps = entry.get("candidate_steps")
-        if (
-            not isinstance(steps, list)
-            or not steps
-            or not all(isinstance(s, int) and s > 0 for s in steps)
-        ):
-            raise ValueError(
-                f"BS {key}: candidate_steps must be a list of positive ints, got {steps!r}"
-            )
-        bs_entries[int(key)] = entry
-
-    if not bs_entries:
-        raise ValueError(
-            "speculative_adaptive_config must contain at least one integer-string "
-            'BS key, e.g. {"1": {"candidate_steps": [1,3,7]}}. '
-            f"Got keys: {list(cfg.keys())}"
-        )
-    return cfg, bs_entries
-
-
 def load_adaptive_config(path: str | None) -> dict[str, object]:
     """Load adaptive speculative config from a JSON file.
 
@@ -131,17 +71,6 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
             f"got {type(cfg).__name__}"
         )
     return cfg
-
-
-def resolve_candidate_steps_from_config(
-    cfg_path: str | None = None,
-) -> list[int]:
-    """Union of every BS slot's candidate steps; sizes the runtime buffers."""
-    _, bs_entries = _load_adaptive_config(cfg_path)
-    all_steps: set[int] = set()
-    for entry in bs_entries.values():
-        all_steps.update(entry["candidate_steps"])
-    return sorted(all_steps)
 
 
 class AdaptiveSpeculativeParams:

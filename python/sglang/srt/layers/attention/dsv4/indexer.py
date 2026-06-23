@@ -402,6 +402,12 @@ class C4IndexerBackendMixin:
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
+        topk_size = core_metadata.c4_sparse_page_indices.shape[1]
+        requires_flexible_topk = topk_size not in (512, 1024)
+        use_topk_v2 = envs.SGLANG_OPT_USE_TOPK_V2.get() and (
+            not hisparse_decode or envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()
+            or requires_flexible_topk
+        )
 
         raw_indices = None
         if capture_enabled:
@@ -420,7 +426,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif use_topk_v2:
             topk_transform_512_v2(
                 logits,
                 indexer_metadata.c4_seq_lens,
@@ -428,8 +434,15 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+                raw_indices,
+                indexer_metadata.get_topk_workspace(),
             )
         else:
+            if requires_flexible_topk:
+                raise ValueError(
+                    "DSV4 top-k values other than 512/1024 require "
+                    "SGLANG_OPT_USE_TOPK_V2=1."
+                )
             topk_transform_512(
                 logits,
                 indexer_metadata.c4_seq_lens,
