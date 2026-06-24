@@ -574,6 +574,11 @@ class OfflinePPStateOffloadManager:
                 self.prefetch_stream.synchronize()
                 self._release_prefetched_req(req, entry)
                 raise
+            if self.is_hybrid:
+                # Hybrid alloc marks a fresh mamba slot as needing a clear.
+                # Offline prefetch immediately restores the authoritative host
+                # state into that slot, so a later deferred clear would be wrong.
+                req.mamba_needs_clear = False
             entry.prefetched = True
             wave.prefetch_done_units += 1
             consumed += alloc_len

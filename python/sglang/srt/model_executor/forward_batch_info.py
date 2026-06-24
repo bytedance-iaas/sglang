@@ -620,6 +620,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        if getattr(batch, "offline_pp_wave_id", None) is not None:
+            mamba_track_indices = None
+            mamba_track_mask = None
+            mamba_track_seqlens = None
+        else:
+            mamba_track_indices = batch.mamba_track_indices
+            mamba_track_mask = batch.mamba_track_mask
+            mamba_track_seqlens = batch.mamba_track_seqlens
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -632,9 +641,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_track_mask=batch.mamba_track_mask,
-            mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=mamba_track_seqlens,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
