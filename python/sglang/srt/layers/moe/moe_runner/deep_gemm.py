@@ -64,6 +64,7 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 logger = logging.getLogger(__name__)
 _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS = 0
+_SM90_MXFP8_GATHER_DIFF_EVENTS = 0
 
 
 def _sm90_mxfp8_act_quant_diff_enabled() -> bool:
@@ -174,6 +175,87 @@ def _sm90_mxfp8_scale_stats(scale: torch.Tensor) -> dict:
         "zero_count": int((scale_bytes == 0).sum().item()),
         "ff_count": int((scale_bytes == 0xFF).sum().item()),
     }
+
+
+def _sm90_mxfp8_gather_diff_report(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output_index: torch.Tensor,
+    gather_out: torch.Tensor,
+) -> None:
+    global _SM90_MXFP8_GATHER_DIFF_EVENTS
+    if not _sm90_mxfp8_act_quant_diff_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_GATHER_MAX_EVENTS", "8"))
+    if _SM90_MXFP8_GATHER_DIFF_EVENTS >= max_events:
+        return
+    if gather_out.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_GATHER_DIFF_EVENTS += 1
+
+    sample_tokens = min(
+        gather_out.shape[0],
+        int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_GATHER_TOKENS", "4")),
+    )
+    sample_cols = min(
+        gather_out.shape[1],
+        int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_GATHER_K", "256")),
+    )
+
+    diffs = []
+    with torch.no_grad():
+        cols = torch.arange(sample_cols, device=gather_out.device, dtype=torch.long)
+        for token in range(sample_tokens):
+            ref = torch.zeros(sample_cols, device=gather_out.device, dtype=torch.float32)
+            token_sources = []
+            token_weights = []
+            token_experts = []
+            for topk_idx in range(topk_ids.shape[1]):
+                expert_id = int(topk_ids[token, topk_idx].item())
+                source_idx = int(output_index[token, topk_idx].item())
+                weight = float(topk_weights[token, topk_idx].item())
+                token_experts.append(expert_id)
+                token_sources.append(source_idx)
+                token_weights.append(weight)
+                if expert_id < 0:
+                    continue
+                ref += hidden_states[source_idx, cols].to(torch.float32) * weight
+            actual = gather_out[token, cols].to(torch.float32)
+            diff = (actual - ref).abs()
+            diffs.append(
+                {
+                    "token": token,
+                    "cols": sample_cols,
+                    "topk_ids": token_experts,
+                    "output_index": token_sources,
+                    "topk_weights": token_weights,
+                    "max_abs_diff": float(diff.max().item()),
+                    "mean_abs_diff": float(diff.mean().item()),
+                    "ref_absmax": float(ref.abs().max().item()),
+                    "actual_absmax": float(actual.abs().max().item()),
+                    "ref_stats": _sm90_mxfp8_numeric_stats(ref),
+                    "actual_stats": _sm90_mxfp8_numeric_stats(actual),
+                }
+            )
+
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H10",
+        "location": "deep_gemm.py:post_permute_deep_gemm_to_deepep_normal:gather_diff",
+        "msg": "[DEBUG] SM90 MXFP8 DeepEP ep_gather local reference diff",
+        "data": {
+            "hidden_states": _sm90_mxfp8_debug_tensor_meta(hidden_states),
+            "topk_ids": _sm90_mxfp8_debug_tensor_meta(topk_ids),
+            "topk_weights": _sm90_mxfp8_debug_tensor_meta(topk_weights),
+            "output_index": _sm90_mxfp8_debug_tensor_meta(output_index),
+            "gather_out": _sm90_mxfp8_debug_tensor_meta(gather_out),
+            "diffs": diffs,
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def _sm90_mxfp8_act_quant_diff_report(
@@ -1312,6 +1394,13 @@ def post_permute_deep_gemm_to_deepep_normal(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+    _sm90_mxfp8_gather_diff_report(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output_index=output_index,
+        gather_out=gather_out,
+    )
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,
