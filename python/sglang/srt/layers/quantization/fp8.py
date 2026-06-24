@@ -395,28 +395,40 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.use_sm90_mxfp8_deepgemm_linear = False
+        self.convert_sm90_mxfp8_to_block = False
         if self.use_mxfp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
+            use_sm90_mxfp8_deepgemm_linear = (
+                envs.SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR.get()
+            )
             self.use_sm90_mxfp8_deepgemm_linear = (
                 deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
-                and envs.SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR.get()
+                and use_sm90_mxfp8_deepgemm_linear
+            )
+            self.convert_sm90_mxfp8_to_block = (
+                _is_cuda
+                and is_sm90_supported()
+                and not is_sm100_supported()
+                and not use_sm90_mxfp8_deepgemm_linear
             )
             if (
                 _is_cuda
                 and is_sm90_supported()
                 and not is_sm100_supported()
                 and not self.use_sm90_mxfp8_deepgemm_linear
-                and envs.SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR.get()
+                and use_sm90_mxfp8_deepgemm_linear
             ):
                 raise RuntimeError(
                     "SM90 MXFP8 dense linear requires DeepGEMM grouped MXFP8 APIs."
                 )
-        # gfx942 lacks dense MXFP8 matmul support; convert dense MXFP8
-        # -> block-fp8 [128,128] at load and run native block-fp8 kernels.
+        # gfx942 lacks dense MXFP8 matmul support; the SM90 conversion path is
+        # a diagnostic fallback when custom DeepGEMM MXFP8 dense linear is
+        # disabled. Convert dense MXFP8 -> block-fp8 [128,128] at load and run
+        # native block-fp8 kernels.
         self.convert_mxfp8_to_block = (
             self.use_mxfp8
-            and _mxfp8_to_block_fp8_required
+            and (_mxfp8_to_block_fp8_required or self.convert_sm90_mxfp8_to_block)
             and not self.use_sm90_mxfp8_deepgemm_linear
         )
         # Effective per-instance block size for the apply path. Defaults to the
@@ -577,7 +589,8 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # Convert dense MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [128,128]
-        # only for targets without a direct MXFP8 path (currently gfx942).
+        # for targets without a direct MXFP8 path or for the SM90 diagnostic
+        # fallback when custom DeepGEMM MXFP8 dense linear is disabled.
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
