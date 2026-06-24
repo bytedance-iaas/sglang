@@ -301,6 +301,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
+            k = k.contiguous()
+            v = v.contiguous()
+            idx_k = idx_k.contiguous()
+            if idx_v is not None:
+                idx_v = idx_v.contiguous()
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
                 forward_batch.out_cache_loc,
