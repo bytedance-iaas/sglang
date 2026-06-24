@@ -367,6 +367,17 @@ class OfflinePPStateOffloadManager:
             self._log_wave("OFFLOAD_READY", wave)
         return wave.offload_ready
 
+    def wait_wave_offload_ready(self, wave: WaveStateHandle) -> bool:
+        if wave.offload_ready:
+            return True
+        if wave.offload_done_event is None:
+            return False
+        self._log_wave("OFFLOAD_WAIT", wave)
+        wave.offload_done_event.synchronize()
+        wave.offload_ready = True
+        self._log_wave("OFFLOAD_READY", wave)
+        return True
+
     def mark_wave_offloaded(self, wave: WaveStateHandle) -> bool:
         """Free the wave's device slots and move it to the OFFLOADED queue.
 
@@ -561,6 +572,43 @@ class OfflinePPStateOffloadManager:
     def wait_prefetch_for_decode(self, wave: WaveStateHandle) -> None:
         if wave.prefetch_done_event is not None:
             self.device_module.current_stream().wait_event(wave.prefetch_done_event)
+
+    def ensure_decode_ready_for_schedule(self, free_slots: int) -> None:
+        """Blocking catch-up at the decode scheduling boundary.
+
+        PP ranks must make the same batch decision. Async D2H/H2D event queries
+        can complete in different scheduler ticks on different ranks, so before
+        starting a decode wave we block only the boundary rank-local laggards
+        until their earliest pending wave reaches DECODE_READY.
+        """
+        if any(wave.state == WaveState.DECODE_READY for wave in self.waves.values()):
+            return
+
+        for wave in list(self.waves.values()):
+            if (
+                wave.state == WaveState.PREFILLING
+                and wave.offload_done_event is not None
+            ):
+                if self.wait_wave_offload_ready(wave):
+                    self.mark_wave_offloaded(wave)
+
+        prefetching = [
+            w for w in self.waves.values() if w.state == WaveState.PREFETCHING
+        ]
+        if not prefetching:
+            wave = self.pop_next_offloaded()
+            if wave is not None and self.admit_wave(wave):
+                self.start_prefetching(wave)
+                prefetching = [wave]
+
+        for wave in prefetching:
+            if free_slots > 0:
+                self.prefetch_step(wave, free_slots)
+            if all(e.prefetched for e in wave.entries.values()):
+                if wave.prefetch_done_event is not None:
+                    self._log_wave("PREFETCH_WAIT", wave)
+                    wave.prefetch_done_event.synchronize()
+                self.is_wave_decode_ready(wave)
 
     def _release_prefetched_req(self, req: "Req", entry: _ReqStateEntry) -> None:
         """Release a partially/fully prefetched request back to host-only state."""

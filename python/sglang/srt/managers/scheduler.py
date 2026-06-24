@@ -2478,6 +2478,9 @@ class Scheduler(
         if mgr.has_decoding_wave():
             return None
 
+        mgr.ensure_decode_ready_for_schedule(
+            self.token_to_kv_pool_allocator.available_size()
+        )
         wave = mgr.take_decode_ready_wave(
             mb_id=getattr(self, "current_pp_mb_id", None)
         )
