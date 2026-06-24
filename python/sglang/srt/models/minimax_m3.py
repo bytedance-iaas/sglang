@@ -474,7 +474,9 @@ class MiniMaxM3MoE(nn.Module):
             num_fused_shared_experts=self.num_fused_shared_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
-            torch_native=envs.SGLANG_OPT_USE_MINIMAX_MOE_TOPK_TORCH_NATIVE.get(),
+        )
+        self.use_torch_native_topk = (
+            envs.SGLANG_OPT_USE_MINIMAX_MOE_TOPK_TORCH_NATIVE.get()
         )
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -511,6 +513,16 @@ class MiniMaxM3MoE(nn.Module):
             self.ep_size = get_moe_expert_parallel_world_size()
             self.top_k = config.num_experts_per_tok
 
+    def _select_topk(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        **kwargs,
+    ):
+        if self.use_torch_native_topk:
+            return self.topk.forward_native(hidden_states, router_logits, **kwargs)
+        return self.topk(hidden_states, router_logits, **kwargs)
+
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
@@ -539,7 +551,7 @@ class MiniMaxM3MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self._select_topk(hidden_states, router_logits)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -560,7 +572,7 @@ class MiniMaxM3MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
-            topk_output = self.topk(
+            topk_output = self._select_topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
