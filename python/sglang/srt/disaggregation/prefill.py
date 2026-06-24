@@ -794,7 +794,11 @@ class SchedulerDisaggregationPrefillMixin:
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
         dcp_size_local = getattr(kv_mgr, "dcp_size", 1) or 1
         dcp_rank_local = getattr(kv_mgr, "dcp_rank", 0) or 0
-        if dcp_size_local > 1:
+        dsv4_dcp_transfer = (
+            dcp_size_local > 1
+            and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        )
+        if dcp_size_local > 1 and not dsv4_dcp_transfer:
             kv_indices = filter_kv_indices_for_dcp_rank(
                 kv_indices, dcp_size_local, dcp_rank_local
             )
@@ -825,8 +829,20 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
+                window_kv_indices_swa_np = window_kv_indices_swa.cpu().numpy()
+                if dsv4_dcp_transfer:
+                    # DSV4 state_data flat layout is heterogeneous:
+                    # [swa_kv, compress_state, indexer_compress_state].
+                    # Under DCP, swa_kv is sharded by SWA-token loc while
+                    # compress states are not sharded and remain page-level.
+                    # Return both lists; mooncake interprets this expanded
+                    # payload only for DSV4+DCP.
+                    return [
+                        window_kv_indices_swa_np,
+                        kv_to_page_indices(window_kv_indices_swa_np, page_size),
+                    ]
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa_np, page_size
                 )
 
             def _nsa_payload():
@@ -843,7 +859,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
+                    swa_payload = _swa_payload()
+                    if dsv4_dcp_transfer:
+                        state_indices.extend(swa_payload)
+                    else:
+                        state_indices.append(swa_payload)
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
                 else:
@@ -857,6 +877,9 @@ class SchedulerDisaggregationPrefillMixin:
             # token-loc array unchanged and let the transfer backend issue
             # token-level RDMA. The arg name stays ``page_indices`` to
             # keep the MooncakeKVSender / NixlKVSender contract stable.
+            # DSV4 keeps the global token-loc array here because c4/c128
+            # buckets must derive their own compressed slot locs in the
+            # backend before applying DCP sharding.
             page_indices = kv_indices
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return

@@ -1113,7 +1113,11 @@ class DecodePreallocQueue:
             # ``kv_to_page_indices``. No-op when dcp_size == 1.
             dcp_size_local = getattr(self.kv_manager, "dcp_size", 1) or 1
             dcp_rank_local = getattr(self.kv_manager, "dcp_rank", 0) or 0
-            if dcp_size_local > 1:
+            dsv4_dcp_transfer = (
+                dcp_size_local > 1
+                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            )
+            if dcp_size_local > 1 and not dsv4_dcp_transfer:
                 kv_indices = filter_kv_indices_for_dcp_rank(
                     kv_indices, dcp_size_local, dcp_rank_local
                 )
@@ -1141,8 +1145,20 @@ class DecodePreallocQueue:
                         window_kv_indices_full
                     )
                 )
+                window_kv_indices_swa_np = window_kv_indices_swa.cpu().numpy()
+                if dsv4_dcp_transfer:
+                    # DSV4 state_data flat layout is heterogeneous:
+                    # [swa_kv, compress_state, indexer_compress_state].
+                    # Under DCP, swa_kv is sharded by SWA-token loc while
+                    # compress states are not sharded and remain page-level.
+                    # Return both lists; mooncake interprets this expanded
+                    # payload only for DSV4+DCP.
+                    return [
+                        window_kv_indices_swa_np,
+                        kv_to_page_indices(window_kv_indices_swa_np, page_size),
+                    ]
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa_np, page_size
                 )
 
             def _nsa_payload():
@@ -1161,7 +1177,11 @@ class DecodePreallocQueue:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
+                    swa_payload = _swa_payload()
+                    if dsv4_dcp_transfer:
+                        state_indices.extend(swa_payload)
+                    else:
+                        state_indices.append(swa_payload)
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
                 else:
@@ -1176,6 +1196,8 @@ class DecodePreallocQueue:
                 # DCP rerouting: send rank-local token-loc array unchanged
                 # so the transfer backend can issue token-level RDMA. See
                 # the matching comment in disaggregation/prefill.py.
+                # DSV4 keeps global token locs so the backend can derive
+                # c4/c128 compressed slot locs before applying DCP sharding.
                 page_indices = kv_indices
             if (
                 self._uses_dsv4_decode_radix_cache()

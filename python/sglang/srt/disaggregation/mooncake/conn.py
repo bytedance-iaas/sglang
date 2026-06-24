@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    filter_kv_indices_for_dcp_rank,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -197,16 +198,14 @@ class MooncakeKVManager(CommonKVManager):
         # from per-page to per-token (see ``send_kvcache``), so the
         # backend supports DCP without protocol changes.
         #
-        # Limit DCP support to the standard MLA/MHA single-pool path:
-        # DSV4's multi-bucket pool layout (``mla_compression_ratios``)
-        # and HiSparse's host-pool path both need their own DCP-aware
-        # transfer routines, which are not part of this commit.
+        # Limit DCP support to Mooncake paths implemented here. Standard
+        # MLA/MHA single-pool DCP uses token-level item strides; DSV4 uses
+        # dedicated bucket-aware routines for c4/c128/state buffers. HiSparse's
+        # host-pool path still needs its own transfer routine and remains
+        # blocked.
         dcp_size_init = getattr(args, "dcp_size", 1) or 1
-        is_dsv4_pool = bool(getattr(args, "mla_compression_ratios", None))
         is_hisparse = bool(getattr(server_args, "enable_hisparse", False))
-        self.supports_dcp_transfer = dcp_size_init <= 1 or not (
-            is_dsv4_pool or is_hisparse
-        )
+        self.supports_dcp_transfer = dcp_size_init <= 1 or not is_hisparse
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -702,6 +701,266 @@ class MooncakeKVManager(CommonKVManager):
             # compared to using multiple threads
             return process_layers(layers_params)
 
+    def _send_indexed_layers(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Send already-aligned layer buffers with caller-provided indices.
+
+        This is the same transfer primitive as ``_send_kvcache_generic``, but
+        without MHA/MLA pointer slicing. DSV4+DCP needs to split the flat DSV4
+        layout into buckets first because c4/c128 buffers use different local
+        index spaces from the SWA/token buffer.
+        """
+        if len(src_data_ptrs) == 0 or len(prefill_data_indices) == 0:
+            return 0
+
+        prefill_blocks, dst_blocks = group_concurrent_contiguous(
+            prefill_data_indices, dst_data_indices
+        )
+        layers_params = list(zip(src_data_ptrs, dst_data_ptrs, item_lens))
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            transfer_blocks = []
+            for prefill_index, decode_index in zip(prefill_blocks, dst_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                transfer_blocks.append((src_addr, dst_addr, item_len * len(prefill_index)))
+            return transfer_blocks
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(
+                    self._transfer_data,
+                    mooncake_session_id,
+                    set_transfer_blocks(src_ptr, dst_ptr, item_len),
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    return status
+            return 0
+
+        transfer_blocks = []
+        for src_ptr, dst_ptr, item_len in layers_params:
+            transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def _is_dsv4_pool(self) -> bool:
+        return bool(getattr(self.kv_args, "mla_compression_ratios", None))
+
+    def _dsv4_stage_bucket_counts(self) -> Tuple[int, int, int]:
+        ratios = getattr(self.kv_args, "mla_compression_ratios", None) or []
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        assert end_layer is not None
+        stage_ratios = ratios[start_layer:end_layer]
+        c4_count = sum(1 for r in stage_ratios if r == 4)
+        c128_count = sum(1 for r in stage_ratios if r == 128)
+        swa_count = end_layer - start_layer
+        return swa_count, c4_count, c128_count
+
+    def _dsv4_bucket_locs_from_token_locs(
+        self,
+        token_locs: npt.NDArray[np.int32],
+        compression_ratio: int,
+        dcp_size: int,
+        dcp_rank: int,
+    ) -> npt.NDArray[np.int32]:
+        """Map full-token locs to DSV4 c4/c128 pool-local locs.
+
+        DSV4 compressed KV buffers are addressed in their own compressed slot
+        spaces: each full KV page corresponds to ``page_size / ratio``
+        compressed slots. Under DCP the compressed slot id, not the raw token
+        loc, is sharded by modulo.
+        """
+        if token_locs.size == 0:
+            return np.array([], dtype=np.int32)
+
+        page_size = max(self.kv_args.page_size, 1)
+        slots_per_page = max(page_size // compression_ratio, 1)
+        page_indices = token_locs[::page_size] // page_size
+        slot_offsets = np.arange(slots_per_page, dtype=np.int32)
+        locs = (
+            page_indices.astype(np.int32).reshape(-1, 1) * slots_per_page
+            + slot_offsets.reshape(1, -1)
+        ).reshape(-1)
+        return filter_kv_indices_for_dcp_rank(locs, dcp_size, dcp_rank)
+
+    def _send_dsv4_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """DSV4 compressed KV transfer under DCP.
+
+        The DSV4 kv_data flat layout is [c4_kv, c4_indexer, c128_kv].
+        c4/c128 buffers use compressed-slot loc spaces, so one raw token/page
+        index list cannot be shared across all buckets once DCP is enabled.
+        """
+        _, c4_count, c128_count = self._dsv4_stage_bucket_counts()
+        src_ptrs, dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+            self.kv_args.kv_data_ptrs, dst_kv_ptrs
+        )
+        item_lens = self.kv_args.kv_item_lens
+
+        c4_slots_per_page = max(self.kv_args.page_size // 4, 1)
+        c128_slots_per_page = max(self.kv_args.page_size // 128, 1)
+
+        src_c4 = self._dsv4_bucket_locs_from_token_locs(
+            prefill_kv_indices, 4, self.dcp_size, self.dcp_rank
+        )
+        dst_c4 = self._dsv4_bucket_locs_from_token_locs(
+            dst_kv_indices, 4, self.dcp_size, self.dcp_rank
+        )
+        src_c128 = self._dsv4_bucket_locs_from_token_locs(
+            prefill_kv_indices, 128, self.dcp_size, self.dcp_rank
+        )
+        dst_c128 = self._dsv4_bucket_locs_from_token_locs(
+            dst_kv_indices, 128, self.dcp_size, self.dcp_rank
+        )
+
+        rc = 0
+        if c4_count > 0:
+            c4_src_ptrs = src_ptrs[: 2 * c4_count]
+            c4_dst_ptrs = dst_ptrs[: 2 * c4_count]
+            c4_item_lens = [
+                item_lens[i] // c4_slots_per_page for i in range(2 * c4_count)
+            ]
+            rc = (
+                self._send_indexed_layers(
+                    mooncake_session_id,
+                    c4_src_ptrs,
+                    c4_dst_ptrs,
+                    c4_item_lens,
+                    src_c4,
+                    dst_c4,
+                    executor,
+                )
+                or rc
+            )
+        if c128_count > 0:
+            c128_start = 2 * c4_count
+            c128_src_ptrs = src_ptrs[c128_start : c128_start + c128_count]
+            c128_dst_ptrs = dst_ptrs[c128_start : c128_start + c128_count]
+            c128_item_lens = [
+                item_lens[c128_start + i] // c128_slots_per_page
+                for i in range(c128_count)
+            ]
+            rc = (
+                self._send_indexed_layers(
+                    mooncake_session_id,
+                    c128_src_ptrs,
+                    c128_dst_ptrs,
+                    c128_item_lens,
+                    src_c128,
+                    dst_c128,
+                    executor,
+                )
+                or rc
+            )
+        return rc
+
+    def _send_dsv4_state_dcp(
+        self,
+        req: TransferInfo,
+        prefill_state_indices: List,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo],
+    ) -> int:
+        """Send DSV4 state_data under DCP.
+
+        Expanded DSV4+DCP SWA payload layout:
+        - [0]: global SWA-token locs for the SWA KV buffer.
+        - [1]: SWA page indices for compress_state/indexer_compress_state.
+
+        DSV4 state_data flat layout is [swa_kv, compress_state,
+        indexer_compress_state]. SWA KV follows token-level DCP sharding;
+        compress states are not DCP-sharded and are copied page-wise.
+        """
+        if target_rank_registration_info is None:
+            return 0
+        if len(prefill_state_indices) < 2 or len(req.dst_state_indices) < 2:
+            raise RuntimeError(
+                "DSV4+DCP state transfer expects expanded state_indices "
+                "[swa_token_locs, state_page_indices] on both prefill and decode."
+            )
+
+        src_data_ptrs = self.kv_args.state_data_ptrs[0]
+        src_item_lens = self.kv_args.state_item_lens[0]
+        dst_data_ptrs = target_rank_registration_info.dst_state_data_ptrs[0]
+
+        src_ptrs, dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+            src_data_ptrs, dst_data_ptrs
+        )
+        swa_count, _, _ = self._dsv4_stage_bucket_counts()
+        page_size = max(self.kv_args.page_size, 1)
+
+        src_swa_locs = filter_kv_indices_for_dcp_rank(
+            np.array(prefill_state_indices[0], dtype=np.int32),
+            self.dcp_size,
+            self.dcp_rank,
+        )
+        dst_swa_locs = filter_kv_indices_for_dcp_rank(
+            np.array(req.dst_state_indices[0], dtype=np.int32),
+            self.dcp_size,
+            self.dcp_rank,
+        )
+        # CompressStatePool is indexed by SWA page. In DCP mode the pool is
+        # sized for the rank-local SWA address space, so derive local page ids
+        # from the rank-local SWA locs instead of reusing global page ids.
+        src_state_pages = np.unique(src_swa_locs // page_size).astype(
+            np.int32, copy=False
+        )
+        dst_state_pages = np.unique(dst_swa_locs // page_size).astype(
+            np.int32, copy=False
+        )
+
+        rc = 0
+        if swa_count > 0:
+            rc = (
+                self._send_indexed_layers(
+                    req.mooncake_session_id,
+                    src_ptrs[:swa_count],
+                    dst_ptrs[:swa_count],
+                    [item_len // page_size for item_len in src_item_lens[:swa_count]],
+                    src_swa_locs,
+                    dst_swa_locs,
+                    executor,
+                )
+                or rc
+            )
+
+        if len(src_ptrs) > swa_count:
+            rc = (
+                self._send_indexed_layers(
+                    req.mooncake_session_id,
+                    src_ptrs[swa_count:],
+                    dst_ptrs[swa_count:],
+                    src_item_lens[swa_count:],
+                    src_state_pages,
+                    dst_state_pages,
+                    executor,
+                )
+                or rc
+            )
+        return rc
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -710,6 +969,14 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        if self.dcp_size > 1 and self._is_dsv4_pool():
+            return self._send_dsv4_kvcache_dcp(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                executor,
+            )
         item_lens = self.kv_args.kv_item_lens
         if self.dcp_size > 1:
             # DCP path: caller passes rank-local *token* loc arrays
@@ -997,6 +1264,14 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
+        if self.dcp_size > 1 and self._is_dsv4_pool():
+            return self._send_dsv4_state_dcp(
+                req,
+                prefill_state_indices,
+                executor,
+                target_rank_registration_info,
+            )
+
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
