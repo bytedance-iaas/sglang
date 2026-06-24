@@ -701,6 +701,8 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        if getattr(batch, "offline_pp_wave_id", None) is not None:
+            msg += f"offline_pp_wave_id: {batch.offline_pp_wave_id}, "
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0

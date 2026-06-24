@@ -93,6 +93,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self.current_pp_mb_id = mb_id
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -180,7 +181,7 @@ class SchedulerPPMixin:
           - tick the logical clock;
           - promote PREFILLING waves whose state finished offloading to host
             (free their GPU slots → OFFLOADED queue);
-          - maintain a single PREFETCHING wave (double-buffer): admit one from
+          - maintain a single PREFETCHING wave (serialized prefetch): admit one from
             the OFFLOADED queue if none is active, then drip-prefetch using the
             currently free slot budget;
           - detect no-progress stalls and roll the wave back (lossless, host
@@ -195,18 +196,17 @@ class SchedulerPPMixin:
 
         # Promote finished-offload prefill waves to OFFLOADED.
         for wave in list(mgr.waves.values()):
-            if wave.state == WaveState.PREFILLING and wave.offload_ready:
+            if wave.state == WaveState.PREFILLING and mgr.is_wave_offload_ready(wave):
                 mgr.mark_wave_offloaded(wave)
 
-        # Maintain at most one in-flight PREFETCHING wave (double-buffer).
+        # Maintain at most one in-flight PREFETCHING wave.
         prefetching = [
             w for w in mgr.waves.values() if w.state == WaveState.PREFETCHING
         ]
         if not prefetching:
             wave = mgr.pop_next_offloaded()
             if wave is not None and mgr.admit_wave(wave):
-                wave.state = WaveState.PREFETCHING
-                wave.last_progress_tick = mgr._tick
+                mgr.start_prefetching(wave)
                 prefetching = [wave]
 
         for wave in prefetching:

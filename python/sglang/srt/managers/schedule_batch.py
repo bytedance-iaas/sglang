@@ -2575,7 +2575,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if get_global_server_args().enable_mamba_extra_buffer():
+        if (
+            get_global_server_args().enable_mamba_extra_buffer()
+            and self.offline_pp_wave_id is None
+        ):
             mamba_track_interval = get_global_server_args().mamba_track_interval
 
             if len(self.reqs) == 0:
@@ -2593,6 +2596,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
+        elif self.offline_pp_wave_id is not None:
+            # Offline PP disables radix/prefix-cache insertion for clear KV/mamba
+            # ownership, so the mamba extra tracking buffer is not consumed.
+            # Skipping it also avoids writing into ping-pong slots that were
+            # released during offload and reallocated during prefetch.
+            self.mamba_track_indices = None
+            self.mamba_track_mask = None
+            self.mamba_track_seqlens = None
 
     def filter_batch(
         self,

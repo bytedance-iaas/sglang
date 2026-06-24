@@ -2451,7 +2451,10 @@ class Scheduler(
             prefilled = [r for r in prefilled_batch.reqs if not r.finished()]
             self.last_batch = None
             if prefilled:
-                mgr.offload_prefilled_wave(prefilled)
+                mgr.offload_prefilled_wave(
+                    prefilled,
+                    source_stream=getattr(self, "forward_stream", None),
+                )
             prefilled_batch.filter_batch(keep_indices=[])
 
         # Step 2: keep prefilling while there is work, to build up waves.
@@ -2472,7 +2475,15 @@ class Scheduler(
                 return self.running_batch
 
         # Step 4: promote a fully-prefetched wave into a decode batch.
-        wave = mgr.take_decode_ready_wave()
+        if mgr.has_decoding_wave():
+            return None
+
+        mgr.ensure_decode_ready_for_schedule(
+            self.token_to_kv_pool_allocator.available_size()
+        )
+        wave = mgr.take_decode_ready_wave(
+            mb_id=getattr(self, "current_pp_mb_id", None)
+        )
         if wave is not None:
             self.running_batch = self._build_offline_pp_decode_batch(wave)
             return self.running_batch
@@ -2487,6 +2498,8 @@ class Scheduler(
         """
         reqs = wave.reqs
         device = self.device
+
+        self.offline_pp_offload_manager.wait_prefetch_for_decode(wave)
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
