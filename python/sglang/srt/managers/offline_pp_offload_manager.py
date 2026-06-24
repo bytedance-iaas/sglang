@@ -292,15 +292,43 @@ class OfflinePPStateOffloadManager:
 
     def _req_device_indices(self, req: "Req", length: int) -> torch.Tensor:
         """First ``length`` KV slot indices currently mapped to this request."""
-        idx = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        idx = self.req_to_token_pool.req_to_token[
+            self._checked_req_pool_idx(req, "read KV mapping")
+        ]
         return idx[:length]
 
     def _req_mamba_indices(self, req: "Req") -> Optional[torch.Tensor]:
         if not self.is_hybrid:
             return None
+        req_pool_idx = self._checked_req_pool_idx(req, "read mamba mapping")
         return self.req_to_token_pool.get_mamba_indices(
-            torch.tensor([req.req_pool_idx], device=self.req_to_token_pool.device)
+            torch.tensor(
+                [req_pool_idx],
+                dtype=torch.int64,
+                device=self.req_to_token_pool.device,
+            )
         )
+
+    def _checked_req_pool_idx(self, req: "Req", context: str) -> int:
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise RuntimeError(
+                "Offline-PP request has no req_pool_idx while trying to "
+                f"{context}: rid={getattr(req, 'rid', None)}."
+            )
+        req_pool_idx = int(req_pool_idx)
+        alloc_size = getattr(
+            self.req_to_token_pool,
+            "_alloc_size",
+            getattr(self.req_to_token_pool, "size", 0) + 1,
+        )
+        if req_pool_idx <= 0 or req_pool_idx >= alloc_size:
+            raise RuntimeError(
+                "Offline-PP request has invalid req_pool_idx while trying to "
+                f"{context}: rid={getattr(req, 'rid', None)} "
+                f"req_pool_idx={req_pool_idx} valid=[1,{alloc_size - 1}]."
+            )
+        return req_pool_idx
 
     # ------------------------------------------------------------------ #
     # Prefill-side: layer-wise offload
@@ -482,48 +510,53 @@ class OfflinePPStateOffloadManager:
         """
         consumed = 0
         progressed = False
-        with self.device_module.stream(self.prefetch_stream):
-            for req in wave.reqs:
-                entry = wave.entries[req.rid]
-                if entry.prefetched:
-                    continue
-                # Only the committed prefix exists and needs slots now; with a
-                # paged allocator the actual allocation must still be page
-                # aligned, while req_to_token maps only committed tokens.
-                committed = entry.committed_len
-                alloc_len = self._align_slot_count(committed)
-                if alloc_len > free_slots - consumed:
-                    # Not enough budget yet for this request; drip continues
-                    # next tick as more slots are freed by the DECODING wave.
+        metadata_stream = self.device_module.current_stream()
+        for req in wave.reqs:
+            entry = wave.entries[req.rid]
+            if entry.prefetched:
+                continue
+            # Only the committed prefix exists and needs slots now; with a
+            # paged allocator the actual allocation must still be page
+            # aligned, while req_to_token maps only committed tokens.
+            committed = entry.committed_len
+            alloc_len = self._align_slot_count(committed)
+            if alloc_len > free_slots - consumed:
+                # Not enough budget yet for this request; drip continues
+                # next tick as more slots are freed by the DECODING wave.
+                break
+            if entry.cpu_state is None:
+                raise RuntimeError(
+                    "Offline-PP prefetch missing host state for "
+                    f"wave={wave.wave_id}, req={req.rid}."
+                )
+
+            # Allocator and mapping tensors are shared scheduler metadata. Keep
+            # those updates on the current stream, then let the transfer stream
+            # wait before issuing the large H2D copies.
+            kv_indices = self.token_to_kv_pool_allocator.alloc(alloc_len)
+            if kv_indices is None:
+                break
+
+            req.req_pool_idx = None
+            if self.is_hybrid:
+                req.mamba_pool_idx = None
+            entry.device_kv_indices = kv_indices
+            try:
+                req_pool_indices = self.req_to_token_pool.alloc([req])
+                if req_pool_indices is None:
+                    self.token_to_kv_pool_allocator.free(kv_indices)
+                    entry.device_kv_indices = None
                     break
-                if entry.cpu_state is None:
-                    raise RuntimeError(
-                        "Offline-PP prefetch missing host state for "
-                        f"wave={wave.wave_id}, req={req.rid}."
-                    )
 
-                # Re-allocate device slots for this request and restore mapping.
-                kv_indices = self.token_to_kv_pool_allocator.alloc(alloc_len)
-                if kv_indices is None:
-                    break
+                restore_indices = kv_indices[:committed]
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, committed)), restore_indices
+                )
+                cpu_state = self.codec.decode_on_prefetch(entry.cpu_state)
+                mamba_indices = self._req_mamba_indices(req)
 
-                req.req_pool_idx = None
-                if self.is_hybrid:
-                    req.mamba_pool_idx = None
-                entry.device_kv_indices = kv_indices
-                try:
-                    req_pool_indices = self.req_to_token_pool.alloc([req])
-                    if req_pool_indices is None:
-                        self.token_to_kv_pool_allocator.free(kv_indices)
-                        entry.device_kv_indices = None
-                        break
-
-                    restore_indices = kv_indices[:committed]
-                    self.req_to_token_pool.write(
-                        (req.req_pool_idx, slice(0, committed)), restore_indices
-                    )
-                    cpu_state = self.codec.decode_on_prefetch(entry.cpu_state)
-                    mamba_indices = self._req_mamba_indices(req)
+                with self.device_module.stream(self.prefetch_stream):
+                    self.prefetch_stream.wait_stream(metadata_stream)
                     if mamba_indices is not None:
                         self.kv_cache.load_cpu_copy(
                             cpu_state,
@@ -537,15 +570,17 @@ class OfflinePPStateOffloadManager:
                             restore_indices,
                             async_copy=True,
                         )
-                except Exception:
-                    self.prefetch_stream.synchronize()
-                    self._release_prefetched_req(req, entry)
-                    raise
-                entry.prefetched = True
-                wave.prefetch_done_units += 1
-                consumed += alloc_len
-                progressed = True
-            if progressed:
+            except Exception:
+                self.prefetch_stream.synchronize()
+                self._release_prefetched_req(req, entry)
+                raise
+            entry.prefetched = True
+            wave.prefetch_done_units += 1
+            consumed += alloc_len
+            progressed = True
+
+        if progressed:
+            with self.device_module.stream(self.prefetch_stream):
                 wave.prefetch_done_event = self.device_module.Event()
                 wave.prefetch_done_event.record(self.prefetch_stream)
         if progressed:
