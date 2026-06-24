@@ -860,6 +860,10 @@ class Envs:
     # wrong results come from sparse block selection/main sparse kernels.
     SGLANG_OPT_USE_MINIMAX_SPARSE_ATTENTION_DENSE_FALLBACK = EnvBool(False)
 
+    # MiniMax-M3 MoE: force router top-k selection through the torch-native
+    # implementation to isolate wrong expert choices from fused top-k kernels.
+    SGLANG_OPT_USE_MINIMAX_MOE_TOPK_TORCH_NATIVE = EnvBool(False)
+
     # MiniMax-M3 attention: fuse per-head GemmaRMSNorm(q,k) + partial NeoX RoPE
     # into one in-place JIT kernel (minimax_qknorm_rope) instead of separate
     # norm + rope launches. Only activates for the verified config (per_head

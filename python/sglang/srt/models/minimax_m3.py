@@ -474,6 +474,7 @@ class MiniMaxM3MoE(nn.Module):
             num_fused_shared_experts=self.num_fused_shared_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
+            torch_native=envs.SGLANG_OPT_USE_MINIMAX_MOE_TOPK_TORCH_NATIVE.get(),
         )
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
