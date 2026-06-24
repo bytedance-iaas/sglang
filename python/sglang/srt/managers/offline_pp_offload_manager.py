@@ -90,6 +90,12 @@ class _ReqStateEntry:
     # allocator works in whole pages. Only the first committed_len entries are
     # written into req_to_token / loaded from the CPU snapshot.
     device_kv_indices: object = None
+    # GPU index tensors captured by async D2H/H2D transfer kernels. They must
+    # stay alive until the corresponding transfer event completes; otherwise the
+    # caching allocator may reuse their storage while an async index kernel still
+    # reads it.
+    transfer_kv_indices: object = None
+    transfer_mamba_indices: object = None
     # Whether this request's state has been brought back to device (drip unit).
     prefetched: bool = False
 
@@ -210,6 +216,11 @@ class OfflinePPStateOffloadManager:
 
     def _event_done(self, event) -> bool:
         return event is None or event.query()
+
+    def _clear_transfer_indices(self, wave: WaveStateHandle) -> None:
+        for entry in wave.entries.values():
+            entry.transfer_kv_indices = None
+            entry.transfer_mamba_indices = None
 
     def _log_wave(self, action: str, wave: WaveStateHandle, **kwargs) -> None:
         device_slots = 0
@@ -365,8 +376,14 @@ class OfflinePPStateOffloadManager:
         with self.device_module.stream(self.offload_stream):
             for req in wave.reqs:
                 entry = wave.entries[req.rid]
-                kv_indices = self._req_device_indices(req, entry.committed_len)
+                kv_indices = self._req_device_indices(
+                    req, entry.committed_len
+                ).clone()
                 mamba_indices = self._req_mamba_indices(req)
+                if mamba_indices is not None:
+                    mamba_indices = mamba_indices.clone()
+                entry.transfer_kv_indices = kv_indices
+                entry.transfer_mamba_indices = mamba_indices
                 if mamba_indices is not None:
                     cpu_state = self.kv_cache.get_cpu_copy(
                         kv_indices,
@@ -392,6 +409,7 @@ class OfflinePPStateOffloadManager:
             return False
         if self._event_done(wave.offload_done_event):
             wave.offload_ready = True
+            self._clear_transfer_indices(wave)
             self._log_wave("OFFLOAD_READY", wave)
         return wave.offload_ready
 
@@ -403,6 +421,7 @@ class OfflinePPStateOffloadManager:
         self._log_wave("OFFLOAD_WAIT", wave)
         wave.offload_done_event.synchronize()
         wave.offload_ready = True
+        self._clear_transfer_indices(wave)
         self._log_wave("OFFLOAD_READY", wave)
         return True
 
@@ -548,12 +567,16 @@ class OfflinePPStateOffloadManager:
                     entry.device_kv_indices = None
                     break
 
-                restore_indices = kv_indices[:committed]
+                restore_indices = kv_indices[:committed].clone()
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, committed)), restore_indices
                 )
                 cpu_state = self.codec.decode_on_prefetch(entry.cpu_state)
                 mamba_indices = self._req_mamba_indices(req)
+                if mamba_indices is not None:
+                    mamba_indices = mamba_indices.clone()
+                entry.transfer_kv_indices = restore_indices
+                entry.transfer_mamba_indices = mamba_indices
 
                 with self.device_module.stream(self.prefetch_stream):
                     self.prefetch_stream.wait_stream(metadata_stream)
@@ -604,6 +627,7 @@ class OfflinePPStateOffloadManager:
         )
         wave.prefetch_ready = ready
         if ready:
+            self._clear_transfer_indices(wave)
             if wave.state != WaveState.DECODE_READY:
                 self._log_wave("DECODE_READY", wave)
             wave.state = WaveState.DECODE_READY
@@ -652,6 +676,8 @@ class OfflinePPStateOffloadManager:
 
     def _release_prefetched_req(self, req: "Req", entry: _ReqStateEntry) -> None:
         """Release a partially/fully prefetched request back to host-only state."""
+        entry.transfer_kv_indices = None
+        entry.transfer_mamba_indices = None
         if entry.device_kv_indices is not None:
             self.token_to_kv_pool_allocator.free(entry.device_kv_indices)
             entry.device_kv_indices = None
