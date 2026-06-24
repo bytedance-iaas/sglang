@@ -261,6 +261,27 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def _uses_dsv4_token_level_transfer(self, req: Req) -> bool:
+        if not isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            return False
+
+        dcp_size_local = getattr(self.kv_manager, "dcp_size", 1) or 1
+        if dcp_size_local > 1:
+            return True
+
+        transfer_infos = getattr(self.kv_manager, "transfer_infos", {}).get(
+            req.bootstrap_room, {}
+        )
+        decode_kv_args_table = getattr(self.kv_manager, "decode_kv_args_table", {})
+        for session_id in transfer_infos.keys():
+            target_info = decode_kv_args_table.get(session_id)
+            if (
+                target_info is not None
+                and (getattr(target_info, "dst_dcp_size", 1) or 1) > 1
+            ):
+                return True
+        return False
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -338,7 +359,12 @@ class PrefillBootstrapQueue:
             num_pages = kv_to_page_num(
                 num_kv_indices_to_send, self.token_to_kv_pool.page_size
             )
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            num_transfer_indices = (
+                num_kv_indices_to_send
+                if self._uses_dsv4_token_level_transfer(req)
+                else num_pages
+            )
+            req.disagg_kv_sender.init(num_transfer_indices, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
