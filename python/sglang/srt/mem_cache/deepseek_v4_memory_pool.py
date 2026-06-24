@@ -946,81 +946,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
-    def snapshot_c128_radix_state(
-        self, req_pool_idx: int, seq_len: int
-    ) -> Optional[List[torch.Tensor]]:
-        """Snapshot request-scoped C128 state for a radix cache node."""
-        if seq_len % 128 == 0:
-            return None
-
-        snapshots: List[torch.Tensor] = []
-        for pool in self.compress_state_pools:
-            if pool is None or pool.ratio != 128:
-                continue
-            state = pool.kv_score_buffer.kv_score
-            if ONLINE_C128:
-                snapshots.append(state[req_pool_idx : req_pool_idx + 1].clone())
-            else:
-                start = req_pool_idx * pool.ring_size
-                state_len = seq_len % 128
-                if state_len == 0:
-                    continue
-                snapshot = state.new_empty((pool.ring_size, state.shape[-1]))
-                half = snapshot.shape[-1] // 2
-                snapshot[:, :half].zero_()
-                snapshot[:, half:].fill_(float("-inf"))
-                positions = torch.arange(
-                    seq_len - state_len,
-                    seq_len,
-                    device=state.device,
-                    dtype=torch.long,
-                )
-                slots = positions % pool.ring_size
-                snapshot[slots] = state[start + slots]
-                snapshots.append(snapshot)
-        return snapshots or None
-
-    def restore_c128_radix_state(
-        self, req_pool_idx: int, snapshots: Optional[List[torch.Tensor]]
-    ) -> None:
-        """Restore radix-cached C128 state into the current request slot."""
-        if not snapshots:
+    def clear_c128_req_states(self, req_pool_indices: List[int]) -> None:
+        """Reset request-scoped C128 states for newly allocated req slots."""
+        if not req_pool_indices:
             return
 
-        snapshot_idx = 0
-        for pool in self.compress_state_pools:
-            if pool is None or pool.ratio != 128:
-                continue
-            snapshot = snapshots[snapshot_idx]
-            snapshot_idx += 1
-
-            state = pool.kv_score_buffer.kv_score
-            if ONLINE_C128:
-                state[req_pool_idx : req_pool_idx + 1].copy_(snapshot)
-            else:
-                start = req_pool_idx * pool.ring_size
-                state[start : start + pool.ring_size].copy_(snapshot)
-
-        assert snapshot_idx == len(snapshots)
-
-    def clear_c128_radix_state(self, req_pool_idx: int) -> None:
-        """Reset request-scoped C128 state at a radix-restorable boundary."""
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
 
             state = pool.kv_score_buffer.kv_score
+            req_indices = torch.tensor(
+                req_pool_indices, dtype=torch.long, device=state.device
+            )
             if ONLINE_C128:
-                row = state[req_pool_idx]
-                head_dim = row.shape[-1] // 3
-                row[:head_dim].fill_(float("-inf"))
-                row[head_dim:].zero_()
+                head_dim = state.shape[-1] // 3
+                state[req_indices, :head_dim] = float("-inf")
+                state[req_indices, head_dim:] = 0
             else:
-                start = req_pool_idx * pool.ring_size
-                rows = state[start : start + pool.ring_size]
-                half = rows.shape[-1] // 2
-                rows[:, :half].zero_()
-                rows[:, half:].fill_(float("-inf"))
+                offsets = torch.arange(pool.ring_size, device=state.device)
+                row_indices = (
+                    req_indices[:, None] * pool.ring_size + offsets[None, :]
+                ).reshape(-1)
+                half = state.shape[-1] // 2
+                state[row_indices, :half] = 0
+                state[row_indices, half:] = float("-inf")
+
+    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+        self.clear_c128_req_states([req_pool_idx])
 
     def clear_unaccepted_c128_draft_states(
         self,
