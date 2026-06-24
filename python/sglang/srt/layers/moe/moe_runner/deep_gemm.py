@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -61,6 +63,225 @@ else:
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 logger = logging.getLogger(__name__)
+_SM90_MXFP8_ACT_QUANT_DIFF_EVENTS = 0
+
+
+def _sm90_mxfp8_act_quant_diff_enabled() -> bool:
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG") != "1":
+        return False
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
+        return False
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_debug_tensor_meta(t: torch.Tensor) -> dict:
+    return {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "device": str(t.device),
+        "numel": t.numel(),
+    }
+
+
+def _sm90_mxfp8_numeric_stats(t: torch.Tensor) -> dict:
+    flat = t.reshape(-1)
+    finite = torch.isfinite(flat)
+    finite_count = int(finite.sum().item())
+    stats = {
+        "numel": flat.numel(),
+        "finite_count": finite_count,
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "inf_count": int(torch.isinf(flat).sum().item()),
+        "isfinite": finite_count == flat.numel(),
+    }
+    if finite_count > 0:
+        stats["finite_absmax"] = float(flat[finite].abs().max().item())
+    return stats
+
+
+def _unpack_sm90_mxfp8_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype in (torch.int, torch.int32):
+        scale_i32 = scale.contiguous().to(torch.int32)
+        return torch.stack(
+            [
+                torch.bitwise_and(torch.bitwise_right_shift(scale_i32, shift), 0xFF)
+                for shift in (0, 8, 16, 24)
+            ],
+            dim=-1,
+        ).reshape(-1).to(torch.uint8)
+    if scale.dtype == torch.uint8:
+        return scale.contiguous()
+    raise RuntimeError(f"Unsupported SM90 MXFP8 scale dtype for debug: {scale.dtype}")
+
+
+def _decode_e8m0_scale_bytes(scale_bytes: torch.Tensor) -> torch.Tensor:
+    scale_i32 = torch.bitwise_left_shift(scale_bytes.to(torch.int32), 23).contiguous()
+    return scale_i32.view(torch.float32)
+
+
+def _dequant_sm90_mxfp8_activation_vector(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    group_size: int,
+    k: int,
+) -> torch.Tensor:
+    if scale.dtype == torch.float32:
+        scale_per_group = scale.contiguous().to(torch.float32)
+    else:
+        scale_per_group = _decode_e8m0_scale_bytes(
+            _unpack_sm90_mxfp8_scale_bytes(scale)
+        )
+    k_scale_idx = torch.arange(k, device=x.device, dtype=torch.long) // group_size
+    return x[:k].to(torch.float32) * scale_per_group[k_scale_idx]
+
+
+def _swiglu_activation_reference(
+    gateup: torch.Tensor,
+    *,
+    gemm1_alpha: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    swiglu_limit: Optional[float],
+) -> torch.Tensor:
+    gate, up = torch.chunk(gateup.to(torch.float32), chunks=2, dim=-1)
+    if gemm1_alpha is not None:
+        if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
+            gate = torch.clamp(gate, max=gemm1_clamp_limit)
+            up = torch.clamp(up, min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+        return gate * torch.sigmoid(gate * float(gemm1_alpha)) * (up + 1.0)
+    if swiglu_limit is not None and swiglu_limit > 0:
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+    gate = gate / (1 + torch.exp(-gate))
+    return gate.to(up.dtype) * up
+
+
+def _sm90_mxfp8_scale_stats(scale: torch.Tensor) -> dict:
+    if scale.dtype == torch.float32:
+        return _sm90_mxfp8_numeric_stats(scale)
+    scale_bytes = _unpack_sm90_mxfp8_scale_bytes(scale)
+    return {
+        "numel": scale_bytes.numel(),
+        "min": int(scale_bytes.min().item()) if scale_bytes.numel() > 0 else None,
+        "max": int(scale_bytes.max().item()) if scale_bytes.numel() > 0 else None,
+        "zero_count": int((scale_bytes == 0).sum().item()),
+        "ff_count": int((scale_bytes == 0xFF).sum().item()),
+    }
+
+
+def _sm90_mxfp8_act_quant_diff_report(
+    *,
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    group_size: int,
+    packed_ue8m0: bool,
+    swiglu_limit: Optional[float],
+    gemm1_alpha: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    path: str,
+) -> None:
+    global _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS
+    if not _sm90_mxfp8_act_quant_diff_enabled():
+        return
+    max_events = int(
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_MAX_EVENTS", "8")
+    )
+    if _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS >= max_events:
+        return
+    if down_input.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS += 1
+
+    sample_groups = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_GROUPS", "4"))
+    sample_rows = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_M", "2"))
+    sample_k = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_K", "256"))
+
+    diffs = []
+    with torch.no_grad():
+        group_candidates = [
+            group
+            for group in range(gateup_output.shape[0])
+            if int(masked_m[group].item()) > 0
+        ][:sample_groups]
+        k = down_input.shape[-1]
+        cols = min(k, sample_k)
+        for group in group_candidates:
+            row_count = min(
+                int(masked_m[group].item()), gateup_output.shape[1], sample_rows
+            )
+            for row in range(row_count):
+                ref = _swiglu_activation_reference(
+                    gateup_output[group, row],
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
+                    swiglu_limit=swiglu_limit,
+                )[:cols]
+                deq = _dequant_sm90_mxfp8_activation_vector(
+                    down_input[group, row],
+                    down_input_scale[group, row],
+                    group_size=group_size,
+                    k=k,
+                )[:cols]
+                diff = (deq - ref).abs()
+                finite_diff = diff[torch.isfinite(diff)]
+                diffs.append(
+                    {
+                        "group": group,
+                        "row": row,
+                        "cols": cols,
+                        "max_abs_diff": (
+                            float(finite_diff.max().item())
+                            if finite_diff.numel() > 0
+                            else float("nan")
+                        ),
+                        "mean_abs_diff": (
+                            float(finite_diff.mean().item())
+                            if finite_diff.numel() > 0
+                            else float("nan")
+                        ),
+                        "ref_absmax": float(ref.abs().max().item()),
+                        "deq_absmax": float(deq.abs().max().item()),
+                        "ref_stats": _sm90_mxfp8_numeric_stats(ref),
+                        "deq_stats": _sm90_mxfp8_numeric_stats(deq),
+                        "raw_fp32_stats": _sm90_mxfp8_numeric_stats(
+                            down_input[group, row, :cols].to(torch.float32)
+                        ),
+                        "scale_stats": _sm90_mxfp8_scale_stats(
+                            down_input_scale[group, row]
+                        ),
+                    }
+                )
+
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H9",
+        "location": "deep_gemm.py:_varlen_deep_gemm_silu_mul_quant:act_quant_diff",
+        "msg": "[DEBUG] SM90 MXFP8 DeepGEMM SwiGLU activation quant diff",
+        "data": {
+            "path": path,
+            "group_size": group_size,
+            "packed_ue8m0": packed_ue8m0,
+            "gemm1_alpha": gemm1_alpha,
+            "gemm1_clamp_limit": gemm1_clamp_limit,
+            "swiglu_limit": swiglu_limit,
+            "gateup_output": _sm90_mxfp8_debug_tensor_meta(gateup_output),
+            "down_input": _sm90_mxfp8_debug_tensor_meta(down_input),
+            "down_input_scale": _sm90_mxfp8_debug_tensor_meta(down_input_scale),
+            "masked_m": _sm90_mxfp8_debug_tensor_meta(masked_m),
+            "diffs": diffs,
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
@@ -1183,7 +1404,20 @@ def _varlen_deep_gemm_silu_mul_quant(
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
         )
-        return down_input, down_input_scale_packed.transpose(-1, -2)
+        down_input_scale = down_input_scale_packed.transpose(-1, -2)
+        _sm90_mxfp8_act_quant_diff_report(
+            gateup_output=gateup_output,
+            down_input=down_input,
+            down_input_scale=down_input_scale,
+            masked_m=masked_m,
+            group_size=group_size,
+            packed_ue8m0=packed_ue8m0,
+            swiglu_limit=swiglu_limit,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            path="packed_fused_oai",
+        )
+        return down_input, down_input_scale
 
     down_input = torch.empty(
         (E, N, D),
@@ -1245,6 +1479,18 @@ def _varlen_deep_gemm_silu_mul_quant(
             gemm1_alpha=gemm1_alpha or 0.0,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
         )
+    _sm90_mxfp8_act_quant_diff_report(
+        gateup_output=gateup_output,
+        down_input=down_input,
+        down_input_scale=down_input_scale,
+        masked_m=masked_m,
+        group_size=group_size,
+        packed_ue8m0=packed_ue8m0,
+        swiglu_limit=swiglu_limit,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        path="jit_ep_activation" if use_jit_ep_activation else "fallback_oai",
+    )
     return down_input, down_input_scale
 
 
