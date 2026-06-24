@@ -794,8 +794,20 @@ class SchedulerDisaggregationPrefillMixin:
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
         dcp_size_local = getattr(kv_mgr, "dcp_size", 1) or 1
         dcp_rank_local = getattr(kv_mgr, "dcp_rank", 0) or 0
+        target_dcp_size = dcp_size_local
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            transfer_infos = getattr(kv_mgr, "transfer_infos", {}).get(
+                req.bootstrap_room, {}
+            )
+            decode_kv_args_table = getattr(kv_mgr, "decode_kv_args_table", {})
+            for session_id in transfer_infos.keys():
+                target_info = decode_kv_args_table.get(session_id)
+                if target_info is not None:
+                    target_dcp_size = max(
+                        target_dcp_size, getattr(target_info, "dst_dcp_size", 1) or 1
+                    )
         dsv4_dcp_transfer = (
-            dcp_size_local > 1
+            target_dcp_size > 1
             and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         )
         if dcp_size_local > 1 and not dsv4_dcp_transfer:
@@ -870,7 +882,7 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if dcp_size_local > 1:
+        if dcp_size_local > 1 or dsv4_dcp_transfer:
             # DCP rerouting: page granularity does not divide cleanly under
             # DCP (logical pages from the cluster-wide loc space scatter
             # into partial local pages on each rank). Send the rank-local
