@@ -400,12 +400,14 @@ class Fp8LinearMethod(LinearMethodBase):
 
             self.use_sm90_mxfp8_deepgemm_linear = (
                 deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
+                and envs.SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR.get()
             )
             if (
                 _is_cuda
                 and is_sm90_supported()
                 and not is_sm100_supported()
                 and not self.use_sm90_mxfp8_deepgemm_linear
+                and envs.SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR.get()
             ):
                 raise RuntimeError(
                     "SM90 MXFP8 dense linear requires DeepGEMM grouped MXFP8 APIs."

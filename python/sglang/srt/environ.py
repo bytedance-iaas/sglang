@@ -881,6 +881,12 @@ class Envs:
     # Falls back to the separate stores when the main and index caches do not
     # share a store dtype (e.g. fp8 KV cache) or on non-CUDA devices.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+
+    # SM90 MXFP8 dense linear: route dense linear layers through the custom
+    # DeepGEMM grouped MXFP8 path. Disable to fall back to the regular MXFP8
+    # linear backend selected by --fp8-gemm-backend, without changing MoE.
+    SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR = EnvBool(True)
+
     # MiniMax-M3 main sparse attention: force the Triton path even when MiniMax's
     # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
     # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.
