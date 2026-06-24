@@ -38,7 +38,6 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    filter_kv_indices_for_dcp_rank,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -132,6 +131,8 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -157,8 +158,10 @@ class KVArgsRegisterInfo:
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
+            dst_dcp_size=int(msg[13].decode("ascii")) if len(msg) > 13 else 1,
+            dst_dcp_rank=int(msg[14].decode("ascii")) if len(msg) > 14 else 0,
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 15),
         )
 
 
@@ -776,15 +779,13 @@ class MooncakeKVManager(CommonKVManager):
         self,
         token_locs: npt.NDArray[np.int32],
         compression_ratio: int,
-        dcp_size: int,
-        dcp_rank: int,
     ) -> npt.NDArray[np.int32]:
-        """Map full-token locs to DSV4 c4/c128 pool-local locs.
+        """Map full-token locs to DSV4 c4/c128 global pool locs.
 
         DSV4 compressed KV buffers are addressed in their own compressed slot
-        spaces: each full KV page corresponds to ``page_size / ratio``
-        compressed slots. Under DCP the compressed slot id, not the raw token
-        loc, is sharded by modulo.
+        spaces. Each full KV page corresponds to ``page_size / ratio``
+        compressed slots. DCP sharding is applied by the caller because source
+        and destination DCP topologies may differ.
         """
         if token_locs.size == 0:
             return np.array([], dtype=np.int32)
@@ -797,7 +798,54 @@ class MooncakeKVManager(CommonKVManager):
             page_indices.astype(np.int32).reshape(-1, 1) * slots_per_page
             + slot_offsets.reshape(1, -1)
         ).reshape(-1)
-        return filter_kv_indices_for_dcp_rank(locs, dcp_size, dcp_rank)
+        return locs.astype(np.int32, copy=False)
+
+    def _dcp_transfer_index_pair(
+        self,
+        src_global_locs: npt.NDArray[np.int32],
+        dst_global_locs: npt.NDArray[np.int32],
+        src_dcp_size: int,
+        src_dcp_rank: int,
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+    ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+        """Build source/destination physical indices for a DCP transfer.
+
+        Source and destination engines allocate KV locs independently, so the
+        numeric loc value for the same sequence position can differ. Select by
+        destination ownership, apply the same position mask to the source locs,
+        and then map each side into its own local physical address space.
+        """
+        if src_global_locs.size == 0 or dst_global_locs.size == 0:
+            empty = np.array([], dtype=np.int32)
+            return empty, empty
+        if src_global_locs.size != dst_global_locs.size:
+            min_len = min(src_global_locs.size, dst_global_locs.size)
+            logger.warning(
+                "DCP transfer loc count mismatch: src=%d dst=%d, clipping to %d",
+                src_global_locs.size,
+                dst_global_locs.size,
+                min_len,
+            )
+            src_global_locs = src_global_locs[:min_len]
+            dst_global_locs = dst_global_locs[:min_len]
+
+        mask = np.ones(dst_global_locs.shape, dtype=bool)
+        if dst_dcp_size > 1:
+            mask &= (dst_global_locs % dst_dcp_size) == dst_dcp_rank
+        if src_dcp_size > 1:
+            mask &= (src_global_locs % src_dcp_size) == src_dcp_rank
+        selected_src = src_global_locs[mask].astype(np.int32, copy=False)
+        selected_dst = dst_global_locs[mask].astype(np.int32, copy=False)
+        if src_dcp_size > 1:
+            src_indices = (selected_src // src_dcp_size).astype(np.int32, copy=False)
+        else:
+            src_indices = selected_src
+        if dst_dcp_size > 1:
+            dst_indices = (selected_dst // dst_dcp_size).astype(np.int32, copy=False)
+        else:
+            dst_indices = selected_dst
+        return src_indices, dst_indices
 
     def _send_dsv4_kvcache_dcp(
         self,
@@ -806,6 +854,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo],
     ) -> int:
         """DSV4 compressed KV transfer under DCP.
 
@@ -818,21 +867,45 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args.kv_data_ptrs, dst_kv_ptrs
         )
         item_lens = self.kv_args.kv_item_lens
+        dst_dcp_size = (
+            target_rank_registration_info.dst_dcp_size
+            if target_rank_registration_info is not None
+            else self.dcp_size
+        )
+        dst_dcp_rank = (
+            target_rank_registration_info.dst_dcp_rank
+            if target_rank_registration_info is not None
+            else self.dcp_rank
+        )
 
         c4_slots_per_page = max(self.kv_args.page_size // 4, 1)
         c128_slots_per_page = max(self.kv_args.page_size // 128, 1)
 
-        src_c4 = self._dsv4_bucket_locs_from_token_locs(
-            prefill_kv_indices, 4, self.dcp_size, self.dcp_rank
+        c4_src_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            prefill_kv_indices, 4
         )
-        dst_c4 = self._dsv4_bucket_locs_from_token_locs(
-            dst_kv_indices, 4, self.dcp_size, self.dcp_rank
+        c4_dst_global_locs = self._dsv4_bucket_locs_from_token_locs(dst_kv_indices, 4)
+        src_c4, dst_c4 = self._dcp_transfer_index_pair(
+            c4_src_global_locs,
+            c4_dst_global_locs,
+            self.dcp_size,
+            self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
         )
-        src_c128 = self._dsv4_bucket_locs_from_token_locs(
-            prefill_kv_indices, 128, self.dcp_size, self.dcp_rank
+        c128_src_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            prefill_kv_indices, 128
         )
-        dst_c128 = self._dsv4_bucket_locs_from_token_locs(
-            dst_kv_indices, 128, self.dcp_size, self.dcp_rank
+        c128_dst_global_locs = self._dsv4_bucket_locs_from_token_locs(
+            dst_kv_indices, 128
+        )
+        src_c128, dst_c128 = self._dcp_transfer_index_pair(
+            c128_src_global_locs,
+            c128_dst_global_locs,
+            self.dcp_size,
+            self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
         )
 
         rc = 0
@@ -910,16 +983,16 @@ class MooncakeKVManager(CommonKVManager):
         )
         swa_count, _, _ = self._dsv4_stage_bucket_counts()
         page_size = max(self.kv_args.page_size, 1)
+        dst_dcp_size = target_rank_registration_info.dst_dcp_size
+        dst_dcp_rank = target_rank_registration_info.dst_dcp_rank
 
-        src_swa_locs = filter_kv_indices_for_dcp_rank(
+        src_swa_locs, dst_swa_locs = self._dcp_transfer_index_pair(
             np.array(prefill_state_indices[0], dtype=np.int32),
-            self.dcp_size,
-            self.dcp_rank,
-        )
-        dst_swa_locs = filter_kv_indices_for_dcp_rank(
             np.array(req.dst_state_indices[0], dtype=np.int32),
             self.dcp_size,
             self.dcp_rank,
+            dst_dcp_size,
+            dst_dcp_rank,
         )
         # CompressStatePool is indexed by SWA page. In DCP mode the pool is
         # sized for the rank-local SWA address space, so derive local page ids
@@ -969,13 +1042,22 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
-        if self.dcp_size > 1 and self._is_dsv4_pool():
+        target_rank_registration_info = self.decode_kv_args_table.get(
+            mooncake_session_id
+        )
+        dst_dcp_size = (
+            target_rank_registration_info.dst_dcp_size
+            if target_rank_registration_info is not None
+            else 1
+        )
+        if (self.dcp_size > 1 or dst_dcp_size > 1) and self._is_dsv4_pool():
             return self._send_dsv4_kvcache_dcp(
                 mooncake_session_id,
                 prefill_kv_indices,
                 dst_kv_ptrs,
                 dst_kv_indices,
                 executor,
+                target_rank_registration_info,
             )
         item_lens = self.kv_args.kv_item_lens
         if self.dcp_size > 1:
@@ -1264,7 +1346,12 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
-        if self.dcp_size > 1 and self._is_dsv4_pool():
+        dst_dcp_size = (
+            target_rank_registration_info.dst_dcp_size
+            if target_rank_registration_info is not None
+            else 1
+        )
+        if (self.dcp_size > 1 or dst_dcp_size > 1) and self._is_dsv4_pool():
             return self._send_dsv4_state_dcp(
                 req,
                 prefill_state_indices,
@@ -2092,6 +2179,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
+            dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+            dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
 
             if (
                 self.kv_mgr.enable_staging
@@ -2121,6 +2210,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                         enable_hisparse,
+                        dst_dcp_size,
+                        dst_dcp_rank,
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]
