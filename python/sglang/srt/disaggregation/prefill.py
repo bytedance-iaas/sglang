@@ -761,6 +761,7 @@ class SchedulerDisaggregationPrefillMixin:
         Send a prefilled chunk to the decode server
         """
         page_size = self.token_to_kv_pool_allocator.page_size
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -795,7 +796,7 @@ class SchedulerDisaggregationPrefillMixin:
         dcp_size_local = getattr(kv_mgr, "dcp_size", 1) or 1
         dcp_rank_local = getattr(kv_mgr, "dcp_rank", 0) or 0
         target_dcp_size = dcp_size_local
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
             transfer_infos = getattr(kv_mgr, "transfer_infos", {}).get(
                 req.bootstrap_room, {}
             )
@@ -806,9 +807,8 @@ class SchedulerDisaggregationPrefillMixin:
                     target_dcp_size = max(
                         target_dcp_size, getattr(target_info, "dst_dcp_size", 1) or 1
                     )
-        dsv4_dcp_transfer = (
-            target_dcp_size > 1
-            and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        dsv4_dcp_transfer = target_dcp_size > 1 and isinstance(
+            token_to_kv_pool, DeepSeekV4TokenToKVPool
         )
         if dcp_size_local > 1 and not dsv4_dcp_transfer:
             kv_indices = filter_kv_indices_for_dcp_rank(
@@ -853,9 +853,7 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_swa_np,
                         kv_to_page_indices(window_kv_indices_swa_np, page_size),
                     ]
-                return kv_to_page_indices(
-                    window_kv_indices_swa_np, page_size
-                )
+                return kv_to_page_indices(window_kv_indices_swa_np, page_size)
 
             def _nsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
