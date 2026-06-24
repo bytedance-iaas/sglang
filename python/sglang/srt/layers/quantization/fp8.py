@@ -908,35 +908,40 @@ class Fp8LinearMethod(LinearMethodBase):
         recipe_a = (1, _infer_sm90_mxfp8_gran_k_from_scale(x_scale_2d, k))
         recipe_b = (1, _infer_sm90_mxfp8_gran_k_from_scale(weight_scale, k))
 
-        # Decode/low-latency shapes are small and benefit from the masked kernel.
-        # Use contiguous only for block-aligned normal/prefill shapes; otherwise
-        # the single dense group can still hit the contiguous scheduler's tail
-        # assumptions and corrupt the prefill state.
-        use_masked = m <= 64 or m % 128 != 0
-
-        if use_masked:
-            masked_m = torch.empty((1,), device=x_2d.device, dtype=torch.int32)
-            masked_m.fill_(m)
-            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
-                (x_2d.unsqueeze(0), x_scale_2d.unsqueeze(0)),
-                (weight, weight_scale),
-                out.unsqueeze(0),
-                masked_m,
-                expected_m=m,
-                recipe_a=recipe_a,
-                recipe_b=recipe_b,
-            )
+        padded_m = ((m + 127) // 128) * 128
+        if padded_m == m:
+            kernel_x = x_2d
+            kernel_scale = x_scale_2d
+            kernel_out = out
         else:
-            m_indices = torch.empty((m,), device=x_2d.device, dtype=torch.int32)
-            m_indices.zero_()
-            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
-                (x_2d, x_scale_2d),
-                (weight, weight_scale),
-                out,
-                m_indices,
-                recipe_a=recipe_a,
-                recipe_b=recipe_b,
+            kernel_x = torch.zeros(
+                (padded_m, k), device=x_2d.device, dtype=x_2d.dtype
             )
+            kernel_x[:m] = x_2d
+            kernel_scale = torch.zeros(
+                (padded_m, x_scale_2d.shape[-1]),
+                device=x_scale_2d.device,
+                dtype=x_scale_2d.dtype,
+            )
+            kernel_scale[:m] = x_scale_2d
+            kernel_out = torch.empty(
+                (padded_m, n), device=out.device, dtype=out.dtype
+            )
+
+        m_indices = torch.full(
+            (padded_m,), -1, device=x_2d.device, dtype=torch.int32
+        )
+        m_indices[:m] = 0
+        deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+            (kernel_x, kernel_scale),
+            (weight, weight_scale),
+            kernel_out,
+            m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+        )
+        if kernel_out is not out:
+            out.copy_(kernel_out[:m])
 
         if bias is not None:
             out = out + bias

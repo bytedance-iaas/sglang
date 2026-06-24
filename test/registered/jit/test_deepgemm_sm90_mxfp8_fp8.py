@@ -238,7 +238,7 @@ def test_sm90_mxfp8_dense_linear_uses_grouped_kernel_accuracy(m):
 
 
 @pytest.mark.parametrize("m,n,k", [(65, 256, 7168), (181, 128, 7168)])
-def test_sm90_mxfp8_dense_linear_masked_large_k_accuracy(m, n, k):
+def test_sm90_mxfp8_dense_linear_contig_tail_large_k_accuracy(m, n, k):
     _require_sm90_mxfp8_grouped_gemm()
 
     from deep_gemm.utils.math import per_token_cast_to_fp8
@@ -264,7 +264,7 @@ def test_sm90_mxfp8_dense_linear_masked_large_k_accuracy(m, n, k):
     )
     quant_method = Fp8LinearMethod(config)
     assert quant_method.use_sm90_mxfp8_deepgemm_linear
-    assert m <= 64 or m % 128 != 0
+    assert m % 128 != 0
 
     out = quant_method.apply(layer, x)
 
