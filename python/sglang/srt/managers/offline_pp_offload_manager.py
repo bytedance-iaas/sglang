@@ -13,8 +13,8 @@ Design (see plan §3.2/3.3/3.3.1):
     soon as free slots appear (released by the finishing DECODING wave) they are
     used to bring back part of the next wave's state, until the whole wave is
     resident and re-mapped, at which point it becomes DECODE_READY.
-  - GPU holds at most two waves at a time (double-buffer). This is a structural
-    constant, not a tunable.
+  - Prefetch is serialized (at most one PREFETCHING wave), while any number of
+    fully prefetched waves may wait in DECODE_READY if device memory allows it.
   - Deadlock avoidance: admission budget check (+ wave splitting), no-progress
     timeout rollback (host keeps the authoritative copy, so dropping the partial
     device copy is lossless), and aging / exclusive-mode fallback.
@@ -42,8 +42,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Number of resident waves on GPU. Structural constant of the double-buffer
-# scheme (current DECODING wave + next PREFETCHING/DECODE_READY wave), NOT a knob.
+# Per-wave admission divisor. Runtime residency is limited by allocator
+# availability; only one wave may be PREFETCHING at a time.
 RESIDENT_WAVES = 2
 
 # Fraction of the total allocatable slots a single wave may use, leaving margin
@@ -108,10 +108,12 @@ class WaveStateHandle:
     # Offload bookkeeping (layer-wise): number of layers offloaded so far.
     offload_done_layers: int = 0
     offload_ready: bool = False
+    offload_done_event: object = None
 
     # Prefetch (drip) bookkeeping: number of requests brought back so far.
     prefetch_done_units: int = 0
     prefetch_ready: bool = False
+    prefetch_done_event: object = None
 
     # Deadlock-avoidance bookkeeping.
     last_progress_tick: int = 0
@@ -206,6 +208,43 @@ class OfflinePPStateOffloadManager:
         """Advance the logical scheduler clock (called once per scheduler loop)."""
         self._tick += 1
 
+    def _event_done(self, event) -> bool:
+        return event is None or event.query()
+
+    def _log_wave(self, action: str, wave: WaveStateHandle, **kwargs) -> None:
+        device_slots = 0
+        for entry in wave.entries.values():
+            if entry.device_kv_indices is not None:
+                device_slots += int(entry.device_kv_indices.numel())
+        mamba_slots = sum(
+            1 for req in wave.reqs if getattr(req, "mamba_pool_idx", None) is not None
+        )
+        extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
+        logger.info(
+            "OfflinePP %s wave=%d state=%s bs=%d prefetched=%d/%d "
+            "committed_slots=%d device_slots=%d mamba_slots=%d%s%s",
+            action,
+            wave.wave_id,
+            wave.state.value,
+            len(wave.reqs),
+            wave.prefetch_done_units,
+            len(wave.reqs),
+            sum(entry.committed_len for entry in wave.entries.values()),
+            device_slots,
+            mamba_slots,
+            " " if extra else "",
+            extra,
+        )
+
+    def has_decoding_wave(self) -> bool:
+        return any(wave.state == WaveState.DECODING for wave in self.waves.values())
+
+    def active_decoding_wave_id(self) -> Optional[int]:
+        for wave in self.waves.values():
+            if wave.state == WaveState.DECODING:
+                return wave.wave_id
+        return None
+
     def new_wave(self, reqs: List["Req"]) -> WaveStateHandle:
         wave_id = self._next_wave_id
         self._next_wave_id += 1
@@ -224,6 +263,7 @@ class OfflinePPStateOffloadManager:
                 committed_len=self._req_committed_len(r),
             )
         self.waves[wave_id] = handle
+        self._log_wave("OFFLOAD_ENQUEUE", handle)
         return handle
 
     def _req_slot_demand(self, req: "Req") -> int:
@@ -288,30 +328,58 @@ class OfflinePPStateOffloadManager:
         self, wave: WaveStateHandle, layer_mask: Optional[set] = None
     ) -> None:
         """Snapshot the wave's full state to host on the offload stream."""
+        self.offload_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.offload_stream):
             for req in wave.reqs:
                 entry = wave.entries[req.rid]
                 kv_indices = self._req_device_indices(req, entry.committed_len)
                 mamba_indices = self._req_mamba_indices(req)
                 if mamba_indices is not None:
-                    cpu_state = self.kv_cache.get_cpu_copy(kv_indices, mamba_indices)
+                    cpu_state = self.kv_cache.get_cpu_copy(
+                        kv_indices,
+                        mamba_indices,
+                        async_copy=True,
+                        pin_memory=True,
+                    )
                 else:
-                    cpu_state = self.kv_cache.get_cpu_copy(kv_indices)
+                    cpu_state = self.kv_cache.get_cpu_copy(
+                        kv_indices,
+                        async_copy=True,
+                        pin_memory=True,
+                    )
                 entry.cpu_state = self.codec.encode_on_offload(cpu_state)
-        self.offload_stream.synchronize()
-        wave.offload_ready = True
+            wave.offload_done_event = self.device_module.Event()
+            wave.offload_done_event.record(self.offload_stream)
+        wave.offload_ready = False
 
-    def mark_wave_offloaded(self, wave: WaveStateHandle) -> None:
+    def is_wave_offload_ready(self, wave: WaveStateHandle) -> bool:
+        if wave.offload_ready:
+            return True
+        if wave.offload_done_event is None:
+            return False
+        if self._event_done(wave.offload_done_event):
+            wave.offload_ready = True
+            self._log_wave("OFFLOAD_READY", wave)
+        return wave.offload_ready
+
+    def mark_wave_offloaded(self, wave: WaveStateHandle) -> bool:
         """Free the wave's device slots and move it to the OFFLOADED queue.
 
         Must be called only after ``offload_ready`` (state is safely on host).
         """
-        assert wave.offload_ready, "mark_wave_offloaded before offload completed"
+        if not self.is_wave_offload_ready(wave):
+            return False
         for req in wave.reqs:
             self._free_req_device_slots(req, wave.entries[req.rid].committed_len)
         wave.state = WaveState.OFFLOADED
         wave.last_progress_tick = self._tick
         self.offloaded_queue.append(wave.wave_id)
+        self._log_wave(
+            "OFFLOAD_TO_HOST",
+            wave,
+            queue_len=len(self.offloaded_queue),
+        )
+        return True
 
     def _free_req_device_slots(self, req: "Req", length: int) -> None:
         kv_indices = self._req_device_indices(req, length)
@@ -377,6 +445,15 @@ class OfflinePPStateOffloadManager:
             rem.entries[r.rid] = entry
         rem.d_wave_slots = sum(rem.entries[r.rid].token_len for r in reqs)
         self.offloaded_queue.append(rem.wave_id)
+        self._log_wave(
+            "OFFLOAD_SPLIT_REQUEUE", rem, queue_len=len(self.offloaded_queue)
+        )
+
+    def start_prefetching(self, wave: WaveStateHandle) -> None:
+        wave.state = WaveState.PREFETCHING
+        wave.last_progress_tick = self._tick
+        wave.prefetch_done_event = None
+        self._log_wave("PREFETCH_START", wave, queue_len=len(self.offloaded_queue))
 
     def prefetch_step(self, wave: WaveStateHandle, free_slots: int) -> int:
         """Drip-prefetch: bring back as many of the wave's requests as the
@@ -433,27 +510,52 @@ class OfflinePPStateOffloadManager:
                     mamba_indices = self._req_mamba_indices(req)
                     if mamba_indices is not None:
                         self.kv_cache.load_cpu_copy(
-                            cpu_state, restore_indices, mamba_indices
+                            cpu_state,
+                            restore_indices,
+                            mamba_indices,
+                            async_copy=True,
                         )
                     else:
-                        self.kv_cache.load_cpu_copy(cpu_state, restore_indices)
+                        self.kv_cache.load_cpu_copy(
+                            cpu_state,
+                            restore_indices,
+                            async_copy=True,
+                        )
                 except Exception:
+                    self.prefetch_stream.synchronize()
                     self._release_prefetched_req(req, entry)
                     raise
                 entry.prefetched = True
                 wave.prefetch_done_units += 1
                 consumed += alloc_len
                 progressed = True
+            if progressed:
+                wave.prefetch_done_event = self.device_module.Event()
+                wave.prefetch_done_event.record(self.prefetch_stream)
         if progressed:
             wave.last_progress_tick = self._tick
+            self._log_wave(
+                "PREFETCH_PROGRESS",
+                wave,
+                consumed_slots=consumed,
+                free_slots=free_slots,
+            )
         return consumed
 
     def is_wave_decode_ready(self, wave: WaveStateHandle) -> bool:
-        ready = all(e.prefetched for e in wave.entries.values())
+        ready = all(e.prefetched for e in wave.entries.values()) and self._event_done(
+            wave.prefetch_done_event
+        )
         wave.prefetch_ready = ready
         if ready:
+            if wave.state != WaveState.DECODE_READY:
+                self._log_wave("DECODE_READY", wave)
             wave.state = WaveState.DECODE_READY
         return ready
+
+    def wait_prefetch_for_decode(self, wave: WaveStateHandle) -> None:
+        if wave.prefetch_done_event is not None:
+            self.device_module.current_stream().wait_event(wave.prefetch_done_event)
 
     def _release_prefetched_req(self, req: "Req", entry: _ReqStateEntry) -> None:
         """Release a partially/fully prefetched request back to host-only state."""
@@ -476,6 +578,10 @@ class OfflinePPStateOffloadManager:
     # Deadlock avoidance
     # ------------------------------------------------------------------ #
     def is_stalled(self, wave: WaveStateHandle) -> bool:
+        if all(e.prefetched for e in wave.entries.values()) and not self._event_done(
+            wave.prefetch_done_event
+        ):
+            return False
         return (self._tick - wave.last_progress_tick) >= self.stall_ticks
 
     def rollback_wave(self, wave: WaveStateHandle) -> None:
@@ -498,6 +604,7 @@ class OfflinePPStateOffloadManager:
                 req.mamba_pool_idx = None
         wave.prefetch_done_units = 0
         wave.prefetch_ready = False
+        wave.prefetch_done_event = None
         wave.retry_count += 1
         wave.last_progress_tick = self._tick
         wave.state = WaveState.OFFLOADED
@@ -507,12 +614,11 @@ class OfflinePPStateOffloadManager:
         # forward progress (run alone once the GPU is fully drained).
         if wave.retry_count >= RESIDENT_WAVES:
             wave.exclusive_mode = True
-        logger.warning(
-            "Offline-PP prefetch wave %d stalled, rolled back "
-            "(retry=%d, exclusive=%s).",
-            wave.wave_id,
-            wave.retry_count,
-            wave.exclusive_mode,
+        self._log_wave(
+            "ROLLBACK",
+            wave,
+            retry=wave.retry_count,
+            exclusive=wave.exclusive_mode,
         )
 
     def pop_next_offloaded(self) -> Optional[WaveStateHandle]:
@@ -524,6 +630,7 @@ class OfflinePPStateOffloadManager:
 
     def retire_wave(self, wave: WaveStateHandle) -> None:
         """Drop a fully-decoded wave's bookkeeping."""
+        self._log_wave("DECODE_RETIRE", wave)
         self.waves.pop(wave.wave_id, None)
         self.offloaded_queue = [
             wid for wid in self.offloaded_queue if wid != wave.wave_id
@@ -542,20 +649,22 @@ class OfflinePPStateOffloadManager:
     # ------------------------------------------------------------------ #
     def offload_prefilled_wave(self, reqs: List["Req"]) -> WaveStateHandle:
         """Register a just-prefilled batch as a wave, snapshot its state to
-        host, and free its device slots. Returns the OFFLOADED wave handle.
+        host, and free its device slots once the async offload event completes.
 
-        v1 performs the host snapshot synchronously here (finalize_offload);
+        v1 snapshots the full state here (finalize_offload);
         layer-wise overlap is a future refinement (offload_wave_layer hook).
         """
         wave = self.new_wave(reqs)
         self.finalize_offload(wave)
-        self.mark_wave_offloaded(wave)
         return wave
 
-    def take_decode_ready_wave(self) -> Optional[WaveStateHandle]:
+    def take_decode_ready_wave(
+        self, mb_id: Optional[int] = None
+    ) -> Optional[WaveStateHandle]:
         """Return a DECODE_READY wave and transition it to DECODING, or None."""
-        for wave in self.waves.values():
+        for wave in sorted(self.waves.values(), key=lambda w: w.wave_id):
             if wave.state == WaveState.DECODE_READY:
                 wave.state = WaveState.DECODING
+                self._log_wave("DECODE_START", wave, mb_id=mb_id)
                 return wave
         return None

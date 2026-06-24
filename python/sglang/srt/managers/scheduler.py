@@ -2472,7 +2472,12 @@ class Scheduler(
                 return self.running_batch
 
         # Step 4: promote a fully-prefetched wave into a decode batch.
-        wave = mgr.take_decode_ready_wave()
+        if mgr.has_decoding_wave():
+            return None
+
+        wave = mgr.take_decode_ready_wave(
+            mb_id=getattr(self, "current_pp_mb_id", None)
+        )
         if wave is not None:
             self.running_batch = self._build_offline_pp_decode_batch(wave)
             return self.running_batch
@@ -2487,6 +2492,8 @@ class Scheduler(
         """
         reqs = wave.reqs
         device = self.device
+
+        self.offline_pp_offload_manager.wait_prefetch_for_decode(wave)
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,

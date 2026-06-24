@@ -78,6 +78,29 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def _copy_to_cpu(
+    tensor: torch.Tensor,
+    *,
+    pin_memory: bool = False,
+    non_blocking: bool = False,
+) -> torch.Tensor:
+    if not pin_memory:
+        return tensor.to("cpu", non_blocking=non_blocking)
+
+    try:
+        cpu_tensor = torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+    except RuntimeError:
+        cpu_tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
+        non_blocking = False
+    cpu_tensor.copy_(tensor, non_blocking=non_blocking)
+    return cpu_tensor
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -402,27 +425,41 @@ class MambaPool:
             :, src_indices
         ]
 
-    def get_cpu_copy(self, indices):
-        current_platform.synchronize()
+    def get_cpu_copy(
+        self, indices, async_copy: bool = False, pin_memory: bool = False
+    ):
+        if not async_copy:
+            current_platform.synchronize()
         conv_cpu = [
-            conv[:, indices].to("cpu", non_blocking=True)
+            _copy_to_cpu(
+                conv[:, indices],
+                pin_memory=pin_memory,
+                non_blocking=True,
+            )
             for conv in self.mamba_cache.conv
         ]
-        temporal_cpu = self.mamba_cache.temporal[:, indices].to(
-            "cpu", non_blocking=True
+        temporal_cpu = _copy_to_cpu(
+            self.mamba_cache.temporal[:, indices],
+            pin_memory=pin_memory,
+            non_blocking=True,
         )
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
-    def load_cpu_copy(self, mamba_cache_cpu, indices):
+    def load_cpu_copy(self, mamba_cache_cpu, indices, async_copy: bool = False):
         conv_cpu, temporal_cpu = mamba_cache_cpu
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
-            conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
+            conv[:, indices] = conv_cpu[i].to(
+                conv.device, non_blocking=True
+            )
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
 
     def get_contiguous_buf_infos(self):
         """
@@ -851,10 +888,18 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        async_copy: bool = False,
+        pin_memory: bool = False,
+    ):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, async_copy: bool = False
+    ):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -1133,26 +1178,41 @@ class MHATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        current_platform.synchronize()
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        async_copy: bool = False,
+        pin_memory: bool = False,
+    ):
+        if not async_copy:
+            current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_cpu = self.k_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
+                k_cpu = _copy_to_cpu(
+                    self.k_buffer[layer_id][chunk_indices],
+                    pin_memory=pin_memory,
+                    non_blocking=True,
                 )
-                v_cpu = self.v_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
+                v_cpu = _copy_to_cpu(
+                    self.v_buffer[layer_id][chunk_indices],
+                    pin_memory=pin_memory,
+                    non_blocking=True,
                 )
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        current_platform.synchronize()
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, async_copy: bool = False
+    ):
+        if not async_copy:
+            current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
@@ -1162,11 +1222,16 @@ class MHATokenToKVPool(KVCache):
                     kv_cache_cpu[layer_id][i // chunk_size][1],
                 )
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
+                k_chunk = k_cpu.to(
+                    self.k_buffer[0].device, non_blocking=True
+                )
+                v_chunk = v_cpu.to(
+                    self.v_buffer[0].device, non_blocking=True
+                )
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -1763,20 +1828,34 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        async_copy: bool = False,
+        pin_memory: bool = False,
+    ):
+        kv_cpu = self.full_kv_pool.get_cpu_copy(
+            indices, async_copy=async_copy, pin_memory=pin_memory
+        )
         mamba_cpu = (
-            self.mamba_pool.get_cpu_copy(mamba_indices)
+            self.mamba_pool.get_cpu_copy(
+                mamba_indices, async_copy=async_copy, pin_memory=pin_memory
+            )
             if mamba_indices is not None
             else None
         )
         return kv_cpu, mamba_cpu
 
-    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, cache_cpu, indices, mamba_indices=None, async_copy: bool = False
+    ):
         kv_cpu, mamba_cpu = cache_cpu
-        self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
+        self.full_kv_pool.load_cpu_copy(kv_cpu, indices, async_copy=async_copy)
         if mamba_cpu is not None and mamba_indices is not None:
-            self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
+            self.mamba_pool.load_cpu_copy(
+                mamba_cpu, mamba_indices, async_copy=async_copy
+            )
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
@@ -2025,32 +2104,48 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        current_platform.synchronize()
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        async_copy: bool = False,
+        pin_memory: bool = False,
+    ):
+        if not async_copy:
+            current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
+                kv_cpu = _copy_to_cpu(
+                    self.kv_buffer[layer_id][chunk_indices],
+                    pin_memory=pin_memory,
+                    non_blocking=True,
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        current_platform.synchronize()
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, async_copy: bool = False
+    ):
+        if not async_copy:
+            current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert kv_cpu.shape[0] == len(chunk_indices)
-                kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
+                kv_chunk = kv_cpu.to(
+                    self.kv_buffer[0].device, non_blocking=True
+                )
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-        current_platform.synchronize()
+        if not async_copy:
+            current_platform.synchronize()
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
@@ -2360,16 +2455,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        async_copy: bool = False,
+        pin_memory: bool = False,
+    ):
         # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
         # DSA attention reads garbage at those token positions.
-        kv_cache_cpu = super().get_cpu_copy(indices)
+        kv_cache_cpu = super().get_cpu_copy(
+            indices, async_copy=async_copy, pin_memory=pin_memory
+        )
 
         page_indices = indices[:: self.page_size] // self.page_size
-        torch.cuda.synchronize()
+        if not async_copy:
+            torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
@@ -2377,20 +2481,30 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.index_k_with_scale_buffer[layer_id][
-                    chunk_page_indices
-                ].to("cpu", non_blocking=True)
+                idx_cpu = _copy_to_cpu(
+                    self.index_k_with_scale_buffer[layer_id][chunk_page_indices],
+                    pin_memory=pin_memory,
+                    non_blocking=True,
+                )
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
+        if not async_copy:
+            torch.cuda.synchronize()
 
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
-        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
+    def load_cpu_copy(
+        self,
+        kv_cache_cpu_dict,
+        indices,
+        mamba_indices=None,
+        async_copy: bool = False,
+    ):
+        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices, async_copy=async_copy)
 
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
-        torch.cuda.synchronize()
+        if not async_copy:
+            torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
@@ -2399,10 +2513,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
                 idx_chunk = idx_cpu.to(
-                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                    self.index_k_with_scale_buffer[0].device,
+                    non_blocking=True,
                 )
                 self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        if not async_copy:
+            torch.cuda.synchronize()
 
     def get_state_buf_infos(self):
         data_ptrs = [
