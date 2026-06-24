@@ -866,8 +866,10 @@ class MiniMaxM3Attention(nn.Module):
         # maybe_build_fused_qkv_index(); falls back to two GEMMs when the quant
         # method does not support a safe output-dim concat (only unquantized
         # bf16 and mxfp8 are fused; anything else keeps the two projections).
-        self._fuse_qkv_index_enabled = self.is_sparse_attention_layer and (
-            _is_cuda or _is_hip
+        self._fuse_qkv_index_enabled = (
+            self.is_sparse_attention_layer
+            and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKV_INDEX.get()
+            and (_is_cuda or _is_hip)
         )
         self._fused_qkv_index = None
         # Per-token main width (q | k | v), in elements; index columns follow it

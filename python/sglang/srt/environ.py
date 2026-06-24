@@ -861,6 +861,11 @@ class Envs:
     # gemma norm, head_dim=128, rotary_dim=64, neox, no output gate, fp32 cache).
     SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE = EnvBool(True)
 
+    # MiniMax-M3 sparse attention: fuse the main qkv projection and sparse
+    # index qkv projection into one GEMM. Disable to isolate sparse-attention
+    # precision issues from the fused projection path.
+    SGLANG_OPT_USE_MINIMAX_FUSED_QKV_INDEX = EnvBool(True)
+
     # MiniMax-M3 sparse attention: store the main K/V plus the index K (and
     # optional index V) into their KV pools in a single fused JIT launch
     # (minimax_store_kv_index) instead of 2-3 separate set_*_buffer copies.
