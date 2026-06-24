@@ -918,20 +918,6 @@ class Fp8LinearMethod(LinearMethodBase):
         if m == 0:
             return out.reshape(output_shape)
 
-        if (
-            _infer_sm90_mxfp8_gran_k_from_scale(x_scale_2d, k) == 32
-            and _infer_sm90_mxfp8_gran_k_from_scale(layer.weight_scale_inv, k) == 32
-            and hasattr(deep_gemm_wrapper, "gemm_nt_mxfp8_f8f8bf16")
-        ):
-            deep_gemm_wrapper.gemm_nt_mxfp8_f8f8bf16(
-                (x_2d, x_scale_2d),
-                (layer.weight, layer.weight_scale_inv),
-                out,
-            )
-            if bias is not None:
-                out = out + bias
-            return out.reshape(output_shape)
-
         weight = layer.weight.unsqueeze(0)
         weight_scale = layer.weight_scale_inv.unsqueeze(0)
         recipe_a = (1, _infer_sm90_mxfp8_gran_k_from_scale(x_scale_2d, k))

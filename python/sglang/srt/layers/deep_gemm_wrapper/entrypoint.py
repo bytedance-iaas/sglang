@@ -767,12 +767,6 @@ def gemm_nt_mxfp8_f8f8bf16(
     num_groups = 1
     kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
 
-    recipe_a = (1, 32)
-    recipe_b = (1, 32)
-    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
-    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
-    _assert_sm90_mxfp8_scale_matches_recipe(lhs[1], k, recipe_a, role="lhs")
-    _assert_sm90_mxfp8_scale_matches_recipe(rhs[1], k, recipe_b, role="rhs")
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
@@ -784,8 +778,8 @@ def gemm_nt_mxfp8_f8f8bf16(
             lhs,
             rhs,
             out,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
             disable_ue8m0_cast=disable_cast,
         )
 
