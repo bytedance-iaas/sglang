@@ -2451,7 +2451,10 @@ class Scheduler(
             prefilled = [r for r in prefilled_batch.reqs if not r.finished()]
             self.last_batch = None
             if prefilled:
-                mgr.offload_prefilled_wave(prefilled)
+                mgr.offload_prefilled_wave(
+                    prefilled,
+                    source_stream=getattr(self, "forward_stream", None),
+                )
             prefilled_batch.filter_batch(keep_indices=[])
 
         # Step 2: keep prefilling while there is work, to build up waves.

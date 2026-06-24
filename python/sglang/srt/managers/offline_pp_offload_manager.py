@@ -325,9 +325,14 @@ class OfflinePPStateOffloadManager:
         wave.offload_done_layers = max(wave.offload_done_layers, layer_id + 1)
 
     def finalize_offload(
-        self, wave: WaveStateHandle, layer_mask: Optional[set] = None
+        self,
+        wave: WaveStateHandle,
+        layer_mask: Optional[set] = None,
+        source_stream=None,
     ) -> None:
         """Snapshot the wave's full state to host on the offload stream."""
+        if source_stream is not None:
+            self.offload_stream.wait_stream(source_stream)
         self.offload_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.offload_stream):
             for req in wave.reqs:
@@ -647,7 +652,9 @@ class OfflinePPStateOffloadManager:
     # ------------------------------------------------------------------ #
     # High-level hooks used by batch formation
     # ------------------------------------------------------------------ #
-    def offload_prefilled_wave(self, reqs: List["Req"]) -> WaveStateHandle:
+    def offload_prefilled_wave(
+        self, reqs: List["Req"], source_stream=None
+    ) -> WaveStateHandle:
         """Register a just-prefilled batch as a wave, snapshot its state to
         host, and free its device slots once the async offload event completes.
 
@@ -655,7 +662,7 @@ class OfflinePPStateOffloadManager:
         layer-wise overlap is a future refinement (offload_wave_layer hook).
         """
         wave = self.new_wave(reqs)
-        self.finalize_offload(wave)
+        self.finalize_offload(wave, source_stream=source_stream)
         return wave
 
     def take_decode_ready_wave(
