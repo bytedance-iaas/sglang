@@ -337,15 +337,35 @@ class TemplateManager:
         self, tokenizer_manager: TokenizerManager
     ) -> Optional[str]:
         try:
-            # Try (mm-)processor first, then tokenizer
-            template = (
-                getattr(tokenizer_manager.processor, "chat_template", None)
-                if tokenizer_manager.processor
-                else None
-            ) or (
-                getattr(tokenizer_manager.tokenizer, "chat_template", None)
-                if tokenizer_manager.tokenizer
-                else None
+            # Try (mm-)processor first, then tokenizer, then the model config.
+            # MiniMax-M3 publishes its Jinja template as `chat_template_jinja`
+            # in config.json rather than tokenizer_config.json.
+            config = getattr(tokenizer_manager.model_config, "hf_config", None)
+            text_config = getattr(config, "text_config", None) if config else None
+            template = next(
+                (
+                    candidate
+                    for candidate in (
+                        getattr(tokenizer_manager.processor, "chat_template", None)
+                        if tokenizer_manager.processor
+                        else None,
+                        getattr(tokenizer_manager.tokenizer, "chat_template", None)
+                        if tokenizer_manager.tokenizer
+                        else None,
+                        getattr(config, "chat_template_jinja", None)
+                        if config
+                        else None,
+                        getattr(config, "chat_template", None) if config else None,
+                        getattr(text_config, "chat_template_jinja", None)
+                        if text_config
+                        else None,
+                        getattr(text_config, "chat_template", None)
+                        if text_config
+                        else None,
+                    )
+                    if candidate
+                ),
+                None,
             )
 
             if template is None:
