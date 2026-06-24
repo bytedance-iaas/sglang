@@ -257,6 +257,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
+    @staticmethod
+    def _make_kv_index_store_inputs_contiguous(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+    ):
+        return (
+            k.contiguous(),
+            v.contiguous(),
+            idx_k.contiguous(),
+            None if idx_v is None else idx_v.contiguous(),
+        )
+
     def forward(
         self,
         q,
@@ -301,11 +315,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
-            k = k.contiguous()
-            v = v.contiguous()
-            idx_k = idx_k.contiguous()
-            if idx_v is not None:
-                idx_v = idx_v.contiguous()
+            k, v, idx_k, idx_v = self._make_kv_index_store_inputs_contiguous(
+                k, v, idx_k, idx_v
+            )
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
                 forward_batch.out_cache_loc,
@@ -452,6 +464,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        k, v, idx_k, idx_v = self._make_kv_index_store_inputs_contiguous(
+            k, v, idx_k, idx_v
+        )
         self.kv_pool.set_fused_kv_index_buffer(
             layer,
             forward_batch.out_cache_loc,
