@@ -855,6 +855,11 @@ class Envs:
     # JIT CUDA radix-select kernel (minimax_decode_topk).
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
+    # MiniMax-M3 sparse attention: route sparse layers through the dense
+    # attention backend. This is a diagnostic fallback to isolate whether
+    # wrong results come from sparse block selection/main sparse kernels.
+    SGLANG_OPT_USE_MINIMAX_SPARSE_ATTENTION_DENSE_FALLBACK = EnvBool(False)
+
     # MiniMax-M3 attention: fuse per-head GemmaRMSNorm(q,k) + partial NeoX RoPE
     # into one in-place JIT kernel (minimax_qknorm_rope) instead of separate
     # norm + rope launches. Only activates for the verified config (per_head

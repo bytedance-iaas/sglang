@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -580,7 +581,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.sparse.get_cuda_graph_seq_len_fill_value()
 
-    def forward(
+    def _dense_forward_with_dp_trim(
         self,
         q,
         k,
@@ -588,20 +589,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         layer,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        **kwargs,
     ):
-        if layer.layer_id in self.sparse_layer_ids:
-            return self.sparse.forward(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
-
-        # Dense layers delegate to the stock backend (e.g. flashinfer). Under DP
-        # attention the per-rank token block is padded to an even length
-        # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
-        # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
-        # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
-        # the real token count and re-pad the output; k/v stay untrimmed so the
-        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
         mode = forward_batch.forward_mode
         if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
@@ -614,13 +602,43 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
                     layer,
                     forward_batch,
                     save_kv_cache,
-                    **kwargs,
                 )
                 pad_len = original_num_tokens - actual_num_tokens
                 return torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
 
-        return self.dense.forward(
-            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+        return self.dense.forward(q, k, v, layer, forward_batch, save_kv_cache)
+
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        if layer.layer_id in self.sparse_layer_ids:
+            if envs.SGLANG_OPT_USE_MINIMAX_SPARSE_ATTENTION_DENSE_FALLBACK.get():
+                return (
+                    None,
+                    self._dense_forward_with_dp_trim(
+                        q, k, v, layer, forward_batch, save_kv_cache
+                    ),
+                )
+            return self.sparse.forward(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+
+        # Dense layers delegate to the stock backend (e.g. flashinfer). Under DP
+        # attention the per-rank token block is padded to an even length
+        # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
+        # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
+        # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
+        # the real token count and re-pad the output; k/v stay untrimmed so the
+        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
+        return self._dense_forward_with_dp_trim(
+            q, k, v, layer, forward_batch, save_kv_cache
         )
 
     def forward_extend(
@@ -634,6 +652,13 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         **kwargs,
     ):
         if layer.layer_id in self.sparse_layer_ids:
+            if envs.SGLANG_OPT_USE_MINIMAX_SPARSE_ATTENTION_DENSE_FALLBACK.get():
+                return (
+                    None,
+                    self._dense_forward_with_dp_trim(
+                        q, k, v, layer, forward_batch, save_kv_cache
+                    ),
+                )
             return self.sparse.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
@@ -653,6 +678,13 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         **kwargs,
     ):
         if layer.layer_id in self.sparse_layer_ids:
+            if envs.SGLANG_OPT_USE_MINIMAX_SPARSE_ATTENTION_DENSE_FALLBACK.get():
+                return (
+                    None,
+                    self._dense_forward_with_dp_trim(
+                        q, k, v, layer, forward_batch, save_kv_cache
+                    ),
+                )
             return self.sparse.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
