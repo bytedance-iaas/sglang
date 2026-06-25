@@ -44,6 +44,10 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_accuracy_trace import (
+    emit_trace_event,
+    should_trace_event,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -809,20 +813,43 @@ class MooncakeKVManager(CommonKVManager):
         decode_prefix_len: int,
         c4_prefix_len: int,
     ) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+        if full_page_size <= 0 or c4_page_size <= 0:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer got invalid page sizes: "
+                f"full_page_size={full_page_size}, c4_page_size={c4_page_size}."
+            )
+        if full_page_size % c4_page_size != 0:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer page sizes are inconsistent: "
+                f"full_page_size={full_page_size}, c4_page_size={c4_page_size}."
+            )
+        if decode_prefix_len < 0 or c4_prefix_len < 0:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer got negative prefix lengths: "
+                f"decode_prefix_len={decode_prefix_len}, c4_prefix_len={c4_prefix_len}."
+            )
+        if c4_prefix_len > len(dst_kv_indices):
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer C4 prefix exceeds destination slots: "
+                f"c4_prefix_len={c4_prefix_len}, dst_tokens={len(dst_kv_indices)}."
+            )
         if len(prefill_kv_indices) == 0 or len(dst_kv_indices) == 0:
             empty = np.array([], dtype=np.int64)
             return empty, empty
 
         src_pages = prefill_kv_indices.astype(np.int64, copy=False)
+        if np.any(src_pages < 0):
+            raise RuntimeError("DSV4 HiSparse C4 transfer got negative source pages.")
         c4_offsets = np.tile(
             np.arange(c4_page_size, dtype=np.int64), len(src_pages)
         )
         src_indices = np.repeat(src_pages * c4_page_size, c4_page_size) + c4_offsets
 
         first_full_page = decode_prefix_len // full_page_size
+        page_start = page_index_slice.start or 0
         logical_pages = np.arange(
-            first_full_page + page_index_slice.start,
-            first_full_page + page_index_slice.start + len(src_pages),
+            first_full_page + page_start,
+            first_full_page + page_start + len(src_pages),
             dtype=np.int64,
         )
         global_c4_indices = (
@@ -839,6 +866,10 @@ class MooncakeKVManager(CommonKVManager):
         dst_indices = dst_kv_indices[global_c4_indices[valid]].astype(
             np.int64, copy=False
         )
+        if np.any(dst_indices < 0):
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer destination has unallocated host slots."
+            )
         return src_indices[valid], dst_indices
 
     def _map_dsv4_c4_src_indices(
@@ -847,6 +878,13 @@ class MooncakeKVManager(CommonKVManager):
         mapping = getattr(self.kv_args, "dsv4_hisparse_c4_mapping", None)
         if mapping is None or src_indices.size == 0:
             return src_indices
+        mapping_size = int(mapping.numel())
+        if np.any(src_indices < 0) or np.any(src_indices >= mapping_size):
+            raise RuntimeError(
+                "DSV4 HiSparse C4 source mapping index is out of range: "
+                f"mapping_size={mapping_size}, "
+                f"min_src={int(src_indices.min())}, max_src={int(src_indices.max())}."
+            )
 
         src_tensor = torch.as_tensor(
             src_indices, dtype=torch.int64, device=mapping.device
@@ -857,6 +895,52 @@ class MooncakeKVManager(CommonKVManager):
                 "DSV4 HiSparse C4 source mapping contains unbound device slots."
             )
         return mapped
+
+    @staticmethod
+    def _validate_dsv4_c4_transfer_plan(
+        plan: DSV4C4TransferPlan,
+        *,
+        c4_page_size: int,
+        dst_kv_item_len: int,
+        gpu_page_bytes: int,
+    ) -> None:
+        if plan.dst_offsets.size == 0:
+            return
+        if plan.value_bytes <= 0:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer has non-positive value bytes: "
+                f"value_bytes={plan.value_bytes}."
+            )
+        scale_bytes = 8
+        if plan.src_value_offsets.shape != plan.src_scale_offsets.shape:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer source value/scale plan size mismatch: "
+                f"value_shape={plan.src_value_offsets.shape}, "
+                f"scale_shape={plan.src_scale_offsets.shape}."
+            )
+        if plan.src_value_offsets.shape != plan.dst_offsets.shape:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer source/destination plan size mismatch: "
+                f"src_shape={plan.src_value_offsets.shape}, "
+                f"dst_shape={plan.dst_offsets.shape}."
+            )
+        if (
+            np.any(plan.src_value_offsets < 0)
+            or np.any(plan.src_scale_offsets < 0)
+            or np.any(plan.dst_offsets < 0)
+        ):
+            raise RuntimeError("DSV4 HiSparse C4 transfer plan contains negative offsets.")
+        src_token_bytes = plan.value_bytes * c4_page_size + scale_bytes * c4_page_size
+        if src_token_bytes > gpu_page_bytes:
+            raise RuntimeError(
+                "DSV4 HiSparse C4 transfer source item bytes exceed source page bytes: "
+                f"value_bytes={plan.value_bytes}, c4_page_size={c4_page_size}, "
+                f"gpu_page_bytes={gpu_page_bytes}."
+            )
+        if np.any((plan.src_value_offsets % gpu_page_bytes) % plan.value_bytes != 0):
+            raise RuntimeError("DSV4 HiSparse C4 transfer value offsets are misaligned.")
+        if np.any(plan.dst_offsets % dst_kv_item_len != 0):
+            raise RuntimeError("DSV4 HiSparse C4 transfer destination offsets are misaligned.")
 
     def _get_dsv4_c4_transfer_plan(
         self,
@@ -889,7 +973,7 @@ class MooncakeKVManager(CommonKVManager):
         src_pages = src_indices // c4_page_size
         src_offsets = src_indices % c4_page_size
         src_base_offsets = src_pages * gpu_page_bytes
-        return DSV4C4TransferPlan(
+        plan = DSV4C4TransferPlan(
             src_value_offsets=src_base_offsets + src_offsets * value_bytes,
             src_scale_offsets=(
                 src_base_offsets
@@ -899,6 +983,31 @@ class MooncakeKVManager(CommonKVManager):
             dst_offsets=dst_indices * dst_kv_item_len,
             value_bytes=value_bytes,
         )
+        self._validate_dsv4_c4_transfer_plan(
+            plan,
+            c4_page_size=c4_page_size,
+            dst_kv_item_len=dst_kv_item_len,
+            gpu_page_bytes=gpu_page_bytes,
+        )
+        if should_trace_event("dsv4_c4_transfer_plan") or envs.SGLANG_DSV4_HISPARSE_STRICT_C4_TRANSFER_CHECK.get():
+            emit_trace_event(
+                logger,
+                "dsv4_c4_transfer_plan",
+                token_count=int(plan.dst_offsets.size),
+                value_bytes=value_bytes,
+                c4_page_size=c4_page_size,
+                dst_kv_item_len=dst_kv_item_len,
+                gpu_page_bytes=gpu_page_bytes,
+                min_src_value_offset=(
+                    int(plan.src_value_offsets.min()) if plan.src_value_offsets.size else 0
+                ),
+                max_src_scale_offset=(
+                    int(plan.src_scale_offsets.max()) if plan.src_scale_offsets.size else 0
+                ),
+                min_dst_offset=int(plan.dst_offsets.min()) if plan.dst_offsets.size else 0,
+                max_dst_offset=int(plan.dst_offsets.max()) if plan.dst_offsets.size else 0,
+            )
+        return plan
 
     def _send_dsv4_c4_to_host(
         self,
@@ -1263,16 +1372,19 @@ class MooncakeKVManager(CommonKVManager):
             local_payload = None
             remote_payload = None
         if isinstance(local_payload, dict) and isinstance(remote_payload, dict):
+            missing_in_prefill = sorted(remote_payload.keys() - local_payload.keys())
+            missing_in_decode = sorted(local_payload.keys() - remote_payload.keys())
             mismatches = {
                 key: (local_payload[key], remote_payload[key])
                 for key in sorted(local_payload.keys() & remote_payload.keys())
                 if local_payload[key] != remote_payload[key]
             }
-            if not mismatches:
+            if not mismatches and not missing_in_prefill and not missing_in_decode:
                 return None
             return (
                 "DSV4 HiSparse P/D capability mismatch: "
-                f"fields={mismatches}, prefill={local_signature}, "
+                f"fields={mismatches}, missing_in_prefill={missing_in_prefill}, "
+                f"missing_in_decode={missing_in_decode}, prefill={local_signature}, "
                 f"decode={remote_signature}"
             )
         return (

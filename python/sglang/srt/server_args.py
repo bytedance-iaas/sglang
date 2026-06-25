@@ -963,6 +963,7 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+        self._handle_dsv4_hisparse_topk_compatibility()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -3933,6 +3934,47 @@ class ServerArgs:
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+    def _handle_dsv4_hisparse_topk_compatibility(self):
+        if not self.enable_hisparse:
+            return
+        try:
+            from sglang.srt.configs.model_config import is_deepseek_v4
+            from sglang.srt.mem_cache.sparsity import (
+                parse_hisparse_config,
+                resolve_hisparse_top_k,
+            )
+
+            model_config = self.get_model_config()
+            hf_config = model_config.hf_config
+            if not is_deepseek_v4(hf_config):
+                return
+            text_config = getattr(hf_config, "text_config", hf_config)
+            top_k = int(resolve_hisparse_top_k(self, text_config))
+            sparse_config = parse_hisparse_config(self)
+            device_buffer_size = int(sparse_config.device_buffer_size)
+        except Exception as exc:
+            raise ValueError(
+                "Failed to validate DSV4 HiSparse top-k configuration."
+            ) from exc
+
+        if top_k <= 0:
+            raise ValueError(f"DSV4 HiSparse top_k must be positive, got {top_k}.")
+        if device_buffer_size < top_k:
+            raise ValueError(
+                "DSV4 HiSparse device_buffer_size must be no smaller than "
+                f"resolved top_k: device_buffer_size={device_buffer_size}, "
+                f"top_k={top_k}."
+            )
+        if top_k not in (512, 1024) and not (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()
+        ):
+            raise ValueError(
+                "DSV4 HiSparse top_k values other than 512/1024 require "
+                "SGLANG_OPT_USE_TOPK_V2=1 and "
+                "SGLANG_OPT_HISPARSE_USE_TOPK_V2=1."
+            )
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:

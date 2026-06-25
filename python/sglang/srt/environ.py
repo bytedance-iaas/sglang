@@ -259,6 +259,12 @@ class Envs:
     # Opt in to reuse full logical prefix pages for the validated DSV4
     # HiSparse C4 host-mirror path.
     SGLANG_HISPARSE_DECODE_SAFE_PREFIX_REUSE = EnvBool(False)
+    # Opt-in low-frequency request tracing for DSV4 HiSparse accuracy debugging.
+    SGLANG_DSV4_HISPARSE_ACCURACY_TRACE = EnvBool(False)
+    SGLANG_DSV4_HISPARSE_ACCURACY_TRACE_MAX_REQS = EnvInt(32)
+    SGLANG_DSV4_HISPARSE_ACCURACY_TRACE_SAMPLE_RATE = EnvFloat(0.0)
+    SGLANG_DSV4_HISPARSE_STRICT_C4_TRANSFER_CHECK = EnvBool(False)
+    SGLANG_DSV4_HISPARSE_STATE_DEBUG = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
