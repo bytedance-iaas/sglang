@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+DSV4_HISPARSE_PROTOCOL_VERSION = 2
 
 
 def is_dsv4_c128_online_enabled() -> bool:
@@ -77,6 +78,7 @@ def build_dsv4_hisparse_capability_signature(
         raise AttributeError(f"HiSparse config does not expose {key!r}")
 
     payload = {
+        "dsv4_hisparse_protocol_version": DSV4_HISPARSE_PROTOCOL_VERSION,
         "compressor_v2": bool(envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()),
         "experimental_online_c128_mtp": bool(
             envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
