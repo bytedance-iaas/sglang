@@ -181,11 +181,11 @@ class SchedulerPPMixin:
           - tick the logical clock;
           - promote PREFILLING waves whose state finished offloading to host
             (free their GPU slots → OFFLOADED queue);
-          - maintain a single PREFETCHING wave (serialized prefetch): admit one from
+          - during DRAINING, maintain a single PREFETCHING wave: admit one from
             the OFFLOADED queue if none is active, then drip-prefetch using the
             currently free slot budget;
-          - detect no-progress stalls and roll the wave back (lossless, host
-            keeps the authoritative copy).
+          - keep partial prefetch state on normal resource backpressure, and
+            roll back only on hard deadlock protection.
 
         Wave registration at prefill completion and consumption of DECODE_READY
         waves are driven by the batch-formation path via the shared manager
@@ -199,6 +199,9 @@ class SchedulerPPMixin:
             if wave.state == WaveState.PREFILLING and mgr.is_wave_offload_ready(wave):
                 mgr.mark_wave_offloaded(wave)
 
+        if mgr.is_filling():
+            return
+
         # Maintain at most one in-flight PREFETCHING wave.
         prefetching = [
             w for w in mgr.waves.values() if w.state == WaveState.PREFETCHING
@@ -211,12 +214,15 @@ class SchedulerPPMixin:
 
         for wave in prefetching:
             free_slots = self.token_to_kv_pool_allocator.available_size()
+            result = None
             if free_slots > 0:
-                mgr.prefetch_step(wave, free_slots)
+                result = mgr.prefetch_step(wave, free_slots)
+            elif not all(entry.prefetched for entry in wave.entries.values()):
+                mgr.mark_prefetch_blocked(wave, "kv_slots")
             if mgr.is_wave_decode_ready(wave):
                 continue
-            if mgr.is_stalled(wave):
-                mgr.rollback_wave(wave)
+            if mgr.is_hard_blocked(wave, result):
+                mgr.handle_hard_prefetch_block(wave, result)
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):

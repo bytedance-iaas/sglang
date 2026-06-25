@@ -730,6 +730,11 @@ class ServerArgs:
     # structural constant and intentionally NOT exposed as a knob.
     enable_offline_pp_offload: bool = False
     offline_pp_prefetch_stall_ticks: int = 64
+    offline_pp_prefetch_hard_timeout_sec: float = 300.0
+    offline_pp_max_host_memory_gb: Optional[float] = None
+    offline_pp_min_prefill_waves: Optional[int] = None
+    offline_pp_max_prefill_waves: Optional[int] = None
+    offline_pp_gpu_resident_factor: float = 2.0
 
     # Scoring configuration
     # Enable Multi-Item Scoring optimization. Combines query and multiple items
@@ -4222,6 +4227,44 @@ class ServerArgs:
                     "mutually exclusive because both own the prefill-to-decode "
                     "KV lifecycle."
                 )
+            if (
+                self.offline_pp_max_host_memory_gb is not None
+                and self.offline_pp_max_host_memory_gb <= 0
+            ):
+                raise ValueError(
+                    "--offline-pp-max-host-memory-gb must be positive when set."
+                )
+            if (
+                self.offline_pp_min_prefill_waves is not None
+                and self.offline_pp_min_prefill_waves <= 0
+            ):
+                raise ValueError("--offline-pp-min-prefill-waves must be positive.")
+            if (
+                self.offline_pp_max_prefill_waves is not None
+                and self.offline_pp_max_prefill_waves <= 0
+            ):
+                raise ValueError("--offline-pp-max-prefill-waves must be positive.")
+            offline_pp_effective_min_prefill_waves = (
+                self.offline_pp_min_prefill_waves or self.pp_size
+            )
+            if (
+                self.offline_pp_max_prefill_waves is not None
+                and self.offline_pp_max_prefill_waves
+                < offline_pp_effective_min_prefill_waves
+            ):
+                raise ValueError(
+                    "--offline-pp-max-prefill-waves must be >= "
+                    "--offline-pp-min-prefill-waves (default: --pp-size)."
+                )
+            if self.offline_pp_gpu_resident_factor < 2:
+                raise ValueError(
+                    "--offline-pp-gpu-resident-factor must be >= 2 to preserve "
+                    "decode/prefetch double buffering."
+                )
+            if self.offline_pp_prefetch_hard_timeout_sec <= 0:
+                raise ValueError(
+                    "--offline-pp-prefetch-hard-timeout-sec must be positive."
+                )
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
@@ -6499,8 +6542,43 @@ class ServerArgs:
             "--offline-pp-prefetch-stall-ticks",
             type=int,
             default=ServerArgs.offline_pp_prefetch_stall_ticks,
-            help="Number of scheduler ticks without prefetch progress before a "
-            "stalled wave is rolled back (deadlock avoidance for offline PP offload).",
+            help="Legacy no-progress tick counter for offline PP prefetch. Normal "
+            "resource backpressure no longer rolls back on this counter; hard "
+            "timeouts are controlled by --offline-pp-prefetch-hard-timeout-sec.",
+        )
+        parser.add_argument(
+            "--offline-pp-prefetch-hard-timeout-sec",
+            type=float,
+            default=ServerArgs.offline_pp_prefetch_hard_timeout_sec,
+            help="Wall-clock seconds a blocked offline PP prefetch wave may wait "
+            "before hard deadlock protection rolls it back.",
+        )
+        parser.add_argument(
+            "--offline-pp-max-host-memory-gb",
+            type=float,
+            default=ServerArgs.offline_pp_max_host_memory_gb,
+            help="Per-rank pinned host memory budget for offline PP offloaded "
+            "state. Unset keeps the historical unlimited behavior.",
+        )
+        parser.add_argument(
+            "--offline-pp-min-prefill-waves",
+            type=int,
+            default=ServerArgs.offline_pp_min_prefill_waves,
+            help="Minimum waves to accumulate before draining an offline PP epoch. "
+            "Unset defaults to --pp-size.",
+        )
+        parser.add_argument(
+            "--offline-pp-max-prefill-waves",
+            type=int,
+            default=ServerArgs.offline_pp_max_prefill_waves,
+            help="Optional hard cap on waves accumulated in one offline PP epoch.",
+        )
+        parser.add_argument(
+            "--offline-pp-gpu-resident-factor",
+            type=float,
+            default=ServerArgs.offline_pp_gpu_resident_factor,
+            help="Resident GPU budget divisor for offline PP wave sizing. The "
+            "default 2 reserves decode/prefetch double buffering.",
         )
 
         # Args for multi-item-scoring

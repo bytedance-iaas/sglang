@@ -51,12 +51,47 @@ class _EmptyBatch:
 class _FakeOfflinePPManager:
     def __init__(self):
         self.offloaded = []
+        self.entered_draining = []
+        self.filling = True
+        self.active_epoch_waves = False
+        self.decode_ready_wave = None
 
-    def offload_prefilled_wave(self, reqs):
+    def offload_prefilled_wave(self, reqs, source_stream=None):
         self.offloaded.append(list(reqs))
+        self.active_epoch_waves = True
 
-    def take_decode_ready_wave(self):
-        return None
+    def is_filling(self):
+        return self.filling
+
+    def is_draining(self):
+        return not self.filling
+
+    def local_fill_stop_reason(self, waiting_queue_empty):
+        return "waiting_empty" if waiting_queue_empty and self.active_epoch_waves else None
+
+    def enter_draining(self, reason):
+        self.entered_draining.append(reason)
+        self.filling = False
+
+    def has_active_epoch_waves(self):
+        return self.active_epoch_waves
+
+    def has_decoding_wave(self):
+        return False
+
+    def ensure_decode_ready_for_schedule(self, free_slots):
+        pass
+
+    def take_decode_ready_wave(self, mb_id=None):
+        wave = self.decode_ready_wave
+        self.decode_ready_wave = None
+        return wave
+
+    def retire_wave_by_id(self, wave_id):
+        self.active_epoch_waves = False
+
+    def wait_prefetch_for_decode(self, wave):
+        pass
 
 
 class _FakeFutureMap:
@@ -90,16 +125,53 @@ def test_prefill_batch_offload_is_consumed_only_once():
     sched = SimpleNamespace(
         last_batch=batch,
         running_batch=_EmptyBatch(),
+        waiting_queue=[],
+        chunked_req=None,
         offline_pp_offload_manager=mgr,
         get_new_batch_prefill=lambda: None,
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
     )
 
     assert Scheduler._get_next_batch_offline_pp(sched) is None
     assert Scheduler._get_next_batch_offline_pp(sched) is None
 
     assert mgr.offloaded == [[req]]
+    assert mgr.entered_draining == ["waiting_empty"]
     assert batch.filtered_to_empty is True
     assert batch.is_empty()
+
+
+def test_draining_epoch_does_not_insert_new_prefill():
+    mgr = _FakeOfflinePPManager()
+    mgr.filling = False
+    calls = {"prefill": 0}
+
+    def _get_new_batch_prefill():
+        calls["prefill"] += 1
+        return object()
+
+    sched = SimpleNamespace(
+        last_batch=None,
+        running_batch=_EmptyBatch(),
+        waiting_queue=[_FakeReq("waiting")],
+        chunked_req=None,
+        offline_pp_offload_manager=mgr,
+        get_new_batch_prefill=_get_new_batch_prefill,
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
+    )
+
+    assert Scheduler._get_next_batch_offline_pp(sched) is None
+    assert calls["prefill"] == 0
+
+
+def test_pp_fill_stop_reason_sync_prioritizes_host_limit():
+    pp_group = SimpleNamespace(
+        world_size=2,
+        all_gather_object=lambda _reason: ["", "host"],
+    )
+    sched = SimpleNamespace(pp_group=pp_group)
+
+    assert Scheduler._offline_pp_sync_fill_stop_reason(sched, None) == "host"
 
 
 def test_decode_ready_wave_batch_stashes_last_token_and_prepares_decode(monkeypatch):
@@ -119,6 +191,9 @@ def test_decode_ready_wave_batch_stashes_last_token_and_prepares_decode(monkeypa
         enable_overlap=False,
         spec_algorithm=SimpleNamespace(is_none=lambda: True),
         future_map=future_map,
+        offline_pp_offload_manager=SimpleNamespace(
+            wait_prefetch_for_decode=lambda wave: None
+        ),
     )
 
     def _init_new(**kwargs):
