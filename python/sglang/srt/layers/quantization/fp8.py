@@ -196,7 +196,23 @@ def _sm90_mxfp8_debug_linear_scale(layer: Module) -> None:
     n, k = weight.shape
     expected_shape = (n, (k + 31) // 32)
     flat = scale.reshape(-1)
+    sample_cols = min(scale.shape[-1], 8)
+    rank_payload = {}
+    try:
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        rank_payload = {
+            "tp_rank": get_tensor_model_parallel_rank(),
+            "tp_world_size": get_tensor_model_parallel_world_size(),
+        }
+    except Exception:
+        pass
+    scale_i64 = flat.to(torch.int64)
     payload = {
+        **rank_payload,
         "prefix": getattr(layer, "prefix", None),
         "weight_shape": list(weight.shape),
         "weight_dtype": str(weight.dtype),
@@ -210,6 +226,13 @@ def _sm90_mxfp8_debug_linear_scale(layer: Module) -> None:
         "scale_byte_max": int(flat.max().item()) if flat.numel() > 0 else None,
         "scale_byte_zero_count": int((flat == 0).sum().item()),
         "scale_byte_ff_count": int((flat == 0xFF).sum().item()),
+        "scale_checksum_mod": int((scale_i64.sum() % 1000000007).item()),
+        "scale_first_row": scale[0, :sample_cols].detach().cpu().tolist()
+        if scale.dim() == 2 and scale.shape[0] > 0
+        else None,
+        "scale_last_row": scale[-1, :sample_cols].detach().cpu().tolist()
+        if scale.dim() == 2 and scale.shape[0] > 0
+        else None,
     }
     logger.warning("[SM90_MXFP8_LINEAR_SCALE] %s", json.dumps(payload))
 
