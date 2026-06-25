@@ -2565,9 +2565,13 @@ class HiSparseCoordinator:
         top_k_indices: torch.Tensor,
         layer_id: int,
     ) -> None:
+        sample_interval = envs.SGLANG_HISPARSE_C4_SWAP_CHECK_SAMPLE_INTERVAL.get()
+        should_check_layer = layer_id == 0 or (
+            sample_interval > 0 and layer_id % sample_interval == 0
+        )
         if (
             not self.is_dsv4_hisparse
-            or layer_id != 0
+            or not should_check_layer
             or not envs.SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK.get()
         ):
             return
@@ -2632,8 +2636,11 @@ class HiSparseCoordinator:
             token = int(top_tokens[row, col].item())
             device_loc = int(top_k_indices[row, col].item())
             matched = int(matched_tokens[row, col].item())
+            newest_loc = int(newest_locs[row, 0].item())
             samples.append(
-                f"req={req_idx},token={token},device_loc={device_loc},matched={matched}"
+                f"layer={layer_id},req={req_idx},raw_token={token},"
+                f"device_loc={device_loc},matched_token={matched},"
+                f"newest_loc={newest_loc}"
             )
         raise RuntimeError(
             "DSV4 HiSparse C4 swap-in produced inconsistent device indices: "

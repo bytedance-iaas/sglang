@@ -649,6 +649,9 @@ class Envs:
     # raw-only topk_v2 is validated against the swap-in mapping path.
     SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(False)
     SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK = EnvBool(True)
+    # 0 means keep the default layer0-only C4 swap check. A positive value
+    # samples every Nth C4 layer in eager mode for debugging precision issues.
+    SGLANG_HISPARSE_C4_SWAP_CHECK_SAMPLE_INTERVAL = EnvInt(0)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
