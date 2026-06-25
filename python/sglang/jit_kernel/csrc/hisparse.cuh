@@ -75,7 +75,7 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + skipped_topk
   static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
@@ -152,7 +152,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
+      if (token_pos >= 0 && token_pos < seq_len) {
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
       }
     }
@@ -175,7 +175,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
-  int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  int32_t& s_skipped_topk = s_hash_keys[HASH_SIZE + 1];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -186,7 +186,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
     s_total_hits = 0;
-    s_newest_hit = 0;
+    s_skipped_topk = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -203,12 +203,15 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      atomicAdd(&s_skipped_topk, 1);
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
-      s_newest_hit = 1;
+      atomicAdd(&s_skipped_topk, 1);
     } else {
       int slot = hash_slot(token_idx, HASH_SIZE);
       while (true) {
@@ -320,6 +323,11 @@ __global__ void load_cache_to_device_buffer_kernel(
       is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
       if (is_miss) {
         my_token = s_top_k_tokens[my_token_idx];
+        if (req_host_cache_locs[my_token] < 0) {
+          s_top_k_tokens[my_token_idx] = TOKEN_HIT;
+          atomicAdd(&s_skipped_topk, 1);
+          is_miss = false;
+        }
       }
     }
 
@@ -350,7 +358,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = NUM_TOP_K - s_total_hits - s_skipped_topk;
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;

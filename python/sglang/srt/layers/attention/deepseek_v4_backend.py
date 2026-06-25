@@ -108,6 +108,7 @@ def _copy_or_replace(dst, src):
 class DSV4AttnMetadata:
     page_size: int
     page_table: torch.Tensor
+    req_pool_indices_repeated: torch.Tensor
     raw_out_loc: torch.Tensor
     cuda_int32_kwargs: dict
 
@@ -157,6 +158,7 @@ class DSV4AttnMetadata:
             ],
             copy_fields=[
                 "raw_out_loc",
+                "req_pool_indices_repeated",
                 "seq_lens_casual",
                 "positions_casual",
                 "c4_out_loc",
@@ -506,6 +508,7 @@ class DeepseekV4AttnBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            req_pool_indices_repeated=core_attn_metadata.req_pool_indices_repeated,
         )
 
     def init_forward_metadata_decode(
@@ -1408,6 +1411,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,
             raw_out_loc=out_loc,
+            req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
             cuda_int32_kwargs=self.cuda_int32_kwargs,
             positions_casual=raw_positions,

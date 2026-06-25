@@ -256,9 +256,14 @@ class EagleDraftInputV2Mixin:
                     batch.req_pool_indices_cpu,
                     num_steps,
                 )
+                token_positions = (
+                    batch.seq_lens[:, None]
+                    + torch.arange(num_steps, device=batch.seq_lens.device)
+                ).reshape(-1)
                 target_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
                     draft_cache_locs,
                     device_slots,
+                    token_positions=token_positions,
                 )
         else:
             self.draft_cache_locs = None
@@ -337,9 +342,14 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices_cpu,
                 num_draft_tokens,
             )
+            token_positions = (
+                seq_lens_cpu_.to(device=batch.device)[:, None]
+                + torch.arange(num_draft_tokens, device=batch.device)
+            ).reshape(-1)
             token_to_kv_pool_allocator.bind_device_mapping(
                 batch.out_cache_loc,
                 device_slots,
+                token_positions=token_positions,
             )
 
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -385,9 +395,14 @@ class EagleVerifyInputV2Mixin:
                     batch.req_pool_indices_cpu,
                     self.draft_token_num,
                 )
+                token_positions = (
+                    batch.seq_lens[:, None]
+                    + torch.arange(self.draft_token_num, device=device)
+                ).reshape(-1)
                 target_worker.model_runner.token_to_kv_pool_allocator.bind_device_mapping(
                     batch.out_cache_loc,
                     device_slots,
+                    token_positions=token_positions,
                 )
 
             if get_global_server_args().enable_mamba_extra_buffer():

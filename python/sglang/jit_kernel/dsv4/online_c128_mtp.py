@@ -18,12 +18,10 @@ def _online_c128_mtp_prepare_kernel(
     seq_lens_ptr,
     req_pool_indices_ptr,
     req_to_token_ptr,
-    full_to_swa_ptr,
     main_state_ptr,
     req_to_token_stride_b: tl.constexpr,
     main_state_stride_b: tl.constexpr,
     bs,
-    swa_page_size: tl.constexpr,
     temp_state_slot_offset: tl.constexpr,
     state_width: tl.constexpr,
     block_d: tl.constexpr,
@@ -37,17 +35,8 @@ def _online_c128_mtp_prepare_kernel(
     seq_len = tl.load(seq_lens_ptr + bid).to(tl.int64)
     has_partial = (seq_len > 0) & ((seq_len % 128) != 0)
 
-    chunk_start = tl.where(has_partial, ((seq_len - 1) // 128) * 128, 0)
     req_idx = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
-    full_loc = tl.load(
-        req_to_token_ptr + req_idx * req_to_token_stride_b + chunk_start,
-        mask=has_partial,
-        other=0,
-    )
-    swa_loc = tl.load(full_to_swa_ptr + full_loc, mask=has_partial, other=0).to(
-        tl.int64
-    )
-    slot = tl.where(has_partial, swa_loc // swa_page_size, 0)
+    slot = tl.where(has_partial, req_idx, 0)
     temp_slot = slot + temp_state_slot_offset
     value = tl.load(
         main_state_ptr + slot * main_state_stride_b + d,
@@ -82,11 +71,9 @@ def online_c128_mtp_write_prefix_states(
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
-    full_to_swa_index_mapping: torch.Tensor,
     ape: torch.Tensor,
     state: torch.Tensor,
     layer_bs: int,
-    swa_page_size: int,
     num_verify_tokens: int,
     state_slot_stride: int,
     head_dim: int,
@@ -98,11 +85,9 @@ def online_c128_mtp_write_prefix_states(
         seq_lens,
         req_pool_indices,
         req_to_token,
-        full_to_swa_index_mapping,
         ape,
         state,
         layer_bs,
-        swa_page_size,
         num_verify_tokens,
         state_slot_stride,
     )
@@ -112,14 +97,13 @@ def online_c128_mtp_lazy_commit(
     *,
     old_seq_lens: torch.Tensor,
     old_req_pool_indices: torch.Tensor,
+    old_tail_locs: torch.Tensor,
     cur_seq_lens: torch.Tensor,
     cur_req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
-    full_to_swa_index_mapping: torch.Tensor,
     state: torch.Tensor,
     old_bs: int,
     cur_bs: int,
-    swa_page_size: int,
     num_verify_tokens: int,
     state_slot_stride: int,
     head_dim: int,
@@ -129,14 +113,13 @@ def online_c128_mtp_lazy_commit(
     _jit_online_c128_mtp_module(head_dim).lazy_commit(
         old_seq_lens,
         old_req_pool_indices,
+        old_tail_locs,
         cur_seq_lens,
         cur_req_pool_indices,
         req_to_token,
-        full_to_swa_index_mapping,
         state,
         old_bs,
         cur_bs,
-        swa_page_size,
         num_verify_tokens,
         state_slot_stride,
     )
@@ -147,10 +130,8 @@ def online_c128_mtp_prepare(
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
-    full_to_swa_index_mapping: torch.Tensor,
     main_state: torch.Tensor,
     bs: int,
-    swa_page_size: int,
     temp_state_slot_offset: int,
     state_width: int,
 ) -> None:
@@ -162,12 +143,10 @@ def online_c128_mtp_prepare(
         seq_lens,
         req_pool_indices,
         req_to_token,
-        full_to_swa_index_mapping,
         main_state,
         req_to_token.stride(0),
         main_state.stride(0),
         bs,
-        swa_page_size,
         temp_state_slot_offset,
         state_width,
         block_d,
@@ -186,6 +165,7 @@ class _OnlineC128LayerRuntime:
 class _OnlineC128VerifyContext:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
+    tail_locs: torch.Tensor
 
 
 class OnlineC128MTPController:
@@ -215,25 +195,24 @@ class OnlineC128MTPController:
             self.clear()
             return
 
+        tail_locs = self._capture_tail_locs(req_pool_indices, seq_lens)
         self._verify_ctx = _OnlineC128VerifyContext(
             req_pool_indices=req_pool_indices.detach(),
             seq_lens=seq_lens.detach(),
+            tail_locs=tail_locs.detach(),
         )
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
             return
         if self._num_verify_tokens() == 0:
             return
-        token_to_kv_pool = self.backend.token_to_kv_pool
         bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
         for runtime in self._iter_layer_runtimes():
             online_c128_mtp_prepare(
                 seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
                 req_to_token=self.backend.req_to_token,
-                full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
                 main_state=runtime.main_state,
                 bs=bs,
-                swa_page_size=token_to_kv_pool.swa_page_size,
                 temp_state_slot_offset=runtime.state_slot_offset,
                 state_width=runtime.state_width,
             )
@@ -314,11 +293,9 @@ class OnlineC128MTPController:
             seq_lens=ctx.seq_lens,
             req_pool_indices=ctx.req_pool_indices,
             req_to_token=self.backend.req_to_token,
-            full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
             ape=compressor.ape.reshape(128, head_dim),
             state=state_pool.kv_score_buffer.kv_score,
             layer_bs=layer_bs,
-            swa_page_size=token_to_kv_pool.swa_page_size,
             num_verify_tokens=num_verify_tokens,
             state_slot_stride=state_pool.online_mtp_state_slot_offset,
             head_dim=head_dim,
@@ -357,14 +334,13 @@ class OnlineC128MTPController:
             online_c128_mtp_lazy_commit(
                 old_seq_lens=ctx.seq_lens,
                 old_req_pool_indices=ctx.req_pool_indices,
+                old_tail_locs=ctx.tail_locs,
                 cur_seq_lens=cur_seq_lens,
                 cur_req_pool_indices=cur_req_pool_indices,
                 req_to_token=backend.req_to_token,
-                full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
                 state=runtime.main_state,
                 old_bs=old_bs,
                 cur_bs=cur_bs,
-                swa_page_size=token_to_kv_pool.swa_page_size,
                 num_verify_tokens=num_verify_tokens,
                 state_slot_stride=runtime.state_slot_offset,
                 head_dim=runtime.head_dim,
@@ -380,6 +356,20 @@ class OnlineC128MTPController:
             self.backend.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
         )
         return num_verify_tokens if 0 < num_verify_tokens <= max_draft_tokens else 0
+
+    def _capture_tail_locs(
+        self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
+            return torch.empty(0, dtype=torch.int32, device=req_pool_indices.device)
+        bs = min(req_pool_indices.shape[0], seq_lens.shape[0])
+        reqs = req_pool_indices[:bs].to(dtype=torch.long)
+        lens = seq_lens[:bs].to(dtype=torch.long)
+        positions = torch.clamp(lens - 1, min=0)
+        tail_locs = self.backend.req_to_token[reqs, positions]
+        return torch.where(lens > 0, tail_locs, torch.zeros_like(tail_locs)).to(
+            dtype=torch.int32
+        )
 
     def _active_ctx(self) -> Optional[_OnlineC128VerifyContext]:
         ctx = self._verify_ctx

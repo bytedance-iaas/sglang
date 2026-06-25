@@ -602,6 +602,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        state_type: Optional[StateType] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -617,7 +618,9 @@ class MooncakeKVManager(CommonKVManager):
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs, dst_data_ptrs, state_type
+                )
             )
             layers_params = [
                 (
@@ -1360,7 +1363,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (StateType.SWA, StateType.NSA, StateType.C128_STATE):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1391,6 +1394,7 @@ class MooncakeKVManager(CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
                     )
                     or rc
                 )

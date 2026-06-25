@@ -8,6 +8,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     DeepSeekV4SingleKVPoolHost,
@@ -367,6 +368,7 @@ class HiSparseCoordinator:
         device: str,
         tp_group,
         host_to_device_ratio: int = 2,
+        topk_work_buffer_rows: Optional[int] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -502,12 +504,21 @@ class HiSparseCoordinator:
             self.padded_buffer_size, dtype=torch.int32, device=device
         )
 
-        # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
+        topk_work_buffer_rows = max(
+            max_num_req_slots, int(topk_work_buffer_rows or 0)
+        )
+
+        # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe).
+        # EAGLE target-verify C4 metadata is token-row shaped, so the top-k
+        # work buffers can be larger than the request-slot table.
         self.top_k_device_locs_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
+            (topk_work_buffer_rows, self.top_k),
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         self.raw_indices_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
+            (topk_work_buffer_rows, self.top_k), -1, dtype=torch.int32, device=device
         )
         self._c4_miss_sample_interval_s = float(
             os.getenv("SGLANG_HISPARSE_C4_MISS_SAMPLE_INTERVAL", "-1")
@@ -1206,6 +1217,28 @@ class HiSparseCoordinator:
         # can race the H2D copy and read a partially populated hot buffer.
         device_module.current_stream().synchronize()
 
+    def _dsv4_c4_compressed_locs_for_prefix(
+        self, req_pool_idx: int, token_len: int
+    ) -> torch.Tensor:
+        """Return C4 compressed logical locs for request-local token positions.
+
+        DSV4 C4 compression boundaries are defined by token position
+        (positions 3, 7, 11, ...), not by the logical KV slot id modulo 4.
+        The metadata kernel writes C4 KV to `raw_out_loc // 4`; HiSparse must use
+        the same key when it builds or clears the physical-device mapping.
+        """
+        if token_len < self.compress_ratio:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        c4_positions = torch.arange(
+            self.compress_ratio - 1,
+            token_len,
+            self.compress_ratio,
+            dtype=torch.long,
+            device=self.device,
+        )
+        full_locs = self.req_to_token_pool.req_to_token[req_pool_idx, c4_positions]
+        return (full_locs // self.compress_ratio).to(torch.int64)
+
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
             allocated_len = req.kv_allocated_len or len(req.fill_ids)
@@ -1222,11 +1255,18 @@ class HiSparseCoordinator:
             if alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
 
-        compressed_logical_indices = (
-            self.mem_pool_device.translate_loc_from_full_to_compressed(
-                self.req_to_token_pool.req_to_token[req.req_pool_idx, :allocated_len]
+        if self.is_dsv4_hisparse:
+            compressed_logical_indices = self._dsv4_c4_compressed_locs_for_prefix(
+                req.req_pool_idx, allocated_len
             )
-        )
+        else:
+            compressed_logical_indices = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :allocated_len
+                    ]
+                )
+            )
         compressed_len = len(compressed_logical_indices)
 
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
@@ -1899,23 +1939,43 @@ class HiSparseCoordinator:
         pos_in_segment = all_indices - torch.repeat_interleave(offsets[:-1], counts)
         starts = seq_lens - counts
         full_positions = torch.repeat_interleave(starts, counts) + pos_in_segment
-        compressed_mask = (accepted_cache_locs + 1) % self.compress_ratio == 0
+        # DSV4 C4 compression is defined by sequence position, not by the
+        # logical KV slot id.  The logical slot can come from an arbitrary
+        # page/cache location, while `full_positions` is the request-local token
+        # position that determines whether this accepted EAGLE token creates a
+        # new C4 entry.
+        compressed_mask = (full_positions + 1) % self.compress_ratio == 0
 
         full_to_device_mapping = (
             self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
-        draft_compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            draft_cache_locs
+        bs = int(req_pool_indices.numel())
+        if bs == 0:
+            return
+        if draft_cache_locs.numel() % bs != 0:
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse draft cache loc shape mismatch: "
+                f"{draft_cache_locs.numel()} locs for {bs} requests."
+            )
+        draft_token_num = draft_cache_locs.numel() // bs
+        draft_positions = (
+            starts[:, None]
+            + torch.arange(draft_token_num, device=starts.device, dtype=starts.dtype)
+        ).reshape(-1)
+        draft_compressed_mask = (
+            (draft_positions + 1) % self.compress_ratio == 0
         )
+        draft_compressed_locs = (
+            draft_cache_locs[draft_compressed_mask] // self.compress_ratio
+        ).to(torch.int64)
         draft_mapping_snapshot = full_to_device_mapping[draft_compressed_locs].clone()
 
         if not torch.any(compressed_mask):
             full_to_device_mapping[draft_compressed_locs] = 0
             return
 
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            accepted_cache_locs
-        )
+        compressed_full_locs = accepted_cache_locs[compressed_mask]
+        compressed_locs = compressed_full_locs // self.compress_ratio
         device_locs = full_to_device_mapping[compressed_locs]
 
         req_indices_expanded = torch.repeat_interleave(req_pool_indices, counts)
@@ -2093,10 +2153,17 @@ class HiSparseCoordinator:
         self.write_staging_stream.synchronize()
 
         prefill_len = len(req.fill_ids)
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
-        ]
-        self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
+        if self.is_dsv4_hisparse:
+            compressed_locs = self._dsv4_c4_compressed_locs_for_prefix(
+                req.req_pool_idx, prefill_len
+            )
+            if compressed_locs.numel() > 0:
+                self.token_to_kv_pool_allocator.free_compressed(compressed_locs)
+        else:
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :prefill_len
+            ]
+            self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
         if self.host_radix_cache is not None:
             self._free_request_host_indices_from(
@@ -2189,13 +2256,20 @@ class HiSparseCoordinator:
         self._free_request_host_indices_from(req, written_host_len)
 
         allocated_len = req.kv_allocated_len
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req_pool_idx, :allocated_len
-        ]
-        if allocated_locs.numel() > 0:
-            compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                allocated_locs
+        if self.is_dsv4_hisparse:
+            compressed_locs = self._dsv4_c4_compressed_locs_for_prefix(
+                req_pool_idx, allocated_len
             )
+        else:
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req_pool_idx, :allocated_len
+            ]
+            compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    allocated_locs
+                )
+            )
+        if compressed_locs.numel() > 0:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = 0
@@ -2325,13 +2399,20 @@ class HiSparseCoordinator:
 
         self._free_device_buffer_slots(req)
 
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
-        ]
-        if allocated_locs.numel() > 0:
-            compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                allocated_locs
+        if self.is_dsv4_hisparse:
+            compressed_locs = self._dsv4_c4_compressed_locs_for_prefix(
+                req.req_pool_idx, allocated_len
             )
+        else:
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :allocated_len
+            ]
+            compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    allocated_locs
+                )
+            )
+        if compressed_locs.numel() > 0:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = 0
@@ -2434,6 +2515,12 @@ class HiSparseCoordinator:
         # this is a no-op there unless a backup was posted after that point.
         self.wait_for_pending_backup()
 
+        if self.top_k_device_locs_buffer.size(0) < num_reqs:
+            raise RuntimeError(
+                "HiSparse device-loc buffer is smaller than swap-in batch: "
+                f"buffer_shape={tuple(self.top_k_device_locs_buffer.shape)}, "
+                f"num_reqs={num_reqs}, top_k={self.top_k}."
+            )
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
         self._maybe_log_c4_swap_in_sample(
@@ -2465,4 +2552,91 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
+        self._check_c4_swap_in_result(
+            req_pool_indices, compressed_seq_lens, top_k_result, top_k_indices, layer_id
+        )
         return top_k_indices
+
+    def _check_c4_swap_in_result(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if (
+            not self.is_dsv4_hisparse
+            or layer_id != 0
+            or not envs.SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK.get()
+        ):
+            return
+
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return
+
+        is_capturing = False
+        try:
+            if hasattr(device_module, "is_current_stream_capturing"):
+                is_capturing = bool(device_module.is_current_stream_capturing())
+        except Exception:
+            is_capturing = True
+        if is_capturing:
+            return
+
+        top_tokens = top_k_result.to(dtype=torch.int32)
+        valid = (top_tokens >= 0) & (
+            top_tokens < compressed_seq_lens.view(-1, 1).to(top_tokens.device)
+        )
+        if not torch.any(valid):
+            return
+
+        invalid_device = valid & (top_k_indices < 0)
+        req_indices = req_pool_indices.to(dtype=torch.long)
+        device_tokens = self.req_device_buffer_tokens[layer_id, req_indices]
+        device_locs = self.req_device_buffer_token_locs[layer_id, req_indices]
+        newest_locs = self.req_device_buffer_token_locs[
+            layer_id, req_indices, self.device_buffer_size
+        ].view(-1, 1)
+        newest_tokens = top_tokens == (
+            compressed_seq_lens.view(-1, 1).to(top_tokens.device) - 1
+        )
+        newest_matches = newest_tokens & (top_k_indices == newest_locs)
+        matched_tokens = torch.full_like(top_tokens, -1)
+        loc_matches = top_k_indices.unsqueeze(-1) == device_locs.unsqueeze(1)
+        if torch.any(loc_matches):
+            matched_tokens = torch.where(
+                loc_matches,
+                device_tokens.unsqueeze(1),
+                torch.full_like(device_tokens.unsqueeze(1), -1),
+            ).amax(dim=-1)
+        mismatched_device = (
+            valid
+            & (top_k_indices >= 0)
+            & (matched_tokens != top_tokens)
+            & ~newest_matches
+        )
+        bad = invalid_device | mismatched_device
+        if not torch.any(bad):
+            return
+
+        bad_rows, bad_cols = torch.where(bad)
+        sample_count = min(int(bad_rows.numel()), 8)
+        samples = []
+        for i in range(sample_count):
+            row = int(bad_rows[i].item())
+            col = int(bad_cols[i].item())
+            req_idx = int(req_indices[row].item())
+            token = int(top_tokens[row, col].item())
+            device_loc = int(top_k_indices[row, col].item())
+            matched = int(matched_tokens[row, col].item())
+            samples.append(
+                f"req={req_idx},token={token},device_loc={device_loc},matched={matched}"
+            )
+        raise RuntimeError(
+            "DSV4 HiSparse C4 swap-in produced inconsistent device indices: "
+            f"bad={int(bad.sum().item())}, samples=[{'; '.join(samples)}]. "
+            "This would feed wrong C4 KV into sparse attention."
+        )

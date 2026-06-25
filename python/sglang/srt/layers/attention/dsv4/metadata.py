@@ -101,6 +101,7 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    req_pool_indices_repeated: Optional[torch.Tensor] = None
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     topk_workspace: Optional[torch.Tensor] = field(init=False, repr=False)
@@ -163,9 +164,14 @@ class PagedIndexerMetadata:
 
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
-            copy_fields = ["page_table", "c4_seq_lens"]
+            copy_fields = ["page_table", "c4_seq_lens", "req_pool_indices_repeated"]
         else:
-            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            copy_fields = [
+                "page_table",
+                "c4_seq_lens",
+                "req_pool_indices_repeated",
+                "deep_gemm_metadata",
+            ]
         copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,

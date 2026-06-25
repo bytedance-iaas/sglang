@@ -376,6 +376,7 @@ def topk_transform_512(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    raw_indices_only: bool = False,
 ) -> None:
     topk = out_page_indices.shape[1]
     if topk == 512:
@@ -388,12 +389,20 @@ def topk_transform_512(
             f"got top_k={topk}. Use topk_transform_512_v2 for flexible top-k."
         )
     module.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+        raw_indices_only,
     )
 
 
 _WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
 _PLAN_METADATA_INTS_PER_BATCH = 4
+_TOPK_V2_NUM_CLUSTERS = 15
+_TOPK_V2_FORCE_PLAN_FOR_SMALL_BATCH = 0xFFFFFFFF
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
@@ -417,6 +426,7 @@ def topk_transform_512_v2(
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
+    raw_indices_only: bool = False,
 ) -> None:
     module = _jit_topk_v2_module(out_page_indices.shape[1])
     bs = scores.shape[0]
@@ -424,6 +434,11 @@ def topk_transform_512_v2(
         workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
     else:
         workspace = workspace[:bs]
+    if raw_indices_only and bs <= _TOPK_V2_NUM_CLUSTERS:
+        # Raw-index output is consumed by HiSparse C4 swap-in. Avoid the
+        # small-batch fused CUDA path for this shape and force metadata planning
+        # so the two-stage path has valid work items.
+        module.topk_plan(seq_lens, metadata, _TOPK_V2_FORCE_PLAN_FOR_SMALL_BATCH)
     module.topk_transform(
         scores,
         seq_lens,
@@ -433,6 +448,7 @@ def topk_transform_512_v2(
         workspace,
         metadata,
         out_raw_indices,
+        raw_indices_only,
     )
 
 
@@ -818,18 +834,21 @@ def create_paged_compress_data_kernel(
         else:
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
-        loc = tl.load(
-            req_to_token_ptr
-            + rid.to(tl.int64) * stride_req_to_token_0
-            + pos.to(tl.int64) * stride_req_to_token_1,
-            mask=mask,
-            other=0,
-        ).to(tl.int32)
-        swa_loc = tl.load(full_to_swa_index_mapping_ptr + loc, mask=mask, other=0).to(
-            tl.int32
-        )
-        swa_page = swa_loc // swa_page_size
-        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        if compress_ratio == 128:
+            state_loc = rid * ring_size + (pos % ring_size)
+        else:
+            loc = tl.load(
+                req_to_token_ptr
+                + rid.to(tl.int64) * stride_req_to_token_0
+                + pos.to(tl.int64) * stride_req_to_token_1,
+                mask=mask,
+                other=0,
+            ).to(tl.int32)
+            swa_loc = tl.load(
+                full_to_swa_index_mapping_ptr + loc, mask=mask, other=0
+            ).to(tl.int32)
+            swa_page = swa_loc // swa_page_size
+            state_loc = swa_page * ring_size + (swa_loc % ring_size)
         state_loc = state_loc // cr
         if i == 0:
             v0 = state_loc

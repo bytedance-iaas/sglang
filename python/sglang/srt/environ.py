@@ -598,11 +598,15 @@ class Envs:
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # If DSV4 thinking generation does not emit a normal-content suffix, expose
+    # the reasoning text as content instead of returning an empty message.
+    SGLANG_DSV4_FORCE_NONEMPTY_CONTENT = EnvBool(True)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_SPLIT_SINKHORN = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
@@ -640,10 +644,11 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-    # HiSparse still needs a separate swap-in pass after raw top-k output, but
-    # topk_v2 avoids the old fixed-512/1024 path and can write raw indices into
-    # the preallocated swap-in buffer.
-    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(True)
+    # HiSparse consumes raw top-k token positions and then runs a separate C4
+    # swap-in pass. Keep the legacy top-k path as the correctness default until
+    # raw-only topk_v2 is validated against the swap-in mapping path.
+    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(False)
+    SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK = EnvBool(True)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

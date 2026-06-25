@@ -153,10 +153,10 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             num_layers=self.layer_num,
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
@@ -365,13 +365,22 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return logical_indices
 
     def bind_device_mapping(
-        self, logical_indices: torch.Tensor, device_slots: torch.Tensor
+        self,
+        logical_indices: torch.Tensor,
+        device_slots: torch.Tensor,
+        token_positions: Optional[torch.Tensor] = None,
     ):
         if logical_indices.numel() != device_slots.numel():
             raise RuntimeError(
                 "HiSparse draft mapping mismatch: "
                 f"{logical_indices.numel()} logical locs vs "
                 f"{device_slots.numel()} device slots."
+            )
+        if token_positions is not None and token_positions.numel() != logical_indices.numel():
+            raise RuntimeError(
+                "HiSparse draft position mapping mismatch: "
+                f"{token_positions.numel()} positions vs "
+                f"{logical_indices.numel()} logical locs."
             )
         self.full_to_hisparse_device_index_mapping[logical_indices] = device_slots
 
@@ -747,14 +756,17 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         return self.logical_attn_allocator.get_cpu_copy(
-            indices, mamba_indices=mamba_indices
+            indices, mamba_indices=mamba_indices, req_pool_idx=req_pool_idx
         )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         return self.logical_attn_allocator.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu,
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_idx=req_pool_idx,
         )
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
@@ -909,12 +921,42 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.free(buffer_indices)
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return (last_locs - 3) // self.compress_ratio
+        return last_locs // self.compress_ratio
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self.hisparse_kvcache._translate_loc_to_hisparse_device(
             self.get_last_loc_compressed(last_locs)
         )
+
+    def _compressed_locs_from_extend_positions(
+        self,
+        logical_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        if logical_indices.numel() == 0:
+            return logical_indices
+
+        extend_lens = (seq_lens - prefix_lens).to(torch.int64)
+        total_extend = int(logical_indices.numel())
+        if total_extend == 0:
+            return logical_indices
+
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=logical_indices.device),
+                extend_lens.cumsum(0),
+            ]
+        )
+        token_offsets = torch.arange(
+            total_extend, dtype=torch.int64, device=logical_indices.device
+        ) - torch.repeat_interleave(offsets[:-1], extend_lens)
+        token_positions = (
+            torch.repeat_interleave(prefix_lens.to(torch.int64), extend_lens)
+            + token_offsets
+        )
+        compressed_mask = (token_positions + 1) % self.compress_ratio == 0
+        return (logical_indices[compressed_mask] // self.compress_ratio).to(torch.int64)
 
     def _merge_logical_release_pages_if_needed(self, num_new_pages: int) -> None:
         """Make recently released logical pages allocatable for a small draft extend."""
@@ -1011,7 +1053,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return logical_indices
 
     def bind_device_mapping(
-        self, logical_indices: torch.Tensor, device_slots: torch.Tensor
+        self,
+        logical_indices: torch.Tensor,
+        device_slots: torch.Tensor,
+        token_positions: Optional[torch.Tensor] = None,
     ):
         if logical_indices.numel() != device_slots.numel():
             raise RuntimeError(
@@ -1019,7 +1064,25 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 f"{logical_indices.numel()} logical locs vs "
                 f"{device_slots.numel()} device slots."
             )
+        if token_positions is not None and token_positions.numel() != logical_indices.numel():
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse draft position mapping mismatch: "
+                f"{token_positions.numel()} positions vs "
+                f"{logical_indices.numel()} logical locs."
+            )
         if logical_indices.numel() == 0:
+            return
+
+        if token_positions is not None:
+            compressed_mask = (token_positions + 1) % self.compress_ratio == 0
+            if not torch.any(compressed_mask):
+                return
+            compressed_indices = (
+                logical_indices[compressed_mask] // self.compress_ratio
+            ).to(torch.int64)
+            self.full_to_hisparse_device_index_mapping[compressed_indices] = (
+                device_slots[compressed_mask]
+            )
             return
 
         block = min(1024, triton.next_power_of_2(logical_indices.numel()))
@@ -1115,8 +1178,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert logical_indices is not None, "Logical allocation failed in alloc_extend"
         self._mark_logical_pages_allocated(logical_indices)
 
-        compressed_logical_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
+        compressed_logical_indices = self._compressed_locs_from_extend_positions(
+            logical_indices,
+            prefix_lens,
+            seq_lens,
         )
         hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
         hisparse_indices = self.hisparse_attn_allocator.alloc_extend(

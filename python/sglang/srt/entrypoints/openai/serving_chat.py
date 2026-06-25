@@ -382,6 +382,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
+        self._apply_dsv4_force_nonempty_content(request)
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
@@ -1455,6 +1457,21 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.reasoning_effort != "none"
         ):
             request.skip_special_tokens = False
+
+    def _apply_dsv4_force_nonempty_content(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        if (
+            self.chat_encoding_spec != "dsv4"
+            or self.reasoning_parser != "deepseek-v4"
+            or not request.separate_reasoning
+            or not envs.SGLANG_DSV4_FORCE_NONEMPTY_CONTENT.get()
+            or not self._get_reasoning_from_request(request)
+        ):
+            return
+
+        request.chat_template_kwargs = dict(request.chat_template_kwargs or {})
+        request.chat_template_kwargs.setdefault("force_nonempty_content", True)
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.

@@ -24,6 +24,7 @@ struct TopK1024Params {
   const int64_t score_stride;
   const int64_t page_table_stride;
   uint32_t page_bits;
+  bool raw_indices_only;
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
@@ -50,12 +51,15 @@ SGL_DEVICE void naive_transform(
     int32_t* __restrict__ indices,
     int32_t* __restrict__ raw_indices,  // optional: output raw abs position indices
     const uint32_t length,
-    const uint32_t page_bits) {
+    const uint32_t page_bits,
+    const bool raw_indices_only) {
   static_assert(kTopK <= kTopKBlockSize);
   if (const auto tx = threadIdx.x; tx < length) {
-    indices[tx] = page_to_indices(page_table, tx, page_bits);
     if (raw_indices != nullptr) {
       raw_indices[tx] = tx;
+      indices[tx] = raw_indices_only ? -1 : page_to_indices(page_table, tx, page_bits);
+    } else {
+      indices[tx] = page_to_indices(page_table, tx, page_bits);
     }
   } else if (kTopK == kTopKBlockSize || tx < kTopK) {
     indices[tx] = -1;  // fill invalid indices to -1
@@ -227,7 +231,7 @@ template <bool kUsePDL>
 __global__ void topk_1024_transform(const __grid_constant__ TopK1024Params params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
-    score_stride, page_table_stride, page_bits // sizes
+    score_stride, page_table_stride, page_bits, raw_indices_only // sizes
   ] = params;
   const uint32_t work_id = blockIdx.x;
 
@@ -241,16 +245,20 @@ __global__ void topk_1024_transform(const __grid_constant__ TopK1024Params param
   device::PDLWaitPrimary<kUsePDL>();
 
   if (seq_len <= kTopK) {
-    naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
+    naive_transform(
+        score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits, raw_indices_only);
   } else {
     __shared__ int32_t s_topk_indices[kTopK];
     radix_topk(score_ptr, s_topk_indices, seq_len);
     static_assert(kTopK <= kTopKBlockSize);
     const auto tx = threadIdx.x;
     if (kTopK == kTopKBlockSize || tx < kTopK) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       if (raw_indices_ptr != nullptr) {
         raw_indices_ptr[tx] = s_topk_indices[tx];
+        indices_ptr[tx] =
+            raw_indices_only ? -1 : page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+      } else {
+        indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       }
     }
   }
@@ -278,7 +286,8 @@ struct TopK1024Kernel {
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool raw_indices_only) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
@@ -326,6 +335,7 @@ struct TopK1024Kernel {
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
         .page_bits = page_bits,
+        .raw_indices_only = raw_indices_only,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
     setup_kernel_smem_once<kernel, kSMEM_>();

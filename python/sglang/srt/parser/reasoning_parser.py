@@ -31,6 +31,7 @@ class BaseReasoningFormatDetector:
         previous_content: str = "",
         thinks_internally: bool = False,
         reasoning_default: str = "always",
+        force_nonempty_content: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -41,6 +42,7 @@ class BaseReasoningFormatDetector:
         self.stream_reasoning = stream_reasoning
         self.thinks_internally = thinks_internally
         self.reasoning_default = reasoning_default
+        self.force_nonempty_content = force_nonempty_content
 
         self._buffer = ""
         self.stripped_think_start = False
@@ -93,6 +95,10 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             # Assume reasoning was truncated before end token
+            if self.force_nonempty_content:
+                return StreamingParseResult(
+                    normal_text=processed_text, reasoning_text=processed_text
+                )
             return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
@@ -243,6 +249,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -260,6 +267,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             thinks_internally=True,
             reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -375,6 +383,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<|channel|>analysis<|message|>",
@@ -383,6 +392,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
         self.parser = HarmonyParser()
 

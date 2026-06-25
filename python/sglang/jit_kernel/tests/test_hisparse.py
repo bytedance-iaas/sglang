@@ -166,7 +166,7 @@ def test_load_cache_to_device_buffer_fast_path(seq_lens_dtype: torch.dtype) -> N
     # seq_len <= HOT_BUFFER_SIZE should skip host loads and LRU mutations,
     # so top_k_tokens acts like direct indexing into device_buffer_locs.
     out = _run_kernel(
-        top_k_tokens=torch.tensor([[2, 0, 1]], dtype=torch.int32, device=DEVICE),
+        top_k_tokens=torch.tensor([[2, 99, 1, -1]], dtype=torch.int32, device=DEVICE),
         device_buffer_tokens=device_buffer_tokens,
         host_cache_locs=torch.arange(
             HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE
@@ -179,7 +179,7 @@ def test_load_cache_to_device_buffer_fast_path(seq_lens_dtype: torch.dtype) -> N
         seq_lens_dtype=seq_lens_dtype,
     )
 
-    assert torch.equal(out.cpu(), torch.tensor([[5, 13, 9]], dtype=torch.int32))
+    assert torch.equal(out.cpu(), torch.tensor([[5, -1, 9, -1]], dtype=torch.int32))
     assert torch.equal(device_buffer_tokens.cpu(), device_buffer_tokens_before.cpu())
     assert torch.equal(lru_slots.cpu(), lru_slots_before.cpu())
     assert torch.equal(device_buffer.cpu(), device_buffer_before.cpu())
@@ -237,6 +237,53 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
         state["lru_slots"].cpu(), torch.tensor([[3, 1, 2, 0]], dtype=torch.int16)
     )
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+
+
+def test_load_cache_to_device_buffer_ignores_invalid_topk_entries() -> None:
+    state = _long_case()
+
+    # Long path should ignore padded / invalid top-k entries just like the short
+    # path.  They must not become host loads from req_host_cache_locs[-1].
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[4, -1, 6, 99, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=8,
+        **state,
+    )
+
+    assert torch.equal(
+        out.cpu(), torch.tensor([[7, -1, 9, -1, 11]], dtype=torch.int32)
+    )
+    assert torch.equal(
+        state["device_buffer_tokens"].cpu(),
+        torch.tensor([[6, 4, 2, 5, -1]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        state["lru_slots"].cpu(), torch.tensor([[2, 3, 0, 1]], dtype=torch.int16)
+    )
+    assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+
+
+def test_load_cache_to_device_buffer_ignores_missing_host_slots() -> None:
+    state = _long_case()
+    state["host_cache_locs"][0, 6] = -1
+
+    # Token 6 is a valid C4 position, but the host mirror does not have a
+    # backing slot.  The kernel should leave that top-k entry unresolved instead
+    # of copying from req_host_cache_locs[-1].
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[4, 6, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=8,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.tensor([[7, -1, 11]], dtype=torch.int32))
+    assert torch.equal(
+        state["device_buffer_tokens"].cpu(),
+        torch.tensor([[1, 4, 2, 5, -1]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        state["lru_slots"].cpu(), torch.tensor([[0, 2, 3, 1]], dtype=torch.int16)
+    )
 
 
 def test_load_cache_to_device_buffer_batched_with_padding() -> None:

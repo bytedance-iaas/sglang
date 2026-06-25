@@ -43,7 +43,9 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_c128_state_indices,
     get_kv_class,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
@@ -1833,6 +1835,16 @@ class DecodePreallocQueue:
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _c128_state_payload():
+                online = is_dsv4_c128_online_enabled()
+                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
+                return get_dsv4_c128_state_indices(
+                    int(decode_req.req.req_pool_idx),
+                    seq_len,
+                    online=online,
+                    ring_size=ring_size,
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1842,6 +1854,8 @@ class DecodePreallocQueue:
                     state_indices.append(_swa_payload())
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 
@@ -2394,6 +2408,9 @@ class DecodePreallocQueue:
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_input_len(len(req.fill_ids) - prefix_len)
+        restore_c128 = getattr(self.tree_cache, "restore_c128_state_for_reqs", None)
+        if restore_c128 is not None:
+            restore_c128([req])
 
         if retracted_hisparse_restore:
             if not coordinator.restore_retracted_decode_req(req):

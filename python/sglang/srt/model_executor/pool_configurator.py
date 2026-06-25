@@ -424,28 +424,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        c4_state_dtype_size, c128_state_dtype_size = (
-            _get_dsv4_compress_state_dtype_sizes()
-        )
+        c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
         c4_state_bytes = 2 * 2 * attn_head_dim * c4_state_dtype_size
-        # Online c128 stores (max, sum, kv) per slot (3*head_dim) instead of
-        # raw (kv, score) (2*head_dim). Combined with ring_size=1 this still
-        # nets a large reduction (~3/256x) but the per-slot bytes go up.
-        c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        c128_state_bytes = (
-            (3 if c128_online else 2 * 1) * attn_head_dim * c128_state_dtype_size
-        )
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
-        c128_state_ratio = self.c128_ring_size / self.swa_page_size
-        if (
-            c128_online
-            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
-            and self.online_c128_mtp_max_draft_tokens > 0
-        ):
-            c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
-
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         bytes_per_full_token = (
             self.swa_ratio * kv_bytes * self.num_layers_total
@@ -453,10 +436,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
-            + self.swa_ratio
-            * c128_state_ratio
-            * c128_state_bytes
-            * self.num_layers_ca128
             + self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
@@ -490,6 +469,37 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 pre_alloc_size = max_num_reqs
 
         return max_num_reqs + int(pre_alloc_size) + 1
+
+    def _estimate_c128_state_pool_size(self) -> int:
+        req_slots = self._estimate_hisparse_req_slots()
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            return req_slots
+        return req_slots * self.c128_ring_size
+
+    def _estimate_c128_state_fixed_overhead_bytes(self) -> int:
+        if self.num_layers_ca128 == 0:
+            return 0
+
+        _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
+        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        c128_state_bytes = (
+            (3 if c128_online else 2) * attn_head_dim * c128_state_dtype_size
+        )
+        banks = 1
+        if (
+            c128_online
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            and self.online_c128_mtp_max_draft_tokens > 0
+        ):
+            banks += self.online_c128_mtp_max_draft_tokens
+
+        return int(
+            self._estimate_c128_state_pool_size()
+            * banks
+            * c128_state_bytes
+            * self.num_layers_ca128
+        )
 
     def _estimate_hisparse_fixed_overhead_bytes(self, page_size: int) -> int:
         if not self.enable_hisparse:
@@ -529,7 +539,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
-            c128_state_pool_size=swa_tokens // self.swa_page_size * self.c128_ring_size,
+            c128_state_pool_size=self._estimate_c128_state_pool_size(),
         )
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
@@ -562,30 +572,40 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         hisparse_fixed_overhead_bytes = self._estimate_hisparse_fixed_overhead_bytes(
             page_size
         )
-        effective_available_bytes = available_bytes - hisparse_fixed_overhead_bytes
+        c128_state_fixed_overhead_bytes = (
+            self._estimate_c128_state_fixed_overhead_bytes()
+        )
+        fixed_overhead_bytes = (
+            hisparse_fixed_overhead_bytes + c128_state_fixed_overhead_bytes
+        )
+        effective_available_bytes = available_bytes - fixed_overhead_bytes
         if effective_available_bytes <= 0:
             logger.warning(
-                "DSV4 HiSparse fixed overhead exceeds available KV pool bytes: "
-                "raw_available_bytes=%.2f GB, hisparse_fixed_overhead=%.2f GB. "
+                "DSV4 fixed overhead exceeds available KV pool bytes: "
+                "raw_available_bytes=%.2f GB, hisparse_fixed_overhead=%.2f GB, "
+                "c128_state_fixed_overhead=%.2f GB. "
                 "Clamping effective pool bytes to zero; lower mem_fraction_static, "
                 "max_running_requests, top_k, or device_buffer_size.",
                 available_bytes / (1 << 30),
                 hisparse_fixed_overhead_bytes / (1 << 30),
+                c128_state_fixed_overhead_bytes / (1 << 30),
             )
             effective_available_bytes = 0
         full_token = int(effective_available_bytes / self.bytes_per_full_token)
         sizes = self._compute_dsv4_sizes(full_token, page_size)
-        if hisparse_fixed_overhead_bytes > 0:
+        if fixed_overhead_bytes > 0:
             logger.info(
                 "DSV4 memory calculation: "
                 "bytes_per_full_token=%.2f, raw_available_bytes=%.2f GB, "
-                "hisparse_fixed_overhead=%.2f GB, effective_available_bytes=%.2f GB, "
+                "hisparse_fixed_overhead=%.2f GB, c128_state_fixed_overhead=%.2f GB, "
+                "effective_available_bytes=%.2f GB, "
                 "full_token=%d, c4_shrink_factor=%s, req_slots=%d, "
                 "padded_buffer_size=%d, top_k=%d, device_buffer_size=%d, "
                 "online_c128_mtp_max_draft_tokens=%d",
                 self.bytes_per_full_token,
                 available_bytes / (1 << 30),
                 hisparse_fixed_overhead_bytes / (1 << 30),
+                c128_state_fixed_overhead_bytes / (1 << 30),
                 effective_available_bytes / (1 << 30),
                 sizes.full_max_total_num_tokens,
                 self.c4_shrink_factor,

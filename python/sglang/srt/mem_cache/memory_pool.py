@@ -400,7 +400,7 @@ class MambaPool:
             :, src_indices
         ]
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -412,7 +412,7 @@ class MambaPool:
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
-    def load_cpu_copy(self, mamba_cache_cpu, indices):
+    def load_cpu_copy(self, mamba_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
@@ -766,10 +766,10 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -971,7 +971,7 @@ class MHATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -989,7 +989,7 @@ class MHATokenToKVPool(KVCache):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1565,8 +1565,8 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
+        kv_cpu = self.full_kv_pool.get_cpu_copy(indices, req_pool_idx=req_pool_idx)
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(mamba_indices)
             if mamba_indices is not None
@@ -1574,9 +1574,9 @@ class HybridLinearKVPool(KVCache):
         )
         return kv_cpu, mamba_cpu
 
-    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         kv_cpu, mamba_cpu = cache_cpu
-        self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
+        self.full_kv_pool.load_cpu_copy(kv_cpu, indices, req_pool_idx=req_pool_idx)
         if mamba_cpu is not None and mamba_indices is not None:
             self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
 
@@ -1811,7 +1811,7 @@ class MLATokenToKVPool(KVCache):
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -1826,7 +1826,7 @@ class MLATokenToKVPool(KVCache):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -2132,7 +2132,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
@@ -2157,7 +2157,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None, req_pool_idx=None):
         super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
 
         page_indices = indices[:: self.page_size] // self.page_size

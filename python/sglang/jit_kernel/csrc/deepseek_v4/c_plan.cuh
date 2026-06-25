@@ -53,7 +53,7 @@ struct Prefill1Params {
   PlanW* plan_w;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // [num_swa_slots]
+  const F2S_T* f2s_ptr;  // [num_full_slots], full_loc -> swa_loc
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -69,7 +69,7 @@ struct DecodeParams {
   PlanD* plan_d;
   const RID_T* rid_ptr;  // [batch_size]
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // [num_swa_slots]
+  const F2S_T* f2s_ptr;  // [num_full_slots], full_loc -> swa_loc
   const IDX_T* seq_ptr;  // [batch_size]
   int64_t stride_r2t;
   uint32_t batch_size;
@@ -281,6 +281,9 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
+  const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
+    return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
+  };
 
   if (!plan_c.is_invalid()) {  // 1. in bound. 2. not masked
     if (plan_c.buffer_len > 0) {
@@ -291,12 +294,17 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       const auto position_1 = static_cast<int32_t>(plan_c.seq_len - 1);
       // only used for c4, harmless for c128
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
-      const auto raw_loc_0 = mapping[position_0];
-      const auto raw_loc_1 = mapping[position_1];
-      const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
-      const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
-      plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
-      plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
+      if (params.compress_ratio == 128) {
+        plan_c.read_page_0 = compute_c128_loc(rid, position_0) / 128;
+        plan_c.read_page_1 = compute_c128_loc(rid, position_1) / 128;
+      } else {
+        const auto raw_loc_0 = mapping[position_0];
+        const auto raw_loc_1 = mapping[position_1];
+        const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
+        const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
+        plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
+        plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
+      }
       params.plan_c[idx] = plan_c;
     }
   } else if (idx < params.num_c_padded) {
@@ -309,10 +317,14 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto mapping = params.r2t_ptr + rid * params.stride_r2t;
     // `seq_len` (`write_loc`) may not be aligned here
     const auto position = static_cast<int32_t>(plan_w.write_loc - 1);
-    const auto raw_loc = mapping[position];
-    const auto swa_loc = params.f2s_ptr[raw_loc];
     plan_w.ragged_id = ragged_id;
-    plan_w.write_loc = compute_loc(swa_loc);
+    if (params.compress_ratio == 128) {
+      plan_w.write_loc = compute_c128_loc(rid, position);
+    } else {
+      const auto raw_loc = mapping[position];
+      const auto swa_loc = params.f2s_ptr[raw_loc];
+      plan_w.write_loc = compute_loc(swa_loc);
+    }
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
     params.plan_w[idx] = PlanW::invalid();
@@ -329,16 +341,28 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
+  const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
+    return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
+  };
   const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
   const auto position_1 = static_cast<int32_t>(seq_len - 1);
   const auto position_0 = max(position_1 - params.compress_ratio, 0);
-  const auto raw_loc_0 = mapping[position_0];
-  const auto raw_loc_1 = mapping[position_1];
-  const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
-  const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
-  const auto write_loc = compute_loc(swa_loc_1);
-  const auto read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
-  const auto read_page_1 = write_loc / params.compress_ratio;
+  int32_t write_loc;
+  int32_t read_page_0;
+  int32_t read_page_1;
+  if (params.compress_ratio == 128) {
+    write_loc = compute_c128_loc(rid, position_1);
+    read_page_0 = compute_c128_loc(rid, position_0) / 128;
+    read_page_1 = compute_c128_loc(rid, position_1) / 128;
+  } else {
+    const auto raw_loc_0 = mapping[position_0];
+    const auto raw_loc_1 = mapping[position_1];
+    const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
+    const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
+    write_loc = static_cast<int32_t>(compute_loc(swa_loc_1));
+    read_page_0 = static_cast<int32_t>(compute_loc(swa_loc_0) / params.compress_ratio);
+    read_page_1 = static_cast<int32_t>(write_loc / params.compress_ratio);
+  }
   params.plan_d[idx] = {
       .seq_len = static_cast<uint32_t>(seq_len),
       .write_loc = write_loc,

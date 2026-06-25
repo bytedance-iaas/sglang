@@ -1,4 +1,5 @@
 import functools
+import logging
 import math
 from typing import Tuple
 
@@ -11,6 +12,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
+logger = logging.getLogger(__name__)
+
 tilelang.set_log_level("WARNING")
 
 pass_configs = {
@@ -22,6 +25,9 @@ FP8 = "float8_e4m3"
 BF16 = "bfloat16"
 FP32 = "float32"
 INT32 = "int32"
+
+_hc_split_sinkhorn_disable_tilelang = False
+_hc_split_sinkhorn_fallback_warned = False
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -99,19 +105,58 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    global _hc_split_sinkhorn_disable_tilelang
+    global _hc_split_sinkhorn_fallback_warned
+
     b, s, _ = mixes.size()
-    pre = mixes.new_empty(b, s, hc_mult)
-    post = mixes.new_empty(b, s, hc_mult)
-    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
-    kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
-    kernel(
-        mixes.view(-1, (2 + hc_mult) * hc_mult),
-        hc_scale,
-        hc_base,
-        pre.view(-1, hc_mult),
-        post.view(-1, hc_mult),
-        comb.view(-1, hc_mult, hc_mult),
+
+    if (
+        envs.SGLANG_OPT_USE_TILELANG_MHC_SPLIT_SINKHORN.get()
+        and not _hc_split_sinkhorn_disable_tilelang
+    ):
+        pre = mixes.new_empty(b, s, hc_mult)
+        post = mixes.new_empty(b, s, hc_mult)
+        comb = mixes.new_empty(b, s, hc_mult, hc_mult)
+        try:
+            kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
+            kernel(
+                mixes.view(-1, (2 + hc_mult) * hc_mult),
+                hc_scale,
+                hc_base,
+                pre.view(-1, hc_mult),
+                post.view(-1, hc_mult),
+                comb.view(-1, hc_mult, hc_mult),
+            )
+            return pre, post, comb
+        except Exception:
+            _hc_split_sinkhorn_disable_tilelang = True
+            if not _hc_split_sinkhorn_fallback_warned:
+                _hc_split_sinkhorn_fallback_warned = True
+                logger.warning(
+                    "TileLang hc_split_sinkhorn failed; falling back to torch implementation.",
+                    exc_info=True,
+                )
+
+    pre = torch.sigmoid(
+        mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + eps
+    post = 2 * torch.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
     )
+    comb = (
+        mixes[..., 2 * hc_mult :].view(b, s, hc_mult, hc_mult) * hc_scale[2]
+        + hc_base[2 * hc_mult :].view(1, 1, hc_mult, hc_mult)
+    )
+
+    comb = torch.exp(comb - comb.max(dim=-1, keepdim=True).values)
+    comb = comb / comb.sum(dim=-1, keepdim=True) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
     return pre, post, comb
 
 

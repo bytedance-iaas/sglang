@@ -97,6 +97,7 @@ def topk_transform_512_pytorch_vectorized(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    raw_indices_only: bool = False,
 ) -> None:
 
     TOPK = out_page_indices.shape[1]
@@ -160,6 +161,14 @@ def topk_transform_512_pytorch_vectorized(
         valid_topk = torch.where(
             needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
         )
+
+    if out_raw_indices is not None and raw_indices_only:
+        raw_indices = torch.where(
+            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
+        )
+        out_raw_indices.copy_(raw_indices)
+        out_page_indices.fill_(-1)
+        return
 
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
@@ -399,22 +408,37 @@ class C4IndexerBackendMixin:
         capture_enabled = indexer_capturer is not None
 
         hisparse_coordinator = forward_batch.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        hisparse_c4_swap_in = hisparse_coordinator is not None and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
         )
         topk_size = core_metadata.c4_sparse_page_indices.shape[1]
+        topk_batch_size = indexer_metadata.c4_seq_lens.shape[0]
         requires_flexible_topk = topk_size not in (512, 1024)
+        # HiSparse consumes raw token positions and then runs a separate C4
+        # host/device swap-in pass. Keep the proven fixed-size top-k kernels for
+        # standard 512/1024 shapes even when the global topk_v2 switch is on;
+        # use v2 for HiSparse only when a flexible top-k shape requires it.
         use_topk_v2 = envs.SGLANG_OPT_USE_TOPK_V2.get() and (
-            not hisparse_decode or envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()
+            not hisparse_c4_swap_in
+            or (envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get() and requires_flexible_topk)
             or requires_flexible_topk
         )
 
         raw_indices = None
         if capture_enabled:
-            raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
-        elif hisparse_decode:
+            raw_indices = core_metadata.c4_sparse_page_indices.new_empty(
+                (topk_batch_size, topk_size)
+            )
+        elif hisparse_c4_swap_in:
+            if hisparse_coordinator.raw_indices_buffer.size(0) < topk_batch_size:
+                raise RuntimeError(
+                    "HiSparse raw-index buffer is smaller than DSV4 C4 top-k batch: "
+                    f"buffer_shape={tuple(hisparse_coordinator.raw_indices_buffer.shape)}, "
+                    f"topk_batch_size={topk_batch_size}, topk_size={topk_size}."
+                )
             raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : core_metadata.c4_sparse_page_indices.size(0)
+                :topk_batch_size
             ]
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
@@ -425,6 +449,7 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
+                hisparse_c4_swap_in,
             )
         elif use_topk_v2:
             topk_transform_512_v2(
@@ -436,6 +461,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.topk_metadata,
                 raw_indices,
                 indexer_metadata.get_topk_workspace(),
+                hisparse_c4_swap_in,
             )
         else:
             if requires_flexible_topk:
@@ -450,20 +476,60 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
+                hisparse_c4_swap_in,
             )
         if hisparse_coordinator is not None:
-            if hisparse_decode:
+            if hisparse_c4_swap_in:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
+                req_pool_indices = indexer_metadata.req_pool_indices_repeated
+                if req_pool_indices is None:
+                    req_pool_indices = forward_batch.req_pool_indices
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and req_pool_indices.size(0) == topk_batch_size
+                    and forward_batch.req_pool_indices.size(0) < topk_batch_size
+                ):
+                    base_req_pool_indices = forward_batch.req_pool_indices
+                    base_batch_size = base_req_pool_indices.size(0)
+                    if topk_batch_size % base_batch_size != 0:
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 top-k batch is not a "
+                            "multiple of request batch size: "
+                            f"topk_batch_size={topk_batch_size}, "
+                            f"base_batch_size={base_batch_size}."
+                        )
+                    tokens_per_req = topk_batch_size // base_batch_size
+                    raw_indices_by_token = raw_indices.view(
+                        base_batch_size, tokens_per_req, topk_size
                     )
-                )
+                    seq_lens_by_token = indexer_metadata.c4_seq_lens.view(
+                        base_batch_size, tokens_per_req
+                    )
+                    device_indices_by_token = (
+                        core_metadata.c4_sparse_page_indices.view(
+                            base_batch_size, tokens_per_req, topk_size
+                        )
+                    )
+                    for token_idx in range(tokens_per_req):
+                        device_indices_by_token[:, token_idx, :].copy_(
+                            hisparse_coordinator.swap_in_selected_pages(
+                                req_pool_indices=base_req_pool_indices,
+                                compressed_seq_lens=seq_lens_by_token[:, token_idx],
+                                top_k_result=raw_indices_by_token[:, token_idx, :],
+                                layer_id=compress_layer_id,
+                            )
+                        )
+                else:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.swap_in_selected_pages(
+                            req_pool_indices=req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                        )
+                    )
             else:
                 core_metadata.c4_sparse_page_indices = (
                     token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(

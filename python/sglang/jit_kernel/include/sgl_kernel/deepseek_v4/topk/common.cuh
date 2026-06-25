@@ -29,13 +29,20 @@ struct TransformParams {
   int32_t* __restrict__ indices_out;
   int32_t* __restrict__ raw_indices_out;
   uint32_t page_bits;
+  bool raw_indices_only;
 
   SGL_DEVICE void transform(const uint32_t idx) const {
     write(idx, indices_in[idx]);
   }
   SGL_DEVICE void write(const uint32_t dst, const uint32_t src) const {
+    if (raw_indices_out != nullptr) {
+      raw_indices_out[dst] = src;
+      if (raw_indices_only) {
+        indices_out[dst] = -1;
+        return;
+      }
+    }
     indices_out[dst] = page_to_indices(page_table, src, page_bits);
-    if (raw_indices_out != nullptr) raw_indices_out[dst] = src;
   }
   SGL_DEVICE void write_invalid(const uint32_t dst) const {
     indices_out[dst] = -1;

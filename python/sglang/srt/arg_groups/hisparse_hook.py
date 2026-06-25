@@ -175,6 +175,50 @@ def _validate_dsv4_hisparse_online_c128_mtp(server_args: "ServerArgs") -> None:
     )
 
 
+def _validate_dsv4_hisparse_c4_verify_hot_buffer(server_args: "ServerArgs") -> None:
+    """Ensure EAGLE target-verify C4 rows can stay resident until attention.
+
+    Target verify runs several draft-token rows for the same request in one
+    forward. HiSparse C4 swap-in returns device slots into a per-request hot
+    buffer, so that buffer must be able to hold the union of all C4 top-k rows
+    consumed by the subsequent attention call. Otherwise later rows can evict
+    slots referenced by earlier rows and produce silent correctness loss.
+    """
+    if server_args.speculative_algorithm != "EAGLE":
+        return
+
+    from sglang.srt.mem_cache.sparsity import (
+        parse_hisparse_config,
+        resolve_hisparse_top_k,
+    )
+
+    hf_config = server_args.get_model_config().hf_config
+    hf_text_config = getattr(hf_config, "text_config", hf_config)
+    hisparse_cfg = parse_hisparse_config(server_args)
+    top_k = resolve_hisparse_top_k(server_args, hf_text_config)
+    draft_tokens = max(int(server_args.speculative_num_draft_tokens or 1), 1)
+    required_device_buffer_size = top_k * draft_tokens
+
+    if hisparse_cfg.device_buffer_size >= required_device_buffer_size:
+        return
+
+    recommended_device_buffer_size = 1 << (
+        required_device_buffer_size - 1
+    ).bit_length()
+    raise ValueError(
+        "DSV4 HiSparse + EAGLE target verify requires the C4 hot buffer to "
+        "hold every draft-token top-k row for one request. Current "
+        f"device_buffer_size={hisparse_cfg.device_buffer_size}, top_k={top_k}, "
+        f"speculative_num_draft_tokens={draft_tokens}, required minimum is "
+        f"{required_device_buffer_size}. Use "
+        f"--hisparse-config '{{\"top_k\": {top_k}, "
+        f"\"device_buffer_size\": {recommended_device_buffer_size}, "
+        "\"host_to_device_ratio\": ...}' or reduce EAGLE draft tokens. "
+        "Running with a smaller hot buffer can silently evict C4 slots needed "
+        "by earlier target-verify rows and degrade answer quality."
+    )
+
+
 def validate_hisparse(server_args: "ServerArgs") -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, NSA backend)."""
     if not server_args.enable_hisparse:
@@ -198,6 +242,7 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
     # HiSparseCoordinator.
     if is_v4_hisparse:
         _validate_dsv4_hisparse_online_c128_mtp(server_args)
+        _validate_dsv4_hisparse_c4_verify_hot_buffer(server_args)
         _validate_dsv4_hisparse_megamoe(server_args)
         return
 

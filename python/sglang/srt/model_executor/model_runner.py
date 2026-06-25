@@ -769,6 +769,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 hisparse_top_k = resolve_hisparse_top_k(
                     self.server_args, self.model_config.hf_text_config
                 )
+                hisparse_topk_work_buffer_rows = (
+                    self.req_to_token_pool.req_to_token.shape[0]
+                )
+                if self.server_args.speculative_algorithm is not None:
+                    speculative_rows_per_req = max(
+                        int(getattr(self.server_args, "speculative_num_steps", 0) or 0)
+                        + 1,
+                        int(
+                            getattr(
+                                self.server_args, "speculative_num_draft_tokens", 0
+                            )
+                            or 0
+                        ),
+                        int(
+                            getattr(
+                                self.server_args,
+                                "max_speculative_num_draft_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        1,
+                    )
+                    hisparse_topk_work_buffer_rows = max(
+                        hisparse_topk_work_buffer_rows,
+                        int(self.server_args.cuda_graph_max_bs or 0)
+                        * speculative_rows_per_req,
+                    )
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -781,6 +809,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else self.tp_group.cpu_group
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    topk_work_buffer_rows=hisparse_topk_work_buffer_rows,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()

@@ -18,6 +18,7 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
+    C128_STATE = "c128_state"
 
 
 @dataclasses.dataclass

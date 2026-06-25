@@ -47,6 +47,7 @@ constexpr uint32_t kNumClusters = 15;  // based on hardware limits
 constexpr uint32_t kClusterSize = Large::kClusterSize;
 constexpr uint32_t kMax2PassLength = Small::kMax2PassLength;
 constexpr uint32_t kMaxSupportedLength = Large::kMaxLength;
+constexpr uint32_t kForcePlanForSmallBatch = UINT32_MAX;
 
 /// Common metadata lives at metadata[0] (first row of the [batch_size+1, 4] tensor).
 /// Per-item metadata starts at metadata[1..batch_size]. The plan kernel writes both.
@@ -85,6 +86,7 @@ struct TopKParams {
   int64_t workspace_stride;  // bytes per batch
   uint32_t batch_size;
   uint32_t page_bits;
+  bool raw_indices_only;
 
   SGL_DEVICE const float* get_scores(const uint32_t batch_id) const {
     return scores + batch_id * score_stride;
@@ -99,6 +101,7 @@ struct TopKParams {
         .indices_out = page_indices + batch_id * K,
         .raw_indices_out = raw_indices_out,
         .page_bits = page_bits,
+        .raw_indices_only = raw_indices_only,
     };
   }
   SGL_DEVICE const GlobalMetadata& get_global_metadata() const {
@@ -166,7 +169,10 @@ PLAN_KERNEL void topk_plan(
   __syncthreads();
 
   // --- Phase 1: decide threshold ------------------------------------------
-  if (static_cluster_threshold > 0) {
+  const bool force_plan_for_small_batch =
+      static_cluster_threshold == kForcePlanForSmallBatch;
+
+  if (static_cluster_threshold > 0 && !force_plan_for_small_batch) {
     if (tx == 0) s_threshold = static_cluster_threshold;
   } else if (batch_size <= kMinBatchSize) {
     if (tx == 0) s_threshold = kMax2PassLength;  // always prefer cluster
@@ -378,7 +384,9 @@ struct CombinedTopKKernel {
 
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1);
-    if (batch_size <= kNumClusters) return;  // metadata unused in fused path
+    if (batch_size <= kNumClusters && static_cluster_threshold != kForcePlanForSmallBatch) {
+      return;  // metadata unused in fused path
+    }
 
     const auto device = device_.unwrap();
     constexpr auto kernel = topk_plan;
@@ -398,7 +406,8 @@ struct CombinedTopKKernel {
       const uint32_t page_size,
       const tvm::ffi::TensorView workspace,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool raw_indices_only) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -470,6 +479,7 @@ struct CombinedTopKKernel {
         .workspace_stride = W.unwrap() * static_cast<int64_t>(sizeof(int32_t)),
         .batch_size = batch_size,
         .page_bits = page_bits,
+        .raw_indices_only = raw_indices_only,
     };
 
     if (max_seq_len <= Small::kMax1PassLength) {
@@ -480,7 +490,11 @@ struct CombinedTopKKernel {
           .enable_pdl(true)(kernel, params);
     } else {
       // Some items may be large -- launch stage-1 + main
-      if (batch_size <= kNumClusters) {
+      // HiSparse C4 swap-in consumes raw top-k token positions. Keep raw-only
+      // output on the planned two-stage path because the small-batch fused path
+      // can fault before the raw-index consumer has a chance to sanitize entries.
+      const bool force_two_stage = raw_indices_only;
+      if (batch_size <= kNumClusters && !force_two_stage) {
         // can fuse into 1 stage
         constexpr auto kernel = topk_fused_transform;
         constexpr auto kSMEM = std::max(kStage1SMEM, kStage2SMEM);

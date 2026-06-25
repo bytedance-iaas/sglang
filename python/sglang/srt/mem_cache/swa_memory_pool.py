@@ -242,10 +242,12 @@ class SWAKVPool(BaseSWAKVPool):
             filtered.append(filtered_layer)
         return filtered
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
-        full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+        full_kv_cpu = self.full_kv_pool.get_cpu_copy(
+            indices, req_pool_idx=req_pool_idx
+        )
 
         swa_mask = None
         if self.full_to_swa_index_mapping is not None:
@@ -264,14 +266,14 @@ class SWAKVPool(BaseSWAKVPool):
 
         return {"full": full_kv_cpu, "swa": swa_kv_cpu, "swa_mask": swa_mask}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         # Load KV cache back from CPU to both full and SWA pools
         # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
         full_kv_cpu = kv_cache_cpu["full"]
         swa_kv_cpu = kv_cache_cpu["swa"]
 
         # Load full KV cache to the new indices
-        self.full_kv_pool.load_cpu_copy(full_kv_cpu, indices)
+        self.full_kv_pool.load_cpu_copy(full_kv_cpu, indices, req_pool_idx=req_pool_idx)
 
         # Load SWA KV cache if it exists
         if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
@@ -770,10 +772,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_attn_allocator.release_pages.numel() > 0:
             self._swa_page_live[self.swa_attn_allocator.release_pages] = False
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_idx=None):
+        return self._kvcache.get_cpu_copy(
+            indices, mamba_indices=mamba_indices, req_pool_idx=req_pool_idx
+        )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_idx=None):
         return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu,
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_idx=req_pool_idx,
         )
