@@ -422,6 +422,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             return None
         return node.c128_state_snapshots.get(len(node.value))
 
+    def _c128_snapshot_required(self, prefix_len: int) -> bool:
+        return prefix_len > 0 and prefix_len % 128 != 0
+
     def _is_c128_restorable_node(self, node: TreeNode) -> bool:
         if node is self.root_node:
             return True
@@ -459,6 +462,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if prefix_len % 128 == 0:
             return
         snapshot = self._snapshot_c128_state_for_req(req, prefix_len)
+        if snapshot is None and self._dsv4_kv_pool() is not None:
+            raise RuntimeError(
+                "DSV4 C128 radix cache attempted to store a non-128-aligned "
+                f"prefix without a snapshot: rid={getattr(req, 'rid', None)}, "
+                f"req_pool_idx={req.req_pool_idx}, prefix_len={prefix_len}."
+            )
         self._store_c128_snapshot_at_prefix_len(node, prefix_len, snapshot)
 
     def _find_c128_restorable_node(self, node: TreeNode) -> TreeNode:
@@ -497,6 +506,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             if snapshot is not None:
                 kv_pool.restore_c128_radix_state(int(req.req_pool_idx), snapshot)
             else:
+                if self._c128_snapshot_required(node_prefix_len):
+                    raise RuntimeError(
+                        "DSV4 C128 radix restore hit a non-128-aligned prefix "
+                        "without a stored snapshot: "
+                        f"rid={getattr(req, 'rid', None)}, "
+                        f"req_pool_idx={req.req_pool_idx}, "
+                        f"prefix_len={node_prefix_len}."
+                    )
                 kv_pool.clear_c128_radix_state(int(req.req_pool_idx))
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
