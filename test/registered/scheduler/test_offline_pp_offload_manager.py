@@ -157,6 +157,9 @@ def _manager(*, kv_allocator=None, req_pool=None):
     mgr._tick = 0
     mgr.epoch_state = EpochState.FILLING
     mgr.current_epoch_id = 0
+    mgr.fill_stop_requested = False
+    mgr.fill_stop_reason = None
+    mgr.inflight_prefill_mbs = set()
     mgr.host_pinned_bytes = 0
     mgr._host_bytes_per_committed_token = None
     mgr._host_bytes_samples = 0
@@ -314,6 +317,44 @@ def test_epoch_drains_all_waves_before_next_fill():
 
     assert mgr.is_filling()
     assert mgr.current_epoch_id == 1
+
+
+def test_request_draining_waits_for_inflight_prefill_to_offload():
+    mgr = _manager()
+    wave = mgr.new_wave([_req("r0", 2)])
+    mgr.note_prefill_dispatched(0)
+
+    mgr.request_draining("host")
+
+    assert mgr.is_filling()
+    assert mgr.fill_stop_requested is True
+    assert mgr.fill_stop_reason == "host"
+    assert mgr.inflight_prefill_count == 1
+
+    mgr.note_prefill_offloaded(0)
+
+    assert mgr.is_draining()
+    assert mgr.inflight_prefill_count == 0
+    assert mgr.has_active_epoch_waves()
+    assert wave.epoch_id == 0
+
+
+def test_epoch_reset_clears_fill_stop_and_inflight_state():
+    mgr = _manager()
+    wave = mgr.new_wave([_req("r0", 2)])
+    mgr.note_prefill_dispatched(0)
+    mgr.request_draining("host")
+    mgr.note_prefill_offloaded(0)
+
+    assert mgr.is_draining()
+
+    mgr.retire_wave(wave)
+
+    assert mgr.is_filling()
+    assert mgr.current_epoch_id == 1
+    assert mgr.fill_stop_requested is False
+    assert mgr.fill_stop_reason is None
+    assert mgr.inflight_prefill_mbs == set()
 
 
 def test_host_state_bytes_are_counted_and_released_when_decode_ready():

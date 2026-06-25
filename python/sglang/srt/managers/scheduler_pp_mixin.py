@@ -199,6 +199,7 @@ class SchedulerPPMixin:
             if wave.state == WaveState.PREFILLING and mgr.is_wave_offload_ready(wave):
                 mgr.mark_wave_offloaded(wave)
 
+        mgr.maybe_enter_draining()
         if mgr.is_filling():
             return
 

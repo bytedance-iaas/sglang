@@ -2459,6 +2459,9 @@ class Scheduler(
             and not self.last_batch.is_empty()
         ):
             prefilled_batch = self.last_batch
+            offline_pp_prefill_mb_id = getattr(
+                prefilled_batch, "offline_pp_prefill_mb_id", None
+            )
             prefilled = [r for r in prefilled_batch.reqs if not r.finished()]
             self.last_batch = None
             if prefilled:
@@ -2466,7 +2469,10 @@ class Scheduler(
                     prefilled,
                     source_stream=getattr(self, "forward_stream", None),
                 )
+            if offline_pp_prefill_mb_id is not None:
+                mgr.note_prefill_offloaded(offline_pp_prefill_mb_id)
             prefilled_batch.filter_batch(keep_indices=[])
+            mgr.maybe_enter_draining()
 
         waiting_queue_empty = len(self.waiting_queue) == 0 and self.chunked_req is None
 
@@ -2481,12 +2487,16 @@ class Scheduler(
                 else local_reason
             )
             if reason is not None:
-                mgr.enter_draining(reason)
+                mgr.request_draining(reason)
 
-        # Step 2: keep prefilling only while the epoch is in FILLING.
-        if mgr.is_filling():
+        # Step 2: keep prefilling only while the epoch is accepting new work.
+        if mgr.can_dispatch_prefill():
             new_batch = self.get_new_batch_prefill()
             if new_batch is not None:
+                mb_id = getattr(self, "current_pp_mb_id", None)
+                new_batch.offline_pp_prefill_epoch_id = mgr.current_epoch_id
+                new_batch.offline_pp_prefill_mb_id = mb_id
+                mgr.note_prefill_dispatched(mb_id)
                 return new_batch
 
             if mgr.has_active_epoch_waves():
@@ -2502,7 +2512,9 @@ class Scheduler(
                     if sync_fill_stop_reason is not None
                     else local_reason
                 )
-                mgr.enter_draining(reason or local_reason)
+                mgr.request_draining(reason or local_reason)
+        else:
+            mgr.maybe_enter_draining()
 
         # Step 3: continue decoding the active wave, if any.
         if not self.running_batch.is_empty():
@@ -2597,6 +2609,8 @@ class Scheduler(
             ret = self._get_next_batch_offline_pp()
             if ret is not None:
                 return ret
+            if self.offline_pp_offload_manager.has_offline_work():
+                return None
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2804,7 +2818,7 @@ class Scheduler(
         effective_max_prefill_tokens = self.max_prefill_tokens
         effective_prefill_max_requests = self.server_args.prefill_max_requests
         offline_mgr = self.offline_pp_offload_manager
-        if offline_mgr is not None and offline_mgr.is_filling():
+        if offline_mgr is not None and offline_mgr.can_dispatch_prefill():
             offline_budget = offline_mgr.prefill_budget_for_waiting_queue(
                 self.waiting_queue,
                 self.max_prefill_tokens,
@@ -3543,7 +3557,10 @@ class Scheduler(
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
         if self.offline_pp_offload_manager is not None:
-            idle &= not self.offline_pp_offload_manager.has_active_waves()
+            if hasattr(self.offline_pp_offload_manager, "has_offline_work"):
+                idle &= not self.offline_pp_offload_manager.has_offline_work()
+            else:
+                idle &= not self.offline_pp_offload_manager.has_active_waves()
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch

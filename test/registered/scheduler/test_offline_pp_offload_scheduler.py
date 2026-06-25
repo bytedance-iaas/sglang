@@ -31,6 +31,8 @@ class _FakeBatch:
         self.reqs = reqs
         self.forward_mode = ForwardMode.EXTEND
         self.filtered_to_empty = False
+        self.offline_pp_prefill_epoch_id = None
+        self.offline_pp_prefill_mb_id = None
 
     def is_empty(self):
         return len(self.reqs) == 0
@@ -53,6 +55,10 @@ class _FakeOfflinePPManager:
         self.offloaded = []
         self.entered_draining = []
         self.filling = True
+        self.fill_stop_requested = False
+        self.fill_stop_reason = None
+        self.inflight_prefill_mbs = set()
+        self.current_epoch_id = 0
         self.active_epoch_waves = False
         self.decode_ready_wave = None
 
@@ -66,6 +72,20 @@ class _FakeOfflinePPManager:
     def is_draining(self):
         return not self.filling
 
+    @property
+    def inflight_prefill_count(self):
+        return len(self.inflight_prefill_mbs)
+
+    def can_dispatch_prefill(self):
+        return self.filling and not self.fill_stop_requested
+
+    def note_prefill_dispatched(self, mb_id):
+        self.inflight_prefill_mbs.add(mb_id)
+
+    def note_prefill_offloaded(self, mb_id):
+        self.inflight_prefill_mbs.discard(mb_id)
+        self.maybe_enter_draining()
+
     def local_fill_stop_reason(self, waiting_queue_empty):
         return "waiting_empty" if waiting_queue_empty and self.active_epoch_waves else None
 
@@ -73,8 +93,33 @@ class _FakeOfflinePPManager:
         self.entered_draining.append(reason)
         self.filling = False
 
+    def request_draining(self, reason):
+        if not self.filling:
+            return
+        if not self.fill_stop_requested:
+            self.fill_stop_requested = True
+            self.fill_stop_reason = reason
+        self.maybe_enter_draining()
+
+    def maybe_enter_draining(self):
+        if (
+            self.filling
+            and self.fill_stop_requested
+            and self.inflight_prefill_count == 0
+        ):
+            self.enter_draining(self.fill_stop_reason)
+            return True
+        return False
+
     def has_active_epoch_waves(self):
         return self.active_epoch_waves
+
+    def has_offline_work(self):
+        return (
+            self.active_epoch_waves
+            or self.fill_stop_requested
+            or self.inflight_prefill_count > 0
+        )
 
     def has_decoding_wave(self):
         return False
@@ -164,6 +209,101 @@ def test_draining_epoch_does_not_insert_new_prefill():
     assert calls["prefill"] == 0
 
 
+def test_filling_epoch_prefill_dispatch_is_marked_inflight():
+    req = _FakeReq()
+    batch = _FakeBatch([req])
+    mgr = _FakeOfflinePPManager()
+
+    sched = SimpleNamespace(
+        last_batch=None,
+        running_batch=_EmptyBatch(),
+        waiting_queue=[req],
+        chunked_req=None,
+        current_pp_mb_id=5,
+        offline_pp_offload_manager=mgr,
+        get_new_batch_prefill=lambda: batch,
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
+    )
+
+    assert Scheduler._get_next_batch_offline_pp(sched) is batch
+
+    assert batch.offline_pp_prefill_epoch_id == 0
+    assert batch.offline_pp_prefill_mb_id == 5
+    assert mgr.inflight_prefill_mbs == {5}
+    assert mgr.entered_draining == []
+
+
+def test_fill_stop_request_blocks_new_prefill_until_inflight_offloads():
+    mgr = _FakeOfflinePPManager()
+    mgr.active_epoch_waves = True
+    mgr.fill_stop_requested = True
+    mgr.fill_stop_reason = "host"
+    mgr.inflight_prefill_mbs = {2}
+    calls = {"prefill": 0}
+
+    def _get_new_batch_prefill():
+        calls["prefill"] += 1
+        return _FakeBatch([_FakeReq()])
+
+    sched = SimpleNamespace(
+        last_batch=None,
+        running_batch=_EmptyBatch(),
+        waiting_queue=[_FakeReq("waiting")],
+        chunked_req=None,
+        offline_pp_offload_manager=mgr,
+        get_new_batch_prefill=_get_new_batch_prefill,
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
+    )
+
+    assert Scheduler._get_next_batch_offline_pp(sched) is None
+
+    assert calls["prefill"] == 0
+    assert mgr.filling is True
+    assert mgr.entered_draining == []
+
+
+def test_last_prefill_offload_closes_inflight_before_draining():
+    req = _FakeReq()
+    batch = _FakeBatch([req])
+    batch.offline_pp_prefill_epoch_id = 0
+    batch.offline_pp_prefill_mb_id = 3
+    mgr = _FakeOfflinePPManager()
+    mgr.active_epoch_waves = True
+    mgr.fill_stop_requested = True
+    mgr.fill_stop_reason = "host"
+    mgr.inflight_prefill_mbs = {3}
+
+    sched = SimpleNamespace(
+        last_batch=batch,
+        running_batch=_EmptyBatch(),
+        waiting_queue=[_FakeReq("waiting")],
+        chunked_req=None,
+        offline_pp_offload_manager=mgr,
+        get_new_batch_prefill=lambda: (_ for _ in ()).throw(
+            AssertionError("must not dispatch new prefill after fill stop")
+        ),
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
+    )
+
+    assert Scheduler._get_next_batch_offline_pp(sched) is None
+
+    assert mgr.offloaded == [[req]]
+    assert mgr.inflight_prefill_mbs == set()
+    assert mgr.entered_draining == ["host"]
+    assert batch.filtered_to_empty is True
+
+
+def test_offline_pp_work_blocks_default_scheduler_fallback():
+    mgr = _FakeOfflinePPManager()
+    mgr.active_epoch_waves = True
+    sched = SimpleNamespace(
+        offline_pp_offload_manager=mgr,
+        _get_next_batch_offline_pp=lambda: None,
+    )
+
+    assert Scheduler.get_next_batch_to_run(sched) is None
+
+
 def test_pp_fill_stop_reason_sync_does_not_collect_in_scheduler_hot_path():
     def _unexpected_collective(_reason):
         raise AssertionError("scheduler hot path must not call PP collectives")
@@ -234,6 +374,27 @@ def test_is_fully_idle_false_when_offline_pp_waves_are_active():
         _pp_microbatches_drained=lambda: True,
         waiting_queue=[],
         offline_pp_offload_manager=SimpleNamespace(has_active_waves=lambda: True),
+        grammar_manager=SimpleNamespace(grammar_queue=[]),
+        disaggregation_mode=DisaggregationMode.NULL,
+        enable_hisparse=False,
+        enable_hierarchical_cache=False,
+    )
+
+    assert Scheduler.is_fully_idle(sched) is False
+
+
+def test_is_fully_idle_false_when_offline_pp_inflight_work_exists():
+    sched = SimpleNamespace(
+        running_batch=_EmptyBatch(),
+        chunked_req=None,
+        dllm_manager=SimpleNamespace(any_staging_reqs=lambda: False),
+        last_batch=None,
+        cur_batch=None,
+        enable_overlap=False,
+        result_queue=[],
+        _pp_microbatches_drained=lambda: True,
+        waiting_queue=[],
+        offline_pp_offload_manager=SimpleNamespace(has_offline_work=lambda: True),
         grammar_manager=SimpleNamespace(grammar_queue=[]),
         disaggregation_mode=DisaggregationMode.NULL,
         enable_hisparse=False,

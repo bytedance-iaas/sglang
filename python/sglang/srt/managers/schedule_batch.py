@@ -1599,6 +1599,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     decoding_reqs: List[Req] = None
     # Offline PP offload bookkeeping: the active wave represented by this batch.
     offline_pp_wave_id: Optional[int] = None
+    # Offline PP prefill bookkeeping: the epoch/microbatch that dispatched this
+    # prefill batch. Used only by the scheduler to close epoch boundaries after
+    # in-flight prefill microbatches have been offloaded.
+    offline_pp_prefill_epoch_id: Optional[int] = None
+    offline_pp_prefill_mb_id: Optional[int] = None
 
     # For split prefill
     split_index: int = 0
@@ -2777,6 +2782,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             offline_pp_wave_id=self.offline_pp_wave_id,
+            offline_pp_prefill_epoch_id=self.offline_pp_prefill_epoch_id,
+            offline_pp_prefill_mb_id=self.offline_pp_prefill_mb_id,
         )
 
     def maybe_evict_swa(self):

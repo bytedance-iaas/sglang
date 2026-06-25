@@ -215,6 +215,9 @@ class OfflinePPStateOffloadManager:
         self._tick = 0
         self.epoch_state = EpochState.FILLING
         self.current_epoch_id = 0
+        self.fill_stop_requested = False
+        self.fill_stop_reason: Optional[str] = None
+        self.inflight_prefill_mbs: set[int] = set()
         self.host_pinned_bytes = 0
         self._host_bytes_per_committed_token: Optional[float] = None
         self._host_bytes_samples = 0
@@ -398,6 +401,65 @@ class OfflinePPStateOffloadManager:
     def is_draining(self) -> bool:
         return self.epoch_state == EpochState.DRAINING
 
+    @property
+    def inflight_prefill_count(self) -> int:
+        return len(self.inflight_prefill_mbs)
+
+    def can_dispatch_prefill(self) -> bool:
+        return self.is_filling() and not self.fill_stop_requested
+
+    def has_offline_work(self) -> bool:
+        return (
+            bool(self.waves)
+            or self.fill_stop_requested
+            or self.inflight_prefill_count > 0
+        )
+
+    def _normalize_mb_id(self, mb_id: Optional[int]) -> int:
+        return int(mb_id) if mb_id is not None else -1
+
+    def _log_prefill_inflight(self, action: str, mb_id: Optional[int]) -> None:
+        logger.info(
+            "OfflinePP %s epoch=%d state=%s mb_id=%s inflight=%d waves=%d",
+            action,
+            self.current_epoch_id,
+            self.epoch_state.value,
+            mb_id,
+            self.inflight_prefill_count,
+            self.active_epoch_wave_count(),
+        )
+
+    def note_prefill_dispatched(self, mb_id: Optional[int]) -> None:
+        if not self.is_filling():
+            logger.warning(
+                "OfflinePP PREFILL_INFLIGHT_ADD ignored outside FILLING "
+                "epoch=%d state=%s mb_id=%s",
+                self.current_epoch_id,
+                self.epoch_state.value,
+                mb_id,
+            )
+            return
+        key = self._normalize_mb_id(mb_id)
+        if key not in self.inflight_prefill_mbs:
+            self.inflight_prefill_mbs.add(key)
+        self._log_prefill_inflight("PREFILL_INFLIGHT_ADD", mb_id)
+
+    def note_prefill_offloaded(self, mb_id: Optional[int]) -> None:
+        key = self._normalize_mb_id(mb_id)
+        if key in self.inflight_prefill_mbs:
+            self.inflight_prefill_mbs.remove(key)
+        elif self.is_filling() or self.fill_stop_requested:
+            logger.warning(
+                "OfflinePP PREFILL_INFLIGHT_DONE for unknown mb_id "
+                "epoch=%d state=%s mb_id=%s inflight=%d",
+                self.current_epoch_id,
+                self.epoch_state.value,
+                mb_id,
+                self.inflight_prefill_count,
+            )
+        self._log_prefill_inflight("PREFILL_INFLIGHT_DONE", mb_id)
+        self.maybe_enter_draining()
+
     def local_fill_stop_reason(self, waiting_queue_empty: bool) -> Optional[str]:
         wave_count = self.active_epoch_wave_count()
         if wave_count == 0:
@@ -427,6 +489,29 @@ class OfflinePPStateOffloadManager:
         if not self.has_active_epoch_waves():
             self._maybe_finish_epoch_after_retire(self.current_epoch_id)
 
+    def request_draining(self, reason: str) -> None:
+        if self.epoch_state != EpochState.FILLING:
+            return
+        if not self.fill_stop_requested:
+            self.fill_stop_requested = True
+            self.fill_stop_reason = reason
+            self._log_epoch(
+                "EPOCH_FILL_STOP_REQUEST",
+                reason=reason,
+                inflight_prefill=self.inflight_prefill_count,
+            )
+        self.maybe_enter_draining()
+
+    def maybe_enter_draining(self) -> bool:
+        if self.epoch_state != EpochState.FILLING:
+            return False
+        if not self.fill_stop_requested:
+            return False
+        if self.inflight_prefill_count > 0:
+            return False
+        self.enter_draining(self.fill_stop_reason or "unknown")
+        return True
+
     def _maybe_finish_epoch_after_retire(self, retired_epoch_id: int) -> None:
         if self.epoch_state != EpochState.DRAINING:
             return
@@ -435,6 +520,9 @@ class OfflinePPStateOffloadManager:
         self._log_epoch("EPOCH_DRAIN_DONE", retired_epoch=retired_epoch_id)
         self.current_epoch_id += 1
         self.epoch_state = EpochState.FILLING
+        self.fill_stop_requested = False
+        self.fill_stop_reason = None
+        self.inflight_prefill_mbs.clear()
         self._log_epoch("EPOCH_START", reason="previous_epoch_drained")
 
     def _mamba_pool_size(self) -> Optional[int]:
