@@ -1372,11 +1372,18 @@ class MooncakeKVManager(CommonKVManager):
             local_payload = None
             remote_payload = None
         if isinstance(local_payload, dict) and isinstance(remote_payload, dict):
-            missing_in_prefill = sorted(remote_payload.keys() - local_payload.keys())
-            missing_in_decode = sorted(local_payload.keys() - remote_payload.keys())
+            common_keys = {
+                "dsv4_hisparse_protocol_version",
+                "compressor_v2",
+                "experimental_online_c128_mtp",
+                "online_c128",
+            }
+            missing_in_prefill = sorted(common_keys - local_payload.keys())
+            missing_in_decode = sorted(common_keys - remote_payload.keys())
+            comparable_keys = set(local_payload.keys() & remote_payload.keys())
             mismatches = {
                 key: (local_payload[key], remote_payload[key])
-                for key in sorted(local_payload.keys() & remote_payload.keys())
+                for key in sorted(comparable_keys)
                 if local_payload[key] != remote_payload[key]
             }
             if not mismatches and not missing_in_prefill and not missing_in_decode:

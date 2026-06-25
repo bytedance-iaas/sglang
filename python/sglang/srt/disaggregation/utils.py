@@ -84,8 +84,6 @@ def build_dsv4_hisparse_capability_signature(
             envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
         ),
         "online_c128": bool(is_dsv4_c128_online_enabled()),
-        "use_topk_v2": bool(envs.SGLANG_OPT_USE_TOPK_V2.get()),
-        "use_hisparse_topk_v2": bool(envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()),
     }
     if enable_hisparse:
         config = parse_hisparse_config(server_args)
@@ -110,6 +108,10 @@ def build_dsv4_hisparse_capability_signature(
                 "device_buffer_size": device_buffer_size,
                 "top_k": top_k,
                 "topk_mode": topk_mode,
+                "use_topk_v2": bool(envs.SGLANG_OPT_USE_TOPK_V2.get()),
+                "use_hisparse_topk_v2": bool(
+                    envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()
+                ),
             }
         )
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
