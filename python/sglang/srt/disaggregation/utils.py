@@ -65,7 +65,10 @@ def build_dsv4_hisparse_capability_signature(
     config = parse_hisparse_config(server_args)
     text_config = getattr(hf_config, "text_config", hf_config)
     top_k = int(resolve_hisparse_top_k(server_args, text_config))
-    device_buffer_size = int(config["device_buffer_size"])
+    if hasattr(config, "device_buffer_size"):
+        device_buffer_size = int(config.device_buffer_size)
+    else:
+        device_buffer_size = int(config["device_buffer_size"])
     topk_mode = (
         "legacy_raw_index"
         if top_k in (512, 1024)
