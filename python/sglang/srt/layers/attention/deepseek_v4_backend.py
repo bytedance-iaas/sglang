@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.managers.hisparse_accuracy_trace import trace_event
 
 if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
     # NOTE: should eventually be the only compressor backend
@@ -961,6 +962,16 @@ class DeepseekV4AttnBackend(
             seq_lens,
             verify_bs=active_bs,
         )
+        trace_event(
+            logger,
+            "dsv4_forward_metadata",
+            mode=str(logical_forward_mode),
+            active_bs=active_bs,
+            padded_bs=int(req_pool_indices.shape[0]),
+            max_seq_len=max_seq_len,
+            online_state_slot_offset=online_c128_state_slot_offset,
+            out_cache_loc=forward_batch.out_cache_loc,
+        )
 
         if logical_forward_mode.is_decode_or_idle():
             metadata = self.init_forward_metadata_decode(
@@ -1118,14 +1129,24 @@ class DeepseekV4AttnBackend(
         actual_max_seq_len = seq_lens_cpu.max().item()
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         assert actual_max_seq_len <= chosen_max_seq_len
+        active_bs = self._active_batch_size(fb, req_pool_indices, seq_lens)
+        active_req_pool_indices = req_pool_indices[:active_bs]
+        active_seq_lens = seq_lens[:active_bs]
 
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
             self.online_c128_mtp.prepare_forward(
                 logical_forward_mode,
-                req_pool_indices,
-                seq_lens,
+                active_req_pool_indices,
+                active_seq_lens,
+            )
+            trace_event(
+                logger,
+                "dsv4_graph_replay_decode",
+                active_bs=active_bs,
+                graph_bs=bs,
+                mode=str(logical_forward_mode),
             )
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
@@ -1140,7 +1161,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            verify_bs = self._active_batch_size(fb, req_pool_indices, seq_lens)
+            verify_bs = active_bs
             if verify_bs < 0 or verify_bs > bs:
                 raise RuntimeError(
                     "DeepSeekV4 graph replay target-verify active batch is invalid: "
@@ -1173,6 +1194,15 @@ class DeepseekV4AttnBackend(
                 seq_lens,
                 verify_bs=verify_bs,
             )
+            trace_event(
+                logger,
+                "dsv4_graph_replay_target_verify",
+                active_bs=verify_bs,
+                graph_bs=bs,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                out_cache_loc=out_cache_loc,
+                online_state_slot_offset=online_c128_state_slot_offset,
+            )
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1184,8 +1214,15 @@ class DeepseekV4AttnBackend(
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             self.online_c128_mtp.prepare_forward(
                 logical_forward_mode,
-                req_pool_indices,
-                seq_lens,
+                active_req_pool_indices,
+                active_seq_lens,
+            )
+            trace_event(
+                logger,
+                "dsv4_graph_replay_draft_extend",
+                active_bs=active_bs,
+                graph_bs=bs,
+                mode=str(logical_forward_mode),
             )
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
             temp_metadata = self.init_forward_metadata_draft_extend(

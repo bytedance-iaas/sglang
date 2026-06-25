@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -11,6 +12,9 @@ from tvm_ffi.module import Module
 from sglang.jit_kernel.dsv4.utils import make_name
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_accuracy_trace import trace_event
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -174,6 +178,18 @@ class OnlineC128MTPController:
         self._verify_ctx: Optional[_OnlineC128VerifyContext] = None
         self._layer_runtimes: Optional[List[_OnlineC128LayerRuntime]] = None
 
+    def _debug_enabled(self) -> bool:
+        return envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get()
+
+    def _ctx_shape(self, ctx: Optional[_OnlineC128VerifyContext]) -> str:
+        if ctx is None:
+            return "None"
+        return (
+            f"req_shape={tuple(ctx.req_pool_indices.shape)}, "
+            f"seq_shape={tuple(ctx.seq_lens.shape)}, "
+            f"tail_shape={tuple(ctx.tail_locs.shape)}"
+        )
+
     def enabled(self) -> bool:
         return (
             envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
@@ -194,12 +210,27 @@ class OnlineC128MTPController:
         if not self.enabled():
             self.clear()
             return
+        if self._verify_ctx is not None and self._debug_enabled():
+            raise RuntimeError(
+                "Online C128 MTP begin_verify found an uncommitted previous "
+                f"verify context: {self._ctx_shape(self._verify_ctx)}."
+            )
 
         tail_locs = self._capture_tail_locs(req_pool_indices, seq_lens)
         self._verify_ctx = _OnlineC128VerifyContext(
             req_pool_indices=req_pool_indices.detach(),
             seq_lens=seq_lens.detach(),
             tail_locs=tail_locs.detach(),
+        )
+        trace_event(
+            logger,
+            "online_c128_begin_verify",
+            bs=min(seq_lens.shape[0], req_pool_indices.shape[0]),
+            num_verify_tokens=self._num_verify_tokens(),
+            state_slot_offset=self.state_slot_offset(),
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            tail_locs=tail_locs,
         )
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
             return
@@ -218,6 +249,15 @@ class OnlineC128MTPController:
             )
 
     def clear(self) -> None:
+        ctx = self._verify_ctx
+        if ctx is not None:
+            trace_event(
+                logger,
+                "online_c128_clear",
+                bs=min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0]),
+                num_verify_tokens=self._num_verify_tokens(),
+                state_slot_offset=self.state_slot_offset(),
+            )
         self._verify_ctx = None
 
     def prepare_forward(
@@ -247,6 +287,23 @@ class OnlineC128MTPController:
                 return 0
 
         self.commit_pending(
+            req_pool_indices=active_req_pool_indices,
+            seq_lens=active_seq_lens,
+        )
+        trace_event(
+            logger,
+            "online_c128_prepare_forward",
+            mode=str(logical_forward_mode),
+            verify_bs=verify_bs,
+            active_bs=min(
+                active_req_pool_indices.shape[0],
+                active_seq_lens.shape[0],
+            ),
+            state_slot_offset=(
+                self.state_slot_offset()
+                if logical_forward_mode.is_target_verify()
+                else 0
+            ),
             req_pool_indices=active_req_pool_indices,
             seq_lens=active_seq_lens,
         )
@@ -316,6 +373,7 @@ class OnlineC128MTPController:
             self.clear()
             return
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
+            self.clear()
             return
 
         num_verify_tokens = self._num_verify_tokens()
@@ -329,6 +387,18 @@ class OnlineC128MTPController:
         cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
         old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
         cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
+        trace_event(
+            logger,
+            "online_c128_commit_pending",
+            old_bs=old_bs,
+            cur_bs=cur_bs,
+            num_verify_tokens=num_verify_tokens,
+            state_slot_offset=self.state_slot_offset(),
+            old_req_pool_indices=ctx.req_pool_indices,
+            cur_req_pool_indices=cur_req_pool_indices,
+            old_seq_lens=ctx.seq_lens,
+            cur_seq_lens=cur_seq_lens,
+        )
 
         for runtime in self._iter_layer_runtimes():
             online_c128_mtp_lazy_commit(
