@@ -1234,6 +1234,16 @@ class MooncakeKVManager(CommonKVManager):
             return None
         if local_signature == remote_signature:
             return None
+        if local_signature is None or remote_signature is None:
+            return (
+                "DSV4 HiSparse P/D capability missing: "
+                f"prefill_reported={local_signature is not None}, "
+                f"decode_reported={remote_signature is not None}, "
+                f"prefill={local_signature}, decode={remote_signature}. "
+                "This usually means P/D are running different source versions "
+                "or one side did not initialize the DSV4 HiSparse capability "
+                "signature."
+            )
         return (
             "DSV4 HiSparse P/D capability mismatch: "
             f"prefill={local_signature}, decode={remote_signature}"

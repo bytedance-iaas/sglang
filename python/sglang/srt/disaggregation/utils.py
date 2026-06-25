@@ -87,10 +87,6 @@ def build_dsv4_hisparse_capability_signature(
             and getattr(hisparse_coordinator, "host_radix_cache", None) is None
         )
 
-    compression_ratios = None
-    if token_to_kv_pool is not None and hasattr(token_to_kv_pool, "compression_ratios"):
-        compression_ratios = list(token_to_kv_pool.compression_ratios)
-
     payload = {
         "c4_host_mirror": bool(c4_host_mirror),
         "compressor_v2": bool(envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()),
@@ -98,7 +94,6 @@ def build_dsv4_hisparse_capability_signature(
         "experimental_online_c128_mtp": bool(
             envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
         ),
-        "mla_compression_ratios": compression_ratios,
         "online_c128": bool(is_dsv4_c128_online_enabled()),
         "top_k": top_k,
         "topk_mode": topk_mode,

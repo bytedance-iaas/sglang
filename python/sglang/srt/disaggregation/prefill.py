@@ -200,16 +200,17 @@ class PrefillBootstrapQueue:
                 "full_to_hisparse_device_index_mapping",
                 None,
             )
-            kv_args.dsv4_hisparse_capability_signature = (
-                build_dsv4_hisparse_capability_signature(
-                    self.scheduler.server_args,
-                    self.scheduler.model_config,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    hisparse_coordinator=getattr(
-                        self.scheduler, "hisparse_coordinator", None
-                    ),
-                )
+
+        kv_args.dsv4_hisparse_capability_signature = (
+            build_dsv4_hisparse_capability_signature(
+                self.scheduler.server_args,
+                self.scheduler.model_config,
+                token_to_kv_pool=self.token_to_kv_pool,
+                hisparse_coordinator=getattr(
+                    self.scheduler, "hisparse_coordinator", None
+                ),
             )
+        )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
