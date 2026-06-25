@@ -62,13 +62,18 @@ def build_dsv4_hisparse_capability_signature(
     if not is_deepseek_v4(hf_config):
         return None
 
+    def hisparse_config_value(config, key: str):
+        if hasattr(config, key):
+            return getattr(config, key)
+        get = getattr(config, "get", None)
+        if get is not None:
+            return get(key)
+        raise AttributeError(f"HiSparse config does not expose {key!r}")
+
     config = parse_hisparse_config(server_args)
     text_config = getattr(hf_config, "text_config", hf_config)
     top_k = int(resolve_hisparse_top_k(server_args, text_config))
-    if hasattr(config, "device_buffer_size"):
-        device_buffer_size = int(config.device_buffer_size)
-    else:
-        device_buffer_size = int(config["device_buffer_size"])
+    device_buffer_size = int(hisparse_config_value(config, "device_buffer_size"))
     topk_mode = (
         "legacy_raw_index"
         if top_k in (512, 1024)
