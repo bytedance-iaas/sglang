@@ -91,6 +91,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
+                self.flush_online_c128_pending_for_reqs([req])
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(
@@ -177,6 +178,27 @@ class SchedulerBatchResultProcessor:
                 elif hasattr(elem, "copy") and callable(elem.copy):
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
+
+    def flush_online_c128_pending_for_reqs(self, reqs: List[Req]) -> None:
+        if not self.server_args.enable_hisparse:
+            return
+        model_runner = getattr(self.model_worker, "model_runner", None)
+        if model_runner is None:
+            return
+
+        backends = []
+        for backend in [getattr(model_runner, "attn_backend", None)] + list(
+            getattr(model_runner, "decode_attn_backend_group", []) or []
+        ):
+            if backend is None or any(backend is item for item in backends):
+                continue
+            backends.append(backend)
+
+        for backend in backends:
+            controller = getattr(backend, "online_c128_mtp", None)
+            flush = getattr(controller, "flush_pending_for_reqs", None)
+            if flush is not None:
+                flush(reqs)
 
     def process_batch_result_prefill(
         self,
@@ -809,6 +831,7 @@ class SchedulerBatchResultProcessor:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
+            self.flush_online_c128_pending_for_reqs([req])
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

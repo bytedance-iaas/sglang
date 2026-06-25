@@ -2707,6 +2707,7 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            self.batch_result_processor.flush_online_c128_pending_for_reqs(batch.reqs)
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)
@@ -3411,6 +3412,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if self.enable_hisparse and self.hisparse_coordinator is not None:
                     req.finished_reason = req.finished_reason or FINISH_ABORT()
+                    self.batch_result_processor.flush_online_c128_pending_for_reqs(
+                        [req]
+                    )
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             # For disaggregation prefill mode, free the metadata buffer index

@@ -418,6 +418,125 @@ class OnlineC128MTPController:
 
         self.clear()
 
+    def flush_pending_for_reqs(self, reqs: List[Any]) -> None:
+        """Commit pending target-verify C128 state before request release.
+
+        The normal path commits pending state at the next forward. A request can
+        finish immediately after target verify, however, and radix cache may
+        snapshot C128 state before that next forward happens. Commit only the
+        finishing request slots here and keep pending state for the rest of the
+        batch.
+        """
+        ctx = self._verify_ctx
+        if ctx is None or not self.enabled():
+            return
+
+        req_pool_indices = []
+        seq_lens = []
+        for req in reqs:
+            req_pool_idx = getattr(req, "req_pool_idx", None)
+            if req_pool_idx is None:
+                continue
+            req_pool_indices.append(int(req_pool_idx))
+            seq_lens.append(int(req.seqlen))
+        if not req_pool_indices:
+            return
+
+        cur_req_pool_indices = torch.tensor(
+            req_pool_indices,
+            dtype=ctx.req_pool_indices.dtype,
+            device=ctx.req_pool_indices.device,
+        )
+        cur_seq_lens = torch.tensor(
+            seq_lens,
+            dtype=ctx.seq_lens.dtype,
+            device=ctx.seq_lens.device,
+        )
+
+        num_verify_tokens = self._num_verify_tokens()
+        if num_verify_tokens == 0:
+            self.clear()
+            return
+
+        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
+        cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
+        if old_bs <= 0 or cur_bs <= 0:
+            return
+
+        old_req_pool_indices = ctx.req_pool_indices[:old_bs]
+        matched = (
+            old_req_pool_indices.reshape(-1, 1)
+            == cur_req_pool_indices[:cur_bs].reshape(1, -1)
+        ).any(dim=1)
+        if not bool(matched.any().item()):
+            return
+
+        if self._debug_enabled():
+            matched_cur_pos = torch.argmax(
+                (
+                    old_req_pool_indices[matched].reshape(-1, 1)
+                    == cur_req_pool_indices[:cur_bs].reshape(1, -1)
+                ).to(torch.int64),
+                dim=1,
+            )
+            stale = cur_seq_lens[matched_cur_pos] <= ctx.seq_lens[:old_bs][matched]
+            if bool(stale.any().item()):
+                raise RuntimeError(
+                    "Online C128 MTP flush found matched request slots without "
+                    "forward progress before request release. "
+                    f"old_req_pool_indices={old_req_pool_indices[matched].tolist()}, "
+                    f"old_seq_lens={ctx.seq_lens[:old_bs][matched].tolist()}, "
+                    f"cur_req_pool_indices={cur_req_pool_indices[:cur_bs].tolist()}, "
+                    f"cur_seq_lens={cur_seq_lens[:cur_bs].tolist()}."
+                )
+
+        matched_old_seq_lens = ctx.seq_lens[:old_bs][matched].detach()
+        matched_old_req_pool_indices = old_req_pool_indices[matched].detach()
+        matched_old_tail_locs = ctx.tail_locs[:old_bs][matched].detach()
+        matched_old_bs = min(
+            matched_old_seq_lens.shape[0], matched_old_req_pool_indices.shape[0]
+        )
+
+        trace_event(
+            logger,
+            "online_c128_flush_pending_for_reqs",
+            old_bs=matched_old_bs,
+            cur_bs=cur_bs,
+            num_verify_tokens=num_verify_tokens,
+            state_slot_offset=self.state_slot_offset(),
+            old_req_pool_indices=matched_old_req_pool_indices,
+            cur_req_pool_indices=cur_req_pool_indices,
+            old_seq_lens=matched_old_seq_lens,
+            cur_seq_lens=cur_seq_lens,
+        )
+
+        backend = self.backend
+        for runtime in self._iter_layer_runtimes():
+            online_c128_mtp_lazy_commit(
+                old_seq_lens=matched_old_seq_lens,
+                old_req_pool_indices=matched_old_req_pool_indices,
+                old_tail_locs=matched_old_tail_locs,
+                cur_seq_lens=cur_seq_lens,
+                cur_req_pool_indices=cur_req_pool_indices,
+                req_to_token=backend.req_to_token,
+                state=runtime.main_state,
+                old_bs=matched_old_bs,
+                cur_bs=cur_bs,
+                num_verify_tokens=num_verify_tokens,
+                state_slot_stride=runtime.state_slot_offset,
+                head_dim=runtime.head_dim,
+            )
+
+        keep = ~matched
+        if not bool(keep.any().item()):
+            self.clear()
+            return
+        self._verify_ctx = _OnlineC128VerifyContext(
+            req_pool_indices=ctx.req_pool_indices[:old_bs][keep].detach(),
+            seq_lens=ctx.seq_lens[:old_bs][keep].detach(),
+            tail_locs=ctx.tail_locs[:old_bs][keep].detach(),
+        )
+
     def _num_verify_tokens(self) -> int:
         if not self.enabled():
             return 0
