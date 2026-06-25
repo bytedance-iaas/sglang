@@ -171,6 +171,7 @@ class CompressorBackendMixin:
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 cache_k=new_compressed_kv,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
         else:
             new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
@@ -181,6 +182,7 @@ class CompressorBackendMixin:
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
+                dcp_kv_mask=forward_batch.dcp_kv_mask,
             )
 
 
@@ -291,20 +293,24 @@ def create_paged_compressor_data(
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
 
     import os as _os
+
     if _os.environ.get("SGLANG_DEBUG_DSV4_DCP_ATTENTION") == "1":
         try:
             from sglang.srt.distributed.parallel_state import (
                 get_dcp_rank as _get_dcp_rank,
+            )
+            from sglang.srt.distributed.parallel_state import (
                 get_dcp_world_size as _get_dcp_world_size,
             )
+
             _ws = _get_dcp_world_size()
             if _ws > 1:
                 _wl = write_loc.detach().to(torch.int64)
-                _valid = (_wl >= 0)
+                _valid = _wl >= 0
                 _vc = int(_valid.sum().item())
                 _wmin = int(_wl[_valid].min().item()) if _vc else -1
                 _wmax = int(_wl[_valid].max().item()) if _vc else -1
-                _par = (_wl % _ws)
+                _par = _wl % _ws
                 _p0 = int(((_par == 0) & _valid).sum().item())
                 _p1 = int(((_par == 1) & _valid).sum().item())
                 _own = int(((_par == _get_dcp_rank()) & _valid).sum().item())
