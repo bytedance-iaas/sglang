@@ -1540,13 +1540,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
-            layer._sglang_moe_bf16_runtime_fallback = (
-                envs.SGLANG_OPT_USE_MINIMAX_MOE_BF16_FALLBACK.get()
-                and _is_cuda
-                and is_sm90_supported()
-                and not is_sm100_supported()
-                and get_moe_runner_backend().is_deep_gemm()
-            )
             return
 
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -1694,29 +1687,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = Parameter(w2_s, requires_grad=False)
         layer.w13_input_scale = None
         layer.w2_input_scale = None
-
-    @staticmethod
-    def _dequant_mxfp8_moe_weight_to_bf16(
-        weight: torch.Tensor, scale_u8: torch.Tensor
-    ) -> torch.Tensor:
-        """Runtime diagnostic dequantization for MiniMax MXFP8 expert weights."""
-        *batch_dims, n, k = weight.shape
-        out = torch.empty(
-            (*batch_dims, n, k), device=weight.device, dtype=torch.bfloat16
-        )
-        weight_2d = weight.reshape(-1, n, k)
-        scale_2d = scale_u8.reshape(-1, n, scale_u8.shape[-1])
-        out_2d = out.reshape(-1, n, k)
-        for idx in range(weight_2d.shape[0]):
-            scale = (
-                (scale_2d[idx].contiguous().to(torch.int32) << 23)
-                .view(torch.float32)
-                .repeat_interleave(32, dim=-1)[..., :k]
-            )
-            out_2d[idx].copy_(
-                (weight_2d[idx].to(torch.float32) * scale).to(torch.bfloat16)
-            )
-        return out
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -2404,19 +2374,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
-            if getattr(layer, "_sglang_moe_bf16_runtime_fallback", False):
-                w13_weight = self._dequant_mxfp8_moe_weight_to_bf16(
-                    layer.w13_weight, layer.w13_weight_scale_inv
-                )
-                w2_weight = self._dequant_mxfp8_moe_weight_to_bf16(
-                    layer.w2_weight, layer.w2_weight_scale_inv
-                )
-                block_shape = None
-                w13_scale = None
-                w2_scale = None
-                use_fp8 = False
-                use_mxfp8 = False
-            elif self.block_quant:
+            if self.block_quant:
                 block_shape = self.quant_config.weight_block_size
                 w13_scale = layer.w13_weight_scale_inv
                 w2_scale = layer.w2_weight_scale_inv
