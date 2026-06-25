@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple
 
@@ -13,6 +15,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,472 @@ if ENABLE_JIT_DEEPGEMM:
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+_SM90_MXFP8_LOCAL_DIFF_EVENTS = 0
+
+
+def supports_sm90_mxfp8_fp8_grouped_gemm() -> bool:
+    if not ENABLE_JIT_DEEPGEMM:
+        return False
+    return hasattr(deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_contiguous") and hasattr(
+        deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_masked"
+    )
+
+
+def is_sm90_mxfp8_deepgemm_enabled() -> bool:
+    return (
+        is_cuda()
+        and is_sm90_supported()
+        and not is_sm100_supported()
+        and supports_sm90_mxfp8_fp8_grouped_gemm()
+    )
+
+
+def supports_mxfp8_deepgemm() -> bool:
+    return DEEPGEMM_BLACKWELL or is_sm90_mxfp8_deepgemm_enabled()
+
+
+def _ceil_align(x: int, align: int) -> int:
+    return ((x + align - 1) // align) * align
+
+
+def _sm90_mxfp8_format_debug_enabled() -> bool:
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG") != "1":
+        return False
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_tensor_meta(t: torch.Tensor) -> dict:
+    return {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "device": str(t.device),
+        "numel": t.numel(),
+    }
+
+
+def _sm90_mxfp8_scale_expected_last_dim(
+    scale: torch.Tensor,
+    k: int,
+    recipe: Optional[Tuple[int, int]],
+) -> Optional[int]:
+    if recipe is None:
+        return None
+    pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+    return (k + recipe[1] * pack_factor - 1) // (recipe[1] * pack_factor)
+
+
+def _assert_sm90_mxfp8_scale_matches_recipe(
+    scale: torch.Tensor,
+    k: int,
+    recipe: Optional[Tuple[int, int]],
+    *,
+    role: str,
+) -> None:
+    expected_last_dim = _sm90_mxfp8_scale_expected_last_dim(scale, k, recipe)
+    if expected_last_dim is None:
+        return
+    if scale.shape[-1] != expected_last_dim:
+        pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+        raise RuntimeError(
+            f"SM90 MXFP8 {role} scale shape does not match recipe: "
+            f"K={k}, recipe={recipe}, scale_dtype={scale.dtype}, "
+            f"scale_shape={tuple(scale.shape)}, pack_factor={pack_factor}, "
+            f"expected_last_dim={expected_last_dim}."
+        )
+
+
+def _sm90_mxfp8_local_diff_enabled() -> bool:
+    return (
+        _sm90_mxfp8_format_debug_enabled()
+        and os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") == "1"
+    )
+
+
+def _unpack_sm90_mxfp8_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype in (torch.int, torch.int32):
+        scale_i32 = scale.contiguous().to(torch.int32)
+        return torch.stack(
+            [
+                torch.bitwise_and(torch.bitwise_right_shift(scale_i32, shift), 0xFF)
+                for shift in (0, 8, 16, 24)
+            ],
+            dim=-1,
+        ).reshape(-1).to(torch.uint8)
+    if scale.dtype == torch.uint8:
+        return scale.contiguous()
+    if scale.dtype == torch.float32:
+        return _e8m0_fp32_to_u8(scale)
+    raise RuntimeError(f"Unsupported SM90 MXFP8 scale dtype for debug: {scale.dtype}")
+
+
+def _decode_e8m0_scale_bytes(scale_bytes: torch.Tensor) -> torch.Tensor:
+    scale_i32 = torch.bitwise_left_shift(scale_bytes.to(torch.int32), 23).contiguous()
+    return scale_i32.view(torch.float32)
+
+
+def _dequant_sm90_mxfp8_vector(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    gran_k: int,
+    k: int,
+) -> torch.Tensor:
+    scale_bytes = _unpack_sm90_mxfp8_scale_bytes(scale)
+    k_scale_idx = torch.arange(k, device=x.device, dtype=torch.long) // gran_k
+    scale_per_k = _decode_e8m0_scale_bytes(scale_bytes[k_scale_idx])
+    return x[:k].to(torch.float32) * scale_per_k
+
+
+def _sm90_mxfp8_numeric_stats(t: torch.Tensor) -> dict:
+    flat = t.reshape(-1)
+    finite = torch.isfinite(flat)
+    finite_count = int(finite.sum().item())
+    stats = {
+        "numel": flat.numel(),
+        "finite_count": finite_count,
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "inf_count": int(torch.isinf(flat).sum().item()),
+        "isfinite": finite_count == flat.numel(),
+    }
+    if finite_count > 0:
+        stats["finite_absmax"] = float(flat[finite].abs().max().item())
+    return stats
+
+
+def _sm90_mxfp8_scale_byte_stats(scale: torch.Tensor) -> dict:
+    scale_bytes = _unpack_sm90_mxfp8_scale_bytes(scale)
+    return {
+        "numel": scale_bytes.numel(),
+        "min": int(scale_bytes.min().item()) if scale_bytes.numel() > 0 else None,
+        "max": int(scale_bytes.max().item()) if scale_bytes.numel() > 0 else None,
+        "zero_count": int((scale_bytes == 0).sum().item()),
+        "ff_count": int((scale_bytes == 0xFF).sum().item()),
+    }
+
+
+def _sm90_mxfp8_diff_entry(
+    *,
+    group: int,
+    row: int,
+    sample_cols: int,
+    diff: torch.Tensor,
+    ref: torch.Tensor,
+    actual: torch.Tensor,
+    a_raw: torch.Tensor,
+    b_raw: torch.Tensor,
+    a_deq: torch.Tensor,
+    b_deq: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    extra: Optional[dict] = None,
+) -> dict:
+    entry = {
+        "group": group,
+        "row": row,
+        "cols": sample_cols,
+        "max_abs_diff": float(diff.max().item()),
+        "mean_abs_diff": float(diff.mean().item()),
+        "ref_absmax": float(ref.abs().max().item()),
+        "actual_absmax": float(actual.abs().max().item()),
+        "ref_stats": _sm90_mxfp8_numeric_stats(ref),
+        "actual_stats": _sm90_mxfp8_numeric_stats(actual),
+        "a_raw_fp32_stats": _sm90_mxfp8_numeric_stats(a_raw.to(torch.float32)),
+        "b_raw_fp32_stats": _sm90_mxfp8_numeric_stats(b_raw.to(torch.float32)),
+        "a_deq_stats": _sm90_mxfp8_numeric_stats(a_deq),
+        "b_deq_stats": _sm90_mxfp8_numeric_stats(b_deq),
+        "a_scale_u8_stats": _sm90_mxfp8_scale_byte_stats(a_scale),
+        "b_scale_u8_stats": _sm90_mxfp8_scale_byte_stats(b_scale),
+    }
+    if extra is not None:
+        entry.update(extra)
+    return entry
+
+
+def _sm90_mxfp8_best_group_match(
+    *,
+    a_deq: torch.Tensor,
+    actual: torch.Tensor,
+    rhs_x: torch.Tensor,
+    rhs_sf: torch.Tensor,
+    rhs_cols: torch.Tensor,
+    gran_k_b: int,
+    k: int,
+) -> dict:
+    best = None
+    for candidate_group in range(rhs_x.shape[0]):
+        b_deq = torch.stack(
+            [
+                _dequant_sm90_mxfp8_vector(
+                    rhs_x[candidate_group, col],
+                    rhs_sf[candidate_group, col],
+                    gran_k=gran_k_b,
+                    k=k,
+                )
+                for col in rhs_cols.tolist()
+            ],
+            dim=0,
+        )
+        ref = torch.matmul(b_deq, a_deq).to(torch.float32)
+        diff = (actual - ref).abs()
+        finite_diff = diff[torch.isfinite(diff)]
+        if finite_diff.numel() == 0:
+            max_abs_diff = float("nan")
+            mean_abs_diff = float("nan")
+            score = float("inf")
+        else:
+            max_abs_diff = float(finite_diff.max().item())
+            mean_abs_diff = float(finite_diff.mean().item())
+            score = mean_abs_diff
+        if best is None or score < best["best_group_mean_abs_diff"]:
+            best = {
+                "best_group": candidate_group,
+                "best_group_max_abs_diff": max_abs_diff,
+                "best_group_mean_abs_diff": mean_abs_diff,
+            }
+    return best if best is not None else {}
+
+
+def _sm90_mxfp8_local_diff_report(
+    location: str,
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    *,
+    recipe_a: Optional[Tuple[int, int]],
+    recipe_b: Optional[Tuple[int, int]],
+    m_indices: Optional[torch.Tensor] = None,
+    masked_m: Optional[torch.Tensor] = None,
+) -> None:
+    global _SM90_MXFP8_LOCAL_DIFF_EVENTS
+    if not _sm90_mxfp8_local_diff_enabled():
+        return
+    max_events = int(
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG_LOCAL_DIFF_MAX_EVENTS", "4")
+    )
+    if _SM90_MXFP8_LOCAL_DIFF_EVENTS >= max_events:
+        return
+    if recipe_a is None or recipe_b is None:
+        return
+    if out.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_LOCAL_DIFF_EVENTS += 1
+
+    lhs_x, lhs_sf = lhs
+    rhs_x, rhs_sf = rhs
+    k = lhs_x.shape[-1]
+    gran_k_a = recipe_a[1]
+    gran_k_b = recipe_b[1]
+    sample_cols = min(
+        rhs_x.shape[-2],
+        int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_LOCAL_DIFF_N", "16")),
+    )
+    sample_rows_per_group = int(
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG_LOCAL_DIFF_M", "2")
+    )
+    sample_groups = min(
+        rhs_x.shape[0],
+        int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_LOCAL_DIFF_GROUPS", "2")),
+    )
+
+    diffs = []
+    with torch.no_grad():
+        rhs_cols = torch.arange(sample_cols, device=rhs_x.device, dtype=torch.long)
+        if m_indices is not None:
+            row_count = min(lhs_x.shape[0], out.shape[0], sample_rows_per_group * 2)
+            for row in range(row_count):
+                group = int(m_indices[row].item())
+                if group < 0 or group >= rhs_x.shape[0]:
+                    continue
+                a_deq = _dequant_sm90_mxfp8_vector(
+                    lhs_x[row],
+                    lhs_sf[row],
+                    gran_k=gran_k_a,
+                    k=k,
+                )
+                b_deq = torch.stack(
+                    [
+                        _dequant_sm90_mxfp8_vector(
+                            rhs_x[group, col],
+                            rhs_sf[group, col],
+                            gran_k=gran_k_b,
+                            k=k,
+                        )
+                        for col in rhs_cols.tolist()
+                    ],
+                    dim=0,
+                )
+                ref = torch.matmul(b_deq, a_deq).to(torch.float32)
+                actual = out[row, :sample_cols].to(torch.float32)
+                diff = (actual - ref).abs()
+                best_group_match = _sm90_mxfp8_best_group_match(
+                    a_deq=a_deq,
+                    actual=actual,
+                    rhs_x=rhs_x,
+                    rhs_sf=rhs_sf,
+                    rhs_cols=rhs_cols,
+                    gran_k_b=gran_k_b,
+                    k=k,
+                )
+                diffs.append(
+                    _sm90_mxfp8_diff_entry(
+                        group=group,
+                        row=row,
+                        sample_cols=sample_cols,
+                        diff=diff,
+                        ref=ref,
+                        actual=actual,
+                        a_raw=lhs_x[row],
+                        b_raw=rhs_x[group, rhs_cols],
+                        a_deq=a_deq,
+                        b_deq=b_deq,
+                        a_scale=lhs_sf[row],
+                        b_scale=rhs_sf[group, rhs_cols],
+                        extra=best_group_match,
+                    )
+                )
+        else:
+            if masked_m is None:
+                group_candidates = list(range(sample_groups))
+            else:
+                group_candidates = [
+                    group
+                    for group in range(rhs_x.shape[0])
+                    if int(masked_m[group].item()) > 0
+                ][:sample_groups]
+            for group in group_candidates:
+                valid_m = out.shape[-2]
+                if masked_m is not None:
+                    valid_m = min(valid_m, int(masked_m[group].item()))
+                row_count = min(valid_m, sample_rows_per_group)
+                for row in range(row_count):
+                    a_deq = _dequant_sm90_mxfp8_vector(
+                        lhs_x[group, row],
+                        lhs_sf[group, row],
+                        gran_k=gran_k_a,
+                        k=k,
+                    )
+                    b_deq = torch.stack(
+                        [
+                            _dequant_sm90_mxfp8_vector(
+                                rhs_x[group, col],
+                                rhs_sf[group, col],
+                                gran_k=gran_k_b,
+                                k=k,
+                            )
+                            for col in rhs_cols.tolist()
+                        ],
+                        dim=0,
+                    )
+                    ref = torch.matmul(b_deq, a_deq).to(torch.float32)
+                    actual = out[group, row, :sample_cols].to(torch.float32)
+                    diff = (actual - ref).abs()
+                    diffs.append(
+                        _sm90_mxfp8_diff_entry(
+                            group=group,
+                            row=row,
+                            sample_cols=sample_cols,
+                            diff=diff,
+                            ref=ref,
+                            actual=actual,
+                            a_raw=lhs_x[group, row],
+                            b_raw=rhs_x[group, rhs_cols],
+                            a_deq=a_deq,
+                            b_deq=b_deq,
+                            a_scale=lhs_sf[group, row],
+                            b_scale=rhs_sf[group, rhs_cols],
+                        )
+                    )
+
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H8",
+        "location": location,
+        "msg": "[DEBUG] SM90 MXFP8 grouped GEMM local PyTorch reference diff",
+        "data": {
+            "recipe_a": list(recipe_a),
+            "recipe_b": list(recipe_b),
+            "lhs": _sm90_mxfp8_tensor_meta(lhs_x),
+            "lhs_scale": _sm90_mxfp8_tensor_meta(lhs_sf),
+            "rhs": _sm90_mxfp8_tensor_meta(rhs_x),
+            "rhs_scale": _sm90_mxfp8_tensor_meta(rhs_sf),
+            "out": _sm90_mxfp8_tensor_meta(out),
+            "diffs": diffs,
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
+
+
+def _e8m0_fp32_to_u8(sf: torch.Tensor) -> torch.Tensor:
+    sf_i32 = sf.to(torch.float32).view(torch.int32)
+    exp = torch.bitwise_right_shift(sf_i32, 23)
+    mant = torch.bitwise_and(sf_i32, 0x7FFFFF)
+    round_up = torch.logical_and(
+        torch.logical_and(mant > 0, exp != 0xFE),
+        ~torch.logical_and(exp == 0, mant <= 0x400000),
+    )
+    return torch.where(round_up, exp + 1, exp).to(torch.uint8).contiguous()
+
+
+def _normalize_sm90_mxfp8_pair(
+    pair: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    scale_role: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x, sf = pair
+    k = x.shape[-1]
+    k32 = _ceil_align(k, 32) // 32
+
+    if sf.dtype == torch.uint8 and sf.shape[-1] == k32 and x.dtype == torch.float8_e4m3fn:
+        return x, sf.contiguous()
+
+    if sf.dtype == torch.int32:
+        if x.dtype == torch.float8_e4m3fn:
+            return x, sf
+        raise RuntimeError(
+            f"SM90 MXFP8 {scale_role} scale received packed UE8M0 scales "
+            f"but activation dtype is {x.dtype}; expected torch.float8_e4m3fn."
+        )
+
+    if sf.dtype == torch.float32 and sf.shape[-1] == k32 and x.dtype == torch.float8_e4m3fn:
+        return x, _e8m0_fp32_to_u8(sf)
+
+    raise RuntimeError(
+        f"SM90 MXFP8 {scale_role} wrapper only performs lossless scale layout adaptation. "
+        f"Got activation dtype={x.dtype}, scale dtype={sf.dtype}, "
+        f"scale_last_dim={sf.shape[-1]}, expected K/32={k32}."
+    )
+
+
+def _pad_sm90_mxfp8_lhs(
+    lhs: Tuple[torch.Tensor, torch.Tensor], expected_m: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x, sf = lhs
+    if x.shape[-2] >= expected_m:
+        return lhs
+    padded_x = torch.empty(
+        (*x.shape[:-2], expected_m, x.shape[-1]), device=x.device, dtype=x.dtype
+    )
+    padded_sf = torch.empty(
+        (*sf.shape[:-2], expected_m, sf.shape[-1]), device=sf.device, dtype=sf.dtype
+    )
+    if sf.dtype == torch.int32 and not sf.is_contiguous() and sf.dim() >= 2:
+        padded_sf_storage = torch.empty(
+            (*sf.shape[:-2], sf.shape[-1], expected_m),
+            device=sf.device,
+            dtype=sf.dtype,
+        )
+        padded_sf = padded_sf_storage.transpose(-1, -2)
+    padded_x[..., : x.shape[-2], :] = x
+    padded_sf[..., : sf.shape[-2], :] = sf
+    return padded_x, padded_sf
 
 
 # TODO maybe rename these functions
@@ -75,6 +544,71 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     else {}
                 ),
             )
+
+
+def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    if not supports_sm90_mxfp8_fp8_grouped_gemm():
+        raise RuntimeError(
+            "The installed deep_gemm does not expose SM90 MXFP8 grouped GEMM APIs."
+        )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_MASKED
+    )
+
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
+    _assert_sm90_mxfp8_scale_matches_recipe(
+        lhs[1], k, recipe_a, role="lhs"
+    )
+    _assert_sm90_mxfp8_scale_matches_recipe(
+        rhs[1], k, recipe_b, role="rhs"
+    )
+
+    padded_expected_m = _ceil_align(max(lhs[0].shape[-2], expected_m), 128)
+    lhs = _pad_sm90_mxfp8_lhs(lhs, padded_expected_m)
+    kernel_out = out
+    if out.shape[-2] < padded_expected_m:
+        kernel_out = torch.empty(
+            (*out.shape[:-2], padded_expected_m, out.shape[-1]),
+            device=out.device,
+            dtype=out.dtype,
+        )
+
+    with compile_utils.deep_gemm_execution_hook(
+        padded_expected_m, n, k, num_groups, kernel_type
+    ):
+        ret = deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
+            lhs,
+            rhs,
+            kernel_out,
+            masked_m,
+            padded_expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+        )
+    if kernel_out is not out:
+        out.copy_(kernel_out[..., : out.shape[-2], :])
+    _sm90_mxfp8_local_diff_report(
+        "entrypoint.py:grouped_gemm_nt_mxfp8_f8f8bf16_masked:local_diff",
+        lhs,
+        rhs,
+        out,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        masked_m=masked_m,
+    )
+    return ret
 
 
 def _ensure_cuda(
@@ -137,6 +671,57 @@ def grouped_gemm_nt_f8f8bf16_contig(
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
         )
+
+
+def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    if not supports_sm90_mxfp8_fp8_grouped_gemm():
+        raise RuntimeError(
+            "The installed deep_gemm does not expose SM90 MXFP8 grouped GEMM APIs."
+        )
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_CONTIG
+    )
+
+    if m == 0:
+        return
+
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
+    _assert_sm90_mxfp8_scale_matches_recipe(
+        lhs[1], k, recipe_a, role="lhs"
+    )
+    _assert_sm90_mxfp8_scale_matches_recipe(
+        rhs[1], k, recipe_b, role="rhs"
+    )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+        )
+    _sm90_mxfp8_local_diff_report(
+        "entrypoint.py:grouped_gemm_nt_mxfp8_f8f8bf16_contig:local_diff",
+        lhs,
+        rhs,
+        out,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        m_indices=m_indices,
+    )
 
 
 def grouped_gemm_nt_bf16_contig(

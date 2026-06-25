@@ -33,6 +33,8 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
+    _sm90_mxfp8_h12_report,
+    _sm90_mxfp8_h12_tensor_dict,
     build_minimax_fused_qkv_index,
     get_spec_layer_idx_from_weight_name,
 )
@@ -215,12 +217,30 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         if self.pp_group.is_last_rank and not get_embedding:
-            return self.logits_processor(
+            _sm90_mxfp8_h12_report(
+                "minimax_m3_vl.py:MiniMaxM3SparseForConditionalGeneration.forward:before_logits",
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                ),
+            )
+            logits_output = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
             )
+            _sm90_mxfp8_h12_report(
+                "minimax_m3_vl.py:MiniMaxM3SparseForConditionalGeneration.forward:after_logits",
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    next_token_logits=getattr(
+                        logits_output, "next_token_logits", None
+                    ),
+                    hidden_states=getattr(logits_output, "hidden_states", None),
+                ),
+            )
+            return logits_output
         return hidden_states
 
     @property

@@ -855,11 +855,25 @@ class Envs:
     # JIT CUDA radix-select kernel (minimax_decode_topk).
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
+    # MiniMax-M3 sparse attention: route sparse layers through the dense
+    # attention backend. This is a diagnostic fallback to isolate whether
+    # wrong results come from sparse block selection/main sparse kernels.
+    SGLANG_OPT_USE_MINIMAX_SPARSE_ATTENTION_DENSE_FALLBACK = EnvBool(False)
+
+    # MiniMax-M3 MoE: force router top-k selection through the torch-native
+    # implementation to isolate wrong expert choices from fused top-k kernels.
+    SGLANG_OPT_USE_MINIMAX_MOE_TOPK_TORCH_NATIVE = EnvBool(False)
+
     # MiniMax-M3 attention: fuse per-head GemmaRMSNorm(q,k) + partial NeoX RoPE
     # into one in-place JIT kernel (minimax_qknorm_rope) instead of separate
     # norm + rope launches. Only activates for the verified config (per_head
     # gemma norm, head_dim=128, rotary_dim=64, neox, no output gate, fp32 cache).
     SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE = EnvBool(True)
+
+    # MiniMax-M3 sparse attention: fuse the main qkv projection and sparse
+    # index qkv projection into one GEMM. Disable to isolate sparse-attention
+    # precision issues from the fused projection path.
+    SGLANG_OPT_USE_MINIMAX_FUSED_QKV_INDEX = EnvBool(True)
 
     # MiniMax-M3 sparse attention: store the main K/V plus the index K (and
     # optional index V) into their KV pools in a single fused JIT launch
@@ -867,6 +881,17 @@ class Envs:
     # Falls back to the separate stores when the main and index caches do not
     # share a store dtype (e.g. fp8 KV cache) or on non-CUDA devices.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+
+    # SM90 MXFP8 dense linear: route dense linear layers through the custom
+    # DeepGEMM grouped MXFP8 path. Disable to fall back to the regular MXFP8
+    # linear backend selected by --fp8-gemm-backend, without changing MoE.
+    SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR = EnvBool(True)
+
+    # SM90 MXFP8 dense linear diagnostics: report loaded weight/scale shape,
+    # stride, and UE8M0 byte stats after dense linear weight loading. This is
+    # intended for TP scale-sharding audits and is off by default.
+    SGLANG_SM90_MXFP8_DEBUG_LINEAR_SCALE = EnvBool(False)
+
     # MiniMax-M3 main sparse attention: force the Triton path even when MiniMax's
     # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
     # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.
