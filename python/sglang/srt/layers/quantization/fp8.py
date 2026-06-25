@@ -1536,6 +1536,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.contiguous(), (16, 16)
                 )
             return
+        if (
+            self.use_mxfp8
+            and envs.SGLANG_OPT_USE_MINIMAX_MOE_BF16_FALLBACK.get()
+            and _is_cuda
+            and is_sm90_supported()
+            and not is_sm100_supported()
+            and get_moe_runner_backend().is_deep_gemm()
+        ):
+            self._process_mxfp8_moe_bf16_fallback(layer)
+            return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
@@ -1687,6 +1697,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = Parameter(w2_s, requires_grad=False)
         layer.w13_input_scale = None
         layer.w2_input_scale = None
+
+    def _process_mxfp8_moe_bf16_fallback(self, layer: Module) -> None:
+        """Diagnostic: dequantize MiniMax MXFP8 experts to BF16 for DeepGEMM."""
+
+        def _e8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
+            return (scale_u8.contiguous().to(torch.int32) << 23).view(torch.float32)
+
+        def _dequant_mxfp8(
+            weight: torch.Tensor, scale_u8: torch.Tensor
+        ) -> torch.Tensor:
+            *_, _, k = weight.shape
+            scale = _e8m0_to_fp32(scale_u8).repeat_interleave(32, dim=-1)
+            scale = scale[..., :k]
+            return (weight.to(torch.float32) * scale).to(torch.bfloat16).contiguous()
+
+        layer.w13_weight.data = _dequant_mxfp8(
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data
+        )
+        layer.w2_weight.data = _dequant_mxfp8(
+            layer.w2_weight.data, layer.w2_weight_scale_inv.data
+        )
+        layer.w13_weight.requires_grad_(False)
+        layer.w2_weight.requires_grad_(False)
+        layer.w13_weight_scale_inv.requires_grad_(False)
+        layer.w2_weight_scale_inv.requires_grad_(False)
+        layer._sglang_moe_bf16_fallback = True
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -2374,10 +2410,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
-            if self.block_quant:
+            if getattr(layer, "_sglang_moe_bf16_fallback", False):
+                block_shape = None
+                w13_scale = None
+                w2_scale = None
+                use_fp8 = False
+                use_mxfp8 = False
+            elif self.block_quant:
                 block_shape = self.quant_config.weight_block_size
                 w13_scale = layer.w13_weight_scale_inv
                 w2_scale = layer.w2_weight_scale_inv
+                use_fp8 = True
+                use_mxfp8 = self.use_mxfp8
             else:
                 # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
                 scale_block_size = 128
@@ -2398,15 +2442,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     .unsqueeze(2)
                     .repeat_interleave(w2_scale_k, dim=2)
                 )
+                use_fp8 = True
+                use_mxfp8 = self.use_mxfp8
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,
-                use_fp8=True,
+                use_fp8=use_fp8,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
-                use_mxfp8=self.use_mxfp8,
+                use_mxfp8=use_mxfp8,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

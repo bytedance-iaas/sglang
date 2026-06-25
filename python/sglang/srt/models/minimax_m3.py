@@ -429,6 +429,11 @@ class MiniMaxM3MoE(nn.Module):
             if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
+        if (
+            envs.SGLANG_OPT_USE_MINIMAX_MOE_BF16_FALLBACK.get()
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            get_global_server_args().deepep_dispatcher_output_dtype = "bf16"
 
         if self.tp_size > config.num_local_experts:
             raise ValueError(
