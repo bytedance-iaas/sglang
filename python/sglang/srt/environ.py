@@ -887,6 +887,11 @@ class Envs:
     # linear backend selected by --fp8-gemm-backend, without changing MoE.
     SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR = EnvBool(True)
 
+    # SM90 MXFP8 dense linear diagnostics: report loaded weight/scale shape,
+    # stride, and UE8M0 byte stats after dense linear weight loading. This is
+    # intended for TP scale-sharding audits and is off by default.
+    SGLANG_SM90_MXFP8_DEBUG_LINEAR_SCALE = EnvBool(False)
+
     # MiniMax-M3 main sparse attention: force the Triton path even when MiniMax's
     # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
     # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.

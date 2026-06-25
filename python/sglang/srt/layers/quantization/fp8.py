@@ -175,6 +175,45 @@ def _infer_sm90_mxfp8_gran_k_from_scale(
     )
 
 
+_SM90_MXFP8_LINEAR_SCALE_DEBUG_EVENTS = 0
+
+
+def _sm90_mxfp8_debug_linear_scale(layer: Module) -> None:
+    global _SM90_MXFP8_LINEAR_SCALE_DEBUG_EVENTS
+    if not envs.SGLANG_SM90_MXFP8_DEBUG_LINEAR_SCALE.get():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_LINEAR_SCALE_EVENTS", "64"))
+    if _SM90_MXFP8_LINEAR_SCALE_DEBUG_EVENTS >= max_events:
+        return
+    if not hasattr(layer, "weight") or not hasattr(layer, "weight_scale_inv"):
+        return
+    weight = layer.weight.data
+    scale = layer.weight_scale_inv.data
+    if scale.dtype != torch.uint8:
+        return
+    _SM90_MXFP8_LINEAR_SCALE_DEBUG_EVENTS += 1
+
+    n, k = weight.shape
+    expected_shape = (n, (k + 31) // 32)
+    flat = scale.reshape(-1)
+    payload = {
+        "prefix": getattr(layer, "prefix", None),
+        "weight_shape": list(weight.shape),
+        "weight_dtype": str(weight.dtype),
+        "scale_shape": list(scale.shape),
+        "scale_stride": list(scale.stride()),
+        "scale_dtype": str(scale.dtype),
+        "scale_is_contiguous": scale.is_contiguous(),
+        "expected_scale_shape": list(expected_shape),
+        "shape_matches_weight": tuple(scale.shape) == expected_shape,
+        "scale_byte_min": int(flat.min().item()) if flat.numel() > 0 else None,
+        "scale_byte_max": int(flat.max().item()) if flat.numel() > 0 else None,
+        "scale_byte_zero_count": int((flat == 0).sum().item()),
+        "scale_byte_ff_count": int((flat == 0xFF).sum().item()),
+    }
+    logger.warning("[SM90_MXFP8_LINEAR_SCALE] %s", json.dumps(payload))
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -619,8 +658,10 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             if self.use_sm90_mxfp8_deepgemm_linear:
                 layer.weight_scale_inv.data = layer.weight_scale_inv.data.contiguous()
+                _sm90_mxfp8_debug_linear_scale(layer)
                 return
             self._process_mxfp8_linear_weight_scale(layer)
+            _sm90_mxfp8_debug_linear_scale(layer)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
