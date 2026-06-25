@@ -697,6 +697,44 @@ class DeepseekV4AttnBackend(
             )
         return num_tokens // batch_size
 
+    def _check_target_verify_metadata_parity(
+        self,
+        *,
+        batch_size: int,
+        num_draft_tokens: int,
+        out_cache_loc: Optional[torch.Tensor],
+        req_pool_indices_repeated: Optional[torch.Tensor] = None,
+        online_c128_state_slot_offset: int = 0,
+        context: str,
+    ) -> None:
+        if batch_size < 0 or num_draft_tokens <= 0:
+            raise RuntimeError(
+                "DeepSeekV4 target-verify metadata has invalid dimensions: "
+                f"context={context}, batch_size={batch_size}, "
+                f"num_draft_tokens={num_draft_tokens}."
+            )
+        expected_tokens = batch_size * num_draft_tokens
+        if out_cache_loc is not None and out_cache_loc.numel() != expected_tokens:
+            raise RuntimeError(
+                "DeepSeekV4 target-verify out_cache_loc shape mismatch: "
+                f"context={context}, expected_tokens={expected_tokens}, "
+                f"out_cache_loc_shape={tuple(out_cache_loc.shape)}."
+            )
+        if (
+            req_pool_indices_repeated is not None
+            and req_pool_indices_repeated.numel() != expected_tokens
+        ):
+            raise RuntimeError(
+                "DeepSeekV4 target-verify repeated req indices shape mismatch: "
+                f"context={context}, expected_tokens={expected_tokens}, "
+                f"req_pool_indices_repeated_shape={tuple(req_pool_indices_repeated.shape)}."
+            )
+        if self.online_c128_mtp.enabled() and online_c128_state_slot_offset < 0:
+            raise RuntimeError(
+                "DeepSeekV4 online C128 state slot offset must be non-negative: "
+                f"context={context}, offset={online_c128_state_slot_offset}."
+            )
+
     def _pad_target_verify_out_cache_loc(
         self,
         seq_lens: torch.Tensor,
@@ -739,6 +777,13 @@ class DeepseekV4AttnBackend(
         out_cache_loc = self._pad_target_verify_out_cache_loc(
             seq_lens, out_cache_loc, num_tokens
         )
+        self._check_target_verify_metadata_parity(
+            batch_size=batch_size,
+            num_draft_tokens=num_draft_tokens,
+            out_cache_loc=out_cache_loc,
+            online_c128_state_slot_offset=online_c128_state_slot_offset,
+            context="target_verify_old",
+        )
         return self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -780,6 +825,14 @@ class DeepseekV4AttnBackend(
             self.expand_extend_with_same_length(
                 bs, num_draft_tokens, seq_lens, req_pool_indices
             )
+        )
+        self._check_target_verify_metadata_parity(
+            batch_size=bs,
+            num_draft_tokens=num_draft_tokens,
+            out_cache_loc=out_cache_loc,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            online_c128_state_slot_offset=online_c128_state_slot_offset,
+            context="raw_verify",
         )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
@@ -1088,6 +1141,11 @@ class DeepseekV4AttnBackend(
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             verify_bs = self._active_batch_size(fb, req_pool_indices, seq_lens)
+            if verify_bs < 0 or verify_bs > bs:
+                raise RuntimeError(
+                    "DeepSeekV4 graph replay target-verify active batch is invalid: "
+                    f"verify_bs={verify_bs}, graph_bs={bs}."
+                )
             if self.online_c128_mtp.enabled() and verify_bs == 0:
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
@@ -1096,6 +1154,13 @@ class DeepseekV4AttnBackend(
                 return
             assert out_cache_loc is not None
             num_tokens = self.speculative_num_draft_tokens * bs
+            if out_cache_loc.numel() > num_tokens:
+                raise RuntimeError(
+                    "DeepSeekV4 graph replay target-verify out_cache_loc exceeds "
+                    "the graph bucket capacity: "
+                    f"out_cache_loc_shape={tuple(out_cache_loc.shape)}, "
+                    f"graph_bs={bs}, draft_tokens={self.speculative_num_draft_tokens}."
+                )
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, num_tokens - len(out_cache_loc)),
