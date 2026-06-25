@@ -72,6 +72,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
+from sglang.srt.managers.hisparse_accuracy_trace import (
+    answer_markers,
+    should_trace_req,
+    text_tail,
+    trace_req,
+)
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -1880,6 +1886,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.convert_to_output_meta_info(
                             scheduler_time_stats, completion_tokens
                         )
+                    )
+                if (
+                    self.server_args.enable_hisparse
+                    and isinstance(recv_obj, BatchStrOutput)
+                    and should_trace_req(state.obj)
+                ):
+                    final_text = state.get_text()
+                    trace_req(
+                        logger,
+                        "tokenizer_output_finished",
+                        state.obj,
+                        finish_reason=meta_info.get("finish_reason"),
+                        prompt_tokens=meta_info.get("prompt_tokens"),
+                        completion_tokens=meta_info.get("completion_tokens"),
+                        reasoning_tokens=meta_info.get("reasoning_tokens"),
+                        cached_tokens=meta_info.get("cached_tokens"),
+                        output_token_count=len(state.output_ids),
+                        output_text_len=len(final_text),
+                        output_text_tail=text_tail(final_text),
+                        answer_markers=answer_markers(final_text),
                     )
 
                 del self.rid_to_state[rid]

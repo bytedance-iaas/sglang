@@ -51,6 +51,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.managers.hisparse_accuracy_trace import trace_event
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -595,11 +596,33 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=thinking_mode,
                     reasoning_effort=v4_reasoning_effort,
                 )
+                if self.tokenizer_manager.server_args.enable_hisparse:
+                    trace_event(
+                        logger,
+                        "dsv4_chat_prompt_encoded",
+                        rid=request.rid,
+                        thinking_mode=thinking_mode,
+                        request_reasoning_effort=request.reasoning_effort,
+                        effective_reasoning_effort=v4_reasoning_effort,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        message_count=len(messages),
+                        input_chars=len(real_input),
+                    )
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            if (
+                self.chat_encoding_spec == "dsv4"
+                and self.tokenizer_manager.server_args.enable_hisparse
+            ):
+                trace_event(
+                    logger,
+                    "dsv4_chat_prompt_tokens",
+                    rid=request.rid,
+                    prompt_tokens=len(prompt_ids),
+                )
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

@@ -16,6 +16,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.hisparse_accuracy_trace import trace_req
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -782,6 +783,27 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            max_new_tokens = getattr(req.sampling_params, "max_new_tokens", None)
+            if self.server_args.enable_hisparse:
+                trace_req(
+                    logger,
+                    "decode_request_finished",
+                    req,
+                    finish_reason_type=type(req.finished_reason).__name__,
+                    finish_reason=req.finished_reason,
+                    finished_len=getattr(req, "finished_len", None),
+                    hit_max_new_tokens=(
+                        max_new_tokens is not None
+                        and len(req.output_ids) >= max_new_tokens
+                    ),
+                    max_new_tokens=max_new_tokens,
+                    is_abort=isinstance(req.finished_reason, FINISH_ABORT),
+                    is_retracted=getattr(req, "is_retracted", False),
+                    spec_verify_ct=getattr(req, "spec_verify_ct", None),
+                    spec_num_correct_drafts=getattr(
+                        req, "spec_num_correct_drafts", None
+                    ),
+                )
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()

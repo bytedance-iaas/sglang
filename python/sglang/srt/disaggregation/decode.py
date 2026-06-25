@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.managers.hisparse_accuracy_trace import trace_req
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -1344,6 +1345,21 @@ class DecodePreallocQueue:
             safe_prefix_reuse_enabled,
             safe_prefix_reuse_state,
         )
+        trace_req(
+            logger,
+            "decode_idle_admission_prefix_probe",
+            req,
+            fill_len=fill_len,
+            matched_prefix_len=probe.matched_prefix_len,
+            safe_prefix_len=probe.safe_prefix_len,
+            c4_host_ready_prefix_len=probe.c4_host_ready_prefix_len,
+            required_full_tokens_after_prefix=(
+                probe.required_full_tokens_after_prefix
+            ),
+            cold_prefix_or_routing_key_miss=probe.cold_prefix_or_routing_key_miss,
+            safe_prefix_reuse_enabled=safe_prefix_reuse_enabled,
+            safe_prefix_reuse_state=safe_prefix_reuse_state,
+        )
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -1630,21 +1646,38 @@ class DecodePreallocQueue:
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
+            future_full_tokens = self._future_full_tokens_for_admission(
+                decode_req.req,
+                origin_input_len=origin_input_len,
+                prefix_len=prefix_len,
+                retractable_tokens=retractable_tokens,
+            )
             if (
                 max(
                     required_tokens_for_request,
-                    self._future_full_tokens_for_admission(
-                        decode_req.req,
-                        origin_input_len=origin_input_len,
-                        prefix_len=prefix_len,
-                        retractable_tokens=retractable_tokens,
-                    ),
+                    future_full_tokens,
                 )
                 > full_allocatable_tokens
             ):
                 if prefix_lock_acquired:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 blocked_reason = "full_allocatable_tokens"
+                trace_req(
+                    logger,
+                    "decode_prealloc_blocked",
+                    decode_req.req,
+                    reason=blocked_reason,
+                    fill_len=fill_len,
+                    prefix_len=prefix_len,
+                    required_alloc_tokens=required_alloc_tokens,
+                    required_tokens_for_request=required_tokens_for_request,
+                    future_full_tokens=future_full_tokens,
+                    full_allocatable_tokens=full_allocatable_tokens,
+                    c4_host_prefix_len=c4_host_prefix_len,
+                    safe_prefix_reuse_enabled=(
+                        self._enable_decode_radix_prefix_reuse()
+                    ),
+                )
                 if bounded_full_scan_skips < bounded_full_scan_limit - 1:
                     bounded_full_scan_skips += 1
                     continue
@@ -1671,6 +1704,18 @@ class DecodePreallocQueue:
                     if prefix_lock_acquired:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     blocked_reason = "swa_allocatable_tokens"
+                    trace_req(
+                        logger,
+                        "decode_prealloc_blocked",
+                        decode_req.req,
+                        reason=blocked_reason,
+                        fill_len=fill_len,
+                        prefix_len=prefix_len,
+                        swa_required=swa_required,
+                        swa_len=swa_len,
+                        max_new_tokens=max_new_tokens,
+                        swa_allocatable_tokens=swa_allocatable_tokens,
+                    )
                     break
 
             if c4_host_allocatable_tokens is not None:
@@ -1704,6 +1749,18 @@ class DecodePreallocQueue:
                     if prefix_lock_acquired:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     blocked_reason = "c4_host_allocatable_tokens"
+                    trace_req(
+                        logger,
+                        "decode_prealloc_blocked",
+                        decode_req.req,
+                        reason=blocked_reason,
+                        fill_len=fill_len,
+                        prefix_len=prefix_len,
+                        c4_host_len=c4_host_len,
+                        c4_host_prefix_len=c4_host_prefix_len,
+                        c4_host_required_tokens=c4_host_required_tokens,
+                        c4_host_allocatable_tokens=c4_host_allocatable_tokens,
+                    )
                     break
 
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
@@ -1935,6 +1992,23 @@ class DecodePreallocQueue:
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            trace_req(
+                logger,
+                "decode_preallocated",
+                decode_req.req,
+                fill_len=fill_len,
+                prefix_len=prefix_len,
+                metadata_decode_prefix_len=metadata_decode_prefix_len,
+                decode_c4_prefix_len=decode_c4_prefix_len,
+                required_alloc_tokens=required_alloc_tokens,
+                required_tokens_for_request=required_tokens_for_request,
+                future_full_tokens=future_full_tokens,
+                full_allocatable_tokens=full_allocatable_tokens,
+                swa_allocatable_tokens=swa_allocatable_tokens,
+                c4_host_required_tokens=c4_host_required_tokens,
+                c4_host_allocatable_tokens=c4_host_allocatable_tokens,
+                hisparse_req_budget=hisparse_req_budget,
+            )
             if (
                 max_new_reqs is not None
                 and len(preallocated_reqs) >= max_new_reqs
@@ -2559,6 +2633,18 @@ class DecodeTransferQueue:
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        if self.scheduler.enable_hisparse:
+            trace_req(
+                logger,
+                "decode_transfer_committed",
+                decode_req.req,
+                cached_tokens=decode_req.req.cached_tokens,
+                cached_tokens_device=decode_req.req.cached_tokens_device,
+                cached_tokens_host=decode_req.req.cached_tokens_host,
+                cached_tokens_storage=decode_req.req.cached_tokens_storage,
+                metadata_buffer_index=idx,
+                output_id=output_id[0].item(),
+            )
         return True
 
     def _publish_transferred_prefix_if_needed(self, req: Req) -> None:
