@@ -164,14 +164,17 @@ def test_draining_epoch_does_not_insert_new_prefill():
     assert calls["prefill"] == 0
 
 
-def test_pp_fill_stop_reason_sync_prioritizes_host_limit():
+def test_pp_fill_stop_reason_sync_does_not_collect_in_scheduler_hot_path():
+    def _unexpected_collective(_reason):
+        raise AssertionError("scheduler hot path must not call PP collectives")
+
     pp_group = SimpleNamespace(
         world_size=2,
-        all_gather_object=lambda _reason: ["", "host"],
+        all_gather_object=_unexpected_collective,
     )
     sched = SimpleNamespace(pp_group=pp_group)
 
-    assert Scheduler._offline_pp_sync_fill_stop_reason(sched, None) == "host"
+    assert Scheduler._offline_pp_sync_fill_stop_reason(sched, "host") == "host"
 
 
 def test_decode_ready_wave_batch_stashes_last_token_and_prepares_decode(monkeypatch):

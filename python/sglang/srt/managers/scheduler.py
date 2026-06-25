@@ -2430,24 +2430,12 @@ class Scheduler(
         self, local_reason: Optional[str]
     ) -> Optional[str]:
         """Make the FILLING->DRAINING decision consistent across PP ranks."""
-        pp_group = getattr(self, "pp_group", None)
-        if (
-            pp_group is None
-            or getattr(pp_group, "world_size", 1) <= 1
-            or not hasattr(pp_group, "all_gather_object")
-        ):
-            return local_reason
-
-        reasons = pp_group.all_gather_object(local_reason or "")
-        reasons = [reason for reason in reasons if reason]
-        if not reasons:
-            return None
-
-        priority = ("host", "max_waves", "prefill_none", "waiting_empty")
-        for reason in priority:
-            if reason in reasons:
-                return reason
-        return reasons[0]
+        # Do not introduce a fresh PP collective in the hot scheduler path.
+        # PP ranks can be at different points in the event loop while P2P
+        # send/recv work is in flight, so an ad-hoc all_gather here can block
+        # startup or warmup. Keep the hook local for now; rank-wide agreement
+        # should be wired through an existing PP synchronization point.
+        return local_reason
 
     def _get_next_batch_offline_pp(self) -> Optional[ScheduleBatch]:
         """Offline-PP batch formation (plan §3.3, gated by the manager).
@@ -2484,7 +2472,14 @@ class Scheduler(
 
         if mgr.is_filling():
             local_reason = mgr.local_fill_stop_reason(waiting_queue_empty)
-            reason = self._offline_pp_sync_fill_stop_reason(local_reason)
+            sync_fill_stop_reason = getattr(
+                self, "_offline_pp_sync_fill_stop_reason", None
+            )
+            reason = (
+                sync_fill_stop_reason(local_reason)
+                if sync_fill_stop_reason is not None
+                else local_reason
+            )
             if reason is not None:
                 mgr.enter_draining(reason)
 
@@ -2499,7 +2494,14 @@ class Scheduler(
                     len(self.waiting_queue) == 0 and self.chunked_req is None
                 )
                 local_reason = "waiting_empty" if waiting_queue_empty else "prefill_none"
-                reason = self._offline_pp_sync_fill_stop_reason(local_reason)
+                sync_fill_stop_reason = getattr(
+                    self, "_offline_pp_sync_fill_stop_reason", None
+                )
+                reason = (
+                    sync_fill_stop_reason(local_reason)
+                    if sync_fill_stop_reason is not None
+                    else local_reason
+                )
                 mgr.enter_draining(reason or local_reason)
 
         # Step 3: continue decoding the active wave, if any.
