@@ -175,6 +175,41 @@ def _validate_dsv4_hisparse_online_c128_mtp(server_args: "ServerArgs") -> None:
     )
 
 
+def _validate_dsv4_hisparse_top_k(server_args: "ServerArgs") -> None:
+    """Fail fast for DSV4 HiSparse C4 top-k modes.
+
+    Fixed 512/1024 shapes keep the legacy raw-index path. Other supported
+    values require the flexible topk_v2 raw-index path and are capped at 1024.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.sparsity import resolve_hisparse_top_k
+
+    hf_config = server_args.get_model_config().hf_config
+    hf_text_config = getattr(hf_config, "text_config", hf_config)
+    top_k = int(resolve_hisparse_top_k(server_args, hf_text_config))
+
+    if top_k <= 0:
+        raise ValueError(f"DSV4 HiSparse requires positive top_k, got {top_k}.")
+    if top_k > 1024:
+        raise ValueError(
+            "DSV4 HiSparse C4 sparse attention currently supports top_k <= 1024; "
+            f"got top_k={top_k}. Use top_k=512/1024 for the legacy raw-index path "
+            "or a flexible top_k <= 1024 with SGLANG_OPT_USE_TOPK_V2=1."
+        )
+    if top_k in (512, 1024):
+        return
+    if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        raise ValueError(
+            "DSV4 HiSparse flexible top_k values require "
+            f"SGLANG_OPT_USE_TOPK_V2=1, got top_k={top_k}."
+        )
+    logger.warning(
+        "DSV4 HiSparse flexible top_k=%d will use the topk_v2 raw-index path. "
+        "Fixed top_k=512/1024 continue to use the legacy raw-index path.",
+        top_k,
+    )
+
+
 def _validate_dsv4_hisparse_c4_verify_hot_buffer(server_args: "ServerArgs") -> None:
     """Ensure EAGLE target-verify C4 rows can stay resident until attention.
 
@@ -242,6 +277,7 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
     # HiSparseCoordinator.
     if is_v4_hisparse:
         _validate_dsv4_hisparse_online_c128_mtp(server_args)
+        _validate_dsv4_hisparse_top_k(server_args)
         _validate_dsv4_hisparse_c4_verify_hot_buffer(server_args)
         _validate_dsv4_hisparse_megamoe(server_args)
         return
