@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import ctypes
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -1234,7 +1235,18 @@ class MooncakeKVManager(CommonKVManager):
             return None
         if local_signature == remote_signature:
             return None
-        if local_signature is None or remote_signature is None:
+        if remote_signature is None:
+            if register_info.enable_hisparse:
+                return (
+                    "DSV4 HiSparse P/D capability missing: "
+                    f"prefill_reported={local_signature is not None}, "
+                    "decode_reported=False, prefill="
+                    f"{local_signature}, decode=None. "
+                    "Decode enabled HiSparse but did not report a DSV4 "
+                    "HiSparse capability signature."
+                )
+            return None
+        if local_signature is None:
             return (
                 "DSV4 HiSparse P/D capability missing: "
                 f"prefill_reported={local_signature is not None}, "
@@ -1243,6 +1255,25 @@ class MooncakeKVManager(CommonKVManager):
                 "This usually means P/D are running different source versions "
                 "or one side did not initialize the DSV4 HiSparse capability "
                 "signature."
+            )
+        try:
+            local_payload = json.loads(local_signature)
+            remote_payload = json.loads(remote_signature)
+        except Exception:
+            local_payload = None
+            remote_payload = None
+        if isinstance(local_payload, dict) and isinstance(remote_payload, dict):
+            mismatches = {
+                key: (local_payload[key], remote_payload[key])
+                for key in sorted(local_payload.keys() & remote_payload.keys())
+                if local_payload[key] != remote_payload[key]
+            }
+            if not mismatches:
+                return None
+            return (
+                "DSV4 HiSparse P/D capability mismatch: "
+                f"fields={mismatches}, prefill={local_signature}, "
+                f"decode={remote_signature}"
             )
         return (
             "DSV4 HiSparse P/D capability mismatch: "

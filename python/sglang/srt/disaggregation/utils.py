@@ -45,13 +45,11 @@ def build_dsv4_hisparse_capability_signature(
 ) -> Optional[str]:
     """Stable P/D signature for DSV4 HiSparse capability compatibility.
 
-    The signature is only emitted for DSV4 HiSparse. It is intentionally small:
-    it captures configuration that changes the meaning of transferred C4/C128
-    state, not ephemeral pointers or pool sizes.
+    The signature is emitted by DSV4 prefill workers and DSV4 HiSparse decode
+    workers. It captures configuration that changes the meaning of transferred
+    C4/C128 state, not ephemeral pointers or pool sizes. Decode-only HiSparse
+    fields are included only when the local worker actually enables HiSparse.
     """
-    if not getattr(server_args, "enable_hisparse", False):
-        return None
-
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.mem_cache.sparsity import (
         parse_hisparse_config,
@@ -62,6 +60,14 @@ def build_dsv4_hisparse_capability_signature(
     if not is_deepseek_v4(hf_config):
         return None
 
+    disaggregation_mode = getattr(server_args, "disaggregation_mode", None)
+    is_prefill = disaggregation_mode == "prefill" or (
+        getattr(disaggregation_mode, "value", None) == "prefill"
+    )
+    enable_hisparse = bool(getattr(server_args, "enable_hisparse", False))
+    if not enable_hisparse and not is_prefill:
+        return None
+
     def hisparse_config_value(config, key: str):
         if hasattr(config, key):
             return getattr(config, key)
@@ -70,36 +76,40 @@ def build_dsv4_hisparse_capability_signature(
             return get(key)
         raise AttributeError(f"HiSparse config does not expose {key!r}")
 
-    config = parse_hisparse_config(server_args)
-    text_config = getattr(hf_config, "text_config", hf_config)
-    top_k = int(resolve_hisparse_top_k(server_args, text_config))
-    device_buffer_size = int(hisparse_config_value(config, "device_buffer_size"))
-    topk_mode = (
-        "legacy_raw_index"
-        if top_k in (512, 1024)
-        else "flexible_topk_v2_raw_index"
-    )
-
-    c4_host_mirror = True
-    if hisparse_coordinator is not None:
-        c4_host_mirror = (
-            bool(getattr(hisparse_coordinator, "is_dsv4_hisparse", False))
-            and getattr(hisparse_coordinator, "host_radix_cache", None) is None
-        )
-
     payload = {
-        "c4_host_mirror": bool(c4_host_mirror),
         "compressor_v2": bool(envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()),
-        "device_buffer_size": device_buffer_size,
         "experimental_online_c128_mtp": bool(
             envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
         ),
         "online_c128": bool(is_dsv4_c128_online_enabled()),
-        "top_k": top_k,
-        "topk_mode": topk_mode,
         "use_topk_v2": bool(envs.SGLANG_OPT_USE_TOPK_V2.get()),
         "use_hisparse_topk_v2": bool(envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()),
     }
+    if enable_hisparse:
+        config = parse_hisparse_config(server_args)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        top_k = int(resolve_hisparse_top_k(server_args, text_config))
+        device_buffer_size = int(hisparse_config_value(config, "device_buffer_size"))
+        topk_mode = (
+            "legacy_raw_index"
+            if top_k in (512, 1024)
+            else "flexible_topk_v2_raw_index"
+        )
+
+        c4_host_mirror = True
+        if hisparse_coordinator is not None:
+            c4_host_mirror = (
+                bool(getattr(hisparse_coordinator, "is_dsv4_hisparse", False))
+                and getattr(hisparse_coordinator, "host_radix_cache", None) is None
+            )
+        payload.update(
+            {
+                "c4_host_mirror": bool(c4_host_mirror),
+                "device_buffer_size": device_buffer_size,
+                "top_k": top_k,
+                "topk_mode": topk_mode,
+            }
+        )
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
