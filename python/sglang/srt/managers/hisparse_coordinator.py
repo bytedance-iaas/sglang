@@ -9,6 +9,11 @@ import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_accuracy_trace import (
+    emit_trace_event,
+    should_trace_event,
+    tensor_digest,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     DeepSeekV4SingleKVPoolHost,
@@ -2178,8 +2183,10 @@ class HiSparseCoordinator:
             )
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
+        self._clear_request_runtime_state(req.req_pool_idx)
         self._clear_c4_prefix_req_state(req.req_pool_idx)
         req.hisparse_staging = False
+        self._debug_assert_request_state_cleared(req.req_pool_idx)
 
     def _clear_request_runtime_state(self, req_pool_idx: int) -> None:
         self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
@@ -2190,6 +2197,34 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req_pool_idx, :] = -1
         self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req_pool_idx] = False
+
+    def _debug_assert_request_state_cleared(self, req_pool_idx: int) -> None:
+        if not envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get():
+            return
+
+        issues = []
+        if torch.any(self.req_to_host_pool[req_pool_idx] >= 0):
+            issues.append("host_row")
+        if int(self.req_device_buffer_size[req_pool_idx].item()) != 0:
+            issues.append("device_buffer_size")
+        if int(self.req_draft_buffer_size[req_pool_idx].item()) != 0:
+            issues.append("draft_buffer_size")
+        if torch.any(self.req_device_buffer_tokens[:, req_pool_idx, :] >= 0):
+            issues.append("device_buffer_tokens")
+        if req_pool_idx in self._req_c4_prefix_len:
+            issues.append("c4_prefix_len")
+        if req_pool_idx in self._req_c4_written_len:
+            issues.append("c4_written_len")
+        if req_pool_idx in self._req_host_written_len:
+            issues.append("host_written_len")
+        if req_pool_idx in self._c4_prefix_cache.req_refs:
+            issues.append("c4_prefix_ref")
+
+        if issues:
+            raise RuntimeError(
+                "DSV4 HiSparse request slot still owns state after release: "
+                f"req_pool_idx={req_pool_idx}, issues={issues}."
+            )
 
     def retract_decode_req(self, req: Req) -> None:
         """Detach DSV4 HiSparse request state without treating the request as done.
@@ -2278,6 +2313,7 @@ class HiSparseCoordinator:
         self._clear_c4_prefix_req_state(req_pool_idx)
         self._req_host_written_len.pop(req_pool_idx, None)
         req.hisparse_staging = False
+        self._debug_assert_request_state_cleared(req_pool_idx)
 
     def restore_retracted_decode_req(self, req: Req) -> bool:
         """Restore DSV4 HiSparse host/device side state saved by retraction."""
@@ -2422,6 +2458,7 @@ class HiSparseCoordinator:
         # clear req info
         self._clear_request_runtime_state(req.req_pool_idx)
         self._clear_c4_prefix_req_state(req.req_pool_idx)
+        self._debug_assert_request_state_cleared(req.req_pool_idx)
 
     def _maybe_log_c4_swap_in_sample(
         self,
@@ -2555,7 +2592,65 @@ class HiSparseCoordinator:
         self._check_c4_swap_in_result(
             req_pool_indices, compressed_seq_lens, top_k_result, top_k_indices, layer_id
         )
+        self._trace_c4_swap_in_result(
+            req_pool_indices,
+            compressed_seq_lens,
+            top_k_result,
+            top_k_indices,
+            layer_id,
+        )
         return top_k_indices
+
+    def _trace_c4_swap_in_result(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if not self.is_dsv4_hisparse or layer_id != 0:
+            return
+        if not should_trace_event("c4_swap_in_result"):
+            return
+
+        hit_count = None
+        miss_count = None
+        valid_count = None
+        try:
+            with torch.no_grad():
+                top_tokens = top_k_result.to(dtype=torch.int32)
+                valid = (top_tokens >= 0) & (
+                    top_tokens < compressed_seq_lens.view(-1, 1).to(top_tokens.device)
+                )
+                if torch.any(valid):
+                    resident_req_indices = req_pool_indices.to(dtype=torch.long)
+                    resident_tokens = self.req_device_buffer_tokens[
+                        layer_id, resident_req_indices
+                    ]
+                    resident = (
+                        top_tokens.unsqueeze(-1) == resident_tokens.unsqueeze(1)
+                    ).any(dim=-1)
+                    valid_count = int(valid.sum().item())
+                    hit_count = int((resident & valid).sum().item())
+                    miss_count = valid_count - hit_count
+        except Exception as exc:
+            hit_count = f"error:{type(exc).__name__}"
+
+        emit_trace_event(
+            logger,
+            "c4_swap_in_result",
+            layer_id=layer_id,
+            top_k=self.top_k,
+            device_buffer_size=self.device_buffer_size,
+            valid_count=valid_count,
+            hot_hit_count=hit_count,
+            host_miss_count=miss_count,
+            req_pool_indices=tensor_digest(req_pool_indices),
+            compressed_seq_lens=tensor_digest(compressed_seq_lens),
+            raw_topk=tensor_digest(top_k_result),
+            device_locs=tensor_digest(top_k_indices),
+        )
 
     def _check_c4_swap_in_result(
         self,
