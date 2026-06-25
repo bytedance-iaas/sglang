@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import json
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -34,6 +35,69 @@ _IS_HIP = is_hip()
 def is_dsv4_c128_online_enabled() -> bool:
     """Return whether DSV4 C128 uses request-scoped online state."""
     return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def build_dsv4_hisparse_capability_signature(
+    server_args,
+    model_config,
+    token_to_kv_pool=None,
+    hisparse_coordinator=None,
+) -> Optional[str]:
+    """Stable P/D signature for DSV4 HiSparse capability compatibility.
+
+    The signature is only emitted for DSV4 HiSparse. It is intentionally small:
+    it captures configuration that changes the meaning of transferred C4/C128
+    state, not ephemeral pointers or pool sizes.
+    """
+    if not getattr(server_args, "enable_hisparse", False):
+        return None
+
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.mem_cache.sparsity import (
+        parse_hisparse_config,
+        resolve_hisparse_top_k,
+    )
+
+    hf_config = getattr(model_config, "hf_config", model_config)
+    if not is_deepseek_v4(hf_config):
+        return None
+
+    config = parse_hisparse_config(server_args)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    top_k = int(resolve_hisparse_top_k(server_args, text_config))
+    device_buffer_size = int(config["device_buffer_size"])
+    topk_mode = (
+        "legacy_raw_index"
+        if top_k in (512, 1024)
+        else "flexible_topk_v2_raw_index"
+    )
+
+    c4_host_mirror = True
+    if hisparse_coordinator is not None:
+        c4_host_mirror = (
+            bool(getattr(hisparse_coordinator, "is_dsv4_hisparse", False))
+            and getattr(hisparse_coordinator, "host_radix_cache", None) is None
+        )
+
+    compression_ratios = None
+    if token_to_kv_pool is not None and hasattr(token_to_kv_pool, "compression_ratios"):
+        compression_ratios = list(token_to_kv_pool.compression_ratios)
+
+    payload = {
+        "c4_host_mirror": bool(c4_host_mirror),
+        "compressor_v2": bool(envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()),
+        "device_buffer_size": device_buffer_size,
+        "experimental_online_c128_mtp": bool(
+            envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+        ),
+        "mla_compression_ratios": compression_ratios,
+        "online_c128": bool(is_dsv4_c128_online_enabled()),
+        "top_k": top_k,
+        "topk_mode": topk_mode,
+        "use_topk_v2": bool(envs.SGLANG_OPT_USE_TOPK_V2.get()),
+        "use_hisparse_topk_v2": bool(envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def get_dsv4_c128_state_indices(

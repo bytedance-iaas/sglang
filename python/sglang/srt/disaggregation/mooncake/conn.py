@@ -146,6 +146,8 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    # DSV4 HiSparse capability signature, compared by prefill before transfer.
+    dsv4_hisparse_capability_signature: Optional[str] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -170,6 +172,9 @@ class KVArgsRegisterInfo:
             ),
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
+            ),
+            dsv4_hisparse_capability_signature=(
+                msg[15].decode("utf-8") if len(msg) > 15 and msg[15] else None
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
@@ -214,6 +219,7 @@ class MooncakeKVManager(CommonKVManager):
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            self.session_failure_reasons = {}
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -1217,6 +1223,22 @@ class MooncakeKVManager(CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def _dsv4_hisparse_capability_mismatch(
+        self, register_info: KVArgsRegisterInfo
+    ) -> Optional[str]:
+        local_signature = getattr(
+            self.kv_args, "dsv4_hisparse_capability_signature", None
+        )
+        remote_signature = register_info.dsv4_hisparse_capability_signature
+        if local_signature is None and remote_signature is None:
+            return None
+        if local_signature == remote_signature:
+            return None
+        return (
+            "DSV4 HiSparse P/D capability mismatch: "
+            f"prefill={local_signature}, decode={remote_signature}"
+        )
+
     def send_aux_tcp(
         self,
         req: TransferInfo,
@@ -1555,9 +1577,13 @@ class MooncakeKVManager(CommonKVManager):
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
+                                failure_reason = self.session_failure_reasons.get(
+                                    req.mooncake_session_id,
+                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                )
                                 self.record_failure(
                                     kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                    failure_reason,
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
@@ -1777,17 +1803,33 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    register_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    failure_reason = self._dsv4_hisparse_capability_mismatch(
+                        register_info
                     )
                     with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
+                        if failure_reason is None:
+                            self.decode_kv_args_table[mooncake_session_id] = (
+                                register_info
+                            )
+                            if mooncake_session_id in self.failed_sessions:
+                                self.failed_sessions.remove(mooncake_session_id)
+                            if mooncake_session_id in self.session_failures:
+                                del self.session_failures[mooncake_session_id]
+                            self.session_failure_reasons.pop(
+                                mooncake_session_id, None
+                            )
+                        else:
+                            self.failed_sessions.add(mooncake_session_id)
+                            self.session_failure_reasons[mooncake_session_id] = (
+                                failure_reason
+                            )
+                    if failure_reason is None:
+                        logger.debug(
+                            f"Register KVArgs from {mooncake_session_id} successfully"
+                        )
+                    else:
+                        logger.error(failure_reason)
                     continue
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
@@ -2147,6 +2189,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
+            dsv4_hisparse_capability_signature = (
+                getattr(
+                    self.kv_mgr.kv_args, "dsv4_hisparse_capability_signature", None
+                )
+                or ""
+            ).encode("utf-8")
 
             if (
                 self.kv_mgr.enable_staging
@@ -2178,6 +2226,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        dsv4_hisparse_capability_signature,
                     ]
                 )
 

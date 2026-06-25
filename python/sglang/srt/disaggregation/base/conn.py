@@ -65,6 +65,9 @@ class KVArgs:
     mla_compression_ratios: Optional[List[int]]
     # DSV4 HiSparse prefill only: compressed logical C4 index -> device C4 index.
     dsv4_hisparse_c4_mapping: Optional[object]
+    # DSV4 HiSparse P/D capability signature. Prefill and decode must match
+    # before transferring host-backed C4/C128 state.
+    dsv4_hisparse_capability_signature: Optional[str]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
