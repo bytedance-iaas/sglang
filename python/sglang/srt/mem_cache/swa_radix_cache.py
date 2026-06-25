@@ -28,6 +28,7 @@ import torch
 from numpy import float64
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_accuracy_trace import trace_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -469,6 +470,15 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"req_pool_idx={req.req_pool_idx}, prefix_len={prefix_len}."
             )
         self._store_c128_snapshot_at_prefix_len(node, prefix_len, snapshot)
+        trace_req(
+            logger,
+            "c128_radix_snapshot_store",
+            req,
+            prefix_len=prefix_len,
+            node_prefix_len=self._node_prefix_len(node),
+            snapshot_count=0 if snapshot is None else len(snapshot),
+            snapshot_required=self._c128_snapshot_required(prefix_len),
+        )
 
     def _find_c128_restorable_node(self, node: TreeNode) -> TreeNode:
         if self._dsv4_kv_pool() is None:
@@ -501,10 +511,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 # chunk in prefix_indices. The request slot already has the
                 # matching C128 state, so radix restore must leave it intact.
                 if getattr(req, "kv_committed_len", 0) >= prefix_len:
+                    trace_req(
+                        logger,
+                        "c128_radix_restore_skip_live_kv",
+                        req,
+                        prefix_len=prefix_len,
+                        node_prefix_len=node_prefix_len,
+                        kv_committed_len=getattr(req, "kv_committed_len", None),
+                        snapshot_required=self._c128_snapshot_required(prefix_len),
+                    )
                     continue
             assert node_prefix_len == prefix_len
             if snapshot is not None:
                 kv_pool.restore_c128_radix_state(int(req.req_pool_idx), snapshot)
+                trace_req(
+                    logger,
+                    "c128_radix_snapshot_restore",
+                    req,
+                    prefix_len=node_prefix_len,
+                    snapshot_count=len(snapshot),
+                    snapshot_required=self._c128_snapshot_required(node_prefix_len),
+                )
             else:
                 if self._c128_snapshot_required(node_prefix_len):
                     raise RuntimeError(
@@ -515,6 +542,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         f"prefix_len={node_prefix_len}."
                     )
                 kv_pool.clear_c128_radix_state(int(req.req_pool_idx))
+                trace_req(
+                    logger,
+                    "c128_radix_snapshot_clear",
+                    req,
+                    prefix_len=node_prefix_len,
+                    snapshot_required=False,
+                )
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
