@@ -1375,8 +1375,14 @@ class MooncakeKVManager(CommonKVManager):
             common_keys = {
                 "dsv4_hisparse_protocol_version",
                 "compressor_v2",
+                "deepgemm_hc_prenorm",
+                "dsv4_compress_state_dtype",
+                "dsv4_fp4_experts",
                 "experimental_online_c128_mtp",
                 "online_c128",
+                "tilelang_mhc_post",
+                "tilelang_mhc_pre",
+                "tilelang_mhc_split_sinkhorn",
             }
             missing_in_prefill = sorted(common_keys - local_payload.keys())
             missing_in_decode = sorted(common_keys - remote_payload.keys())

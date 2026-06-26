@@ -2491,9 +2491,41 @@ class DecodePreallocQueue:
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_input_len(len(req.fill_ids) - prefix_len)
-        restore_c128 = getattr(self.tree_cache, "restore_c128_state_for_reqs", None)
-        if restore_c128 is not None:
-            restore_c128([req])
+        has_dsv4_c128_state = (
+            isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and StateType.C128_STATE in self.kv_manager.kv_args.state_types
+        )
+        if has_dsv4_c128_state:
+            # P/D state transfer carries request-scoped C128 state for the full
+            # prompt when seq_len is not 128-aligned. Do not overwrite it with
+            # a radix-prefix snapshot. For 128-aligned prompts there is no C128
+            # payload, so clear any stale state left by a reused req slot.
+            c128_seq_len = len(req.origin_input_ids)
+            cleared_stale_c128 = c128_seq_len % 128 == 0 and hasattr(
+                self.token_to_kv_pool, "clear_c128_radix_state"
+            )
+            if cleared_stale_c128:
+                self.token_to_kv_pool.clear_c128_radix_state(int(req.req_pool_idx))
+            trace_req(
+                logger,
+                "decode_c128_state_transfer_selected",
+                req,
+                c128_seq_len=c128_seq_len,
+                c128_transferred=c128_seq_len % 128 != 0,
+                cleared_stale_c128=cleared_stale_c128,
+                radix_restore_skipped=True,
+            )
+        else:
+            restore_c128 = getattr(self.tree_cache, "restore_c128_state_for_reqs", None)
+            if restore_c128 is not None:
+                restore_c128([req])
+                trace_req(
+                    logger,
+                    "decode_c128_radix_restore_selected",
+                    req,
+                    c128_seq_len=len(req.origin_input_ids),
+                    radix_restore_skipped=False,
+                )
 
         if retracted_hisparse_restore:
             if not coordinator.restore_retracted_decode_req(req):

@@ -418,7 +418,12 @@ class OnlineC128MTPController:
 
         self.clear()
 
-    def flush_pending_for_reqs(self, reqs: List[Any]) -> None:
+    def flush_pending_for_reqs(
+        self,
+        reqs: List[Any],
+        *,
+        require_forward_progress: bool = False,
+    ) -> None:
         """Commit pending target-verify C128 state before request release.
 
         The normal path commits pending state at the next forward. A request can
@@ -471,7 +476,7 @@ class OnlineC128MTPController:
         if not bool(matched.any().item()):
             return
 
-        if self._debug_enabled():
+        if require_forward_progress or self._debug_enabled():
             matched_cur_pos = torch.argmax(
                 (
                     old_req_pool_indices[matched].reshape(-1, 1)
@@ -484,6 +489,7 @@ class OnlineC128MTPController:
                 raise RuntimeError(
                     "Online C128 MTP flush found matched request slots without "
                     "forward progress before request release. "
+                    f"require_forward_progress={require_forward_progress}, "
                     f"old_req_pool_indices={old_req_pool_indices[matched].tolist()}, "
                     f"old_seq_lens={ctx.seq_lens[:old_bs][matched].tolist()}, "
                     f"cur_req_pool_indices={cur_req_pool_indices[:cur_bs].tolist()}, "

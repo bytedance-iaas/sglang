@@ -182,14 +182,32 @@ def _validate_dsv4_hisparse_top_k(server_args: "ServerArgs") -> None:
     values require the flexible topk_v2 raw-index path and are capped at 1024.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.mem_cache.sparsity import resolve_hisparse_top_k
+    from sglang.srt.mem_cache.sparsity import (
+        parse_hisparse_config,
+        resolve_hisparse_top_k,
+    )
 
     hf_config = server_args.get_model_config().hf_config
     hf_text_config = getattr(hf_config, "text_config", hf_config)
     top_k = int(resolve_hisparse_top_k(server_args, hf_text_config))
+    hisparse_config = parse_hisparse_config(server_args)
+    model_index_topk = int(getattr(hf_text_config, "index_topk", top_k))
 
     if top_k <= 0:
         raise ValueError(f"DSV4 HiSparse requires positive top_k, got {top_k}.")
+    if (
+        getattr(hisparse_config, "top_k_explicit", False)
+        and top_k != model_index_topk
+        and not envs.SGLANG_DSV4_HISPARSE_ALLOW_TOPK_OVERRIDE.get()
+    ):
+        raise ValueError(
+            "DSV4 HiSparse top_k must match the model index_topk for "
+            "precision-equivalent C4 sparse attention. "
+            f"hisparse_config.top_k={top_k}, model index_topk={model_index_topk}. "
+            "Remove top_k from --hisparse-config or set it to the model value. "
+            "Set SGLANG_DSV4_HISPARSE_ALLOW_TOPK_OVERRIDE=1 only for explicit "
+            "accuracy/performance experiments."
+        )
     if top_k > 1024:
         raise ValueError(
             "DSV4 HiSparse C4 sparse attention currently supports top_k <= 1024; "

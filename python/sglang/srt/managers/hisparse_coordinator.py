@@ -902,6 +902,7 @@ class HiSparseCoordinator:
                 token_ids,
                 host_indices.cpu(),
                 req.extra_key,
+                req=req,
             )
             if duplicate_indices.numel() > 0:
                 self.mem_pool_host.free(duplicate_indices)
@@ -1391,6 +1392,7 @@ class HiSparseCoordinator:
                 new_protected_len=prefill_len,
                 lock_new_node=True,
                 return_canonical_indices=True,
+                req=req,
             )
         )
 

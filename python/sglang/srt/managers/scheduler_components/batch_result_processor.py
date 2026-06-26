@@ -91,7 +91,12 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.flush_online_c128_pending_for_reqs([req])
+                self.flush_online_c128_pending_for_reqs(
+                    [req],
+                    require_forward_progress=not isinstance(
+                        req.finished_reason, FINISH_ABORT
+                    ),
+                )
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(
@@ -179,7 +184,12 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
-    def flush_online_c128_pending_for_reqs(self, reqs: List[Req]) -> None:
+    def flush_online_c128_pending_for_reqs(
+        self,
+        reqs: List[Req],
+        *,
+        require_forward_progress: bool = False,
+    ) -> None:
         if not self.server_args.enable_hisparse:
             return
         model_runner = getattr(self.model_worker, "model_runner", None)
@@ -198,7 +208,7 @@ class SchedulerBatchResultProcessor:
             controller = getattr(backend, "online_c128_mtp", None)
             flush = getattr(controller, "flush_pending_for_reqs", None)
             if flush is not None:
-                flush(reqs)
+                flush(reqs, require_forward_progress=require_forward_progress)
 
     def process_batch_result_prefill(
         self,
@@ -831,7 +841,12 @@ class SchedulerBatchResultProcessor:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
-            self.flush_online_c128_pending_for_reqs([req])
+            self.flush_online_c128_pending_for_reqs(
+                [req],
+                require_forward_progress=not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ),
+            )
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

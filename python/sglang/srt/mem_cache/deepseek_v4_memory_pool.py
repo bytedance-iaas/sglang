@@ -918,10 +918,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             state = pool.kv_score_buffer.kv_score
             if ONLINE_C128:
-                row = state[req_pool_idx]
-                head_dim = row.shape[-1] // 3
-                row[:head_dim].fill_(float("-inf"))
-                row[head_dim:].zero_()
+                # Online C128 state layout is [max, sum, kv].  The online
+                # kernels use (0, 0, 0) as the empty running-state identity and
+                # ignore the previous state at 128-aligned chunk boundaries.
+                # Keep radix/request-slot clears consistent with that layout so
+                # a reused slot cannot carry stale partial C128 state.
+                state[req_pool_idx].zero_()
             else:
                 start = req_pool_idx * pool.ring_size
                 rows = state[start : start + pool.ring_size]

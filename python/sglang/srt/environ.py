@@ -654,6 +654,9 @@ class Envs:
     # swap-in pass. Keep the legacy top-k path as the correctness default until
     # raw-only topk_v2 is validated against the swap-in mapping path.
     SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(False)
+    # DSV4 C4 sparse attention quality is calibrated by the model's index_topk.
+    # Keep HiSparse on that value unless an experiment explicitly opts out.
+    SGLANG_DSV4_HISPARSE_ALLOW_TOPK_OVERRIDE = EnvBool(False)
     SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK = EnvBool(True)
     # 0 means keep the default layer0-only C4 swap check. A positive value
     # samples every Nth C4 layer in eager mode for debugging precision issues.

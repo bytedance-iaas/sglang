@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
-DSV4_HISPARSE_PROTOCOL_VERSION = 2
+DSV4_HISPARSE_PROTOCOL_VERSION = 3
 
 
 def is_dsv4_c128_online_enabled() -> bool:
@@ -80,10 +80,22 @@ def build_dsv4_hisparse_capability_signature(
     payload = {
         "dsv4_hisparse_protocol_version": DSV4_HISPARSE_PROTOCOL_VERSION,
         "compressor_v2": bool(envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()),
+        "deepgemm_hc_prenorm": bool(envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()),
+        "dsv4_compress_state_dtype": envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get()
+        .strip()
+        .lower(),
+        "dsv4_fp4_experts": bool(
+            getattr(model_config, "is_fp4_experts", envs.SGLANG_DSV4_FP4_EXPERTS.get())
+        ),
         "experimental_online_c128_mtp": bool(
             envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
         ),
         "online_c128": bool(is_dsv4_c128_online_enabled()),
+        "tilelang_mhc_post": bool(envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()),
+        "tilelang_mhc_pre": bool(envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()),
+        "tilelang_mhc_split_sinkhorn": bool(
+            envs.SGLANG_OPT_USE_TILELANG_MHC_SPLIT_SINKHORN.get()
+        ),
     }
     if enable_hisparse:
         config = parse_hisparse_config(server_args)
@@ -704,6 +716,16 @@ def setup_state_kv_args(
                         c128_data_lens,
                         c128_item_lens,
                     )
+            if (
+                envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                and StateType.C128_STATE not in kv_args.state_types
+            ):
+                raise RuntimeError(
+                    "DSV4 online C128 compression requires P/D transfer of "
+                    "StateType.C128_STATE, but setup_state_kv_args did not "
+                    "register a C128 state component. This would let decode "
+                    "reuse a radix prefix without the request-scoped C128 state."
+                )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()

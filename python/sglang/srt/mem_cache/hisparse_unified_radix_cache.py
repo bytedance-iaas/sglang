@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.managers.hisparse_accuracy_trace import trace_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -61,6 +62,217 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         self._last_match_host_indices.clear()
         self._req_radix_node.clear()
         self._req_radix_prefix_len.clear()
+
+    def _dsv4_kv_pool(self):
+        if self.token_to_kv_pool_allocator is None:
+            return None
+        get_kvcache = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return None
+        kv_pool = get_kvcache()
+        if (
+            not hasattr(kv_pool, "snapshot_c128_radix_state")
+            or not hasattr(kv_pool, "restore_c128_radix_state")
+            or not hasattr(kv_pool, "clear_c128_radix_state")
+        ):
+            return None
+        return kv_pool
+
+    def _node_token_len(self, node: UnifiedTreeNode) -> int:
+        if node is None or node is self.root_node:
+            return 0
+        host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if host_value is not None:
+            return len(host_value)
+        value = node.component_data[BASE_COMPONENT_TYPE].value
+        if value is not None:
+            return len(value)
+        return len(node.key) if node.key is not None else 0
+
+    def _node_prefix_len(self, node: UnifiedTreeNode) -> int:
+        prefix_len = 0
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            prefix_len += self._node_token_len(cur)
+            cur = cur.parent
+        return prefix_len
+
+    def _snapshot_c128_state_for_req(
+        self, req: Req, seq_len: int
+    ) -> Optional[list[torch.Tensor]]:
+        kv_pool = self._dsv4_kv_pool()
+        if kv_pool is None or req.req_pool_idx is None or seq_len <= 0:
+            return None
+        return kv_pool.snapshot_c128_radix_state(int(req.req_pool_idx), seq_len)
+
+    def _get_c128_snapshot_at_node_offset(
+        self, node: UnifiedTreeNode, offset: int
+    ) -> Optional[list[torch.Tensor]]:
+        snapshots = getattr(node, "c128_state_snapshots", None)
+        if snapshots is None:
+            return None
+        return snapshots.get(offset)
+
+    def _c128_snapshot_required(self, prefix_len: int) -> bool:
+        return prefix_len > 0 and prefix_len % 128 != 0
+
+    def _node_at_prefix_len(
+        self, node: UnifiedTreeNode, prefix_len: int
+    ) -> tuple[UnifiedTreeNode, int, int]:
+        path: list[UnifiedTreeNode] = []
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            path.append(cur)
+            cur = cur.parent
+        path.reverse()
+
+        remaining = prefix_len
+        accumulated = 0
+        for cur in path:
+            node_len = self._node_token_len(cur)
+            if remaining <= node_len:
+                return cur, remaining, accumulated + remaining
+            remaining -= node_len
+            accumulated += node_len
+        return self.root_node, 0, 0
+
+    def _store_c128_snapshot_at_prefix_len(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        snapshot: Optional[list[torch.Tensor]],
+    ) -> None:
+        if snapshot is None or prefix_len <= 0:
+            return
+        target_node, offset, _ = self._node_at_prefix_len(node, prefix_len)
+        if target_node is self.root_node or offset <= 0:
+            return
+        snapshots = getattr(target_node, "c128_state_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            setattr(target_node, "c128_state_snapshots", snapshots)
+        snapshots[offset] = snapshot
+
+    def _store_c128_partial_snapshot_for_req(
+        self, req: Req, node: UnifiedTreeNode, prefix_len: int
+    ) -> None:
+        if prefix_len <= 0 or prefix_len % 128 == 0:
+            return
+        node_prefix_len = self._node_prefix_len(node)
+        if node_prefix_len < prefix_len:
+            raise RuntimeError(
+                "DSV4 HiSparse unified radix cannot attach C128 snapshot to "
+                "a host node shorter than the cached prefix: "
+                f"rid={getattr(req, 'rid', None)}, "
+                f"req_pool_idx={req.req_pool_idx}, prefix_len={prefix_len}, "
+                f"node_prefix_len={node_prefix_len}, "
+                f"node_id={getattr(node, 'id', None)}."
+            )
+        snapshot = self._snapshot_c128_state_for_req(req, prefix_len)
+        if snapshot is None and self._dsv4_kv_pool() is not None:
+            raise RuntimeError(
+                "DSV4 HiSparse unified radix attempted to store a "
+                "non-128-aligned C128 prefix without a snapshot: "
+                f"rid={getattr(req, 'rid', None)}, "
+                f"req_pool_idx={req.req_pool_idx}, prefix_len={prefix_len}."
+            )
+        self._store_c128_snapshot_at_prefix_len(node, prefix_len, snapshot)
+        trace_req(
+            logger,
+            "hisparse_unified_c128_snapshot_store",
+            req,
+            prefix_len=prefix_len,
+            node_prefix_len=node_prefix_len,
+            snapshot_count=0 if snapshot is None else len(snapshot),
+        )
+
+    def _restore_c128_state_for_req_idx(
+        self,
+        req_idx: int,
+        node: Optional[UnifiedTreeNode],
+        prefix_len: int,
+        req: Optional[Req] = None,
+    ) -> None:
+        kv_pool = self._dsv4_kv_pool()
+        if kv_pool is None or node is None or node is self.root_node:
+            return
+
+        target_node, offset, node_prefix_len = self._node_at_prefix_len(
+            node, prefix_len
+        )
+        if target_node is self.root_node:
+            return
+        if node_prefix_len != prefix_len:
+            raise RuntimeError(
+                "DSV4 HiSparse unified radix C128 restore prefix mismatch: "
+                f"req_idx={req_idx}, requested_prefix_len={prefix_len}, "
+                f"node_prefix_len={node_prefix_len}, node_id={getattr(node, 'id', None)}."
+            )
+
+        snapshot = self._get_c128_snapshot_at_node_offset(target_node, offset)
+        if snapshot is not None:
+            kv_pool.restore_c128_radix_state(int(req_idx), snapshot)
+            if req is not None:
+                trace_req(
+                    logger,
+                    "hisparse_unified_c128_snapshot_restore",
+                    req,
+                    prefix_len=prefix_len,
+                    node_id=getattr(target_node, "id", None),
+                    snapshot_count=len(snapshot),
+                )
+            return
+
+        if self._c128_snapshot_required(prefix_len):
+            raise RuntimeError(
+                "DSV4 HiSparse unified radix hit a non-128-aligned prefix "
+                "without stored C128 snapshot: "
+                f"req_idx={req_idx}, prefix_len={prefix_len}, "
+                f"node_id={getattr(target_node, 'id', None)}."
+            )
+        kv_pool.clear_c128_radix_state(int(req_idx))
+        if req is not None:
+            trace_req(
+                logger,
+                "hisparse_unified_c128_snapshot_clear",
+                req,
+                prefix_len=prefix_len,
+                node_id=getattr(target_node, "id", None),
+            )
+
+    def restore_c128_state_for_reqs(self, reqs: list[Req]) -> None:
+        for req in reqs:
+            if req.req_pool_idx is None:
+                continue
+            node = self._req_radix_node.get(req.req_pool_idx)
+            prefix_len = self._req_radix_prefix_len.get(req.req_pool_idx, 0)
+            self._restore_c128_state_for_req_idx(
+                int(req.req_pool_idx), node, prefix_len, req=req
+            )
+
+    def _split_node(
+        self, key: RadixKey, child: UnifiedTreeNode, split_len: int
+    ) -> UnifiedTreeNode:
+        old_snapshots = getattr(child, "c128_state_snapshots", None)
+        new_parent = super()._split_node(key, child, split_len)
+        if old_snapshots:
+            parent_snapshots = {
+                offset: snapshot
+                for offset, snapshot in old_snapshots.items()
+                if offset <= split_len
+            }
+            child_snapshots = {
+                offset - split_len: snapshot
+                for offset, snapshot in old_snapshots.items()
+                if offset > split_len
+            }
+            if parent_snapshots:
+                setattr(new_parent, "c128_state_snapshots", parent_snapshots)
+            if child_snapshots:
+                setattr(child, "c128_state_snapshots", child_snapshots)
+            elif hasattr(child, "c128_state_snapshots"):
+                delattr(child, "c128_state_snapshots")
+        return new_parent
 
     def init_hisparse_radix_cache(
         self, host_pool, server_args: Optional[ServerArgs] = None
@@ -310,7 +522,9 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
                 0,
             )
 
-        _, best_match_node, _, _ = self._match_prefix_helper(key)
+        _, best_match_node, _, _ = self._match_prefix_helper(
+            key, MatchPrefixParams(key=key)
+        )
         host_indices = self._collect_host_indices(best_match_node)
         return host_indices, best_match_node, len(host_indices)
 
@@ -498,6 +712,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         new_protected_len: Optional[int] = None,
         lock_new_node: bool = False,
         return_canonical_indices: bool = False,
+        req: Optional[Req] = None,
     ) -> tuple[int, torch.Tensor, Optional[torch.Tensor]]:
         old_node = (
             self._req_radix_node.get(req_idx)
@@ -512,9 +727,29 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
                 protected_len=self.req_prefix_len(req_idx),
                 old_node=old_node,
                 lock_new_node=lock_new_node,
-                return_canonical_indices=return_canonical_indices,
+                return_canonical_indices=return_canonical_indices
+                or req is not None,
             )
         )
+        if req is not None:
+            snapshot_prefix_len = len(
+                RadixKey(token_ids=token_ids, extra_key=extra_key).page_aligned(
+                    self.page_size
+                )
+            )
+            if snapshot_prefix_len > 0:
+                if new_node is None:
+                    _, new_node, _ = self.host_match_prefix(token_ids, extra_key)
+                if new_node is None or new_node is self.root_node:
+                    raise RuntimeError(
+                        "DSV4 HiSparse unified radix failed to locate a host "
+                        "node for C128 snapshot after insert: "
+                        f"req_idx={req_idx}, rid={getattr(req, 'rid', None)}, "
+                        f"snapshot_prefix_len={snapshot_prefix_len}."
+                    )
+                self._store_c128_partial_snapshot_for_req(
+                    req, new_node, snapshot_prefix_len
+                )
         if new_protected_len is not None:
             if new_node is None:
                 self._req_radix_node.pop(req_idx, None)

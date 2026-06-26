@@ -889,7 +889,16 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
+        has_state_payload = bool(state_indices) and any(
+            component_indices is not None and len(component_indices) > 0
+            for component_indices in state_indices
+        )
+        if (
+            not req.disagg_kv_sender.should_send_kv_chunk(
+                len(page_indices), last_chunk
+            )
+            and not has_state_payload
+        ):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx

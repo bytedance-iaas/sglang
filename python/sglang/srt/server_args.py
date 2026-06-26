@@ -3953,6 +3953,7 @@ class ServerArgs:
             top_k = int(resolve_hisparse_top_k(self, text_config))
             sparse_config = parse_hisparse_config(self)
             device_buffer_size = int(sparse_config.device_buffer_size)
+            model_index_topk = int(getattr(text_config, "index_topk", top_k))
         except Exception as exc:
             raise ValueError(
                 "Failed to validate DSV4 HiSparse top-k configuration."
@@ -3960,6 +3961,19 @@ class ServerArgs:
 
         if top_k <= 0:
             raise ValueError(f"DSV4 HiSparse top_k must be positive, got {top_k}.")
+        if (
+            getattr(sparse_config, "top_k_explicit", False)
+            and top_k != model_index_topk
+            and not envs.SGLANG_DSV4_HISPARSE_ALLOW_TOPK_OVERRIDE.get()
+        ):
+            raise ValueError(
+                "DSV4 HiSparse top_k must match the model index_topk for "
+                "precision-equivalent C4 sparse attention. "
+                f"hisparse_config.top_k={top_k}, model index_topk={model_index_topk}. "
+                "Remove top_k from --hisparse-config or set it to the model value. "
+                "Set SGLANG_DSV4_HISPARSE_ALLOW_TOPK_OVERRIDE=1 only for explicit "
+                "accuracy/performance experiments."
+            )
         if device_buffer_size < top_k:
             raise ValueError(
                 "DSV4 HiSparse device_buffer_size must be no smaller than "
