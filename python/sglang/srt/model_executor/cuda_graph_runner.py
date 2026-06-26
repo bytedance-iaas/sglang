@@ -291,6 +291,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
     ):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
+            # Padded req slots must use ReqToTokenPool row 0. Otherwise stale
+            # req ids from an earlier larger replay can leak into metadata that
+            # still plans padded tokens, such as DSV4 HiSparse C4/C128 state.
+            self.req_pool_indices.zero_()
             self.out_cache_loc.zero_()
             # Padded SWA indices left over from a previous replay would point
             # into real SWA slots, so set_kv_buffer on padded tokens would

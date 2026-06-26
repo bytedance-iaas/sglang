@@ -457,6 +457,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+        if bs != raw_bs:
+            buffers.req_pool_indices.zero_()
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)

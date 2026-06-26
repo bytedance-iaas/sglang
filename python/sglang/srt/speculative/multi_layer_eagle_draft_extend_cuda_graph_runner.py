@@ -517,6 +517,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int
     ):
         buffers = self.buffers
+        if bs != raw_bs:
+            buffers.req_pool_indices.zero_()
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
