@@ -479,6 +479,7 @@ class HiSparseCoordinator:
         self._has_pending_backup = False
         self._c4_backup_wait_count = 0
         self._c4_backup_wait_enqueue_ms = 0.0
+        self._trace_req_pool_rids: Dict[int, str] = {}
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -1123,6 +1124,7 @@ class HiSparseCoordinator:
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
+        self._remember_trace_req(req)
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1177,6 +1179,7 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
+        self._remember_trace_req(req)
         self.alloc_device_buffer(req)
 
         host_len = self._host_token_len(req.kv_allocated_len)
@@ -2202,6 +2205,7 @@ class HiSparseCoordinator:
         self._debug_assert_request_state_cleared(req.req_pool_idx)
 
     def _clear_request_runtime_state(self, req_pool_idx: int) -> None:
+        self._trace_req_pool_rids.pop(int(req_pool_idx), None)
         self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
         self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
         self.req_to_device_buffer[req_pool_idx, :] = 0
@@ -2338,6 +2342,7 @@ class HiSparseCoordinator:
             return False
 
         req_pool_idx = req.req_pool_idx
+        self._remember_trace_req(req)
         host_len = int(getattr(req, "hisparse_retract_host_len", len(host_indices)))
         if host_len > self.req_to_host_pool.shape[1]:
             raise RuntimeError(
@@ -2391,6 +2396,22 @@ class HiSparseCoordinator:
             if hasattr(req, attr):
                 delattr(req, attr)
         return True
+
+    def _remember_trace_req(self, req: Req) -> None:
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            return
+        self._trace_req_pool_rids[int(req_pool_idx)] = str(getattr(req, "rid", None))
+
+    def _trace_rids_for_req_pool_indices(self, req_pool_indices: torch.Tensor) -> List[str]:
+        try:
+            indices = req_pool_indices.detach().to("cpu", non_blocking=False).tolist()
+        except Exception as exc:
+            return [f"error:{type(exc).__name__}"]
+        return [
+            self._trace_req_pool_rids.get(int(req_idx), f"unknown:{int(req_idx)}")
+            for req_idx in indices[:8]
+        ]
 
     def release_retracted_decode_req(self, req: Req) -> None:
         """Free DSV4 HiSparse state for a request aborted while retracted."""
@@ -2659,6 +2680,7 @@ class HiSparseCoordinator:
             valid_count=valid_count,
             hot_hit_count=hit_count,
             host_miss_count=miss_count,
+            req_rids=self._trace_rids_for_req_pool_indices(req_pool_indices),
             req_pool_indices=tensor_digest(req_pool_indices),
             compressed_seq_lens=tensor_digest(compressed_seq_lens),
             raw_topk=tensor_digest(top_k_result),
