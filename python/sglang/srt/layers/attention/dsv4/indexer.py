@@ -493,22 +493,52 @@ class C4IndexerBackendMixin:
                 ):
                     base_req_pool_indices = forward_batch.req_pool_indices
                     base_batch_size = base_req_pool_indices.size(0)
-                    if topk_batch_size % base_batch_size != 0:
+                    if base_batch_size <= 0:
                         raise RuntimeError(
-                            "HiSparse target-verify C4 top-k batch is not a "
-                            "multiple of request batch size: "
+                            "HiSparse target-verify C4 top-k has no base requests: "
+                            f"topk_batch_size={topk_batch_size}."
+                        )
+                    if forward_batch.out_cache_loc is not None:
+                        real_topk_batch_size = forward_batch.out_cache_loc.numel()
+                        if real_topk_batch_size % base_batch_size != 0:
+                            raise RuntimeError(
+                                "HiSparse target-verify C4 output token count is not "
+                                "a multiple of request batch size: "
+                                f"real_topk_batch_size={real_topk_batch_size}, "
+                                f"base_batch_size={base_batch_size}."
+                            )
+                    else:
+                        real_topk_batch_size = topk_batch_size
+                        if real_topk_batch_size % base_batch_size != 0:
+                            raise RuntimeError(
+                                "HiSparse target-verify C4 top-k batch is not a "
+                                "multiple of request batch size: "
+                                f"topk_batch_size={topk_batch_size}, "
+                                f"base_batch_size={base_batch_size}."
+                            )
+                    if real_topk_batch_size > topk_batch_size:
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 real token count exceeds "
+                            "top-k metadata rows: "
+                            f"real_topk_batch_size={real_topk_batch_size}, "
                             f"topk_batch_size={topk_batch_size}, "
                             f"base_batch_size={base_batch_size}."
                         )
-                    tokens_per_req = topk_batch_size // base_batch_size
-                    raw_indices_by_token = raw_indices.view(
+                    if real_topk_batch_size < topk_batch_size:
+                        core_metadata.c4_sparse_page_indices[
+                            real_topk_batch_size:
+                        ].fill_(-1)
+                    tokens_per_req = real_topk_batch_size // base_batch_size
+                    raw_indices_by_token = raw_indices[:real_topk_batch_size].view(
                         base_batch_size, tokens_per_req, topk_size
                     )
                     seq_lens_by_token = indexer_metadata.c4_seq_lens.view(
+                        -1
+                    )[:real_topk_batch_size].view(
                         base_batch_size, tokens_per_req
                     )
                     device_indices_by_token = (
-                        core_metadata.c4_sparse_page_indices.view(
+                        core_metadata.c4_sparse_page_indices[:real_topk_batch_size].view(
                             base_batch_size, tokens_per_req, topk_size
                         )
                     )
