@@ -958,6 +958,39 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         compressed_mask = (token_positions + 1) % self.compress_ratio == 0
         return (logical_indices[compressed_mask] // self.compress_ratio).to(torch.int64)
 
+    def _token_positions_from_extend_lens(
+        self,
+        logical_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        if logical_indices.numel() == 0:
+            return torch.empty(
+                (0,), dtype=torch.int64, device=logical_indices.device
+            )
+
+        extend_lens = (seq_lens - prefix_lens).to(torch.int64)
+        total_extend = int(logical_indices.numel())
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=logical_indices.device),
+                extend_lens.cumsum(0),
+            ]
+        )
+        position_bases = torch.repeat_interleave(
+            prefix_lens.to(torch.int64), extend_lens
+        )
+        if position_bases.numel() != total_extend:
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse extend position mismatch: "
+                f"{position_bases.numel()} positions vs "
+                f"{total_extend} logical locs."
+            )
+        token_offsets = torch.arange(
+            total_extend, dtype=torch.int64, device=logical_indices.device
+        ) - torch.repeat_interleave(offsets[:-1], extend_lens)
+        return position_bases + token_offsets
+
     def _merge_logical_release_pages_if_needed(self, num_new_pages: int) -> None:
         """Make recently released logical pages allocatable for a small draft extend."""
         if num_new_pages <= 0:
@@ -1122,7 +1155,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             logical_indices = out
             state = None
 
-        self.bind_device_mapping(logical_indices, device_slots)
+        token_positions = self._token_positions_from_extend_lens(
+            logical_indices, prefix_lens, seq_lens
+        )
+        self.bind_device_mapping(logical_indices, device_slots, token_positions)
         if backup_state:
             return logical_indices, state
         return logical_indices
