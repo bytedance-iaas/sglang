@@ -877,7 +877,10 @@ class HiSparseCoordinator:
 
     def _release_host_slots(self, req: Req) -> None:
         if self.host_radix_cache is not None:
-            self._release_or_cache_host_radix_slots(req)
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self._release_aborted_host_radix_slots(req)
+            else:
+                self._release_or_cache_host_radix_slots(req)
             return
         if self.is_dsv4_hisparse:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -908,6 +911,14 @@ class HiSparseCoordinator:
                 self.mem_pool_host.free(duplicate_indices)
 
         self._free_request_host_indices_from(req, max(cache_key_len, old_protected))
+        self.host_radix_cache.release_req_node(req.req_pool_idx)
+
+    def _release_aborted_host_radix_slots(self, req: Req) -> None:
+        # Abort/failed requests must not publish partially generated C4 host
+        # mirrors into the shared radix tree. Preserve only the matched prefix
+        # that was already locked when the request was admitted.
+        protected_len = self.host_radix_cache.req_prefix_len(req.req_pool_idx)
+        self._free_request_host_indices_from(req, protected_len)
         self.host_radix_cache.release_req_node(req.req_pool_idx)
 
     def _prepare_radix_cache_len(self, req: Req, total_len: int) -> int:
