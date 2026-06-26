@@ -216,31 +216,35 @@ class OnlineC128MTPController:
                 f"verify context: {self._ctx_shape(self._verify_ctx)}."
             )
 
-        tail_locs = self._capture_tail_locs(req_pool_indices, seq_lens)
+        bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
+        captured_req_pool_indices = req_pool_indices[:bs].detach().clone()
+        captured_seq_lens = seq_lens[:bs].detach().clone()
+        tail_locs = self._capture_tail_locs(
+            captured_req_pool_indices, captured_seq_lens
+        )
         self._verify_ctx = _OnlineC128VerifyContext(
-            req_pool_indices=req_pool_indices.detach(),
-            seq_lens=seq_lens.detach(),
-            tail_locs=tail_locs.detach(),
+            req_pool_indices=captured_req_pool_indices,
+            seq_lens=captured_seq_lens,
+            tail_locs=tail_locs.detach().clone(),
         )
         trace_event(
             logger,
             "online_c128_begin_verify",
-            bs=min(seq_lens.shape[0], req_pool_indices.shape[0]),
+            bs=bs,
             num_verify_tokens=self._num_verify_tokens(),
             state_slot_offset=self.state_slot_offset(),
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+            req_pool_indices=captured_req_pool_indices,
+            seq_lens=captured_seq_lens,
             tail_locs=tail_locs,
         )
-        if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
+        if captured_req_pool_indices.numel() == 0 or captured_seq_lens.numel() == 0:
             return
         if self._num_verify_tokens() == 0:
             return
-        bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
         for runtime in self._iter_layer_runtimes():
             online_c128_mtp_prepare(
-                seq_lens=seq_lens,
-                req_pool_indices=req_pool_indices,
+                seq_lens=captured_seq_lens,
+                req_pool_indices=captured_req_pool_indices,
                 req_to_token=self.backend.req_to_token,
                 main_state=runtime.main_state,
                 bs=bs,
@@ -538,9 +542,9 @@ class OnlineC128MTPController:
             self.clear()
             return
         self._verify_ctx = _OnlineC128VerifyContext(
-            req_pool_indices=ctx.req_pool_indices[:old_bs][keep].detach(),
-            seq_lens=ctx.seq_lens[:old_bs][keep].detach(),
-            tail_locs=ctx.tail_locs[:old_bs][keep].detach(),
+            req_pool_indices=ctx.req_pool_indices[:old_bs][keep].detach().clone(),
+            seq_lens=ctx.seq_lens[:old_bs][keep].detach().clone(),
+            tail_locs=ctx.tail_locs[:old_bs][keep].detach().clone(),
         )
 
     def _num_verify_tokens(self) -> int:
