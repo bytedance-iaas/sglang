@@ -1,0 +1,16 @@
+python/sglang/srt/mem_cache/eic_hiradix_cache.py
+  h_650b59c79eeeea 956-957
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9f94a850d060055a22339fdad39e3032261ab17e",
+  "prompts": {},
+  "humans": {
+    "h_650b59c79eeeea": {
+      "author": "chenkailun.c <chenkailun.c@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
