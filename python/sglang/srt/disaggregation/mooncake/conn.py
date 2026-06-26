@@ -1145,13 +1145,19 @@ class MooncakeKVManager(CommonKVManager):
             if dst_kv_item_len is None:
                 logger.error("DSV4 HiSparse C4 transfer requires dst_kv_item_len.")
                 return -1
+            if decode_prefix_len is None:
+                logger.error(
+                    "DSV4 HiSparse C4 transfer requires decode_prefix_len when "
+                    "decode_c4_prefix_len is provided."
+                )
+                return -1
             return self._send_kvcache_hisparse_dsv4_c4(
                 mooncake_session_id=mooncake_session_id,
                 prefill_kv_indices=prefill_kv_indices,
                 dst_kv_ptrs=dst_kv_ptrs,
                 dst_kv_indices=dst_kv_indices,
                 page_index_slice=page_index_slice,
-                decode_prefix_len=decode_prefix_len or 0,
+                decode_prefix_len=decode_prefix_len,
                 dst_kv_item_len=dst_kv_item_len,
                 dst_c4_prefix_len=dst_c4_prefix_len,
             )
@@ -2446,7 +2452,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
-                        str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            str(decode_prefix_len).encode("ascii")
+                            if not is_dummy and decode_prefix_len is not None
+                            else b""
+                        ),
                         (
                             str(decode_c4_prefix_len).encode("ascii")
                             if not is_dummy and decode_c4_prefix_len is not None
