@@ -119,7 +119,9 @@ class CompressStatePool:
             self.kv_score_buffer = KVAndScore(
                 torch.empty((self._size, last_dim), dtype=dtype, device=device)
             )
-            if not online:
+            if online:
+                self._clear_online_dummy_rows()
+            else:
                 self.kv_score_buffer[-1].clear()
         else:
             self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -142,8 +144,20 @@ class CompressStatePool:
                             device=device,
                         )
                     )
-                    if not online:
+                    if online:
+                        self._clear_online_dummy_rows()
+                    else:
                         self.kv_score_buffer[-1].clear()
+
+    def _clear_online_dummy_rows(self) -> None:
+        """Initialize req_pool_idx=0 rows in every online C128 state bank.
+
+        CUDA graph padding routes dummy requests through req_pool_idx=0. Online
+        C128 MTP also has temporary banks at offsets of `_logical_size`, so each
+        bank needs a deterministic dummy row.
+        """
+        for row in range(0, self._size, self._logical_size):
+            self.kv_score_buffer.kv_score[row].zero_()
 
     def translate_from_swa_loc_to_state_loc(
         self, swa_loc: torch.Tensor
