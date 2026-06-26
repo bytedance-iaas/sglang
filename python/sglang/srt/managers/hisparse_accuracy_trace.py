@@ -94,9 +94,10 @@ def tensor_digest(tensor: Any, *, max_items: int = 16) -> str:
         flat = tensor.detach().reshape(-1)
         sample = flat[: min(max_items, flat.numel())].to("cpu", non_blocking=False)
         digest = hashlib.blake2b(sample.numpy().tobytes(), digest_size=8).hexdigest()
+        sample_list = sample.tolist()
         return (
             f"shape={tuple(tensor.shape)},dtype={tensor.dtype},device={tensor.device},"
-            f"sample_items={sample.numel()},digest={digest}"
+            f"sample_items={sample.numel()},digest={digest},head={sample_list}"
         )
     except Exception as exc:
         return (
@@ -132,10 +133,7 @@ def answer_markers(text: Optional[str]) -> dict[str, Any]:
 
 def _format_value(value: Any) -> str:
     if isinstance(value, torch.Tensor):
-        return (
-            f"Tensor(shape={tuple(value.shape)},dtype={value.dtype},"
-            f"device={value.device})"
-        )
+        return f"Tensor({tensor_digest(value, max_items=8)})"
     if isinstance(value, (list, tuple)):
         if len(value) > 8:
             return f"{type(value).__name__}(len={len(value)},head={list(value[:8])})"
