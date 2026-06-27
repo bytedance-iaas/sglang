@@ -1783,6 +1783,8 @@ class DeepseekV4Model(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
+        self.layers_to_capture = []
+        self.capture_aux_hidden_states_mean = False
 
     def hc_head(
         self,
@@ -1855,6 +1857,14 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
+        aux_hidden_states = []
+        layers_to_capture = set(getattr(self, "layers_to_capture", []))
+        if self.pp_group.is_last_rank and 0 in layers_to_capture:
+            if getattr(self, "capture_aux_hidden_states_mean", False):
+                aux_hidden_states.append(hidden_states.mean(dim=1))
+            else:
+                aux_hidden_states.append(hidden_states.flatten(1))
+
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
@@ -1877,6 +1887,12 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+            capture_point = i + 1
+            if self.pp_group.is_last_rank and capture_point in layers_to_capture:
+                if getattr(self, "capture_aux_hidden_states_mean", False):
+                    aux_hidden_states.append(hidden_states.mean(dim=1))
+                else:
+                    aux_hidden_states.append(hidden_states.flatten(1))
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
@@ -1902,6 +1918,8 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if aux_hidden_states:
+            return (hidden_states, pre_hc_head), aux_hidden_states
         return hidden_states, pre_hc_head
 
 
@@ -2028,16 +2046,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model.forward(
+            model_output = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         if not self.pp_group.is_last_rank:
-            return hidden_states
+            return model_output
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-        hidden_states, pre_hc_head = hidden_states
+            model_output, aux_hidden_states = model_output
+        hidden_states, pre_hc_head = model_output
 
         return self.logits_processor(
             input_ids,
@@ -2045,7 +2063,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
@@ -2496,6 +2516,9 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -2505,6 +2528,34 @@ class DeepseekV4ForCausalLM(nn.Module):
         # accessor so this works on both CUDA/HIP and NPU.
         torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states_mean = True
+        self.model.layers_to_capture = [
+            0 if int(layer_id) == -1 else int(layer_id) + 1
+            for layer_id in layer_ids
+        ]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states_mean = False
+        self.model.layers_to_capture = [
+            0 if int(layer_id) == -1 else int(layer_id) + 1
+            for layer_id in layer_ids
+        ]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

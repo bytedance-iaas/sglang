@@ -242,6 +242,109 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_dspark(server_args: ServerArgs) -> None:
+    if server_args.enable_dp_attention:
+        raise ValueError(
+            "Currently DSPARK speculative decoding does not support dp attention."
+        )
+
+    if server_args.pp_size != 1:
+        raise ValueError(
+            "Currently DSPARK speculative decoding only supports pp_size == 1."
+        )
+
+    if server_args.speculative_draft_model_path is None:
+        server_args.speculative_draft_model_path = server_args.model_path
+        server_args.speculative_draft_model_revision = server_args.revision
+    elif server_args.speculative_draft_model_revision is None:
+        server_args.speculative_draft_model_revision = "main"
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "DSPARK only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(server_args.speculative_eagle_topk) != 1:
+        logger.warning(
+            "DSPARK MVP only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+            server_args.speculative_eagle_topk,
+        )
+        server_args.speculative_eagle_topk = 1
+
+    model_override_args = json.loads(server_args.json_model_override_args)
+    inferred_block_size = None
+    try:
+        from sglang.srt.speculative.dspark_utils import parse_dspark_draft_config
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=model_override_args,
+        )
+        inferred_block_size = parse_dspark_draft_config(
+            draft_hf_config=draft_hf_config
+        ).resolve_block_size(default=None)
+    except Exception as e:
+        logger.warning(
+            "Failed to infer DSPARK block_size from draft model config; "
+            "defaulting block_size to 5. Error: %s",
+            e,
+        )
+
+    if inferred_block_size is None:
+        inferred_block_size = 5
+
+    # DSPARK's model config block_size is proposal length. SGLang's
+    # speculative_num_draft_tokens is the target verify window, which includes
+    # the current token plus the proposals.
+    inferred_verify_len = int(inferred_block_size) + 1
+    if server_args.speculative_num_draft_tokens is None:
+        server_args.speculative_num_draft_tokens = inferred_verify_len
+    elif int(server_args.speculative_num_draft_tokens) == int(inferred_block_size):
+        logger.warning(
+            "DSPARK config block_size=%s is proposal length; converting "
+            "speculative_num_draft_tokens from %s to verify window length %s.",
+            inferred_block_size,
+            server_args.speculative_num_draft_tokens,
+            inferred_verify_len,
+        )
+        server_args.speculative_num_draft_tokens = inferred_verify_len
+    elif int(server_args.speculative_num_draft_tokens) < 2:
+        raise ValueError(
+            "DSPARK requires --speculative-num-draft-tokens to be at least 2 "
+            "(current token + one proposal token). "
+            f"Got {server_args.speculative_num_draft_tokens}."
+        )
+
+    threshold = float(server_args.speculative_dspark_confidence_threshold)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            "--speculative-dspark-confidence-threshold must be in [0, 1], "
+            f"got {threshold}."
+        )
+    server_args.speculative_dspark_confidence_threshold = threshold
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+        )
+
+
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
