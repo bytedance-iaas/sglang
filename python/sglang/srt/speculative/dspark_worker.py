@@ -392,8 +392,13 @@ class DSparkWorker:
         self.draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        # DSpark draft forwarding uses fixed-length target-verify style prefill
+        # with FlashInfer. Capturing large draft graph buckets can exceed the
+        # shared FlashInfer workspace before serving starts; keep the draft
+        # runner eager for the MVP while the target runner still follows the
+        # normal CUDA graph configuration.
         self.draft_worker.init_cuda_graphs(
-            capture_decode_cuda_graph=not self.server_args.disable_cuda_graph
+            capture_decode_cuda_graph=False
         )
 
     def _gather_req_to_token_masked(
