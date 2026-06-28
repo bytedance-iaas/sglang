@@ -370,6 +370,32 @@ class DSparkWorker:
         # to flush here.
         pass
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        # Without draft windowing, the draft worker aliases the target
+        # request->token mapping and allocation state. With draft windowing
+        # enabled, the draft worker keeps a private compact req->token table
+        # over the same global KV index space.
+        self.draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=(
+                None if self.use_compact_draft_cache else req_to_token_pool
+            ),
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+    def init_attention_backends(self):
+        self.draft_worker.init_attention_backends()
+
+    def init_cuda_graphs(self):
+        self.draft_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=not self.server_args.disable_cuda_graph
+        )
+
     def _gather_req_to_token_masked(
         self,
         *,
