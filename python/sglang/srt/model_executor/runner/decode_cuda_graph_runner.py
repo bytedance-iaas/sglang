@@ -234,7 +234,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if not (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    or self.model_runner.spec_algorithm.is_dspark()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -405,6 +408,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -796,7 +800,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash()
+                    (
+                        self.model_runner.spec_algorithm.is_dflash()
+                        or self.model_runner.spec_algorithm.is_dspark()
+                    )
                     and self.model_runner.is_draft_worker
                     and "input_embeds" in inspect.signature(forward).parameters
                 ):
@@ -874,7 +881,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    or self.model_runner.spec_algorithm.is_dspark()
+                )
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
@@ -901,6 +911,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -917,7 +928,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         if (
-            self.model_runner.spec_algorithm.is_dflash()
+            (
+                self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
+            )
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
@@ -1073,6 +1087,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=(
+                    None
+                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    else self.buffers.custom_mask
+                ),
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+            from sglang.srt.speculative.dspark_utils import (
+                resolve_dspark_verify_mask_policy,
+            )
+
+            _, build_custom_mask = resolve_dspark_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            spec_info = DSparkVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
