@@ -20,6 +20,7 @@ from sglang.srt.speculative.dspark_utils import (
     compute_dspark_sampling_correct_drafts_and_bonus,
     is_dspark_sampling_verify_available,
 )
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -144,6 +145,25 @@ class DSparkDraftInput(SpecInput):
             self.target_hidden = torch.cat(
                 [self.target_hidden, spec_info.target_hidden], dim=0
             )
+
+
+@dataclass
+class DSparkDraftInputV2(DFlashDraftInputV2):
+    """Draft-side state carried across overlap iterations (spec-v2)."""
+
+    def __post_init__(self):
+        SpecInput.__init__(self, spec_input_type=SpecInputType.DSPARK_DRAFT)
+
+    @classmethod
+    def create_idle_input(cls, device: torch.device) -> "DSparkDraftInputV2":
+        return cls(
+            topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
+            hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
+            verify_done=None,
+        )
 
 
 @dataclass
