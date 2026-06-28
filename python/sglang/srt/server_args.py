@@ -1485,7 +1485,10 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        Arg(
+            help="Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+            aliases=["--speculative-algo"],
+        ),
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1521,6 +1524,10 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_confidence_threshold: A[
+        float,
+        "DSPARK only. Static confidence threshold for truncating the proposed block. Set to 0 to disable confidence truncation.",
+    ] = 0.0
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

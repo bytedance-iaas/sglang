@@ -57,11 +57,17 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    # V2 workers nest the draft runner under `.draft_worker`.
-    if server_args.enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    # V2 workers nest the draft runner under `.draft_worker`. DSpark currently
+    # uses a TpModelWorker internally, whose runner is exposed as `model_runner`.
+    inner_draft_worker = draft_worker.draft_worker
+    if server_args.enable_multi_layer_eagle and hasattr(
+        inner_draft_worker, "draft_runner_list"
+    ):
+        draft_runner = inner_draft_worker.draft_runner_list[0]
+    elif hasattr(inner_draft_worker, "draft_runner"):
+        draft_runner = inner_draft_worker.draft_runner
     else:
-        draft_runner = draft_worker.draft_worker.draft_runner
+        draft_runner = inner_draft_worker.model_runner
     return draft_runner.token_to_kv_pool, draft_runner.model_config
 
 

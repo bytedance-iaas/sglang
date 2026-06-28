@@ -144,19 +144,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * (1 + int(eagle_draft_num_layers) / int(num_layers))
                 )
 
-        # DFLASH: scale cell_size to account for draft model KV cache
-        if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                scale_kv_cell_size_per_token_for_dflash,
-            )
+        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache.
+        if (
+            mr.spec_algorithm.is_dflash() or mr.spec_algorithm.is_dspark()
+        ) and not mr.is_draft_worker:
+            if mr.spec_algorithm.is_dspark():
+                from sglang.srt.speculative.dspark_utils import (
+                    scale_kv_cell_size_per_token_for_dspark as scale_kv_cell_size,
+                )
 
-            draft_num_layers = mr.dflash_draft_num_layers
+                draft_num_layers = mr.dspark_draft_num_layers
+            else:
+                from sglang.srt.speculative.dflash_utils import (
+                    scale_kv_cell_size_per_token_for_dflash as scale_kv_cell_size,
+                )
+
+                draft_num_layers = mr.dflash_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                self._cell_size = scale_kv_cell_size(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
