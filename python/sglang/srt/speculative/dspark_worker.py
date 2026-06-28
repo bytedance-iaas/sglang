@@ -1193,20 +1193,49 @@ class DSparkWorker:
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         for layer in self.draft_model.layers:
             attn = layer.self_attn
-            k, v = attn.kv_proj_only(ctx_hidden)
-            k = attn.apply_k_norm(k)
-            k = attn.apply_k_rope(ctx_positions, k)
-            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
-                attn.attn,
-                ctx_cache_loc,
-                k,
-                v,
-                attn.attn.k_scale,
-                attn.attn.v_scale,
+            if hasattr(attn, "kv_proj_only"):
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(ctx_positions, k)
+                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                token_to_kv_pool.set_kv_buffer(
+                    attn.attn,
+                    ctx_cache_loc,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
+                )
+                continue
+
+            if hasattr(attn, "wkv") and hasattr(
+                token_to_kv_pool, "set_swa_key_buffer_radix_fused_norm_rope"
+            ):
+                # DeepSeek V4 DSpark uses MQALayer. Its KV cache stores the
+                # single MQA KV vector in the model-specific SWA pool, after
+                # RMSNorm and RoPE.
+                kv, _ = attn.wkv(ctx_hidden)
+                swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
+                    ctx_cache_loc
+                ).to(torch.int32)
+                token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+                    layer_id=attn.layer_id,
+                    swa_loc=swa_loc,
+                    kv=kv,
+                    kv_weight=attn.kv_norm.weight.data,
+                    eps=attn.eps,
+                    freqs_cis=attn.freqs_cis,
+                    positions=ctx_positions,
+                )
+                continue
+
+            raise RuntimeError(
+                "DSPARK cannot materialize draft KV for attention layer "
+                f"{attn.__class__.__name__}: expected kv_proj_only() or DeepSeek V4 MQALayer fields."
             )
 
     def _append_target_hidden_fused(
