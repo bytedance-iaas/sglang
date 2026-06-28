@@ -1194,7 +1194,8 @@ class DSparkWorker:
         ctx_cache_loc: torch.Tensor,
     ) -> None:
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
-        for layer in self.draft_model.layers:
+        pool_stage_start = int(getattr(token_to_kv_pool, "_stage_start", 0))
+        for local_layer_idx, layer in enumerate(self.draft_model.layers):
             attn = layer.self_attn
             if hasattr(attn, "kv_proj_only"):
                 k, v = attn.kv_proj_only(ctx_hidden)
@@ -1230,7 +1231,7 @@ class DSparkWorker:
                     ctx_cache_loc
                 ).to(torch.int32)
                 token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
-                    layer_id=attn.layer_id,
+                    layer_id=pool_stage_start + local_layer_idx,
                     swa_loc=swa_loc,
                     kv=kv,
                     kv_weight=attn.kv_norm.weight.data,
