@@ -1212,13 +1212,20 @@ class DSparkWorker:
                 )
                 continue
 
-            if hasattr(attn, "wkv") and hasattr(
-                token_to_kv_pool, "set_swa_key_buffer_radix_fused_norm_rope"
+            if (
+                (hasattr(attn, "wkv") or hasattr(attn, "wqkv_a"))
+                and hasattr(token_to_kv_pool, "set_swa_key_buffer_radix_fused_norm_rope")
+                and hasattr(attn, "kv_norm")
             ):
                 # DeepSeek V4 DSpark uses MQALayer. Its KV cache stores the
                 # single MQA KV vector in the model-specific SWA pool, after
-                # RMSNorm and RoPE.
-                kv, _ = attn.wkv(ctx_hidden)
+                # RMSNorm and RoPE. Depending on SGLANG_OPT_FUSE_WQA_WKV, the
+                # first-stage Q and KV projections are either separate or fused.
+                if hasattr(attn, "wqkv_a"):
+                    qkv_a, _ = attn.wqkv_a(ctx_hidden)
+                    kv = qkv_a[..., attn.q_lora_rank :]
+                else:
+                    kv, _ = attn.wkv(ctx_hidden)
                 swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
                     ctx_cache_loc
                 ).to(torch.int32)
