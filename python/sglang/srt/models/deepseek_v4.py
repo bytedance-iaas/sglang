@@ -544,6 +544,39 @@ class MQALayer(nn.Module):
             positions=positions,
         )
 
+    def kv_from_hidden(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        layer_id: Optional[int] = None,
+    ) -> None:
+        """Materialize MQA KV cache directly from already-computed hidden states.
+
+        DSpark reuses selected target hidden states as the draft prefix. This path
+        writes those hidden states into the DeepSeek V4 SWA KV pool without running
+        a full attention forward or creating a bf16 KV intermediate.
+        """
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x)
+            kv = qkv_a[..., self.q_lora_rank :]
+        else:
+            kv, _ = self.wkv(x)
+
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
+            torch.int32
+        )
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id if layer_id is None else int(layer_id),
+            swa_loc=swa_loc,
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=positions,
+        )
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,

@@ -157,6 +157,7 @@ class DSparkWorker:
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+        self._share_target_projection_weights()
         draft_config = parse_dspark_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -327,6 +328,35 @@ class DSparkWorker:
             )
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
+
+    def _share_target_projection_weights(self) -> None:
+        """Reuse target embedding/lm_head weights when the draft model exposes them."""
+        target_model = self.target_worker.model_runner.model
+        draft_model = self.draft_model
+
+        target_embed = getattr(
+            getattr(target_model, "model", None), "embed_tokens", None
+        )
+        draft_embed = getattr(
+            getattr(draft_model, "model", None), "embed_tokens", None
+        )
+        if (
+            target_embed is not None
+            and draft_embed is not None
+            and hasattr(target_embed, "weight")
+            and hasattr(draft_embed, "weight")
+        ):
+            draft_embed.weight = target_embed.weight
+
+        target_lm_head = getattr(target_model, "lm_head", None)
+        draft_lm_head = getattr(draft_model, "lm_head", None)
+        if (
+            target_lm_head is not None
+            and draft_lm_head is not None
+            and hasattr(target_lm_head, "weight")
+            and hasattr(draft_lm_head, "weight")
+        ):
+            draft_lm_head.weight = target_lm_head.weight
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -1214,30 +1244,18 @@ class DSparkWorker:
                 continue
 
             if (
-                (hasattr(attn, "wkv") or hasattr(attn, "wqkv_a"))
+                hasattr(attn, "kv_from_hidden")
                 and hasattr(token_to_kv_pool, "set_swa_key_buffer_radix_fused_norm_rope")
-                and hasattr(attn, "kv_norm")
             ):
-                # DeepSeek V4 DSpark uses MQALayer. Its KV cache stores the
-                # single MQA KV vector in the model-specific SWA pool, after
-                # RMSNorm and RoPE. Depending on SGLANG_OPT_FUSE_WQA_WKV, the
-                # first-stage Q and KV projections are either separate or fused.
-                if hasattr(attn, "wqkv_a"):
-                    qkv_a, _ = attn.wqkv_a(ctx_hidden)
-                    kv = qkv_a[..., attn.q_lora_rank :]
-                else:
-                    kv, _ = attn.wkv(ctx_hidden)
-                swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
-                    ctx_cache_loc
-                ).to(torch.int32)
-                token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+                # DeepSeek V4 DSpark uses MQALayer. Keep the model-specific
+                # projection/norm/rope details in the attention layer and only
+                # pass the draft pool's local layer mapping from the worker.
+                attn.kv_from_hidden(
+                    ctx_hidden,
+                    ctx_positions,
+                    ctx_cache_loc,
+                    token_to_kv_pool,
                     layer_id=pool_stage_start + local_layer_idx,
-                    swa_loc=swa_loc,
-                    kv=kv,
-                    kv_weight=attn.kv_norm.weight.data,
-                    eps=attn.eps,
-                    freqs_cis=attn.freqs_cis,
-                    positions=ctx_positions,
                 )
                 continue
 
