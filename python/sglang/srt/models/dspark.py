@@ -744,7 +744,9 @@ class DeepseekV4DSparkModel(DeepseekV4ForCausalLM):
     ) -> Optional[torch.Tensor]:
         embed = self.get_prev_embeddings(prev_token_ids).to(dtype=hidden_states.dtype)
         features = torch.cat([hidden_states, embed], dim=-1)
-        return self.model.layers[-1].confidence_head.proj(features.float()).squeeze(-1)
+        proj = self.model.layers[-1].confidence_head.proj
+        bias = None if proj.bias is None else proj.bias.float()
+        return F.linear(features.float(), proj.weight.float(), bias).squeeze(-1)
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if not name.startswith("mtp."):
