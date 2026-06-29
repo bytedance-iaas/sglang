@@ -250,6 +250,25 @@ class UnifiedRadixCache(BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
+    def _swa_release_tail_values(self, values: torch.Tensor) -> torch.Tensor:
+        """Return the SWA-mapped tail of a full-only donated prefix.
+
+        DSV4 decode radix can cache a long full-attention prefix while leaving
+        SWA as a tombstone. Only the sliding-window tail can have request-owned
+        SWA slots, so avoid scanning the whole long prefix through the full->SWA
+        mapping on finish/insert.
+        """
+        protected_len = int(values.numel())
+        if protected_len <= 0:
+            return values
+
+        sliding_window_size = self.sliding_window_size
+        if sliding_window_size is None or sliding_window_size <= 0:
+            tail_len = min(protected_len, self.page_size)
+        else:
+            tail_len = min(protected_len, max(self.page_size, sliding_window_size))
+        return values[protected_len - tail_len :]
+
     def enable_hisparse_mode(self) -> None:
         """Mark this tree as the DSV4 HiSparse companion cache.
 
@@ -584,14 +603,17 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
             if insert_params.skip_swa_component:
-                self.token_to_kv_pool_allocator.free_swa(values)
+                self.token_to_kv_pool_allocator.free_swa(
+                    self._swa_release_tail_values(values)
+                )
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             if getattr(req, "skip_swa_radix_cache_insert", False):
+                protected_values = kv_indices[: req.cache_protected_len]
                 self.token_to_kv_pool_allocator.free_swa(
-                    kv_indices[: req.cache_protected_len]
+                    self._swa_release_tail_values(protected_values)
                 )
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
