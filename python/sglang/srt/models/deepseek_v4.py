@@ -1923,7 +1923,12 @@ class DeepseekV4Model(nn.Module):
             capture_point = i + 1
             if self.pp_group.is_last_rank and capture_point in layers_to_capture:
                 if getattr(self, "capture_aux_hidden_states_mean", False):
-                    aux_hidden_states.append(hidden_states.mean(dim=1))
+                    captured = (
+                        layer.hc_post(hidden_states, prev_residual, prev_post, prev_comb)
+                        if prev_residual is not None
+                        else hidden_states
+                    )
+                    aux_hidden_states.append(captured.mean(dim=1))
                 else:
                     aux_hidden_states.append(hidden_states.flatten(1))
         if use_fused and last_layer is not None:
