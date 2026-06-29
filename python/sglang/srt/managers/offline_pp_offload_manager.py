@@ -28,6 +28,7 @@ machinery.
 import enum
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -42,6 +43,18 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _nvtx_range(message: str):
+    if not torch.cuda.is_available() or not hasattr(torch.cuda, "nvtx"):
+        yield
+        return
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 # Per-wave admission divisor. Runtime residency is limited by allocator
 # availability; only one wave may be PREFETCHING at a time.
@@ -163,6 +176,9 @@ class WaveStateHandle:
 
 class OfflinePPStateOffloadManager:
     """Manage offline-PP state offload (prefill) and prefetch (decode)."""
+
+    def nvtx_range(self, message: str):
+        return _nvtx_range(message)
 
     def __init__(
         self,
@@ -836,19 +852,24 @@ class OfflinePPStateOffloadManager:
                     mamba_indices = mamba_indices.clone()
                 entry.transfer_kv_indices = kv_indices
                 entry.transfer_mamba_indices = mamba_indices
-                if mamba_indices is not None:
-                    cpu_state = self.kv_cache.get_cpu_copy(
-                        kv_indices,
-                        mamba_indices,
-                        async_copy=True,
-                        pin_memory=True,
-                    )
-                else:
-                    cpu_state = self.kv_cache.get_cpu_copy(
-                        kv_indices,
-                        async_copy=True,
-                        pin_memory=True,
-                    )
+                with _nvtx_range(
+                    "offline_pp.offload_req "
+                    f"epoch={wave.epoch_id} wave={wave.wave_id} "
+                    f"tokens={entry.committed_len}"
+                ):
+                    if mamba_indices is not None:
+                        cpu_state = self.kv_cache.get_cpu_copy(
+                            kv_indices,
+                            mamba_indices,
+                            async_copy=True,
+                            pin_memory=True,
+                        )
+                    else:
+                        cpu_state = self.kv_cache.get_cpu_copy(
+                            kv_indices,
+                            async_copy=True,
+                            pin_memory=True,
+                        )
                 self._set_entry_host_state(
                     wave, entry, self.codec.encode_on_offload(cpu_state)
                 )
@@ -898,8 +919,12 @@ class OfflinePPStateOffloadManager:
         """
         if not self.is_wave_offload_ready(wave):
             return False
-        for req in wave.reqs:
-            self._free_req_device_slots(req, wave.entries[req.rid].committed_len)
+        with _nvtx_range(
+            "offline_pp.release_wave "
+            f"epoch={wave.epoch_id} wave={wave.wave_id} bs={len(wave.reqs)}"
+        ):
+            for req in wave.reqs:
+                self._free_req_device_slots(req, wave.entries[req.rid].committed_len)
         wave.state = WaveState.OFFLOADED
         wave.last_progress_tick = self._tick
         self.offloaded_queue.append(wave.wave_id)
@@ -1097,21 +1122,26 @@ class OfflinePPStateOffloadManager:
                 entry.transfer_kv_indices = restore_indices
                 entry.transfer_mamba_indices = mamba_indices
 
-                with self.device_module.stream(self.prefetch_stream):
-                    self.prefetch_stream.wait_stream(metadata_stream)
-                    if mamba_indices is not None:
-                        self.kv_cache.load_cpu_copy(
-                            cpu_state,
-                            restore_indices,
-                            mamba_indices,
-                            async_copy=True,
-                        )
-                    else:
-                        self.kv_cache.load_cpu_copy(
-                            cpu_state,
-                            restore_indices,
-                            async_copy=True,
-                        )
+                with _nvtx_range(
+                    "offline_pp.prefetch_req "
+                    f"epoch={wave.epoch_id} wave={wave.wave_id} "
+                    f"tokens={committed} alloc={alloc_len}"
+                ):
+                    with self.device_module.stream(self.prefetch_stream):
+                        self.prefetch_stream.wait_stream(metadata_stream)
+                        if mamba_indices is not None:
+                            self.kv_cache.load_cpu_copy(
+                                cpu_state,
+                                restore_indices,
+                                mamba_indices,
+                                async_copy=True,
+                            )
+                        else:
+                            self.kv_cache.load_cpu_copy(
+                                cpu_state,
+                                restore_indices,
+                                async_copy=True,
+                            )
             except Exception:
                 self.prefetch_stream.synchronize()
                 self._release_prefetched_req(req, entry)
@@ -1175,7 +1205,13 @@ class OfflinePPStateOffloadManager:
 
     def wait_prefetch_for_decode(self, wave: WaveStateHandle) -> None:
         if wave.prefetch_done_event is not None:
-            self.device_module.current_stream().wait_event(wave.prefetch_done_event)
+            with _nvtx_range(
+                "offline_pp.prefetch_wait_for_decode "
+                f"epoch={wave.epoch_id} wave={wave.wave_id}"
+            ):
+                self.device_module.current_stream().wait_event(
+                    wave.prefetch_done_event
+                )
 
     def ensure_decode_ready_for_schedule(self, free_slots: int) -> None:
         """Blocking catch-up at the decode scheduling boundary.
@@ -1323,7 +1359,11 @@ class OfflinePPStateOffloadManager:
         Safe because the authoritative state copy remains on host; only the
         in-progress device replica (and its slots) is discarded.
         """
-        self.prefetch_stream.synchronize()
+        with _nvtx_range(
+            "offline_pp.rollback_prefetch_sync "
+            f"epoch={wave.epoch_id} wave={wave.wave_id}"
+        ):
+            self.prefetch_stream.synchronize()
         for req in wave.reqs:
             entry = wave.entries[req.rid]
             if (

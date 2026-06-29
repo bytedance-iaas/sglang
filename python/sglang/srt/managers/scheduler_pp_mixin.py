@@ -5,6 +5,7 @@ import math
 import time
 from array import array
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -41,6 +42,35 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
+
+def _offline_pp_batch_nvtx_message(
+    scheduler, batch: Optional[ScheduleBatch], mb_id: int
+):
+    mgr = getattr(scheduler, "offline_pp_offload_manager", None)
+    if mgr is None or batch is None:
+        return None
+
+    wave_id = getattr(batch, "offline_pp_wave_id", None)
+    if wave_id is not None:
+        wave = getattr(mgr, "waves", {}).get(wave_id)
+        epoch_id = getattr(wave, "epoch_id", "unknown")
+        return (
+            "offline_pp.decode_forward "
+            f"epoch={epoch_id} wave={wave_id} mb={mb_id} bs={len(batch.reqs)}"
+        )
+
+    epoch_id = getattr(batch, "offline_pp_prefill_epoch_id", None)
+    if epoch_id is not None:
+        prefill_mb_id = getattr(batch, "offline_pp_prefill_mb_id", None)
+        return (
+            "offline_pp.prefill_forward "
+            f"epoch={epoch_id} mb={prefill_mb_id} "
+            f"loop_mb={mb_id} bs={len(batch.reqs)}"
+        )
+
+    return None
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -1288,7 +1318,14 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
-        with torch.profiler.record_function("run_batch"):
+        nvtx_message = _offline_pp_batch_nvtx_message(self, self.cur_batch, mb_id)
+        nvtx_range = getattr(self.offline_pp_offload_manager, "nvtx_range", None)
+        nvtx_ctx = (
+            nvtx_range(nvtx_message)
+            if nvtx_message is not None and nvtx_range is not None
+            else nullcontext()
+        )
+        with torch.profiler.record_function("run_batch"), nvtx_ctx:
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
                 set_time_batch(

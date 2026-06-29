@@ -2553,7 +2553,18 @@ class Scheduler(
         reqs = wave.reqs
         device = self.device
 
-        self.offline_pp_offload_manager.wait_prefetch_for_decode(wave)
+        nvtx_range = getattr(self.offline_pp_offload_manager, "nvtx_range", None)
+        nvtx_ctx = (
+            nvtx_range(
+                "offline_pp.decode_batch_prepare "
+                f"epoch={getattr(wave, 'epoch_id', 'unknown')} "
+                f"wave={wave.wave_id} bs={len(reqs)}"
+            )
+            if nvtx_range is not None
+            else nullcontext()
+        )
+        with nvtx_ctx:
+            self.offline_pp_offload_manager.wait_prefetch_for_decode(wave)
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
