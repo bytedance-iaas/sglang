@@ -58,8 +58,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.device = target_worker.device
 
+        self.verify_len = int(server_args.speculative_num_draft_tokens)
+        self.proposal_len = int(self.verify_len) - 1
+        if self.proposal_len <= 0:
+            raise ValueError(
+                "DSpark requires speculative_num_draft_tokens to be at least 2 "
+                "(current token + one proposal token)."
+            )
+
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        # The target verifies current token + proposals, while the DSpark draft
+        # block only runs the proposal tokens. Keep the target runner on
+        # verify_len and size the draft runner/backend metadata to proposal_len.
+        draft_server_args.speculative_num_draft_tokens = int(self.proposal_len)
+        draft_server_args.__dict__.pop("max_speculative_num_draft_tokens", None)
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
@@ -84,13 +97,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._share_target_projection_weights()
 
-        self.verify_len = int(server_args.speculative_num_draft_tokens)
-        self.proposal_len = int(self.verify_len) - 1
-        if self.proposal_len <= 0:
-            raise ValueError(
-                "DSpark requires speculative_num_draft_tokens to be at least 2 "
-                "(current token + one proposal token)."
-            )
         self.block_size = int(self.proposal_len)
         model_block_size = int(getattr(self.draft_model, "block_size", self.block_size))
         if model_block_size != self.proposal_len:
