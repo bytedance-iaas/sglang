@@ -373,9 +373,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
+        bs = int(seq_lens.numel())
+        device = bonus_tokens.device
         return DSparkDraftInputV2(
+            topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
+            hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
@@ -386,9 +391,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         new_seq_lens: torch.Tensor,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DSparkDraftInputV2:
+        bs = int(new_seq_lens.numel())
+        device = bonus_tokens.device
         return DSparkDraftInputV2(
+            topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
+            hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
