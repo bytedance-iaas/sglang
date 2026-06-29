@@ -756,7 +756,17 @@ class DeepseekV4DSparkModel(DeepseekV4ForCausalLM):
             return None
         layer_idx = int(parts[1])
         rest = parts[2]
-        name = f"model.layers.{layer_idx}.{rest}"
+        head_layer_idx = self.model.num_hidden_layers - 1
+        if rest.startswith(("main_proj", "main_norm")):
+            name = f"model.layers.0.{rest}"
+        elif rest.startswith(("markov_head", "confidence_head")):
+            name = f"model.layers.{head_layer_idx}.{rest}"
+        elif rest == "norm.weight":
+            name = f"model.layers.{head_layer_idx}.norm.weight"
+        elif rest.startswith("hc_head_"):
+            name = f"model.layers.{head_layer_idx}.{rest}"
+        else:
+            name = f"model.layers.{layer_idx}.{rest}"
         name = name.replace(".attn.", ".self_attn.")
         name = name.replace(".ffn.", ".mlp.")
         name = name.replace(".attn_norm.", ".input_layernorm.")
