@@ -55,8 +55,10 @@ def _online_c128_mtp_prepare_kernel(
 
 
 @cache_once
-def _jit_online_c128_mtp_module(head_dim: int) -> Module:
-    args = make_cpp_args(head_dim)
+def _jit_online_c128_mtp_module(
+    head_dim: int, dtype_buffer: torch.dtype = torch.float32
+) -> Module:
+    args = make_cpp_args(head_dim, dtype_buffer)
     return load_jit(
         make_name(f"online_c128_mtp_{head_dim}"),
         *args,
@@ -84,7 +86,7 @@ def online_c128_mtp_write_prefix_states(
 ) -> None:
     if layer_bs <= 0:
         return
-    _jit_online_c128_mtp_module(head_dim).write_prefix_states(
+    _jit_online_c128_mtp_module(head_dim, state.dtype).write_prefix_states(
         kv_score_input,
         seq_lens,
         req_pool_indices,
@@ -114,7 +116,7 @@ def online_c128_mtp_lazy_commit(
 ) -> None:
     if old_bs <= 0 or cur_bs <= 0:
         return
-    _jit_online_c128_mtp_module(head_dim).lazy_commit(
+    _jit_online_c128_mtp_module(head_dim, state.dtype).lazy_commit(
         old_seq_lens,
         old_req_pool_indices,
         old_tail_locs,
