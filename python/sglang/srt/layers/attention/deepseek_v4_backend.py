@@ -583,14 +583,20 @@ class DeepseekV4AttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None and pool.ratio == 128
         )
+        c128_state_dtype = None
+        for pool in self.token_to_kv_pool.compress_state_pools:
+            if pool is not None and pool.ratio == 128:
+                c128_state_dtype = pool.kv_score_buffer.kv_score.dtype
+                break
         state_slot_offset = self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
         max_draft_tokens = self.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
 
         if getattr(model_runner, "is_draft_worker", False):
             logger.info(
                 "DSV4 HiSparse online C128 MTP draft runner initialized: "
-                "c128_state_layers=%d, draft_banks=%d.",
+                "c128_state_layers=%d, c128_state_dtype=%s, draft_banks=%d.",
                 c128_state_layers,
+                c128_state_dtype,
                 max_draft_tokens,
             )
             return
@@ -607,9 +613,11 @@ class DeepseekV4AttnBackend(
 
         logger.warning(
             "DSV4 HiSparse online C128 MTP target runner initialized: "
-            "c128_state_layers=%d, state_slot_offset=%d, draft_banks=%d. "
+            "c128_state_layers=%d, c128_state_dtype=%s, "
+            "state_slot_offset=%d, draft_banks=%d. "
             "C4 host mirror remains handled by HiSparseCoordinator.",
             c128_state_layers,
+            c128_state_dtype,
             state_slot_offset,
             max_draft_tokens,
         )
