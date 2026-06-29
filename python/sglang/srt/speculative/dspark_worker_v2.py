@@ -387,7 +387,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
-            cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            cur_allocated_seq_lens_cpu=None,
         )
 
     def _make_next_draft_input_decode(
@@ -405,7 +405,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
-            cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+            cur_allocated_seq_lens_cpu=None,
         )
 
     def forward_batch_generation(
