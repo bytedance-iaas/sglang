@@ -652,13 +652,24 @@ class DeepseekV4DSparkCore(nn.Module):
         if input_embeds is None:
             raise ValueError("DeepseekV4DSparkModel requires input_embeds.")
         hidden_states = input_embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        use_fused = self.layers[0].use_fused_mhc_post_pre
+        prev_residual, prev_post, prev_comb = None, None, None
+        last_layer = None
         for layer in self.layers:
-            hidden_states = layer(
+            last_layer = layer
+            hidden_states, prev_residual, prev_post, prev_comb = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids,
+                prev_residual=prev_residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+            )
+        if use_fused and last_layer is not None:
+            hidden_states = last_layer.hc_post(
+                hidden_states, prev_residual, prev_post, prev_comb
             )
         last_layer = self.layers[-1]
         hidden_states = self.hc_head(
