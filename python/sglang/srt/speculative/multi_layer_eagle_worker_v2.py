@@ -794,6 +794,18 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
+        clear_unaccepted_c128 = getattr(
+            self.target_worker.model_runner.token_to_kv_pool,
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+            clear_unaccepted_c128(
+                batch.req_pool_indices,
+                batch.seq_lens,
+                accept_lens,
+                self.speculative_num_draft_tokens,
+            )
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 

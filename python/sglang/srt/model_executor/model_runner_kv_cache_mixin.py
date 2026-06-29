@@ -398,6 +398,7 @@ class ModelRunnerKVCacheMixin:
                 online_mtp_max_draft_tokens=(
                     self.server_args.speculative_num_draft_tokens or 0
                 ),
+                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:

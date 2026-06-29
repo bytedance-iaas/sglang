@@ -7,6 +7,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 import torch
 
 from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import clear_unaccepted_c128_draft_states
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import (
@@ -527,6 +528,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
+        num_req_slots: Optional[int] = None,
     ):
         super().__init__(
             swa_size,
@@ -553,13 +555,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
+        c128_num_req_slots = int(num_req_slots or max_num_reqs)
         if ONLINE_C128:
             # Online C128 state is request-scoped and indexed by req_pool_idx.
-            c128_state_pool_size = max(c128_state_pool_size, max_num_reqs)
+            c128_state_pool_size = max(c128_state_pool_size, c128_num_req_slots)
         else:
             # Offline C128 keeps one ring per request.
             c128_state_pool_size = max(
-                c128_state_pool_size, max_num_reqs * c128_ring_size
+                c128_state_pool_size, c128_num_req_slots * c128_ring_size
             )
         self.c128_state_pool_size = c128_state_pool_size
         self.c4_state_dtype = c4_state_dtype
@@ -930,6 +933,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 half = rows.shape[-1] // 2
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
+
+    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+        """Reset request-scoped C128 state before reusing a req slot."""
+        self.clear_c128_radix_state(req_pool_idx)
+
+    def clear_unaccepted_c128_draft_states(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        """Clear offline C128 ring slots written for rejected speculative tokens."""
+        if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
+            return
+
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            clear_unaccepted_c128_draft_states(
+                pool.kv_score_buffer.kv_score,
+                req_pool_indices,
+                seq_lens,
+                accept_lens,
+                ring_size=pool.ring_size,
+                num_draft_tokens=num_draft_tokens,
+            )
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
