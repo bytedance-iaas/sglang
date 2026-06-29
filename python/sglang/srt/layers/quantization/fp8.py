@@ -1305,11 +1305,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                # FP4 expert mega MoE requires SM100. All-FP8 mega MoE on
-                # SM90 is handled below in the non-fp4-expert branch.
+                # FP4 expert Mega-MoE has two DeepGEMM paths:
+                #   * SM90: software FP4-weight decode in fp8_fp4_mega_moe
+                #   * SM100: native FP4 block-scaled Mega-MoE
                 if (
                     get_moe_a2a_backend().is_megamoe()
-                    and is_sm100_supported()
+                    and (is_sm90_supported() or is_sm100_supported())
                 ):
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
