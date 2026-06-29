@@ -530,8 +530,29 @@ class ModelConfig:
         ):
             if self.hf_config.architectures[0] == "DeepseekV4ForCausalLM":
                 self.hf_config.architectures[0] = "DeepseekV4DSparkModel"
-                if getattr(self.hf_config, "num_nextn_predict_layers", None) is None:
-                    self.hf_config.num_nextn_predict_layers = 1
+                target_num_hidden_layers = int(self.hf_config.num_hidden_layers)
+                dspark_target_layer_ids = getattr(
+                    self.hf_config, "dspark_target_layer_ids", None
+                )
+                draft_num_hidden_layers = getattr(
+                    self.hf_config, "dspark_num_hidden_layers", None
+                )
+                if draft_num_hidden_layers is None and isinstance(
+                    dspark_target_layer_ids, (list, tuple)
+                ):
+                    draft_num_hidden_layers = len(dspark_target_layer_ids)
+                if draft_num_hidden_layers is None:
+                    draft_num_hidden_layers = getattr(
+                        self.hf_config, "num_nextn_predict_layers", 1
+                    )
+                draft_num_hidden_layers = int(draft_num_hidden_layers)
+                self.hf_config.dspark_target_num_hidden_layers = (
+                    target_num_hidden_layers
+                )
+                self.hf_config.dspark_num_hidden_layers = draft_num_hidden_layers
+                self.hf_config.num_hidden_layers = draft_num_hidden_layers
+                self.hf_config.num_nextn_predict_layers = draft_num_hidden_layers
+                self.hf_config.compress_ratios = [0] * draft_num_hidden_layers
                 return
 
         if is_draft_model and self.hf_config.architectures[0] in [

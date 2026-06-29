@@ -548,8 +548,15 @@ class DeepseekV4DSparkCore(nn.Module):
         draft_config = parse_dspark_draft_config(draft_hf_config=config)
         self.block_size = int(draft_config.resolve_block_size(default=5))
         self.noise_token_id = int(draft_config.mask_token_id)
+        target_num_hidden_layers = int(
+            getattr(
+                config,
+                "dspark_target_num_hidden_layers",
+                config.num_hidden_layers,
+            )
+        )
         self.target_layer_ids = draft_config.resolve_target_layer_ids(
-            target_num_layers=int(config.num_hidden_layers),
+            target_num_layers=target_num_hidden_layers,
             draft_num_layers=len(getattr(config, "dspark_target_layer_ids", []) or []),
         )
         self.num_hidden_layers = len(self.target_layer_ids)
