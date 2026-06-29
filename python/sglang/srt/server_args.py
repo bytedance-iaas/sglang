@@ -3689,15 +3689,21 @@ class ServerArgs:
                         f"{supported_transfer_backends}, but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
-                if (
-                    self.speculative_algorithm is not None
-                    and not is_dsv4_hisparse_decode
-                ):
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with speculative decoding "
-                        f"(--speculative-algorithm {self.speculative_algorithm})"
-                    )
+                if self.speculative_algorithm is not None:
+                    if not is_dsv4_hisparse_decode:
+                        raise ValueError(
+                            "--disaggregation-decode-enable-radix-cache is incompatible "
+                            "with speculative decoding "
+                            f"(--speculative-algorithm {self.speculative_algorithm})"
+                        )
+                    if not self._allow_dsv4_decode_radix_speculative():
+                        raise ValueError(
+                            "DeepSeek-V4 HiSparse decode radix cache with speculative "
+                            "decode currently supports only EAGLE topk=1 with online "
+                            "C128 MTP. Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
+                            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1, or disable "
+                            "--disaggregation-decode-enable-radix-cache."
+                        )
                 if self.enable_dp_attention:
                     logger.warning(
                         "EXPERIMENTAL: Decode radix cache with DP attention. "
@@ -3736,6 +3742,14 @@ class ServerArgs:
                     f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
+
+    def _allow_dsv4_decode_radix_speculative(self) -> bool:
+        return (
+            self.speculative_algorithm == "EAGLE"
+            and self.speculative_eagle_topk in (None, 1)
+            and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+        )
 
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:

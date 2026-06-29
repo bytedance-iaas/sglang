@@ -2706,8 +2706,25 @@ class DecodeTransferQueue:
         # same-prefix requests allocate the whole long prompt while this request
         # waits to enter decode, which can pin the full/logical pool at 0.99.
         req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
-        coordinator._publish_dsv4_c4_host_prompt_prefix(req)
-        maybe_cache_unfinished_req(req, self.tree_cache)
+        page_size = self._logical_kv_page_size()
+        radix_key_len = page_align_floor(len(req.fill_ids), page_size)
+        if radix_key_len <= 0:
+            return
+
+        # The transferred prompt owns full/logical KV and C4 host slots, but it
+        # does not own SWA slots for the long prefix. Publish it as a full-only
+        # decode-radix leaf; otherwise the unified SWA component may cache stale
+        # sentinel mappings and later restore an invalid SWA view for a radix hit.
+        old_skip_swa = getattr(req, "skip_swa_radix_cache_insert", False)
+        old_swa_evicted_seqlen = getattr(req, "swa_evicted_seqlen", 0)
+        try:
+            req.skip_swa_radix_cache_insert = True
+            req.swa_evicted_seqlen = max(old_swa_evicted_seqlen, radix_key_len)
+            coordinator._publish_dsv4_c4_host_prompt_prefix(req)
+            maybe_cache_unfinished_req(req, self.tree_cache)
+        finally:
+            req.skip_swa_radix_cache_insert = old_skip_swa
+            req.swa_evicted_seqlen = old_swa_evicted_seqlen
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
