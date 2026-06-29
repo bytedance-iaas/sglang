@@ -58,21 +58,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.device = target_worker.device
 
-        self.verify_len = int(server_args.speculative_num_draft_tokens)
-        self.proposal_len = int(self.verify_len) - 1
-        if self.proposal_len <= 0:
+        self.block_size = int(server_args.speculative_num_draft_tokens)
+        if self.block_size <= 0:
             raise ValueError(
-                "DSpark requires speculative_num_draft_tokens to be at least 2 "
-                "(current token + one proposal token)."
+                "DSpark requires speculative_num_draft_tokens to be positive."
             )
 
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
-        # The target verifies current token + proposals, while the DSpark draft
-        # block only runs the proposal tokens. Keep the target runner on
-        # verify_len and size the draft runner/backend metadata to proposal_len.
-        draft_server_args.speculative_num_draft_tokens = int(self.proposal_len)
-        draft_server_args.__dict__.pop("max_speculative_num_draft_tokens", None)
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
@@ -97,16 +90,15 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._share_target_projection_weights()
 
-        self.block_size = int(self.proposal_len)
         model_block_size = int(getattr(self.draft_model, "block_size", self.block_size))
-        if model_block_size != self.proposal_len:
+        if model_block_size != self.block_size:
             logger.warning(
                 "DSpark block size mismatch: using speculative_num_draft_tokens=%s "
                 "but draft model block_size=%s.",
-                self.verify_len,
+                self.block_size,
                 model_block_size,
             )
-        self.speculative_num_draft_tokens = int(self.verify_len)
+        self.speculative_num_draft_tokens = int(self.block_size)
 
         self.noise_token_id = int(self._draft_inner.noise_token_id)
         self.markov_rank = int(
@@ -130,18 +122,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
-        self._verify_pos_offsets = torch.arange(
-            self.verify_len, device=self.device, dtype=torch.int64
-        )
 
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DSpark draft runner. model=%s, proposal_len=%s, verify_len=%s, "
+                "Initialized DSpark draft runner. model=%s, block_size=%s, "
                 "num_dspark_layers=%s, noise_token_id=%s, markov_rank=%s, "
                 "confidence_threshold=%s",
                 self.draft_model.__class__.__name__,
-                self.proposal_len,
-                self.verify_len,
+                self.block_size,
                 self.num_dspark_layers,
                 self.noise_token_id,
                 self.markov_rank,
@@ -313,8 +301,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bs = int(block_hidden.shape[0])
-        proposal_len = int(self.proposal_len)
-        verify_len = int(self.verify_len)
+        block_size = int(self.block_size)
         target_model = self.target_worker.model_runner.model
         lm_head = target_model.lm_head
 
@@ -329,7 +316,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ]
 
         out_tokens = torch.empty(
-            (bs, verify_len), dtype=torch.int64, device=block_hidden.device
+            (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
         )
         out_tokens[:, 0] = bonus_tokens.view(-1).to(torch.int64)
         confidence_logits = []
@@ -341,9 +328,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
                 if hasattr(self.draft_model, "get_logits_hidden")
                 else block_hidden.reshape(-1, block_hidden.shape[-1])
-            ).view(bs, proposal_len, -1)
+            ).view(bs, block_size, -1)
             base_logits = F.linear(logits_hidden, lm_head.weight)
-            for i in range(proposal_len):
+            for i in range(block_size):
                 local_bias, _ = self.draft_model.compute_markov_bias_local(
                     prev_token_ids=prev_token_ids,
                     hidden_states=block_hidden[:, i],
@@ -363,9 +350,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.stack(confidence_logits, dim=1) if confidence_logits else None
         )
         if confidence is None:
-            confidence = torch.empty((bs, proposal_len), device=block_hidden.device)
+            confidence = torch.empty((bs, block_size), device=block_hidden.device)
             confidence.fill_(float("inf"))
-        candidates = out_tokens.contiguous()
+        candidates = out_tokens[:, :block_size].contiguous()
         return candidates, confidence
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
@@ -519,31 +506,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         device = self.device
         bs = len(model_worker_batch.seq_lens)
-        proposal_len = int(self.proposal_len)
-        verify_len = int(self.verify_len)
+        block_size = int(self.block_size)
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
 
         block_ids = torch.full(
-            (bs, proposal_len), self.noise_token_id, dtype=torch.int64, device=device
+            (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
         )
         block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         embed_module = self.target_worker.model_runner.model.get_input_embeddings()
-        input_embeds = embed_module(block_ids).view(bs * proposal_len, -1)
+        input_embeds = embed_module(block_ids).view(bs * block_size, -1)
 
         draft_positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
         draft_positions = draft_positions_2d.reshape(-1).to(torch.int64)
-        verify_positions_2d = prefix_lens.unsqueeze(1) + self._verify_pos_offsets
-        verify_positions = verify_positions_2d.reshape(-1).to(torch.int64)
 
-        end_offset = prefix_lens + verify_len
+        end_offset = prefix_lens + block_size
         verify_out_cache_loc = assign_extend_cache_locs_func(
             req_pool_indices=req_pool_indices,
             req_to_token=self.model_runner.req_to_token_pool.req_to_token,
             start_offset=prefix_lens,
             end_offset=end_offset,
             batch_size=bs,
-            draft_token_num=verify_len,
+            draft_token_num=block_size,
             device=device,
         )
 
@@ -551,9 +535,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs=bs,
             block_ids=block_ids,
             positions=draft_positions,
-            verify_out_cache_loc=verify_out_cache_loc.view(bs, verify_len)[
-                :, :proposal_len
-            ].reshape(-1),
+            verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
             input_embeds=input_embeds,
@@ -566,8 +548,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),
-            positions=verify_positions,
-            draft_token_num=verify_len,
+            positions=draft_positions,
+            draft_token_num=block_size,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -607,7 +589,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, verify_len
+            bs, block_size
         )
 
         correct_len, _ = compute_dspark_correct_drafts_and_bonus(
@@ -621,10 +603,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(1)
         commit_lens = correct_len.to(torch.int32) + 1
 
-        out_tokens = torch.empty((bs, verify_len), dtype=torch.int64, device=device)
-        if verify_len > 1:
-            out_tokens[:, : verify_len - 1].copy_(candidates[:, 1:])
-        out_tokens[:, verify_len - 1].fill_(0)
+        out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
+        if block_size > 1:
+            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+        out_tokens[:, block_size - 1].fill_(0)
         out_tokens.scatter_(
             1, correct_len.unsqueeze(1), bonus_tokens.unsqueeze(1).to(torch.int64)
         )
@@ -638,15 +620,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        hidden = hidden.view(bs, verify_len, -1)
+        hidden = hidden.view(bs, block_size, -1)
         commit_mask = (
-            self._verify_pos_offsets.unsqueeze(0)
+            self._block_pos_offsets.unsqueeze(0)
             < commit_lens.unsqueeze(1).to(torch.int64)
         ).reshape(-1)
         self._materialize_main_hidden_to_draft_kv(
             main_hidden=hidden.reshape(-1, hidden.shape[-1])[commit_mask],
             cache_loc=verify_out_cache_loc[commit_mask],
-            positions=verify_positions[commit_mask],
+            positions=draft_positions[commit_mask],
         )
 
         logits_output.hidden_states = None
@@ -666,7 +648,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=verify_len,
+            speculative_num_draft_tokens=block_size,
             new_seq_lens=new_seq_lens,
         )
 
@@ -688,6 +670,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             accept_lens=empty_lens,
             next_draft_input=next_draft_input,
             can_run_cuda_graph=False,
-            speculative_num_draft_tokens=int(self.verify_len),
+            speculative_num_draft_tokens=int(self.block_size),
             new_seq_lens=next_draft_input.new_seq_lens,
         )

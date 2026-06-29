@@ -302,27 +302,22 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if inferred_block_size is None:
         inferred_block_size = 5
 
-    # DSPARK's model config block_size is proposal length. SGLang's
-    # speculative_num_draft_tokens is the target verify window, which includes
-    # the current token plus the proposals.
-    inferred_verify_len = int(inferred_block_size) + 1
     if server_args.speculative_num_draft_tokens is None:
-        server_args.speculative_num_draft_tokens = inferred_verify_len
-    elif int(server_args.speculative_num_draft_tokens) == int(inferred_block_size):
-        logger.warning(
-            "DSPARK config block_size=%s is proposal length; converting "
-            "speculative_num_draft_tokens from %s to verify window length %s.",
-            inferred_block_size,
-            server_args.speculative_num_draft_tokens,
-            inferred_verify_len,
-        )
-        server_args.speculative_num_draft_tokens = inferred_verify_len
-    elif int(server_args.speculative_num_draft_tokens) < 2:
+        server_args.speculative_num_draft_tokens = int(inferred_block_size)
+    elif int(server_args.speculative_num_draft_tokens) < 1:
         raise ValueError(
-            "DSPARK requires --speculative-num-draft-tokens to be at least 2 "
-            "(current token + one proposal token). "
+            "DSPARK requires --speculative-num-draft-tokens to be at least 1. "
             f"Got {server_args.speculative_num_draft_tokens}."
         )
+    elif int(server_args.speculative_num_draft_tokens) != int(inferred_block_size):
+        logger.warning(
+            "DSPARK checkpoint block_size=%s must match speculative_num_draft_tokens; "
+            "overriding speculative_num_draft_tokens=%s to %s.",
+            inferred_block_size,
+            server_args.speculative_num_draft_tokens,
+            inferred_block_size,
+        )
+        server_args.speculative_num_draft_tokens = int(inferred_block_size)
 
     threshold = float(server_args.speculative_dspark_confidence_threshold)
     if not 0.0 <= threshold <= 1.0:
