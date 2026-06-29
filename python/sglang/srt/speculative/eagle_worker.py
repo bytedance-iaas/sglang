@@ -1164,6 +1164,7 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
+        req_pool_indices_cpu_backup = batch.req_pool_indices_cpu
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -1179,6 +1180,8 @@ class EAGLEWorker(TpModelWorker):
             # batch (DP attn rank w/o reqs) and active batch with all reqs
             # finished. prepare_for_idle() is idempotent on already-idle.
             batch = batch.copy()
+            batch.reqs = []
+            batch.decoding_reqs = []
             batch.prepare_for_idle()
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
@@ -1271,6 +1274,7 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
+        batch.req_pool_indices_cpu = req_pool_indices_cpu_backup
         batch.return_logprob = return_logprob_backup
         return next_draft_input
 

@@ -88,6 +88,142 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
+def _reshape_flashmla_query_metadata(
+    tensor: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    query_len: int,
+    name: str,
+    pad_value: int,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    expected_rows = batch_size * query_len
+    if tensor.ndim == 1:
+        if tensor.numel() < expected_rows:
+            tensor = torch.cat(
+                [
+                    tensor,
+                    tensor.new_full((expected_rows - tensor.numel(),), pad_value),
+                ],
+                dim=0,
+            )
+        if tensor.numel() == expected_rows:
+            return tensor.view(batch_size, query_len)
+        if query_len == 1 and tensor.numel() == batch_size:
+            return tensor.unsqueeze(1)
+    elif tensor.ndim == 2:
+        if tensor.shape[0] < expected_rows:
+            tensor = torch.cat(
+                [
+                    tensor,
+                    tensor.new_full(
+                        (expected_rows - tensor.shape[0], tensor.shape[1]),
+                        pad_value,
+                    ),
+                ],
+                dim=0,
+            )
+        if tensor.shape[0] == expected_rows:
+            return tensor.view(batch_size, query_len, tensor.shape[1])
+        if tensor.shape[0] == batch_size and query_len == 1:
+            return tensor.unsqueeze(1)
+    elif tensor.ndim >= 3:
+        if tensor.shape[0] == batch_size and tensor.shape[1] == query_len:
+            return tensor
+
+    raise RuntimeError(
+        f"DeepSeekV4 FlashMLA {name} has incompatible shape: "
+        f"shape={tuple(tensor.shape)}, expected_rows={expected_rows}, "
+        f"batch_size={batch_size}, query_len={query_len}."
+    )
+
+
+def _reshape_flashmla_topk_length_metadata(
+    tensor: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    query_len: int,
+    name: str,
+    pad_value: int,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    expected_rows = batch_size * query_len
+
+    if tensor.ndim == 2:
+        if tensor.shape == (batch_size, query_len):
+            return tensor.max(dim=1).values.contiguous()
+        if tensor.shape[-1] == 1:
+            tensor = tensor.reshape(-1)
+        else:
+            raise RuntimeError(
+                f"DeepSeekV4 FlashMLA {name} has incompatible shape: "
+                f"shape={tuple(tensor.shape)}, expected batch length shape "
+                f"({batch_size},)."
+            )
+    elif tensor.ndim > 2:
+        raise RuntimeError(
+            f"DeepSeekV4 FlashMLA {name} has incompatible shape: "
+            f"shape={tuple(tensor.shape)}, expected batch length shape "
+            f"({batch_size},)."
+        )
+
+    if tensor.ndim != 1:
+        raise RuntimeError(
+            f"DeepSeekV4 FlashMLA {name} must be 1D after normalization, "
+            f"got shape={tuple(tensor.shape)}."
+        )
+
+    if tensor.numel() == batch_size:
+        return tensor
+    if tensor.numel() < expected_rows:
+        tensor = torch.cat(
+            [
+                tensor,
+                tensor.new_full((expected_rows - tensor.numel(),), pad_value),
+            ],
+            dim=0,
+        )
+    if tensor.numel() >= expected_rows:
+        return tensor[:expected_rows].view(batch_size, query_len).max(dim=1).values
+
+    raise RuntimeError(
+        f"DeepSeekV4 FlashMLA {name} has incompatible shape: "
+        f"shape={tuple(tensor.shape)}, expected batch length shape "
+        f"({batch_size},), expected_rows={expected_rows}."
+    )
+
+
+def _normalize_flashmla_sparse_metadata(
+    *,
+    indices: Optional[torch.Tensor],
+    topk_lengths: Optional[torch.Tensor],
+    batch_size: int,
+    query_len: int,
+    indices_name: str,
+    lengths_name: str,
+    indices_pad_value: int,
+    lengths_pad_value: int,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    return (
+        _reshape_flashmla_query_metadata(
+            indices,
+            batch_size=batch_size,
+            query_len=query_len,
+            name=indices_name,
+            pad_value=indices_pad_value,
+        ),
+        _reshape_flashmla_topk_length_metadata(
+            topk_lengths,
+            batch_size=batch_size,
+            query_len=query_len,
+            name=lengths_name,
+            pad_value=lengths_pad_value,
+        ),
+    )
+
+
 def _create_flashmla_metadata():
     import flash_mla
 
@@ -103,6 +239,15 @@ def _copy_or_replace(dst, src):
         dst.copy_(src)
         return dst
     return src
+
+
+@dataclass(frozen=True)
+class TargetVerifyLayout:
+    active_bs: int
+    query_len: int
+    semantic_num_tokens: int
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
 
 
 @dataclass
@@ -419,6 +564,9 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
+        self._accuracy_trace_enabled = (
+            envs.SGLANG_DSV4_HISPARSE_ACCURACY_TRACE.get()
+        )
         self.online_c128_mtp = OnlineC128MTPController(self)
         self._log_hisparse_online_c128_mtp_state(model_runner)
 
@@ -688,6 +836,9 @@ class DeepseekV4AttnBackend(
         if num_tokens is None:
             if out_cache_loc is None:
                 return self.speculative_num_draft_tokens
+            expected_tokens = batch_size * self.speculative_num_draft_tokens
+            if out_cache_loc.numel() >= expected_tokens:
+                return self.speculative_num_draft_tokens
             num_tokens = out_cache_loc.numel()
 
         if num_tokens % batch_size != 0:
@@ -748,11 +899,10 @@ class DeepseekV4AttnBackend(
             return out_cache_loc
         if out_cache_loc.numel() > num_tokens:
             return out_cache_loc[:num_tokens]
-        return torch.nn.functional.pad(
-            out_cache_loc,
-            pad=(0, num_tokens - out_cache_loc.numel()),
-            mode="constant",
-            value=0,
+        raise RuntimeError(
+            "DeepSeekV4 target-verify out_cache_loc is shorter than the "
+            "semantic token count: "
+            f"out_cache_loc_shape={tuple(out_cache_loc.shape)}, num_tokens={num_tokens}."
         )
 
     def init_forward_metadata_target_verify_old(
@@ -937,9 +1087,73 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
     ) -> int:
         # CUDA graph replay pads req/seq tensors to the captured bucket size.
-        # ForwardBatch.batch_size is the raw active batch size before padding.
-        raw_bs = int(forward_batch.batch_size)
+        # Some graph runners temporarily set ForwardBatch.batch_size to the
+        # padded bucket size, so prefer the raw replay batch size when provided.
+        raw_bs = int(
+            getattr(
+                forward_batch,
+                "_cuda_graph_raw_batch_size",
+                forward_batch.batch_size,
+            )
+        )
         return min(raw_bs, int(req_pool_indices.shape[0]), int(seq_lens.shape[0]))
+
+    def _target_verify_query_len(
+        self,
+        forward_batch: ForwardBatch,
+        batch_size: int,
+    ) -> int:
+        if batch_size == 0:
+            return self.speculative_num_draft_tokens
+
+        spec_info = forward_batch.spec_info
+        if spec_info is not None:
+            draft_token_num = getattr(spec_info, "draft_token_num", None)
+            if draft_token_num is not None:
+                query_len = int(draft_token_num)
+                if query_len <= 0:
+                    raise RuntimeError(
+                        "DeepSeekV4 target-verify draft_token_num must be positive: "
+                        f"draft_token_num={draft_token_num}."
+                    )
+                return query_len
+            draft_token = getattr(spec_info, "draft_token", None)
+            if draft_token is not None:
+                draft_numel = int(draft_token.numel())
+                if batch_size > 0 and draft_numel % batch_size == 0:
+                    return draft_numel // batch_size
+
+        # Last-resort fallback for non-EAGLE callers. Target verify normally
+        # must not use input_ids here because TP scatter may pad it. Only accept
+        # it when it still represents a uniform per-request token width.
+        if forward_batch.input_ids is not None:
+            input_numel = int(forward_batch.input_ids.numel())
+            if batch_size > 0 and input_numel % batch_size == 0:
+                return input_numel // batch_size
+        raise RuntimeError(
+            "DeepSeekV4 target-verify cannot determine semantic query length: "
+            f"batch_size={batch_size}, "
+            f"input_ids_shape={None if forward_batch.input_ids is None else tuple(forward_batch.input_ids.shape)}."
+        )
+
+    def _make_target_verify_layout(
+        self,
+        forward_batch: ForwardBatch,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        active_bs: Optional[int] = None,
+    ) -> TargetVerifyLayout:
+        if active_bs is None:
+            active_bs = self._active_batch_size(forward_batch, req_pool_indices, seq_lens)
+        query_len = self._target_verify_query_len(forward_batch, active_bs)
+        return TargetVerifyLayout(
+            active_bs=active_bs,
+            query_len=query_len,
+            semantic_num_tokens=active_bs * query_len,
+            req_pool_indices=req_pool_indices[:active_bs],
+            seq_lens=seq_lens[:active_bs],
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
@@ -962,16 +1176,17 @@ class DeepseekV4AttnBackend(
             seq_lens,
             verify_bs=active_bs,
         )
-        trace_event(
-            logger,
-            "dsv4_forward_metadata",
-            mode=str(logical_forward_mode),
-            active_bs=active_bs,
-            padded_bs=int(req_pool_indices.shape[0]),
-            max_seq_len=max_seq_len,
-            online_state_slot_offset=online_c128_state_slot_offset,
-            out_cache_loc=forward_batch.out_cache_loc,
-        )
+        if self._accuracy_trace_enabled:
+            trace_event(
+                logger,
+                "dsv4_forward_metadata",
+                mode=str(logical_forward_mode),
+                active_bs=active_bs,
+                padded_bs=int(req_pool_indices.shape[0]),
+                max_seq_len=max_seq_len,
+                online_state_slot_offset=online_c128_state_slot_offset,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
 
         if logical_forward_mode.is_decode_or_idle():
             metadata = self.init_forward_metadata_decode(
@@ -981,17 +1196,33 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
             )
         elif logical_forward_mode.is_target_verify():
-            num_tokens = (
-                forward_batch.input_ids.numel()
-                if forward_batch.input_ids is not None
-                else None
+            layout = self._make_target_verify_layout(
+                forward_batch,
+                req_pool_indices,
+                seq_lens,
+                active_bs=active_bs,
             )
+            if (
+                self._accuracy_trace_enabled
+                and forward_batch.input_ids is not None
+                and int(forward_batch.input_ids.numel())
+                != layout.semantic_num_tokens
+            ):
+                trace_event(
+                    logger,
+                    "dsv4_target_verify_tp_padding",
+                    active_bs=layout.active_bs,
+                    query_len=layout.query_len,
+                    semantic_num_tokens=layout.semantic_num_tokens,
+                    input_ids_numel=int(forward_batch.input_ids.numel()),
+                    out_cache_loc=forward_batch.out_cache_loc,
+                )
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
+                req_pool_indices=layout.req_pool_indices,
+                seq_lens=layout.seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
-                num_tokens=num_tokens,
+                num_tokens=layout.semantic_num_tokens,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
         elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
@@ -1141,13 +1372,14 @@ class DeepseekV4AttnBackend(
                 active_req_pool_indices,
                 active_seq_lens,
             )
-            trace_event(
-                logger,
-                "dsv4_graph_replay_decode",
-                active_bs=active_bs,
-                graph_bs=bs,
-                mode=str(logical_forward_mode),
-            )
+            if self._accuracy_trace_enabled:
+                trace_event(
+                    logger,
+                    "dsv4_graph_replay_decode",
+                    active_bs=active_bs,
+                    graph_bs=bs,
+                    mode=str(logical_forward_mode),
+                )
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, bs - len(out_cache_loc)),
@@ -1161,7 +1393,13 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            verify_bs = active_bs
+            layout = self._make_target_verify_layout(
+                fb,
+                req_pool_indices,
+                seq_lens,
+                active_bs=active_bs,
+            )
+            verify_bs = layout.active_bs
             if verify_bs < 0 or verify_bs > bs:
                 raise RuntimeError(
                     "DeepSeekV4 graph replay target-verify active batch is invalid: "
@@ -1174,17 +1412,17 @@ class DeepseekV4AttnBackend(
                 ][bs]
                 return
             assert out_cache_loc is not None
-            num_tokens = self.speculative_num_draft_tokens * bs
-            if out_cache_loc.numel() > num_tokens:
+            graph_num_tokens = layout.query_len * bs
+            if out_cache_loc.numel() > graph_num_tokens:
                 raise RuntimeError(
                     "DeepSeekV4 graph replay target-verify out_cache_loc exceeds "
                     "the graph bucket capacity: "
                     f"out_cache_loc_shape={tuple(out_cache_loc.shape)}, "
-                    f"graph_bs={bs}, draft_tokens={self.speculative_num_draft_tokens}."
+                    f"graph_bs={bs}, query_len={layout.query_len}."
                 )
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
-                pad=(0, num_tokens - len(out_cache_loc)),
+                pad=(0, graph_num_tokens - len(out_cache_loc)),
                 mode="constant",
                 value=0,
             )
@@ -1194,20 +1432,24 @@ class DeepseekV4AttnBackend(
                 seq_lens,
                 verify_bs=verify_bs,
             )
-            trace_event(
-                logger,
-                "dsv4_graph_replay_target_verify",
-                active_bs=verify_bs,
-                graph_bs=bs,
-                num_draft_tokens=self.speculative_num_draft_tokens,
-                out_cache_loc=out_cache_loc,
-                online_state_slot_offset=online_c128_state_slot_offset,
-            )
+            if self._accuracy_trace_enabled:
+                trace_event(
+                    logger,
+                    "dsv4_graph_replay_target_verify",
+                    active_bs=verify_bs,
+                    graph_bs=bs,
+                    query_len=layout.query_len,
+                    semantic_num_tokens=layout.semantic_num_tokens,
+                    graph_num_tokens=graph_num_tokens,
+                    out_cache_loc=out_cache_loc,
+                    online_state_slot_offset=online_c128_state_slot_offset,
+                )
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
+                req_pool_indices=layout.req_pool_indices,
+                seq_lens=layout.seq_lens,
                 out_cache_loc=out_cache_loc_padded,
+                num_tokens=layout.semantic_num_tokens,
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
@@ -1217,13 +1459,14 @@ class DeepseekV4AttnBackend(
                 active_req_pool_indices,
                 active_seq_lens,
             )
-            trace_event(
-                logger,
-                "dsv4_graph_replay_draft_extend",
-                active_bs=active_bs,
-                graph_bs=bs,
-                mode=str(logical_forward_mode),
-            )
+            if self._accuracy_trace_enabled:
+                trace_event(
+                    logger,
+                    "dsv4_graph_replay_draft_extend",
+                    active_bs=active_bs,
+                    graph_bs=bs,
+                    mode=str(logical_forward_mode),
+                )
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
             temp_metadata = self.init_forward_metadata_draft_extend(
                 max_seq_len=chosen_max_seq_len,
@@ -1375,23 +1618,29 @@ class DeepseekV4AttnBackend(
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
-            if self.mtp_enabled:
-                if swa_page_indices.shape[0] != q.shape[0]:
-                    swa_page_indices = _pad_tensor_to_size(
-                        swa_page_indices, q.shape[0], value=0
-                    )
-
-                if swa_topk_lengths.shape[0] != q.shape[0]:
-                    swa_topk_lengths = _pad_tensor_to_size(
-                        swa_topk_lengths, q.shape[0], value=1
-                    )
-
             if q.ndim == 3:
                 q = q.unsqueeze(1)
-            if swa_page_indices.ndim == 2:
-                swa_page_indices = swa_page_indices.unsqueeze(1)
-            if extra_indices is not None and extra_indices.ndim == 2:
-                extra_indices = extra_indices.unsqueeze(1)
+            query_batch_size, query_len = int(q.shape[0]), int(q.shape[1])
+            swa_page_indices, swa_topk_lengths = _normalize_flashmla_sparse_metadata(
+                indices=swa_page_indices,
+                topk_lengths=swa_topk_lengths,
+                batch_size=query_batch_size,
+                query_len=query_len,
+                indices_name="swa_page_indices",
+                lengths_name="swa_topk_lengths",
+                indices_pad_value=0,
+                lengths_pad_value=1,
+            )
+            extra_indices, extra_topk_lengths = _normalize_flashmla_sparse_metadata(
+                indices=extra_indices,
+                topk_lengths=extra_topk_lengths,
+                batch_size=query_batch_size,
+                query_len=query_len,
+                indices_name="extra_indices",
+                lengths_name="extra_topk_lengths",
+                indices_pad_value=-1,
+                lengths_pad_value=1,
+            )
 
             assert attn_sink is not None
 

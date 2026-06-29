@@ -1965,6 +1965,10 @@ class DecodePreallocQueue:
                     decode_req.req.return_logprob,
                 )
                 if self.scheduler.enable_hisparse:
+                    self.scheduler.batch_result_processor.flush_online_c128_pending_for_reqs(
+                        [decode_req.req],
+                        require_forward_progress=False,
+                    )
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 if (
@@ -2748,6 +2752,10 @@ class DecodeTransferQueue:
     def _cleanup_failed_decode_req(self, decode_req: DecodeRequest) -> None:
         self._clear_receiver(decode_req)
         if self.scheduler.enable_hisparse:
+            self.scheduler.batch_result_processor.flush_online_c128_pending_for_reqs(
+                [decode_req.req],
+                require_forward_progress=False,
+            )
             self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
         self._unregister_staging_req(decode_req)
@@ -2805,11 +2813,8 @@ class DecodeTransferQueue:
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                self._clear_receiver(decode_req)
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                self._cleanup_failed_decode_req(decode_req)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2824,13 +2829,7 @@ class DecodeTransferQueue:
                             [decode_req.req],
                             decode_req.req.return_logprob,
                         )
-                        if self.scheduler.enable_hisparse:
-                            self.scheduler.hisparse_coordinator.request_finished(
-                                decode_req.req
-                            )
-                        release_kv_cache(
-                            decode_req.req, self.tree_cache, is_insert=False
-                        )
+                        self._cleanup_failed_decode_req(decode_req)
                         if self.scheduler.metrics_reporter.enable_metrics:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:

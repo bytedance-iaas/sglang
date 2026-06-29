@@ -174,6 +174,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 step=self.num_tokens_per_bs,
                 dtype=torch.int32,
             )
+            self.extend_start_loc_template = extend_start_loc.clone()
 
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
@@ -518,12 +519,19 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
     ):
         buffers = self.buffers
         if bs != raw_bs:
+            padded_num_tokens = bs * self.num_tokens_per_bs
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.req_pool_indices.zero_()
+            buffers.input_ids[num_tokens:padded_num_tokens].zero_()
             buffers.out_cache_loc.zero_()
             buffers.swa_out_cache_loc.zero_()
             buffers.positions.zero_()
+            buffers.mrope_positions[:, num_tokens:padded_num_tokens].zero_()
+            buffers.hidden_states[num_tokens:padded_num_tokens].zero_()
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            buffers.extend_start_loc[raw_bs:bs].copy_(
+                self.extend_start_loc_template[raw_bs:bs]
+            )
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
         # Common inputs
@@ -550,11 +558,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             )
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
+        if bs != raw_bs:
+            buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
         if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
+        if bs != raw_bs:
+            self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
+                bs - raw_bs
+            )
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
@@ -591,19 +603,25 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         forward_batch.spec_info.positions = buffers.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
-        self.eagle_worker.draft_extend_attn_backend_list[
-            self.step
-        ].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-        )
+        forward_batch._cuda_graph_raw_batch_size = raw_bs
+        attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
+        attn_backend._replay_forward_batch = forward_batch
+        try:
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=buffers.req_pool_indices,
+                seq_lens=buffers.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu,
+            )
+        finally:
+            attn_backend._replay_forward_batch = None
+            if hasattr(forward_batch, "_cuda_graph_raw_batch_size"):
+                delattr(forward_batch, "_cuda_graph_raw_batch_size")
 
         # Replay
         self.raw_bs = raw_bs

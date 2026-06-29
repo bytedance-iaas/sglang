@@ -126,6 +126,33 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
+        bs = batch.batch_size()
+        expected_num_tokens = bs * self.draft_token_num
+        actual_num_tokens = self.draft_token.numel()
+        if actual_num_tokens != expected_num_tokens:
+            raise RuntimeError(
+                "EAGLE target-verify input is inconsistent before KV allocation: "
+                f"batch_size={bs}, draft_token_num={self.draft_token_num}, "
+                f"draft_token_shape={tuple(self.draft_token.shape)}, "
+                f"expected_num_tokens={expected_num_tokens}, "
+                f"actual_num_tokens={actual_num_tokens}, "
+                f"retrieve_index_shape={tuple(self.retrieve_index.shape)}, "
+                f"seq_lens_shape={tuple(batch.seq_lens.shape)}, "
+                f"req_pool_indices_shape={tuple(batch.req_pool_indices.shape)}"
+            )
+        if self.retrieve_index.shape[0] != bs:
+            raise RuntimeError(
+                "EAGLE target-verify retrieve_index batch mismatch: "
+                f"batch_size={bs}, retrieve_index_shape={tuple(self.retrieve_index.shape)}"
+            )
+        if self.positions.numel() != expected_num_tokens:
+            raise RuntimeError(
+                "EAGLE target-verify positions length mismatch: "
+                f"batch_size={bs}, draft_token_num={self.draft_token_num}, "
+                f"positions_shape={tuple(self.positions.shape)}, "
+                f"expected_num_tokens={expected_num_tokens}"
+            )
+
         batch.input_ids = self.draft_token
 
         if page_size == 1:
@@ -182,7 +209,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     len(batch.input_ids),
                 )
 
-        bs = batch.batch_size()
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -620,6 +646,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 req_pool_indices=batch.req_pool_indices,
+                req_pool_indices_cpu=batch.req_pool_indices_cpu,
             )
 
             return EagleVerifyOutput(
@@ -692,6 +719,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     seq_lens=batch.seq_lens[unfinished_index_device],
                     seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
+                    req_pool_indices_cpu=batch.req_pool_indices_cpu[unfinished_index],
                 )
             else:
                 # hidden_size=None: worker fixup rebuilds via
@@ -817,19 +845,33 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-            if len(new_indices) != len(self.topk_p):
-                if strict_check:
-                    raise ValueError(error_msg)
-                else:
-                    logger.warning(error_msg)
+            # therefore, we should not slice by prefix here. Prefix slicing
+            # silently corrupts the mapping when finished requests are not the
+            # suffix of the original batch.
+            if len(new_indices) == len(self.topk_p):
+                return
 
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
+            if new_indices.numel() > 0 and int(new_indices.max().item()) < len(
+                self.topk_p
+            ):
+                self.topk_p = self.topk_p[new_indices]
+                self.topk_index = self.topk_index[new_indices]
+                if self.hidden_states is not None:
+                    self.hidden_states = self.hidden_states[new_indices]
+                self.bonus_tokens = self.bonus_tokens[new_indices]
+                return
+
+            error_msg = (
+                "EAGLE draft state was marked as already filtered, but its "
+                "shape does not match the current batch and cannot be indexed "
+                f"by keep indices: len(new_indices)={len(new_indices)}, "
+                f"topk_p_shape={tuple(self.topk_p.shape)}, "
+                f"new_indices={new_indices.tolist()}"
+            )
+            if strict_check:
+                raise ValueError(error_msg)
+            logger.warning(error_msg)
+            return
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -902,6 +944,7 @@ class EagleDraftExtendInput(SpecInput):
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
+    req_pool_indices_cpu: torch.Tensor = None
 
     # Set by `prepare_extend_after_decode`:
     #   - positions: kernel-written, shape `[total_accepted]`.
@@ -974,6 +1017,7 @@ class EagleDraftExtendInput(SpecInput):
             seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
             req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
+            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
         )
 
@@ -996,6 +1040,8 @@ class EagleDraftExtendInput(SpecInput):
         batch.seq_lens = self.seq_lens
         batch.seq_lens_cpu = self.seq_lens_cpu
         batch.req_pool_indices = self.req_pool_indices
+        if self.req_pool_indices_cpu is not None:
+            batch.req_pool_indices_cpu = self.req_pool_indices_cpu
         batch.return_logprob = False
         batch.return_hidden_states = False
 

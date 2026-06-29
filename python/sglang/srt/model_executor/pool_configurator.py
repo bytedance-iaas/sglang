@@ -518,9 +518,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         uint64_bytes = 8
 
         overhead = 0
-        overhead += req_slots * max_context_len * int32_bytes
         overhead += req_slots * padded_buffer_size * int64_bytes
-        overhead += req_slots * (max_compressed_context_len + 1) * int64_bytes
+        overhead += req_slots * (max_compressed_context_len + c4_page_size) * int64_bytes
         overhead += 2 * c4_layers * req_slots * padded_buffer_size * int32_bytes
         overhead += c4_layers * req_slots * self.hisparse_device_buffer_size * int16_bytes
         overhead += self.hisparse_device_buffer_size * int16_bytes

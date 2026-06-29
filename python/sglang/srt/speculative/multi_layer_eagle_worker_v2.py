@@ -165,6 +165,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             dtype=self.model_config.dtype,
             device=self.device,
         )
+        if self.req_to_hidden_states_pool.shape[0] > 0:
+            self.req_to_hidden_states_pool[0].zero_()
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
@@ -239,6 +241,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.topk,
             self.speculative_num_steps,
         )
+        self._seed_hidden_states_pool_from_draft_input(forward_batch)
 
         # Run draft
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
@@ -291,6 +294,22 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+        )
+
+    def _seed_hidden_states_pool_from_draft_input(self, forward_batch: ForwardBatch):
+        hidden_states = getattr(forward_batch.spec_info, "hidden_states", None)
+        pool_size = self.req_to_hidden_states_pool.shape[1]
+        if (
+            hidden_states is None
+            or pool_size == 0
+            or forward_batch.batch_size == 0
+            or hidden_states.shape[0] != forward_batch.batch_size
+        ):
+            return
+
+        req_pool_indices = forward_batch.req_pool_indices[: forward_batch.batch_size]
+        self.req_to_hidden_states_pool[req_pool_indices, pool_size - 1, :].copy_(
+            hidden_states[: forward_batch.batch_size]
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):

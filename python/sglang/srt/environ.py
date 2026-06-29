@@ -253,7 +253,7 @@ class Envs:
     # DSV4 HiSparse keeps C4 KV compressed/host-backed on decode, so reserving
     # the full clipped output length during PD preallocation is too conservative.
     SGLANG_HISPARSE_RELAX_DECODE_OUTPUT_RESERVE = EnvBool(True)
-    SGLANG_HISPARSE_DECODE_UTILIZATION_GOVERNOR = EnvBool(True)
+    SGLANG_HISPARSE_DECODE_UTILIZATION_GOVERNOR = EnvBool(False)
     SGLANG_HISPARSE_DECODE_FULL_USAGE_TARGET = EnvFloat(0.92)
     SGLANG_HISPARSE_DECODE_FULL_USAGE_HARD_LIMIT = EnvFloat(0.98)
     # Opt in to reuse full logical prefix pages for the validated DSV4
@@ -650,14 +650,7 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-    # HiSparse consumes raw top-k token positions and then runs a separate C4
-    # swap-in pass. Keep the legacy top-k path as the correctness default until
-    # raw-only topk_v2 is validated against the swap-in mapping path.
-    SGLANG_OPT_HISPARSE_USE_TOPK_V2 = EnvBool(False)
-    # DSV4 C4 sparse attention quality is calibrated by the model's index_topk.
-    # Keep HiSparse on that value unless an experiment explicitly opts out.
-    SGLANG_DSV4_HISPARSE_ALLOW_TOPK_OVERRIDE = EnvBool(False)
-    SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK = EnvBool(True)
+    SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK = EnvBool(False)
     # 0 means keep the default layer0-only C4 swap check. A positive value
     # samples every Nth C4 layer in eager mode for debugging precision issues.
     SGLANG_HISPARSE_C4_SWAP_CHECK_SAMPLE_INTERVAL = EnvInt(0)

@@ -177,9 +177,13 @@ class OnlineC128MTPController:
         self.backend = backend
         self._verify_ctx: Optional[_OnlineC128VerifyContext] = None
         self._layer_runtimes: Optional[List[_OnlineC128LayerRuntime]] = None
+        self._state_debug_enabled = envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get()
+        self._accuracy_trace_enabled = (
+            envs.SGLANG_DSV4_HISPARSE_ACCURACY_TRACE.get()
+        )
 
     def _debug_enabled(self) -> bool:
-        return envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get()
+        return self._state_debug_enabled
 
     def _ctx_shape(self, ctx: Optional[_OnlineC128VerifyContext]) -> str:
         if ctx is None:
@@ -227,16 +231,17 @@ class OnlineC128MTPController:
             seq_lens=captured_seq_lens,
             tail_locs=tail_locs.detach().clone(),
         )
-        trace_event(
-            logger,
-            "online_c128_begin_verify",
-            bs=bs,
-            num_verify_tokens=self._num_verify_tokens(),
-            state_slot_offset=self.state_slot_offset(),
-            req_pool_indices=captured_req_pool_indices,
-            seq_lens=captured_seq_lens,
-            tail_locs=tail_locs,
-        )
+        if self._accuracy_trace_enabled:
+            trace_event(
+                logger,
+                "online_c128_begin_verify",
+                bs=bs,
+                num_verify_tokens=self._num_verify_tokens(),
+                state_slot_offset=self.state_slot_offset(),
+                req_pool_indices=captured_req_pool_indices,
+                seq_lens=captured_seq_lens,
+                tail_locs=tail_locs,
+            )
         if captured_req_pool_indices.numel() == 0 or captured_seq_lens.numel() == 0:
             return
         if self._num_verify_tokens() == 0:
@@ -254,7 +259,7 @@ class OnlineC128MTPController:
 
     def clear(self) -> None:
         ctx = self._verify_ctx
-        if ctx is not None:
+        if ctx is not None and self._accuracy_trace_enabled:
             trace_event(
                 logger,
                 "online_c128_clear",
@@ -294,23 +299,24 @@ class OnlineC128MTPController:
             req_pool_indices=active_req_pool_indices,
             seq_lens=active_seq_lens,
         )
-        trace_event(
-            logger,
-            "online_c128_prepare_forward",
-            mode=str(logical_forward_mode),
-            verify_bs=verify_bs,
-            active_bs=min(
-                active_req_pool_indices.shape[0],
-                active_seq_lens.shape[0],
-            ),
-            state_slot_offset=(
-                self.state_slot_offset()
-                if logical_forward_mode.is_target_verify()
-                else 0
-            ),
-            req_pool_indices=active_req_pool_indices,
-            seq_lens=active_seq_lens,
-        )
+        if self._accuracy_trace_enabled:
+            trace_event(
+                logger,
+                "online_c128_prepare_forward",
+                mode=str(logical_forward_mode),
+                verify_bs=verify_bs,
+                active_bs=min(
+                    active_req_pool_indices.shape[0],
+                    active_seq_lens.shape[0],
+                ),
+                state_slot_offset=(
+                    self.state_slot_offset()
+                    if logical_forward_mode.is_target_verify()
+                    else 0
+                ),
+                req_pool_indices=active_req_pool_indices,
+                seq_lens=active_seq_lens,
+            )
         if not logical_forward_mode.is_target_verify():
             return 0
 
@@ -391,18 +397,19 @@ class OnlineC128MTPController:
         cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
         old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
         cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
-        trace_event(
-            logger,
-            "online_c128_commit_pending",
-            old_bs=old_bs,
-            cur_bs=cur_bs,
-            num_verify_tokens=num_verify_tokens,
-            state_slot_offset=self.state_slot_offset(),
-            old_req_pool_indices=ctx.req_pool_indices,
-            cur_req_pool_indices=cur_req_pool_indices,
-            old_seq_lens=ctx.seq_lens,
-            cur_seq_lens=cur_seq_lens,
-        )
+        if self._accuracy_trace_enabled:
+            trace_event(
+                logger,
+                "online_c128_commit_pending",
+                old_bs=old_bs,
+                cur_bs=cur_bs,
+                num_verify_tokens=num_verify_tokens,
+                state_slot_offset=self.state_slot_offset(),
+                old_req_pool_indices=ctx.req_pool_indices,
+                cur_req_pool_indices=cur_req_pool_indices,
+                old_seq_lens=ctx.seq_lens,
+                cur_seq_lens=cur_seq_lens,
+            )
 
         for runtime in self._iter_layer_runtimes():
             online_c128_mtp_lazy_commit(
@@ -507,18 +514,19 @@ class OnlineC128MTPController:
             matched_old_seq_lens.shape[0], matched_old_req_pool_indices.shape[0]
         )
 
-        trace_event(
-            logger,
-            "online_c128_flush_pending_for_reqs",
-            old_bs=matched_old_bs,
-            cur_bs=cur_bs,
-            num_verify_tokens=num_verify_tokens,
-            state_slot_offset=self.state_slot_offset(),
-            old_req_pool_indices=matched_old_req_pool_indices,
-            cur_req_pool_indices=cur_req_pool_indices,
-            old_seq_lens=matched_old_seq_lens,
-            cur_seq_lens=cur_seq_lens,
-        )
+        if self._accuracy_trace_enabled:
+            trace_event(
+                logger,
+                "online_c128_flush_pending_for_reqs",
+                old_bs=matched_old_bs,
+                cur_bs=cur_bs,
+                num_verify_tokens=num_verify_tokens,
+                state_slot_offset=self.state_slot_offset(),
+                old_req_pool_indices=matched_old_req_pool_indices,
+                cur_req_pool_indices=cur_req_pool_indices,
+                old_seq_lens=matched_old_seq_lens,
+                cur_seq_lens=cur_seq_lens,
+            )
 
         backend = self.backend
         for runtime in self._iter_layer_runtimes():

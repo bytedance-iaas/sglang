@@ -296,20 +296,24 @@ class FrozenKVMTPWorker(TpModelWorker):
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices[:bs],
-                forward_batch.seq_lens[:bs],
-                seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-                seq_lens_cpu=(
-                    forward_batch.seq_lens_cpu[:bs]
-                    if forward_batch.seq_lens_cpu is not None
-                    else None
-                ),
-            )
+            self.draft_attn_backend._replay_forward_batch = forward_batch
+            try:
+                self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    forward_batch.req_pool_indices[:bs],
+                    forward_batch.seq_lens[:bs],
+                    seq_lens_sum,
+                    encoder_lens=None,
+                    forward_mode=ForwardMode.DECODE,
+                    spec_info=None,
+                    seq_lens_cpu=(
+                        forward_batch.seq_lens_cpu[:bs]
+                        if forward_batch.seq_lens_cpu is not None
+                        else None
+                    ),
+                )
+            finally:
+                self.draft_attn_backend._replay_forward_batch = None
         forward_batch.attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self) -> None:
@@ -523,6 +527,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             # All reqs finished. Install an idle FrozenKVMTPDraftInput so the
             # next-iter draft sees a valid spec_info.
             batch = batch.copy()
+            batch.reqs = []
+            batch.decoding_reqs = []
             batch.prepare_for_idle()
             batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
                 device=self.device,
@@ -539,6 +545,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
+        req_pool_indices_cpu_backup = batch.req_pool_indices_cpu
 
         try:
             # Verify may leave finished requests in ScheduleBatch; seed only
@@ -546,6 +553,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch.seq_lens = draft_extend_input.seq_lens
             batch.seq_lens_cpu = draft_extend_input.seq_lens_cpu
             batch.req_pool_indices = draft_extend_input.req_pool_indices
+            batch.req_pool_indices_cpu = draft_extend_input.req_pool_indices_cpu
 
             last_token_ids, last_hidden = self._select_last_verified_seed(
                 draft_extend_input
@@ -562,6 +570,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch.seq_lens = seq_lens_backup
             batch.seq_lens_cpu = seq_lens_cpu_backup
             batch.req_pool_indices = req_pool_indices_backup
+            batch.req_pool_indices_cpu = req_pool_indices_cpu_backup
 
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():

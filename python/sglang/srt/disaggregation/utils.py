@@ -121,9 +121,6 @@ def build_dsv4_hisparse_capability_signature(
                 "top_k": top_k,
                 "topk_mode": topk_mode,
                 "use_topk_v2": bool(envs.SGLANG_OPT_USE_TOPK_V2.get()),
-                "use_hisparse_topk_v2": bool(
-                    envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get()
-                ),
             }
         )
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))

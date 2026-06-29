@@ -2524,6 +2524,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(self):
+        self.reqs = []
+        self.decoding_reqs = []
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)

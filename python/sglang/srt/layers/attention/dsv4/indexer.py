@@ -418,10 +418,9 @@ class C4IndexerBackendMixin:
         # HiSparse consumes raw token positions and then runs a separate C4
         # host/device swap-in pass. Keep the proven fixed-size top-k kernels for
         # standard 512/1024 shapes even when the global topk_v2 switch is on;
-        # use v2 for HiSparse only when a flexible top-k shape requires it.
+        # use v2 for HiSparse when a flexible top-k shape requires it.
         use_topk_v2 = envs.SGLANG_OPT_USE_TOPK_V2.get() and (
             not hisparse_c4_swap_in
-            or (envs.SGLANG_OPT_HISPARSE_USE_TOPK_V2.get() and requires_flexible_topk)
             or requires_flexible_topk
         )
 
@@ -486,49 +485,76 @@ class C4IndexerBackendMixin:
                 req_pool_indices = indexer_metadata.req_pool_indices_repeated
                 if req_pool_indices is None:
                     req_pool_indices = forward_batch.req_pool_indices
-                if (
-                    forward_batch.forward_mode.is_target_verify()
-                    and req_pool_indices.size(0) == topk_batch_size
-                    and forward_batch.req_pool_indices.size(0) < topk_batch_size
-                ):
-                    base_req_pool_indices = forward_batch.req_pool_indices
-                    base_batch_size = base_req_pool_indices.size(0)
-                    if base_batch_size <= 0:
+                if forward_batch.forward_mode.is_target_verify():
+                    if req_pool_indices.size(0) < topk_batch_size:
                         raise RuntimeError(
-                            "HiSparse target-verify C4 top-k has no base requests: "
+                            "HiSparse target-verify C4 swap-in requires repeated "
+                            "request rows for each semantic token: "
+                            f"req_pool_indices_shape={tuple(req_pool_indices.shape)}, "
                             f"topk_batch_size={topk_batch_size}."
                         )
-                    if forward_batch.out_cache_loc is not None:
-                        real_topk_batch_size = forward_batch.out_cache_loc.numel()
-                        if real_topk_batch_size % base_batch_size != 0:
-                            raise RuntimeError(
-                                "HiSparse target-verify C4 output token count is not "
-                                "a multiple of request batch size: "
-                                f"real_topk_batch_size={real_topk_batch_size}, "
-                                f"base_batch_size={base_batch_size}."
-                            )
-                    else:
-                        real_topk_batch_size = topk_batch_size
-                        if real_topk_batch_size % base_batch_size != 0:
-                            raise RuntimeError(
-                                "HiSparse target-verify C4 top-k batch is not a "
-                                "multiple of request batch size: "
-                                f"topk_batch_size={topk_batch_size}, "
-                                f"base_batch_size={base_batch_size}."
-                            )
+                    real_topk_batch_size = int(core_metadata.raw_out_loc.numel())
+                    if real_topk_batch_size <= 0:
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 top-k has no semantic rows: "
+                            f"topk_batch_size={topk_batch_size}, "
+                            f"raw_out_loc_shape={tuple(core_metadata.raw_out_loc.shape)}."
+                        )
                     if real_topk_batch_size > topk_batch_size:
                         raise RuntimeError(
-                            "HiSparse target-verify C4 real token count exceeds "
+                            "HiSparse target-verify C4 semantic token count exceeds "
                             "top-k metadata rows: "
                             f"real_topk_batch_size={real_topk_batch_size}, "
-                            f"topk_batch_size={topk_batch_size}, "
-                            f"base_batch_size={base_batch_size}."
+                            f"topk_batch_size={topk_batch_size}."
+                        )
+                    draft_token_num = getattr(
+                        getattr(forward_batch, "spec_info", None),
+                        "draft_token_num",
+                        None,
+                    )
+                    if draft_token_num is None or int(draft_token_num) <= 0:
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 swap-in requires EAGLE "
+                            "draft_token_num to group semantic rows: "
+                            f"draft_token_num={draft_token_num}, "
+                            f"real_topk_batch_size={real_topk_batch_size}."
+                        )
+                    tokens_per_req = int(draft_token_num)
+                    if real_topk_batch_size % tokens_per_req != 0:
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 semantic token count is not "
+                            "a multiple of draft_token_num: "
+                            f"real_topk_batch_size={real_topk_batch_size}, "
+                            f"tokens_per_req={tokens_per_req}."
+                        )
+                    base_batch_size = real_topk_batch_size // tokens_per_req
+                    if req_pool_indices.size(0) < real_topk_batch_size:
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 repeated req rows are shorter "
+                            "than semantic token rows: "
+                            f"req_pool_indices_shape={tuple(req_pool_indices.shape)}, "
+                            f"real_topk_batch_size={real_topk_batch_size}, "
+                            f"base_batch_size={base_batch_size}, "
+                            f"tokens_per_req={tokens_per_req}."
                         )
                     if real_topk_batch_size < topk_batch_size:
                         core_metadata.c4_sparse_page_indices[
                             real_topk_batch_size:
                         ].fill_(-1)
-                    tokens_per_req = real_topk_batch_size // base_batch_size
+                    req_indices_by_token = req_pool_indices[
+                        :real_topk_batch_size
+                    ].view(base_batch_size, tokens_per_req)
+                    base_req_pool_indices = req_indices_by_token[:, 0].contiguous()
+                    if envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get() and torch.any(
+                        req_indices_by_token != base_req_pool_indices[:, None]
+                    ):
+                        raise RuntimeError(
+                            "HiSparse target-verify C4 repeated req rows are not "
+                            "grouped by request: "
+                            f"req_indices_shape={tuple(req_indices_by_token.shape)}, "
+                            f"base_batch_size={base_batch_size}, "
+                            f"tokens_per_req={tokens_per_req}."
+                        )
                     raw_indices_by_token = raw_indices[:real_topk_batch_size].view(
                         base_batch_size, tokens_per_req, topk_size
                     )

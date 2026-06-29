@@ -390,6 +390,11 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        self._state_debug_enabled = envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get()
+        self._strict_c4_swap_check_enabled = (
+            envs.SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK.get()
+        )
+        self._accuracy_trace_enabled = envs.SGLANG_DSV4_HISPARSE_ACCURACY_TRACE.get()
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
         if self.is_dsv4_hisparse:
@@ -2216,7 +2221,7 @@ class HiSparseCoordinator:
         self._skip_first_backup[req_pool_idx] = False
 
     def _debug_assert_request_state_cleared(self, req_pool_idx: int) -> None:
-        if not envs.SGLANG_DSV4_HISPARSE_STATE_DEBUG.get():
+        if not self._state_debug_enabled:
             return
 
         issues = []
@@ -2623,16 +2628,22 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
-        self._check_c4_swap_in_result(
-            req_pool_indices, compressed_seq_lens, top_k_result, top_k_indices, layer_id
-        )
-        self._trace_c4_swap_in_result(
-            req_pool_indices,
-            compressed_seq_lens,
-            top_k_result,
-            top_k_indices,
-            layer_id,
-        )
+        if self._strict_c4_swap_check_enabled:
+            self._check_c4_swap_in_result(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                top_k_indices,
+                layer_id,
+            )
+        if self._accuracy_trace_enabled:
+            self._trace_c4_swap_in_result(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                top_k_indices,
+                layer_id,
+            )
         return top_k_indices
 
     def _trace_c4_swap_in_result(
@@ -2702,7 +2713,6 @@ class HiSparseCoordinator:
         if (
             not self.is_dsv4_hisparse
             or not should_check_layer
-            or not envs.SGLANG_HISPARSE_STRICT_C4_SWAP_CHECK.get()
         ):
             return
 
