@@ -787,6 +787,7 @@ class DeepseekV4DSparkModel(DeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -836,12 +837,48 @@ class DeepseekV4DSparkModel(DeepseekV4ForCausalLM):
                     break
                 if loaded:
                     continue
+                if (
+                    name.endswith(".wq_a.weight")
+                    or name.endswith(".wq_a.weight_scale_inv")
+                    or name.endswith(".wkv.weight")
+                    or name.endswith(".wkv.weight_scale_inv")
+                ):
+                    is_q = ".wq_a." in name
+                    mapped_name = name.replace(
+                        ".wq_a." if is_q else ".wkv.", ".wqkv_a."
+                    )
+                    if mapped_name in params_dict:
+                        bucket = cache_wqkv_a_weight.setdefault(mapped_name, {})
+                        shard_key = "q" if is_q else "kv"
+                        if shard_key in bucket:
+                            raise ValueError(
+                                f"Duplicate DSpark wqkv_a shard {shard_key} for {mapped_name}."
+                            )
+                        bucket[shard_key] = loaded_weight
+                        if len(bucket) == 2:
+                            fused_weight = torch.cat(
+                                [bucket["q"], bucket["kv"]], dim=0
+                            )
+                            param = params_dict[mapped_name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, fused_weight)
+                            loaded_params.add(mapped_name)
+                            cache_wqkv_a_weight.pop(mapped_name)
+                        continue
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+
+        if cache_wqkv_a_weight:
+            raise ValueError(
+                "Incomplete DSpark wqkv_a fused weights: "
+                f"{cache_wqkv_a_weight.keys()}"
+            )
 
         unloaded_params = {
             p
