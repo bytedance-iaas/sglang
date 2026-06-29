@@ -535,7 +535,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
