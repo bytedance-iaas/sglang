@@ -895,6 +895,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    def _resize_cache_loc_to_size(self, tensor: torch.Tensor, size: int):
+        if tensor.shape[0] > size:
+            return tensor[:size]
+        return self._pad_tensor_to_size(tensor, size)
+
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
@@ -1013,7 +1018,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
         if self.out_cache_loc_swa is not None:
-            self.out_cache_loc_swa = self._pad_tensor_to_size(
+            self.out_cache_loc_swa = self._resize_cache_loc_to_size(
                 self.out_cache_loc_swa, num_tokens
             )
         if self.encoder_lens is not None:
@@ -1048,6 +1053,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
+            self.output_cache_loc_swa_backup = self.out_cache_loc_swa
             self.hidden_states_backup = spec_info.hidden_states
             # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
             # a disjoint subset of the fields below, so getattr-guard each one.
@@ -1124,6 +1130,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.spec_info.hidden_states = self.hidden_states_backup
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
+            if hasattr(self, "output_cache_loc_swa_backup"):
+                self.out_cache_loc_swa = self.output_cache_loc_swa_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
