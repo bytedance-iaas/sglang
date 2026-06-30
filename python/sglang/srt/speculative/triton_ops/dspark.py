@@ -140,3 +140,79 @@ def _compute_dspark_accept_bonus_triton_unchecked(
         BLOCK_SIZE=block,
         num_warps=num_warps,
     )
+
+
+@triton.jit
+def _dspark_add_argmax_contig_kernel(
+    base_logits_ptr,
+    bias_ptr,
+    out_token_ptr,
+    base_row_stride,
+    bias_row_stride,
+    out_stride,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < vocab_size
+
+    base = tl.load(
+        base_logits_ptr + row * base_row_stride + offsets,
+        mask=mask,
+        other=-3.4028234663852886e38,
+    ).to(tl.float32)
+    bias = tl.load(
+        bias_ptr + row * bias_row_stride + offsets,
+        mask=mask,
+        other=-3.4028234663852886e38,
+    ).to(tl.float32)
+    vals = base + bias
+    max_val = tl.max(vals, axis=0)
+    token_ids = tl.where(vals == max_val, offsets, BLOCK_SIZE)
+    token_id = tl.min(token_ids, axis=0)
+    tl.store(out_token_ptr + row * out_stride, token_id)
+
+
+def _has_contiguous_vocab_dim(x: torch.Tensor) -> bool:
+    return x.ndim == 2 and x.stride(-1) == 1
+
+
+def _compute_dspark_add_argmax_triton_unchecked(
+    base_logits: torch.Tensor,
+    bias: torch.Tensor,
+    out_tokens: torch.Tensor,
+) -> None:
+    batch_size, vocab_size = bias.shape
+    if batch_size == 0:
+        return
+
+    if not _has_contiguous_vocab_dim(base_logits):
+        raise ValueError(
+            "DSPARK Triton add_argmax requires contiguous vocab dim for base_logits."
+        )
+    if not _has_contiguous_vocab_dim(bias):
+        raise ValueError(
+            "DSPARK Triton add_argmax requires contiguous vocab dim for bias."
+        )
+    if base_logits.shape != bias.shape:
+        raise ValueError(
+            "DSPARK Triton add_argmax requires matching base_logits and bias shapes. "
+            f"base_logits={tuple(base_logits.shape)}, bias={tuple(bias.shape)}"
+        )
+    if out_tokens.ndim != 1 or not out_tokens.is_contiguous():
+        raise ValueError("DSPARK Triton add_argmax requires contiguous 1D out_tokens.")
+
+    block = triton.next_power_of_2(vocab_size)
+    num_warps = _pick_num_warps(block)
+    _dspark_add_argmax_contig_kernel[(batch_size,)](
+        base_logits,
+        bias,
+        out_tokens,
+        base_logits.stride(0),
+        bias.stride(0),
+        out_tokens.stride(0),
+        vocab_size,
+        BLOCK_SIZE=block,
+        num_warps=num_warps,
+    )
