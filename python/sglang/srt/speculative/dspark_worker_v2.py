@@ -14,7 +14,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -177,32 +176,33 @@ class DSparkWorkerV2(BaseSpecWorker):
 
             wkv = getattr(attn, "wkv", None)
             scheme = getattr(wkv, "scheme", None)
-            scale = self._get_mxfp4_wkv_scale(wkv)
+            scale = self._get_mxfp8_wkv_scale(wkv)
             if (
                 wkv is None
                 or not hasattr(wkv, "weight")
-                or wkv.weight.dtype != torch.uint8
+                or wkv.weight.dtype
+                not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                 or scale is None
                 or wkv.weight.dim() != 2
                 or scale.dim() != 2
-                or wkv.weight.shape[1] * 2 != scale.shape[1] * 32
+                or wkv.weight.shape[0] != scale.shape[0]
+                or wkv.weight.shape[1] != scale.shape[1] * 32
                 or getattr(wkv, "skip_bias_add", False)
             ):
                 reason = (
-                    "unsupported wkv MXFP4 layout: "
+                    "unsupported wkv MXFP8 layout: "
                     f"scheme={scheme.__class__.__name__ if scheme is not None else None}, "
                     f"weight_dtype={getattr(getattr(wkv, 'weight', None), 'dtype', None)}, "
-                    f"scale_dtype={getattr(scale, 'dtype', None)}"
+                    f"weight_shape={tuple(wkv.weight.shape) if hasattr(wkv, 'weight') else None}, "
+                    f"scale_dtype={getattr(scale, 'dtype', None)}, "
+                    f"scale_shape={tuple(scale.shape) if scale is not None else None}"
                 )
                 self._log_dequant_wkv_stack_disabled(reason)
                 return
 
-            weight_bf16 = MXFP4QuantizeUtil.dequantize(
-                quantized_data=wkv.weight.detach(),
-                scale=scale.detach(),
-                dtype=torch.bfloat16,
-                block_sizes=[32],
-            ).contiguous()
+            weight_bf16 = self._dequant_mxfp8_weight_to_bf16(
+                wkv.weight.detach(), scale.detach()
+            )
             weights.append(weight_bf16)
 
             bias = getattr(wkv, "bias", None)
@@ -236,14 +236,36 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.warning("DSpark BF16 dequantized wkv stack disabled: %s", reason)
 
     @staticmethod
-    def _get_mxfp4_wkv_scale(wkv) -> Optional[torch.Tensor]:
+    def _get_mxfp8_wkv_scale(wkv) -> Optional[torch.Tensor]:
         if wkv is None:
             return None
-        for name in ("weight_scale", "weight_scale_inv"):
+        for name in ("weight_scale_inv", "weight_scale", "scale"):
             scale = getattr(wkv, name, None)
-            if scale is not None and getattr(scale, "dtype", None) == torch.uint8:
+            if scale is None:
+                continue
+            dtype = getattr(scale, "dtype", None)
+            if dtype == torch.uint8 or dtype == getattr(torch, "float8_e8m0fnu", None):
                 return scale
         return None
+
+    @staticmethod
+    def _dequant_mxfp8_weight_to_bf16(
+        weight: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        weight_float = weight.to(torch.float32)
+        num_blocks = weight.shape[-1] // 32
+        weight_blocked = weight_float.view(*weight.shape[:-1], num_blocks, 32)
+
+        if scale.dtype == torch.uint8:
+            descale = torch.exp2(scale.to(torch.float32) - 127.0)
+        elif scale.dtype == getattr(torch, "float8_e8m0fnu", None):
+            descale = scale.to(torch.float32)
+        else:
+            raise TypeError(f"Unsupported MXFP8 scale dtype: {scale.dtype}")
+
+        return (weight_blocked * descale.unsqueeze(-1)).view(*weight.shape).to(
+            torch.bfloat16
+        ).contiguous()
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
