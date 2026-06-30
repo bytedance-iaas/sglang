@@ -13,7 +13,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -141,7 +140,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
-        self._use_prequantized_wkv_input = self._init_prequantized_wkv_input_path()
 
         if self.tp_rank == 0:
             logger.info(
@@ -155,57 +153,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
             )
-
-    def _init_prequantized_wkv_input_path(self) -> bool:
-        if fp4_quantize is None:
-            return False
-
-        layers = getattr(self._draft_inner, "layers", None)
-        if not layers:
-            return False
-
-        first_scale = None
-        wkv_layers = []
-        for layer in layers:
-            attn = getattr(layer, "self_attn", None)
-            if attn is None or getattr(attn, "fuse_wqa_wkv", False):
-                return False
-
-            wkv = getattr(attn, "wkv", None)
-            quant_method = getattr(wkv, "quant_method", None)
-            if (
-                wkv is None
-                or quant_method is None
-                or quant_method.__class__.__name__ != "ModelOptFp4LinearMethod"
-                or not hasattr(wkv, "input_scale_inv")
-                or not hasattr(wkv, "weight_scale_interleaved")
-                or not hasattr(wkv, "alpha")
-            ):
-                return False
-
-            scale = wkv.input_scale_inv.detach()
-            if scale.numel() != 1:
-                return False
-            if first_scale is None:
-                first_scale = scale
-            elif not torch.equal(scale, first_scale):
-                return False
-
-            wkv_layers.append(wkv)
-
-        if not wkv_layers or first_scale is None:
-            return False
-
-        for wkv in wkv_layers:
-            wkv._accepts_prequantized_fp4 = True
-        self._prequantized_wkv_input_scale_inv = first_scale
-
-        if self.tp_rank == 0:
-            logger.info(
-                "Enabled DSpark prequantized FP4 wkv input reuse for %s layers.",
-                len(wkv_layers),
-            )
-        return True
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
@@ -301,48 +248,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
-            prequantized_main_x = None
-            if self._use_prequantized_wkv_input:
-                prequantized_main_x = fp4_quantize(
-                    main_x, self._prequantized_wkv_input_scale_inv
-                )
             for layer in self._draft_inner.layers:
-                attn = layer.self_attn
-                if prequantized_main_x is None:
-                    attn.kv_from_hidden(main_x, positions, cache_loc, attn_backend)
-                else:
-                    self._kv_from_prequantized_wkv_input(
-                        attn=attn,
-                        prequantized_x=prequantized_main_x,
-                        positions=positions,
-                        cache_loc=cache_loc,
-                        attn_backend=attn_backend,
-                    )
-
-    def _kv_from_prequantized_wkv_input(
-        self,
-        *,
-        attn,
-        prequantized_x: tuple[torch.Tensor, torch.Tensor],
-        positions: torch.Tensor,
-        cache_loc: torch.Tensor,
-        attn_backend,
-    ) -> None:
-        kv, _ = attn.wkv(prequantized_x)
-
-        token_to_kv_pool = attn_backend.token_to_kv_pool
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
-            torch.int32
-        )
-        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
-            layer_id=attn.layer_id,
-            swa_loc=swa_loc,
-            kv=kv,
-            kv_weight=attn.kv_norm.weight.data,
-            eps=attn.eps,
-            freqs_cis=attn.freqs_cis,
-            positions=positions,
-        )
+                layer.self_attn.kv_from_hidden(
+                    main_x, positions, cache_loc, attn_backend
+                )
 
     def _run_draft_block(
         self,
