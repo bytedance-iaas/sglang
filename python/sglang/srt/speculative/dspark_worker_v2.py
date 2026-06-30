@@ -9,10 +9,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -140,6 +142,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._stacked_wkv_weight_bf16: Optional[torch.Tensor] = None
+        self._stacked_wkv_bias: Optional[torch.Tensor] = None
+        self._init_dequant_wkv_bf16_stack()
 
         if self.tp_rank == 0:
             logger.info(
@@ -153,6 +158,82 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
             )
+
+    def _init_dequant_wkv_bf16_stack(self) -> None:
+        if not envs.SGLANG_DSPARK_DEQUANT_WKV_BF16_STACK.get():
+            return
+
+        layers = getattr(self._draft_inner, "layers", None)
+        if not layers:
+            return
+
+        weights = []
+        biases = []
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None or getattr(attn, "fuse_wqa_wkv", False):
+                self._log_dequant_wkv_stack_disabled("fused wqkv_a is not supported")
+                return
+
+            wkv = getattr(attn, "wkv", None)
+            scheme = getattr(wkv, "scheme", None)
+            if (
+                wkv is None
+                or scheme is None
+                or scheme.__class__.__name__ != "QuarkW4A4MXFP4"
+                or not hasattr(wkv, "weight")
+                or not hasattr(wkv, "weight_scale")
+                or wkv.weight.dtype != torch.uint8
+                or wkv.weight_scale.dtype != torch.uint8
+                or wkv.weight.dim() != 2
+                or wkv.weight_scale.dim() != 2
+                or wkv.weight.shape[1] * 2 != wkv.weight_scale.shape[1] * 32
+                or getattr(wkv, "skip_bias_add", False)
+            ):
+                reason = (
+                    f"unsupported wkv quant path: "
+                    f"{scheme.__class__.__name__ if scheme is not None else None}"
+                )
+                self._log_dequant_wkv_stack_disabled(reason)
+                return
+
+            weight_bf16 = MXFP4QuantizeUtil.dequantize(
+                quantized_data=wkv.weight.detach(),
+                scale=wkv.weight_scale.detach(),
+                dtype=torch.bfloat16,
+                block_sizes=[32],
+            ).contiguous()
+            weights.append(weight_bf16)
+
+            bias = getattr(wkv, "bias", None)
+            if bias is not None:
+                biases.append(bias.detach().to(dtype=torch.bfloat16))
+            else:
+                biases.append(None)
+
+        if not weights:
+            return
+
+        has_bias = [bias is not None for bias in biases]
+        if any(has_bias) and not all(has_bias):
+            self._log_dequant_wkv_stack_disabled("mixed wkv bias layout")
+            return
+
+        self._stacked_wkv_weight_bf16 = torch.stack(weights, dim=0).contiguous()
+        if all(has_bias):
+            self._stacked_wkv_bias = torch.stack(biases, dim=0).contiguous()
+
+        if self.tp_rank == 0:
+            logger.info(
+                "Enabled DSpark BF16 dequantized wkv stack. layers=%s, "
+                "weight_shape=%s, env=SGLANG_DSPARK_DEQUANT_WKV_BF16_STACK",
+                len(weights),
+                tuple(self._stacked_wkv_weight_bf16.shape),
+            )
+
+    def _log_dequant_wkv_stack_disabled(self, reason: str) -> None:
+        if self.tp_rank == 0:
+            logger.warning("DSpark BF16 dequantized wkv stack disabled: %s", reason)
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
@@ -248,10 +329,49 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
-            for layer in self._draft_inner.layers:
-                layer.self_attn.kv_from_hidden(
-                    main_x, positions, cache_loc, attn_backend
+            if self._stacked_wkv_weight_bf16 is None:
+                for layer in self._draft_inner.layers:
+                    layer.self_attn.kv_from_hidden(
+                        main_x, positions, cache_loc, attn_backend
+                    )
+            else:
+                kvs = torch.matmul(
+                    main_x.to(dtype=torch.bfloat16).unsqueeze(0),
+                    self._stacked_wkv_weight_bf16.transpose(1, 2),
                 )
+                if self._stacked_wkv_bias is not None:
+                    kvs = kvs + self._stacked_wkv_bias[:, None, :]
+                for layer_idx, layer in enumerate(self._draft_inner.layers):
+                    self._write_draft_kv_from_projected_kv(
+                        attn=layer.self_attn,
+                        kv=kvs[layer_idx],
+                        positions=positions,
+                        cache_loc=cache_loc,
+                        attn_backend=attn_backend,
+                    )
+
+    def _write_draft_kv_from_projected_kv(
+        self,
+        *,
+        attn,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        attn_backend,
+    ) -> None:
+        token_to_kv_pool = attn_backend.token_to_kv_pool
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
+            torch.int32
+        )
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=attn.layer_id,
+            swa_loc=swa_loc,
+            kv=kv,
+            kv_weight=attn.kv_norm.weight.data,
+            eps=attn.eps,
+            freqs_cis=attn.freqs_cis,
+            positions=positions,
+        )
 
     def _run_draft_block(
         self,
