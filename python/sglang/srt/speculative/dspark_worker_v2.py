@@ -137,6 +137,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._markov_refine_buffer_cap: int = 0
+        self._markov_candidates_buf: Optional[torch.Tensor] = None
+        self._markov_embeds_buf: Optional[torch.Tensor] = None
 
         if self.tp_rank == 0:
             logger.info(
@@ -301,6 +304,34 @@ class DSparkWorkerV2(BaseSpecWorker):
             reshape_bs, int(self.block_size), block_hidden.shape[-1]
         )
 
+    def _ensure_markov_refine_buffers(self, bs: int, device: torch.device) -> None:
+        cap = self._markov_refine_buffer_cap
+        if (
+            cap >= int(bs)
+            and self._markov_candidates_buf is not None
+            and self._markov_embeds_buf is not None
+            and self._markov_candidates_buf.device == device
+            and self._markov_embeds_buf.device == device
+        ):
+            return
+
+        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        markov_weight = getattr(self._draft_inner.markov_head.markov_w1, "weight", None)
+        markov_dtype = (
+            markov_weight.dtype
+            if markov_weight is not None
+            else self.draft_model.lm_head.weight.dtype
+        )
+        self._markov_candidates_buf = torch.empty(
+            (new_cap, int(self.block_size)), dtype=torch.int64, device=device
+        )
+        self._markov_embeds_buf = torch.empty(
+            (new_cap, int(self.block_size), int(self.markov_rank)),
+            dtype=markov_dtype,
+            device=device,
+        )
+        self._markov_refine_buffer_cap = new_cap
+
     def _refine_block_markov(
         self,
         *,
@@ -320,6 +351,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             return empty_tokens, empty_confidence
 
+        self._ensure_markov_refine_buffers(bs, block_hidden.device)
+        assert self._markov_candidates_buf is not None
+        assert self._markov_embeds_buf is not None
+        candidates = self._markov_candidates_buf[:bs]
+        markov_embeds = self._markov_embeds_buf[:bs]
+
         markov_head = self._draft_inner.markov_head
         confidence_head = self._draft_inner.confidence_head
         lm_head = self.draft_model.lm_head
@@ -336,33 +373,29 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ..., :vocab_size
             ]
 
-        out_tokens = torch.empty(
-            (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
-        )
         if bonus_tokens.numel() == bs:
             first_tokens = bonus_tokens.view(-1).to(torch.int64)
         else:
             first_tokens = torch.full(
                 (bs,), self.noise_token_id, dtype=torch.int64, device=block_hidden.device
             )
-        out_tokens[:, 0] = first_tokens
-        markov_embeds = None
+        candidates[:, 0].copy_(first_tokens)
+
         with torch.inference_mode():
             base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
+            prev_tokens = candidates[:, 0]
             for i in range(block_size):
-                prev_embed = markov_head.get_prev_embeddings(out_tokens[:, i])
-                if markov_embeds is None:
-                    markov_embeds = prev_embed.new_empty(
-                        (bs, block_size, prev_embed.shape[-1])
-                    )
+                prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
-                refined = base_logits[:, i] + bias
-                out_tokens[:, i + 1] = torch.argmax(refined, dim=-1)
+                bias.add_(base_logits[:, i])
+                next_tokens = torch.argmax(bias, dim=-1)
+                if i + 1 < block_size:
+                    candidates[:, i + 1].copy_(next_tokens)
+                prev_tokens = next_tokens
 
             confidence = confidence_head(block_hidden, markov_embeds)
 
-        candidates = out_tokens[:, :block_size].contiguous()
         return candidates[:output_bs], confidence[:output_bs]
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
