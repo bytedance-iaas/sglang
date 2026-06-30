@@ -195,8 +195,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or scale is None
                 or wkv_proj.weight.dim() != 2
                 or scale.dim() != 2
-                or wkv_proj.weight.shape[0] != scale.shape[0]
-                or wkv_proj.weight.shape[1] != scale.shape[1] * 32
+                or wkv_proj.weight.shape[0] < scale.shape[0]
+                or wkv_proj.weight.shape[1] < scale.shape[1]
+                or (wkv_proj.weight.shape[0] + scale.shape[0] - 1)
+                // scale.shape[0]
+                not in (1, 32, 64, 128)
+                or (wkv_proj.weight.shape[1] + scale.shape[1] - 1)
+                // scale.shape[1]
+                not in (1, 32, 64, 128)
                 or kv_end > wkv_proj.weight.shape[0]
                 or getattr(wkv_proj, "skip_bias_add", False)
             ):
@@ -259,7 +265,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             if scale is None:
                 continue
             dtype = getattr(scale, "dtype", None)
-            if dtype == torch.uint8 or dtype == getattr(torch, "float8_e8m0fnu", None):
+            if dtype in (
+                torch.uint8,
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+                getattr(torch, "float8_e8m0fnu", None),
+            ):
                 return scale
         return None
 
@@ -268,19 +280,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         weight: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         weight_float = weight.to(torch.float32)
-        num_blocks = weight.shape[-1] // 32
-        weight_blocked = weight_float.view(*weight.shape[:-1], num_blocks, 32)
 
         if scale.dtype == torch.uint8:
             descale = torch.exp2(scale.to(torch.float32) - 127.0)
         elif scale.dtype == getattr(torch, "float8_e8m0fnu", None):
             descale = scale.to(torch.float32)
+        elif scale.dtype in (torch.float32, torch.bfloat16, torch.float16):
+            descale = scale.to(torch.float32)
         else:
-            raise TypeError(f"Unsupported MXFP8 scale dtype: {scale.dtype}")
+            raise TypeError(f"Unsupported FP8 scale dtype: {scale.dtype}")
 
-        return (weight_blocked * descale.unsqueeze(-1)).view(*weight.shape).to(
-            torch.bfloat16
-        ).contiguous()
+        block_m = (weight.shape[0] + descale.shape[0] - 1) // descale.shape[0]
+        block_k = (weight.shape[1] + descale.shape[1] - 1) // descale.shape[1]
+        descale = descale.repeat_interleave(block_m, dim=0).repeat_interleave(
+            block_k, dim=1
+        )
+        descale = descale[: weight.shape[0], : weight.shape[1]]
+        return (weight_float * descale).to(torch.bfloat16).contiguous()
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
