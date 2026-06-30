@@ -166,13 +166,6 @@ class SWAComponent(TreeComponent):
             # Branch 3: entire value_slice is outside SWA window — not consumed
             return prefix_len
 
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        if params.force_leaf_creation:
-            return False
-        return params.swa_evicted_seqlen >= total_prefix_len + key_len
-
     def recover_after_unevict(
         self,
         node: UnifiedTreeNode,
