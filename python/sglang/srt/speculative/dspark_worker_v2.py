@@ -37,7 +37,6 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
-    _compute_dspark_add_argmax_triton_unchecked,
 )
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import empty_context
@@ -141,8 +140,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
-        self._markov_next_tokens_buf: Optional[torch.Tensor] = None
-        self._use_triton_markov_argmax = is_cuda() or is_hip()
 
         if self.tp_rank == 0:
             logger.info(
@@ -313,10 +310,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             cap >= int(bs)
             and self._markov_candidates_buf is not None
             and self._markov_embeds_buf is not None
-            and self._markov_next_tokens_buf is not None
             and self._markov_candidates_buf.device == device
             and self._markov_embeds_buf.device == device
-            and self._markov_next_tokens_buf.device == device
         ):
             return
 
@@ -334,9 +329,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             (new_cap, int(self.block_size), int(self.markov_rank)),
             dtype=markov_dtype,
             device=device,
-        )
-        self._markov_next_tokens_buf = torch.empty(
-            (new_cap,), dtype=torch.int64, device=device
         )
         self._markov_refine_buffer_cap = new_cap
 
@@ -362,10 +354,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._ensure_markov_refine_buffers(bs, block_hidden.device)
         assert self._markov_candidates_buf is not None
         assert self._markov_embeds_buf is not None
-        assert self._markov_next_tokens_buf is not None
         candidates = self._markov_candidates_buf[:bs]
         markov_embeds = self._markov_embeds_buf[:bs]
-        next_tokens_buf = self._markov_next_tokens_buf[:bs]
 
         markov_head = self._draft_inner.markov_head
         confidence_head = self._draft_inner.confidence_head
@@ -398,26 +388,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
-                if self._use_triton_markov_argmax:
-                    try:
-                        _compute_dspark_add_argmax_triton_unchecked(
-                            base_logits=base_logits[:, i],
-                            bias=bias,
-                            out_tokens=next_tokens_buf,
-                        )
-                        next_tokens = next_tokens_buf
-                    except Exception as e:
-                        self._use_triton_markov_argmax = False
-                        logger.warning(
-                            "DSPARK Triton Markov add/argmax failed; "
-                            "falling back to eager path: %s",
-                            e,
-                        )
-                        bias.add_(base_logits[:, i])
-                        next_tokens = torch.argmax(bias, dim=-1)
-                else:
-                    bias.add_(base_logits[:, i])
-                    next_tokens = torch.argmax(bias, dim=-1)
+                bias.add_(base_logits[:, i])
+                next_tokens = torch.argmax(bias, dim=-1)
                 if i + 1 < block_size:
                     candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens
