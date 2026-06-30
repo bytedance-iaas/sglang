@@ -18,10 +18,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    SpecInput,
+    SpecInputType,
+    SpeculativeAlgorithm,
+)
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.managers.tp_worker import TpModelWorker
 
 
@@ -45,6 +50,48 @@ class DSparkVerifyInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
+
+    def prepare_for_draft_block(
+        self,
+        batch: ScheduleBatch,
+        draft_model_runner: ModelRunner,
+        out_cache_loc: torch.Tensor,
+        dp_decode_global_num_tokens: Optional[list[int]] = None,
+    ) -> ForwardBatch:
+        batch.input_ids = self.draft_token
+        batch.out_cache_loc = out_cache_loc
+        batch.spec_info = self
+        batch.spec_algorithm = SpeculativeAlgorithm.DSPARK
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.capture_hidden_mode = self.capture_hidden_mode
+
+        draft_forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        draft_forward_batch.lora_ids = [None] * draft_forward_batch.batch_size
+
+        server_args = get_global_server_args()
+        if (
+            server_args.enable_dp_attention
+            and dp_decode_global_num_tokens is not None
+        ):
+            draft_global_num_tokens = [
+                int(x) * int(self.draft_token_num) for x in dp_decode_global_num_tokens
+            ]
+            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
+            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
+                draft_global_num_tokens,
+                dtype=torch.int64,
+                device=draft_model_runner.device,
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
+                draft_global_num_tokens
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                draft_global_num_tokens,
+                dtype=torch.int64,
+                device=draft_model_runner.device,
+            )
+
+        return draft_forward_batch
 
     def prepare_for_verify(
         self,

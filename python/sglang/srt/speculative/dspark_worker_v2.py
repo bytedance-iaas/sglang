@@ -18,7 +18,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
     compute_position,
 )
@@ -30,7 +29,6 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_info import DSparkDraftInputV2, DSparkVerifyInput
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.utils.common import empty_context
@@ -245,12 +243,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_ids: torch.Tensor,
         positions: torch.Tensor,
         verify_out_cache_loc: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
         dp_decode_global_num_tokens: Optional[list[int]] = None,
     ) -> torch.Tensor:
-        device = self.device
-        seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
         draft_block_spec_info = DSparkVerifyInput(
             draft_token=block_ids.reshape(-1),
             positions=positions,
@@ -258,43 +252,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        draft_forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
-            input_ids=block_ids.reshape(-1),
-            req_pool_indices=req_pool_indices,
-            seq_lens=prefix_lens,
+        draft_forward_batch = draft_block_spec_info.prepare_for_draft_block(
+            batch=batch,
+            draft_model_runner=self.draft_model_runner,
             out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=int(seq_lens_cpu.sum().item()),
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
-            spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            spec_info=draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            lora_ids=[None] * bs,
+            dp_decode_global_num_tokens=dp_decode_global_num_tokens,
         )
-        if dp_decode_global_num_tokens is None:
-            dp_decode_global_num_tokens = batch.global_num_tokens
-        if (
-            self.server_args.enable_dp_attention
-            and dp_decode_global_num_tokens is not None
-        ):
-            draft_global_num_tokens = [
-                int(x) * int(self.block_size) for x in dp_decode_global_num_tokens
-            ]
-            draft_forward_batch.original_global_num_tokens_cpu = (
-                batch.global_num_tokens
-            )
-            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
-            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
-                draft_global_num_tokens, dtype=torch.int64, device=device
-            )
-            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
-                draft_global_num_tokens
-            )
-            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-                draft_global_num_tokens, dtype=torch.int64, device=device
-            )
 
         from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
 
@@ -572,8 +535,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 block_ids=block_ids,
                 positions=positions,
                 verify_out_cache_loc=verify_out_cache_loc,
-                prefix_lens=prefix_lens,
-                req_pool_indices=req_pool_indices,
                 dp_decode_global_num_tokens=dp_decode_global_num_tokens,
             )
 
