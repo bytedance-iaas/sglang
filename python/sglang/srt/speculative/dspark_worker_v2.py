@@ -1,5 +1,6 @@
 import logging
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
@@ -141,10 +142,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
-        self._stacked_wkv_weight_bf16: Optional[torch.Tensor] = None
-        self._stacked_wkv_bias: Optional[torch.Tensor] = None
-        self._stacked_wkv_kv_offsets: list[tuple[int, int]] = []
-        self._init_dequant_wkv_bf16_stack()
+        self._stacked_wqkv_fp8_proj = None
+        self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
+        self._stacked_wqkv_out_sizes: list[int] = []
+        self._init_fp8_wqkv_stack()
 
         if self.tp_rank == 0:
             logger.info(
@@ -159,8 +160,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.confidence_threshold,
             )
 
-    def _init_dequant_wkv_bf16_stack(self) -> None:
-        if not envs.SGLANG_DSPARK_DEQUANT_WKV_BF16_STACK.get():
+    def _init_fp8_wqkv_stack(self) -> None:
+        if not envs.SGLANG_DSPARK_FP8_WQKV_STACK.get():
             return
 
         layers = getattr(self._draft_inner, "layers", None)
@@ -168,64 +169,70 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         weights = []
+        scales = []
         biases = []
         kv_offsets = []
+        out_sizes = []
+        first_proj = None
+        scale_name = None
         for layer in layers:
             attn = getattr(layer, "self_attn", None)
             if attn is None:
-                self._log_dequant_wkv_stack_disabled("missing self_attn")
+                self._log_fp8_wqkv_stack_disabled("missing self_attn")
                 return
 
             if getattr(attn, "fuse_wqa_wkv", False):
-                wkv_proj = getattr(attn, "wqkv_a", None)
+                proj = getattr(attn, "wqkv_a", None)
                 kv_start = int(attn.q_lora_rank)
                 kv_end = kv_start + int(attn.head_dim)
             else:
-                wkv_proj = getattr(attn, "wkv", None)
+                proj = getattr(attn, "wkv", None)
                 kv_start = 0
                 kv_end = int(attn.head_dim)
 
-            scheme = getattr(wkv_proj, "scheme", None)
-            scale = self._get_mxfp8_wkv_scale(wkv_proj)
+            cur_scale_name, scale = self._get_fp8_wqkv_scale(proj)
             if (
-                wkv_proj is None
-                or not hasattr(wkv_proj, "weight")
-                or wkv_proj.weight.dtype
+                proj is None
+                or not hasattr(proj, "weight")
+                or proj.weight.dtype
                 not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                 or scale is None
-                or wkv_proj.weight.dim() != 2
+                or proj.weight.dim() != 2
                 or scale.dim() != 2
-                or wkv_proj.weight.shape[0] < scale.shape[0]
-                or wkv_proj.weight.shape[1] < scale.shape[1]
-                or (wkv_proj.weight.shape[0] + scale.shape[0] - 1)
-                // scale.shape[0]
-                not in (1, 32, 64, 128)
-                or (wkv_proj.weight.shape[1] + scale.shape[1] - 1)
-                // scale.shape[1]
-                not in (1, 32, 64, 128)
-                or kv_end > wkv_proj.weight.shape[0]
-                or getattr(wkv_proj, "skip_bias_add", False)
+                or kv_end > proj.weight.shape[0]
+                or getattr(proj, "skip_bias_add", False)
             ):
                 reason = (
-                    "unsupported wkv MXFP8 layout: "
-                    f"scheme={scheme.__class__.__name__ if scheme is not None else None}, "
-                    f"weight_dtype={getattr(getattr(wkv_proj, 'weight', None), 'dtype', None)}, "
-                    f"weight_shape={tuple(wkv_proj.weight.shape) if hasattr(wkv_proj, 'weight') else None}, "
+                    "unsupported wqkv FP8 layout: "
+                    f"weight_dtype={getattr(getattr(proj, 'weight', None), 'dtype', None)}, "
+                    f"weight_shape={tuple(proj.weight.shape) if hasattr(proj, 'weight') else None}, "
                     f"scale_dtype={getattr(scale, 'dtype', None)}, "
                     f"scale_shape={tuple(scale.shape) if scale is not None else None}"
                 )
-                self._log_dequant_wkv_stack_disabled(reason)
+                self._log_fp8_wqkv_stack_disabled(reason)
                 return
 
-            weight_bf16 = self._dequant_mxfp8_weight_to_bf16(
-                wkv_proj.weight.detach(), scale.detach()
-            )
-            weights.append(weight_bf16)
-            kv_offsets.append((kv_start, kv_end))
+            if first_proj is None:
+                first_proj = proj
+                scale_name = cur_scale_name
+            elif (
+                proj.weight.shape[1] != first_proj.weight.shape[1]
+                or proj.weight.dtype != first_proj.weight.dtype
+                or proj.quant_method.__class__ is not first_proj.quant_method.__class__
+                or cur_scale_name != scale_name
+                or scale.shape[1:] != scales[0].shape[1:]
+            ):
+                self._log_fp8_wqkv_stack_disabled("mixed wqkv FP8 layouts")
+                return
 
-            bias = getattr(wkv_proj, "bias", None)
+            weights.append(proj.weight.detach())
+            scales.append(scale.detach())
+            kv_offsets.append((kv_start, kv_end))
+            out_sizes.append(int(proj.weight.shape[0]))
+
+            bias = getattr(proj, "bias", None)
             if bias is not None:
-                biases.append(bias.detach().to(dtype=torch.bfloat16))
+                biases.append(bias.detach())
             else:
                 biases.append(None)
 
@@ -234,34 +241,57 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         has_bias = [bias is not None for bias in biases]
         if any(has_bias) and not all(has_bias):
-            self._log_dequant_wkv_stack_disabled("mixed wkv bias layout")
+            self._log_fp8_wqkv_stack_disabled("mixed wqkv bias layout")
             return
 
-        self._stacked_wkv_weight_bf16 = torch.stack(weights, dim=0).contiguous()
-        self._stacked_wkv_kv_offsets = kv_offsets
-        if all(has_bias):
-            self._stacked_wkv_bias = torch.stack(biases, dim=0).contiguous()
+        stacked_weight = torch.cat(weights, dim=0).contiguous()
+        stacked_scale = torch.cat(scales, dim=0).contiguous()
+        stacked_bias = torch.cat(biases, dim=0).contiguous() if all(has_bias) else None
+
+        stacked_proj = SimpleNamespace()
+        for name in (
+            "input_size",
+            "input_size_per_partition",
+            "params_dtype",
+            "quant_config",
+            "quant_method",
+            "skip_bias_add",
+            "weight_block_size",
+        ):
+            if hasattr(first_proj, name):
+                setattr(stacked_proj, name, getattr(first_proj, name))
+        stacked_proj.output_size = int(stacked_weight.shape[0])
+        stacked_proj.output_size_per_partition = int(stacked_weight.shape[0])
+        stacked_proj.weight = stacked_weight
+        stacked_proj.bias = stacked_bias
+        setattr(stacked_proj, scale_name, stacked_scale)
+
+        self._stacked_wqkv_fp8_proj = stacked_proj
+        self._stacked_wqkv_kv_offsets = kv_offsets
+        self._stacked_wqkv_out_sizes = out_sizes
 
         if self.tp_rank == 0:
             logger.info(
-                "Enabled DSpark BF16 dequantized wkv stack. layers=%s, "
-                "weight_shape=%s, kv_offsets=%s, "
-                "env=SGLANG_DSPARK_DEQUANT_WKV_BF16_STACK",
+                "Enabled DSpark FP8 wqkv stack. layers=%s, weight_shape=%s, "
+                "scale_shape=%s, scale_name=%s, kv_offsets=%s, "
+                "env=SGLANG_DSPARK_FP8_WQKV_STACK",
                 len(weights),
-                tuple(self._stacked_wkv_weight_bf16.shape),
-                self._stacked_wkv_kv_offsets,
+                tuple(stacked_weight.shape),
+                tuple(stacked_scale.shape),
+                scale_name,
+                self._stacked_wqkv_kv_offsets,
             )
 
-    def _log_dequant_wkv_stack_disabled(self, reason: str) -> None:
+    def _log_fp8_wqkv_stack_disabled(self, reason: str) -> None:
         if self.tp_rank == 0:
-            logger.warning("DSpark BF16 dequantized wkv stack disabled: %s", reason)
+            logger.warning("DSpark FP8 wqkv stack disabled: %s", reason)
 
     @staticmethod
-    def _get_mxfp8_wkv_scale(wkv) -> Optional[torch.Tensor]:
-        if wkv is None:
-            return None
+    def _get_fp8_wqkv_scale(proj) -> tuple[Optional[str], Optional[torch.Tensor]]:
+        if proj is None:
+            return None, None
         for name in ("weight_scale_inv", "weight_scale", "scale"):
-            scale = getattr(wkv, name, None)
+            scale = getattr(proj, name, None)
             if scale is None:
                 continue
             dtype = getattr(scale, "dtype", None)
@@ -272,31 +302,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 torch.float16,
                 getattr(torch, "float8_e8m0fnu", None),
             ):
-                return scale
-        return None
-
-    @staticmethod
-    def _dequant_mxfp8_weight_to_bf16(
-        weight: torch.Tensor, scale: torch.Tensor
-    ) -> torch.Tensor:
-        weight_float = weight.to(torch.float32)
-
-        if scale.dtype == torch.uint8:
-            descale = torch.exp2(scale.to(torch.float32) - 127.0)
-        elif scale.dtype == getattr(torch, "float8_e8m0fnu", None):
-            descale = scale.to(torch.float32)
-        elif scale.dtype in (torch.float32, torch.bfloat16, torch.float16):
-            descale = scale.to(torch.float32)
-        else:
-            raise TypeError(f"Unsupported FP8 scale dtype: {scale.dtype}")
-
-        block_m = (weight.shape[0] + descale.shape[0] - 1) // descale.shape[0]
-        block_k = (weight.shape[1] + descale.shape[1] - 1) // descale.shape[1]
-        descale = descale.repeat_interleave(block_m, dim=0).repeat_interleave(
-            block_k, dim=1
-        )
-        descale = descale[: weight.shape[0], : weight.shape[1]]
-        return (weight_float * descale).to(torch.bfloat16).contiguous()
+                return name, scale
+        return None, None
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
@@ -392,23 +399,25 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
-            if self._stacked_wkv_weight_bf16 is None:
+            if self._stacked_wqkv_fp8_proj is None:
                 for layer in self._draft_inner.layers:
                     layer.self_attn.kv_from_hidden(
                         main_x, positions, cache_loc, attn_backend
                     )
             else:
-                kvs = torch.matmul(
-                    main_x.to(dtype=torch.bfloat16).unsqueeze(0),
-                    self._stacked_wkv_weight_bf16.transpose(1, 2),
+                stacked_out = self._stacked_wqkv_fp8_proj.quant_method.apply(
+                    self._stacked_wqkv_fp8_proj,
+                    main_x,
+                    self._stacked_wqkv_fp8_proj.bias,
                 )
-                if self._stacked_wkv_bias is not None:
-                    kvs = kvs + self._stacked_wkv_bias[:, None, :]
+                layer_outputs = torch.split(
+                    stacked_out, self._stacked_wqkv_out_sizes, dim=-1
+                )
                 for layer_idx, layer in enumerate(self._draft_inner.layers):
-                    kv_start, kv_end = self._stacked_wkv_kv_offsets[layer_idx]
+                    kv_start, kv_end = self._stacked_wqkv_kv_offsets[layer_idx]
                     self._write_draft_kv_from_projected_kv(
                         attn=layer.self_attn,
-                        kv=kvs[layer_idx, :, kv_start:kv_end],
+                        kv=layer_outputs[layer_idx][..., kv_start:kv_end],
                         positions=positions,
                         cache_loc=cache_loc,
                         attn_backend=attn_backend,
