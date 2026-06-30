@@ -206,15 +206,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or kv_end > wkv_proj.weight.shape[0]
                 or getattr(wkv_proj, "skip_bias_add", False)
             ):
-                scale_candidates = self._describe_scale_candidates(wkv_proj)
                 reason = (
                     "unsupported wkv MXFP8 layout: "
                     f"scheme={scheme.__class__.__name__ if scheme is not None else None}, "
                     f"weight_dtype={getattr(getattr(wkv_proj, 'weight', None), 'dtype', None)}, "
                     f"weight_shape={tuple(wkv_proj.weight.shape) if hasattr(wkv_proj, 'weight') else None}, "
                     f"scale_dtype={getattr(scale, 'dtype', None)}, "
-                    f"scale_shape={tuple(scale.shape) if scale is not None else None}, "
-                    f"scale_candidates={scale_candidates}"
+                    f"scale_shape={tuple(scale.shape) if scale is not None else None}"
                 )
                 self._log_dequant_wkv_stack_disabled(reason)
                 return
@@ -257,29 +255,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _log_dequant_wkv_stack_disabled(self, reason: str) -> None:
         if self.tp_rank == 0:
             logger.warning("DSpark BF16 dequantized wkv stack disabled: %s", reason)
-
-    @staticmethod
-    def _describe_scale_candidates(module) -> list[str]:
-        if module is None:
-            return []
-
-        candidates = []
-        for name, value in vars(module).items():
-            if "scale" not in name:
-                continue
-            if isinstance(value, torch.Tensor):
-                candidates.append(
-                    f"{name}:dtype={value.dtype},shape={tuple(value.shape)}"
-                )
-            else:
-                candidates.append(f"{name}:type={type(value).__name__}")
-
-        for name, value in module.named_parameters(recurse=False):
-            if "scale" in name:
-                candidates.append(
-                    f"param.{name}:dtype={value.dtype},shape={tuple(value.shape)}"
-                )
-        return candidates
 
     @staticmethod
     def _get_mxfp8_wkv_scale(wkv) -> Optional[torch.Tensor]:
