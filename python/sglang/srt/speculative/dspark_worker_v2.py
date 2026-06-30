@@ -35,6 +35,7 @@ from sglang.srt.speculative.dspark_info import (
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.speculative.triton_ops.dspark import (
     _compute_dspark_accept_bonus_triton_unchecked,
 )
@@ -42,6 +43,135 @@ from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import empty_context
 
 logger = logging.getLogger(__name__)
+
+
+class _DSparkFusedKVMaterializeHelper:
+    """Materialize DeepSeek V4 DSpark KV with one stacked KV projection.
+
+    DSpark uses DeepSeek V4 MLA/SWA cache writes, so we keep the existing fused
+    norm/rope/cache-write path and only batch the per-layer WKV GEMMs.
+    """
+
+    def __init__(self, layers: List, device: torch.device) -> None:
+        self.layers = layers
+        self.device = device
+        self.n_layers = len(layers)
+        self._workspace_capacity = 0
+        self._workspace_dtype: Optional[torch.dtype] = None
+        self._kv_workspace: Optional[torch.Tensor] = None
+
+        kv_weights = []
+        self.layer_ids = []
+        self.head_dim = None
+        self.weight_dtype = None
+        for layer in layers:
+            attn = layer.self_attn
+            if getattr(attn, "fuse_wqa_wkv", False):
+                proj = attn.wqkv_a
+                weight = proj.weight[attn.q_lora_rank :]
+            else:
+                proj = attn.wkv
+                weight = proj.weight
+
+            if not isinstance(
+                getattr(proj, "quant_method", None), UnquantizedLinearMethod
+            ):
+                raise ValueError(
+                    "quantized DeepSeek V4 KV projection is not supported for DSpark "
+                    "fused KV materialization"
+                )
+            if getattr(proj, "bias", None) is not None:
+                raise ValueError(
+                    "biased DeepSeek V4 KV projection is not supported for DSpark "
+                    "fused KV materialization"
+                )
+            if self.head_dim is None:
+                self.head_dim = int(attn.head_dim)
+                self.weight_dtype = weight.dtype
+            elif int(attn.head_dim) != self.head_dim:
+                raise ValueError("DeepSeek V4 DSpark head_dim mismatch across layers")
+            if weight.shape[0] != self.head_dim:
+                raise ValueError(
+                    "DeepSeek V4 DSpark KV projection shape mismatch for fused KV "
+                    f"materialization: weight={tuple(weight.shape)}, head_dim={self.head_dim}"
+                )
+            kv_weights.append(weight)
+            self.layer_ids.append(int(attn.layer_id))
+
+        flat_weight = torch.stack(kv_weights).reshape(self.n_layers * self.head_dim, -1)
+        self.flat_kv_weight_t = flat_weight.transpose(0, 1).contiguous()
+
+    def _ensure_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
+        if (
+            self._workspace_capacity >= total_ctx
+            and self._workspace_dtype == dtype
+            and self._kv_workspace is not None
+        ):
+            return
+        new_capacity = max(1, total_ctx)
+        if self._workspace_capacity > 0:
+            new_capacity = max(new_capacity, self._workspace_capacity * 2)
+        self._kv_workspace = torch.empty(
+            (new_capacity, self.n_layers, self.head_dim),
+            dtype=dtype,
+            device=self.device,
+        )
+        self._workspace_capacity = new_capacity
+        self._workspace_dtype = dtype
+
+    def materialize(
+        self,
+        *,
+        main_x: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        attn_backend,
+    ) -> None:
+        total_ctx = int(main_x.shape[0])
+        if total_ctx == 0:
+            return
+
+        if main_x.device != self.device:
+            main_x = main_x.to(self.device, non_blocking=True)
+        if main_x.dtype != self.flat_kv_weight_t.dtype:
+            main_x = main_x.to(self.flat_kv_weight_t.dtype)
+        if positions.device != self.device:
+            positions = positions.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+        elif positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if cache_loc.device != self.device:
+            cache_loc = cache_loc.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+        elif cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+
+        self._ensure_workspace(total_ctx, main_x.dtype)
+        assert self._kv_workspace is not None
+        projected = torch.mm(
+            main_x,
+            self.flat_kv_weight_t,
+            out=self._kv_workspace[:total_ctx].reshape(total_ctx, -1),
+        )
+        stacked_kv = projected.view(total_ctx, self.n_layers, self.head_dim)
+
+        token_to_kv_pool = attn_backend.token_to_kv_pool
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
+            torch.int32
+        )
+        for layer_idx, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+                layer_id=self.layer_ids[layer_idx],
+                swa_loc=swa_loc,
+                kv=stacked_kv[:, layer_idx, :],
+                kv_weight=attn.kv_norm.weight.data,
+                eps=attn.eps,
+                freqs_cis=attn.freqs_cis,
+                positions=positions,
+            )
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -140,6 +270,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._markov_refine_buffer_cap: int = 0
         self._markov_candidates_buf: Optional[torch.Tensor] = None
         self._markov_embeds_buf: Optional[torch.Tensor] = None
+        self._use_fused_kv_materialize = False
+        self._fused_kv_helper: Optional[_DSparkFusedKVMaterializeHelper] = None
+        self._init_fused_kv_helper()
 
         if self.tp_rank == 0:
             logger.info(
@@ -153,6 +286,30 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
             )
+
+    def _init_fused_kv_helper(self) -> None:
+        if not (is_cuda() or is_hip()):
+            return
+        try:
+            self._fused_kv_helper = _DSparkFusedKVMaterializeHelper(
+                layers=list(self._draft_inner.layers),
+                device=self.device,
+            )
+            self._use_fused_kv_materialize = True
+            if self.tp_rank == 0:
+                logger.info(
+                    "DSPARK fused KV materialization enabled. n_layers=%d, head_dim=%d",
+                    self._fused_kv_helper.n_layers,
+                    self._fused_kv_helper.head_dim,
+                )
+        except Exception as e:
+            self._use_fused_kv_materialize = False
+            self._fused_kv_helper = None
+            if self.tp_rank == 0:
+                logger.info(
+                    "DSPARK fused KV materialization disabled: %s",
+                    e,
+                )
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
@@ -248,6 +405,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
         ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._fused_kv_helper.materialize(
+                        main_x=main_x,
+                        positions=positions,
+                        cache_loc=cache_loc,
+                        attn_backend=attn_backend,
+                    )
+                    return
+                except Exception as e:
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                    logger.warning(
+                        "DSPARK fused KV materialization failed; falling back to "
+                        "per-layer path: %s",
+                        e,
+                    )
+
             for layer in self._draft_inner.layers:
                 layer.self_attn.kv_from_hidden(
                     main_x, positions, cache_loc, attn_backend
