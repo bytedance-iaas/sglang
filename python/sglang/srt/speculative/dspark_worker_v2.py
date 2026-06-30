@@ -177,29 +177,29 @@ class DSparkWorkerV2(BaseSpecWorker):
 
             wkv = getattr(attn, "wkv", None)
             scheme = getattr(wkv, "scheme", None)
+            scale = self._get_mxfp4_wkv_scale(wkv)
             if (
                 wkv is None
-                or scheme is None
-                or scheme.__class__.__name__ != "QuarkW4A4MXFP4"
                 or not hasattr(wkv, "weight")
-                or not hasattr(wkv, "weight_scale")
                 or wkv.weight.dtype != torch.uint8
-                or wkv.weight_scale.dtype != torch.uint8
+                or scale is None
                 or wkv.weight.dim() != 2
-                or wkv.weight_scale.dim() != 2
-                or wkv.weight.shape[1] * 2 != wkv.weight_scale.shape[1] * 32
+                or scale.dim() != 2
+                or wkv.weight.shape[1] * 2 != scale.shape[1] * 32
                 or getattr(wkv, "skip_bias_add", False)
             ):
                 reason = (
-                    f"unsupported wkv quant path: "
-                    f"{scheme.__class__.__name__ if scheme is not None else None}"
+                    "unsupported wkv MXFP4 layout: "
+                    f"scheme={scheme.__class__.__name__ if scheme is not None else None}, "
+                    f"weight_dtype={getattr(getattr(wkv, 'weight', None), 'dtype', None)}, "
+                    f"scale_dtype={getattr(scale, 'dtype', None)}"
                 )
                 self._log_dequant_wkv_stack_disabled(reason)
                 return
 
             weight_bf16 = MXFP4QuantizeUtil.dequantize(
                 quantized_data=wkv.weight.detach(),
-                scale=wkv.weight_scale.detach(),
+                scale=scale.detach(),
                 dtype=torch.bfloat16,
                 block_sizes=[32],
             ).contiguous()
@@ -234,6 +234,16 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _log_dequant_wkv_stack_disabled(self, reason: str) -> None:
         if self.tp_rank == 0:
             logger.warning("DSpark BF16 dequantized wkv stack disabled: %s", reason)
+
+    @staticmethod
+    def _get_mxfp4_wkv_scale(wkv) -> Optional[torch.Tensor]:
+        if wkv is None:
+            return None
+        for name in ("weight_scale", "weight_scale_inv"):
+            scale = getattr(wkv, name, None)
+            if scale is not None and getattr(scale, "dtype", None) == torch.uint8:
+                return scale
+        return None
 
     def _get_dp_decode_global_num_tokens(
         self, batch: ScheduleBatch
