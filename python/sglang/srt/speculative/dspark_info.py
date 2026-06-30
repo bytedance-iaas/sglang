@@ -288,7 +288,9 @@ class DSparkDraftInputV2(SpecInput):
 
     def prepare_for_decode(self, batch: ScheduleBatch):
         if self.verify_done is not None:
-            self.verify_done.synchronize()
+            torch.get_device_module(batch.device).current_stream().wait_event(
+                self.verify_done
+            )
 
         bs = batch.batch_size()
         if bs == 0:
