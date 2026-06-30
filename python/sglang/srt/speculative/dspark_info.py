@@ -24,6 +24,7 @@ from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
 )
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -219,12 +220,60 @@ class DSparkDraftInputV2(SpecInput):
     )
     direct_carry_valid: bool = True
     future_indices: Optional[torch.Tensor] = None
+    _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DSPARK_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return 1, 1
+
+    def carry_prepare_buffers_from(self, other: DSparkDraftInputV2) -> None:
+        self._prepare_batch_seq_lens_cpu_buf = other._prepare_batch_seq_lens_cpu_buf
+        self._prepare_cur_kv_lens_cpu_buf = other._prepare_cur_kv_lens_cpu_buf
+        self._prepare_nxt_kv_lens_cpu_buf = other._prepare_nxt_kv_lens_cpu_buf
+        self._prepare_cur_kv_lens_gpu_buf = other._prepare_cur_kv_lens_gpu_buf
+        self._prepare_nxt_kv_lens_gpu_buf = other._prepare_nxt_kv_lens_gpu_buf
+
+    def _ensure_prepare_length_buffers(
+        self, bs: int, device: torch.device | str, need_gpu: bool = False
+    ) -> None:
+        pin_memory = is_pin_memory_available(device)
+
+        def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
+            return buf is None or buf.numel() < bs
+
+        def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
+            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+
+        def grown_capacity(buf: Optional[torch.Tensor]) -> int:
+            current = 0 if buf is None else int(buf.numel())
+            return max(bs, 32, current * 2 if current > 0 else 0)
+
+        if needs_cpu_alloc(self._prepare_batch_seq_lens_cpu_buf):
+            capacity = grown_capacity(self._prepare_batch_seq_lens_cpu_buf)
+            self._prepare_batch_seq_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int64, device="cpu"
+            )
+            self._prepare_cur_kv_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            )
+            self._prepare_nxt_kv_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            )
+
+        if need_gpu and needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
+            capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
+            self._prepare_cur_kv_lens_gpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device=device
+            )
+            self._prepare_nxt_kv_lens_gpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device=device
+            )
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> DSparkDraftInputV2:
@@ -255,9 +304,13 @@ class DSparkDraftInputV2(SpecInput):
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_alloc = self.cur_allocated_seq_lens_cpu
 
-        cur_kv_lens_cpu = torch.empty((bs,), dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.empty((bs,), dtype=torch.int32, device="cpu")
-        committed_cpu = torch.empty((bs,), dtype=torch.int64, device="cpu")
+        self._ensure_prepare_length_buffers(bs, device, need_gpu=False)
+        assert self._prepare_batch_seq_lens_cpu_buf is not None
+        assert self._prepare_cur_kv_lens_cpu_buf is not None
+        assert self._prepare_nxt_kv_lens_cpu_buf is not None
+        committed_cpu = self._prepare_batch_seq_lens_cpu_buf[:bs]
+        cur_kv_lens_cpu = self._prepare_cur_kv_lens_cpu_buf[:bs]
+        nxt_kv_lens_cpu = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_sum = 0
         reserved_sum = 0
         num_needed_tokens = 0
@@ -275,10 +328,15 @@ class DSparkDraftInputV2(SpecInput):
             reserved_sum += reserved_len
             num_needed_tokens += reserved_len - cur_alloc_len
 
-        cur_kv_lens = cur_kv_lens_cpu.to(device, non_blocking=True)
-        nxt_kv_lens = nxt_kv_lens_cpu.to(device, non_blocking=True)
-
         if num_needed_tokens > 0:
+            self._ensure_prepare_length_buffers(bs, device, need_gpu=True)
+            assert self._prepare_cur_kv_lens_gpu_buf is not None
+            assert self._prepare_nxt_kv_lens_gpu_buf is not None
+            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
+            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+            cur_kv_lens.copy_(cur_kv_lens_cpu, non_blocking=True)
+            nxt_kv_lens.copy_(nxt_kv_lens_cpu, non_blocking=True)
+
             if page_size == 1:
                 out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
             else:

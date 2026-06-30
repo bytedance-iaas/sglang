@@ -781,6 +781,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )
+        next_draft_input.carry_prepare_buffers_from(draft_input)
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
         next_draft_input.verify_done = verify_done
