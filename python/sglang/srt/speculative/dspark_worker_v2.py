@@ -145,6 +145,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
+        self._stacked_wqkv_out_offsets: list[int] = []
         self._init_fp8_wqkv_stack()
 
         if self.tp_rank == 0:
@@ -269,6 +270,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._stacked_wqkv_fp8_proj = stacked_proj
         self._stacked_wqkv_kv_offsets = kv_offsets
         self._stacked_wqkv_out_sizes = out_sizes
+        self._stacked_wqkv_out_offsets = [0]
+        for out_size in out_sizes[:-1]:
+            self._stacked_wqkv_out_offsets.append(
+                self._stacked_wqkv_out_offsets[-1] + out_size
+            )
 
         if self.tp_rank == 0:
             logger.info(
@@ -410,14 +416,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     main_x,
                     self._stacked_wqkv_fp8_proj.bias,
                 )
-                layer_outputs = torch.split(
-                    stacked_out, self._stacked_wqkv_out_sizes, dim=-1
-                )
                 for layer_idx, layer in enumerate(self._draft_inner.layers):
                     kv_start, kv_end = self._stacked_wqkv_kv_offsets[layer_idx]
+                    out_start = self._stacked_wqkv_out_offsets[layer_idx]
                     self._write_draft_kv_from_projected_kv(
                         attn=layer.self_attn,
-                        kv=layer_outputs[layer_idx][..., kv_start:kv_end],
+                        kv=stacked_out[
+                            ..., out_start + kv_start : out_start + kv_end
+                        ],
                         positions=positions,
                         cache_loc=cache_loc,
                         attn_backend=attn_backend,
