@@ -987,7 +987,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, torch.Tensor]:
         timer_ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={"category": forward_batch.forward_mode.name.lower()}
@@ -1035,6 +1035,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 customized_info=output.customized_info,
             )
+        elif isinstance(output, torch.Tensor):
+            return output[: self.raw_num_token]
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
