@@ -28,7 +28,11 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
-from sglang.srt.speculative.dspark_info import DSparkDraftInputV2, DSparkVerifyInput
+from sglang.srt.speculative.dspark_info import (
+    DSparkDraftBlockInput,
+    DSparkDraftInputV2,
+    DSparkVerifyInput,
+)
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.utils.common import empty_context
@@ -245,7 +249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         dp_decode_global_num_tokens: Optional[list[int]] = None,
     ) -> torch.Tensor:
-        draft_block_spec_info = DSparkVerifyInput(
+        draft_block_spec_info = DSparkDraftBlockInput(
             draft_token=block_ids.reshape(-1),
             positions=positions,
             draft_token_num=int(self.block_size),

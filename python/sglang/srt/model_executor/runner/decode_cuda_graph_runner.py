@@ -1107,9 +1107,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         elif self.model_runner.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+            from sglang.srt.speculative.dspark_info import (
+                DSparkDraftBlockInput,
+                DSparkVerifyInput,
+            )
 
-            spec_info = DSparkVerifyInput(
+            dspark_spec_input_cls = (
+                DSparkDraftBlockInput
+                if self.model_runner.is_draft_worker
+                else DSparkVerifyInput
+            )
+            spec_info = dspark_spec_input_cls(
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

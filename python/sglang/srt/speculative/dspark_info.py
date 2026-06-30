@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class DSparkVerifyInput(SpecInput):
+class _DSparkBlockInputBase(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
@@ -41,8 +41,8 @@ class DSparkVerifyInput(SpecInput):
     num_tokens_per_batch: int = -1
     num_tokens_per_req: int = -1
 
-    def __post_init__(self):
-        super().__init__(spec_input_type=SpecInputType.DSPARK_VERIFY)
+    def _init_spec_input(self, spec_input_type: SpecInputType):
+        SpecInput.__init__(self, spec_input_type=spec_input_type)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
         if self.num_tokens_per_req == -1:
@@ -50,81 +50,6 @@ class DSparkVerifyInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
-
-    def prepare_for_draft_block(
-        self,
-        batch: ScheduleBatch,
-        draft_model_runner: ModelRunner,
-        out_cache_loc: torch.Tensor,
-        dp_decode_global_num_tokens: Optional[list[int]] = None,
-    ) -> ForwardBatch:
-        batch.input_ids = self.draft_token
-        batch.out_cache_loc = out_cache_loc
-        batch.spec_info = self
-        batch.spec_algorithm = SpeculativeAlgorithm.DSPARK
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.capture_hidden_mode = self.capture_hidden_mode
-
-        draft_forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        draft_forward_batch.lora_ids = [None] * draft_forward_batch.batch_size
-
-        server_args = get_global_server_args()
-        if (
-            server_args.enable_dp_attention
-            and dp_decode_global_num_tokens is not None
-        ):
-            draft_global_num_tokens = [
-                int(x) * int(self.draft_token_num) for x in dp_decode_global_num_tokens
-            ]
-            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
-            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
-                draft_global_num_tokens,
-                dtype=torch.int64,
-                device=draft_model_runner.device,
-            )
-            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
-                draft_global_num_tokens
-            )
-            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-                draft_global_num_tokens,
-                dtype=torch.int64,
-                device=draft_model_runner.device,
-            )
-
-        return draft_forward_batch
-
-    def prepare_for_verify(
-        self,
-        batch: ScheduleBatch,
-        target_worker: TpModelWorker,
-    ) -> tuple[ForwardBatch, bool]:
-        batch.input_ids = self.draft_token
-        batch.spec_info = self
-        batch.forward_mode = (
-            ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
-            else ForwardMode.TARGET_VERIFY
-        )
-        batch.capture_hidden_mode = self.capture_hidden_mode
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
-
-        server_args = get_global_server_args()
-        can_run_cuda_graph = bool(
-            not server_args.enable_dp_attention
-            and target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-                verify_forward_batch
-            )
-        )
-        if can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
-            )
-            verify_forward_batch.mark_forward_metadata_ready()
-        # Non-cuda-graph: defer metadata init to the forward path so DP attention
-        # padding in prepare_mlp_sync_batch is reflected in the backend plan.
-
-        return verify_forward_batch, can_run_cuda_graph
 
     def generate_attn_arg_prefill(
         self,
@@ -184,6 +109,93 @@ class DSparkVerifyInput(SpecInput):
                 )
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
+
+
+@dataclass
+class DSparkDraftBlockInput(_DSparkBlockInputBase):
+    def __post_init__(self):
+        self._init_spec_input(SpecInputType.DSPARK_DRAFT_BLOCK)
+
+    def prepare_for_draft_block(
+        self,
+        batch: ScheduleBatch,
+        draft_model_runner: ModelRunner,
+        out_cache_loc: torch.Tensor,
+        dp_decode_global_num_tokens: Optional[list[int]] = None,
+    ) -> ForwardBatch:
+        batch.input_ids = self.draft_token
+        batch.out_cache_loc = out_cache_loc
+        batch.spec_info = self
+        batch.spec_algorithm = SpeculativeAlgorithm.DSPARK
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.capture_hidden_mode = self.capture_hidden_mode
+
+        draft_forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        draft_forward_batch.lora_ids = [None] * draft_forward_batch.batch_size
+
+        server_args = get_global_server_args()
+        if (
+            server_args.enable_dp_attention
+            and dp_decode_global_num_tokens is not None
+        ):
+            draft_global_num_tokens = [
+                int(x) * int(self.draft_token_num) for x in dp_decode_global_num_tokens
+            ]
+            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
+            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
+                draft_global_num_tokens,
+                dtype=torch.int64,
+                device=draft_model_runner.device,
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
+                draft_global_num_tokens
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                draft_global_num_tokens,
+                dtype=torch.int64,
+                device=draft_model_runner.device,
+            )
+
+        return draft_forward_batch
+
+
+@dataclass
+class DSparkVerifyInput(_DSparkBlockInputBase):
+    def __post_init__(self):
+        self._init_spec_input(SpecInputType.DSPARK_VERIFY)
+
+    def prepare_for_verify(
+        self,
+        batch: ScheduleBatch,
+        target_worker: TpModelWorker,
+    ) -> tuple[ForwardBatch, bool]:
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        server_args = get_global_server_args()
+        can_run_cuda_graph = bool(
+            not server_args.enable_dp_attention
+            and target_worker.model_runner.decode_cuda_graph_runner
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
+                verify_forward_batch
+            )
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
+                verify_forward_batch
+            )
+            verify_forward_batch.mark_forward_metadata_ready()
+        # Non-cuda-graph: defer metadata init to the forward path so DP attention
+        # padding in prepare_mlp_sync_batch is reflected in the backend plan.
+
+        return verify_forward_batch, can_run_cuda_graph
 
 
 @dataclass
