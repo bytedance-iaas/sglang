@@ -377,6 +377,7 @@ class FrozenKVMTPCudaGraphRunner:
             expanded_bs,
             forward_batch.seq_lens_sum
             + (expanded_bs - raw_expanded_bs) * self.seq_len_fill_value,
+            raw_expanded_bs,
         )
 
         self.raw_bs = raw_bs

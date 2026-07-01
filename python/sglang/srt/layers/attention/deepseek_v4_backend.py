@@ -467,9 +467,26 @@ class DSV4RawVerifyMetadata:
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
     def copy_(self, other: DSV4RawVerifyMetadata):
-        self.req_pool_indices.copy_(other.req_pool_indices)
-        self.seq_lens.copy_(other.seq_lens)
-        self.out_cache_loc.copy_(other.out_cache_loc)
+        for field_name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+            dst = getattr(self, field_name)
+            src = getattr(other, field_name)
+            if dst.shape != src.shape:
+                raise RuntimeError(
+                    "DeepSeekV4 raw target-verify metadata copy shape mismatch: "
+                    f"field={field_name}, dst_shape={tuple(dst.shape)}, "
+                    f"src_shape={tuple(src.shape)}."
+                )
+            if dst is src:
+                continue
+            try:
+                dst.copy_(src)
+            except RuntimeError as exc:
+                if (
+                    "some elements of the input tensor and the written-to tensor "
+                    "refer to a single memory location"
+                ) not in str(exc):
+                    raise
+                dst.copy_(src.clone())
 
         self.extend_seq_lens = other.extend_seq_lens
         self.num_draft_tokens = other.num_draft_tokens
@@ -486,9 +503,26 @@ class DSV4RawDecodeMetadata:
     out_cache_loc: torch.Tensor
 
     def copy_(self, other: DSV4RawDecodeMetadata):
-        self.req_pool_indices.copy_(other.req_pool_indices)
-        self.seq_lens.copy_(other.seq_lens)
-        self.out_cache_loc.copy_(other.out_cache_loc)
+        for field_name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+            dst = getattr(self, field_name)
+            src = getattr(other, field_name)
+            if dst.shape != src.shape:
+                raise RuntimeError(
+                    "DeepSeekV4 raw decode metadata copy shape mismatch: "
+                    f"field={field_name}, dst_shape={tuple(dst.shape)}, "
+                    f"src_shape={tuple(src.shape)}."
+                )
+            if dst is src:
+                continue
+            try:
+                dst.copy_(src)
+            except RuntimeError as exc:
+                if (
+                    "some elements of the input tensor and the written-to tensor "
+                    "refer to a single memory location"
+                ) not in str(exc):
+                    raise
+                dst.copy_(src.clone())
 
 
 class _GraphBucket(enum.Enum):
@@ -1093,15 +1127,36 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        *,
+        prefer_draft_token: bool = False,
     ) -> int:
+        if prefer_draft_token:
+            spec_info = getattr(forward_batch, "spec_info", None)
+            draft_token_num = getattr(spec_info, "draft_token_num", None)
+            draft_token = getattr(spec_info, "draft_token", None)
+            if draft_token_num is not None and draft_token is not None:
+                draft_token_num = int(draft_token_num)
+                if draft_token_num > 0:
+                    draft_numel = int(draft_token.numel())
+                    if draft_numel % draft_token_num == 0:
+                        return min(
+                            draft_numel // draft_token_num,
+                            int(req_pool_indices.shape[0]),
+                            int(seq_lens.shape[0]),
+                        )
+
         # CUDA graph replay pads req/seq tensors to the captured bucket size.
         # Some graph runners temporarily set ForwardBatch.batch_size to the
-        # padded bucket size, so prefer the raw replay batch size when provided.
+        # padded bucket size, so prefer the semantic batch size when provided.
         raw_bs = int(
             getattr(
                 forward_batch,
                 "_cuda_graph_raw_batch_size",
-                forward_batch.batch_size,
+                getattr(
+                    forward_batch,
+                    "_original_batch_size",
+                    forward_batch.batch_size,
+                ),
             )
         )
         return min(raw_bs, int(req_pool_indices.shape[0]), int(seq_lens.shape[0]))
@@ -1153,7 +1208,12 @@ class DeepseekV4AttnBackend(
         active_bs: Optional[int] = None,
     ) -> TargetVerifyLayout:
         if active_bs is None:
-            active_bs = self._active_batch_size(forward_batch, req_pool_indices, seq_lens)
+            active_bs = self._active_batch_size(
+                forward_batch,
+                req_pool_indices,
+                seq_lens,
+                prefer_draft_token=True,
+            )
         query_len = self._target_verify_query_len(forward_batch, active_bs)
         return TargetVerifyLayout(
             active_bs=active_bs,
@@ -1177,7 +1237,12 @@ class DeepseekV4AttnBackend(
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
-        active_bs = self._active_batch_size(forward_batch, req_pool_indices, seq_lens)
+        active_bs = self._active_batch_size(
+            forward_batch,
+            req_pool_indices,
+            seq_lens,
+            prefer_draft_token=logical_forward_mode.is_target_verify(),
+        )
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
@@ -1368,7 +1433,12 @@ class DeepseekV4AttnBackend(
         actual_max_seq_len = seq_lens_cpu.max().item()
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         assert actual_max_seq_len <= chosen_max_seq_len
-        active_bs = self._active_batch_size(fb, req_pool_indices, seq_lens)
+        active_bs = self._active_batch_size(
+            fb,
+            req_pool_indices,
+            seq_lens,
+            prefer_draft_token=logical_forward_mode.is_target_verify(),
+        )
         active_req_pool_indices = req_pool_indices[:active_bs]
         active_seq_lens = seq_lens[:active_bs]
 
@@ -1454,10 +1524,10 @@ class DeepseekV4AttnBackend(
                 )
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
-                req_pool_indices=layout.req_pool_indices,
-                seq_lens=layout.seq_lens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
-                num_tokens=layout.semantic_num_tokens,
+                num_tokens=graph_num_tokens,
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
@@ -1503,6 +1573,32 @@ class DeepseekV4AttnBackend(
         bucket: _GraphBucket,
     ) -> None:
         chosen_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs]
+        if isinstance(chosen_metadata, DSV4RawVerifyMetadata) and isinstance(
+            temp_metadata, DSV4RawVerifyMetadata
+        ):
+            for field_name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+                dst = getattr(chosen_metadata, field_name)
+                src = getattr(temp_metadata, field_name)
+                if dst.shape != src.shape:
+                    raise RuntimeError(
+                        "DeepSeekV4 target-verify graph replay metadata shape "
+                        "mismatch before copy: "
+                        f"field={field_name}, graph_bs={bs}, "
+                        f"dst_shape={tuple(dst.shape)}, src_shape={tuple(src.shape)}."
+                    )
+        elif isinstance(chosen_metadata, DSV4RawDecodeMetadata) and isinstance(
+            temp_metadata, DSV4RawDecodeMetadata
+        ):
+            for field_name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+                dst = getattr(chosen_metadata, field_name)
+                src = getattr(temp_metadata, field_name)
+                if dst.shape != src.shape:
+                    raise RuntimeError(
+                        "DeepSeekV4 decode graph replay metadata shape mismatch "
+                        "before copy: "
+                        f"field={field_name}, graph_bs={bs}, "
+                        f"dst_shape={tuple(dst.shape)}, src_shape={tuple(src.shape)}."
+                    )
         chosen_metadata.copy_(temp_metadata)
         self.forward_metadata = chosen_metadata
 
@@ -1906,7 +2002,11 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         if step_out_cache_loc is not None:
             forward_batch.out_cache_loc = step_out_cache_loc[0]
 
+        semantic_raw_bs = int(
+            getattr(forward_batch, "_original_batch_size", forward_batch.batch_size)
+        )
         self.attn_backends[0]._replay_forward_batch = forward_batch
+        forward_batch._cuda_graph_raw_batch_size = semantic_raw_bs
         try:
             self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
                 bs=bs,
@@ -1920,6 +2020,8 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
         finally:
             self.attn_backends[0]._replay_forward_batch = None
+            if hasattr(forward_batch, "_cuda_graph_raw_batch_size"):
+                delattr(forward_batch, "_cuda_graph_raw_batch_size")
             forward_batch.out_cache_loc = original_out_cache_loc
         temp_metadata = self.attn_backends[0].forward_metadata
 

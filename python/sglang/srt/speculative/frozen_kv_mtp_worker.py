@@ -293,10 +293,15 @@ class FrozenKVMTPWorker(TpModelWorker):
         forward_batch.attn_backend = self.draft_attn_backend
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        seq_lens_sum: int,
+        semantic_bs: int,
     ) -> None:
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend._replay_forward_batch = forward_batch
+            forward_batch._cuda_graph_raw_batch_size = semantic_bs
             try:
                 self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                     bs,
@@ -314,6 +319,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                 )
             finally:
                 self.draft_attn_backend._replay_forward_batch = None
+                if hasattr(forward_batch, "_cuda_graph_raw_batch_size"):
+                    delattr(forward_batch, "_cuda_graph_raw_batch_size")
         forward_batch.attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self) -> None:

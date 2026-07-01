@@ -341,13 +341,38 @@ class C4IndexerBackendMixin:
         core_metadata = metadata.core_metadata
 
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
+        semantic_rows = int(indexer_metadata.c4_seq_lens.shape[0])
+        positions = core_metadata.positions
+        if positions.dim() != 1:
+            raise RuntimeError(
+                "DSV4 C4 indexer positions must be 1D: "
+                f"context={forward_batch.forward_mode}, "
+                f"positions_shape={tuple(positions.shape)}."
+            )
+        if int(positions.shape[0]) != semantic_rows:
+            raise RuntimeError(
+                "DSV4 C4 indexer metadata row mismatch: "
+                f"context={forward_batch.forward_mode}, "
+                f"semantic_rows={semantic_rows}, "
+                f"positions_shape={tuple(positions.shape)}."
+            )
+        if x.shape[0] < semantic_rows or q_lora.shape[0] < semantic_rows:
+            raise RuntimeError(
+                "DSV4 C4 indexer input shorter than semantic metadata rows: "
+                f"context={forward_batch.forward_mode}, "
+                f"semantic_rows={semantic_rows}, "
+                f"x_shape={tuple(x.shape)}, q_lora_shape={tuple(q_lora.shape)}."
+            )
+        x_indexer = x[:semantic_rows]
+        q_lora_indexer = q_lora[:semantic_rows]
+        positions_indexer = positions
 
         if enable_multi_stream:
             q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
-                x=x,
-                q_lora=q_lora,
+                x=x_indexer,
+                q_lora=q_lora_indexer,
                 c4_indexer=c4_indexer,
-                positions=core_metadata.positions,
+                positions=positions_indexer,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
                 alt_streams=alt_streams,
@@ -356,10 +381,10 @@ class C4IndexerBackendMixin:
         else:
             assert q_lora_ready is None
             q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
-                x=x,
-                q_lora=q_lora,
+                x=x_indexer,
+                q_lora=q_lora_indexer,
                 c4_indexer=c4_indexer,
-                positions=core_metadata.positions,
+                positions=positions_indexer,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
             )

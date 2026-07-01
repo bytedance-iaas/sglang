@@ -1244,17 +1244,19 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
             return
 
         self.attn_backends[0]._replay_forward_batch = forward_batch
-        self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-        )
-        self.attn_backends[0]._replay_forward_batch = None
+        try:
+            self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            )
+        finally:
+            self.attn_backends[0]._replay_forward_batch = None
         temp_metadata = self.attn_backends[0].forward_metadata
 
         for i in range(1, self.speculative_num_steps - 1):
