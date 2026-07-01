@@ -110,6 +110,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ top_k_device_locs,
     const ReqPoolIndicesT* __restrict__ req_pool_indices,
     const SeqLensT* __restrict__ seq_lens,
+    const int32_t* __restrict__ req_hot_buffer_sizes,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     int64_t buffer_stride_0,
@@ -136,6 +137,12 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int64_t rid = req_pool_indices[bid];
   const int64_t seq_len = seq_lens[bid];
+  int effective_hot = HOT_BUFFER_SIZE;
+  if (req_hot_buffer_sizes != nullptr) {
+    effective_hot = req_hot_buffer_sizes[rid];
+    effective_hot = effective_hot < NUM_TOP_K ? NUM_TOP_K : effective_hot;
+    effective_hot = effective_hot > HOT_BUFFER_SIZE ? HOT_BUFFER_SIZE : effective_hot;
+  }
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -148,7 +155,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
 
   // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
+  if (seq_len <= effective_hot) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
@@ -197,7 +204,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  const int newest_slot = HOT_BUFFER_SIZE;
+  const int newest_slot = effective_hot;
   const int32_t newest_token = seq_len - 1;
 
   // Insert top-k tokens into shared-memory hash table.
@@ -235,7 +242,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
 
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
-    const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
+    const bool has_valid_slot = has_valid_chunk && (slot_idx < effective_hot);
     const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
     int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
     int my_found_top_k_idx = -1;
@@ -293,7 +300,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     // Evictables grow backward from HOT_BUFFER_SIZE - 1
     if (is_evictable) {
       int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
-      s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
+      s_lru_slots_out[effective_hot - 1 - evict_offset] = buf_slot;
     }
   }
   __syncthreads();
@@ -348,7 +355,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      int16_t evict_slot = s_lru_slots_out[effective_hot - 1 - miss_offset];
       // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
       // holds (hits are skipped), so compacted writes never overrun pending reads.
       s_top_k_tokens[miss_offset] = my_token;
@@ -361,14 +368,14 @@ __global__ void load_cache_to_device_buffer_kernel(
   total_misses = NUM_TOP_K - s_total_hits - s_skipped_topk;
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
-    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+    const int total_evictable = effective_hot - s_total_hits;
+    for (int i = tid; i < effective_hot; i += BLOCK_SIZE) {
       if (i < total_misses) {
         // Misses: just loaded from host, place right before hits
-        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[effective_hot - 1 - i];
       } else if (i < total_evictable) {
         // Remaining evictables: truly stale, dest at LRU front
-        req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+        req_lru_slots[i - total_misses] = s_lru_slots_out[effective_hot - 1 - i];
       } else {
         // Hits: source at forward end, dest at MRU back
         req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
@@ -379,7 +386,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
-    const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+    const int16_t evict_slot = s_lru_slots_out[effective_hot - 1 - miss_idx];
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
@@ -420,6 +427,7 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_device_locs,
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView req_hot_buffer_sizes,
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
@@ -432,6 +440,13 @@ void load_cache_to_device_buffer(
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const int32_t* req_hot_buffer_sizes_ptr =
+      req_hot_buffer_sizes.numel() > 0 ? static_cast<const int32_t*>(req_hot_buffer_sizes.data_ptr()) : nullptr;
+  if (req_hot_buffer_sizes_ptr != nullptr) {
+    RuntimeCheck(
+        req_hot_buffer_sizes.shape()[0] >= device_buffer_tokens.shape()[0],
+        "req_hot_buffer_sizes must cover request-slot rows");
+  }
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
@@ -454,6 +469,7 @@ void load_cache_to_device_buffer(
         static_cast<int32_t*>(top_k_device_locs.data_ptr()),
         req_pool_indices_ptr,
         seq_lens_ptr,
+        req_hot_buffer_sizes_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
         buffer_stride_0,

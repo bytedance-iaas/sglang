@@ -769,9 +769,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 hisparse_top_k = resolve_hisparse_top_k(
                     self.server_args, self.model_config.hf_text_config
                 )
-                hisparse_topk_work_buffer_rows = (
-                    self.req_to_token_pool.req_to_token.shape[0]
-                )
+                hisparse_req_slots = self.req_to_token_pool.req_to_token.shape[0]
+                hisparse_topk_work_buffer_rows = hisparse_req_slots
                 if self.server_args.speculative_algorithm is not None:
                     speculative_rows_per_req = max(
                         int(getattr(self.server_args, "speculative_num_steps", 0) or 0)
@@ -793,6 +792,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         1,
                     )
                     hisparse_topk_work_buffer_rows = max(
+                        hisparse_req_slots * speculative_rows_per_req,
+                        int(self.server_args.max_running_requests or 0)
+                        * speculative_rows_per_req,
                         hisparse_topk_work_buffer_rows,
                         int(self.server_args.cuda_graph_max_bs or 0)
                         * speculative_rows_per_req,
@@ -802,6 +804,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     top_k=hisparse_top_k,
                     device_buffer_size=hisparse_cfg.device_buffer_size,
+                    min_device_buffer_size=hisparse_cfg.min_device_buffer_size,
                     device=self.device,
                     tp_group=(
                         self.attention_tp_group.cpu_group

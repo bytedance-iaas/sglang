@@ -72,6 +72,7 @@ def _run_kernel(
         top_k_device_locs=out,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
+        req_hot_buffer_sizes=None,
         lru_slots=lru_slots,
         item_size_bytes=ITEM_SIZE_BYTES,
         num_top_k=top_k_tokens.shape[1],

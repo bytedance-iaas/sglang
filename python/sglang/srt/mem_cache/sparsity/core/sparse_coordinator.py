@@ -58,6 +58,7 @@ class SparseConfig:
     top_k: int = 2048
     top_k_explicit: bool = False
     device_buffer_size: int = 4096
+    min_device_buffer_size: Optional[int] = None
     host_to_device_ratio: int = 2
     algorithm: Optional[str] = None
     backend: Optional[str] = None

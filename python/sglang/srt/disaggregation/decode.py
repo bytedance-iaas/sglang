@@ -1164,6 +1164,10 @@ class DecodePreallocQueue:
         c4_host_required_tokens: int,
         hisparse_req_budget,
         hisparse_avail: Optional[int],
+        hisparse_required_slots: int = 0,
+        hisparse_remaining_slots: Optional[int] = None,
+        hisparse_hot_cap: Optional[int] = None,
+        hisparse_page_size: Optional[int] = None,
     ) -> None:
         now = time.monotonic()
         self.scheduler._last_disagg_decode_prealloc_block_reason = reason
@@ -1240,15 +1244,22 @@ class DecodePreallocQueue:
             "metadata_slots=%d, full_allocatable_tokens=%d, "
             "full_evictable_tokens=%d, full_available_tokens=%s, "
             "logical_available_tokens=%s, swa_allocatable_tokens=%d, "
+            "active_reserved_tokens=%d, "
             "c4_host_allocatable_tokens=%s, c4_host_required_tokens=%d, "
             "c4_host_reclaimable_tokens=%s, hisparse_req_budget=%s, "
+            "hisparse_required_slots=%s, hisparse_remaining_slots=%s, "
+            "hisparse_hot_cap=%s, hisparse_page_size=%s, "
             "eagle_draft_reserve_tokens=%d, "
-            "staging_full_tokens=%d, staging_headroom_tokens=%d, "
+            "staged_transfer_waiting_full_tokens=%d, staging_headroom_tokens=%d, "
             "staging_reclaimable_tokens=%d, full_usage_target=%.3f, "
             "hisparse_avail=%s, hisparse_padded_buffer_size=%s, "
             "hisparse_top_k=%s, hisparse_device_buffer_size=%s, "
+            "hisparse_min_device_buffer_size=%s, "
             "max_running_requests=%s, idle_admission_deadlock=%s, "
-            "relaxed_output_reserve=%s, decode_output_reserve_cap=%s",
+            "relaxed_output_reserve=%s, decode_output_reserve_cap=%s, "
+            "head_fill_len=%s, head_prefix_len=%s, head_safe_prefix_len=%s, "
+            "head_required_alloc_tokens=%s, head_output_reserve=%s, "
+            "head_required_tokens_for_request=%s, head_future_full_tokens=%s",
             reason,
             len(self.queue),
             ready_reqs,
@@ -1265,10 +1276,15 @@ class DecodePreallocQueue:
             full_available_tokens,
             logical_available_tokens,
             swa_allocatable_tokens,
+            active_reserved_tokens,
             c4_host_allocatable_tokens,
             c4_host_required_tokens,
             c4_host_reclaimable_tokens,
             hisparse_req_budget,
+            hisparse_required_slots,
+            hisparse_remaining_slots,
+            hisparse_hot_cap,
+            hisparse_page_size,
             eagle_draft_reserve_tokens,
             staging_full_tokens,
             staging_headroom_tokens,
@@ -1507,26 +1523,47 @@ class DecodePreallocQueue:
                 indices_to_remove.add(i)
 
         # HiSparse physical constraint: max requests by device buffer capacity.
-        # Each admitted req needs padded_buffer_size from hisparse device pool.
-        # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
-        # only transfer_queue reqs are pending device buffer allocation.
+        # waiting_queue reqs already have device buffers (allocated in
+        # admit_request_direct), only transfer_queue reqs are pending device
+        # buffer allocation. DSV4 can use per-request C4 hot caps, so account in
+        # slots instead of a fixed padded-buffer request count.
         hisparse_req_budget = float("inf")
         hisparse_avail = None
+        hisparse_remaining_slots = None
+        hisparse_required_slots = 0
+        hisparse_hot_cap = None
+        hisparse_page_size = None
         c4_host_allocatable_tokens = None
         c4_host_required_tokens = 0
         c4_host_reserved_decode_reqs: List[DecodeRequest] = []
         if self.scheduler.enable_hisparse:
+            coordinator = self.scheduler.hisparse_coordinator
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
-            hisparse_req_budget = max(
-                0,
-                hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
-                - len(self.transfer_queue.queue),
-            )
+            if hasattr(coordinator, "device_buffer_slots_for_request"):
+                transfer_reserved_slots = sum(
+                    coordinator.device_buffer_slots_for_request(decode_req.req)
+                    for decode_req in self.transfer_queue.queue
+                )
+                hisparse_remaining_slots = max(
+                    0, hisparse_avail - transfer_reserved_slots
+                )
+                default_slots = coordinator.device_buffer_slots_for_request(None)
+                hisparse_req_budget = (
+                    hisparse_remaining_slots // default_slots
+                    if default_slots > 0
+                    else 0
+                )
+            else:
+                hisparse_req_budget = max(
+                    0,
+                    hisparse_avail // coordinator.padded_buffer_size
+                    - len(self.transfer_queue.queue),
+                )
             if (
-                self.scheduler.hisparse_coordinator.is_dsv4_hisparse
-                and self.scheduler.hisparse_coordinator.host_radix_cache is None
+                coordinator.is_dsv4_hisparse
+                and coordinator.host_radix_cache is None
             ):
                 c4_host_decode_reserve_tokens = (
                     self._dsv4_c4_host_decode_reserve_tokens()
@@ -1565,9 +1602,25 @@ class DecodePreallocQueue:
                 blocked_reason = "metadata_buffer_slots"
                 break
 
-            if hisparse_req_budget <= 0:
-                blocked_reason = "hisparse_c4_hot_req_budget"
-                break
+            if self.scheduler.enable_hisparse:
+                coordinator = self.scheduler.hisparse_coordinator
+                if hasattr(coordinator, "device_buffer_slots_for_request"):
+                    hisparse_required_slots = (
+                        coordinator.device_buffer_slots_for_request(decode_req.req)
+                    )
+                    hisparse_hot_cap = coordinator.device_hot_buffer_size_for_request(
+                        decode_req.req
+                    )
+                    hisparse_page_size = coordinator.mem_pool_device.page_size
+                    if (
+                        hisparse_remaining_slots is not None
+                        and hisparse_required_slots > hisparse_remaining_slots
+                    ):
+                        blocked_reason = "hisparse_c4_hot_req_budget"
+                        break
+                elif hisparse_req_budget <= 0:
+                    blocked_reason = "hisparse_c4_hot_req_budget"
+                    break
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
@@ -1764,7 +1817,21 @@ class DecodePreallocQueue:
                     break
 
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
-            hisparse_req_budget -= 1
+            if self.scheduler.enable_hisparse:
+                if hisparse_remaining_slots is not None:
+                    hisparse_remaining_slots -= hisparse_required_slots
+                    default_slots = (
+                        self.scheduler.hisparse_coordinator.device_buffer_slots_for_request(
+                            None
+                        )
+                    )
+                    hisparse_req_budget = (
+                        hisparse_remaining_slots // default_slots
+                        if default_slots > 0
+                        else 0
+                    )
+                else:
+                    hisparse_req_budget -= 1
             if c4_host_allocatable_tokens is not None:
                 c4_host_reserved_decode_reqs.append(decode_req)
                 c4_host_allocatable_tokens = (
@@ -2028,6 +2095,10 @@ class DecodePreallocQueue:
                 c4_host_required_tokens=c4_host_required_tokens,
                 hisparse_req_budget=hisparse_req_budget,
                 hisparse_avail=hisparse_avail,
+                hisparse_required_slots=hisparse_required_slots,
+                hisparse_remaining_slots=hisparse_remaining_slots,
+                hisparse_hot_cap=hisparse_hot_cap,
+                hisparse_page_size=hisparse_page_size,
             )
 
         self.queue = [

@@ -133,6 +133,7 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
             top_k_device_locs=state["top_k_device_locs"],
             req_pool_indices=state["req_pool_indices"],
             seq_lens=state["seq_lens"],
+            req_hot_buffer_sizes=None,
             lru_slots=state["lru_slots"],
             item_size_bytes=ITEM_SIZE_BYTES,
             num_top_k=TOP_K,

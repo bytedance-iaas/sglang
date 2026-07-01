@@ -372,6 +372,7 @@ class HiSparseCoordinator:
         device_buffer_size: int,
         device: str,
         tp_group,
+        min_device_buffer_size: Optional[int] = None,
         host_to_device_ratio: int = 2,
         topk_work_buffer_rows: Optional[int] = None,
     ):
@@ -448,6 +449,24 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_host.page_size
+        self.min_device_buffer_size = self._align_device_hot_buffer_size(
+            self.top_k if min_device_buffer_size is None else min_device_buffer_size
+        )
+        if self.min_device_buffer_size > self.device_buffer_size:
+            raise ValueError(
+                "HiSparse min_device_buffer_size must be no larger than "
+                f"device_buffer_size: min_device_buffer_size="
+                f"{self.min_device_buffer_size}, device_buffer_size="
+                f"{self.device_buffer_size}."
+            )
+        logger.info(
+            "HiSparse C4 hot buffer sizing: top_k=%d, "
+            "min_device_buffer_size=%d, max_device_buffer_size=%d, page_size=%d",
+            self.top_k,
+            self.min_device_buffer_size,
+            self.device_buffer_size,
+            self.page_size,
+        )
 
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
@@ -465,6 +484,12 @@ class HiSparseCoordinator:
         )
         self.req_device_buffer_size = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
+        self.req_device_hot_buffer_size = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
+        self.req_device_hot_buffer_size_gpu = torch.zeros(
+            max_num_req_slots, dtype=torch.int32, device=device
         )
         self.req_draft_buffer_size = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
@@ -551,6 +576,40 @@ class HiSparseCoordinator:
         self._req_c4_written_len: Dict[int, int] = {}
         self._req_host_written_len: Dict[int, int] = {}
         self.host_radix_cache = None
+
+    def _align_device_hot_buffer_size(self, value: int) -> int:
+        value = max(int(value), int(self.top_k))
+        page_size = max(int(self.mem_pool_device.page_size), 1)
+        return ((value + page_size - 1) // page_size) * page_size
+
+    def device_hot_buffer_size_for_request(self, req: Optional[Req] = None) -> int:
+        if not self.is_dsv4_hisparse:
+            return self.device_buffer_size
+        return self.min_device_buffer_size
+
+    def device_buffer_slots_for_request(self, req: Optional[Req] = None) -> int:
+        return (
+            self.device_hot_buffer_size_for_request(req)
+            + self.mem_pool_device.page_size
+        )
+
+    def _req_hot_cap_cpu(self, req_pool_idx: int) -> int:
+        hot_cap = int(self.req_device_hot_buffer_size[int(req_pool_idx)])
+        if hot_cap <= 0:
+            hot_cap = (
+                self.min_device_buffer_size
+                if self.is_dsv4_hisparse
+                else self.device_buffer_size
+            )
+        return hot_cap
+
+    def _newest_slot_locs(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
+        if self.is_dsv4_hisparse:
+            hot_caps = self.req_device_hot_buffer_size_gpu[
+                req_pool_indices.to(dtype=torch.long)
+            ].to(dtype=torch.long)
+            return self.req_to_device_buffer[req_pool_indices, hot_caps]
+        return self.req_to_device_buffer[req_pool_indices, self.device_buffer_size]
 
     # ---- DSV4 C4 prefix-cache integration ----
 
@@ -1188,7 +1247,8 @@ class HiSparseCoordinator:
         self.alloc_device_buffer(req)
 
         host_len = self._host_token_len(req.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
+        hot_cap = self._req_hot_cap_cpu(req.req_pool_idx)
+        if host_len <= hot_cap:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -1198,7 +1258,7 @@ class HiSparseCoordinator:
             # Long sequence: reset device_buffer_tokens to -1 so the kernel
             # sees all slots as empty -> every top-k lookup is a miss -> host load.
             self.req_device_buffer_tokens[
-                :, req.req_pool_idx, : self.device_buffer_size
+                :, req.req_pool_idx, :hot_cap
             ] = -1
 
         req.hisparse_staging = False
@@ -1267,7 +1327,8 @@ class HiSparseCoordinator:
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
             allocated_len = req.kv_allocated_len or len(req.fill_ids)
-            alloc_size = self.padded_buffer_size
+            hot_cap = self.device_hot_buffer_size_for_request(req)
+            alloc_size = hot_cap + self.mem_pool_device.page_size
         else:
             allocated_len = req.kv_allocated_len
             page_size = self.mem_pool_device.page_size
@@ -1310,10 +1371,22 @@ class HiSparseCoordinator:
         buffer_indices = buffer_indices.to(torch.int32)
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
-
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :alloc_size] = (
-            self._device_buffer_arange_i32[:alloc_size]
+        self.req_device_hot_buffer_size[req.req_pool_idx] = (
+            hot_cap if self.is_dsv4_hisparse else min(alloc_size, self.device_buffer_size)
         )
+        self.req_device_hot_buffer_size_gpu[req.req_pool_idx] = (
+            hot_cap if self.is_dsv4_hisparse else self.device_buffer_size
+        )
+
+        if self.is_dsv4_hisparse:
+            self.req_device_buffer_tokens[:, req.req_pool_idx, :alloc_size] = -1
+            self.req_device_buffer_tokens[:, req.req_pool_idx, :hot_cap] = (
+                self._device_buffer_arange_i32[:hot_cap]
+            )
+        else:
+            self.req_device_buffer_tokens[:, req.req_pool_idx, :alloc_size] = (
+                self._device_buffer_arange_i32[:alloc_size]
+            )
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
@@ -1500,16 +1573,22 @@ class HiSparseCoordinator:
         active_req_pool_indices = req_pool_indices[active_reqs]
 
         compressed_seq_lens = active_seq_lens // self.compress_ratio
-        reserved_positions = (compressed_seq_lens - 1).clamp(
-            max=self.device_buffer_size
+        active_hot_caps = self.req_device_hot_buffer_size_gpu[
+            active_req_pool_indices.to(dtype=torch.long)
+        ].to(dtype=torch.long)
+        reserved_positions = torch.minimum(
+            compressed_seq_lens - 1,
+            active_hot_caps.to(device=compressed_seq_lens.device),
         )
         reserved_buffer_loc = self.req_to_device_buffer[
             active_req_pool_indices, reserved_positions
         ]
 
-        self.req_device_buffer_token_locs[
-            :, active_req_pool_indices, self.device_buffer_size
-        ] = reserved_buffer_loc.to(torch.int32)
+        reserved_buffer_loc_i32 = reserved_buffer_loc.to(torch.int32)
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.req_device_buffer_token_locs[
+                layer_id, active_req_pool_indices, reserved_positions
+            ] = reserved_buffer_loc_i32
 
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
             active_out_cache_loc
@@ -1565,7 +1644,10 @@ class HiSparseCoordinator:
         compressed_prev_seq_lens = prev_seq_lens // self.compress_ratio
         actual_compressed_pos = compressed_prev_seq_lens - 1
 
-        buffer_slot = actual_compressed_pos.clamp(max=self.device_buffer_size)
+        hot_caps = self.req_device_hot_buffer_size_gpu[
+            backup_req_indices.to(dtype=torch.long)
+        ].to(device=actual_compressed_pos.device, dtype=actual_compressed_pos.dtype)
+        buffer_slot = torch.minimum(actual_compressed_pos, hot_caps)
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
@@ -1677,7 +1759,7 @@ class HiSparseCoordinator:
                 self.req_to_device_buffer[req.req_pool_idx, :current_cap]
             )
         if draft_cap > 0:
-            draft_start = self.device_buffer_size + 1
+            draft_start = self._req_hot_cap_cpu(req.req_pool_idx) + 1
             draft_end = draft_start + draft_cap
             # If the request already owns the padded extra page through the side
             # buffer, draft slots live inside that range and must not be freed
@@ -1717,28 +1799,31 @@ class HiSparseCoordinator:
         if num_tokens <= 0:
             return
 
-        start = self.device_buffer_size + 1
-        end = start + num_tokens
-        if end > self.padded_buffer_size:
-            raise ValueError(
-                f"Requested {num_tokens} draft slots but extra page only "
-                f"has {self.padded_buffer_size - self.device_buffer_size - 1} "
-                f"available (padded_buffer_size={self.padded_buffer_size}, "
-                f"device_buffer_size={self.device_buffer_size})."
-            )
-
         req_indices_cpu = req_pool_indices_cpu.to(torch.int64).tolist()
         grow_reqs = []
         total_grow = 0
         for req_idx in req_indices_cpu:
+            hot_cap = self._req_hot_cap_cpu(req_idx)
+            start = hot_cap + 1
+            end = start + num_tokens
+            if end > self.padded_buffer_size:
+                raise ValueError(
+                    f"Requested {num_tokens} draft slots but request hot buffer "
+                    f"only has {self.padded_buffer_size - hot_cap - 1} available "
+                    f"(padded_buffer_size={self.padded_buffer_size}, "
+                    f"request_hot_buffer_size={hot_cap})."
+                )
             current_cap = int(self.req_draft_buffer_size[req_idx])
             existing_device_cap = int(self.req_device_buffer_size[req_idx])
+            existing_draft_cap = max(0, existing_device_cap - start)
+            current_cap = max(current_cap, existing_draft_cap)
             if existing_device_cap >= end:
                 self.req_draft_buffer_size[req_idx] = max(current_cap, num_tokens)
                 continue
             if current_cap >= num_tokens:
+                self.req_draft_buffer_size[req_idx] = current_cap
                 continue
-            grow_reqs.append((req_idx, current_cap))
+            grow_reqs.append((req_idx, start + current_cap, num_tokens - current_cap))
             total_grow += num_tokens - current_cap
 
         if total_grow == 0:
@@ -1753,16 +1838,17 @@ class HiSparseCoordinator:
             )
 
         offset = 0
-        for req_idx, current_cap in grow_reqs:
-            grow_size = num_tokens - current_cap
+        for req_idx, slot_start, grow_size in grow_reqs:
             chunk = all_new[offset : offset + grow_size]
             offset += grow_size
-            slot_start = start + current_cap
             slot_end = slot_start + grow_size
             self.req_to_device_buffer[req_idx, slot_start:slot_end] = chunk
-            self.req_device_buffer_tokens[:, req_idx, slot_start:slot_end] = (
-                self._device_buffer_arange_i32[slot_start:slot_end]
-            )
+            if self.is_dsv4_hisparse:
+                self.req_device_buffer_tokens[:, req_idx, slot_start:slot_end] = -1
+            else:
+                self.req_device_buffer_tokens[:, req_idx, slot_start:slot_end] = (
+                    self._device_buffer_arange_i32[slot_start:slot_end]
+                )
             self.req_device_buffer_token_locs[:, req_idx, slot_start:slot_end] = chunk
             self.req_draft_buffer_size[req_idx] = num_tokens
 
@@ -1781,19 +1867,19 @@ class HiSparseCoordinator:
         req_pool_indices_cpu: torch.Tensor,
         num_tokens_per_req: int,
     ) -> torch.Tensor:
-        start = self.device_buffer_size + 1
-        end = start + num_tokens_per_req
-        if end > self.padded_buffer_size:
-            raise ValueError(
-                f"Requested {num_tokens_per_req} draft slots but extra page only "
-                f"has {self.padded_buffer_size - self.device_buffer_size - 1} "
-                f"available (padded_buffer_size={self.padded_buffer_size}, "
-                f"device_buffer_size={self.device_buffer_size})."
-            )
         self._ensure_draft_buffer(
             req_pool_indices, req_pool_indices_cpu, num_tokens_per_req
         )
-        return self.req_to_device_buffer[req_pool_indices, start:end].reshape(-1)
+        hot_caps = self.req_device_hot_buffer_size_gpu[
+            req_pool_indices.to(dtype=torch.long)
+        ].to(dtype=torch.long)
+        offsets = torch.arange(
+            num_tokens_per_req, dtype=torch.long, device=req_pool_indices.device
+        )
+        col_indices = hot_caps[:, None] + 1 + offsets.view(1, -1)
+        return self.req_to_device_buffer[
+            req_pool_indices.to(dtype=torch.long)[:, None], col_indices
+        ].reshape(-1)
 
     def get_draft_device_slots_variable(
         self,
@@ -1822,13 +1908,7 @@ class HiSparseCoordinator:
                     first_tokens,
                 )
 
-        start = self.device_buffer_size + 1
         max_tokens = int(tokens_per_req_cpu.max().item())
-        if start + max_tokens > self.padded_buffer_size:
-            raise ValueError(
-                f"Max per-request draft slots ({max_tokens}) exceeds extra page "
-                f"capacity ({self.padded_buffer_size - self.device_buffer_size - 1})."
-            )
 
         self._ensure_draft_buffer(req_pool_indices, req_pool_indices_cpu, max_tokens)
 
@@ -1849,7 +1929,11 @@ class HiSparseCoordinator:
         pos_in_segment = torch.arange(total_slots, device=tokens_per_req.device) - (
             torch.repeat_interleave(offsets[:-1], tokens_per_req)
         )
-        col_indices = start + pos_in_segment
+        hot_caps = self.req_device_hot_buffer_size_gpu[
+            req_pool_indices.to(dtype=torch.long)
+        ].to(device=tokens_per_req.device, dtype=torch.long)
+        starts = torch.repeat_interleave(hot_caps + 1, tokens_per_req)
+        col_indices = starts + pos_in_segment
 
         return self.req_to_device_buffer[row_indices, col_indices]
 
@@ -1924,9 +2008,7 @@ class HiSparseCoordinator:
 
         self._backup_accepted_device_locs(host_locs, all_device_locs)
 
-        newest_slots = self.req_to_device_buffer[
-            req_pool_indices, self.device_buffer_size
-        ]
+        newest_slots = self._newest_slot_locs(req_pool_indices)
         for idx in req_pool_indices_cpu.tolist():
             self._skip_first_backup[idx] = True
 
@@ -2042,9 +2124,7 @@ class HiSparseCoordinator:
 
         self._backup_accepted_device_locs(host_locs, device_locs)
 
-        newest_slots = self.req_to_device_buffer[
-            req_pool_indices, self.device_buffer_size
-        ]
+        newest_slots = self._newest_slot_locs(req_pool_indices)
         for idx in req_pool_indices_cpu.tolist():
             self._skip_first_backup[idx] = True
 
@@ -2215,6 +2295,8 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
         self.req_to_device_buffer[req_pool_idx, :] = 0
         self.req_device_buffer_size[req_pool_idx] = 0
+        self.req_device_hot_buffer_size[req_pool_idx] = 0
+        self.req_device_hot_buffer_size_gpu[req_pool_idx] = 0
         self.req_draft_buffer_size[req_pool_idx] = 0
         self.req_to_host_pool[req_pool_idx, :] = -1
         self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
@@ -2229,6 +2311,8 @@ class HiSparseCoordinator:
             issues.append("host_row")
         if int(self.req_device_buffer_size[req_pool_idx].item()) != 0:
             issues.append("device_buffer_size")
+        if int(self.req_device_hot_buffer_size[req_pool_idx].item()) != 0:
+            issues.append("device_hot_buffer_size")
         if int(self.req_draft_buffer_size[req_pool_idx].item()) != 0:
             issues.append("draft_buffer_size")
         if torch.any(self.req_device_buffer_tokens[:, req_pool_idx, :] >= 0):
@@ -2374,11 +2458,12 @@ class HiSparseCoordinator:
             self._req_host_written_len[req_pool_idx] = min(host_written_len, host_len)
 
         self.alloc_device_buffer(req)
-        if host_len <= self.device_buffer_size:
+        hot_cap = self._req_hot_cap_cpu(req_pool_idx)
+        if host_len <= hot_cap:
             self._preload_to_device_buffer(req)
         else:
             self.req_device_buffer_tokens[
-                :, req_pool_idx, : self.device_buffer_size
+                :, req_pool_idx, :hot_cap
             ] = -1
 
         self._skip_first_backup[req_pool_idx] = True
@@ -2620,6 +2705,9 @@ class HiSparseCoordinator:
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
+            req_hot_buffer_sizes=(
+                self.req_device_hot_buffer_size_gpu if self.is_dsv4_hisparse else None
+            ),
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
@@ -2741,9 +2829,17 @@ class HiSparseCoordinator:
         req_indices = req_pool_indices.to(dtype=torch.long)
         device_tokens = self.req_device_buffer_tokens[layer_id, req_indices]
         device_locs = self.req_device_buffer_token_locs[layer_id, req_indices]
-        newest_locs = self.req_device_buffer_token_locs[
-            layer_id, req_indices, self.device_buffer_size
-        ].view(-1, 1)
+        if self.is_dsv4_hisparse:
+            newest_slots = self.req_device_hot_buffer_size_gpu[
+                req_indices
+            ].to(dtype=torch.long)
+            newest_locs = self.req_device_buffer_token_locs[
+                layer_id, req_indices, newest_slots
+            ].view(-1, 1)
+        else:
+            newest_locs = self.req_device_buffer_token_locs[
+                layer_id, req_indices, self.device_buffer_size
+            ].view(-1, 1)
         newest_tokens = top_tokens == (
             compressed_seq_lens.view(-1, 1).to(top_tokens.device) - 1
         )

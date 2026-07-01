@@ -102,6 +102,9 @@ def build_dsv4_hisparse_capability_signature(
         text_config = getattr(hf_config, "text_config", hf_config)
         top_k = int(resolve_hisparse_top_k(server_args, text_config))
         device_buffer_size = int(hisparse_config_value(config, "device_buffer_size"))
+        min_device_buffer_size = int(
+            hisparse_config_value(config, "min_device_buffer_size")
+        )
         topk_mode = (
             "legacy_raw_index"
             if top_k in (512, 1024)
@@ -118,6 +121,7 @@ def build_dsv4_hisparse_capability_signature(
             {
                 "c4_host_mirror": bool(c4_host_mirror),
                 "device_buffer_size": device_buffer_size,
+                "min_device_buffer_size": min_device_buffer_size,
                 "top_k": top_k,
                 "topk_mode": topk_mode,
                 "use_topk_v2": bool(envs.SGLANG_OPT_USE_TOPK_V2.get()),

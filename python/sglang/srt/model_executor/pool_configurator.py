@@ -359,6 +359,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = server_args.swa_full_tokens_ratio
         self.is_speculative = server_args.speculative_algorithm is not None
+        self.speculative_num_steps = int(server_args.speculative_num_steps or 0)
+        self.speculative_num_draft_tokens = int(
+            server_args.speculative_num_draft_tokens or 0
+        )
         self.online_c128_mtp_max_draft_tokens = (
             getattr(server_args, "max_speculative_num_draft_tokens", None)
             or server_args.speculative_num_draft_tokens
@@ -519,11 +523,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * self.num_layers_ca128
         )
 
+    def _estimate_hisparse_topk_work_buffer_rows(self) -> int:
+        req_slots = self._estimate_hisparse_req_slots()
+        if not self.is_speculative:
+            return req_slots
+        speculative_rows_per_req = max(
+            self.speculative_num_steps + 1,
+            self.speculative_num_draft_tokens,
+            int(self.online_c128_mtp_max_draft_tokens or 0),
+            1,
+        )
+        return req_slots * speculative_rows_per_req
+
     def _estimate_hisparse_fixed_overhead_bytes(self, page_size: int) -> int:
         if not self.enable_hisparse:
             return 0
 
         req_slots = self._estimate_hisparse_req_slots()
+        topk_work_buffer_rows = self._estimate_hisparse_topk_work_buffer_rows()
         c4_page_size = max(1, page_size // 4)
         padded_buffer_size = self.hisparse_device_buffer_size + c4_page_size
         max_context_len = self.context_len + self.extra_context_len
@@ -542,7 +559,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         overhead += c4_layers * req_slots * self.hisparse_device_buffer_size * int16_bytes
         overhead += self.hisparse_device_buffer_size * int16_bytes
         overhead += padded_buffer_size * int32_bytes
-        overhead += 2 * req_slots * self.hisparse_top_k * int32_bytes
+        overhead += 2 * topk_work_buffer_rows * self.hisparse_top_k * int32_bytes
         overhead += c4_layers * uint64_bytes
         overhead += (c4_page_size + 1) * int64_bytes
         return int(overhead)

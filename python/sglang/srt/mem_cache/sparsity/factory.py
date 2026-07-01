@@ -64,7 +64,7 @@ def _parse_sparse_config(
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
-    host_to_device_ratio (2).
+    min_device_buffer_size (top_k), host_to_device_ratio (2).
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
@@ -80,11 +80,23 @@ def _parse_sparse_config(
     top_k_explicit = "top_k" in extra_config
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
+    min_device_buffer_size = extra_config.pop("min_device_buffer_size", top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
 
     if (top_k_explicit or validate_default_top_k) and device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
+        )
+    if min_device_buffer_size < top_k:
+        raise ValueError(
+            "min_device_buffer_size "
+            f"({min_device_buffer_size}) must be no smaller than top_k ({top_k})"
+        )
+    if min_device_buffer_size > device_buffer_size:
+        raise ValueError(
+            "min_device_buffer_size "
+            f"({min_device_buffer_size}) must be no larger than "
+            f"device_buffer_size ({device_buffer_size})"
         )
 
     algorithm = extra_config.pop("algorithm", None)
@@ -96,6 +108,7 @@ def _parse_sparse_config(
         top_k=top_k,
         top_k_explicit=top_k_explicit,
         device_buffer_size=device_buffer_size,
+        min_device_buffer_size=min_device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
         algorithm=algorithm,
         backend=backend,

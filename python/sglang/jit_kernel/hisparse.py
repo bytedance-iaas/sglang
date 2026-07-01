@@ -51,6 +51,7 @@ def _load_cache_to_device_buffer_mla(
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
+    req_hot_buffer_sizes: torch.Tensor | None,
     lru_slots: torch.Tensor,
     item_size_bytes: int,
     num_top_k: int,
@@ -72,7 +73,9 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
     )
 
-    empty = torch.empty(0)
+    empty = torch.empty(0, dtype=torch.int32, device=top_k_tokens.device)
+    if req_hot_buffer_sizes is None:
+        req_hot_buffer_sizes = empty
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -91,6 +94,7 @@ def _load_cache_to_device_buffer_mla(
         top_k_device_locs,
         req_pool_indices,
         seq_lens,
+        req_hot_buffer_sizes,
         lru_slots,
         num_real_reqs,
         page_size,
@@ -108,6 +112,7 @@ def load_cache_to_device_buffer_mla(
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
+    req_hot_buffer_sizes: torch.Tensor | None,
     lru_slots: torch.Tensor,
     item_size_bytes: int,
     num_top_k: int,
@@ -128,6 +133,7 @@ def load_cache_to_device_buffer_mla(
         top_k_device_locs=top_k_device_locs,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
+        req_hot_buffer_sizes=req_hot_buffer_sizes,
         lru_slots=lru_slots,
         item_size_bytes=item_size_bytes,
         num_top_k=num_top_k,
@@ -148,6 +154,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
+    req_hot_buffer_sizes: torch.Tensor | None,
     lru_slots: torch.Tensor,
     item_size_bytes: int,
     num_top_k: int,
@@ -168,6 +175,7 @@ def load_cache_to_device_buffer_dsv4_mla(
         top_k_device_locs=top_k_device_locs,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
+        req_hot_buffer_sizes=req_hot_buffer_sizes,
         lru_slots=lru_slots,
         item_size_bytes=item_size_bytes,
         num_top_k=num_top_k,
