@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    get_num_new_pages,
+    is_pin_memory_available,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1593,6 +1597,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    decode_mem_block_reason: str = "none"
+    decode_mem_required_tokens: int = 0
+    decode_mem_available_tokens: Optional[int] = None
 
     @classmethod
     def init_new(
@@ -2362,8 +2369,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_algorithm.is_none():
             return 1
 
+        draft_tokens = getattr(getattr(self, "spec_info", None), "draft_token_num", None)
         server_args = get_global_server_args()
-        draft_tokens = server_args.speculative_num_draft_tokens
         if draft_tokens is None:
             draft_tokens = server_args.speculative_num_steps
         return max(1, int(draft_tokens or 1) + 1)
@@ -2396,10 +2403,121 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return coordinator.ensure_dsv4_c4_host_available(required_tokens)
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        self.decode_mem_block_reason = "none"
+        self.decode_mem_required_tokens = 0
+        self.decode_mem_available_tokens = None
+
+        hisparse_coordinator = getattr(self, "hisparse_coordinator", None)
+        logical_available_size = getattr(
+            self.token_to_kv_pool_allocator, "logical_available_size", None
+        )
+        logical_page_size = getattr(
+            self.token_to_kv_pool_allocator, "logical_page_size", None
+        )
+        server_args = get_global_server_args()
+        spec_info = getattr(self, "spec_info", None)
+        spec_tokens = getattr(spec_info, "draft_token_num", None)
+        if spec_tokens is None:
+            spec_tokens = server_args.speculative_num_draft_tokens
+        if spec_tokens is None:
+            spec_tokens = server_args.speculative_num_steps
+        spec_topk = getattr(spec_info, "topk", None)
+        if spec_topk is None:
+            spec_topk = server_args.speculative_eagle_topk or 1
+        has_spec_token_budget = self.is_spec_v2 or (
+            spec_tokens is not None and spec_tokens > 0
+        )
+        is_dsv4_hisparse = (
+            hisparse_coordinator is not None
+            and getattr(hisparse_coordinator, "is_dsv4_hisparse", False)
+        )
+        uses_dsv4_logical_decode_alloc = (
+            is_dsv4_hisparse
+            and logical_available_size is not None
+            and logical_page_size is not None
+            and (
+                self.spec_algorithm.is_none()
+                or (
+                    getattr(
+                        hisparse_coordinator,
+                        "supports_hisparse_draft_slots",
+                        lambda: False,
+                    )()
+                    and spec_topk == 1
+                    and has_spec_token_budget
+                )
+            )
+        )
+        if uses_dsv4_logical_decode_alloc:
+            requests = self._selected_reqs_for_decode_mem(selected_indices)
+            if self.spec_algorithm.is_none():
+                num_new_pages = sum(
+                    1
+                    for r in requests
+                    if r.kv_committed_len % int(logical_page_size) == 0
+                )
+                num_tokens = num_new_pages * int(logical_page_size)
+            elif self.is_spec_v2:
+                num_tokens = self._new_tokens_required_next_decode_spec_v2(
+                    requests, int(logical_page_size)
+                )
+            else:
+                if selected_indices is None:
+                    prefix_lens_cpu = self.seq_lens_cpu
+                else:
+                    prefix_lens_cpu = self.seq_lens_cpu[selected_indices]
+                if not isinstance(prefix_lens_cpu, torch.Tensor):
+                    prefix_lens_cpu = torch.tensor(prefix_lens_cpu, dtype=torch.int64)
+                elif prefix_lens_cpu.device.type != "cpu":
+                    prefix_lens_cpu = prefix_lens_cpu.cpu()
+                prefix_lens_cpu = prefix_lens_cpu.to(dtype=torch.int64)
+                end_lens_cpu = prefix_lens_cpu + int(spec_tokens)
+                num_new_pages = get_num_new_pages(
+                    seq_lens=end_lens_cpu,
+                    page_size=int(logical_page_size),
+                    prefix_lens=prefix_lens_cpu,
+                )
+                num_tokens = num_new_pages * int(logical_page_size)
+            self.decode_mem_required_tokens = num_tokens
+            evict_from_tree_cache(self.tree_cache, num_tokens, logical_only=True)
+            available_tokens = logical_available_size()
+            self.decode_mem_available_tokens = available_tokens
+            if available_tokens < num_tokens:
+                if (
+                    self.forward_mode is not None
+                    and self.forward_mode.is_decode()
+                    and (
+                        self.tree_cache.supports_swa()
+                        or (
+                            hasattr(self.token_to_kv_pool_allocator, "free_swa")
+                            and getattr(self.model_config, "sliding_window_size", None)
+                        )
+                    )
+                ):
+                    self.maybe_evict_swa(force=True)
+                    evict_from_tree_cache(self.tree_cache, num_tokens, logical_only=True)
+                    available_tokens = logical_available_size()
+                    self.decode_mem_available_tokens = available_tokens
+                if available_tokens < num_tokens:
+                    self.decode_mem_block_reason = "logical_pages"
+                    return False
+
+            if self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices):
+                return True
+            self.decode_mem_block_reason = "c4_host_decode_reserve"
+            return False
+
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        self.decode_mem_required_tokens = num_tokens
         evict_from_tree_cache(self.tree_cache, num_tokens)
         if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
-            return self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices)
+            self.decode_mem_available_tokens = (
+                self.token_to_kv_pool_allocator.available_size()
+            )
+            if self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices):
+                return True
+            self.decode_mem_block_reason = "c4_host_decode_reserve"
+            return False
 
         # SWA eviction is normally done while preparing the next decode batch.
         # When SWA becomes the first limiting pool, the scheduler can reach this
@@ -2420,8 +2538,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             evict_from_tree_cache(self.tree_cache, num_tokens)
 
         if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+            self.decode_mem_available_tokens = (
+                self.token_to_kv_pool_allocator.available_size()
+            )
+            self.decode_mem_block_reason = "mixed_available_size"
             return False
-        return self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices)
+        self.decode_mem_available_tokens = (
+            self.token_to_kv_pool_allocator.available_size()
+        )
+        if self._check_dsv4_hisparse_c4_host_decode_mem(selected_indices):
+            return True
+        self.decode_mem_block_reason = "c4_host_decode_reserve"
+        return False
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -2515,7 +2643,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        evict_from_tree_cache(
+            self.tree_cache,
+            num_tokens,
+            logical_only=(
+                server_args.disaggregation_mode == "decode"
+                and self.hisparse_coordinator is not None
+                and self.hisparse_coordinator.is_dsv4_hisparse
+                and self.decode_mem_block_reason == "logical_pages"
+            ),
+        )
 
         req.reset_for_retract()
 

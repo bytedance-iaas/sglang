@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
     get_available_gpu_memory,
+    get_num_new_pages,
     is_cuda,
     is_musa,
     is_npu,
@@ -670,9 +671,13 @@ class EAGLEWorker(TpModelWorker):
                 batch.ensure_req_pool_indices()
                 allocator = self.token_to_kv_pool_allocator
                 page_size = getattr(allocator, "logical_page_size", allocator.page_size)
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
                 evict_from_tree_cache(
-                    batch.tree_cache,
-                    extend_num_tokens + len(prefix_lens_cpu) * page_size,
+                    batch.tree_cache, num_new_pages * page_size, logical_only=True
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots_variable(
                     batch.req_pool_indices,

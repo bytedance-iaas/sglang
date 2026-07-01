@@ -39,7 +39,14 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    get_num_new_pages,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -171,9 +178,14 @@ class EagleDraftInputV2Mixin:
                 and hisparse_coordinator.supports_hisparse_draft_slots()
             ):
                 allocator = batch.tree_cache.token_to_kv_pool_allocator
+                page_size = getattr(allocator, "logical_page_size", page_size)
+                num_new_pages = get_num_new_pages(
+                    seq_lens=nxt_kv_lens_cpu,
+                    page_size=page_size,
+                    prefix_lens=cur_kv_lens_cpu,
+                )
                 evict_from_tree_cache(
-                    batch.tree_cache,
-                    num_needed_tokens + len(cur_kv_lens_cpu) * page_size,
+                    batch.tree_cache, num_new_pages * page_size, logical_only=True
                 )
                 # Spec V2 over-allocates logical slots across iterations. Bind
                 # HiSparse device slots only for the active draft/verify window.

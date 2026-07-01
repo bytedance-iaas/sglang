@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils import get_num_new_pages, is_cuda, is_musa, next_power_of_2
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -180,9 +180,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.ensure_req_pool_indices()
                 allocator = batch.tree_cache.token_to_kv_pool_allocator
                 page_size = getattr(allocator, "logical_page_size", allocator.page_size)
+                num_new_pages = get_num_new_pages(
+                    seq_lens=end_offset_cpu,
+                    page_size=page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
                 evict_from_tree_cache(
-                    batch.tree_cache,
-                    len(batch.input_ids) + len(prefix_lens_cpu) * page_size,
+                    batch.tree_cache, num_new_pages * page_size, logical_only=True
                 )
                 device_slots = hisparse_coordinator.get_draft_device_slots(
                     batch.req_pool_indices,

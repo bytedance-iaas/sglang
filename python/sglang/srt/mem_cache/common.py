@@ -339,7 +339,12 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    logical_only: bool = False,
+):
     if tree_cache is None:
         return
 
@@ -347,6 +352,25 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
+
+    dsv4_full_logical_available_size = getattr(
+        allocator, "dsv4_full_logical_available_size", None
+    )
+    if logical_only and dsv4_full_logical_available_size is not None:
+        # DSV4 HiSparse has a mixed allocator: available_size() is
+        # min(logical KV, C4 device KV). Logical-only draft-slot allocations
+        # must evict radix entries based on the logical full/SWA pools, not
+        # the C4 device hot-buffer ledger.
+        full_available_size = dsv4_full_logical_available_size()
+        swa_available_size = allocator.swa_available_size()
+
+        if full_available_size < num_tokens or swa_available_size < num_tokens:
+            full_num_tokens = max(0, num_tokens - full_available_size)
+            swa_num_tokens = max(0, num_tokens - swa_available_size)
+            tree_cache.evict(
+                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+            )
+        return
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
@@ -513,9 +537,15 @@ def alloc_paged_token_slots_decode(
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
+    logical_only = hasattr(allocator, "dsv4_full_logical_available_size")
+    page_size = (
+        getattr(allocator, "logical_page_size", allocator.page_size)
+        if logical_only
+        else allocator.page_size
+    )
     # Over estimate the number of tokens: assume each request needs a new page.
-    num_tokens = len(seq_lens) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    num_tokens = len(seq_lens) * page_size
+    evict_from_tree_cache(tree_cache, num_tokens, logical_only=logical_only)
 
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 

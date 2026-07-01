@@ -1771,7 +1771,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._all_component_values_flatten(ComponentType.SWA)
 
     def available_and_evictable_str(self) -> str:
-        if self.supports_swa():
+        dsv4_full_logical_available_size = getattr(
+            self.token_to_kv_pool_allocator, "dsv4_full_logical_available_size", None
+        )
+        if dsv4_full_logical_available_size is not None:
+            full_available_size = dsv4_full_logical_available_size()
+        elif self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()

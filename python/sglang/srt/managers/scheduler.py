@@ -2707,8 +2707,40 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
-            self.batch_result_processor.flush_online_c128_pending_for_reqs(batch.reqs)
+            decode_mem_block_reason = getattr(
+                batch, "decode_mem_block_reason", "unknown"
+            )
+            decode_mem_required_tokens = getattr(
+                batch, "decode_mem_required_tokens", None
+            )
+            decode_mem_available_tokens = getattr(
+                batch, "decode_mem_available_tokens", None
+            )
+            self.batch_result_processor.flush_online_c128_pending_for_reqs(
+                batch.reqs, require_forward_progress=True
+            )
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            logical_allocator = getattr(
+                self.token_to_kv_pool_allocator, "logical_attn_allocator", None
+            )
+            hisparse_attn_allocator = getattr(
+                self.token_to_kv_pool_allocator, "hisparse_attn_allocator", None
+            )
+            compress_ratio = getattr(
+                self.token_to_kv_pool_allocator, "compress_ratio", 1
+            )
+            old_logical_available_tokens = (
+                logical_allocator.available_size()
+                if logical_allocator is not None
+                and hasattr(logical_allocator, "available_size")
+                else None
+            )
+            old_c4_device_equiv_tokens = (
+                hisparse_attn_allocator.available_size() * compress_ratio
+                if hisparse_attn_allocator is not None
+                and hasattr(hisparse_attn_allocator, "available_size")
+                else None
+            )
             old_ratio = self.new_token_ratio_tracker.current
             mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)
             old_mamba_available = (
@@ -2719,6 +2751,18 @@ class Scheduler(
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
+            new_logical_available_tokens = (
+                logical_allocator.available_size()
+                if logical_allocator is not None
+                and hasattr(logical_allocator, "available_size")
+                else None
+            )
+            new_c4_device_equiv_tokens = (
+                hisparse_attn_allocator.available_size() * compress_ratio
+                if hisparse_attn_allocator is not None
+                and hasattr(hisparse_attn_allocator, "available_size")
+                else None
+            )
             mamba_num_gained = (
                 mamba_pool.available_size() - old_mamba_available
                 if mamba_pool is not None
@@ -2752,7 +2796,42 @@ class Scheduler(
                 if kv_full_retract_flag
                 else "Testing retraction. "
             )
-            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
+            has_hisparse_split_gained = (
+                old_logical_available_tokens is not None
+                or old_c4_device_equiv_tokens is not None
+            )
+            if has_hisparse_split_gained:
+                msg_details = (
+                    f"#retracted_reqs: {len(retracted_reqs)}, "
+                    f"mixed_tokens_gained: {new_token_gained}"
+                )
+            else:
+                msg_details = (
+                    f"#retracted_reqs: {len(retracted_reqs)}, "
+                    f"#new_tokens_gained: {new_token_gained}"
+                )
+            if kv_full_retract_flag:
+                msg_details += (
+                    f", decode_mem_block_reason: {decode_mem_block_reason}, "
+                    f"decode_mem_required_tokens: {decode_mem_required_tokens}, "
+                    f"decode_mem_available_tokens: {decode_mem_available_tokens}"
+                )
+            if (
+                old_logical_available_tokens is not None
+                and new_logical_available_tokens is not None
+            ):
+                msg_details += (
+                    f", logical_tokens_gained: "
+                    f"{new_logical_available_tokens - old_logical_available_tokens}"
+                )
+            if (
+                old_c4_device_equiv_tokens is not None
+                and new_c4_device_equiv_tokens is not None
+            ):
+                msg_details += (
+                    f", c4_device_equiv_tokens_gained: "
+                    f"{new_c4_device_equiv_tokens - old_c4_device_equiv_tokens}"
+                )
             if mamba_num_gained is not None:
                 msg_details += f", #mamba_num_gained: {mamba_num_gained}"
             if kv_full_retract_flag:
