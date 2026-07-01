@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -142,6 +143,12 @@ def _maybe_compile_deep_gemm_one_type_all(
                 "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
             )
 
+        logger.info(
+            f"Try DeepGEMM JIT Compiling for "
+            f"<{kernel_type.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
+            f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
+        )
+
         _compile_deep_gemm_one_type_all(
             kernel_type=kernel_type,
             n=n,
@@ -177,6 +184,9 @@ def _compile_deep_gemm_one_type_all(
         max_m = max(m_list)
         required_memory = _BaseWarmupExecutor.get_memory_requirement(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+        )
+        logger.info(
+            f"Required memory for warmup: {required_memory}GB, Available memory: {memory_budget}GB"
         )
         if memory_budget < required_memory:
             # TODO: Maybe compute the max_m based on the memory budget
@@ -521,10 +531,20 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     run_decode = model_runner.is_generation and disagg_mode != "prefill"
     run_extend = disagg_mode != "decode"
 
+    logger.info(
+        "PP-parallel DeepGEMM warmup start "
+        "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
+        model_runner.pp_rank,
+        model_runner.tp_rank,
+        batch_sizes,
+        disagg_mode,
+    )
+
     # One buffer set sized to the largest shape, reused across the sweep
     # (the decode runner's max_bs is too small for n_sms*block_m).
     dummy_buffers = runner._alloc_dummy_decode_buffers(max(batch_sizes))
 
+    t0 = time.perf_counter()
     with torch.inference_mode():
         for bs in batch_sizes:
             if run_decode:
@@ -539,3 +559,9 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
                     forward_mode_override=ForwardMode.EXTEND,
                     buffers=dummy_buffers,
                 )
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
+        time.perf_counter() - t0,
+        model_runner.pp_rank,
+    )
