@@ -284,9 +284,10 @@ class DisaggDecodePipelineStats:
     staging_reclaimable_tokens: int = 0
     full_headroom_tokens: int = 0
     full_usage_target: float = 0.0
-    max_new_prealloc_reqs: int = -1
-    governor_action: str = "not_checked"
-    governor_reason: str = "not_checked"
+    max_new_prealloc_reqs: Optional[int] = None
+    governor_action: Optional[str] = None
+    governor_reason: Optional[str] = None
+    running_deficit_reason: str = "none"
     safe_prefix_len: int = 0
     full_tokens_saved: int = 0
     c4_host_tokens_saved: int = 0
@@ -308,8 +309,16 @@ class DisaggDecodePipelineStats:
     ) -> None:
         self.samples += 1
         self.running_bs_sum += running
-        if running + waiting < target_bs and (prealloc > 0 or transfer > 0):
+        if running + waiting < target_bs:
             self.underfed_cycles += 1
+            if transfer > 0:
+                self.running_deficit_reason = "transfer_wait"
+            elif prealloc > 0:
+                self.running_deficit_reason = "prealloc_wait"
+            elif waiting > 0:
+                self.running_deficit_reason = "waiting_not_scheduled"
+            else:
+                self.running_deficit_reason = "no_supply"
         self.prealloc_oldest_ms = max(
             self.prealloc_oldest_ms, prealloc_oldest_ms
         )
@@ -353,11 +362,9 @@ class DisaggDecodePipelineStats:
             self.full_headroom_tokens, full_headroom_tokens
         )
         self.full_usage_target = max(self.full_usage_target, full_usage_target)
-        if max_new_prealloc_reqs is None:
-            self.max_new_prealloc_reqs = -1
-        else:
+        if max_new_prealloc_reqs is not None:
             self.max_new_prealloc_reqs = max(
-                self.max_new_prealloc_reqs, max_new_prealloc_reqs
+                self.max_new_prealloc_reqs or 0, max_new_prealloc_reqs
             )
         self.governor_action = governor_action
         self.governor_reason = governor_reason
@@ -377,29 +384,50 @@ class DisaggDecodePipelineStats:
 
     def format_log_message(self, *, target_bs: int) -> str:
         samples = max(1, self.samples)
-        return (
-            f"avg running bs: {self.running_bs_sum / samples:.2f}, "
-            f"target bs: {target_bs}, "
-            f"underfed cycles: {self.underfed_cycles}, "
-            f"adaptive polls: {self.adaptive_polls}, "
-            f"interval polls: {self.interval_polls}, "
-            f"poll skips: {self.poll_skips}, "
-            f"staging full tokens: {self.staging_full_tokens}, "
-            f"staging headroom tokens: {self.staging_headroom_tokens}, "
-            f"staging reclaimable tokens: {self.staging_reclaimable_tokens}, "
-            f"full usage target: {self.full_usage_target:.3f}, "
-            f"full headroom tokens: {self.full_headroom_tokens}, "
-            f"governor action: {self.governor_action}, "
-            f"max new prealloc: {self.max_new_prealloc_reqs}, "
-            f"hard limit block count: {self.hard_limit_block_count}, "
-            f"governor reason: {self.governor_reason}, "
-            f"safe prefix len: {self.safe_prefix_len}, "
-            f"full tokens saved: {self.full_tokens_saved}, "
-            f"c4 host tokens saved: {self.c4_host_tokens_saved}, "
-            f"prealloc oldest ms: {self.prealloc_oldest_ms:.1f}, "
-            f"transfer oldest ms: {self.transfer_oldest_ms:.1f}, "
-            f"waiting oldest ms: {self.waiting_oldest_ms:.1f}, "
+        max_new_prealloc = (
+            "unlimited"
+            if self.max_new_prealloc_reqs is None
+            else str(self.max_new_prealloc_reqs)
         )
+        parts = [
+            f"avg running bs: {self.running_bs_sum / samples:.2f}",
+            f"target bs: {target_bs}",
+            f"underfed cycles: {self.underfed_cycles}",
+            f"running deficit reason: {self.running_deficit_reason}",
+            f"adaptive polls: {self.adaptive_polls}",
+            f"interval polls: {self.interval_polls}",
+            f"poll skips: {self.poll_skips}",
+        ]
+        if self.governor_action == "disabled":
+            parts.append(f"governor: {self.governor_action}")
+        elif self.governor_action is not None:
+            parts += [
+                f"staging full tokens: {self.staging_full_tokens}",
+                f"staging headroom tokens: {self.staging_headroom_tokens}",
+                f"staging reclaimable tokens: {self.staging_reclaimable_tokens}",
+                f"full usage target: {self.full_usage_target:.3f}",
+                f"full headroom tokens: {self.full_headroom_tokens}",
+                f"governor action: {self.governor_action}",
+                f"max new prealloc: {max_new_prealloc}",
+                f"hard limit block count: {self.hard_limit_block_count}",
+                f"governor reason: {self.governor_reason}",
+            ]
+        if (
+            self.safe_prefix_len > 0
+            or self.full_tokens_saved > 0
+            or self.c4_host_tokens_saved > 0
+        ):
+            parts += [
+                f"safe prefix len: {self.safe_prefix_len}",
+                f"full tokens saved: {self.full_tokens_saved}",
+                f"c4 host tokens saved: {self.c4_host_tokens_saved}",
+            ]
+        parts += [
+            f"prealloc oldest ms: {self.prealloc_oldest_ms:.1f}",
+            f"transfer oldest ms: {self.transfer_oldest_ms:.1f}",
+            f"waiting oldest ms: {self.waiting_oldest_ms:.1f}",
+        ]
+        return ", ".join(parts) + ", "
 
 
 @dataclass
@@ -2437,10 +2465,8 @@ class DecodePreallocQueue:
 
         # SWA growth is bounded by the sliding window: once a req's SWA
         # footprint reaches `sliding_window_size`, further decode tokens
-        # evict old ones and net growth is zero. The linear reservation
-        # `num_reserved_decode_tokens * n_active` (correct for the full
-        # pool) over-reserves SWA in steady state. Cap by the actual
-        # remaining headroom up to per-req window cap.
+        # evict old ones and net growth is zero. Cap the request-aware output
+        # reserve by the actual remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
         swa_total = self.token_to_kv_pool_allocator.size_swa
         swa_used = swa_total - self.token_to_kv_pool_allocator.swa_available_size()

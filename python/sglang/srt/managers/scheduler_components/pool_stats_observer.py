@@ -49,10 +49,11 @@ class PoolStats:
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
-    hisparse_c4_swap_miss_tokens: Optional[int] = None
-    hisparse_c4_swap_hit_tokens: Optional[int] = None
-    hisparse_c4_swap_miss_rate: Optional[float] = None
-    hisparse_c4_swap_h2d_bytes: Optional[int] = None
+    hisparse_c4_sampled_topk_miss_enabled: Optional[bool] = None
+    hisparse_c4_sampled_topk_miss_tokens: Optional[int] = None
+    hisparse_c4_sampled_topk_hit_tokens: Optional[int] = None
+    hisparse_c4_sampled_topk_miss_rate: Optional[float] = None
+    hisparse_c4_sampled_h2d_bytes: Optional[int] = None
     hisparse_c4_backup_wait_count: Optional[int] = None
     hisparse_c4_backup_wait_enqueue_ms: Optional[float] = None
     hisparse_c4_backup_pending: Optional[bool] = None
@@ -118,11 +119,13 @@ class PoolStats:
                 f"#cpu token: {self.hisparse_host_tokens}",
                 f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
             ]
-            if self.hisparse_c4_swap_miss_tokens is not None:
+            if self.hisparse_c4_sampled_topk_miss_enabled is False:
+                parts += ["c4 sampled topk miss: disabled"]
+            elif self.hisparse_c4_sampled_topk_miss_tokens is not None:
                 parts += [
-                    f"#c4 miss token: {self.hisparse_c4_swap_miss_tokens}",
-                    f"c4 miss rate: {self.hisparse_c4_swap_miss_rate:.2f}",
-                    f"c4 h2d MB: {self.hisparse_c4_swap_h2d_bytes / (1024 * 1024):.2f}",
+                    f"#c4 sampled topk miss token: {self.hisparse_c4_sampled_topk_miss_tokens}",
+                    f"c4 sampled topk miss rate: {self.hisparse_c4_sampled_topk_miss_rate:.2f}",
+                    f"c4 sampled h2d MB: {self.hisparse_c4_sampled_h2d_bytes / (1024 * 1024):.2f}",
                 ]
             if self.hisparse_c4_backup_wait_count is not None:
                 parts += [
@@ -254,10 +257,11 @@ class SchedulerPoolStatsObserver:
                 hisparse_device_token_usage=h.device_token_usage,
                 hisparse_host_tokens=h.host_tokens,
                 hisparse_host_token_usage=h.host_token_usage,
-                hisparse_c4_swap_miss_tokens=h.c4_swap_miss_tokens,
-                hisparse_c4_swap_hit_tokens=h.c4_swap_hit_tokens,
-                hisparse_c4_swap_miss_rate=h.c4_swap_miss_rate,
-                hisparse_c4_swap_h2d_bytes=h.c4_swap_h2d_bytes,
+                hisparse_c4_sampled_topk_miss_enabled=h.c4_sampled_topk_miss_enabled,
+                hisparse_c4_sampled_topk_miss_tokens=h.c4_sampled_topk_miss_tokens,
+                hisparse_c4_sampled_topk_hit_tokens=h.c4_sampled_topk_hit_tokens,
+                hisparse_c4_sampled_topk_miss_rate=h.c4_sampled_topk_miss_rate,
+                hisparse_c4_sampled_h2d_bytes=h.c4_sampled_h2d_bytes,
                 hisparse_c4_backup_wait_count=h.c4_backup_wait_count,
                 hisparse_c4_backup_wait_enqueue_ms=h.c4_backup_wait_enqueue_ms,
                 hisparse_c4_backup_pending=h.c4_backup_pending,

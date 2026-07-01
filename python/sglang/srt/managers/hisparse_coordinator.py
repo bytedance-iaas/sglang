@@ -45,10 +45,11 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
-    c4_swap_miss_tokens: Optional[int] = None
-    c4_swap_hit_tokens: Optional[int] = None
-    c4_swap_miss_rate: Optional[float] = None
-    c4_swap_h2d_bytes: Optional[int] = None
+    c4_sampled_topk_miss_enabled: Optional[bool] = None
+    c4_sampled_topk_miss_tokens: Optional[int] = None
+    c4_sampled_topk_hit_tokens: Optional[int] = None
+    c4_sampled_topk_miss_rate: Optional[float] = None
+    c4_sampled_h2d_bytes: Optional[int] = None
     c4_backup_wait_count: Optional[int] = None
     c4_backup_wait_enqueue_ms: Optional[float] = None
     c4_backup_pending: Optional[bool] = None
@@ -556,13 +557,13 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (topk_work_buffer_rows, self.top_k), -1, dtype=torch.int32, device=device
         )
-        self._c4_miss_sample_interval_s = float(
+        self._c4_topk_miss_sample_interval_s = float(
             os.getenv("SGLANG_HISPARSE_C4_MISS_SAMPLE_INTERVAL", "-1")
         )
-        self._last_c4_miss_sample_time = 0.0
-        self._c4_swap_miss_tokens = 0
-        self._c4_swap_hit_tokens = 0
-        self._c4_swap_h2d_bytes = 0
+        self._last_c4_topk_miss_sample_time = 0.0
+        self._c4_sampled_topk_miss_tokens = 0
+        self._c4_sampled_topk_hit_tokens = 0
+        self._c4_sampled_h2d_bytes = 0
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1149,23 +1150,39 @@ class HiSparseCoordinator:
         host_capacity = self.mem_pool_host.size
         host_tokens = host_capacity - self.mem_pool_host.available_size()
         if self.is_dsv4_hisparse:
-            c4_swap_total = self._c4_swap_miss_tokens + self._c4_swap_hit_tokens
-            c4_swap_miss_tokens = self._c4_swap_miss_tokens
-            c4_swap_hit_tokens = self._c4_swap_hit_tokens
-            c4_swap_miss_rate = (
-                self._c4_swap_miss_tokens / c4_swap_total
-                if c4_swap_total > 0
-                else 0.0
+            # This is an opt-in sampled top-k hot-buffer check, not a full
+            # swap-in kernel counter. Keep it absent when sampling is disabled
+            # so decode logs do not report "0 miss" as a real measurement.
+            c4_sampled_topk_miss_enabled = (
+                self._c4_topk_miss_sample_interval_s > 0
             )
-            c4_swap_h2d_bytes = self._c4_swap_h2d_bytes
+            if c4_sampled_topk_miss_enabled:
+                c4_sampled_topk_total = (
+                    self._c4_sampled_topk_miss_tokens
+                    + self._c4_sampled_topk_hit_tokens
+                )
+                c4_sampled_topk_miss_tokens = self._c4_sampled_topk_miss_tokens
+                c4_sampled_topk_hit_tokens = self._c4_sampled_topk_hit_tokens
+                c4_sampled_topk_miss_rate = (
+                    self._c4_sampled_topk_miss_tokens / c4_sampled_topk_total
+                    if c4_sampled_topk_total > 0
+                    else 0.0
+                )
+                c4_sampled_h2d_bytes = self._c4_sampled_h2d_bytes
+            else:
+                c4_sampled_topk_miss_tokens = None
+                c4_sampled_topk_hit_tokens = None
+                c4_sampled_topk_miss_rate = None
+                c4_sampled_h2d_bytes = None
             c4_backup_wait_count = self._c4_backup_wait_count
             c4_backup_wait_enqueue_ms = self._c4_backup_wait_enqueue_ms
             c4_backup_pending = self._has_pending_backup
         else:
-            c4_swap_miss_tokens = None
-            c4_swap_hit_tokens = None
-            c4_swap_miss_rate = None
-            c4_swap_h2d_bytes = None
+            c4_sampled_topk_miss_enabled = None
+            c4_sampled_topk_miss_tokens = None
+            c4_sampled_topk_hit_tokens = None
+            c4_sampled_topk_miss_rate = None
+            c4_sampled_h2d_bytes = None
             c4_backup_wait_count = None
             c4_backup_wait_enqueue_ms = None
             c4_backup_pending = None
@@ -1178,10 +1195,11 @@ class HiSparseCoordinator:
             host_token_usage=(
                 host_tokens / host_capacity if host_capacity > 0 else 0.0
             ),
-            c4_swap_miss_tokens=c4_swap_miss_tokens,
-            c4_swap_hit_tokens=c4_swap_hit_tokens,
-            c4_swap_miss_rate=c4_swap_miss_rate,
-            c4_swap_h2d_bytes=c4_swap_h2d_bytes,
+            c4_sampled_topk_miss_enabled=c4_sampled_topk_miss_enabled,
+            c4_sampled_topk_miss_tokens=c4_sampled_topk_miss_tokens,
+            c4_sampled_topk_hit_tokens=c4_sampled_topk_hit_tokens,
+            c4_sampled_topk_miss_rate=c4_sampled_topk_miss_rate,
+            c4_sampled_h2d_bytes=c4_sampled_h2d_bytes,
             c4_backup_wait_count=c4_backup_wait_count,
             c4_backup_wait_enqueue_ms=c4_backup_wait_enqueue_ms,
             c4_backup_pending=c4_backup_pending,
@@ -2596,13 +2614,16 @@ class HiSparseCoordinator:
         if (
             not self.is_dsv4_hisparse
             or layer_id != 0
-            or self._c4_miss_sample_interval_s <= 0
+            or self._c4_topk_miss_sample_interval_s <= 0
             or not logger.isEnabledFor(logging.INFO)
         ):
             return
 
         now = time.monotonic()
-        if now - self._last_c4_miss_sample_time < self._c4_miss_sample_interval_s:
+        if (
+            now - self._last_c4_topk_miss_sample_time
+            < self._c4_topk_miss_sample_interval_s
+        ):
             return
 
         is_capturing = False
@@ -2614,7 +2635,7 @@ class HiSparseCoordinator:
         if is_capturing:
             return
 
-        self._last_c4_miss_sample_time = now
+        self._last_c4_topk_miss_sample_time = now
         with torch.no_grad():
             top_tokens = top_k_result.to(dtype=torch.int32)
             valid = (top_tokens >= 0) & (
@@ -2634,9 +2655,9 @@ class HiSparseCoordinator:
             hit_count = int((resident & valid).sum().item())
             miss_count = valid_count - hit_count
 
-        self._c4_swap_hit_tokens += hit_count
-        self._c4_swap_miss_tokens += miss_count
-        self._c4_swap_h2d_bytes += miss_count * self.item_size_bytes
+        self._c4_sampled_topk_hit_tokens += hit_count
+        self._c4_sampled_topk_miss_tokens += miss_count
+        self._c4_sampled_h2d_bytes += miss_count * self.item_size_bytes
 
         logger.info(
             "HiSparse C4 swap-in sample: reqs=%d topk_tokens=%d hot_hits=%d "
