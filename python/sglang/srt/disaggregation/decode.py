@@ -2503,13 +2503,19 @@ class DecodePreallocQueue:
             # P/D state transfer carries request-scoped C128 state for the full
             # prompt when seq_len is not 128-aligned. Do not overwrite it with
             # a radix-prefix snapshot. For 128-aligned prompts there is no C128
-            # payload, so clear any stale state left by a reused req slot.
+            # payload, so clear any stale state left by a reused req slot. The
+            # MTP pending bank is never transferred and must be cleared for
+            # every newly assigned request slot.
             c128_seq_len = len(req.origin_input_ids)
             cleared_stale_c128 = c128_seq_len % 128 == 0 and hasattr(
-                self.token_to_kv_pool, "clear_c128_radix_state"
+                self.token_to_kv_pool, "clear_c128_req_state"
             )
             if cleared_stale_c128:
-                self.token_to_kv_pool.clear_c128_radix_state(int(req.req_pool_idx))
+                self.token_to_kv_pool.clear_c128_req_state(int(req.req_pool_idx))
+            elif hasattr(self.token_to_kv_pool, "clear_online_c128_mtp_pending"):
+                self.token_to_kv_pool.clear_online_c128_mtp_pending(
+                    int(req.req_pool_idx)
+                )
             trace_req(
                 logger,
                 "decode_c128_state_transfer_selected",

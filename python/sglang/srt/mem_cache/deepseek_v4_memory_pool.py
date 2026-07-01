@@ -571,10 +571,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
         self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
+        self.online_c128_mtp_pending_tail_locs: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             self.online_c128_mtp_pending_seq_lens = torch.empty(
                 self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )
+            self.online_c128_mtp_pending_seq_lens.fill_(-1)
+            self.online_c128_mtp_pending_tail_locs = torch.empty(
+                self.online_c128_state_num_req_slots, dtype=torch.int32, device=device
+            )
+            self.online_c128_mtp_pending_tail_locs.zero_()
 
         # Determine this PP stage's absolute layer range
         if (
@@ -856,6 +862,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         return self.online_c128_mtp_pending_seq_lens
 
+    def get_online_c128_mtp_pending_tail_locs(self) -> torch.Tensor:
+        if self.online_c128_mtp_pending_tail_locs is None:
+            raise RuntimeError(
+                "Online C128 MTP pending tail_locs buffer is not initialized. "
+                "Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1 for EAGLE online C128 MTP."
+            )
+        return self.online_c128_mtp_pending_tail_locs
+
+    def clear_online_c128_mtp_pending(self, req_pool_idx: int) -> None:
+        if self.online_c128_mtp_pending_seq_lens is None:
+            return
+        self.online_c128_mtp_pending_seq_lens[req_pool_idx] = -1
+        if self.online_c128_mtp_pending_tail_locs is not None:
+            self.online_c128_mtp_pending_tail_locs[req_pool_idx] = 0
+
     def snapshot_c128_radix_state(
         self, req_pool_idx: int, seq_len: int
     ) -> Optional[List[torch.Tensor]]:
@@ -894,6 +916,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self, req_pool_idx: int, snapshots: Optional[List[torch.Tensor]]
     ) -> None:
         """Restore radix-cached C128 state into the current request slot."""
+        self.clear_online_c128_mtp_pending(req_pool_idx)
         if not snapshots:
             return
 
@@ -915,6 +938,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def clear_c128_radix_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped C128 state at a radix-restorable boundary."""
+        self.clear_online_c128_mtp_pending(req_pool_idx)
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
@@ -937,6 +961,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped C128 state before reusing a req slot."""
         self.clear_c128_radix_state(req_pool_idx)
+        self.clear_online_c128_mtp_pending(req_pool_idx)
 
     def clear_unaccepted_c128_draft_states(
         self,

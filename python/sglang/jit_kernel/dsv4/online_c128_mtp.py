@@ -65,10 +65,28 @@ def _jit_online_c128_mtp_module(
         cuda_files=["deepseek_v4/online_c128_mtp.cuh"],
         cuda_wrappers=[
             ("write_prefix_states", f"OnlineC128MTPWritePrefixKernel<{args}>::run"),
+            ("mark_pending", f"OnlineC128MTPMarkPendingKernel<{args}>::run"),
             ("lazy_commit", f"OnlineC128MTPLazyCommitKernel<{args}>::run"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
     )
+
+
+_COMMIT_STATUS_NO_PENDING = 0
+_COMMIT_STATUS_COMMITTED = 1
+_COMMIT_STATUS_BOUNDARY_NO_STATE = 2
+_COMMIT_STATUS_INVALID_REQ = -1
+_COMMIT_STATUS_TAIL_MISMATCH = -2
+_COMMIT_STATUS_NO_PROGRESS = -3
+
+_COMMIT_STATUS_NAMES = {
+    _COMMIT_STATUS_NO_PENDING: "no_pending",
+    _COMMIT_STATUS_COMMITTED: "committed",
+    _COMMIT_STATUS_BOUNDARY_NO_STATE: "boundary_no_state",
+    _COMMIT_STATUS_INVALID_REQ: "invalid_req",
+    _COMMIT_STATUS_TAIL_MISMATCH: "tail_mismatch",
+    _COMMIT_STATUS_NO_PROGRESS: "no_progress",
+}
 
 
 def online_c128_mtp_write_prefix_states(
@@ -99,35 +117,59 @@ def online_c128_mtp_write_prefix_states(
     )
 
 
+def online_c128_mtp_mark_pending(
+    *,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    pending_seq_lens: torch.Tensor,
+    pending_tail_locs: torch.Tensor,
+    bs: int,
+    head_dim: int,
+) -> None:
+    if bs <= 0:
+        return
+    _jit_online_c128_mtp_module(head_dim, torch.float32).mark_pending(
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        pending_seq_lens,
+        pending_tail_locs,
+        bs,
+        pending_seq_lens.shape[0],
+    )
+
+
 def online_c128_mtp_lazy_commit(
     *,
-    old_seq_lens: torch.Tensor,
-    old_req_pool_indices: torch.Tensor,
-    old_tail_locs: torch.Tensor,
     cur_seq_lens: torch.Tensor,
     cur_req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
+    pending_seq_lens: torch.Tensor,
+    pending_tail_locs: torch.Tensor,
+    commit_status: torch.Tensor,
     state: torch.Tensor,
-    old_bs: int,
     cur_bs: int,
     num_verify_tokens: int,
     state_slot_stride: int,
     head_dim: int,
+    clear_pending: bool,
 ) -> None:
-    if old_bs <= 0 or cur_bs <= 0:
+    if cur_bs <= 0:
         return
     _jit_online_c128_mtp_module(head_dim, state.dtype).lazy_commit(
-        old_seq_lens,
-        old_req_pool_indices,
-        old_tail_locs,
         cur_seq_lens,
         cur_req_pool_indices,
         req_to_token,
+        pending_seq_lens,
+        pending_tail_locs,
+        commit_status,
         state,
-        old_bs,
         cur_bs,
         num_verify_tokens,
         state_slot_stride,
+        pending_seq_lens.shape[0],
+        clear_pending,
     )
 
 
@@ -197,6 +239,8 @@ class OnlineC128MTPController:
         )
 
     def enabled(self) -> bool:
+        if getattr(self.backend.model_runner, "is_draft_worker", False):
+            return False
         return (
             envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
             and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
@@ -248,6 +292,19 @@ class OnlineC128MTPController:
             return
         if self._num_verify_tokens() == 0:
             return
+        head_dim = self._head_dim()
+        if head_dim is None:
+            return
+        token_to_kv_pool = self.backend.token_to_kv_pool
+        online_c128_mtp_mark_pending(
+            seq_lens=captured_seq_lens,
+            req_pool_indices=captured_req_pool_indices,
+            req_to_token=self.backend.req_to_token,
+            pending_seq_lens=token_to_kv_pool.get_online_c128_mtp_pending_seq_lens(),
+            pending_tail_locs=token_to_kv_pool.get_online_c128_mtp_pending_tail_locs(),
+            bs=bs,
+            head_dim=head_dim,
+        )
         for runtime in self._iter_layer_runtimes():
             online_c128_mtp_prepare(
                 seq_lens=captured_seq_lens,
@@ -385,7 +442,6 @@ class OnlineC128MTPController:
             self.clear()
             return
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
-            self.clear()
             return
 
         num_verify_tokens = self._num_verify_tokens()
@@ -393,17 +449,16 @@ class OnlineC128MTPController:
             self.clear()
             return
 
-        backend = self.backend
-        token_to_kv_pool = backend.token_to_kv_pool
-        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
-        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
-        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
+        pending_seq_lens = (
+            self.backend.token_to_kv_pool.get_online_c128_mtp_pending_seq_lens()
+        )
+        cur_seq_lens = seq_lens.to(pending_seq_lens.device)
+        cur_req_pool_indices = req_pool_indices.to(pending_seq_lens.device)
         cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
         if self._accuracy_trace_enabled:
             trace_event(
                 logger,
                 "online_c128_commit_pending",
-                old_bs=old_bs,
                 cur_bs=cur_bs,
                 num_verify_tokens=num_verify_tokens,
                 state_slot_offset=self.state_slot_offset(),
@@ -413,22 +468,14 @@ class OnlineC128MTPController:
                 cur_seq_lens=cur_seq_lens,
             )
 
-        for runtime in self._iter_layer_runtimes():
-            online_c128_mtp_lazy_commit(
-                old_seq_lens=ctx.seq_lens,
-                old_req_pool_indices=ctx.req_pool_indices,
-                old_tail_locs=ctx.tail_locs,
-                cur_seq_lens=cur_seq_lens,
-                cur_req_pool_indices=cur_req_pool_indices,
-                req_to_token=backend.req_to_token,
-                state=runtime.main_state,
-                old_bs=old_bs,
-                cur_bs=cur_bs,
-                num_verify_tokens=num_verify_tokens,
-                state_slot_stride=runtime.state_slot_offset,
-                head_dim=runtime.head_dim,
-            )
-
+        self._commit_current_pending(
+            cur_req_pool_indices=cur_req_pool_indices,
+            cur_seq_lens=cur_seq_lens,
+            cur_bs=cur_bs,
+            num_verify_tokens=num_verify_tokens,
+            context="online_c128_commit_pending",
+            allow_no_progress_clear=False,
+        )
         self.clear()
 
     def flush_pending_for_reqs(
@@ -445,8 +492,7 @@ class OnlineC128MTPController:
         finishing request slots here and keep pending state for the rest of the
         batch.
         """
-        ctx = self._verify_ctx
-        if ctx is None or not self.enabled():
+        if not self.enabled():
             return
 
         req_pool_indices = []
@@ -460,94 +506,181 @@ class OnlineC128MTPController:
         if not req_pool_indices:
             return
 
+        pending_seq_lens = (
+            self.backend.token_to_kv_pool.get_online_c128_mtp_pending_seq_lens()
+        )
         cur_req_pool_indices = torch.tensor(
             req_pool_indices,
-            dtype=ctx.req_pool_indices.dtype,
-            device=ctx.req_pool_indices.device,
+            dtype=torch.int64,
+            device=pending_seq_lens.device,
         )
         cur_seq_lens = torch.tensor(
             seq_lens,
-            dtype=ctx.seq_lens.dtype,
-            device=ctx.seq_lens.device,
+            dtype=torch.int64,
+            device=pending_seq_lens.device,
         )
 
         num_verify_tokens = self._num_verify_tokens()
         if num_verify_tokens == 0:
-            self.clear()
+            self._clear_pending_req_pool_indices(cur_req_pool_indices)
             return
 
-        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
         cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
-        if old_bs <= 0 or cur_bs <= 0:
+        if cur_bs <= 0:
             return
-
-        old_req_pool_indices = ctx.req_pool_indices[:old_bs]
-        matched = (
-            old_req_pool_indices.reshape(-1, 1)
-            == cur_req_pool_indices[:cur_bs].reshape(1, -1)
-        ).any(dim=1)
-        if not bool(matched.any().item()):
-            return
-
-        if require_forward_progress or self._debug_enabled():
-            matched_cur_pos = torch.argmax(
-                (
-                    old_req_pool_indices[matched].reshape(-1, 1)
-                    == cur_req_pool_indices[:cur_bs].reshape(1, -1)
-                ).to(torch.int64),
-                dim=1,
-            )
-            stale = cur_seq_lens[matched_cur_pos] <= ctx.seq_lens[:old_bs][matched]
-            if bool(stale.any().item()):
-                raise RuntimeError(
-                    "Online C128 MTP flush found matched request slots without "
-                    "forward progress before request release. "
-                    f"require_forward_progress={require_forward_progress}, "
-                    f"old_req_pool_indices={old_req_pool_indices[matched].tolist()}, "
-                    f"old_seq_lens={ctx.seq_lens[:old_bs][matched].tolist()}, "
-                    f"cur_req_pool_indices={cur_req_pool_indices[:cur_bs].tolist()}, "
-                    f"cur_seq_lens={cur_seq_lens[:cur_bs].tolist()}."
-                )
-
-        matched_old_seq_lens = ctx.seq_lens[:old_bs][matched].detach()
-        matched_old_req_pool_indices = old_req_pool_indices[matched].detach()
-        matched_old_tail_locs = ctx.tail_locs[:old_bs][matched].detach()
-        matched_old_bs = min(
-            matched_old_seq_lens.shape[0], matched_old_req_pool_indices.shape[0]
-        )
 
         if self._accuracy_trace_enabled:
             trace_event(
                 logger,
                 "online_c128_flush_pending_for_reqs",
-                old_bs=matched_old_bs,
                 cur_bs=cur_bs,
                 num_verify_tokens=num_verify_tokens,
                 state_slot_offset=self.state_slot_offset(),
-                old_req_pool_indices=matched_old_req_pool_indices,
                 cur_req_pool_indices=cur_req_pool_indices,
-                old_seq_lens=matched_old_seq_lens,
                 cur_seq_lens=cur_seq_lens,
             )
 
+        self._commit_current_pending(
+            cur_req_pool_indices=cur_req_pool_indices,
+            cur_seq_lens=cur_seq_lens,
+            cur_bs=cur_bs,
+            num_verify_tokens=num_verify_tokens,
+            context="online_c128_flush_pending_for_reqs",
+            allow_no_progress_clear=not require_forward_progress,
+        )
+        self._drop_ctx_req_pool_indices(cur_req_pool_indices[:cur_bs])
+
+    def _commit_current_pending(
+        self,
+        *,
+        cur_req_pool_indices: torch.Tensor,
+        cur_seq_lens: torch.Tensor,
+        cur_bs: int,
+        num_verify_tokens: int,
+        context: str,
+        allow_no_progress_clear: bool,
+    ) -> None:
+        if cur_bs <= 0:
+            return
+        runtimes = list(self._iter_layer_runtimes())
+        if not runtimes:
+            return
+
         backend = self.backend
-        for runtime in self._iter_layer_runtimes():
+        token_to_kv_pool = backend.token_to_kv_pool
+        pending_seq_lens = token_to_kv_pool.get_online_c128_mtp_pending_seq_lens()
+        pending_tail_locs = token_to_kv_pool.get_online_c128_mtp_pending_tail_locs()
+        commit_status = torch.empty(
+            (cur_bs,), dtype=torch.int32, device=pending_seq_lens.device
+        )
+
+        for i, runtime in enumerate(runtimes):
+            commit_status.zero_()
             online_c128_mtp_lazy_commit(
-                old_seq_lens=matched_old_seq_lens,
-                old_req_pool_indices=matched_old_req_pool_indices,
-                old_tail_locs=matched_old_tail_locs,
                 cur_seq_lens=cur_seq_lens,
                 cur_req_pool_indices=cur_req_pool_indices,
                 req_to_token=backend.req_to_token,
+                pending_seq_lens=pending_seq_lens,
+                pending_tail_locs=pending_tail_locs,
+                commit_status=commit_status,
                 state=runtime.main_state,
-                old_bs=matched_old_bs,
                 cur_bs=cur_bs,
                 num_verify_tokens=num_verify_tokens,
                 state_slot_stride=runtime.state_slot_offset,
                 head_dim=runtime.head_dim,
+                clear_pending=(i == len(runtimes) - 1),
             )
 
-        keep = ~matched
+        self._check_commit_status(
+            commit_status=commit_status,
+            cur_req_pool_indices=cur_req_pool_indices,
+            cur_seq_lens=cur_seq_lens,
+            cur_bs=cur_bs,
+            context=context,
+            allow_no_progress_clear=allow_no_progress_clear,
+        )
+
+    def _check_commit_status(
+        self,
+        *,
+        commit_status: torch.Tensor,
+        cur_req_pool_indices: torch.Tensor,
+        cur_seq_lens: torch.Tensor,
+        cur_bs: int,
+        context: str,
+        allow_no_progress_clear: bool,
+    ) -> None:
+        status_cpu = commit_status[:cur_bs].detach().cpu()
+        bad = status_cpu < 0
+        if not bool(bad.any().item()):
+            return
+
+        req_cpu = cur_req_pool_indices[:cur_bs].detach().cpu()
+        seq_cpu = cur_seq_lens[:cur_bs].detach().cpu()
+        bad_indices = bad.nonzero(as_tuple=False).flatten()
+        bad_entries = []
+        no_progress_req_indices = []
+        for pos in bad_indices.tolist():
+            status = int(status_cpu[pos].item())
+            req_idx = int(req_cpu[pos].item())
+            bad_entries.append(
+                {
+                    "pos": pos,
+                    "req_pool_idx": req_idx,
+                    "seq_len": int(seq_cpu[pos].item()),
+                    "status": _COMMIT_STATUS_NAMES.get(status, str(status)),
+                }
+            )
+            if status == _COMMIT_STATUS_NO_PROGRESS:
+                no_progress_req_indices.append(req_idx)
+
+        all_no_progress = all(
+            int(status_cpu[pos].item()) == _COMMIT_STATUS_NO_PROGRESS
+            for pos in bad_indices.tolist()
+        )
+        if allow_no_progress_clear and all_no_progress:
+            self._clear_pending_req_pool_indices(
+                torch.tensor(
+                    no_progress_req_indices,
+                    dtype=torch.int64,
+                    device=cur_req_pool_indices.device,
+                )
+            )
+            return
+
+        raise RuntimeError(
+            "Online C128 MTP commit failed; refusing to clear pending state. "
+            f"context={context}, entries={bad_entries}"
+        )
+
+    def _clear_pending_req_pool_indices(self, req_pool_indices: torch.Tensor) -> None:
+        if req_pool_indices.numel() == 0:
+            return
+        token_to_kv_pool = self.backend.token_to_kv_pool
+        pending_seq_lens = token_to_kv_pool.get_online_c128_mtp_pending_seq_lens()
+        pending_tail_locs = token_to_kv_pool.get_online_c128_mtp_pending_tail_locs()
+        reqs = req_pool_indices.to(device=pending_seq_lens.device, dtype=torch.long)
+        valid = (reqs >= 0) & (reqs < pending_seq_lens.shape[0])
+        reqs = reqs[valid]
+        if reqs.numel() == 0:
+            return
+        pending_seq_lens[reqs] = -1
+        pending_tail_locs[reqs] = 0
+
+    def _drop_ctx_req_pool_indices(self, req_pool_indices: torch.Tensor) -> None:
+        ctx = self._verify_ctx
+        if ctx is None or req_pool_indices.numel() == 0:
+            return
+        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
+        if old_bs <= 0:
+            self.clear()
+            return
+        old_req_pool_indices = ctx.req_pool_indices[:old_bs]
+        remove = (
+            old_req_pool_indices.reshape(-1, 1)
+            == req_pool_indices.to(old_req_pool_indices.device).reshape(1, -1)
+        ).any(dim=1)
+        keep = ~remove
         if not bool(keep.any().item()):
             self.clear()
             return
