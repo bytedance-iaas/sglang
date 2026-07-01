@@ -97,8 +97,11 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DisableEICReqInput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EICSwitchOutput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -218,6 +221,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICPagedHiRadixCache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -340,6 +347,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.enable_eic_cache = (
+            server_args.enable_eic_cache if self.enable_hierarchical_cache else False
+        )
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -438,6 +448,7 @@ class Scheduler(
             ps=self.ps,
             tp_group=self.tp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_eic_cache=self.enable_eic_cache,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -982,7 +993,6 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
-
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -1448,6 +1458,8 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (EnableEICReqInput, self.enable_eic_cache_wrapped),
+                (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
         )
 
@@ -2477,6 +2489,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            enable_eic_cache=self.enable_eic_cache,
         )
 
         if self.chunked_req is not None:
@@ -2496,6 +2509,10 @@ class Scheduler(
                     self.waiting_queue,
                     self.running_batch.reqs,
                 )
+
+        if isinstance(self.tree_cache, EICPagedHiRadixCache):
+            # for batch exists from EIC cache
+            self.tree_cache.match_from_remote(self.waiting_queue)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -3577,6 +3594,42 @@ class Scheduler(
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
+
+    def enable_eic_cache_wrapped(self, recv_req: EnableEICReqInput) -> EICSwitchOutput:
+        if not isinstance(self.tree_cache, EICHiRadixCache):
+            message = (
+                "Runtime enable_eic is not supported on this scheduler layout. "
+                "Restart with --enable-hierarchical-cache --enable-eic-cache."
+            )
+            logger.info(message)
+            return EICSwitchOutput(success=False, message=message)
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
+
+    def disable_eic_cache_wrapped(
+        self, recv_req: DisableEICReqInput
+    ) -> EICSwitchOutput:
+        if isinstance(self.tree_cache, EICHiRadixCache):
+            message = (
+                "Runtime disable_eic is not supported on this scheduler layout. "
+                "Restart without --enable-eic-cache."
+            )
+            logger.info(message)
+            return EICSwitchOutput(success=False, message=message)
+        else:
+            message = "EIC cache is already disabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time

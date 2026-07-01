@@ -1857,6 +1857,16 @@ class DeepSeekV4PagedHostPool(HostKVCache):
             )
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
 
+    def _to_kernel_indices(
+        self, host_rows: torch.Tensor, device_rows: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            host_rows.to(device=self.gpu_device, dtype=torch.int64, non_blocking=True),
+            device_rows.to(
+                device=self.gpu_device, dtype=torch.int64, non_blocking=True
+            ),
+        )
+
     def get_size_per_token(self):
         return self.item_bytes
 
@@ -1901,6 +1911,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             assert self.data_ptrs is not None
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
@@ -1911,6 +1922,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
                 num_layers=self.layer_num,
             )
         elif io_backend == "kernel" and self.layout == "page_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             transfer_kv_all_layer_mla_lf_pf(
                 src_layers=self.device_ptrs,
                 dst=self.kv_buffer,
@@ -1949,6 +1961,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
                 dst=self.device_buffers[layer_id],
@@ -1957,6 +1970,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
                 item_size=self.item_bytes,
             )
         elif io_backend == "kernel" and self.layout == "page_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_buffers[layer_id],
@@ -2195,6 +2209,16 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
         return indices.reshape(-1, self.swa_page_size)[:, 0] // self.swa_page_size
 
+    def _to_kernel_indices(
+        self, host_rows: torch.Tensor, device_rows: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            host_rows.to(device=self.gpu_device, dtype=torch.int64, non_blocking=True),
+            device_rows.to(
+                device=self.gpu_device, dtype=torch.int64, non_blocking=True
+            ),
+        )
+
     def get_size_per_token(self):
         return self.state_page_bytes
 
@@ -2235,6 +2259,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             assert self.data_ptrs is not None
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
@@ -2245,6 +2270,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 num_layers=self.layer_num,
             )
         elif io_backend == "kernel" and self.layout == "page_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             transfer_kv_all_layer_mla_lf_pf(
                 src_layers=self.device_ptrs,
                 dst=self.kv_buffer,
@@ -2283,6 +2309,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
                 dst=self.device_page_views[layer_id],
@@ -2291,6 +2318,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 item_size=self.state_page_bytes,
             )
         elif io_backend == "kernel" and self.layout == "page_first":
+            host_rows, device_rows = self._to_kernel_indices(host_rows, device_rows)
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_page_views[layer_id],
