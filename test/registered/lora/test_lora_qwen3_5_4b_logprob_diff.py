@@ -83,6 +83,7 @@ class TestLoRAQwen3_5_4BLogprobDiff(CustomTestCase):
             max_lora_rank=MAX_LORA_RANK,
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
+            mamba_scheduler_strategy="extra_buffer",
         )
 
         try:

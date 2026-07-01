@@ -44,6 +44,7 @@ class TestEagle3Basic(EagleServerBase):
             base_url=self.base_url,
             model=self.target_model,
             eval_name="mmlu",
+            max_tokens=512,
             num_examples=64,
             num_threads=32,
         )
