@@ -2975,7 +2975,7 @@ class DecodeTransferQueue:
         # same-prefix requests allocate the whole long prompt while this request
         # waits to enter decode, which can pin the full/logical pool at 0.99.
         req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
-        page_size = self._logical_kv_page_size()
+        page_size = self.scheduler._disagg_decode_logical_page_size()
         radix_key_len = page_align_floor(len(req.fill_ids), page_size)
         if radix_key_len <= 0:
             return

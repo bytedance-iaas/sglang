@@ -1858,7 +1858,7 @@ class HiSparseCoordinator:
         self._ensure_draft_buffer(
             req_pool_indices,
             req_pool_indices_cpu,
-            self.padded_buffer_size - self.device_buffer_size - 1,
+            self.mem_pool_device.page_size - 1,
         )
 
     def get_draft_device_slots(
@@ -1919,7 +1919,9 @@ class HiSparseCoordinator:
         tokens_per_req = tokens_per_req_cpu.to(
             device=req_pool_indices.device, dtype=torch.int64
         )
-        row_indices = torch.repeat_interleave(req_pool_indices, tokens_per_req)
+        row_indices = torch.repeat_interleave(
+            req_pool_indices.to(dtype=torch.long), tokens_per_req
+        )
         offsets = torch.cat(
             [
                 torch.zeros(1, dtype=torch.int64, device=tokens_per_req.device),
