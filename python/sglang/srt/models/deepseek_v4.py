@@ -1043,9 +1043,18 @@ class DeepseekV4Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
-                hidden_states = hidden_states.view(
-                    hidden_states.shape[0], self.hc_mult, self.hidden_size
-                )
+                if hidden_states.shape[1] == self.hc_mult * self.hidden_size:
+                    hidden_states = hidden_states.view(
+                        hidden_states.shape[0], self.hc_mult, self.hidden_size
+                    )
+                else:
+                    raise RuntimeError(
+                        "DeepSeek V4 PP proxy hidden_states has incompatible "
+                        "mHC shape: "
+                        f"shape={tuple(hidden_states.shape)}, "
+                        f"hc_mult={self.hc_mult}, "
+                        f"hidden_size={self.hidden_size}."
+                    )
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(

@@ -110,10 +110,14 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
@@ -2463,7 +2467,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if self.spec_algorithm.is_speculative():
+        if self.spec_algorithm.is_speculative() and self.is_generation:
             if self.is_draft_worker:
                 if not self.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
@@ -2523,6 +2527,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            hc_hidden_size=self.model_config.hc_hidden_size,
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -2549,8 +2554,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_start_loc = None
 
         if self.server_args.pp_size > 1:
+            pp_proxy_num_tokens = num_tokens
+            if (
+                not self.is_generation
+                and capture_forward_mode.is_context_parallel_extend()
+                and self.pp_rank > 0
+                and is_nsa_enable_prefill_cp()
+                and is_nsa_prefill_cp_round_robin_split()
+            ):
+                cp_size = get_attention_cp_size()
+                assert num_tokens % cp_size == 0, (
+                    "FlashInfer autotune dummy PP proxy expects the global "
+                    f"token count to be divisible by CP size, got "
+                    f"num_tokens={num_tokens}, cp_size={cp_size}."
+                )
+                pp_proxy_num_tokens = num_tokens // cp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {
+                    k: v[:pp_proxy_num_tokens]
+                    for k, v in buffers.pp_proxy_tensors.items()
+                }
             )
 
         if require_mlp_tp_gather_:
