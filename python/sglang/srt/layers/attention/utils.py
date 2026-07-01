@@ -10,6 +10,12 @@ from sglang.srt.layers.attention.triton_ops.cache_ops import (
     concat_and_cast_mha_k_triton as concat_and_cast_mha_k_triton,
 )
 from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    concat_and_cast_q_fp8_pad as concat_and_cast_q_fp8_pad,
+)
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    concat_and_cast_q_fp8_pad_kernel as concat_and_cast_q_fp8_pad_kernel,
+)
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
     launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
 )
 from sglang.srt.layers.attention.triton_ops.cache_ops import (
