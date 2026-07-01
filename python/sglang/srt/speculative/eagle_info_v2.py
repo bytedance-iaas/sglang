@@ -38,7 +38,14 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_pin_memory_available,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -144,21 +151,23 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
+        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+        # barrier has chained to the prev forward -> host stalls a full forward.
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                cur_kv_lens,
+                cur_kv_lens_device,
             )
             out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
-                cur_kv_lens,
+                cur_kv_lens_device,
                 cur_kv_lens_cpu,
-                nxt_kv_lens,
+                nxt_kv_lens_device,
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
@@ -167,14 +176,30 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
+            cur_kv_lens_device,
+            nxt_kv_lens_device,
             out_cache_loc,
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        if (
+            (_is_cuda or _is_hip)
+            and batch.seq_lens.is_cuda
+            and is_pin_memory_available(batch.device)
+        ):
+            # Move D2H off the schedule stream; only gate it on verify completion.
+            fwd_prepare_d2h_stream = torch.get_device_module(batch.device).Stream()
+            if self.verify_done is not None:
+                fwd_prepare_d2h_stream.wait_event(self.verify_done)
+            seq_lens_cpu = torch.empty_like(
+                batch.seq_lens, device="cpu", pin_memory=True
+            )
+            with torch.get_device_module(batch.device).stream(fwd_prepare_d2h_stream):
+                seq_lens_cpu.copy_(batch.seq_lens, non_blocking=True)
+            fwd_prepare_d2h_stream.synchronize()
+            batch.seq_lens_cpu = seq_lens_cpu
+        else:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
