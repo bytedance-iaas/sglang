@@ -1305,17 +1305,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                # FP4 expert mega MoE requires SM100. All-FP8 mega MoE on
-                # SM90 is handled below in the non-fp4-expert branch.
-                if (
-                    get_moe_a2a_backend().is_megamoe()
-                    and is_sm100_supported()
-                ):
-                    from sglang.srt.layers.moe.mega_moe import (
-                        build_mega_moe_experts_weights,
-                    )
+                if get_moe_a2a_backend().is_megamoe():
+                    if is_sm90_supported():
+                        # SM90 decodes packed FP4 weights in-kernel and needs a
+                        # dedicated weight transform (see mega_moe_sm90).
+                        from sglang.srt.layers.moe.mega_moe_sm90 import (
+                            build_sm90_fp4_mega_moe_experts_weights,
+                        )
 
-                    build_mega_moe_experts_weights(layer)
+                        build_sm90_fp4_mega_moe_experts_weights(layer)
+                    else:
+                        from sglang.srt.layers.moe.mega_moe import (
+                            build_mega_moe_experts_weights,
+                        )
+
+                        build_mega_moe_experts_weights(layer)
                     return
 
                 if (
@@ -1359,17 +1363,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
-            if (
-                not self.is_fp4_expert
-                and get_moe_a2a_backend().is_megamoe()
-                and is_sm90_supported()
-                and not is_sm100_supported()
-            ):
-                from sglang.srt.layers.moe.mega_moe import (
-                    build_mega_moe_experts_weights,
+            if get_moe_a2a_backend().is_megamoe() and is_sm90_supported():
+                from sglang.srt.layers.moe.mega_moe_sm90 import (
+                    build_sm90_mega_moe_experts_weights,
                 )
 
-                build_mega_moe_experts_weights(layer)
+                assert not self.is_fp4_expert
+                build_sm90_mega_moe_experts_weights(layer)
                 return
 
             if (
