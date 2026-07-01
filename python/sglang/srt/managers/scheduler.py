@@ -2491,6 +2491,13 @@ class Scheduler(
 
         # Step 2: keep prefilling only while the epoch is accepting new work.
         if mgr.can_dispatch_prefill():
+            if mgr.should_wait_for_prefill(
+                waiting_queue_len=len(self.waiting_queue),
+                has_chunked_req=self.chunked_req is not None,
+                base_prefill_max_requests=self.server_args.prefill_max_requests,
+            ):
+                return None
+
             new_batch = self.get_new_batch_prefill()
             if new_batch is not None:
                 mb_id = getattr(self, "current_pp_mb_id", None)

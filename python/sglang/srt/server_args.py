@@ -731,6 +731,7 @@ class ServerArgs:
     enable_offline_pp_offload: bool = False
     offline_pp_prefetch_stall_ticks: int = 64
     offline_pp_prefetch_hard_timeout_sec: float = 300.0
+    offline_pp_prefill_wait_timeout_ticks: int = 0
     offline_pp_max_host_memory_gb: Optional[float] = None
     offline_pp_min_prefill_waves: Optional[int] = None
     offline_pp_max_prefill_waves: Optional[int] = None
@@ -4265,6 +4266,10 @@ class ServerArgs:
                 raise ValueError(
                     "--offline-pp-prefetch-hard-timeout-sec must be positive."
                 )
+            if self.offline_pp_prefill_wait_timeout_ticks < 0:
+                raise ValueError(
+                    "--offline-pp-prefill-wait-timeout-ticks must be non-negative."
+                )
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
@@ -6552,6 +6557,14 @@ class ServerArgs:
             default=ServerArgs.offline_pp_prefetch_hard_timeout_sec,
             help="Wall-clock seconds a blocked offline PP prefetch wave may wait "
             "before hard deadlock protection rolls it back.",
+        )
+        parser.add_argument(
+            "--offline-pp-prefill-wait-timeout-ticks",
+            type=int,
+            default=ServerArgs.offline_pp_prefill_wait_timeout_ticks,
+            help="Logical scheduler ticks to wait in offline PP filling when "
+            "the current waiting queue is below --prefill-max-requests, or "
+            "briefly empty before the epoch is full. 0 disables prefill waiting.",
         )
         parser.add_argument(
             "--offline-pp-max-host-memory-gb",

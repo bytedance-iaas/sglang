@@ -145,6 +145,12 @@ def _manager(*, kv_allocator=None, req_pool=None):
     mgr.gpu_resident_factor = 2.0
     mgr.min_prefill_waves = 2
     mgr.max_prefill_waves = None
+    mgr.server_args = SimpleNamespace(prefill_max_requests=8)
+    mgr.prefill_wait_timeout_ticks = 1
+    mgr._prefill_wait_start_time = None
+    mgr._prefill_wait_start_tick = None
+    mgr._prefill_wait_reason = None
+    mgr._prefill_wait_timeout_logged = False
     mgr.host_limit_bytes = None
     mgr.is_hybrid = False
     mgr.offload_stream = _FakeStream()
@@ -319,6 +325,25 @@ def test_epoch_drains_all_waves_before_next_fill():
     assert mgr.current_epoch_id == 1
 
 
+def test_fill_stop_counts_inflight_prefill_against_max_waves():
+    mgr = _manager()
+    mgr.max_prefill_waves = 2
+    mgr.new_wave([_req("r0", 2)])
+    mgr.note_prefill_dispatched(0)
+
+    assert mgr.pending_epoch_wave_count() == 2
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=False) == "max_waves"
+
+
+def test_fill_stop_counts_inflight_prefill_before_wave_materializes():
+    mgr = _manager()
+    mgr.max_prefill_waves = 1
+    mgr.note_prefill_dispatched(0)
+
+    assert mgr.pending_epoch_wave_count() == 1
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=False) == "max_waves"
+
+
 def test_request_draining_waits_for_inflight_prefill_to_offload():
     mgr = _manager()
     wave = mgr.new_wave([_req("r0", 2)])
@@ -375,6 +400,61 @@ def test_host_state_bytes_are_counted_and_released_when_decode_ready():
     assert mgr.host_pinned_bytes == 0
 
 
+def test_prefill_waits_for_underfilled_wave_before_timeout():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 60
+
+    assert (
+        mgr.should_wait_for_prefill(
+            waiting_queue_len=7,
+            has_chunked_req=False,
+            base_prefill_max_requests=8,
+        )
+        is True
+    )
+    assert mgr.has_offline_work() is True
+
+
+def test_prefill_wait_timeout_allows_underfilled_wave():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 2
+
+    assert mgr.should_wait_for_prefill(7, False, 8) is True
+    mgr._tick += 2
+
+    assert mgr.should_wait_for_prefill(7, False, 8) is False
+
+
+def test_prefill_wait_full_wave_resets_wait():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 60
+
+    assert mgr.should_wait_for_prefill(7, False, 8) is True
+    assert mgr.should_wait_for_prefill(8, False, 8) is False
+    assert mgr._prefill_wait_start_tick is None
+
+
+def test_waiting_empty_waits_before_draining_when_epoch_has_room():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 60
+    mgr.max_prefill_waves = 4
+    mgr.new_wave([_req("r0", 2)])
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=True) is None
+
+
+def test_waiting_empty_drains_after_wait_timeout():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 2
+    mgr.max_prefill_waves = 4
+    mgr.new_wave([_req("r0", 2)])
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=True) is None
+    mgr._tick += 2
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=True) == "waiting_empty"
+
+
 def test_prefill_budget_uses_decode_tokens_for_gpu_and_prompt_bytes_for_host():
     mgr = _manager(kv_allocator=_FakeKVAllocator(size=40))
     mgr.host_limit_bytes = 200
@@ -396,6 +476,34 @@ def test_prefill_budget_uses_decode_tokens_for_gpu_and_prompt_bytes_for_host():
     assert budget.kv_decode_slots == 40
     assert budget.kv_prefetch_slots == 8
     assert budget.host_bytes_est == 80
+
+
+def test_prefill_budget_marks_waiting_queue_limited_underfill():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=1024))
+    reqs = [_req(f"r{i}", 4) for i in range(7)]
+
+    budget = mgr.prefill_budget_for_waiting_queue(
+        reqs,
+        base_max_prefill_tokens=1024,
+        base_prefill_max_requests=8,
+    )
+
+    assert budget.prefill_max_requests == 7
+    assert budget.limited_by == "waiting_queue"
+
+
+def test_prefill_budget_resource_limit_does_not_report_waiting_queue():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=80))
+    reqs = [_req(f"r{i}", 4, max_new_tokens=1) for i in range(8)]
+
+    budget = mgr.prefill_budget_for_waiting_queue(
+        reqs,
+        base_max_prefill_tokens=1024,
+        base_prefill_max_requests=8,
+    )
+
+    assert budget.prefill_max_requests == 7
+    assert budget.limited_by == "gpu_double_buffer"
 
 
 def test_prefill_budget_can_be_limited_by_mamba_slots():

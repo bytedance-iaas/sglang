@@ -61,6 +61,7 @@ class _FakeOfflinePPManager:
         self.current_epoch_id = 0
         self.active_epoch_waves = False
         self.decode_ready_wave = None
+        self.wait_for_prefill = False
 
     def offload_prefilled_wave(self, reqs, source_stream=None):
         self.offloaded.append(list(reqs))
@@ -78,6 +79,11 @@ class _FakeOfflinePPManager:
 
     def can_dispatch_prefill(self):
         return self.filling and not self.fill_stop_requested
+
+    def should_wait_for_prefill(
+        self, waiting_queue_len, has_chunked_req, base_prefill_max_requests
+    ):
+        return self.wait_for_prefill
 
     def note_prefill_dispatched(self, mb_id):
         self.inflight_prefill_mbs.add(mb_id)
@@ -119,6 +125,7 @@ class _FakeOfflinePPManager:
             self.active_epoch_waves
             or self.fill_stop_requested
             or self.inflight_prefill_count > 0
+            or self.wait_for_prefill
         )
 
     def has_decoding_wave(self):
@@ -221,6 +228,7 @@ def test_filling_epoch_prefill_dispatch_is_marked_inflight():
         chunked_req=None,
         current_pp_mb_id=5,
         offline_pp_offload_manager=mgr,
+        server_args=SimpleNamespace(prefill_max_requests=8),
         get_new_batch_prefill=lambda: batch,
         token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
     )
@@ -231,6 +239,26 @@ def test_filling_epoch_prefill_dispatch_is_marked_inflight():
     assert batch.offline_pp_prefill_mb_id == 5
     assert mgr.inflight_prefill_mbs == {5}
     assert mgr.entered_draining == []
+
+
+def test_filling_epoch_prefill_wait_blocks_partial_prefill():
+    mgr = _FakeOfflinePPManager()
+    mgr.wait_for_prefill = True
+
+    sched = SimpleNamespace(
+        last_batch=None,
+        running_batch=_EmptyBatch(),
+        waiting_queue=[_FakeReq("waiting")],
+        chunked_req=None,
+        offline_pp_offload_manager=mgr,
+        server_args=SimpleNamespace(prefill_max_requests=8),
+        get_new_batch_prefill=lambda: (_ for _ in ()).throw(
+            AssertionError("prefill wait should block prefill dispatch")
+        ),
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
+    )
+
+    assert Scheduler._get_next_batch_offline_pp(sched) is None
 
 
 def test_fill_stop_request_blocks_new_prefill_until_inflight_offloads():

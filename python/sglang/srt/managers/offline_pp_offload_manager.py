@@ -64,6 +64,9 @@ RESIDENT_WAVES = 2
 # for fragmentation. Combined with the /RESIDENT_WAVES split for admission.
 ADMISSION_ALPHA = 0.95
 
+PREFILL_WAIT_REASON_UNDERFILLED_WAVE = "underfilled_wave"
+PREFILL_WAIT_REASON_WAITING_EMPTY = "waiting_empty"
+
 
 class WaveState(enum.Enum):
     PREFILLING = "prefilling"
@@ -204,6 +207,15 @@ class OfflinePPStateOffloadManager:
             server_args.offline_pp_min_prefill_waves or server_args.pp_size
         )
         self.max_prefill_waves = server_args.offline_pp_max_prefill_waves
+        # PP ranks must make identical batch/no-batch decisions. Use logical
+        # scheduler ticks for the timeout gate instead of per-process wall time.
+        self.prefill_wait_timeout_ticks = max(
+            0,
+            int(
+                getattr(server_args, "offline_pp_prefill_wait_timeout_ticks", 0)
+                or 0
+            ),
+        )
         max_host_gb = server_args.offline_pp_max_host_memory_gb
         self.host_limit_bytes = (
             int(max_host_gb * (1024**3)) if max_host_gb is not None else None
@@ -234,6 +246,10 @@ class OfflinePPStateOffloadManager:
         self.fill_stop_requested = False
         self.fill_stop_reason: Optional[str] = None
         self.inflight_prefill_mbs: set[int] = set()
+        self._prefill_wait_start_time: Optional[float] = None
+        self._prefill_wait_start_tick: Optional[int] = None
+        self._prefill_wait_reason: Optional[str] = None
+        self._prefill_wait_timeout_logged = False
         self.host_pinned_bytes = 0
         self._host_bytes_per_committed_token: Optional[float] = None
         self._host_bytes_samples = 0
@@ -241,13 +257,15 @@ class OfflinePPStateOffloadManager:
         logger.info(
             "OfflinePPStateOffloadManager enabled (hybrid=%s, layers=%d, "
             "resident_factor=%.2f, min_prefill_waves=%d, "
-            "max_prefill_waves=%s, host_limit_bytes=%s).",
+            "max_prefill_waves=%s, host_limit_bytes=%s, "
+            "prefill_wait_timeout_ticks=%d).",
             self.is_hybrid,
             self.layer_num,
             self.gpu_resident_factor,
             self.min_prefill_waves,
             self.max_prefill_waves,
             self.host_limit_bytes,
+            self.prefill_wait_timeout_ticks,
         )
         if self.host_limit_bytes is None:
             logger.warning(
@@ -421,6 +439,13 @@ class OfflinePPStateOffloadManager:
     def inflight_prefill_count(self) -> int:
         return len(self.inflight_prefill_mbs)
 
+    def pending_epoch_wave_count(self, epoch_id: Optional[int] = None) -> int:
+        epoch_id = self.current_epoch_id if epoch_id is None else epoch_id
+        count = self.active_epoch_wave_count(epoch_id)
+        if epoch_id == self.current_epoch_id:
+            count += self.inflight_prefill_count
+        return count
+
     def can_dispatch_prefill(self) -> bool:
         return self.is_filling() and not self.fill_stop_requested
 
@@ -429,6 +454,111 @@ class OfflinePPStateOffloadManager:
             bool(self.waves)
             or self.fill_stop_requested
             or self.inflight_prefill_count > 0
+            or (
+                self.is_filling()
+                and self._prefill_wait_start_tick is not None
+            )
+        )
+
+    def _prefill_wait_target_requests(
+        self, base_prefill_max_requests: Optional[int]
+    ) -> Optional[int]:
+        if base_prefill_max_requests is None:
+            return None
+        target = int(base_prefill_max_requests)
+        return target if target > 1 else None
+
+    def _prefill_wait_enabled(self, target_requests: Optional[int]) -> bool:
+        return (
+            self.prefill_wait_timeout_ticks > 0
+            and target_requests is not None
+            and target_requests > 1
+        )
+
+    def _reset_prefill_wait(self) -> None:
+        self._prefill_wait_start_time = None
+        self._prefill_wait_start_tick = None
+        self._prefill_wait_reason = None
+        self._prefill_wait_timeout_logged = False
+
+    def _prefill_wait_epoch_has_room(self) -> bool:
+        return (
+            self.max_prefill_waves is None
+            or self.pending_epoch_wave_count() < self.max_prefill_waves
+        )
+
+    def _wait_for_prefill_batch(
+        self, reason: str, waiting_queue_len: int, target_requests: int
+    ) -> bool:
+        if self._prefill_wait_start_tick is None:
+            self._prefill_wait_start_time = time.monotonic()
+            self._prefill_wait_start_tick = self._tick
+            self._prefill_wait_reason = reason
+            self._prefill_wait_timeout_logged = False
+            logger.info(
+                "OfflinePP PREFILL_WAIT_START epoch=%d reason=%s "
+                "waiting=%d target=%d timeout_ticks=%d pending_waves=%d",
+                self.current_epoch_id,
+                reason,
+                waiting_queue_len,
+                target_requests,
+                self.prefill_wait_timeout_ticks,
+                self.pending_epoch_wave_count(),
+            )
+        elif self._prefill_wait_reason != reason:
+            self._prefill_wait_reason = reason
+
+        elapsed_ticks = self._tick - self._prefill_wait_start_tick
+        if elapsed_ticks < self.prefill_wait_timeout_ticks:
+            return True
+
+        if not self._prefill_wait_timeout_logged:
+            self._prefill_wait_timeout_logged = True
+            elapsed_sec = (
+                time.monotonic() - self._prefill_wait_start_time
+                if self._prefill_wait_start_time is not None
+                else 0.0
+            )
+            logger.info(
+                "OfflinePP PREFILL_WAIT_TIMEOUT epoch=%d reason=%s "
+                "waiting=%d target=%d elapsed_sec=%.3f elapsed_ticks=%d "
+                "pending_waves=%d",
+                self.current_epoch_id,
+                reason,
+                waiting_queue_len,
+                target_requests,
+                elapsed_sec,
+                elapsed_ticks,
+                self.pending_epoch_wave_count(),
+            )
+        return False
+
+    def should_wait_for_prefill(
+        self,
+        waiting_queue_len: int,
+        has_chunked_req: bool,
+        base_prefill_max_requests: Optional[int],
+    ) -> bool:
+        target_requests = self._prefill_wait_target_requests(
+            base_prefill_max_requests
+        )
+        if not self._prefill_wait_enabled(target_requests):
+            return False
+        if has_chunked_req:
+            self._reset_prefill_wait()
+            return False
+        if waiting_queue_len >= target_requests:
+            self._reset_prefill_wait()
+            return False
+        if waiting_queue_len <= 0:
+            return False
+        if not self._prefill_wait_epoch_has_room():
+            self._reset_prefill_wait()
+            return False
+        return self._wait_for_prefill_batch(
+            PREFILL_WAIT_REASON_UNDERFILLED_WAVE,
+            waiting_queue_len,
+            target_requests,
         )
 
     def _normalize_mb_id(self, mb_id: Optional[int]) -> int:
@@ -478,19 +608,35 @@ class OfflinePPStateOffloadManager:
 
     def local_fill_stop_reason(self, waiting_queue_empty: bool) -> Optional[str]:
         wave_count = self.active_epoch_wave_count()
+        pending_wave_count = self.pending_epoch_wave_count()
+        if (
+            self.max_prefill_waves is not None
+            and pending_wave_count >= self.max_prefill_waves
+        ):
+            self._reset_prefill_wait()
+            return "max_waves"
         if wave_count == 0:
             return None
         if (
             self.host_limit_bytes is not None
             and self.host_pinned_bytes >= self.host_limit_bytes
         ):
+            self._reset_prefill_wait()
             return "host"
-        if (
-            self.max_prefill_waves is not None
-            and wave_count >= self.max_prefill_waves
-        ):
-            return "max_waves"
         if waiting_queue_empty:
+            target_requests = self._prefill_wait_target_requests(
+                getattr(self.server_args, "prefill_max_requests", None)
+            )
+            if (
+                self._prefill_wait_enabled(target_requests)
+                and self._prefill_wait_epoch_has_room()
+            ):
+                if self._wait_for_prefill_batch(
+                    PREFILL_WAIT_REASON_WAITING_EMPTY,
+                    0,
+                    target_requests,
+                ):
+                    return None
             return "waiting_empty"
         if wave_count < self.min_prefill_waves:
             return None
@@ -499,6 +645,7 @@ class OfflinePPStateOffloadManager:
     def enter_draining(self, reason: str) -> None:
         if self.epoch_state == EpochState.DRAINING:
             return
+        self._reset_prefill_wait()
         self._log_epoch("EPOCH_FILL_STOP", reason=reason)
         self.epoch_state = EpochState.DRAINING
         self._log_epoch("EPOCH_DRAIN_START", reason=reason)
@@ -539,6 +686,7 @@ class OfflinePPStateOffloadManager:
         self.fill_stop_requested = False
         self.fill_stop_reason = None
         self.inflight_prefill_mbs.clear()
+        self._reset_prefill_wait()
         self._log_epoch("EPOCH_START", reason="previous_epoch_drained")
 
     def _mamba_pool_size(self) -> Optional[int]:
@@ -673,6 +821,13 @@ class OfflinePPStateOffloadManager:
             if accepted >= req_cap:
                 limited_by = "user_cap"
                 break
+
+        if (
+            waiting_queue
+            and accepted == len(waiting_queue)
+            and accepted < req_cap
+        ):
+            limited_by = "waiting_queue"
 
         if accepted == 0 and waiting_queue:
             req = waiting_queue[0]
