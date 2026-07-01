@@ -437,6 +437,33 @@ class MQALayer(nn.Module):
         )
         return kv
 
+    def kv_from_hidden(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        attn_backend,
+    ) -> None:
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x)
+            kv = qkv_a[..., self.q_lora_rank :]
+        else:
+            kv, _ = self.wkv(x)
+
+        token_to_kv_pool = attn_backend.token_to_kv_pool
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
+            torch.int32
+        )
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            swa_loc=swa_loc,
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=positions,
+        )
+
     def _forward_prepare_multi_stream(
         self,
         x: torch.Tensor,
@@ -986,6 +1013,7 @@ class DeepseekV4Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
         self.gemm_output_zero_allocator_size = 0
+        self.layers_to_capture = []
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
@@ -1073,6 +1101,7 @@ class DeepseekV4Model(nn.Module):
         # forks alt-streams; later per-layer calls become no-ops.
         forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(
@@ -1081,6 +1110,24 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
+            )
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
+
+        if self.layers_to_capture and len(aux_hidden_states) != len(
+            self.layers_to_capture
+        ):
+            missing_layers = [
+                i
+                for i in self.layers_to_capture
+                if i < self.start_layer or i >= self.end_layer
+            ]
+            raise RuntimeError(
+                "DSpark aux hidden capture is incomplete: "
+                f"captured {len(aux_hidden_states)} tensors for requested layers "
+                f"{self.layers_to_capture} on local layer range "
+                f"[{self.start_layer}, {self.end_layer}). "
+                f"Layers outside this rank: {missing_layers}."
             )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
@@ -1103,6 +1150,8 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if self.layers_to_capture:
+            return (hidden_states, pre_hc_head), aux_hidden_states
         return hidden_states, pre_hc_head
 
 
@@ -1211,23 +1260,64 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if (
+            isinstance(hidden_states, tuple)
+            and len(hidden_states) == 2
+            and isinstance(hidden_states[1], list)
+        ):
             hidden_states, aux_hidden_states = hidden_states
+        elif self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        if self.capture_aux_hidden_states and aux_hidden_states is None:
+            raise RuntimeError(
+                "DSpark aux hidden capture was enabled, but DeepSeek-V4 did not "
+                "return auxiliary hidden states."
+            )
         hidden_states, pre_hc_head = hidden_states
+
+        hidden_states_before_norm = (
+            None if aux_hidden_states is not None else pre_hc_head
+        )
+
         return self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=hidden_states_before_norm,
         )
 
-    def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if not layer_ids:
+            raise ValueError(
+                "DSpark requires explicit layer_ids for aux hidden capture."
+            )
+        start_layer = getattr(self.model, "start_layer", None)
+        end_layer = getattr(self.model, "end_layer", None)
+        if start_layer is not None and end_layer is not None:
+            missing_layers = [
+                i for i in layer_ids if i < start_layer or i >= end_layer
+            ]
+            if missing_layers:
+                raise ValueError(
+                    "DSpark target layers must be owned by the last PP rank for "
+                    "DeepSeek-V4 aux hidden capture. "
+                    f"Requested layers {list(layer_ids)}, local layer range "
+                    f"[{start_layer}, {end_layer}), missing layers {missing_layers}."
+                )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = list(layer_ids)
+
+    def _setup_fp8_wo_a_scales(self, is_nextn: bool, is_dspark: bool = False) -> None:
         from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
             layers = [self.model.decoder]
+        elif is_dspark:
+            layers = list(self.model.layers)
         else:
             layers = [
                 self.model.layers[layer_id]
@@ -1249,11 +1339,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 is_sfa=False,
             )
 
-    def post_load_weights(self, is_nextn=False, weight_names=None):
+    def post_load_weights(self, is_nextn=False, is_dspark=False, weight_names=None):
         if _FP8_WO_A_GEMM:
-            self._setup_fp8_wo_a_scales(is_nextn)
+            self._setup_fp8_wo_a_scales(is_nextn, is_dspark)
 
-        if is_nextn:
+        if is_nextn or is_dspark:
             return
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
@@ -1268,7 +1358,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        name: str,
+        is_nextn: bool = False,
+        is_dspark: bool = False,
+        num_hidden_layers: Optional[int] = None,
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -1278,6 +1371,22 @@ class DeepseekV4ForCausalLM(nn.Module):
             return "model.norm.weight"
         if name.startswith("hc_head_"):
             return "model." + name
+
+        if is_dspark and name.startswith("mtp."):
+            parts = name.split(".", 2)
+            if len(parts) >= 3:
+                stage, rest = parts[1], parts[2]
+                if rest.startswith(("main_proj", "main_norm")):
+                    if rest == "main_proj.scale":
+                        rest = "main_proj.weight_scale_inv"
+                    return "model." + rest
+                if rest.startswith(("markov_head", "confidence_head")):
+                    return "model." + rest
+                if rest == "norm.weight":
+                    return "model.shared_head.norm.weight"
+                if rest.startswith("hc_head_"):
+                    return "model." + rest
+                name = f"layers.{stage}." + rest
 
         if is_nextn and name.startswith("mtp."):
             parts = name.split(".", 2)
@@ -1327,7 +1436,12 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        is_dspark=False,
+    ):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -1404,9 +1518,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 try:
                     use_async_loading = should_async_load(loaded_weight)
 
+                    orig_name = name
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
                         is_nextn=is_nextn,
+                        is_dspark=is_dspark,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
 
@@ -1431,7 +1547,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
                     weight_names.append(name)
 
-                    if not is_nextn:
+                    if is_dspark:
+                        if not orig_name.startswith("mtp."):
+                            continue
+                    elif not is_nextn:
                         if hasattr(self.config, "num_nextn_predict_layers"):
                             num_nextn_layers = self.config.num_nextn_predict_layers
                             if num_nextn_layers > 0 and name.startswith("model.layers"):
@@ -1641,7 +1760,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             skipped_checking_patterns.append("model.norm.")
             skipped_checking_patterns.extend(["lm_head", "hc_head_"])
-        if is_nextn:
+        if is_nextn or is_dspark:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
         unloaded_params = {
             p
@@ -1656,7 +1775,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        self.post_load_weights(
+            is_nextn=is_nextn, is_dspark=is_dspark, weight_names=weight_names
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

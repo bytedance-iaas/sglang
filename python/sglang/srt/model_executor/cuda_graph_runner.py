@@ -631,7 +631,10 @@ class CudaGraphRunner:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        if (
+            model_runner.server_args.enable_return_hidden_states
+            or model_runner.spec_algorithm.is_dspark()
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -729,6 +732,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1196,6 +1200,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1267,7 +1272,7 @@ class CudaGraphRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, torch.Tensor]:
         self.deepep_adapter.replay()
 
         if not skip_attn_backend_init:
@@ -1330,6 +1335,8 @@ class CudaGraphRunner:
                 ),
                 customized_info=output.customized_info,
             )
+        elif isinstance(output, torch.Tensor):
+            return output[: self.raw_num_token]
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
@@ -1386,6 +1393,29 @@ class CudaGraphRunner:
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
                     else self.buffers.custom_mask
                 ),
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_info import (
+                DSparkDraftBlockInput,
+                DSparkVerifyInput,
+            )
+
+            dspark_spec_input_cls = (
+                DSparkDraftBlockInput
+                if self.model_runner.is_draft_worker
+                else DSparkVerifyInput
+            )
+            spec_info = dspark_spec_input_cls(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=None,
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL
                     if self.model_runner.is_draft_worker

@@ -416,6 +416,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dspark_use_aux_hidden_state = False
+        self.dspark_target_layer_ids = None
+        self.dspark_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -486,6 +489,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+
+        if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
+            from sglang.srt.models.deepseek_v4_dspark import get_dspark_num_layers
+
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=server_args.speculative_draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            self.dspark_use_aux_hidden_state = True
+            self.dspark_draft_num_layers = get_dspark_num_layers(
+                draft_model_config.hf_config
+            )
+            self.dspark_target_layer_ids = list(
+                getattr(draft_model_config.hf_config, "dspark_target_layer_ids", [])
+            )
+            if not self.dspark_target_layer_ids:
+                raise ValueError(
+                    "DSpark requires dspark_target_layer_ids in the draft model config."
+                )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -671,15 +695,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
+        # Some EAGLE3 drafts (e.g. nvidia/Kimi-K2.5-Thinking-Eagle3) carry the full DeepSeek-V3
+        # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
+        # the field being absent — otherwise the draft worker takes the MTP branch below with
+        # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
+        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+        _nnpl = self.model_config.num_nextn_predict_layers
+        model_has_mtp_layers = _nnpl is not None and _nnpl > 0
+        if self.is_draft_worker and self.spec_algorithm.is_dspark():
+            model_num_layers = int(getattr(self.model, "num_dspark_layers", 3))
+        elif self.is_draft_worker and model_has_mtp_layers:
+            model_num_layers = self.model_config.num_nextn_predict_layers
+        else:
+            model_num_layers = max(
                 self.model_config.num_hidden_layers,
                 self.model_config.num_attention_layers,
             )
-        )
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
         elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
@@ -903,6 +934,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "set_dflash_layers_to_capture, which is required for DFLASH."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        if self.dspark_use_aux_hidden_state:
+            if not hasattr(self.model, "set_dspark_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} does not implement "
+                    "set_dspark_layers_to_capture, which is required for DSpark."
+                )
+            self.model.set_dspark_layers_to_capture(self.dspark_target_layer_ids)
 
     def remote_instance_init_transfer_engine(self):
         try:

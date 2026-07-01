@@ -554,6 +554,8 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dspark_block_size: Optional[int] = None
+    speculative_dspark_confidence_threshold: float = 0.0
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -5434,7 +5436,7 @@ class ServerArgs:
             type=str,
             help=(
                 "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
-                "NGRAM, DFLASH. Or any name registered via "
+                "NGRAM, DFLASH, DSPARK. Or any name registered via "
                 "`SpeculativeAlgorithm.register`."
             ),
         )
@@ -5484,6 +5486,18 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-block-size",
+            type=int,
+            help="DSpark only. Block size (draft block length). Alias of --speculative-num-draft-tokens for DSpark.",
+            default=ServerArgs.speculative_dspark_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-confidence-threshold",
+            type=float,
+            help="DSpark only. Truncate the draft block at the first position whose confidence-head probability falls below this threshold. 0 disables truncation.",
+            default=ServerArgs.speculative_dspark_confidence_threshold,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

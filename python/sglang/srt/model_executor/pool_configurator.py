@@ -139,6 +139,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_num_layers=int(draft_num_layers),
                 )
 
+        if mr.spec_algorithm.is_dspark() and not mr.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                scale_kv_cell_size_per_token_for_dflash,
+            )
+
+            draft_num_layers = mr.dspark_draft_num_layers
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                    target_cell_size_per_token=self._cell_size,
+                    target_num_layers=int(num_layers),
+                    draft_num_layers=int(draft_num_layers),
+                )
+
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
