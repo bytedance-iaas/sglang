@@ -503,6 +503,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    def requires_swa_mapping_for_radix_cache(self) -> bool:
+        # DSV4 compressor_v2 derives c4/c128 state slots from full KV slots via
+        # full_to_swa_index_mapping. If a radix-cached full prefix outlives its
+        # SWA mapping, later cache hits can build compressor plans that read
+        # from slot 0 or a reused SWA page.
+        return True
+
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
         is_speculative = server_args.speculative_algorithm is not None
