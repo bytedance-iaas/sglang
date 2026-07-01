@@ -116,6 +116,7 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
 | **Sub-backend**       | **Prefill** | **Decode** | **Notes**                                     |
 |-----------------------|-------------|------------|-----------------------------------------------|
 | **flashmla_sparse**   | ✅          | ✅         | Default prefill on Hopper and Blackwell (bf16) |
+| **flashmla_sparse_q8** | ✅          | ❌         | Native FP8 (q8×kv8) sparse prefill on Hopper (SM90); requires `--kv-cache-dtype fp8_e4m3` |
 | **flashmla_kv**       | ✅          | ✅         | Default decode for FP8 on Blackwell with DP   |
 | **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv based on kv_cache_dtype |
 | **fa3**               | ✅          | ✅         | Default decode on Hopper (bf16)               |
