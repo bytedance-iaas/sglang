@@ -672,7 +672,7 @@ class DecodePreallocQueue:
         )
         required_full_tokens_after_prefix = max(
             self._required_alloc_tokens(fill_len=fill_len, prefix_len=safe_prefix_len)
-            + self.num_reserved_decode_tokens,
+            + self._output_reserve_tokens_for_admission(req),
             self._future_full_tokens_for_admission(
                 req,
                 origin_input_len=len(req.origin_input_ids),
@@ -744,9 +744,10 @@ class DecodePreallocQueue:
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        output_reserve = self._output_reserve_tokens_for_admission(req)
         return (
-            full_len + self.num_reserved_decode_tokens,
-            swa_len + self.num_reserved_decode_tokens,
+            full_len + output_reserve,
+            swa_len + output_reserve,
         )
 
     def _output_reserve_tokens_for_admission(self, req: Req) -> int:
@@ -754,9 +755,11 @@ class DecodePreallocQueue:
             req.sampling_params.max_new_tokens,
             CLIP_MAX_NEW_TOKEN,
         )
+        committed_output_tokens = max(len(req.output_ids) - 1, 0)
+        remaining_output_tokens = max(0, max_new_tokens - committed_output_tokens)
         if self._relax_decode_output_reserve:
-            return min(max_new_tokens, self.num_reserved_decode_tokens)
-        return max_new_tokens
+            return min(remaining_output_tokens, self.num_reserved_decode_tokens)
+        return remaining_output_tokens
 
     def _dsv4_c4_host_output_reserve_tokens_for_admission(self, req: Req) -> int:
         if not self._is_dsv4_hisparse_swa_tail_prealloc():
@@ -1070,13 +1073,25 @@ class DecodePreallocQueue:
         resumed_reqs = []
         indices_to_remove = set()
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
         if uses_swa_tail_prealloc:
+            retractable_swa_tokens = sum(
+                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
+            )
             full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(count_retracted=False)
+                self._swa_aware_allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    retractable_swa_tokens=retractable_swa_tokens,
+                    count_retracted=False,
+                )
             )
         else:
             full_allocatable_tokens = self._allocatable_token_budgets(
-                count_retracted=False
+                retractable_tokens=retractable_tokens,
+                count_retracted=False,
             )
 
         for i, req in enumerate(self.retracted_queue):
@@ -1086,22 +1101,102 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            full_required, swa_required = self._prealloc_required_tokens(req)
+            req.skip_swa_radix_cache_insert = (
+                self._enable_decode_radix_prefix_reuse()
+                and self._is_dsv4_hisparse_swa_tail_prealloc()
+            )
+            prefix_indices = None
+            prefix_len = 0
+            prefix_lock_acquired = False
+            origin_input_len = len(req.origin_input_ids)
+            fill_len = origin_input_len + max(len(req.output_ids) - 1, 0)
+
+            if self._enable_decode_radix_prefix_reuse():
+                prefix_indices, prefix_len = self._match_prefix_and_lock(req)
+                prefix_lock_acquired = True
+                page_size = self._logical_kv_page_size()
+                if page_size > 1 and prefix_len % page_size != 0:
+                    prefix_len = page_align_floor(prefix_len, page_size)
+                    prefix_indices = prefix_indices[:prefix_len]
+
+                if self._is_dsv4_hisparse_swa_tail_prealloc():
+                    c4_host_prefix_len = getattr(
+                        req, "hisparse_retract_c4_prefix_len", None
+                    )
+                    if c4_host_prefix_len is None:
+                        _, _, c4_host_prefix_len = (
+                            self._dsv4_c4_host_required_tokens_for_admission(
+                                req, fill_len
+                            )
+                        )
+                    safe_prefix_len = self._dsv4_hisparse_safe_logical_prefix_len(
+                        fill_len=fill_len,
+                        matched_prefix_len=prefix_len,
+                        c4_prefix_len=c4_host_prefix_len,
+                    )
+                    if safe_prefix_len < prefix_len:
+                        matched_prefix_len = prefix_len
+                        self.tree_cache.dec_lock_ref(req.last_node)
+                        prefix_lock_acquired = False
+                        prefix_indices, prefix_len = self._match_prefix_and_lock(
+                            req, req.origin_input_ids[:safe_prefix_len]
+                        )
+                        prefix_lock_acquired = True
+                        logger.debug(
+                            "DSV4 HiSparse retracted logical prefix capped: req=%s "
+                            "matched=%d safe=%d c4_prefix=%s swa_tail=%d fill=%d",
+                            req.rid,
+                            matched_prefix_len,
+                            prefix_len,
+                            c4_host_prefix_len,
+                            self._swa_tail_len(fill_len),
+                            fill_len,
+                        )
+
+            required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=fill_len, prefix_len=prefix_len
+            )
+            output_reserve = self._output_reserve_tokens_for_admission(req)
+            required_tokens_for_request = required_alloc_tokens + output_reserve
+            future_full_tokens = self._future_full_tokens_for_admission(
+                req,
+                origin_input_len=origin_input_len,
+                prefix_len=prefix_len,
+                retractable_tokens=retractable_tokens,
+            )
+            full_required = max(required_tokens_for_request, future_full_tokens)
+            if prefix_lock_acquired:
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=False,
+                    extra_reserved_reqs=len(resumed_reqs),
+                )
+            _, swa_required = self._prealloc_required_tokens(req)
             if full_required > full_allocatable_tokens:
+                if prefix_lock_acquired:
+                    self.tree_cache.dec_lock_ref(req.last_node)
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
+                if prefix_lock_acquired:
+                    self.tree_cache.dec_lock_ref(req.last_node)
                 break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
+            self._pre_alloc(req, prefix_indices, prefix_len)
+            req.cache_protected_len = prefix_len
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens,
+                count_retracted=False,
+                extra_reserved_reqs=len(resumed_reqs),
+            )
 
         self.retracted_queue = [
             entry
@@ -1220,6 +1315,7 @@ class DecodePreallocQueue:
         eagle_draft_reserve_tokens = (
             self._hisparse_eagle_draft_logical_reserve_tokens()
         )
+        active_reserved_tokens = self._active_reserved_tokens()
         if self.scheduler.enable_hisparse and hasattr(
             self.scheduler, "_disagg_decode_budget_snapshot"
         ):
@@ -1236,6 +1332,47 @@ class DecodePreallocQueue:
             staging_headroom_tokens = 0
             staging_reclaimable_tokens = 0
             full_usage_target = 0.0
+        head_fill_len = None
+        head_prefix_len = None
+        head_safe_prefix_len = None
+        head_required_alloc_tokens = None
+        head_output_reserve = None
+        head_required_tokens_for_request = None
+        head_future_full_tokens = None
+        head_req = next(
+            (entry.req for entry in self.queue if entry.waiting_for_input),
+            None,
+        )
+        if head_req is not None:
+            head_origin_input_len = len(head_req.origin_input_ids)
+            head_fill_len = head_origin_input_len + max(
+                len(head_req.output_ids) - 1, 0
+            )
+            if self._enable_decode_radix_prefix_reuse():
+                head_probe = self._probe_dsv4_safe_prefix_for_req(
+                    head_req, fill_len=head_fill_len
+                )
+                head_prefix_len = head_probe.matched_prefix_len
+                head_safe_prefix_len = head_probe.safe_prefix_len
+            else:
+                head_prefix_len = 0
+                head_safe_prefix_len = 0
+            head_required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=head_fill_len, prefix_len=head_safe_prefix_len or 0
+            )
+            head_output_reserve = self._output_reserve_tokens_for_admission(head_req)
+            head_required_tokens_for_request = (
+                head_required_alloc_tokens + head_output_reserve
+            )
+            head_future_full_tokens = self._future_full_tokens_for_admission(
+                head_req,
+                origin_input_len=head_origin_input_len,
+                prefix_len=head_safe_prefix_len or 0,
+                retractable_tokens=sum(
+                    len(r.origin_input_ids) + len(r.output_ids)
+                    for r in self.scheduler.running_batch.reqs
+                ),
+            )
         log_fn = logger.warning if idle_admission_deadlock else logger.info
         log_fn(
             "Decode prealloc admission limited: reason=%s, queue=%d, "
@@ -1294,12 +1431,20 @@ class DecodePreallocQueue:
             getattr(coordinator, "padded_buffer_size", None),
             getattr(coordinator, "top_k", None),
             getattr(coordinator, "device_buffer_size", None),
+            getattr(coordinator, "min_device_buffer_size", None),
             getattr(self.scheduler, "max_running_requests", None),
             idle_admission_deadlock,
             self._relax_decode_output_reserve,
             self.num_reserved_decode_tokens
             if self._relax_decode_output_reserve
             else CLIP_MAX_NEW_TOKEN,
+            head_fill_len,
+            head_prefix_len,
+            head_safe_prefix_len,
+            head_required_alloc_tokens,
+            head_output_reserve if head_req is not None else None,
+            head_required_tokens_for_request,
+            head_future_full_tokens,
         )
         if idle_admission_deadlock and reason == "full_allocatable_tokens":
             self._maybe_log_idle_deadlock_prefix_probe(
@@ -1695,9 +1840,8 @@ class DecodePreallocQueue:
                 prefix_len = 0
                 required_alloc_tokens = origin_input_len
 
-            required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
-            )
+            output_reserve = self._output_reserve_tokens_for_admission(decode_req.req)
+            required_tokens_for_request = required_alloc_tokens + output_reserve
 
             future_full_tokens = self._future_full_tokens_for_admission(
                 decode_req.req,
@@ -1723,6 +1867,7 @@ class DecodePreallocQueue:
                     fill_len=fill_len,
                     prefix_len=prefix_len,
                     required_alloc_tokens=required_alloc_tokens,
+                    output_reserve=output_reserve,
                     required_tokens_for_request=required_tokens_for_request,
                     future_full_tokens=future_full_tokens,
                     full_allocatable_tokens=full_allocatable_tokens,
@@ -2072,6 +2217,7 @@ class DecodePreallocQueue:
                 metadata_decode_prefix_len=metadata_decode_prefix_len,
                 decode_c4_prefix_len=decode_c4_prefix_len,
                 required_alloc_tokens=required_alloc_tokens,
+                output_reserve=output_reserve,
                 required_tokens_for_request=required_tokens_for_request,
                 future_full_tokens=future_full_tokens,
                 full_allocatable_tokens=full_allocatable_tokens,
@@ -2142,9 +2288,26 @@ class DecodePreallocQueue:
     def _active_reserved_tokens(
         self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0
     ) -> int:
-        if n_active is None:
-            n_active = self._active_req_count(extra_reserved_reqs)
-        return self.num_reserved_decode_tokens * n_active
+        active_reqs: List[Req] = []
+        active_reqs.extend(self.scheduler.running_batch.reqs)
+        active_reqs.extend(decode_req.req for decode_req in self.transfer_queue.queue)
+        active_reqs.extend(self.scheduler.waiting_queue)
+
+        seen = set()
+        reserved_tokens = 0
+        for req in active_reqs:
+            key = getattr(req, "rid", None) or id(req)
+            if key in seen:
+                continue
+            seen.add(key)
+            reserved_tokens += self._output_reserve_tokens_for_admission(req)
+
+        # Preserve the conservative cap for callers that reserve room for
+        # requests that are not materialized yet.
+        if n_active is not None:
+            extra_reserved_reqs = max(extra_reserved_reqs, n_active - len(seen))
+        reserved_tokens += max(0, extra_reserved_reqs) * self.num_reserved_decode_tokens
+        return reserved_tokens
 
     def _swa_aware_allocatable_token_budgets(
         self,
@@ -2214,13 +2377,33 @@ class DecodePreallocQueue:
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+            active_req_ids = {id(req) for req in self.scheduler.running_batch.reqs}
+            active_req_ids.update(id(req) for req in self.scheduler.waiting_queue)
+            active_req_ids.update(id(req.req) for req in self.transfer_queue.queue)
+            prebuilt_reqs_needing_reserve = [
+                req
+                for req in self.scheduler.last_batch.reqs
+                if id(req) not in active_req_ids
+            ]
+            allocatable_tokens -= sum(
+                self._output_reserve_tokens_for_admission(req)
+                for req in prebuilt_reqs_needing_reserve
             )
 
         if count_retracted:
             for req in self.retracted_queue:
                 full_required, _ = self._prealloc_required_tokens(req)
+                if self._enable_decode_radix_prefix_reuse():
+                    fill_len = len(req.origin_input_ids) + max(
+                        len(req.output_ids) - 1, 0
+                    )
+                    probe = self._probe_dsv4_safe_prefix_for_req(
+                        req,
+                        fill_len=fill_len,
+                        retractable_tokens=retractable_tokens or 0,
+                    )
+                    if probe.required_full_tokens_after_prefix > 0:
+                        full_required = probe.required_full_tokens_after_prefix
                 allocatable_tokens -= full_required
 
         return allocatable_tokens
@@ -2281,10 +2464,19 @@ class DecodePreallocQueue:
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+            active_req_ids = {id(req) for req in self.scheduler.running_batch.reqs}
+            active_req_ids.update(id(req) for req in self.scheduler.waiting_queue)
+            active_req_ids.update(id(req.req) for req in self.transfer_queue.queue)
+            prebuilt_reqs_needing_reserve = [
+                req
+                for req in self.scheduler.last_batch.reqs
+                if id(req) not in active_req_ids
+            ]
+            prebuilt_reserved_tokens = sum(
+                self._output_reserve_tokens_for_admission(req)
+                for req in prebuilt_reqs_needing_reserve
             )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
+            prebuilt_n = len(prebuilt_reqs_needing_reserve)
             prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
             swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
             swa_allocatable_tokens -= (
