@@ -8,12 +8,20 @@
 
 namespace device::top512 {
 
-inline constexpr uint32_t kMaxTopK = 1024;
 inline constexpr uint32_t kBlockSize = 1024;
 inline constexpr uint32_t kNumWarps = kBlockSize / kWarpThreads;
-inline constexpr uint32_t kMaxTies = 1024;  // == kBlockSize: 1 element per thread in stage2
+// kMaxTies must be >= the largest K we support, so that even when num_above == 0
+// we can stage K candidates from the threshold bin and pick the topk.
+// For SGL_TOPK <= 1024 we keep the historical 1024 (1 elem/thread).
+// For larger K (e.g. 4096) each thread handles kTiesPerThread elements.
+#ifdef SGL_TOPK
+inline constexpr uint32_t kMaxTies = (SGL_TOPK > 1024u) ? SGL_TOPK : 1024u;
+#else
+inline constexpr uint32_t kMaxTies = 1024u;
+#endif
+inline constexpr uint32_t kTiesPerThread = (kMaxTies + kBlockSize - 1) / kBlockSize;
 static constexpr uint32_t kRadixBins = 256;
-static_assert(kMaxTopK <= kBlockSize && kMaxTies <= kBlockSize);
+static_assert(kTiesPerThread * kBlockSize >= kMaxTies);
 
 // always use float4 to load from global memory
 using Vec4 = AlignedVector<float, 4>;
@@ -81,10 +89,14 @@ SGL_DEVICE uint32_t extract_exact_bin(float x) {
 }
 
 SGL_DEVICE void trivial_transform(const TransformParams& params, uint32_t length, uint32_t K) {
-  if (const auto tx = threadIdx.x; tx < length) {
-    params.write(tx, tx);
-  } else if (tx < K) {
-    params.indices_out[tx] = -1;
+  // K may exceed kBlockSize, so loop until we cover all K positions.
+  for (uint32_t base = 0; base < K; base += kBlockSize) {
+    const uint32_t tx = base + threadIdx.x;
+    if (tx < length) {
+      params.write(tx, tx);
+    } else if (tx < K) {
+      params.indices_out[tx] = -1;
+    }
   }
 }
 
@@ -100,14 +112,22 @@ SGL_DEVICE void tie_handle_transform(
   const auto lane_id = tx % kWarpThreads;
   const auto warp_id = tx / kWarpThreads;
 
-  // Each thread loads one element (or becomes inactive)
-  const bool has_elem = tx < num_ties;
-  const auto tie = has_elem ? ties[tx] : Tie{0, 0.0f};
-  const uint32_t key = extract_exact_bin(tie.score);
-  const uint32_t idx = tie.idx;
-  bool active = has_elem;
+  // Each thread loads up to kTiesPerThread elements (1 when kMaxTies <= kBlockSize).
+  uint32_t my_keys[kTiesPerThread];
+  uint32_t my_idx[kTiesPerThread];
+  bool active[kTiesPerThread];
+  uint32_t write_pos[kTiesPerThread];
+#pragma unroll
+  for (uint32_t i = 0; i < kTiesPerThread; ++i) {
+    const uint32_t local_idx = tx + i * kBlockSize;
+    const bool has_elem = local_idx < num_ties;
+    const auto tie = has_elem ? ties[local_idx] : Tie{0, 0.0f};
+    my_keys[i] = extract_exact_bin(tie.score);
+    my_idx[i] = tie.idx;
+    active[i] = has_elem;
+    write_pos[i] = K;
+  }
   uint32_t topk_remain = K - num_above;
-  uint32_t write_pos = K;
 
   smem->counter = 0;
   __syncthreads();
@@ -118,12 +138,17 @@ SGL_DEVICE void tie_handle_transform(
 #pragma unroll
   for (int round = 0; round < 4; round++) {
     const uint32_t shift = 24 - round * 8;
-    const uint32_t bin = (key >> shift) & 0xFFu;
 
     // 1. Build histogram
     if (tx < kRadixBins) smem->histogram[tx] = 0;
     __syncthreads();
-    if (active) atomicAdd(&smem->histogram[bin], 1);
+#pragma unroll
+    for (uint32_t i = 0; i < kTiesPerThread; ++i) {
+      if (active[i]) {
+        const uint32_t bin = (my_keys[i] >> shift) & 0xFFu;
+        atomicAdd(&smem->histogram[bin], 1);
+      }
+    }
     __syncthreads();
 
     // 2. v2-style 2-pass prefix sum on 256 bins
@@ -154,23 +179,30 @@ SGL_DEVICE void tie_handle_transform(
     const auto [thr, n_above, _] = smem->match;
 
     // 4. Scatter
-    if (active) {
-      if (bin > thr) {
-        write_pos = num_above + atomicAdd(&smem->counter, 1);
-        active = false;
-      } else if (bin < thr) {
-        active = false;
-      } else if (round == 3) {
-        write_pos = K - atomicAdd(&smem->match.equal_count, -1u);
+#pragma unroll
+    for (uint32_t i = 0; i < kTiesPerThread; ++i) {
+      if (active[i]) {
+        const uint32_t bin = (my_keys[i] >> shift) & 0xFFu;
+        if (bin > thr) {
+          write_pos[i] = num_above + atomicAdd(&smem->counter, 1);
+          active[i] = false;
+        } else if (bin < thr) {
+          active[i] = false;
+        } else if (round == 3) {
+          write_pos[i] = K - atomicAdd(&smem->match.equal_count, -1u);
+        }
+        // my_bin == thr && round < 3: stay active for next round
       }
-      // my_bin == thr && round < 3: stay active for next round
     }
 
     topk_remain -= n_above;
     if (topk_remain == 0) break;
   }
 
-  if (write_pos < K) params.write(write_pos, idx);
+#pragma unroll
+  for (uint32_t i = 0; i < kTiesPerThread; ++i) {
+    if (write_pos[i] < K) params.write(write_pos[i], my_idx[i]);
+  }
 }
 
 }  // namespace device::top512
