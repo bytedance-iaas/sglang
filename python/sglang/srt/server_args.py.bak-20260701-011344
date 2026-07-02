@@ -1365,16 +1365,6 @@ class ServerArgs:
         # 16. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 17. Unified asym_gemm MoE. The unified INT8 CPU+GPU path is not
-        # capturable, so piecewise capture silently falls back to the BF16 asym
-        # path for every prefill token bucket (~2x slower prefill measured);
-        # prefill is faster left on the eager unified path. Decode graphs are
-        # unaffected. Override with --enforce-piecewise-cuda-graph.
-        if (
-            self.moe_runner_backend == "asym_gemm"
-            and envs.SGLANG_ASYMGEMM_UNIFIED_MOE.get()
-        ):
-            self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True

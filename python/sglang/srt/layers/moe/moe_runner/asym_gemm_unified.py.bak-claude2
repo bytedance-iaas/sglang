@@ -71,14 +71,7 @@ def has_unified_asym_gemm_layer(layer: torch.nn.Module) -> bool:
 
 
 def _check_convertible(layer: torch.nn.Module) -> str | None:
-    """Return None if `layer` is *structurally* eligible for the unified path.
-
-    Dtype-agnostic on purpose: the INT8 fast path (``from_int8``) consumes a
-    pre-quantized slab and never touches the BF16/FP8 masters, so it works for a
-    BF16 *or* a block-scaled FP8 checkpoint. The BF16 requirement only applies to
-    the online-quantization fallback (``from_bf16``) and is enforced by the
-    caller, not here.
-    """
+    """Return None if `layer` can use the unified path, else the reason."""
     from asym_gemm.unified_moe.runtime import GRAN_K
 
     w13 = layer.w13_weight
@@ -88,6 +81,8 @@ def _check_convertible(layer: torch.nn.Module) -> str | None:
         return "MoE is not gated (unified kernel computes SwiGLU)"
     if layer.moe_runner_config.activation != "silu":
         return f"activation {layer.moe_runner_config.activation!r} != 'silu'"
+    if w13.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
+        return f"weights are {w13.dtype}/{w2.dtype}, need bfloat16"
     if layer.moe_ep_size > 1:
         return "expert parallelism is not supported yet"
     if getattr(layer, "num_fused_shared_experts", 0):
@@ -177,15 +172,13 @@ def _maybe_load_int8_slab(
 
 
 def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
-    """Build the unified INT8 MoE layer for a converted MoE.
+    """Build the unified INT8 MoE layer from the BF16 w13/w2 masters.
 
-    Called from both UnquantizedFusedMoEMethod (BF16 masters) and Fp8MoEMethod
-    (block-scaled FP8 masters) in process_weights_after_loading, when the
-    asym_gemm backend is active and the unified path is enabled. BF16 masters
-    can be quantized online (from_bf16); FP8 masters require a pre-quantized
-    INT8 slab (SGLANG_ASYMGEMM_UNIFIED_INT8_PATH). On any unsupported
-    configuration the reason is logged and the layer keeps using the existing
-    asym_gemm path (whose masters stay intact for the capture-time fallback).
+    Called from UnquantizedFusedMoEMethod.process_weights_after_loading when
+    the asym_gemm backend is active and the unified path is enabled. On any
+    unsupported configuration the reason is logged once and the layer keeps
+    using the existing asym_gemm path. The BF16 masters are kept so the
+    fallback path stays functional.
     """
     if not unified_asym_gemm_enabled():
         return
@@ -208,15 +201,6 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
     num_experts, two_inter, hidden = layer.w13_weight.shape
     inter = two_inter // 2
 
-    # BF16 masters can be quantized online; FP8 (block-scaled) masters cannot —
-    # for those the pre-quantized INT8 slab is the only way in. This also
-    # decides whether the capture-time fallback is the BF16 asym path (only when
-    # the host method is the unquantized/BF16 one) worth pre-warming below.
-    masters_are_bf16 = (
-        layer.w13_weight.dtype == torch.bfloat16
-        and layer.w2_weight.dtype == torch.bfloat16
-    )
-
     # Fast path: load INT8 weights pre-quantized offline, skipping the slow
     # per-expert quantization loop. Falls back to None on any mismatch.
     slab = _maybe_load_int8_slab(layer, num_experts, hidden, inter)
@@ -237,19 +221,6 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
             m_cpu=envs.SGLANG_ASYMGEMM_UNIFIED_M_CPU.get(),
         )
         source = "loaded pre-quantized INT8 for"
-    elif not masters_are_bf16:
-        # No offline INT8 and the masters aren't BF16 (e.g. a block-scaled FP8
-        # checkpoint) — online quantization can't run. Leave the layer on its
-        # existing asym_gemm path (BF16 or FP8) instead of failing.
-        logger.warning(
-            "AsymGEMM unified MoE: layer %s has %s/%s masters and no INT8 "
-            "weights; set SGLANG_ASYMGEMM_UNIFIED_INT8_PATH to an offline-"
-            "converted INT8 dir to enable the unified path. Falling back.",
-            getattr(layer, "layer_id", "?"),
-            layer.w13_weight.dtype,
-            layer.w2_weight.dtype,
-        )
-        return
     else:
         # The default loader's device_loading_context temporarily moves the
         # pinned-CPU masters onto the GPU while process_weights_after_loading
@@ -285,13 +256,7 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
         unified_layer.m_cpu,
     )
     _maybe_init_capturable_decode(unified_layer)
-    # Pre-warm the capture-time fallback kernels for this host's own asym path
-    # (BF16 masked for a BF16 host, FP8 masked for an FP8 host). The unified path
-    # shadows them during the pre-capture warmup forward, so without this their
-    # first JIT compile would land inside capture (illegal stream sync).
-    _maybe_warm_asym_fallback_kernels(
-        num_experts, hidden, inter, use_fp8=not masters_are_bf16
-    )
+    _maybe_warm_bf16_fallback_kernels(num_experts, hidden, inter)
 
 
 def _capture_max_bs() -> int:
@@ -371,22 +336,18 @@ def _maybe_init_capturable_decode(unified_layer) -> None:
 _warmed_fallback_shapes = set()
 
 
-def _maybe_warm_asym_fallback_kernels(
-    num_experts: int, hidden: int, inter: int, use_fp8: bool
+def _maybe_warm_bf16_fallback_kernels(
+    num_experts: int, hidden: int, inter: int
 ) -> None:
-    """Pre-warm the asym masked kernels the capture-time fallback will run.
+    """Pre-warm the BF16 asym kernels the capture-time fallback will run.
 
-    Any CUDA graph capture that hits the asym path replays it (the unified
+    Any CUDA graph capture that hits the BF16 asym path replays it (the unified
     kernel cannot be captured): piecewise prefill token buckets, and — since the
     capturable decode path only covers batch sizes up to the cap — decode graphs
     above _capture_max_bs(). With the unified path serving all eager forwards,
-    those kernels would otherwise first run *inside* capture, where the asym JIT
-    ensure-compiled step's stream synchronize is illegal. Run that step here,
+    the BF16 kernels would otherwise first run *inside* capture, where the asym
+    JIT ensure-compiled step's stream synchronize is illegal. Run that step here,
     outside capture, for this layer's shapes whenever any capture will occur.
-
-    The fallback kernel is the host method's own: the BF16 masked kernel for the
-    unquantized/BF16 host, the FP8 masked kernel for the FP8 host — pre-warm
-    whichever matches so capture never triggers a first-time JIT compile.
     """
     from sglang.srt.server_args import get_global_server_args
 
@@ -401,20 +362,14 @@ def _maybe_warm_asym_fallback_kernels(
 
     from sglang.srt.layers.asym_gemm_wrapper import compile_utils
 
-    kernel_type = (
-        compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
-        if use_fp8
-        else compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
-    )
-
-    # (n, k) of the two grouped GEMMs in the asym runner's _run_masked_gemm
+    # (n, k) of the two grouped GEMMs in AsymGemmBf16RunnerCore._run_masked_gemm
     for n, k in ((2 * inter, hidden), (hidden, inter)):
-        key = (kernel_type, n, k, num_experts)
+        key = (n, k, num_experts)
         if key in _warmed_fallback_shapes:
             continue
         _warmed_fallback_shapes.add(key)
         compile_utils._maybe_compile_asym_gemm_one_type_all(
-            kernel_type,
+            compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED,
             n,
             k,
             num_experts,

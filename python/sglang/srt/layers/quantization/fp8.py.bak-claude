@@ -1202,16 +1202,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
-
-            # Opt-in unified CPU(AMX INT8)+GPU(SM90 INT8) path. For an FP8
-            # checkpoint this only engages when a pre-quantized INT8 dir is
-            # provided (SGLANG_ASYMGEMM_UNIFIED_INT8_PATH); otherwise it is a
-            # no-op and the FP8 asym_gemm path above stays in effect.
-            from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
-                maybe_create_unified_asym_gemm_layer,
-            )
-
-            maybe_create_unified_asym_gemm_layer(layer)
             return
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
@@ -1731,18 +1721,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        # Unified asym_gemm INT8 fast path (when this layer was converted).
-        if get_moe_runner_backend().is_asym_gemm():
-            from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
-                should_use_unified_asym_gemm_forward,
-                unified_asym_gemm_forward,
-            )
-
-            if should_use_unified_asym_gemm_forward(
-                layer, dispatch_output.hidden_states.shape[0]
-            ):
-                return unified_asym_gemm_forward(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config

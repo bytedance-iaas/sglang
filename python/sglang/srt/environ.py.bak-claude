@@ -422,14 +422,6 @@ class Envs:
     # pool shared by every converted MoE layer (not per-layer), read once when
     # the first layer is built. 0 = library default (host hardware concurrency).
     SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS = EnvInt(0)
-    # Directory of pre-quantized INT8 expert weights produced offline by
-    # AsymGEMM/scripts/convert_int8_weights.py. When set and a matching
-    # per-layer file (layer_{id}.safetensors) is present, the unified MoE path
-    # loads the INT8 slab directly instead of quantizing the BF16 masters at
-    # load time (which is slow: a per-expert Python loop over every MoE layer).
-    # Empty = always quantize online. On any missing file or shape mismatch the
-    # affected layer transparently falls back to online quantization.
-    SGLANG_ASYMGEMM_UNIFIED_INT8_PATH = EnvStr("")
     # Largest decode batch size the CUDA-graph-capturable (CPU-only) unified
     # MoE path pre-allocates pinned buffers for and captures with the unified
     # INT8 kernel. Decode graphs above this — and every piecewise prefill token

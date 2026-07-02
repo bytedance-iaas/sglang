@@ -446,9 +446,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             unified_asym_gemm_forward,
         )
 
-        if should_use_unified_asym_gemm_forward(
-            layer, dispatch_output.hidden_states.shape[0]
-        ):
+        if should_use_unified_asym_gemm_forward(layer):
             return unified_asym_gemm_forward(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
