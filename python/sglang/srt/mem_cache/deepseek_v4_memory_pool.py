@@ -1249,22 +1249,56 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         if old_state_locs.numel() == 0 or new_state_locs.numel() == 0:
             return
-        old_unique_state_locs = torch.unique(old_state_locs.to(torch.int64), sorted=True)
         new_unique_state_locs = torch.unique(new_state_locs.to(torch.int64), sorted=True)
-        if torch.equal(old_unique_state_locs, new_unique_state_locs):
+        saved_state_locs = saved_state_locs_cpu.to(device="cpu", dtype=torch.int64)
+        new_unique_state_locs_cpu = new_unique_state_locs.to(device="cpu")
+        if torch.equal(saved_state_locs, new_unique_state_locs_cpu):
             self._load_compress_state_pools(
                 copied_states, new_unique_state_locs, state_pools, compress_ratio
             )
             return
 
-        saved_state_locs = saved_state_locs_cpu.to(device="cpu", dtype=torch.int64)
         saved_rows = {int(loc): row for row, loc in enumerate(saved_state_locs.tolist())}
         new_to_old = {}
+        old_to_new = {}
+        missing_old_locs = set()
+        split_old_locs = {}
         for old_loc, new_loc in zip(
             old_state_locs.to("cpu").tolist(), new_state_locs.to("cpu").tolist()
         ):
-            if old_loc in saved_rows and new_loc not in new_to_old:
-                new_to_old[new_loc] = old_loc
+            old_loc = int(old_loc)
+            new_loc = int(new_loc)
+            if old_loc not in saved_rows:
+                missing_old_locs.add(old_loc)
+                continue
+            existing_new_loc = old_to_new.setdefault(old_loc, new_loc)
+            if existing_new_loc != new_loc:
+                split_old_locs.setdefault(old_loc, set()).update(
+                    [existing_new_loc, new_loc]
+                )
+                continue
+            # If multiple old state slots collapse to the same target slot after
+            # SWA remap, the later row corresponds to the newer token state.
+            new_to_old[new_loc] = old_loc
+
+        if missing_old_locs:
+            raise RuntimeError(
+                "DSV4 KV offload/load remapped state missing saved rows: "
+                f"missing_old_locs={sorted(missing_old_locs)[:8]}, "
+                f"saved_state_locs={saved_state_locs.tolist()[:8]}, "
+                f"compress_ratio={compress_ratio}."
+            )
+        if split_old_locs:
+            split_preview = {
+                old_loc: sorted(new_locs)[:4]
+                for old_loc, new_locs in list(split_old_locs.items())[:4]
+            }
+            raise RuntimeError(
+                "DSV4 KV offload/load cannot split one saved compress state "
+                "row into multiple target state rows: "
+                f"split_old_locs={split_preview}, "
+                f"compress_ratio={compress_ratio}."
+            )
 
         if not new_to_old:
             return
@@ -1286,6 +1320,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 or self.compression_ratios[layer_id] != compress_ratio
             ):
                 continue
+            if copied_state.shape[0] != saved_state_locs.numel():
+                raise RuntimeError(
+                    "DSV4 KV offload/load saved state row mismatch: "
+                    f"saved_rows={copied_state.shape[0]}, "
+                    f"saved_state_locs={saved_state_locs.numel()}, "
+                    f"target={target_locs.numel()}."
+                )
             pool.set_state_by_state_loc(
                 target_locs,
                 KVAndScore(
