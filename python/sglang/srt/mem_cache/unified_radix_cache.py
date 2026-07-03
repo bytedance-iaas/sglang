@@ -266,7 +266,19 @@ class UnifiedRadixCache(BasePrefixCache):
         if sliding_window_size is None or sliding_window_size <= 0:
             tail_len = min(protected_len, self.page_size)
         else:
-            tail_len = min(protected_len, max(self.page_size, sliding_window_size))
+            tail_limit = max(self.page_size, sliding_window_size)
+            if self.hisparse_mode:
+                # DSV4 HiSparse decode keeps SWA as a live request tail while the
+                # decode radix node is full-only.  The live tail can be one page
+                # larger than the nominal window because SWA eviction is page
+                # aligned, so release the same upper bound used by admission.
+                tail_limit = max(
+                    self.page_size, sliding_window_size + self.page_size - 1
+                )
+            tail_len = min(
+                protected_len,
+                tail_limit,
+            )
         return values[protected_len - tail_len :]
 
     def enable_hisparse_mode(self) -> None:
