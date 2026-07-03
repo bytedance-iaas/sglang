@@ -973,6 +973,28 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
             else:
                 PoolCls = DSATokenToKVPool
+
+            if (
+                not self.enable_hisparse
+                and dsa_cp_layer_shard_rank is None
+                and PoolCls is DSATokenToKVPool
+            ):
+                # Compact only the regular target DSA pool. HiSparse has a
+                # different host/device layout, CP layer-split owns a subset of
+                # layers per rank, and NEXTN draft layers own real indexer state.
+                from sglang.srt.mem_cache.memory_pool import (
+                    dsa_compact_indexer_layer_mask,
+                )
+
+                compact_mask = dsa_compact_indexer_layer_mask(
+                    self.model_config.hf_config,
+                    self.num_effective_layers,
+                    self.start_layer,
+                    self.end_layer,
+                    is_draft_worker=self.is_draft_worker,
+                )
+                if compact_mask is not None:
+                    pool_kwargs["indexer_layer_mask"] = compact_mask
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

@@ -31,7 +31,10 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    dsa_compact_indexer_layer_mask,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -216,9 +219,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
-                )
+                indexer_layers = effective_num_layers
+                compact_mask = None
+                if (
+                    effective_num_layers == num_layers
+                    and not getattr(mr, "enable_hisparse", False)
+                ):
+                    compact_mask = dsa_compact_indexer_layer_mask(
+                        model_config.hf_config,
+                        num_layers,
+                        mr.start_layer,
+                        mr.end_layer,
+                        is_draft_worker=mr.is_draft_worker,
+                    )
+                if compact_mask is not None:
+                    # real buffers + one shared alias -- must match the pool actual
+                    # allocation or the freed VRAM never becomes extra tokens
+                    indexer_layers = sum(compact_mask) + 1
+                cell_size += indexer_size_per_token * indexer_layers * element_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
