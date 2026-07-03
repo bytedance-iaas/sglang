@@ -376,6 +376,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.max_running_requests = server_args.max_running_requests
         self.hisparse_top_k = 0
         self.hisparse_device_buffer_size = 0
+        self.hisparse_min_device_buffer_size = 0
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import (
                 parse_hisparse_config,
@@ -388,6 +389,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 server_args, cfg.hf_text_config
             )
             self.hisparse_device_buffer_size = hisparse_cfg.device_buffer_size
+            self.hisparse_min_device_buffer_size = (
+                hisparse_cfg.min_device_buffer_size
+                or hisparse_cfg.device_buffer_size
+            )
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -473,7 +478,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             bytes_per_full_token += 1 / max(1, self.swa_page_size)
         return bytes_per_full_token
 
-    def _estimate_hisparse_req_slots(self) -> int:
+    def _estimate_hisparse_req_slot_counts(self) -> tuple[int, int, int]:
         max_num_reqs = self.max_running_requests
         if max_num_reqs is not None:
             max_num_reqs = max(1, int(max_num_reqs) // max(1, int(self.dp_size)))
@@ -490,7 +495,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             elif pre_alloc_size == 0 and self.enable_hisparse:
                 pre_alloc_size = max_num_reqs
 
-        return max_num_reqs + int(pre_alloc_size) + 1
+        return max_num_reqs, int(pre_alloc_size), max_num_reqs + int(pre_alloc_size) + 1
+
+    def _estimate_hisparse_req_slots(self) -> int:
+        return self._estimate_hisparse_req_slot_counts()[2]
 
     def _estimate_c128_state_pool_size(self) -> int:
         req_slots = self._estimate_hisparse_req_slots()
@@ -553,8 +561,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         uint64_bytes = 8
 
         overhead = 0
+        # Keep this aligned with HiSparseCoordinator's fixed tensors.
         overhead += req_slots * padded_buffer_size * int64_bytes
-        overhead += req_slots * (max_compressed_context_len + c4_page_size) * int64_bytes
+        overhead += req_slots * (max_compressed_context_len + 1) * int64_bytes
         overhead += 2 * c4_layers * req_slots * padded_buffer_size * int32_bytes
         overhead += c4_layers * req_slots * self.hisparse_device_buffer_size * int16_bytes
         overhead += self.hisparse_device_buffer_size * int16_bytes
@@ -562,6 +571,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         overhead += 2 * topk_work_buffer_rows * self.hisparse_top_k * int32_bytes
         overhead += c4_layers * uint64_bytes
         overhead += (c4_page_size + 1) * int64_bytes
+        overhead += req_slots * int32_bytes
         return int(overhead)
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
@@ -627,14 +637,34 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             effective_available_bytes = 0
         full_token = int(effective_available_bytes / self.bytes_per_full_token)
         sizes = self._compute_dsv4_sizes(full_token, page_size)
+        c4_hot_required_slots = 0
+        c4_hot_running_capacity = 0
+        c4_hot_target_reqs = 0
+        max_req_slots, prealloc_slots, req_slots = (
+            self._estimate_hisparse_req_slot_counts()
+        )
+        topk_work_buffer_rows = self._estimate_hisparse_topk_work_buffer_rows()
+        c4_page_size = max(1, page_size // 4)
+        if self.enable_hisparse:
+            c4_hot_required_slots = (
+                self.hisparse_min_device_buffer_size + c4_page_size
+            )
+            c4_hot_running_capacity = sizes.c4_max_total_num_tokens // max(
+                1, c4_hot_required_slots
+            )
+            c4_hot_target_reqs = max_req_slots
         if fixed_overhead_bytes > 0:
             logger.info(
                 "DSV4 memory calculation: "
                 "bytes_per_full_token=%.2f, raw_available_bytes=%.2f GB, "
                 "hisparse_fixed_overhead=%.2f GB, c128_state_fixed_overhead=%.2f GB, "
                 "effective_available_bytes=%.2f GB, "
-                "full_token=%d, c4_shrink_factor=%s, req_slots=%d, "
+                "full_token=%d, "
+                "c4_shrink_factor=%s, max_req_slots=%d, prealloc_slots=%d, "
+                "req_slots=%d, topk_work_buffer_rows=%d, c4_page_size=%d, "
                 "padded_buffer_size=%d, top_k=%d, device_buffer_size=%d, "
+                "min_device_buffer_size=%d, c4_hot_required_slots=%d, "
+                "c4_hot_running_capacity=%d, c4_hot_target_reqs=%d, "
                 "online_c128_mtp_max_draft_tokens=%d",
                 self.bytes_per_full_token,
                 available_bytes / (1 << 30),
@@ -643,12 +673,36 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 effective_available_bytes / (1 << 30),
                 sizes.full_max_total_num_tokens,
                 self.c4_shrink_factor,
-                self._estimate_hisparse_req_slots(),
-                self.hisparse_device_buffer_size + max(1, page_size // 4),
+                max_req_slots,
+                prealloc_slots,
+                req_slots,
+                topk_work_buffer_rows,
+                c4_page_size,
+                self.hisparse_device_buffer_size + c4_page_size,
                 self.hisparse_top_k,
                 self.hisparse_device_buffer_size,
+                self.hisparse_min_device_buffer_size,
+                c4_hot_required_slots,
+                c4_hot_running_capacity,
+                c4_hot_target_reqs,
                 self.online_c128_mtp_max_draft_tokens,
             )
+            if (
+                self.enable_hisparse
+                and c4_hot_target_reqs > 0
+                and c4_hot_running_capacity < c4_hot_target_reqs
+            ):
+                logger.warning(
+                    "DSV4 HiSparse C4 hot pool is below target running requests: "
+                    "c4_hot_running_capacity=%d, c4_hot_target_reqs=%d, "
+                    "c4_hot_required_slots=%d, final_c4_tokens=%d. "
+                    "Admission can be limited by hisparse_c4_hot_req_budget; "
+                    "increase C4 device pool or lower target concurrency.",
+                    c4_hot_running_capacity,
+                    c4_hot_target_reqs,
+                    c4_hot_required_slots,
+                    sizes.c4_max_total_num_tokens,
+                )
         else:
             logger.info(
                 f"DSV4 memory calculation: "
