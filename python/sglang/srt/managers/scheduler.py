@@ -488,6 +488,7 @@ class Scheduler(
                 ),
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
+                hisparse_coordinator=self.hisparse_coordinator,
             )
         else:
             self.decode_offload_manager = None
@@ -1661,6 +1662,21 @@ class Scheduler(
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
+        requested_max_new_tokens = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        if self._defer_input_length_validation_to_decode_prealloc(req):
+            req.sampling_params.max_new_tokens = max(
+                0,
+                min(
+                    requested_max_new_tokens,
+                    self.model_config.context_len - input_len - 1,
+                ),
+            )
+            return
+
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
@@ -1670,15 +1686,29 @@ class Scheduler(
         req.sampling_params.max_new_tokens = max(
             0,
             min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
+                requested_max_new_tokens,
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
+
+    def _defer_input_length_validation_to_decode_prealloc(self, req: Req) -> bool:
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            return False
+        if self.server_args.allow_auto_truncate:
+            return False
+        if len(req.origin_input_ids) <= self.max_req_input_len:
+            return False
+        if len(req.origin_input_ids) >= self.model_config.context_len - 1:
+            return False
+
+        prealloc_queue = self.disagg_decode_prealloc_queue
+        if prealloc_queue is None:
+            return False
+        can_probe_safe_prefix = getattr(
+            prealloc_queue, "_can_probe_dsv4_safe_prefix", None
+        )
+        return bool(can_probe_safe_prefix and can_probe_safe_prefix())
 
     def _process_and_broadcast_mm_inputs(
         self,
@@ -1944,11 +1974,13 @@ class Scheduler(
         self.init_req_max_new_tokens(req)
 
         # Validate prompt length
-        error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
-        )
+        error_msg = None
+        if not self._defer_input_length_validation_to_decode_prealloc(req):
+            error_msg = validate_input_length(
+                req,
+                self.max_req_input_len,
+                self.server_args.allow_auto_truncate,
+            )
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
@@ -2214,11 +2246,13 @@ class Scheduler(
                 return
 
         # Validate prompts length
-        error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
-        )
+        error_msg = None
+        if not self._defer_input_length_validation_to_decode_prealloc(req):
+            error_msg = validate_input_length(
+                req,
+                self.max_req_input_len,
+                self.server_args.allow_auto_truncate,
+            )
         if error_msg:
             self._add_request_to_queue(req)
             return
@@ -3221,6 +3255,9 @@ class Scheduler(
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                    idle &= len(self.decode_offload_manager.ongoing_backup) == 0
+                    idle &= len(self.decode_offload_manager.aborted_req_ids) == 0
+                    idle &= len(self.decode_offload_manager.offloaded_state) == 0
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -3360,7 +3397,15 @@ class Scheduler(
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}, "
+                f"#decode-offload-write: "
+                f"{len(self.decode_offload_manager.ongoing_offload) if self.decode_offload_manager is not None else 0}, "
+                f"#decode-offload-backup: "
+                f"{len(self.decode_offload_manager.ongoing_backup) if self.decode_offload_manager is not None else 0}, "
+                f"#decode-offload-abort: "
+                f"{len(self.decode_offload_manager.aborted_req_ids) if self.decode_offload_manager is not None else 0}, "
+                f"#decode-offload-state: "
+                f"{len(self.decode_offload_manager.offloaded_state) if self.decode_offload_manager is not None else 0}"
             )
             success = False
         return success
@@ -3470,7 +3515,9 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
-        # todo hisparse, release resources for abort requests in hisparse coordinator
+        # Decode disaggregation can hold KV/HiSparse state before a request
+        # reaches running.  Each queue below owns its own cleanup path; running
+        # requests are drained only at a safe non-inflight boundary.
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3489,13 +3536,21 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if self.enable_hisparse and self.hisparse_coordinator is not None:
-                    req.finished_reason = req.finished_reason or FINISH_ABORT()
-                    self.batch_result_processor.flush_online_c128_pending_for_reqs(
-                        [req]
-                    )
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                if req.req_pool_idx is not None:
+                    if self.enable_hisparse and self.hisparse_coordinator is not None:
+                        req.finished_reason = req.finished_reason or FINISH_ABORT()
+                        self.batch_result_processor.flush_online_c128_pending_for_reqs(
+                            [req],
+                            require_forward_progress=False,
+                        )
+                    if self.decode_offload_manager is not None:
+                        self.decode_offload_manager.release_on_abort(req)
+                    else:
+                        if self.enable_hisparse and self.hisparse_coordinator is not None:
+                            self.hisparse_coordinator.request_finished(req)
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                elif self.decode_offload_manager is not None:
+                    self.decode_offload_manager.abort_request(req)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
@@ -3548,8 +3603,21 @@ class Scheduler(
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        assert hasattr(decode_req, "kv_cache_cpu")
-                        del decode_req.kv_cache_cpu
+                        decode_req.finished_reason = (
+                            decode_req.finished_reason or FINISH_ABORT()
+                        )
+                        if self.decode_offload_manager is not None:
+                            self.decode_offload_manager.release_on_abort(decode_req)
+                        elif decode_req.req_pool_idx is not None:
+                            if self.enable_hisparse and self.hisparse_coordinator:
+                                self.batch_result_processor.flush_online_c128_pending_for_reqs(
+                                    [decode_req],
+                                    require_forward_progress=False,
+                                )
+                                self.hisparse_coordinator.request_finished(decode_req)
+                            release_kv_cache(decode_req, self.tree_cache, is_insert=False)
+                        if hasattr(decode_req, "kv_cache_cpu"):
+                            del decode_req.kv_cache_cpu
                         if self.enable_hisparse and self.hisparse_coordinator:
                             self.hisparse_coordinator.release_retracted_decode_req(
                                 decode_req
@@ -3576,6 +3644,62 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                if self.decode_offload_manager is not None:
+                    self.decode_offload_manager.abort_request(req)
+
+        self._drain_aborted_hisparse_decode_running_reqs(recv_req)
+
+    def _drain_aborted_hisparse_decode_running_reqs(self, recv_req: AbortReq) -> None:
+        if not (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.enable_hisparse
+            and self.hisparse_coordinator is not None
+        ):
+            return
+        if self.running_batch.is_empty():
+            return
+
+        # Do not release KV that may still be referenced by an in-flight forward.
+        # Those requests keep the existing to_finish path and are released by the
+        # normal batch-result processor on the next safe boundary.
+        if self.cur_batch is not None or self.last_batch is not None:
+            return
+
+        aborted_reqs = [
+            req
+            for req in self.running_batch.reqs
+            if req.to_finish is not None
+            and (recv_req.abort_all or req.rid.startswith(recv_req.rid))
+            and not req.finished()
+        ]
+        if not aborted_reqs:
+            return
+
+        use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
+        if use_free_group:
+            self.token_to_kv_pool_allocator.free_group_begin()
+        try:
+            for req in aborted_reqs:
+                req.finished_reason = req.to_finish
+                req.to_finish = None
+                self.batch_result_processor.flush_online_c128_pending_for_reqs(
+                    [req],
+                    require_forward_progress=False,
+                )
+                if self.decode_offload_manager is not None:
+                    self.decode_offload_manager.release_on_abort(req)
+                else:
+                    self.hisparse_coordinator.request_finished(req)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                req.time_stats.set_completion_time()
+                self.output_streamer.stream_output([req], req.return_logprob)
+        finally:
+            if use_free_group:
+                self.token_to_kv_pool_allocator.free_group_end()
+
+        self.running_batch.filter_batch(v1_spec_info_filtered=True)
+        if self.running_batch.is_empty():
+            self.running_batch.batch_is_full = False
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -3622,7 +3746,18 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                retracted_reqs, reqs_to_abort = self.running_batch.retract_all(
+                    self.server_args
+                )
+                for req in reqs_to_abort:
+                    abort_reason: FINISH_ABORT = req.to_finish
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(
+                            finished_reason=abort_reason.to_json(),
+                            rid=req.rid,
+                        ),
+                        req,
+                    )
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 

@@ -1320,15 +1320,21 @@ class Req(ReqDllmMixin):
             self.output_ids = []
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        req_pool_idx = self.req_pool_idx
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
+            req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices,
             mamba_indices=self.mamba_pool_idx,
-            req_pool_idx=self.req_pool_idx,
+            req_pool_idx=req_pool_idx,
         )
+        get_kvcache = getattr(token_to_kv_pool_allocator, "get_kvcache", None)
+        if get_kvcache is not None:
+            clear_c128_state = getattr(get_kvcache(), "clear_c128_req_state", None)
+            if clear_c128_state is not None:
+                clear_c128_state(int(req_pool_idx))
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2552,12 +2558,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return False
 
     def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = self.reqs
+        retracted_reqs: List[Req] = []
+        reqs_to_abort: List[Req] = []
         for idx in range(len(self.reqs)):
+            req = self.reqs[idx]
             self.release_req(idx, len(self.reqs) - idx, server_args)
+            if isinstance(req.to_finish, FINISH_ABORT):
+                reqs_to_abort.append(req)
+            else:
+                retracted_reqs.append(req)
 
-        self.filter_batch(retracted_reqs)
-        return retracted_reqs
+        self.filter_batch(keep_indices=[])
+        return retracted_reqs, reqs_to_abort
 
     def retract_decode(
         self, server_args: ServerArgs
@@ -2580,6 +2592,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2591,11 +2604,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
+            if isinstance(req.to_finish, FINISH_ABORT):
+                reqs_to_abort.append(req)
+            else:
+                retracted_reqs.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2625,20 +2640,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+        abort_without_retract = isinstance(req.to_finish, FINISH_ABORT)
+        if abort_without_retract:
+            req.finished_reason = req.to_finish
 
-        if self.hisparse_coordinator is not None and not req.finished():
-            if (
+        if self.hisparse_coordinator is not None:
+            if abort_without_retract:
+                self.hisparse_coordinator.request_finished(req)
+            elif not req.finished() and (
                 server_args.disaggregation_mode == "decode"
                 and self.hisparse_coordinator.is_dsv4_hisparse
             ):
                 self.hisparse_coordinator.retract_decode_req(req)
-            else:
+            elif not req.finished():
                 self.hisparse_coordinator.retract_req(req)
 
-        if server_args.disaggregation_mode == "decode":
-            req.offload_kv_cache(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
+        if server_args.disaggregation_mode == "decode" and not abort_without_retract:
+            try:
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to offload retracted decode request %s", req.rid
+                )
+                req.to_finish = FINISH_ABORT(
+                    "Failed to offload retracted decode request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                if (
+                    self.hisparse_coordinator is not None
+                    and self.hisparse_coordinator.is_dsv4_hisparse
+                ):
+                    self.hisparse_coordinator.release_retracted_decode_req(req)
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2653,6 +2687,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and self.decode_mem_block_reason == "logical_pages"
             ),
         )
+
+        if isinstance(req.to_finish, FINISH_ABORT):
+            return
 
         req.reset_for_retract()
 
@@ -3006,13 +3043,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.tree_cache.page_size,
                 )
             )
-            eviction_interval = max(
-                page_size,
-                int(
-                    sliding_window_size
-                    * envs.SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER.get()
-                ),
+            is_dsv4_hisparse_full_only_swa = (
+                supports_swa_allocator
+                and not supports_swa_cache
+                and self.hisparse_coordinator is not None
+                and getattr(self.hisparse_coordinator, "is_dsv4_hisparse", False)
             )
+            if is_dsv4_hisparse_full_only_swa:
+                # DSV4 HiSparse keeps decode radix FULL-only, so SWA is owned
+                # only by the live request tail.  Evict at page granularity to
+                # preserve sliding-window semantics; otherwise short generations
+                # below `sliding_window_size` can grow SWA as tail + output.
+                eviction_interval = page_size
+            else:
+                eviction_interval = max(
+                    page_size,
+                    int(
+                        sliding_window_size
+                        * envs.SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER.get()
+                    ),
+                )
             eviction_interval = (eviction_interval // page_size) * page_size
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():

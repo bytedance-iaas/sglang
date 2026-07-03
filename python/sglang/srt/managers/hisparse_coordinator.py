@@ -956,6 +956,42 @@ class HiSparseCoordinator:
         else:
             self._free_request_host_indices_from(req, 0)
 
+    def abort_partial_prealloc_req(self, req: Req) -> None:
+        """Release HiSparse state for a request that failed during prealloc.
+
+        This path is intentionally narrower than request_finished(): during
+        preallocation the req slot may exist before req_to_token has been fully
+        populated, so reading full KV locs would risk freeing stale row data.
+        Only release state tracked by the HiSparse coordinator itself.
+        """
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            return
+
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        clear_c128_state = getattr(kvcache, "clear_c128_req_state", None)
+        if clear_c128_state is not None:
+            clear_c128_state(int(req_pool_idx))
+        else:
+            clear_pending = getattr(kvcache, "clear_online_c128_mtp_pending", None)
+            if clear_pending is not None:
+                clear_pending(int(req_pool_idx))
+
+        self._free_device_buffer_slots(req)
+        if self.host_radix_cache is not None:
+            self._release_aborted_host_radix_slots(req)
+        elif self.is_dsv4_hisparse:
+            self._release_aborted_dsv4_c4_host_slots(req)
+        else:
+            self._free_request_host_indices_from(req, 0)
+        self._clear_request_runtime_state(req_pool_idx)
+        self._clear_c4_prefix_req_state(req_pool_idx)
+        self._debug_assert_request_state_cleared(req_pool_idx)
+
     def _release_or_cache_host_radix_slots(self, req: Req) -> None:
         total_len = self._prepare_radix_cache_len(
             req, self._host_token_len(req.kv_allocated_len)
@@ -2529,7 +2565,21 @@ class HiSparseCoordinator:
             return
 
         host_indices = getattr(req, "hisparse_retract_host_indices", None)
+        prefix_ref = getattr(req, "hisparse_retract_c4_prefix_ref", None)
         if host_indices is None:
+            released_indices = self._c4_prefix_cache.release_retained(prefix_ref)
+            if released_indices.numel() > 0:
+                self.mem_pool_host.free(released_indices)
+            for attr in (
+                "hisparse_retract_host_indices",
+                "hisparse_retract_host_len",
+                "hisparse_retract_c4_prefix_len",
+                "hisparse_retract_c4_written_len",
+                "hisparse_retract_host_written_len",
+                "hisparse_retract_c4_prefix_ref",
+            ):
+                if hasattr(req, attr):
+                    delattr(req, attr)
             return
 
         prefix_len = int(getattr(req, "hisparse_retract_c4_prefix_len", 0))
@@ -2541,7 +2591,7 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(torch.unique(suffix_indices))
 
         released_indices = self._c4_prefix_cache.release_retained(
-            getattr(req, "hisparse_retract_c4_prefix_ref", None)
+            prefix_ref
         )
         if released_indices.numel() > 0:
             self.mem_pool_host.free(released_indices)
@@ -2564,10 +2614,24 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            return
+
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
+
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+            clear_c128_state = getattr(kvcache, "clear_c128_req_state", None)
+            if clear_c128_state is not None:
+                clear_c128_state(int(req_pool_idx))
+            else:
+                clear_pending = getattr(kvcache, "clear_online_c128_mtp_pending", None)
+                if clear_pending is not None:
+                    clear_pending(int(req_pool_idx))
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -2581,11 +2645,11 @@ class HiSparseCoordinator:
 
         if self.is_dsv4_hisparse:
             compressed_locs = self._dsv4_c4_compressed_locs_for_prefix(
-                req.req_pool_idx, allocated_len
+                req_pool_idx, allocated_len
             )
         else:
             allocated_locs = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :allocated_len
+                req_pool_idx, :allocated_len
             ]
             compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -2600,9 +2664,9 @@ class HiSparseCoordinator:
         self._release_host_slots(req)
 
         # clear req info
-        self._clear_request_runtime_state(req.req_pool_idx)
-        self._clear_c4_prefix_req_state(req.req_pool_idx)
-        self._debug_assert_request_state_cleared(req.req_pool_idx)
+        self._clear_request_runtime_state(req_pool_idx)
+        self._clear_c4_prefix_req_state(req_pool_idx)
+        self._debug_assert_request_state_cleared(req_pool_idx)
 
     def _maybe_log_c4_swap_in_sample(
         self,
@@ -2648,26 +2712,58 @@ class HiSparseCoordinator:
             resident_tokens = self.req_device_buffer_tokens[
                 layer_id, resident_req_indices
             ]
-            resident = (top_tokens.unsqueeze(-1) == resident_tokens.unsqueeze(1)).any(
-                dim=-1
+            resident_slot_mask = None
+            if self.is_dsv4_hisparse:
+                hot_caps = self.req_device_hot_buffer_size_gpu[
+                    resident_req_indices
+                ].to(dtype=torch.long)
+                slot_ids = torch.arange(
+                    resident_tokens.size(1),
+                    dtype=torch.long,
+                    device=resident_tokens.device,
+                ).view(1, -1)
+                # DSV4 keeps a fixed max stride for graph stability, but only
+                # [0, hot_cap) plus the newest-token slot at hot_cap are live
+                # hot-buffer slots. Do not let stale padded-tail values make
+                # the sampled miss metric look better than the kernel path.
+                resident_slot_mask = slot_ids <= hot_caps.view(-1, 1)
+            resident_matches = top_tokens.unsqueeze(-1) == resident_tokens.unsqueeze(1)
+            if resident_slot_mask is not None:
+                resident_matches = resident_matches & resident_slot_mask.unsqueeze(1)
+            resident = resident_matches.any(dim=-1)
+            newest = top_tokens == (
+                compressed_seq_lens.view(-1, 1).to(top_tokens.device) - 1
             )
-            valid_count = int(valid.sum().item())
+            resident = resident | (valid & newest)
+            host_rows = self.req_to_host_pool[resident_req_indices]
+            host_in_range = top_tokens < host_rows.size(1)
+            safe_top_tokens = top_tokens.clamp(
+                min=0, max=max(host_rows.size(1) - 1, 0)
+            ).to(dtype=torch.long)
+            host_ready = host_in_range & (
+                torch.gather(host_rows, 1, safe_top_tokens) >= 0
+            )
             hit_count = int((resident & valid).sum().item())
-            miss_count = valid_count - hit_count
+            miss_count = int((~resident & valid & host_ready).sum().item())
+            measured_count = hit_count + miss_count
 
         self._c4_sampled_topk_hit_tokens += hit_count
         self._c4_sampled_topk_miss_tokens += miss_count
         self._c4_sampled_h2d_bytes += miss_count * self.item_size_bytes
 
         logger.info(
-            "HiSparse C4 swap-in sample: reqs=%d topk_tokens=%d hot_hits=%d "
+            "HiSparse C4 swap-in sample: reqs=%d measured_topk_tokens=%d hot_hits=%d "
             "host_misses=%d miss_rate=%.4f hot_buffer_size=%d top_k=%d",
             top_k_result.size(0),
-            valid_count,
+            measured_count,
             hit_count,
             miss_count,
-            miss_count / max(valid_count, 1),
-            self.device_buffer_size,
+            miss_count / max(measured_count, 1),
+            (
+                self.min_device_buffer_size
+                if self.is_dsv4_hisparse
+                else self.device_buffer_size
+            ),
             self.top_k,
         )
 
@@ -2711,7 +2807,10 @@ class HiSparseCoordinator:
             req_pool_indices, compressed_seq_lens, top_k_result, layer_id
         )
 
-        # todo, adjustable for performance
+        # Keep the production launch capacity aligned with the configured max
+        # device buffer. DSV4 still passes req_hot_buffer_sizes so the kernel can
+        # honor each request's effective hot cap; using the smaller min cap here
+        # changes the compiled launch shape and regresses the historical hot path.
         block_size = 1024
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
@@ -2784,12 +2883,40 @@ class HiSparseCoordinator:
                     resident_tokens = self.req_device_buffer_tokens[
                         layer_id, resident_req_indices
                     ]
-                    resident = (
+                    resident_slot_mask = None
+                    if self.is_dsv4_hisparse:
+                        hot_caps = self.req_device_hot_buffer_size_gpu[
+                            resident_req_indices
+                        ].to(dtype=torch.long)
+                        slot_ids = torch.arange(
+                            resident_tokens.size(1),
+                            dtype=torch.long,
+                            device=resident_tokens.device,
+                        ).view(1, -1)
+                        resident_slot_mask = slot_ids <= hot_caps.view(-1, 1)
+                    resident_matches = (
                         top_tokens.unsqueeze(-1) == resident_tokens.unsqueeze(1)
-                    ).any(dim=-1)
+                    )
+                    if resident_slot_mask is not None:
+                        resident_matches = (
+                            resident_matches & resident_slot_mask.unsqueeze(1)
+                        )
+                    resident = resident_matches.any(dim=-1)
+                    newest = top_tokens == (
+                        compressed_seq_lens.view(-1, 1).to(top_tokens.device) - 1
+                    )
+                    resident = resident | (valid & newest)
+                    host_rows = self.req_to_host_pool[resident_req_indices]
+                    host_in_range = top_tokens < host_rows.size(1)
+                    safe_top_tokens = top_tokens.clamp(
+                        min=0, max=max(host_rows.size(1) - 1, 0)
+                    ).to(dtype=torch.long)
+                    host_ready = host_in_range & (
+                        torch.gather(host_rows, 1, safe_top_tokens) >= 0
+                    )
                     valid_count = int(valid.sum().item())
                     hit_count = int((resident & valid).sum().item())
-                    miss_count = valid_count - hit_count
+                    miss_count = int((~resident & valid & host_ready).sum().item())
         except Exception as exc:
             hit_count = f"error:{type(exc).__name__}"
 
@@ -2798,7 +2925,7 @@ class HiSparseCoordinator:
             "c4_swap_in_result",
             layer_id=layer_id,
             top_k=self.top_k,
-            device_buffer_size=self.device_buffer_size,
+            device_buffer_size=self.min_device_buffer_size,
             valid_count=valid_count,
             hot_hit_count=hit_count,
             host_miss_count=miss_count,

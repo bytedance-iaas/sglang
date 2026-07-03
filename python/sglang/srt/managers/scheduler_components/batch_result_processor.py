@@ -16,7 +16,6 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.hisparse_accuracy_trace import trace_req
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -86,29 +85,37 @@ class SchedulerBatchResultProcessor:
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
-        for req in batch.reqs:
-            req.time_stats.set_decode_prebuilt_finish_time()
-            req.update_finish_state()
-            if req.finished():
-                req.time_stats.set_quick_finish_time()
-                self.flush_online_c128_pending_for_reqs(
-                    [req],
-                    require_forward_progress=not isinstance(
-                        req.finished_reason, FINISH_ABORT
-                    ),
-                )
-                if self.server_args.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(
-                    req,
-                    self.tree_cache,
-                    is_insert=not isinstance(req.finished_reason, FINISH_ABORT),
-                )
+        try:
+            for req in batch.reqs:
+                req.time_stats.set_decode_prebuilt_finish_time()
+                req.update_finish_state()
+                if req.finished():
+                    req.time_stats.set_quick_finish_time()
+                    self.flush_online_c128_pending_for_reqs(
+                        [req],
+                        require_forward_progress=not isinstance(
+                            req.finished_reason, FINISH_ABORT
+                        ),
+                    )
+                    if self.decode_offload_manager is not None:
+                        if isinstance(req.finished_reason, FINISH_ABORT):
+                            self.decode_offload_manager.release_on_abort(req)
+                        elif not self.decode_offload_manager.offload_kv_cache(req):
+                            self.decode_offload_manager.finalize_release_on_finish(req)
+                    else:
+                        if self.server_args.enable_hisparse:
+                            self.hisparse_coordinator.request_finished(req)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not isinstance(req.finished_reason, FINISH_ABORT),
+                        )
 
-        # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
-        if use_free_group:
-            self.token_to_kv_pool_allocator.free_group_end()
+            # Note: Logprobs should be handled on the prefill engine.
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        finally:
+            if use_free_group:
+                self.token_to_kv_pool_allocator.free_group_end()
 
     def _maybe_collect_routed_experts(self, req: Req):
         """Collect routed experts for a finished request.
@@ -623,73 +630,78 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        try:
 
-        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
-        # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+            # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
+            # in the verify phase. Non-spec and V2 handle them here in post-processing.
+            is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
-        for i, req in enumerate(batch.reqs):
-            req: Req
+            for i, req in enumerate(batch.reqs):
+                req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
+                if (self.enable_overlap or self.enable_overlap_mlx) and (
+                    req.finished() or req.is_retracted
+                ):
+                    # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+                    # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                    continue
 
-            if is_spec_v1:
+                if is_spec_v1:
+                    self._mamba_prefix_cache_update(req, batch, result, i)
+                    req.time_stats.set_last_decode_finish_time()
+                    self._handle_finished_req(req, i, logits_output)
+                    if (
+                        req.return_hidden_states
+                        and logits_output.hidden_states is not None
+                    ):
+                        req.hidden_states.append(
+                            logits_output.hidden_states[i].cpu().clone().tolist()
+                        )
+                    if req.grammar is not None:
+                        req.grammar.finished = req.finished()
+                    continue
+
+                # Non-spec and V2: full post-processing
+                next_token_id = next_token_ids[i]
+                new_accepted_len = 1
+                if batch.spec_algorithm.is_none():
+                    req.output_ids.append(next_token_id)
+                else:
+                    req.output_ids.extend(next_token_id)
+                    new_accepted_len = len(next_token_id)
+
+                self._maybe_update_reasoning_tokens(req, next_token_id)
+
+                # Update Mamba last track seqlen
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
+                req.update_finish_state(new_accepted_len)
+
                 self._handle_finished_req(req, i, logits_output)
+
+                if req.return_logprob:
+                    self._apply_decode_logprobs(
+                        req=req,
+                        i=i,
+                        batch=batch,
+                        next_token_id=next_token_id,
+                        next_token_logprobs=next_token_logprobs,
+                        logits_output=logits_output,
+                    )
+
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
+
                 if req.grammar is not None:
-                    req.grammar.finished = req.finished()
-                continue
+                    self._apply_decode_grammar(
+                        req=req, next_token_id=next_token_id, batch=batch
+                    )
 
-            # Non-spec and V2: full post-processing
-            next_token_id = next_token_ids[i]
-            new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
-            else:
-                req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
-
-            self._maybe_update_reasoning_tokens(req, next_token_id)
-
-            # Update Mamba last track seqlen
-            self._mamba_prefix_cache_update(req, batch, result, i)
-            req.time_stats.set_last_decode_finish_time()
-            req.update_finish_state(new_accepted_len)
-
-            self._handle_finished_req(req, i, logits_output)
-
-            if req.return_logprob:
-                self._apply_decode_logprobs(
-                    req=req,
-                    i=i,
-                    batch=batch,
-                    next_token_id=next_token_id,
-                    next_token_logprobs=next_token_logprobs,
-                    logits_output=logits_output,
-                )
-
-            if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
-
-            if req.grammar is not None:
-                self._apply_decode_grammar(
-                    req=req, next_token_id=next_token_id, batch=batch
-                )
-
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        finally:
+            self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1
@@ -815,27 +827,6 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            max_new_tokens = getattr(req.sampling_params, "max_new_tokens", None)
-            if self.server_args.enable_hisparse:
-                trace_req(
-                    logger,
-                    "decode_request_finished",
-                    req,
-                    finish_reason_type=type(req.finished_reason).__name__,
-                    finish_reason=req.finished_reason,
-                    finished_len=getattr(req, "finished_len", None),
-                    hit_max_new_tokens=(
-                        max_new_tokens is not None
-                        and len(req.output_ids) >= max_new_tokens
-                    ),
-                    max_new_tokens=max_new_tokens,
-                    is_abort=isinstance(req.finished_reason, FINISH_ABORT),
-                    is_retracted=getattr(req, "is_retracted", False),
-                    spec_verify_ct=getattr(req, "spec_verify_ct", None),
-                    spec_num_correct_drafts=getattr(
-                        req, "spec_num_correct_drafts", None
-                    ),
-                )
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
@@ -850,7 +841,9 @@ class SchedulerBatchResultProcessor:
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    self.decode_offload_manager.release_on_abort(req)
+                elif not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 if self.server_args.enable_hisparse:
