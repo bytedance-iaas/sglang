@@ -1765,7 +1765,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if comp.component_type == ComponentType.SWA:
                 window_pages = (
-                    getattr(comp, "sliding_window_size") + self.page_size - 1
+                    getattr(comp, "sliding_window_size", 0) + self.page_size - 1
                 ) // self.page_size
                 if window_pages == 0 or prefetch_pages < window_pages:
                     continue

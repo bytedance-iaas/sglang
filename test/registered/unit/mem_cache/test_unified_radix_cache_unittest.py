@@ -1522,7 +1522,6 @@ class UnifiedRadixCacheSuite:
         self.assertLess(b_pos, a_pos, "A was below B in pre, must stay below")
         tree.sanity_check()
 
-<<<<<<< /tmp/m-ours.py
     def test_swa_eager_eviction_on_unfinished_req(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest(
@@ -1615,8 +1614,6 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
-=======
->>>>>>> /tmp/m-theirs.py
     def test_swa_sanity_check_passes_after_deep_match(self):
         if not self._swa_pinning_cfg_supported():
             self.skipTest("requires SWA-only config with node size >= cushion")
