@@ -90,16 +90,14 @@ def _jit_topk1024_module() -> Module:
 
 
 @cache_once
-def _jit_topk_v2_module(topk: int) -> Module:
+def _jit_topk_v2_module() -> Module:
     return load_jit(
         make_name("topk_v2"),
-        str(topk),
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
-            ("topk_transform", "CombinedTopKKernel::transform"),
-            ("topk_plan", "CombinedTopKKernel::plan"),
+            ("topk_transform", "TopKKernel::transform"),
+            ("topk_plan", "TopKKernel::plan"),
         ],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
     )
 
 
@@ -399,14 +397,11 @@ def topk_transform_512(
     )
 
 
-_WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
-_PLAN_METADATA_INTS_PER_BATCH = 4
-_TOPK_V2_NUM_CLUSTERS = 15
-_TOPK_V2_FORCE_PLAN_FOR_SMALL_BATCH = 0xFFFFFFFF
+_PLAN_METADATA_INTS_PER_BATCH = 2
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
-    module = _jit_topk_v2_module(512)  # does not matter
+    module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
     module.topk_plan(seq_lens, metadata, static_threshold)
@@ -414,7 +409,7 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
 
 
 def new_topk_v2_workspace(seq_lens: torch.Tensor) -> torch.Tensor:
-    return seq_lens.new_empty(seq_lens.shape[0], _WORKSPACE_INTS_PER_BATCH)
+    return seq_lens.new_empty(seq_lens.shape[0])
 
 
 def topk_transform_512_v2(
@@ -428,24 +423,14 @@ def topk_transform_512_v2(
     workspace: Optional[torch.Tensor] = None,
     raw_indices_only: bool = False,
 ) -> None:
-    module = _jit_topk_v2_module(out_page_indices.shape[1])
-    bs = scores.shape[0]
-    if workspace is None:
-        workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
-    else:
-        workspace = workspace[:bs]
-    if raw_indices_only and bs <= _TOPK_V2_NUM_CLUSTERS:
-        # Raw-index output is consumed by HiSparse C4 swap-in. Avoid the
-        # small-batch fused CUDA path for this shape and force metadata planning
-        # so the two-stage path has valid work items.
-        module.topk_plan(seq_lens, metadata, _TOPK_V2_FORCE_PLAN_FOR_SMALL_BATCH)
+    del workspace
+    module = _jit_topk_v2_module()
     module.topk_transform(
         scores,
         seq_lens,
         page_tables,
         out_page_indices,
         page_size,
-        workspace,
         metadata,
         out_raw_indices,
         raw_indices_only,
