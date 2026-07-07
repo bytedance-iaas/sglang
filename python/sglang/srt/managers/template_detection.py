@@ -18,6 +18,7 @@ Provides rule-based detection of reasoning mode, reasoning parser, and tool-call
 parser from chat templates and tokenizer vocabularies.
 """
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -443,7 +444,7 @@ def resolve_auto_parsers(server_args) -> None:
     if not needs_reasoning and not needs_tool_call:
         return
 
-    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+    from sglang.srt.utils.hf_transformers_utils import get_config, get_tokenizer
 
     try:
         tokenizer = get_tokenizer(
@@ -451,6 +452,33 @@ def resolve_auto_parsers(server_args) -> None:
             trust_remote_code=server_args.trust_remote_code,
         )
         template = getattr(tokenizer, "chat_template", None)
+        if not template:
+            model_override_args = json.loads(server_args.json_model_override_args)
+            config = get_config(
+                server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                model_override_args=model_override_args,
+                model_config_parser=server_args.model_config_parser,
+            )
+            text_config = getattr(config, "text_config", None)
+            template = next(
+                (
+                    candidate
+                    for candidate in (
+                        getattr(config, "chat_template_jinja", None),
+                        getattr(config, "chat_template", None),
+                        getattr(text_config, "chat_template_jinja", None)
+                        if text_config
+                        else None,
+                        getattr(text_config, "chat_template", None)
+                        if text_config
+                        else None,
+                    )
+                    if candidate
+                ),
+                None,
+            )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
         if needs_reasoning:

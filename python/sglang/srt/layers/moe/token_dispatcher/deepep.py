@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -66,6 +68,97 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+_SM90_MXFP8_COMBINE_DEBUG_EVENTS = 0
+
+
+def _sm90_mxfp8_combine_debug_enabled() -> bool:
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG") != "1":
+        return False
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
+        return False
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_tensor_meta(t: torch.Tensor) -> dict:
+    return {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "device": str(t.device),
+        "numel": t.numel(),
+    }
+
+
+def _sm90_mxfp8_tensor_stats(t: torch.Tensor, *, sample_cols: int) -> dict:
+    if t.numel() == 0:
+        return {"numel": 0, "is_empty": True}
+    sample = t
+    if t.dim() >= 2:
+        sample = t[: min(t.shape[0], 4), : min(t.shape[1], sample_cols)]
+    else:
+        sample = t[: min(t.numel(), sample_cols)]
+    sample = sample.to(torch.float32).reshape(-1)
+    finite = torch.isfinite(sample)
+    finite_count = int(finite.sum().item())
+    stats = {
+        "sample_numel": sample.numel(),
+        "finite_count": finite_count,
+        "nan_count": int(torch.isnan(sample).sum().item()),
+        "inf_count": int(torch.isinf(sample).sum().item()),
+        "isfinite": finite_count == sample.numel(),
+    }
+    if finite_count > 0:
+        finite_sample = sample[finite]
+        stats.update(
+            {
+                "sample_mean": float(finite_sample.mean().item()),
+                "sample_absmax": float(finite_sample.abs().max().item()),
+            }
+        )
+    return stats
+
+
+def _sm90_mxfp8_combine_debug_report(
+    *,
+    location: str,
+    before_combine: torch.Tensor,
+    after_combine: torch.Tensor,
+) -> None:
+    global _SM90_MXFP8_COMBINE_DEBUG_EVENTS
+    if not _sm90_mxfp8_combine_debug_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_COMBINE_MAX_EVENTS", "8"))
+    if _SM90_MXFP8_COMBINE_DEBUG_EVENTS >= max_events:
+        return
+    if after_combine.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_COMBINE_DEBUG_EVENTS += 1
+
+    sample_cols = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_COMBINE_K", "256"))
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H11",
+        "location": location,
+        "msg": "[DEBUG] SM90 MXFP8 DeepEP normal combine boundary stats",
+        "data": {
+            "before_combine": _sm90_mxfp8_tensor_meta(before_combine),
+            "after_combine": _sm90_mxfp8_tensor_meta(after_combine),
+            "before_stats": _sm90_mxfp8_tensor_stats(
+                before_combine, sample_cols=sample_cols
+            ),
+            "after_stats": _sm90_mxfp8_tensor_stats(
+                after_combine, sample_cols=sample_cols
+            ),
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -392,6 +485,14 @@ class _DeepEPDispatcherImplBase:
         self.quant_config = quant_config
         self.set_deepep_dispatcher_dtype()
 
+    def use_sm90_mxfp8_deepgemm(self) -> bool:
+        return (
+            self.use_fp8
+            and self.quant_config is not None
+            and self.quant_config.get("use_mxfp8", False)
+            and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
+        )
+
     def set_deepep_dispatcher_dtype(self) -> None:
         self.deepep_output_dtype = get_deepep_output_dtype(self)
 
@@ -482,14 +583,21 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and self.use_fp8
+        ):
             # TODO hard code 128 block quant,use fp8 communication
+            use_ue8m0_scales = (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                or self.use_sm90_mxfp8_deepgemm()
+            )
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
                 128,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                column_major_scales=use_ue8m0_scales,
+                scale_tma_aligned=use_ue8m0_scales,
+                scale_ue8m0=use_ue8m0_scales,
             )
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
@@ -597,6 +705,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        _sm90_mxfp8_combine_debug_report(
+            location="deepep.py:_DeepEPDispatcherImplNormal.combine_b:combine_boundary",
+            before_combine=output,
+            after_combine=hidden_states,
+        )
         self.handle = None
         self.src2dst = None
         return hidden_states
@@ -702,6 +815,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        dispatch_fp8 = self.use_fp8
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -709,11 +823,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         fp8_deepgemm_scale_opts = (
             dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and (
+                    deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                    or self.use_sm90_mxfp8_deepgemm()
+                ),
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and (
+                    deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                    or self.use_sm90_mxfp8_deepgemm()
+                ),
             )
-            if self.use_fp8
+            if dispatch_fp8
             else dict()
         )
 
@@ -725,7 +845,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
+                use_fp8=dispatch_fp8,
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)

@@ -15,7 +15,9 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M3 model compatible with HuggingFace weights."""
 
+import json
 import logging
+import os
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -123,6 +125,115 @@ if _is_hip:
         _has_rocm_qk_norm_rope = False
 
 logger = logging.getLogger(__name__)
+
+_SM90_MXFP8_H12_EVENTS = 0
+
+
+def _sm90_mxfp8_h12_enabled() -> bool:
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG") != "1":
+        return False
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
+        return False
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_h12_layer_enabled(layer_id: Optional[int]) -> bool:
+    if layer_id is None:
+        return True
+    layers = os.environ.get(
+        "SGLANG_SM90_MXFP8_DEBUG_MODEL_LAYERS", "0,1,2,3,10,30,59"
+    )
+    if layers == "*":
+        return True
+    try:
+        return layer_id in {int(x.strip()) for x in layers.split(",") if x.strip()}
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_h12_tensor_stats(t: Optional[torch.Tensor]) -> dict:
+    if not _sm90_mxfp8_h12_enabled():
+        return {}
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return {"skipped_during_capture": True}
+    if t is None:
+        return {"is_none": True}
+    data = {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "device": str(t.device),
+        "numel": t.numel(),
+    }
+    if t.numel() == 0:
+        data["is_empty"] = True
+        return data
+    sample_k = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MODEL_K", "256"))
+    sample = t.detach().reshape(-1)[:sample_k]
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz):
+        sample = sample.to(torch.float32)
+    elif not torch.is_floating_point(sample):
+        data["sample_values"] = sample[: min(sample.numel(), 16)].cpu().tolist()
+        return data
+    else:
+        sample = sample.to(torch.float32)
+    finite = torch.isfinite(sample)
+    data.update(
+        {
+            "sample_numel": sample.numel(),
+            "finite_count": int(finite.sum().item()),
+            "nan_count": int(torch.isnan(sample).sum().item()),
+            "inf_count": int(torch.isinf(sample).sum().item()),
+            "isfinite": bool(finite.all().item()),
+        }
+    )
+    if finite.any():
+        finite_sample = sample[finite]
+        data.update(
+            {
+                "sample_mean": float(finite_sample.mean().item()),
+                "sample_absmax": float(finite_sample.abs().max().item()),
+            }
+        )
+    return data
+
+
+def _sm90_mxfp8_h12_tensor_dict(**tensors: Optional[torch.Tensor]) -> dict:
+    return {name: _sm90_mxfp8_h12_tensor_stats(t) for name, t in tensors.items()}
+
+
+def _sm90_mxfp8_h12_report(
+    location: str,
+    *,
+    layer_id: Optional[int] = None,
+    data: Optional[dict] = None,
+) -> None:
+    global _SM90_MXFP8_H12_EVENTS
+    if not _sm90_mxfp8_h12_enabled():
+        return
+    if not _sm90_mxfp8_h12_layer_enabled(layer_id):
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_MODEL_MAX_EVENTS", "512"))
+    if _SM90_MXFP8_H12_EVENTS >= max_events:
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_H12_EVENTS += 1
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H12",
+        "location": location,
+        "msg": "[DEBUG] SM90 MiniMax model path boundary stats",
+        "data": {"layer_id": layer_id, **(data or {})},
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -512,6 +623,7 @@ class MiniMaxM3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
         self.is_sparse_attention_layer = is_sparse_attention_layer
         self.disable_index_value = is_sparse_attention_layer and disable_index_value
 
@@ -560,11 +672,12 @@ class MiniMaxM3Attention(nn.Module):
         # Sparse-attention-specific config (read from sparse_attention_config).
         # Only the index-branch dimensions are needed at module level; all
         # block/topk/local/init knobs live in the sparse attention backend.
-        if self.is_sparse_attention_layer:
+        if self.is_sparse_attention_layer and self.use_qk_norm:
             assert self.qk_norm_type == "per_head", (
                 f"sparse attention only supports qk_norm_type='per_head', "
                 f"got {self.qk_norm_type!r}"
             )
+        if self.is_sparse_attention_layer:
             assert (
                 not self.attention_output_gate
             ), "sparse attention does not support attention_output_gate"
@@ -661,61 +774,67 @@ class MiniMaxM3Attention(nn.Module):
                 )
             self.index_rotary_emb = self.rotary_emb
 
-        # QK Normalization layers
-        # Use RMSNormTP for proper tensor parallel support
-        # Use total dimensions (before TP sharding) for correct normalization
-        if self.qk_norm_type == "per_layer":
-            if attn_tp_size > 1:
-                self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-                self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-            else:
-                self.q_norm = RMSNorm(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-                self.k_norm = RMSNorm(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-        elif self.qk_norm_type == "per_head":
-            if self.use_gemma_norm:
-                self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            else:
-                self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            if self.is_sparse_attention_layer:
-                if self.use_gemma_norm:
-                    self.index_q_norm = GemmaRMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+        if self.use_qk_norm:
+            # Use RMSNormTP for proper tensor parallel support. Per-layer norm
+            # weights are defined over the global Q/K widths and sharded here.
+            if self.qk_norm_type == "per_layer":
+                if attn_tp_size > 1:
+                    self.q_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_heads * self.head_dim,
+                        num_heads=self.total_num_heads,
+                        eps=config.rms_norm_eps,
                     )
-                    self.index_k_norm = GemmaRMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+                    self.k_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_kv_heads * self.head_dim,
+                        num_heads=self.total_num_kv_heads,
+                        eps=config.rms_norm_eps,
                     )
                 else:
-                    self.index_q_norm = RMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+                    self.q_norm = RMSNorm(
+                        self.total_num_heads * self.head_dim,
+                        eps=config.rms_norm_eps,
                     )
-                    self.index_k_norm = RMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+                    self.k_norm = RMSNorm(
+                        self.total_num_kv_heads * self.head_dim,
+                        eps=config.rms_norm_eps,
                     )
-        elif self.qk_norm_type == "multi_head":
-            self.q_norm = MultiHeadRMSNorm(
-                self.total_num_heads,
-                self.head_dim,
-                eps=config.rms_norm_eps,
-                apply_layernorm_1p=self.use_gemma_norm,
-            )
-            self.k_norm = MultiHeadRMSNorm(
-                self.total_num_kv_heads,
-                self.head_dim,
-                eps=config.rms_norm_eps,
-                apply_layernorm_1p=self.use_gemma_norm,
-            )
-        else:
-            raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
+            elif self.qk_norm_type == "per_head":
+                if self.use_gemma_norm:
+                    self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                    self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                else:
+                    self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                    self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                if self.is_sparse_attention_layer:
+                    if self.use_gemma_norm:
+                        self.index_q_norm = GemmaRMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+                        self.index_k_norm = GemmaRMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+                    else:
+                        self.index_q_norm = RMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+                        self.index_k_norm = RMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+            elif self.qk_norm_type == "multi_head":
+                self.q_norm = MultiHeadRMSNorm(
+                    self.total_num_heads,
+                    self.head_dim,
+                    eps=config.rms_norm_eps,
+                    apply_layernorm_1p=self.use_gemma_norm,
+                )
+                self.k_norm = MultiHeadRMSNorm(
+                    self.total_num_kv_heads,
+                    self.head_dim,
+                    eps=config.rms_norm_eps,
+                    apply_layernorm_1p=self.use_gemma_norm,
+                )
+            else:
+                raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -735,6 +854,8 @@ class MiniMaxM3Attention(nn.Module):
         # call time.
         self._use_fused_qknorm_rope = (
             _is_cuda
+            and self.use_qk_norm
+            and get_global_server_args().enable_fused_qk_norm_rope
             and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE.get()
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
@@ -749,8 +870,10 @@ class MiniMaxM3Attention(nn.Module):
         # maybe_build_fused_qkv_index(); falls back to two GEMMs when the quant
         # method does not support a safe output-dim concat (only unquantized
         # bf16 and mxfp8 are fused; anything else keeps the two projections).
-        self._fuse_qkv_index_enabled = self.is_sparse_attention_layer and (
-            _is_cuda or _is_hip
+        self._fuse_qkv_index_enabled = (
+            self.is_sparse_attention_layer
+            and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKV_INDEX.get()
+            and (_is_cuda or _is_hip)
         )
         self._fused_qkv_index = None
         # Per-token main width (q | k | v), in elements; index columns follow it
@@ -785,6 +908,7 @@ class MiniMaxM3Attention(nn.Module):
         # dtype guards are applied where the cached value is consulted.
         self._can_use_rocm_qk_norm_rope_static = (
             _has_rocm_qk_norm_rope
+            and self.use_qk_norm
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
             and not self.attention_output_gate
@@ -795,6 +919,7 @@ class MiniMaxM3Attention(nn.Module):
         )
         self._can_use_rocm_index_qk_norm_rope_static = (
             self.is_sparse_attention_layer
+            and self.use_qk_norm
             and _has_rocm_qk_norm_rope
             and self.use_gemma_norm
             and self.index_q_norm.variance_epsilon == self.index_k_norm.variance_epsilon
@@ -827,6 +952,8 @@ class MiniMaxM3Attention(nn.Module):
     def _qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return self.rotary_emb(positions, q, k)
         if self._can_use_rocm_qk_norm_rope(positions, q, k):
             return qk_gemma_rmsnorm_rope(
                 q,
@@ -846,6 +973,8 @@ class MiniMaxM3Attention(nn.Module):
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return q, k
         if self.qk_norm_type == "per_layer":
             if self.attn_tp_size > 1:
                 q, k = MiniMaxM2RMSNormTP.forward_qk(
@@ -871,6 +1000,8 @@ class MiniMaxM3Attention(nn.Module):
     def _index_qk_norm_rope(
         self, positions: torch.Tensor, idx_q: torch.Tensor, idx_k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return self.index_rotary_emb(positions, idx_q, idx_k)
         if (
             self._can_use_rocm_index_qk_norm_rope_static
             and positions.dim() == 1
@@ -897,6 +1028,8 @@ class MiniMaxM3Attention(nn.Module):
     def _index_qk_norm(
         self, idx_q: torch.Tensor, idx_k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return idx_q, idx_k
         # sparse index branch only supports per_head norm; init asserts this.
         idx_q_shape = idx_q.shape
         idx_k_shape = idx_k.shape
@@ -942,6 +1075,11 @@ class MiniMaxM3Attention(nn.Module):
         qm = qp.quant_method
         # Both projections must share the same quant method/layout to concat.
         if type(ip.quant_method) is not type(qm):
+            return
+        # Some backends convert dense MXFP8 during the loader's post-process
+        # pass. The fused holder skips that pass, so keep the two original
+        # projections when conversion is required.
+        if getattr(qm, "convert_mxfp8_to_block", False):
             return
 
         weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
@@ -1131,6 +1269,20 @@ class MiniMaxM3Attention(nn.Module):
         if self._fused_qkv_index is not None:
             fused_out = self.fused_qkv_index_proj(hidden_states)
             qkv = fused_out[:, : self._fused_main_size]
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_prepare:fused_qkv_index_proj",
+                layer_id=self.layer_id,
+                data={
+                    "is_sparse_attention_layer": self.is_sparse_attention_layer,
+                    "combined_qknorm_ok": self._combined_qknorm_ok,
+                    **_sm90_mxfp8_h12_tensor_dict(
+                        hidden_states=hidden_states,
+                        fused_out=fused_out,
+                        qkv=qkv,
+                        positions=positions,
+                    ),
+                },
+            )
 
             # Combined main+index GemmaRMSNorm + partial NeoX RoPE in one launch
             # over the whole fused tensor (q, k, idx_q, idx_k groups; v / idx_v
@@ -1150,10 +1302,37 @@ class MiniMaxM3Attention(nn.Module):
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
                 idx_qkv = fused_out[:, self._fused_main_size :]
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                _sm90_mxfp8_h12_report(
+                    "minimax_m3.py:MiniMaxM3Attention.forward_prepare:combined_qknorm_rope",
+                    layer_id=self.layer_id,
+                    data={
+                        "is_sparse_attention_layer": self.is_sparse_attention_layer,
+                        **_sm90_mxfp8_h12_tensor_dict(
+                            q=q,
+                            k=k,
+                            v=v,
+                            idx_q=idx_q,
+                            idx_k=idx_k,
+                            idx_v=idx_v,
+                        ),
+                    },
+                )
                 inner_state = (q, k, v, None, idx_q, idx_k, idx_v, forward_batch)
                 return None, forward_batch, inner_state
         else:
             qkv, _ = self.qkv_proj(hidden_states)
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_prepare:qkv_proj",
+                layer_id=self.layer_id,
+                data={
+                    "is_sparse_attention_layer": self.is_sparse_attention_layer,
+                    **_sm90_mxfp8_h12_tensor_dict(
+                        hidden_states=hidden_states,
+                        qkv=qkv,
+                        positions=positions,
+                    ),
+                },
+            )
 
         if self.attention_output_gate:
             q_gate, k, v = qkv.split(
@@ -1169,6 +1348,12 @@ class MiniMaxM3Attention(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
             q, k = self._qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
+            main_qk_already_normed = True
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_prepare:gated_qk_norm_rope",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(q=q, k=k, v=v, gate=gate),
+            )
         elif self._use_fused_qknorm_rope:
             # Fused per-head GemmaRMSNorm + partial NeoX RoPE, in place on qkv.
             from sglang.jit_kernel.minimax_qknorm_rope import minimax_qknorm_rope
@@ -1187,16 +1372,31 @@ class MiniMaxM3Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
             main_qk_already_normed = True
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_prepare:fused_qknorm_rope",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(q=q, k=k, v=v),
+            )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
             main_qk_already_normed = False
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_prepare:qkv_split_before_norm",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(q=q, k=k, v=v),
+            )
 
         if self.is_sparse_attention_layer:
             if fused_out is not None:
                 idx_qkv = fused_out[:, self._fused_main_size :]
             else:
                 idx_qkv, _ = self.index_qkv_proj(hidden_states)
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_prepare:index_qkv",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(idx_qkv=idx_qkv),
+            )
 
             if main_qk_already_normed:
                 use_fused_index_norm_rope = (
@@ -1225,11 +1425,25 @@ class MiniMaxM3Attention(nn.Module):
                         self.index_q_norm.variance_epsilon,
                     )
                     idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                    _sm90_mxfp8_h12_report(
+                        "minimax_m3.py:MiniMaxM3Attention.forward_prepare:fused_index_qknorm_rope",
+                        layer_id=self.layer_id,
+                        data=_sm90_mxfp8_h12_tensor_dict(
+                            idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
+                        ),
+                    )
                 else:
                     # Main q/k were normed+roped by the fused base kernel
                     # above; only the index branch still needs norm+rope.
                     idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                     idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+                    _sm90_mxfp8_h12_report(
+                        "minimax_m3.py:MiniMaxM3Attention.forward_prepare:index_qknorm_rope",
+                        layer_id=self.layer_id,
+                        data=_sm90_mxfp8_h12_tensor_dict(
+                            idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
+                        ),
+                    )
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 # Prefer the PR's ROCm sparse cache-store + norm/rope fusion
@@ -1240,11 +1454,23 @@ class MiniMaxM3Attention(nn.Module):
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
                     positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
                 )
+                _sm90_mxfp8_h12_report(
+                    "minimax_m3.py:MiniMaxM3Attention.forward_prepare:sparse_qk_index_norm_rope",
+                    layer_id=self.layer_id,
+                    data=_sm90_mxfp8_h12_tensor_dict(
+                        q=q, k=k, v=v, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
+                    ),
+                )
 
             inner_state = (q, k, v, gate, idx_q, idx_k, idx_v, forward_batch)
         else:
             if not main_qk_already_normed:
                 q, k = self._qk_norm_rope(positions, q, k)
+                _sm90_mxfp8_h12_report(
+                    "minimax_m3.py:MiniMaxM3Attention.forward_prepare:qk_norm_rope",
+                    layer_id=self.layer_id,
+                    data=_sm90_mxfp8_h12_tensor_dict(q=q, k=k, v=v),
+                )
             inner_state = (q, k, v, gate, forward_batch)
         return None, forward_batch, inner_state
 
@@ -1268,7 +1494,26 @@ class MiniMaxM3Attention(nn.Module):
             idx_o, attn_output = self.attn(
                 q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
             )
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_core:sparse_attn",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    q=q,
+                    k=k,
+                    v=v,
+                    idx_q=idx_q,
+                    idx_k=idx_k,
+                    idx_v=idx_v,
+                    idx_o=idx_o,
+                    attn_output=attn_output,
+                ),
+            )
             output, _ = self.o_proj(attn_output)
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_core:o_proj",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(output=output),
+            )
             if self.disable_index_value:
                 return output
             # When idx_replica_size > 1, `idx_replica_size` ranks share the
@@ -1280,7 +1525,15 @@ class MiniMaxM3Attention(nn.Module):
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
-            return output + idx_output
+            combined = output + idx_output
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Attention.forward_core:index_o_proj",
+                layer_id=self.layer_id,
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    idx_o=idx_o, idx_output=idx_output, combined=combined
+                ),
+            )
+            return combined
 
         q, k, v, gate, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
@@ -1288,6 +1541,13 @@ class MiniMaxM3Attention(nn.Module):
             gate = torch.sigmoid(gate.float())
             attn_output = (attn_output * gate).to(attn_output.dtype)
         output, _ = self.o_proj(attn_output)
+        _sm90_mxfp8_h12_report(
+            "minimax_m3.py:MiniMaxM3Attention.forward_core:dense_attn_o_proj",
+            layer_id=self.layer_id,
+            data=_sm90_mxfp8_h12_tensor_dict(
+                q=q, k=k, v=v, attn_output=attn_output, output=output
+            ),
+        )
         return output
 
     def forward(
@@ -1440,6 +1700,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 **kwargs,
             )
         )
+        _sm90_mxfp8_h12_report(
+            "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_prepare_attn",
+            layer_id=self.layer_id,
+            data={
+                "is_layer_sparse": self.is_layer_sparse,
+                "is_sparse_attention_layer": self.self_attn.is_sparse_attention_layer,
+                **_sm90_mxfp8_h12_tensor_dict(
+                    hidden_states=hidden_states, residual=residual, positions=positions
+                ),
+            },
+        )
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -1447,10 +1718,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        _sm90_mxfp8_h12_report(
+            "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_attn",
+            layer_id=self.layer_id,
+            data=_sm90_mxfp8_h12_tensor_dict(hidden_states=hidden_states),
+        )
 
         # Fully Connected (MLP or MoE)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        _sm90_mxfp8_h12_report(
+            "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_prepare_mlp",
+            layer_id=self.layer_id,
+            data=_sm90_mxfp8_h12_tensor_dict(
+                hidden_states=hidden_states, residual=residual
+            ),
         )
 
         should_allreduce_fusion = (
@@ -1480,6 +1763,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 should_allreduce_fusion,
                 use_reduce_scatter,
             )
+        _sm90_mxfp8_h12_report(
+            "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_mlp",
+            layer_id=self.layer_id,
+            data={
+                "should_allreduce_fusion": should_allreduce_fusion,
+                "use_reduce_scatter": use_reduce_scatter,
+                **_sm90_mxfp8_h12_tensor_dict(hidden_states=hidden_states),
+            },
+        )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1487,6 +1779,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        _sm90_mxfp8_h12_report(
+            "minimax_m3.py:MiniMaxM3DecoderLayer.forward:after_postprocess_layer",
+            layer_id=self.layer_id,
+            data=_sm90_mxfp8_h12_tensor_dict(
+                hidden_states=hidden_states, residual=residual
+            ),
+        )
 
         return hidden_states, residual
 
@@ -1563,10 +1862,26 @@ class MiniMaxM3Model(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Model.forward:input_embedding",
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                ),
+            )
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Model.forward:pp_input",
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                ),
+            )
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -1606,10 +1921,20 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         if hidden_states.shape[0] != 0:
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Model.forward:before_final_norm",
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    hidden_states=hidden_states, residual=residual
+                ),
+            )
             if residual is not None:
                 hidden_states, _ = self.norm(hidden_states, residual)
             else:
                 hidden_states = self.norm(hidden_states)
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3Model.forward:after_final_norm",
+                data=_sm90_mxfp8_h12_tensor_dict(hidden_states=hidden_states),
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1730,9 +2055,18 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            _sm90_mxfp8_h12_report(
+                "minimax_m3.py:MiniMaxM3SparseForCausalLM.forward:before_logits",
+                data=_sm90_mxfp8_h12_tensor_dict(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                ),
+            )
+            logits_output = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            return logits_output
         else:
             return hidden_states
 

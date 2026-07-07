@@ -1709,8 +1709,11 @@ def select_experts(
         # on; otherwise it falls through to fused_topk -> topk_sigmoid (the
         # historical path), keeping flag-off behavior byte-identical.
         use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+        use_minimax_torch_topk = (
+            envs.SGLANG_OPT_USE_MINIMAX_MOE_TOPK_TORCH_NATIVE.get()
+        )
         if scoring_func == "sqrtsoftplus" or (
-            scoring_func == "sigmoid" and use_jit_fused_gate
+            scoring_func == "sigmoid" and (use_jit_fused_gate or use_minimax_torch_topk)
         ):
             _biased_topk = (
                 biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl

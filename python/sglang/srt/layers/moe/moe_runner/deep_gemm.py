@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -59,6 +62,352 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+logger = logging.getLogger(__name__)
+_SM90_MXFP8_ACT_QUANT_DIFF_EVENTS = 0
+_SM90_MXFP8_GATHER_DIFF_EVENTS = 0
+
+
+def _sm90_mxfp8_act_quant_diff_enabled() -> bool:
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG") != "1":
+        return False
+    if os.environ.get("SGLANG_SM90_MXFP8_DEBUG_STATS") != "1":
+        return False
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return False
+
+
+def _sm90_mxfp8_debug_tensor_meta(t: torch.Tensor) -> dict:
+    return {
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype),
+        "is_contiguous": t.is_contiguous(),
+        "device": str(t.device),
+        "numel": t.numel(),
+    }
+
+
+def _sm90_mxfp8_numeric_stats(t: torch.Tensor) -> dict:
+    flat = t.reshape(-1)
+    finite = torch.isfinite(flat)
+    finite_count = int(finite.sum().item())
+    stats = {
+        "numel": flat.numel(),
+        "finite_count": finite_count,
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "inf_count": int(torch.isinf(flat).sum().item()),
+        "isfinite": finite_count == flat.numel(),
+    }
+    if finite_count > 0:
+        stats["finite_absmax"] = float(flat[finite].abs().max().item())
+    return stats
+
+
+def _unpack_sm90_mxfp8_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype in (torch.int, torch.int32):
+        scale_i32 = scale.contiguous().to(torch.int32)
+        return torch.stack(
+            [
+                torch.bitwise_and(torch.bitwise_right_shift(scale_i32, shift), 0xFF)
+                for shift in (0, 8, 16, 24)
+            ],
+            dim=-1,
+        ).reshape(-1).to(torch.uint8)
+    if scale.dtype == torch.uint8:
+        return scale.contiguous()
+    raise RuntimeError(f"Unsupported SM90 MXFP8 scale dtype for debug: {scale.dtype}")
+
+
+def _decode_e8m0_scale_bytes(scale_bytes: torch.Tensor) -> torch.Tensor:
+    scale_i32 = torch.bitwise_left_shift(scale_bytes.to(torch.int32), 23).contiguous()
+    return scale_i32.view(torch.float32)
+
+
+def _dequant_sm90_mxfp8_activation_vector(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    group_size: int,
+    k: int,
+) -> torch.Tensor:
+    if scale.dtype == torch.float32:
+        scale_per_group = scale.contiguous().to(torch.float32)
+    else:
+        scale_per_group = _decode_e8m0_scale_bytes(
+            _unpack_sm90_mxfp8_scale_bytes(scale)
+        )
+    k_scale_idx = torch.arange(k, device=x.device, dtype=torch.long) // group_size
+    return x[:k].to(torch.float32) * scale_per_group[k_scale_idx]
+
+
+def _swiglu_activation_reference(
+    gateup: torch.Tensor,
+    *,
+    gemm1_alpha: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    swiglu_limit: Optional[float],
+) -> torch.Tensor:
+    gate, up = torch.chunk(gateup.to(torch.float32), chunks=2, dim=-1)
+    if gemm1_alpha is not None:
+        if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
+            gate = torch.clamp(gate, max=gemm1_clamp_limit)
+            up = torch.clamp(up, min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+        return gate * torch.sigmoid(gate * float(gemm1_alpha)) * (up + 1.0)
+    if swiglu_limit is not None and swiglu_limit > 0:
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+    gate = gate / (1 + torch.exp(-gate))
+    return gate.to(up.dtype) * up
+
+
+def _sm90_mxfp8_scale_stats(scale: torch.Tensor) -> dict:
+    if scale.dtype == torch.float32:
+        return _sm90_mxfp8_numeric_stats(scale)
+    scale_bytes = _unpack_sm90_mxfp8_scale_bytes(scale)
+    return {
+        "numel": scale_bytes.numel(),
+        "min": int(scale_bytes.min().item()) if scale_bytes.numel() > 0 else None,
+        "max": int(scale_bytes.max().item()) if scale_bytes.numel() > 0 else None,
+        "zero_count": int((scale_bytes == 0).sum().item()),
+        "ff_count": int((scale_bytes == 0xFF).sum().item()),
+    }
+
+
+def _sm90_mxfp8_gather_diff_report(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output_index: torch.Tensor,
+    gather_out: torch.Tensor,
+) -> None:
+    global _SM90_MXFP8_GATHER_DIFF_EVENTS
+    if not _sm90_mxfp8_act_quant_diff_enabled():
+        return
+    max_events = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_GATHER_MAX_EVENTS", "8"))
+    if _SM90_MXFP8_GATHER_DIFF_EVENTS >= max_events:
+        return
+    if gather_out.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_GATHER_DIFF_EVENTS += 1
+
+    sample_tokens = min(
+        gather_out.shape[0],
+        int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_GATHER_TOKENS", "4")),
+    )
+    sample_cols = min(
+        gather_out.shape[1],
+        int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_GATHER_K", "256")),
+    )
+
+    diffs = []
+    with torch.no_grad():
+        cols = torch.arange(sample_cols, device=gather_out.device, dtype=torch.long)
+        for token in range(sample_tokens):
+            ref = torch.zeros(sample_cols, device=gather_out.device, dtype=torch.float32)
+            token_sources = []
+            token_weights = []
+            token_experts = []
+            for topk_idx in range(topk_ids.shape[1]):
+                expert_id = int(topk_ids[token, topk_idx].item())
+                source_idx = int(output_index[token, topk_idx].item())
+                weight = float(topk_weights[token, topk_idx].item())
+                token_experts.append(expert_id)
+                token_sources.append(source_idx)
+                token_weights.append(weight)
+                if expert_id < 0:
+                    continue
+                ref += hidden_states[source_idx, cols].to(torch.float32) * weight
+            actual = gather_out[token, cols].to(torch.float32)
+            diff = (actual - ref).abs()
+            diffs.append(
+                {
+                    "token": token,
+                    "cols": sample_cols,
+                    "topk_ids": token_experts,
+                    "output_index": token_sources,
+                    "topk_weights": token_weights,
+                    "max_abs_diff": float(diff.max().item()),
+                    "mean_abs_diff": float(diff.mean().item()),
+                    "ref_absmax": float(ref.abs().max().item()),
+                    "actual_absmax": float(actual.abs().max().item()),
+                    "ref_stats": _sm90_mxfp8_numeric_stats(ref),
+                    "actual_stats": _sm90_mxfp8_numeric_stats(actual),
+                }
+            )
+
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H10",
+        "location": "deep_gemm.py:post_permute_deep_gemm_to_deepep_normal:gather_diff",
+        "msg": "[DEBUG] SM90 MXFP8 DeepEP ep_gather local reference diff",
+        "data": {
+            "hidden_states": _sm90_mxfp8_debug_tensor_meta(hidden_states),
+            "topk_ids": _sm90_mxfp8_debug_tensor_meta(topk_ids),
+            "topk_weights": _sm90_mxfp8_debug_tensor_meta(topk_weights),
+            "output_index": _sm90_mxfp8_debug_tensor_meta(output_index),
+            "gather_out": _sm90_mxfp8_debug_tensor_meta(gather_out),
+            "diffs": diffs,
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
+
+
+def _sm90_mxfp8_act_quant_diff_report(
+    *,
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    group_size: int,
+    packed_ue8m0: bool,
+    swiglu_limit: Optional[float],
+    gemm1_alpha: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    path: str,
+) -> None:
+    global _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS
+    if not _sm90_mxfp8_act_quant_diff_enabled():
+        return
+    max_events = int(
+        os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_MAX_EVENTS", "8")
+    )
+    if _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS >= max_events:
+        return
+    if down_input.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _SM90_MXFP8_ACT_QUANT_DIFF_EVENTS += 1
+
+    sample_groups = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_GROUPS", "4"))
+    sample_rows = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_M", "2"))
+    sample_k = int(os.environ.get("SGLANG_SM90_MXFP8_DEBUG_ACT_QUANT_K", "256"))
+
+    diffs = []
+    with torch.no_grad():
+        group_candidates = [
+            group
+            for group in range(gateup_output.shape[0])
+            if int(masked_m[group].item()) > 0
+        ][:sample_groups]
+        k = down_input.shape[-1]
+        cols = min(k, sample_k)
+        for group in group_candidates:
+            row_count = min(
+                int(masked_m[group].item()), gateup_output.shape[1], sample_rows
+            )
+            for row in range(row_count):
+                ref = _swiglu_activation_reference(
+                    gateup_output[group, row],
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
+                    swiglu_limit=swiglu_limit,
+                )[:cols]
+                deq = _dequant_sm90_mxfp8_activation_vector(
+                    down_input[group, row],
+                    down_input_scale[group, row],
+                    group_size=group_size,
+                    k=k,
+                )[:cols]
+                diff = (deq - ref).abs()
+                finite_diff = diff[torch.isfinite(diff)]
+                diffs.append(
+                    {
+                        "group": group,
+                        "row": row,
+                        "cols": cols,
+                        "max_abs_diff": (
+                            float(finite_diff.max().item())
+                            if finite_diff.numel() > 0
+                            else float("nan")
+                        ),
+                        "mean_abs_diff": (
+                            float(finite_diff.mean().item())
+                            if finite_diff.numel() > 0
+                            else float("nan")
+                        ),
+                        "ref_absmax": float(ref.abs().max().item()),
+                        "deq_absmax": float(deq.abs().max().item()),
+                        "ref_stats": _sm90_mxfp8_numeric_stats(ref),
+                        "deq_stats": _sm90_mxfp8_numeric_stats(deq),
+                        "raw_fp32_stats": _sm90_mxfp8_numeric_stats(
+                            down_input[group, row, :cols].to(torch.float32)
+                        ),
+                        "scale_stats": _sm90_mxfp8_scale_stats(
+                            down_input_scale[group, row]
+                        ),
+                    }
+                )
+
+    payload = {
+        "sessionId": "sm90-mxfp8-precision",
+        "runId": os.environ.get("SGLANG_SM90_MXFP8_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": "H9",
+        "location": "deep_gemm.py:_varlen_deep_gemm_silu_mul_quant:act_quant_diff",
+        "msg": "[DEBUG] SM90 MXFP8 DeepGEMM SwiGLU activation quant diff",
+        "data": {
+            "path": path,
+            "group_size": group_size,
+            "packed_ue8m0": packed_ue8m0,
+            "gemm1_alpha": gemm1_alpha,
+            "gemm1_clamp_limit": gemm1_clamp_limit,
+            "swiglu_limit": swiglu_limit,
+            "gateup_output": _sm90_mxfp8_debug_tensor_meta(gateup_output),
+            "down_input": _sm90_mxfp8_debug_tensor_meta(down_input),
+            "down_input_scale": _sm90_mxfp8_debug_tensor_meta(down_input_scale),
+            "masked_m": _sm90_mxfp8_debug_tensor_meta(masked_m),
+            "diffs": diffs,
+        },
+    }
+    logger.warning("[SM90_MXFP8_DEBUG] %s", json.dumps(payload, ensure_ascii=False))
+
+
+def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
+    return quant_info.use_mxfp8 and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
+
+
+def _infer_mxfp8_gran_k_from_scale(
+    scale: torch.Tensor,
+    k: int,
+    *,
+    preferred_gran_k: Optional[int] = None,
+) -> int:
+    pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+    last_dim = scale.shape[-1]
+    candidates = []
+    if preferred_gran_k in (32, 128):
+        candidates.append(preferred_gran_k)
+    candidates.extend(gran_k for gran_k in (32, 128) if gran_k not in candidates)
+    for gran_k in candidates:
+        if last_dim == ceil_div(k, gran_k * pack_factor):
+            return gran_k
+    raise AssertionError(
+        "MXFP8 scale shape does not match supported gran_k: "
+        f"K={k}, scale_dtype={scale.dtype}, scale_last_dim={last_dim}, "
+        f"expected_k32={ceil_div(k, 32 * pack_factor)}, "
+        f"expected_k128={ceil_div(k, 128 * pack_factor)}"
+    )
+
+
+def _assert_mxfp8_scale_matches_recipe(
+    scale: torch.Tensor,
+    k: int,
+    recipe: Tuple[int, int],
+    location: str,
+) -> None:
+    gran_k = recipe[1]
+    pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+    expected_last_dim = ceil_div(k, gran_k * pack_factor)
+    assert scale.shape[-1] == expected_last_dim, (
+        f"MXFP8 scale/recipe mismatch at {location}: "
+        f"K={k}, recipe={recipe}, scale_dtype={scale.dtype}, "
+        f"scale_shape={tuple(scale.shape)}, scale_last_dim={scale.shape[-1]}, "
+        f"pack_factor={pack_factor}, expected_last_dim={expected_last_dim}"
+    )
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -127,9 +476,12 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
                 1,
                 32,
             ], f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
-            assert (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+            if not (
+                deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
+            ):
+                assert (
+                    deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -194,11 +546,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
-        scale_block_size = 128
+        use_sm90_mxfp8 = _use_sm90_mxfp8_fp8_grouped_gemm(quant_info)
+        use_mxfp8_ue8m0_scales = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or use_sm90_mxfp8
+        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
+        if use_sm90_mxfp8:
+            gran_k_act = _infer_mxfp8_gran_k_from_scale(
+                hidden_states_scale,
+                K,
+                preferred_gran_k=running_state.get("mxfp8_act_gran_k"),
+            )
+            recipe_a, recipe_b = (
+                (1, gran_k_act),
+                (1, scale_block_size),
+            )
+        else:
+            recipe_a, recipe_b = (
+                ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+            )
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -212,16 +577,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
-            hidden_states_scale = tma_align_input_scale(hidden_states_scale)
+            if not use_sm90_mxfp8:
+                hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if use_sm90_mxfp8:
+            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -238,17 +614,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 x_shape=(all_tokens, N // 2),
                 device=gateup_output.device,
                 group_size=scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                column_major_scales=use_mxfp8_ue8m0_scales,
+                scale_tma_aligned=use_mxfp8_ue8m0_scales,
+                scale_ue8m0=use_mxfp8_ue8m0_scales,
             )
             silu_and_mul_contig_post_quant(
                 input=gateup_output,
                 output=down_input_fp8,
                 output_scale=down_input_scale,
                 quant_group_size=scale_block_size,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=use_mxfp8_ue8m0_scales,
+                transposed=use_mxfp8_ue8m0_scales,
                 swiglu_limit=swiglu_limit_arg,
                 swizzle=self.use_swizzle,
             )
@@ -280,9 +656,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
                 down_input,
                 scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                column_major_scales=use_mxfp8_ue8m0_scales,
+                scale_tma_aligned=use_mxfp8_ue8m0_scales,
+                scale_ue8m0=use_mxfp8_ue8m0_scales,
             )
             del down_input
 
@@ -292,16 +668,44 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
-            down_input_scale = tma_align_input_scale(down_input_scale)
+            if not use_sm90_mxfp8:
+                down_input_scale = tma_align_input_scale(down_input_scale)
+        if use_sm90_mxfp8 and down_input_scale.dtype == torch.float32:
+            import deep_gemm.utils.layout
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+            down_input_scale = (
+                deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                    down_input_scale
+                )
+            )
+
+        recipe_a_down = (1, scale_block_size)
+        if use_sm90_mxfp8:
+            _assert_mxfp8_scale_matches_recipe(
+                down_input_scale,
+                down_input_fp8.shape[-1],
+                recipe_a_down,
+                "deep_gemm.py:_run_contiguous_gemm:down_input_scale",
+            )
+
+        if use_sm90_mxfp8:
+            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                down_output,
+                m_indices,
+                recipe_a=recipe_a_down,
+                recipe_b=recipe_b,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         return down_output
 
@@ -391,9 +795,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
 
         use_mxfp8 = quant_info.use_mxfp8
+        use_sm90_mxfp8 = _use_sm90_mxfp8_fp8_grouped_gemm(quant_info)
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
-
-        if use_mxfp8:
+        if use_sm90_mxfp8:
+            _, _, k_for_recipe = hidden_states.shape
+            gran_k_act = _infer_mxfp8_gran_k_from_scale(
+                hidden_states_scale,
+                k_for_recipe,
+                preferred_gran_k=running_state.get("mxfp8_act_gran_k"),
+            )
+            recipe_a, recipe_b = (1, gran_k_act), (1, scale_block_size)
+        elif use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
             # gran_k depends on the dispatch path that quantised the gateup acts,
             # not on tensor shapes: standard dispatch uses block_shape[1] (=32),
@@ -421,7 +833,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a, recipe_b = None, None
 
         # GroupGemm-0
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if use_sm90_mxfp8:
+            pass
+        elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
                 assert (
@@ -440,15 +854,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if use_sm90_mxfp8:
+            deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -491,7 +916,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             topk_ids_rs.shape[0]
             if (
                 use_mxfp8
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and (deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or use_sm90_mxfp8)
                 and topk_ids_rs is not None
                 and "src2dst" in running_state
             )
@@ -502,6 +927,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             group_size=scale_block_size,
             topk=self.config.top_k,
+            packed_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or use_sm90_mxfp8,
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
             gemm1_alpha=self.config.gemm1_alpha,
@@ -521,9 +947,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         n = w2_weight.shape[1]
 
         if (
-            use_mxfp8
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and down_input_scale.dtype != torch.int32
+            (use_sm90_mxfp8 or (use_mxfp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0))
+            and down_input_scale.dtype == torch.float32
         ):
             # Already-packed int32 (from the fused-pack activation above) skips this.
             import deep_gemm.utils.layout
@@ -538,12 +963,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
+        if use_mxfp8:
+            _assert_mxfp8_scale_matches_recipe(
+                down_input_scale,
+                down_input.shape[-1],
+                recipe_a_down,
+                "deep_gemm.py:_run_masked_gemm:down_input_scale",
+            )
+
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
         if down_gemm_overlap_args is None:
+            gemm_overlap_args_dict = {}
+        elif use_sm90_mxfp8:
             gemm_overlap_args_dict = {}
         else:
             down_gemm_overlap_args.start_event.record()
@@ -555,16 +990,29 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
-            **gemm_overlap_args_dict,
-        )
+        if use_sm90_mxfp8:
+            deep_gemm_return_value = (
+                deep_gemm_wrapper.grouped_gemm_nt_mxfp8_f8f8bf16_masked(
+                    (down_input, down_input_scale),
+                    (w2_weight, w2_scale),
+                    down_output,
+                    masked_m,
+                    expected_m,
+                    recipe_a=recipe_a_down,
+                    recipe_b=recipe_b,
+                )
+            )
+        else:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a_down,
+                recipe_b=recipe_b,
+                **gemm_overlap_args_dict,
+            )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
@@ -672,13 +1120,14 @@ def pre_permute_standard_to_deep_gemm(
         if quant_info.w13_weight.dtype == torch.bfloat16
         else torch.float8_e4m3fn
     )
+    preprocess_block_shape = quant_info.block_shape
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
         moe_ep_deepgemm_preprocess(
             topk_ids,
             runner_config.num_local_experts,
             hidden_states,
             runner_config.top_k,
-            quant_info.block_shape,
+            preprocess_block_shape,
             output_dtype=output_dtype,
             use_mxfp8=quant_info.use_mxfp8,
         )
@@ -696,7 +1145,7 @@ def pre_permute_standard_to_deep_gemm(
     # mxfp8); _run_masked_gemm needs this to build recipe_a (see its comment).
     # block_shape is None on the non-mxfp8/bf16 path, where gran_k is unused.
     running_state["mxfp8_act_gran_k"] = (
-        quant_info.block_shape[1] if quant_info.block_shape else 128
+        preprocess_block_shape[1] if preprocess_block_shape else 128
     )
 
     return DeepGemmRunnerInput(
@@ -788,8 +1237,6 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
-    # DeepEP LL FP8 dispatch quantises activations at a fixed 128 block, not the
-    # checkpoint block_shape; _run_masked_gemm reads this to build recipe_a.
     running_state["mxfp8_act_gran_k"] = 128
 
     return DeepGemmRunnerInput(
@@ -844,6 +1291,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
     hidden_states_device = hidden_states.device
     hidden_states_dtype = hidden_states.dtype
 
+    scale_ue8m0 = hidden_states_scale is not None and hidden_states_scale.dtype == torch.int32
+
     running_state["hidden_states_shape"] = hidden_states_shape
     running_state["hidden_states_device"] = hidden_states_device
     running_state["hidden_states_dtype"] = hidden_states_dtype
@@ -855,8 +1304,14 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        # TODO check whether need `zeros`
+    is_fp8_input = (
+        hidden_states_scale is not None and hidden_states.dtype != torch.bfloat16
+    )
+    if is_fp8_input:
+        # ep_scatter only writes real routed tokens. Keep per-expert padded rows as
+        # zero activations so grouped GEMM never consumes uninitialized FP8 payloads.
+        input_tensor.zero_()
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or scale_ue8m0:
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
@@ -868,6 +1323,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device=hidden_states.device,
             dtype=torch.float32,
         )
+        if is_fp8_input:
+            input_tensor_scale.zero_()
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
@@ -894,7 +1351,13 @@ def pre_permute_deepep_normal_to_deep_gemm(
         input_tensor_scale,
         m_indices,
         output_index,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or scale_ue8m0,
+        quant_block_size=128,
+    )
+    valid_topk = topk_ids >= 0
+    m_indices.fill_(-1)
+    m_indices[output_index[valid_topk].to(torch.long)] = topk_ids[valid_topk].to(
+        torch.int32
     )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
@@ -931,6 +1394,13 @@ def post_permute_deep_gemm_to_deepep_normal(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+    _sm90_mxfp8_gather_diff_report(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output_index=output_index,
+        gather_out=gather_out,
+    )
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,
@@ -944,6 +1414,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     masked_m: Optional[torch.Tensor],
     group_size: int,
     topk: int,
+    packed_ue8m0: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
     gemm1_alpha: Optional[float] = None,
@@ -973,7 +1444,7 @@ def _varlen_deep_gemm_silu_mul_quant(
             masked_m=masked_m,
             column_major_scales=True,
             scale_tma_aligned=True,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=packed_ue8m0,
             fuse_silu_and_mul=True,
             enable_v2=True,
         )
@@ -991,7 +1462,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     # get_mn_major_tma_aligned_packed_ue8m0_tensor. Needs 4 groups per packed int32.
     if (
         gemm1_alpha is not None
-        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and packed_ue8m0
         and num_real_tokens is not None
         and G % 4 == 0
         and D % (group_size * 4) == 0
@@ -1022,7 +1493,20 @@ def _varlen_deep_gemm_silu_mul_quant(
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
         )
-        return down_input, down_input_scale_packed.transpose(-1, -2)
+        down_input_scale = down_input_scale_packed.transpose(-1, -2)
+        _sm90_mxfp8_act_quant_diff_report(
+            gateup_output=gateup_output,
+            down_input=down_input,
+            down_input_scale=down_input_scale,
+            masked_m=masked_m,
+            group_size=group_size,
+            packed_ue8m0=packed_ue8m0,
+            swiglu_limit=swiglu_limit,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            path="packed_fused_oai",
+        )
+        return down_input, down_input_scale
 
     down_input = torch.empty(
         (E, N, D),
@@ -1037,7 +1521,6 @@ def _varlen_deep_gemm_silu_mul_quant(
         use_jit_ep_activation = False
 
     if use_jit_ep_activation:
-        packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
             device=hidden_states_device,
@@ -1081,10 +1564,22 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale,
             group_size,
             masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=packed_ue8m0,
             gemm1_alpha=gemm1_alpha or 0.0,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
         )
+    _sm90_mxfp8_act_quant_diff_report(
+        gateup_output=gateup_output,
+        down_input=down_input,
+        down_input_scale=down_input_scale,
+        masked_m=masked_m,
+        group_size=group_size,
+        packed_ue8m0=packed_ue8m0,
+        swiglu_limit=swiglu_limit,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        path="jit_ep_activation" if use_jit_ep_activation else "fallback_oai",
+    )
     return down_input, down_input_scale
 
 
