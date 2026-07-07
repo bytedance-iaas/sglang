@@ -121,8 +121,8 @@ class EICCacheController(HiCacheController):
 
         # synchronize for write or load operation
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
-        if self.device == "cpu":
-            self.scheduler_stream.synchronize = lambda: None
+        # Avoid monkey-patching C-extension stream objects; gate the call instead.
+        self._sync_scheduler_stream = self.device != "cpu"
         self.sync_before_write = self.need_sync_before_write()
         if server_args.moe_a2a_backend == "deepep":
             self.hook_model_forward()
@@ -220,7 +220,7 @@ class EICCacheController(HiCacheController):
 
         def syned_dispatch(*args, **kwargs):
             while self.load_wait_event.is_set():
-                time.sleep(0.1)
+                time.sleep(0.001)
             result = original_dispatch(*args, **kwargs)
             return result
 
@@ -406,7 +406,8 @@ class EICCacheController(HiCacheController):
                 try:
                     operation = self.write_queue.get(block=True, timeout=1)
                     if self.sync_before_write:
-                        self.scheduler_stream.synchronize()
+                        if self._sync_scheduler_stream:
+                            self.scheduler_stream.synchronize()
                     self.write_to_eic(operation)
                 except Empty:
                     continue

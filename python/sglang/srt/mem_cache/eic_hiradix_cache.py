@@ -1315,8 +1315,9 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             mask = self.cache_controller.mem_pool_host.batch_exist_page(check_keys)
             check_ret = all(mask)
             if self.tp_size > 1:
+                # gloo (cpu_group) has no ReduceOp.SUM for bool; use int32.
                 check_tensor = torch.tensor(
-                    0 if check_ret else 1, dtype=torch.bool, device="cpu"
+                    0 if check_ret else 1, dtype=torch.int32, device="cpu"
                 )
                 torch.distributed.all_reduce(
                     check_tensor,

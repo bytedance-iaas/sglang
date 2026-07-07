@@ -105,9 +105,10 @@ class FlexibleKVCacheMemoryPool:
         for i in kvcache_shape:
             self.kv_cache_numel *= i
 
+        device = str(device)
         if device.startswith("cpu") and G_EnableGPUNicAffinity:
             gpu_id = torch.cuda.current_device()
-            self.device = CPUNicAffinity["cuda:" + str(gpu_id)]
+            self.device = CPUNicAffinity.get("cuda:" + str(gpu_id), "cpu")
             # current memory pool size is 5 times of CPU buffer size
             mempool_size = G_GDRBounceTensorCount * 5
         else:
@@ -134,7 +135,7 @@ class FlexibleKVCacheMemoryPool:
 
         meminfo = eic.MemoryInfo()
         meminfo.type = eic.MemoryType.MEMORY_CUDA
-        meminfo.cuda_id = 0
+        meminfo.cuda_id = torch.cuda.current_device()
         vals = eic.IOBuffers()
         vals.append(
             self.kvcache_mempool.data_ptr(),
@@ -312,9 +313,9 @@ class EICKVClient:
 
         if G_EnableGPUNicAffinity:
             gpu_id = torch.cuda.current_device()
-            init_option.multi_net_local_interface_names = GPUNicAffinity[
-                "cuda:" + str(gpu_id)
-            ]
+            init_option.multi_net_local_interface_names = GPUNicAffinity.get(
+                "cuda:" + str(gpu_id), "eth1"
+            )
             logger.info(
                 f"gpu {gpu_id} set gpu nic affinity to {init_option.multi_net_local_interface_names}"
             )
@@ -804,9 +805,14 @@ class EICBaseTokenToKVPoolHost:
         ]
 
     def _get_host_ip(self):
+        import os
         import socket
 
-        return socket.gethostbyname(socket.gethostname())
+        # gethostbyname can resolve to 127.0.0.1 on some hosts, colliding keys
+        # across nodes; prefer the pod-provided MY_HOST_IP.
+        return os.environ.get("MY_HOST_IP") or socket.gethostbyname(
+            socket.gethostname()
+        )
 
     def _get_deploy_info(self):
         model_path = self.extra_info.get("model_path", "fake_model_path")
@@ -1261,6 +1267,7 @@ class EICMHATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             self.head_dim,
             dtype=self.dtype,
             device="cpu",
+            pin_memory=True,
         )
         for layer_id in range(self.layer_num):
             cpu_tensor[0][layer_id][:].copy_(
