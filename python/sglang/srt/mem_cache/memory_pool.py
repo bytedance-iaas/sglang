@@ -3022,12 +3022,14 @@ class MiniMaxSparseKVPool(KVCache):
         index_pool: MHATokenToKVPool,
         cache_k: torch.Tensor,
         cache_idx_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_v: Optional[torch.Tensor],
     ) -> bool:
         """Fast-path precondition: CUDA, no per-store quantization, and a single
         head byte size shared by the main and index caches (see
         ``set_fused_kv_index_buffer``)."""
         main = self.main_pool
-        return (
+        if not (
             envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
             and _is_cuda
             # No dtype conversion / fp8 scaling on either side (the fused kernel
@@ -3041,7 +3043,23 @@ class MiniMaxSparseKVPool(KVCache):
             and main.head_dim == index_pool.head_dim
             # 128-bit vector copy requires a 16-byte-aligned head size.
             and (main.head_dim * main.dtype.itemsize) % 16 == 0
-        )
+        ):
+            return False
+
+        # The fused kernel matches every source tensor against
+        # ``TensorMatcher({B, row}).with_strides({-1, 1})``, i.e. the flattened
+        # 2D rows must be inner-dim contiguous with stride[0] == row length.
+        # Non-contiguous slices (e.g. columns carved out of a fused qkv/idx_qkv
+        # buffer via ``.split()``) inherit the parent stride and fail the check
+        # at kernel launch time. Gate on stride here so we transparently fall
+        # back to the separate stores when the caller passes such views.
+        for t in (cache_k, cache_v, cache_idx_k, cache_idx_v):
+            if t is None:
+                continue
+            flat = t.flatten(1)
+            if flat.stride(-1) != 1 or flat.stride(0) != flat.shape[1]:
+                return False
+        return True
 
     def set_fused_kv_index_buffer(
         self,
@@ -3063,7 +3081,7 @@ class MiniMaxSparseKVPool(KVCache):
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
 
         if index_pool is not None and self._can_fuse_kv_index_store(
-            index_pool, cache_k, cache_idx_k
+            index_pool, cache_k, cache_idx_k, cache_v, cache_idx_v
         ):
             from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
 
