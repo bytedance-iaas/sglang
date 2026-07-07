@@ -64,6 +64,10 @@ RESIDENT_WAVES = 2
 # for fragmentation. Combined with the /RESIDENT_WAVES split for admission.
 ADMISSION_ALPHA = 0.95
 
+# Very short startup/internal requests are dominated by fixed per-request state.
+# Do not use them to estimate per-token host bytes for long benchmark waves.
+HOST_BYTES_OBSERVATION_MIN_TOKENS = 1024
+
 PREFILL_WAIT_REASON_UNDERFILLED_WAVE = "underfilled_wave"
 PREFILL_WAIT_REASON_WAITING_EMPTY = "waiting_empty"
 
@@ -348,6 +352,8 @@ class OfflinePPStateOffloadManager:
 
     def _observe_host_bytes(self, committed_len: int, host_bytes: int) -> None:
         if committed_len <= 0 or host_bytes <= 0:
+            return
+        if committed_len < HOST_BYTES_OBSERVATION_MIN_TOKENS:
             return
         sample = host_bytes / committed_len
         if self._host_bytes_per_committed_token is None:
