@@ -1410,6 +1410,7 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             self.kv_cache_dim,
             dtype=self.dtype,
             device="cpu",
+            pin_memory=True,
         )
         for layer_id in range(self.layer_num):
             cpu_tensor[layer_id].copy_(
@@ -1505,6 +1506,7 @@ class EICNSATokenToKVPoolHost(EICMLATokenToKVPoolHost):
             self.final_dim,
             dtype=torch.uint8,
             device="cpu",
+            pin_memory=True,
         )
 
         for layer_id in range(self.layer_num):
