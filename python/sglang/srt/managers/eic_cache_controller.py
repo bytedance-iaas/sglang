@@ -122,7 +122,7 @@ class EICCacheController(HiCacheController):
         # synchronize for write or load operation
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
         # Avoid monkey-patching C-extension stream objects; gate the call instead.
-        self._sync_scheduler_stream = self.device != "cpu"
+        self._sync_scheduler_stream = str(self.device) != "cpu"
         self.sync_before_write = self.need_sync_before_write()
         if server_args.moe_a2a_backend == "deepep":
             self.hook_model_forward()
