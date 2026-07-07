@@ -157,6 +157,10 @@ def _sm90_mxfp8_h12_layer_enabled(layer_id: Optional[int]) -> bool:
 
 
 def _sm90_mxfp8_h12_tensor_stats(t: Optional[torch.Tensor]) -> dict:
+    if not _sm90_mxfp8_h12_enabled():
+        return {}
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return {"skipped_during_capture": True}
     if t is None:
         return {"is_none": True}
     data = {
