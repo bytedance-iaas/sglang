@@ -812,11 +812,19 @@ def setup_state_kv_args(
                 )
             target_geometry = (
                 token_to_kv_pool.page_size,
-                token_to_kv_pool.sliding_window,
+                getattr(
+                    token_to_kv_pool,
+                    "swa_window_size",
+                    getattr(token_to_kv_pool, "sliding_window", None),
+                ),
             )
             draft_geometry = (
                 draft_token_to_kv_pool.page_size,
-                draft_token_to_kv_pool.sliding_window,
+                getattr(
+                    draft_token_to_kv_pool,
+                    "swa_window_size",
+                    getattr(draft_token_to_kv_pool, "sliding_window", None),
+                ),
             )
             if target_geometry != draft_geometry:
                 raise RuntimeError(

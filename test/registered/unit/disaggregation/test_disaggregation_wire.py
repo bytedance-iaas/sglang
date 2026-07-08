@@ -27,7 +27,7 @@ def _make_dsv4_target(*, unified, mapping=None, legacy_unified_attr=False):
     if not legacy_unified_attr:
         pool._unified_kv = unified
     pool.page_size = 256
-    pool.sliding_window = 128
+    pool.swa_window_size = 128
     pool.full_to_swa_index_mapping = mapping
     pool.unified_swa_window = 128
     pool.unified_swa_ring_size = 131
@@ -46,7 +46,7 @@ def _make_dsv4_draft(*, unified, mapping=None, legacy_unified_attr=False):
         pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256
-    pool.sliding_window = 128
+    pool.swa_window_size = 128
     pool.full_to_swa_index_mapping = mapping
     pool.unified_swa_window = 128
     pool.unified_swa_ring_size = 131
