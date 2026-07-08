@@ -9,6 +9,8 @@ from sglang.srt.managers.eic_cache_controller import (
     EICCacheOperation,
 )
 from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
@@ -87,6 +89,17 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(operation.node_ids, [12])
         self.assertIsNone(operation.content_hash)
         self.assertEqual(operation.priority, -3)
+
+    def test_unified_tree_node_exposes_storage_hash_helpers(self):
+        root = UnifiedTreeNode((ComponentType.FULL, ComponentType.SWA))
+        child = UnifiedTreeNode((ComponentType.FULL, ComponentType.SWA))
+        child.parent = root
+        root.hash_value = ["root-hash"]
+        child.hash_value = ["child-hash-0", "child-hash-1"]
+
+        self.assertEqual(root.get_last_hash_value(), "root-hash")
+        self.assertEqual(child.get_last_hash_value(), "child-hash-1")
+        self.assertEqual(child.get_prefix_hash_values(child.parent), ["root-hash"])
 
 
 if __name__ == "__main__":
