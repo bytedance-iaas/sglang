@@ -14,14 +14,128 @@ import pandas
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
-    ANSWER_PATTERN_MULTICHOICE,
     HTML_JINJA,
     Eval,
     EvalResult,
     SamplerBase,
     SingleEvalResult,
-    format_multichoice_question,
 )
+
+GPQA_ANSWER_PATTERN_MULTICHOICE = (
+    r"(?im)(?:^|\n)\s*Answer\s*:\s*(?:[\(\[]\s*)?"
+    r"([A-D])(?:\s*[\)\]])?\s*\.?\s*$"
+)
+
+
+def format_gpqa_question(row: dict) -> str:
+    return f"""
+You are answering a GPQA multiple-choice question.
+Choose exactly one option from A, B, C, and D.
+
+Question:
+{row["Question"]}
+
+A) {row["A"]}
+B) {row["B"]}
+C) {row["C"]}
+D) {row["D"]}
+
+Your final line must be exactly:
+Answer: X
+
+Replace X with one of A, B, C, or D.
+Do not put any value, formula, option text, or explanation after the final answer line.
+""".strip()
+
+
+def _normalize_answer_text(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-zA-Z0-9]+", " ", text)).strip().lower()
+
+
+def _extract_answer_spans(response_text: str) -> list[tuple[int, str]]:
+    spans: list[tuple[int, str]] = []
+
+    for match in re.finditer(GPQA_ANSWER_PATTERN_MULTICHOICE, response_text):
+        if response_text[match.end() :].strip():
+            continue
+        spans.append((match.start(), match.group(1).upper()))
+
+    answer_phrases = [
+        r"(?i)\b(?:(?:final\s+(?:answer|option|choice)|"
+        r"correct\s+(?:answer|option|choice))\s*(?:is|:)|answer\s+is)\s*"
+        r"(?:option|choice)?\s*[\(\[]?\s*([A-D])\b"
+        r"(?!\s*(?:[-/,]|or\b|and\b))",
+        r"(?i)\\boxed\{\s*([A-D])\s*\}",
+    ]
+    for pattern in answer_phrases:
+        for match in re.finditer(pattern, response_text):
+            prefix = response_text[max(0, match.start() - 80) : match.start()]
+            suffix = response_text[match.end() :].split("\n", 1)[0]
+            if re.search(
+                r"(?i)\b(?:considered|initially|first|thought|tempting)\b",
+                prefix,
+            ) or re.search(
+                r"(?i)(?:\b(?:but|however|though|although|instead|rather|"
+                r"wrong|changed|unsure|not\s+sure)\b|actually\s+no)",
+                suffix,
+            ):
+                continue
+            spans.append((match.start(), match.group(1).upper()))
+
+    tail_match = re.search(r"(?:^|</think>|\n)\s*([A-D])\s*$", response_text, re.I)
+    if tail_match:
+        spans.append((tail_match.start(), tail_match.group(1).upper()))
+
+    tail_choice_match = re.search(
+        r"(?:^|\n)\s*([A-D])\s*[\)\].:-]\s*\S[^\n]*\s*$",
+        response_text,
+        re.I,
+    )
+    if tail_choice_match:
+        prefix = response_text[: tail_choice_match.start()].strip()
+        if (
+            prefix.endswith("</think>")
+            or re.search(r"(?i)(?:final|answer|correct)\s*[:\n]?\s*$", prefix[-80:])
+        ):
+            spans.append((tail_choice_match.start(), tail_choice_match.group(1).upper()))
+
+    return spans
+
+
+def _match_choice_text(response_text: str, choices_dict: dict) -> Optional[str]:
+    tail_text = "\n".join(response_text.strip().splitlines()[-3:])
+    normalized_tail = _normalize_answer_text(tail_text)
+    if not normalized_tail:
+        return None
+    if not re.search(r"(?i)\b(answer|final|correct|therefore|thus|hence)\b", tail_text):
+        return None
+    if re.search(
+        r"(?i)(?:\b(?:but|however|though|although|instead|rather|wrong|"
+        r"changed|unsure|not\s+sure|not\s+final)\b|actually\s+no)",
+        tail_text,
+    ):
+        return None
+
+    hits = []
+    for answer in "ABCD":
+        choice_text = _normalize_answer_text(str(choices_dict[answer]))
+        if choice_text and re.search(
+            rf"(?:^| ){re.escape(choice_text)}(?: |$)", normalized_tail
+        ):
+            hits.append((answer, len(choice_text)))
+    if not hits:
+        return None
+
+    max_len = max(length for _, length in hits)
+    longest_hits = [answer for answer, length in hits if length == max_len]
+    return longest_hits[0] if len(longest_hits) == 1 else None
+
+
+def extract_gpqa_answer(response_text: str, choices_dict: dict) -> Optional[str]:
+    spans = _extract_answer_spans(response_text)
+    if spans:
+        return max(spans, key=lambda item: item[0])[1]
+    return _match_choice_text(response_text, choices_dict)
 
 
 class GPQAEval(Eval):
@@ -69,14 +183,13 @@ class GPQAEval(Eval):
             )
             prompt_messages = [
                 sampler._pack_message(
-                    content=format_multichoice_question(choices_dict), role="user"
+                    content=format_gpqa_question(choices_dict), role="user"
                 )
             ]
             response_text = sampler(prompt_messages)
             if response_text is None:
                 response_text = ""
-            match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
-            extracted_answer = match.group(1) if match else None
+            extracted_answer = extract_gpqa_answer(response_text, choices_dict)
             score = 1.0 if extracted_answer == correct_answer else 0.0
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,

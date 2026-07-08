@@ -20,10 +20,10 @@ from sglang.test.simple_eval_common import (
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
     if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
+        if thinking_mode in ["deepseek-v3", "deepseek-v4", "kimi-k2"]:
             thinking_param = "thinking"
         else:
-            # All models other than dpsk v3/kimi_k2
+            # Qwen/GLM-style templates use enable_thinking instead of thinking.
             thinking_param = "enable_thinking"
         return {thinking_param: True}
     return {}
@@ -41,7 +41,7 @@ def parse_json_object(value: str) -> dict:
     return parsed
 
 
-def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
+def resolve_chat_template_kwargs(args) -> dict:
     chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
     if isinstance(chat_template_kwargs, str):
         chat_template_kwargs = parse_json_object(chat_template_kwargs)
@@ -50,7 +50,15 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     elif not isinstance(chat_template_kwargs, dict):
         raise ValueError("chat_template_kwargs must be a dict or a JSON object string")
 
-    chat_template_kwargs = {**get_thinking_kwargs(args), **chat_template_kwargs}
+    return {**get_thinking_kwargs(args), **chat_template_kwargs}
+
+
+def should_fallback_to_reasoning_content(args) -> bool:
+    return getattr(args, "eval_name", None) == "gpqa"
+
+
+def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
+    chat_template_kwargs = resolve_chat_template_kwargs(args)
 
     extra_body = {}
     if chat_template_kwargs:
@@ -82,6 +90,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
+            fallback_to_reasoning_content=should_fallback_to_reasoning_content(args),
         )
 
     # Run eval
@@ -272,7 +281,14 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
+THINKING_MODE_CHOICES = [
+    "deepseek-v3",
+    "deepseek-v4",
+    "qwen-3",
+    "qwen3",
+    "glm-45",
+    "kimi-k2",
+]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -321,7 +337,11 @@ if __name__ == "__main__":
         "--chat-template-kwargs",
         type=parse_json_object,
         default=None,
-        help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
+        help=(
+            "JSON object string for chat_template_kwargs, e.g. "
+            '\'{"thinking": true}\' for DeepSeek or '
+            '\'{"enable_thinking": true}\' for Qwen3'
+        ),
     )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
@@ -329,7 +349,11 @@ if __name__ == "__main__":
         default=None,
         type=str,
         choices=THINKING_MODE_CHOICES,
-        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
+        help=(
+            "Enable thinking mode in DeepSeek V3/V4, Kimi-K2, Qwen3, or "
+            "GLM-4.5. Launch with --reasoning-parser when the eval needs "
+            "separate reasoning_content."
+        ),
     )
 
     # LongBench-v2 specific arguments

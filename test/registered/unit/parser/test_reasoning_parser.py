@@ -199,6 +199,44 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
+class TestDeepSeekV4ReasoningContract(CustomTestCase):
+    def test_force_reasoning_strips_deepseek_end_token(self):
+        parser = ReasoningParser(
+            model_type="deepseek-v4",
+            stream_reasoning=False,
+            force_reasoning=True,
+        )
+        reasoning_text, normal_text = parser.parse_non_stream(
+            "I considered A and B.</think>Answer: C"
+        )
+        self.assertEqual(reasoning_text, "I considered A and B.")
+        self.assertEqual(normal_text, "Answer: C")
+
+    def test_stream_force_reasoning_strips_deepseek_end_token(self):
+        parser = ReasoningParser(
+            model_type="deepseek-v4",
+            stream_reasoning=True,
+            force_reasoning=True,
+        )
+        reasoning_text, normal_text = parser.parse_stream_chunk(
+            "I considered A and B.</think>Answer: C"
+        )
+        self.assertEqual(reasoning_text, "I considered A and B.")
+        self.assertEqual(normal_text, "Answer: C")
+
+    def test_without_force_reasoning_keeps_deepseek_end_token(self):
+        parser = ReasoningParser(
+            model_type="deepseek-v4",
+            stream_reasoning=False,
+            force_reasoning=False,
+        )
+        reasoning_text, normal_text = parser.parse_non_stream(
+            "I considered A and B.</think>Answer: C"
+        )
+        self.assertEqual(reasoning_text, "")
+        self.assertEqual(normal_text, "I considered A and B.</think>Answer: C")
+
+
 class TestQwen3Detector(CustomTestCase):
     def setUp(self):
         self.detector = Qwen3Detector()

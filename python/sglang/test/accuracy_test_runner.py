@@ -25,7 +25,7 @@ class AccuracyTestParams:
     max_tokens: Optional[int] = None
     return_latency: bool = False
     # Extended parameters for special evaluations (e.g., GPQA with thinking mode)
-    thinking_mode: Optional[str] = None  # e.g., "deepseek-v3"
+    thinking_mode: Optional[str] = None  # e.g., "deepseek-v4", "deepseek-v3"
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None

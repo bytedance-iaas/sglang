@@ -95,6 +95,7 @@ class ChatCompletionSampler(SamplerBase):
         reasoning_effort: Optional[str] = None,
         max_tokens: int = 2048,
         extra_body: Optional[Dict[str, Any]] = None,
+        fallback_to_reasoning_content: bool = False,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -108,6 +109,7 @@ class ChatCompletionSampler(SamplerBase):
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
+        self.fallback_to_reasoning_content = fallback_to_reasoning_content
         self.image_format = "url"
         self._completion_tokens: list[int] = []
         print(
@@ -154,7 +156,13 @@ class ChatCompletionSampler(SamplerBase):
                 )
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
-                return response.choices[0].message.content or ""
+                message = response.choices[0].message
+                content = message.content or ""
+                if content.strip():
+                    return content
+                if self.fallback_to_reasoning_content:
+                    return getattr(message, "reasoning_content", None) or ""
+                return ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)

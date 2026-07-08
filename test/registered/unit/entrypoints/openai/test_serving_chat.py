@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -146,6 +147,50 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
+
+    def test_dsv4_require_reasoning_uses_thinking_without_parser(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        self.chat.reasoning_parser = None
+        self.tm.server_args.reasoning_parser = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                [],
+                None,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(req)
+
+        self.assertTrue(adapted.require_reasoning)
+
+    def test_dsv4_process_messages_uses_thinking_without_parser(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        self.chat.reasoning_parser = None
+        self.tm.server_args.reasoning_parser = None
+        self.template_manager.jinja_template_content_format = "string"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encoding_dsv4.encode_messages",
+            return_value="encoded prompt",
+        ) as encode_mock:
+            self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(encode_mock.call_args.kwargs["thinking_mode"], "thinking")
 
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
@@ -1227,6 +1272,63 @@ class ServingChatTestCase(unittest.TestCase):
             with self.subTest(effort=effort):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
+    def test_resolve_dsv4_thinking_contract(self):
+        cases = [
+            ({"thinking": True}, None, False, True),
+            ({"thinking": False}, None, True, False),
+            ({"thinking": "true"}, None, False, True),
+            ({"thinking": "false"}, None, True, False),
+            ({"thinking": "yes"}, None, False, True),
+            ({"thinking": "0"}, None, True, False),
+            ({"thinking": "maybe"}, None, True, False),
+            ({"thinking": True}, "none", False, True),
+            ({}, "none", True, False),
+            ({}, "no_think", True, False),
+            ({}, None, True, True),
+            ({}, None, False, False),
+        ]
+        for chat_template_kwargs, reasoning_effort, default, expected in cases:
+            with self.subTest(
+                chat_template_kwargs=chat_template_kwargs,
+                reasoning_effort=reasoning_effort,
+                default=default,
+            ):
+                self.assertEqual(
+                    OpenAIServingChat._resolve_dsv4_thinking(
+                        chat_template_kwargs, reasoning_effort, default
+                    ),
+                    expected,
+                )
+
+    def test_dsv4_force_nonempty_content_default_disabled(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        self.chat.reasoning_parser = "deepseek-v4"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            separate_reasoning=True,
+            chat_template_kwargs={"thinking": True},
+        )
+
+        self.chat._apply_dsv4_force_nonempty_content(req)
+
+        self.assertNotIn("force_nonempty_content", req.chat_template_kwargs)
+
+    def test_dsv4_force_nonempty_content_can_be_enabled(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        self.chat.reasoning_parser = "deepseek-v4"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            separate_reasoning=True,
+            chat_template_kwargs={"thinking": True},
+        )
+
+        with envs.SGLANG_DSV4_FORCE_NONEMPTY_CONTENT.override(True):
+            self.chat._apply_dsv4_force_nonempty_content(req)
+
+        self.assertTrue(req.chat_template_kwargs["force_nonempty_content"])
 
     # ------------- reasoning config tests -------------
     def test_get_reasoning_from_request_default_true_toggle(self):

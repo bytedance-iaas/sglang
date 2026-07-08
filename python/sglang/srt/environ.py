@@ -606,7 +606,7 @@ class Envs:
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # If DSV4 thinking generation does not emit a normal-content suffix, expose
     # the reasoning text as content instead of returning an empty message.
-    SGLANG_DSV4_FORCE_NONEMPTY_CONTENT = EnvBool(True)
+    SGLANG_DSV4_FORCE_NONEMPTY_CONTENT = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

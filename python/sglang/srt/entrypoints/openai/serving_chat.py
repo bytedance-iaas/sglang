@@ -443,7 +443,11 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            require_reasoning=self._get_reasoning_from_request(request),
+            require_reasoning=(
+                self._get_dsv4_thinking_from_request(request)
+                if self.chat_encoding_spec == "dsv4"
+                else self._get_reasoning_from_request(request)
+            ),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -466,7 +470,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_mistral_skip_special_tokens(request)
 
-        thinking_mode = self._get_reasoning_from_request(request)
+        if self.chat_encoding_spec == "dsv4":
+            thinking_mode = self._get_dsv4_thinking_from_request(request)
+        else:
+            thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
@@ -536,9 +543,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.chat_encoding_spec is not None:
             # Per-request wins; env is fallback default for benchmark
             # workflows that can't pass per-request chat_template_kwargs.
-            thinking_requested = (request.chat_template_kwargs or {}).get(
-                "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-            )
+            if self.chat_encoding_spec == "dsv4":
+                thinking_requested = self._get_dsv4_thinking_from_request(request)
+            else:
+                thinking_requested = (request.chat_template_kwargs or {}).get(
+                    "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+                )
             thinking_mode = "thinking" if thinking_requested else "chat"
             messages = [msg.model_dump() for msg in request.messages]
 
@@ -1172,10 +1182,16 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
-                is_force_reasoning = (
-                    self.template_manager.force_reasoning
-                    or self._get_reasoning_from_request(request)
-                )
+                if (
+                    self.chat_encoding_spec == "dsv4"
+                    and reasoning_parser == "deepseek-v4"
+                ):
+                    is_force_reasoning = self._get_dsv4_thinking_from_request(request)
+                else:
+                    is_force_reasoning = (
+                        self.template_manager.force_reasoning
+                        or self._get_reasoning_from_request(request)
+                    )
                 try:
                     parser = ReasoningParser(
                         model_type=reasoning_parser,
@@ -1436,10 +1452,16 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
-            is_force_reasoning = (
-                self.template_manager.force_reasoning
-                or self._get_reasoning_from_request(request)
-            )
+            if (
+                self.chat_encoding_spec == "dsv4"
+                and self.reasoning_parser == "deepseek-v4"
+            ):
+                is_force_reasoning = self._get_dsv4_thinking_from_request(request)
+            else:
+                is_force_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self._get_reasoning_from_request(request)
+                )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
                 request.stream_reasoning,
@@ -1489,12 +1511,35 @@ class OpenAIServingChat(OpenAIServingBase):
             or self.reasoning_parser != "deepseek-v4"
             or not request.separate_reasoning
             or not envs.SGLANG_DSV4_FORCE_NONEMPTY_CONTENT.get()
-            or not self._get_reasoning_from_request(request)
+            or not self._get_dsv4_thinking_from_request(request)
         ):
             return
 
         request.chat_template_kwargs = dict(request.chat_template_kwargs or {})
         request.chat_template_kwargs.setdefault("force_nonempty_content", True)
+
+    def _get_dsv4_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
+        return self._resolve_dsv4_thinking(
+            request.chat_template_kwargs,
+            request.reasoning_effort,
+            envs.SGLANG_DEFAULT_THINKING.get(),
+        )
+
+    @staticmethod
+    def _resolve_dsv4_thinking(
+        chat_template_kwargs: Optional[Dict],
+        reasoning_effort: Optional[str],
+        default: bool,
+    ) -> bool:
+        chat_template_kwargs = chat_template_kwargs or {}
+        if "thinking" in chat_template_kwargs:
+            thinking = chat_template_kwargs["thinking"]
+            if isinstance(thinking, str):
+                return thinking.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(thinking)
+        if reasoning_effort in ("none", "no_think"):
+            return False
+        return bool(default)
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.
