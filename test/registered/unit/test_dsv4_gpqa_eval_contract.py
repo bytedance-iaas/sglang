@@ -87,17 +87,15 @@ class TestDSV4GPQAEvalContract(unittest.TestCase):
             {"thinking": False, "foo": "bar"},
         )
 
-    def test_reasoning_content_fallback_is_gpqa_only(self):
-        self.assertTrue(
+    def test_reasoning_content_fallback_is_diagnostic_opt_in(self):
+        self.assertFalse(
             should_fallback_to_reasoning_content(SimpleNamespace(eval_name="gpqa"))
         )
-        for eval_name in ["mmlu", "math", "longbench_v2", None]:
-            with self.subTest(eval_name=eval_name):
-                self.assertFalse(
-                    should_fallback_to_reasoning_content(
-                        SimpleNamespace(eval_name=eval_name)
-                    )
-                )
+        self.assertTrue(
+            should_fallback_to_reasoning_content(
+                SimpleNamespace(eval_name="gpqa", gpqa_reasoning_fallback=True)
+            )
+        )
 
     def test_gpqa_extractor_uses_last_answer(self):
         choices = {
@@ -109,6 +107,27 @@ class TestDSV4GPQAEvalContract(unittest.TestCase):
         }
         response = "At first I considered A.\nAnswer: A\nFinal check.\nAnswer: C"
         self.assertEqual(extract_gpqa_answer(response, choices), "C")
+
+    def test_gpqa_strict_extractor_matches_official_behavior(self):
+        choices = {
+            "Question": "Which option is correct?",
+            "A": "alpha",
+            "B": "beta",
+            "C": "gamma",
+            "D": "delta",
+        }
+        self.assertEqual(
+            extract_gpqa_answer(
+                "Answer: A\nActually no.\nAnswer: C",
+                choices,
+                relaxed=False,
+            ),
+            "A",
+        )
+        self.assertIsNone(
+            extract_gpqa_answer("The final answer is C.", choices, relaxed=False)
+        )
+        self.assertIsNone(extract_gpqa_answer("C", choices, relaxed=False))
 
     def test_gpqa_extractor_rejects_ambiguous_answer_line(self):
         choices = {

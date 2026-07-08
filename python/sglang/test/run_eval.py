@@ -54,7 +54,7 @@ def resolve_chat_template_kwargs(args) -> dict:
 
 
 def should_fallback_to_reasoning_content(args) -> bool:
-    return getattr(args, "eval_name", None) == "gpqa"
+    return bool(getattr(args, "gpqa_reasoning_fallback", False))
 
 
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
@@ -144,7 +144,13 @@ def run_eval(args):
         filename = (
             "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         )
-        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
+        eval_obj = GPQAEval(
+            filename,
+            args.num_examples,
+            args.num_threads,
+            prompt_style=getattr(args, "gpqa_prompt_style", "official"),
+            relaxed_extraction=getattr(args, "gpqa_relaxed_extraction", False),
+        )
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
@@ -353,6 +359,33 @@ if __name__ == "__main__":
             "Enable thinking mode in DeepSeek V3/V4, Kimi-K2, Qwen3, or "
             "GLM-4.5. Launch with --reasoning-parser when the eval needs "
             "separate reasoning_content."
+        ),
+    )
+    parser.add_argument(
+        "--gpqa-prompt-style",
+        default="official",
+        choices=["official", "strict-final-line"],
+        help=(
+            "GPQA prompt style. The default 'official' matches the simple-evals "
+            "multiple-choice prompt; 'strict-final-line' is a diagnostic prompt "
+            "that explicitly asks for a final 'Answer: X' line."
+        ),
+    )
+    parser.add_argument(
+        "--gpqa-relaxed-extraction",
+        action="store_true",
+        help=(
+            "Diagnostic-only GPQA scoring: accept final answer phrases, bare "
+            "tail letters, and answer text matches. Default is official strict "
+            "'Answer: X' extraction."
+        ),
+    )
+    parser.add_argument(
+        "--gpqa-reasoning-fallback",
+        action="store_true",
+        help=(
+            "Diagnostic-only GPQA sampling: if message.content is empty, score "
+            "message.reasoning_content. Default keeps official content-only behavior."
         ),
     )
 

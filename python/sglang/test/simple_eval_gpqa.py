@@ -14,11 +14,13 @@ import pandas
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
+    ANSWER_PATTERN_MULTICHOICE,
     HTML_JINJA,
     Eval,
     EvalResult,
     SamplerBase,
     SingleEvalResult,
+    format_multichoice_question,
 )
 
 GPQA_ANSWER_PATTERN_MULTICHOICE = (
@@ -131,7 +133,13 @@ def _match_choice_text(response_text: str, choices_dict: dict) -> Optional[str]:
     return longest_hits[0] if len(longest_hits) == 1 else None
 
 
-def extract_gpqa_answer(response_text: str, choices_dict: dict) -> Optional[str]:
+def extract_gpqa_answer(
+    response_text: str, choices_dict: dict, relaxed: bool = True
+) -> Optional[str]:
+    if not relaxed:
+        match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
+        return match.group(1) if match else None
+
     spans = _extract_answer_spans(response_text)
     if spans:
         return max(spans, key=lambda item: item[0])[1]
@@ -145,7 +153,13 @@ class GPQAEval(Eval):
         num_examples: Optional[int],
         num_threads: int,
         n_repeats: int = 1,
+        prompt_style: str = "official",
+        relaxed_extraction: bool = False,
     ):
+        if prompt_style not in ("official", "strict-final-line"):
+            raise ValueError(
+                "prompt_style must be either 'official' or 'strict-final-line'"
+            )
         if "://" in filename:
             df = pandas.read_csv(filename, storage_options={"timeout": 30})
         else:
@@ -162,6 +176,8 @@ class GPQAEval(Eval):
         self.examples = examples
         self.n_repeats = n_repeats
         self.num_threads = num_threads
+        self.prompt_style = prompt_style
+        self.relaxed_extraction = relaxed_extraction
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
@@ -181,15 +197,25 @@ class GPQAEval(Eval):
                 D=choices[3],
                 Question=row["Question"],
             )
+            prompt_text = (
+                format_multichoice_question(choices_dict)
+                if self.prompt_style == "official"
+                else format_gpqa_question(choices_dict)
+            )
             prompt_messages = [
-                sampler._pack_message(
-                    content=format_gpqa_question(choices_dict), role="user"
-                )
+                sampler._pack_message(content=prompt_text, role="user")
             ]
             response_text = sampler(prompt_messages)
             if response_text is None:
                 response_text = ""
-            extracted_answer = extract_gpqa_answer(response_text, choices_dict)
+            extracted_answer = extract_gpqa_answer(
+                response_text, choices_dict, relaxed=self.relaxed_extraction
+            )
+            relaxed_answer = (
+                extracted_answer
+                if self.relaxed_extraction
+                else extract_gpqa_answer(response_text, choices_dict, relaxed=True)
+            )
             score = 1.0 if extracted_answer == correct_answer else 0.0
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,
@@ -203,7 +229,19 @@ class GPQAEval(Eval):
                 html=html,
                 score=score,
                 convo=convo,
-                metrics={"chars": len(response_text)},
+                metrics={
+                    "chars": len(response_text),
+                    "empty_response": 0.0 if response_text.strip() else 1.0,
+                    "answer_extracted": 1.0 if extracted_answer is not None else 0.0,
+                    "strict_final_answer_line": (
+                        1.0
+                        if re.search(GPQA_ANSWER_PATTERN_MULTICHOICE, response_text)
+                        else 0.0
+                    ),
+                    "relaxed_would_extract": (
+                        1.0 if relaxed_answer is not None else 0.0
+                    ),
+                },
             )
 
         results = common.map_with_progress(fn, self.examples, self.num_threads)
