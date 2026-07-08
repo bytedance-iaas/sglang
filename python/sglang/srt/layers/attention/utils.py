@@ -311,7 +311,11 @@ def seqlens_expand_kernel(
     offs = tl.arange(0, BLOCK)
     mask = offs < qo_len
 
-    values = start + offs
+    # DP-padded or idle companion rows can have kv_len < qo_len, which would
+    # produce negative visible KV lengths. Some downstream top-k kernels read
+    # these lengths as unsigned values, so clamp padded rows to the valid
+    # all-empty path.
+    values = tl.maximum(start + offs, 0)
     tl.store(output_ptr + out_offset + offs, values, mask=mask)
 
 

@@ -401,6 +401,13 @@ _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
+    """Preprocess the per-batch routing plan for ``topk_transform_512_v2``.
+
+    Every entry of ``seq_lens`` must be non-negative. The device kernel reads
+    the int32 buffer as uint32_t, so a negative length from a padded or idle row
+    would be interpreted as a huge sequence length. Producers of padded rows
+    should clamp those lengths to 0; 0 is the valid all-(-1) output path.
+    """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
@@ -423,6 +430,13 @@ def topk_transform_512_v2(
     workspace: Optional[torch.Tensor] = None,
     raw_indices_only: bool = False,
 ) -> None:
+    """Fused top-k plus page-table transform for DeepSeek-V4.
+
+    ``seq_lens`` must match the values used by ``plan_topk_v2`` and every row
+    length must be non-negative. Padded rows should use 0 so the kernel emits
+    all -1 outputs instead of treating a negative int32 value as a huge uint32
+    sequence length.
+    """
     del workspace
     module = _jit_topk_v2_module()
     module.topk_transform(
