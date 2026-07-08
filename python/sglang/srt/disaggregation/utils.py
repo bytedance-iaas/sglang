@@ -773,12 +773,16 @@ def setup_state_kv_args(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
         ):
             raise RuntimeError("DSV4 draft state transfer expects SWA-only NextN layers")
-        if token_to_kv_pool._unified_kv != draft_token_to_kv_pool._unified_kv:
+        target_unified_kv = bool(getattr(token_to_kv_pool, "_unified_kv", False))
+        draft_unified_kv = bool(
+            getattr(draft_token_to_kv_pool, "_unified_kv", False)
+        )
+        if target_unified_kv != draft_unified_kv:
             raise RuntimeError(
                 "DSV4 target and draft pools must use the same unified-KV mode"
             )
 
-        if token_to_kv_pool._unified_kv:
+        if target_unified_kv:
             target_geometry = (
                 token_to_kv_pool.unified_swa_window,
                 token_to_kv_pool.unified_swa_ring_size,

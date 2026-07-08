@@ -22,9 +22,10 @@ def _buf_infos(*ptrs):
     return list(ptrs), [ptr + 100 for ptr in ptrs], [ptr + 200 for ptr in ptrs]
 
 
-def _make_dsv4_target(*, unified, mapping=None):
+def _make_dsv4_target(*, unified, mapping=None, legacy_unified_attr=False):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
-    pool._unified_kv = unified
+    if not legacy_unified_attr:
+        pool._unified_kv = unified
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
@@ -39,9 +40,10 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, legacy_unified_attr=False):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
-    pool._unified_kv = unified
+    if not legacy_unified_attr:
+        pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.sliding_window = 128
@@ -105,6 +107,17 @@ class TestDisaggregationWire(unittest.TestCase):
                 [[11]],
             ),
             (
+                "legacy-paged-no-unified-attr",
+                _make_dsv4_target(
+                    unified=False, mapping=mapping, legacy_unified_attr=True
+                ),
+                _make_dsv4_draft(
+                    unified=False, mapping=mapping, legacy_unified_attr=True
+                ),
+                [StateType.SWA, StateType.SWA],
+                [[11]],
+            ),
+            (
                 "unified",
                 _make_dsv4_target(unified=True),
                 _make_dsv4_draft(unified=True),
@@ -115,7 +128,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):
-                if draft._unified_kv:
+                if getattr(draft, "_unified_kv", False):
                     expected_infos = draft.get_unified_swa_ring_buf_infos()
                 else:
                     expected_infos = draft.get_state_buf_infos()
