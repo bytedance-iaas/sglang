@@ -61,11 +61,11 @@ def _extract_answer_spans(response_text: str) -> list[tuple[int, str]]:
         spans.append((match.start(), match.group(1).upper()))
 
     answer_phrases = [
-        r"(?i)\b(?:(?:final\s+(?:answer|option|choice)|"
-        r"correct\s+(?:answer|option|choice))\s*(?:is|:)|answer\s+is)\s*"
-        r"(?:option|choice)?\s*[\(\[]?\s*([A-D])\b"
+        r"\b(?:(?i:(?:final\s+(?:answer|option|choice)|"
+        r"correct\s+(?:answer|option|choice))\s*(?:is|:)|answer\s+is))\s*"
+        r"(?i:(?:option|choice)?)\s*[\(\[]?\s*([A-D])\b"
         r"(?!\s*(?:[-/,]|or\b|and\b))",
-        r"(?i)\\boxed\{\s*([A-D])\s*\}",
+        r"(?i:\\boxed\{\s*)([A-D])(?i:\s*\})",
     ]
     for pattern in answer_phrases:
         for match in re.finditer(pattern, response_text):

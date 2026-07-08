@@ -219,6 +219,23 @@ class TestDSV4GPQAEvalContract(unittest.TestCase):
             "C",
         )
 
+    def test_gpqa_extractor_rejects_lowercase_article_after_answer_phrase(self):
+        choices = {
+            "Question": "Which option is correct?",
+            "A": "alpha",
+            "B": "beta",
+            "C": "gamma",
+            "D": "delta",
+        }
+        rejected = [
+            "The answer is a 2-dimensional vector.",
+            "The final answer is a Diels-Alder adduct.",
+            "The correct answer is a structural isomer.",
+        ]
+        for response in rejected:
+            with self.subTest(response=response):
+                self.assertIsNone(extract_gpqa_answer(response, choices))
+
     def test_gpqa_extractor_rejects_bare_option_line(self):
         choices = {
             "Question": "Which option is correct?",
