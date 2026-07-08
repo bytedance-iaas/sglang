@@ -335,6 +335,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 origin_weight.untyped_storage().resize_(0)
                 weight.data = npu_format_cast(new_weight)
 
+        if get_moe_runner_backend().is_asym_gemm():
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+                maybe_create_unified_asym_gemm_layer,
+            )
+
+            maybe_create_unified_asym_gemm_layer(layer)
+
         return
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
@@ -433,6 +440,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+            should_use_unified_asym_gemm_forward,
+            unified_asym_gemm_forward,
+        )
+
+        if should_use_unified_asym_gemm_forward(
+            layer, dispatch_output.hidden_states.shape[0]
+        ):
+            return unified_asym_gemm_forward(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
 

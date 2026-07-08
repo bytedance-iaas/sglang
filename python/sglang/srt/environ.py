@@ -411,6 +411,25 @@ class Envs:
     SGLANG_JIT_ASYMGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_ASYMGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_IN_ASYMGEMM_PRECOMPILE_STAGE = EnvBool(False)
+    # Unified CPU(AMX INT8)+GPU(SM90 INT8) MoE kernel for the asym_gemm
+    # backend (BF16 checkpoints only). Off by default; the existing
+    # asym_gemm paths are untouched when disabled.
+    SGLANG_ASYMGEMM_UNIFIED_MOE = EnvBool(False)
+    # Per-expert dispatch threshold: experts with <= this many routed tokens
+    # run on the CPU AMX bucket, the rest on the GPU INT8 grouped kernel.
+    SGLANG_ASYMGEMM_UNIFIED_M_CPU = EnvInt(16)
+    # Total CPU worker threads for the AMX bucket. Sizes a single process-wide
+    # pool shared by every converted MoE layer (not per-layer), read once when
+    # the first layer is built. 0 = library default (host hardware concurrency).
+    SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS = EnvInt(0)
+    # Directory of pre-quantized INT8 expert weights produced offline by
+    # AsymGEMM/scripts/convert_int8_weights.py. When set and a matching
+    # per-layer file (layer_{id}.safetensors) is present, the unified MoE path
+    # loads the INT8 slab directly instead of quantizing the BF16 masters at
+    # load time (which is slow: a per-expert Python loop over every MoE layer).
+    # Empty = always quantize online. On any missing file or shape mismatch the
+    # affected layer transparently falls back to online quantization.
+    SGLANG_ASYMGEMM_UNIFIED_INT8_PATH = EnvStr("")
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
