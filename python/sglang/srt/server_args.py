@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -565,6 +566,25 @@ class ServerArgs:
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+
+    @cached_property
+    def max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count speculative decoding may use."""
+        if self.speculative_num_draft_tokens is None:
+            return None
+        if not self.speculative_adaptive:
+            return self.speculative_num_draft_tokens
+
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidate_steps = resolve_candidate_steps_from_config(
+            cfg_path=self.speculative_adaptive_config,
+        )
+        # Adaptive spec currently requires topk=1, so each runtime state needs
+        # steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+        return max(candidate_steps) + 1
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -3675,7 +3695,10 @@ class ServerArgs:
                         "('nixl', 'mooncake'), but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
-                if self.speculative_algorithm is not None:
+                if (
+                    self.speculative_algorithm is not None
+                    and not self._allow_dsv4_decode_radix_speculative()
+                ):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with speculative decoding "
@@ -3719,6 +3742,15 @@ class ServerArgs:
                     f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
+
+    def _allow_dsv4_decode_radix_speculative(self) -> bool:
+        return (
+            envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get()
+            and self.speculative_algorithm.upper() == "EAGLE"
+            and self.speculative_eagle_topk == 1
+            and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+        )
 
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:

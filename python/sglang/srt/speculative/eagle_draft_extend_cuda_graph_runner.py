@@ -457,6 +457,20 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            # Reset the padding region of req_pool_indices so that stale
+            # req-pool slot ids from a previous replay are not picked up by
+            # gathers (req_to_token / full->swa mapping) inside the captured
+            # graph, which would trigger vectorized_gather_kernel index out of
+            # bounds.
+            buffers.req_pool_indices.zero_()
+            # Likewise, input_ids is used as a gather index by the vocab
+            # embedding inside the captured graph. If the padding region
+            # [num_tokens : bs*num_tokens_per_bs] still holds stale token ids
+            # from a previous replay (possibly >= vocab_size), it will trigger
+            # the same vectorized_gather_kernel index out of bounds.
+            buffers.input_ids.zero_()
+            if buffers.hidden_states is not None:
+                buffers.hidden_states.zero_()
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -519,17 +533,24 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-        )
+        # Some attention backends (DSv4) need the original ForwardBatch for
+        # replay-only metadata fields such as out_cache_loc and logical mode.
+        forward_batch.batch_size_before_padding = raw_bs
+        self.draft_extend_attn_backend._replay_forward_batch = forward_batch
+        try:
+            self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=buffers.req_pool_indices,
+                seq_lens=buffers.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu,
+            )
+        finally:
+            self.draft_extend_attn_backend._replay_forward_batch = None
 
         # Replay
         self.raw_bs = raw_bs

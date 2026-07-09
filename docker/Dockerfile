@@ -12,9 +12,14 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.2.post2
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+merge.pr332.pr36.sgl.dev
+ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
+ARG DEEPGEMM_REF=merge-pr332-pr36-sgl-dev
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
+ARG GDRCOPY_GITHUB_ARTIFACTORY
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -43,11 +48,13 @@ fi
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    apt update && apt install -y --no-install-recommends wget curl software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
@@ -134,8 +141,9 @@ fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
+    && GDRCOPY_GITHUB_ARTIFACTORY="${GDRCOPY_GITHUB_ARTIFACTORY:-${GITHUB_ARTIFACTORY}}" \
     && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
-        https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
+        https://${GDRCOPY_GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
     && CUDA=/usr/local/cuda ./build-deb-packages.sh \
@@ -177,6 +185,11 @@ FROM base AS torch_deps
 ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.0+merge.pr332.pr36.sgl.dev
+ARG DEEPGEMM_REPO=qiushixiaoyu/DeepGEMM
+ARG DEEPGEMM_REF=merge-pr332-pr36-sgl-dev
+ARG DEEPGEMM_CACHE_BUST=manual
+ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
@@ -184,8 +197,11 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -244,8 +260,25 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
-           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
+    && echo "${DEEPGEMM_CACHE_BUST}" \
+    && DEEPGEMM_GITHUB_ARTIFACTORY="${DEEPGEMM_GITHUB_ARTIFACTORY:-${GITHUB_ARTIFACTORY}}" \
+    && git config --global url."https://${DEEPGEMM_GITHUB_ARTIFACTORY}/".insteadOf "https://github.com/" \
+    && rm -rf /tmp/DeepGEMM \
+    && git clone --no-checkout "https://${DEEPGEMM_GITHUB_ARTIFACTORY}/${DEEPGEMM_REPO}.git" /tmp/DeepGEMM \
+    && cd /tmp/DeepGEMM \
+    && git fetch --depth=1 origin "${DEEPGEMM_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && git submodule update --init --recursive \
+    && mkdir -p /usr/local/share \
+    && git rev-parse HEAD | tee /usr/local/share/sgl-deep-gemm-commit.txt \
+    && echo -n "${SGL_DEEP_GEMM_VERSION}" > sgl_deep_gemm/VERSION \
+    && bash build_sgl_deep_gemm.sh \
+    && (python3 -m pip uninstall -y sgl-deep-gemm deep-gemm || true) \
+    && python3 -m pip install --no-deps --force-reinstall dist/sgl_deep_gemm-*.whl \
+    && rm -rf /tmp/DeepGEMM /root/.cache/deep_gemm \
+    && python3 -c 'import importlib.metadata as md; version = md.version("sgl-deep-gemm"); files = {str(p) for p in (md.files("sgl-deep-gemm") or [])}; required = ("deep_gemm/_C.so", "deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh", "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh"); missing = [p for p in required if p not in files]; assert not missing, missing; print("sgl-deep-gemm:", version)' \
+    && test "$(python3 -c 'import importlib.metadata as md; print(md.version("sgl-deep-gemm"))')" = "${SGL_DEEP_GEMM_VERSION}" \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -388,9 +421,19 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+RUN JUST_VERSION=1.42.4 \
+    && case "$(uname -m)" in \
+        x86_64) JUST_TARGET=x86_64-unknown-linux-musl ;; \
+        aarch64) JUST_TARGET=aarch64-unknown-linux-musl ;; \
+        *) echo "Unsupported architecture for just: $(uname -m)" && exit 1 ;; \
+    esac \
+    && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 -fsSL \
+        -o /tmp/just.tar.gz \
+        "https://${GITHUB_ARTIFACTORY}/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-${JUST_TARGET}.tar.gz" \
+    && tar -xzf /tmp/just.tar.gz -C /tools just \
+    && chmod +x /tools/just \
+    && /tools/just --version \
+    && rm -f /tmp/just.tar.gz
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
@@ -416,7 +459,11 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y \
+    && rm /tmp/rustup-init.sh \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -509,6 +556,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt update -y \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Onion model/data tooling. The onion-ai-data package provides oniond.
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    OS="$(. /etc/os-release && echo "${ID}")" \
+    && VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "https://mirrors.ivolces.com/extra-tools/${OS}/GPG-KEY-system" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/${OS} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends onion-ai-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
@@ -756,11 +816,26 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
     && python3 -m pip config set global.break-system-packages true \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install Onion model/data tooling. The onion-ai-data package provides oniond.
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    OS="$(. /etc/os-release && echo "${ID}")" \
+    && VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "https://mirrors.ivolces.com/extra-tools/${OS}/GPG-KEY-system" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/${OS} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends onion-ai-data \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

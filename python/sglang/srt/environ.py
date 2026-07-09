@@ -211,6 +211,7 @@ class Envs:
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -573,6 +574,8 @@ class Envs:
     # ====================================================================
     # DeepSeek V4
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE = EnvBool(False)
+    SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER = EnvBool(False)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
@@ -594,6 +597,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)

@@ -169,6 +169,8 @@ class SWAComponent(TreeComponent):
     def should_skip_leaf_creation(
         self, total_prefix_len: int, key_len: int, params: InsertParams
     ) -> bool:
+        if params.force_leaf_creation:
+            return False
         return params.swa_evicted_seqlen >= total_prefix_len + key_len
 
     def recover_after_unevict(
@@ -350,7 +352,10 @@ class SWAComponent(TreeComponent):
                 x = x_next
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
         root = self.cache.root_node
@@ -384,7 +389,10 @@ class SWAComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
         root = self.cache.root_node
@@ -418,8 +426,14 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        # Mark leading out-of-window tokens SWA-evicted on the unfinished path
+        # too: the decode-side radix cache caches reqs at admission whose reused
+        # prefix reaches past the window, and those tokens must be tombstoned, not
+        # counted as swa_evictable, or the SWA pool leaks. 0 on the aggregated path.
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.force_leaf_creation = getattr(
+            req, "force_radix_leaf_creation", False
+        )
         return None
 
     # ---- HiCache Hooks ----
@@ -484,6 +498,7 @@ class SWAComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        **kw,
     ) -> None:
         ct = self.component_type
 

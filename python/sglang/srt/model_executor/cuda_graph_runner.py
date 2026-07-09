@@ -1240,6 +1240,7 @@ class CudaGraphRunner:
             attn_backend = self.attn_backend
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
+        forward_batch.batch_size_before_padding = raw_bs
         attn_backend._replay_forward_batch = forward_batch
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,

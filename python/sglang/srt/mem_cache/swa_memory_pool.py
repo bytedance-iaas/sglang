@@ -371,9 +371,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._kvcache = kvcache
 
         self.clear()
-        self._kvcache = kvcache
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
@@ -614,10 +614,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        swa_indices = self.full_to_swa_index_mapping[free_index]
+        if free_index.numel() == 0:
+            return
+
+        # Negative indices are sentinels (for example, last_loc=-1), and values
+        # beyond the mapping table may come from full-only pools. Do not use
+        # either as gather indices into full_to_swa_index_mapping.
+        free_index = free_index[
+            (free_index >= 0) & (free_index < self.full_to_swa_index_mapping.shape[0])
+        ]
+        if free_index.numel() == 0:
+            return
+
+        if self.page_size == 1:
+            mapping_indices = free_index
+        else:
+            mapping_indices = self._expand_to_full_pages(free_index)
+
+        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        self.full_to_swa_index_mapping[mapping_indices] = 0
+
+    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
+        pages = torch.unique(indices // self.page_size)
+        page_offsets = torch.arange(
+            self.page_size, dtype=indices.dtype, device=indices.device
+        )
+        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
     def backup_state(self):
         return [
