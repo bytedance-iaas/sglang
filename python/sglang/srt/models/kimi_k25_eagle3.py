@@ -279,17 +279,12 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # Target quantization can be inherited by the draft worker when
-        # --speculative-draft-model-quantization is unset. This MLA EAGLE3
-        # draft checkpoint is bf16 unless it declares its own quantization.
-        if (
-            quant_config is not None
-            and getattr(config, "quantization_config", None) is None
-        ):
+        # Match deepseek_nextn behavior: modelopt_fp4 is target-only and the
+        # bf16 draft must not inherit the FP4 quant method.
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
-                "%s target; draft weights are float.",
-                quant_config.get_name(),
+                "modelopt_fp4 target; draft weights are bf16."
             )
             quant_config = None
         self.quant_config = quant_config
@@ -303,7 +298,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         # missing. This checkpoint declares its own draft head, so keep ours.
         self.load_lm_head_from_target = False
         draft_vocab_size = getattr(config, "draft_vocab_size", None)
-        if draft_vocab_size is None and getattr(config, "tie_word_embeddings", False):
+        if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             if draft_vocab_size is None:

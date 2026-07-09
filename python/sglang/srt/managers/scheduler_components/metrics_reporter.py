@@ -530,7 +530,6 @@ class SchedulerMetricsReporter:
                     f"{total_hit_rate:.2f}/{gpu_hit_rate:.2f}/{eic_hit_rate:.2f}, "
                 )
 
-
         if (
             self.scheduler.server_args.language_only
             and self.scheduler.server_args.encoder_transfer_backend

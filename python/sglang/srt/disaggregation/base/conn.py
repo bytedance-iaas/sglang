@@ -32,8 +32,6 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
-    # Number of non-draft KV pointers before any draft/MTP KV pointers are appended.
-    non_draft_kv_data_lens: int
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -53,7 +51,6 @@ class KVArgs:
     system_dp_rank: int
     # for pp prefill
     pp_rank: int
-    prefill_pp_size: int
     prefill_start_layer: int
     # Absolute end layer (exclusive) for this prefill PP stage. Needed to
     # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
@@ -65,10 +62,6 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
-    # For hybrid linear-attention models: full-model mamba layer ids and this
-    # PP stage's indices into that list.
-    total_mamba_layer_ids: List[int]
-    mamba_layer_ids: List[int]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers

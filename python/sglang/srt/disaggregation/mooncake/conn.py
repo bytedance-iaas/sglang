@@ -121,7 +121,6 @@ class KVArgsRegisterInfo:
     dst_port: int
     mooncake_session_id: str
     dst_kv_ptrs: list[int]
-    dst_non_draft_kv_data_lens: int
     dst_aux_ptrs: list[int]
     dst_state_data_ptrs: List[List[int]]  # parallel to state_types (same below)
     dst_tp_rank: int
@@ -154,14 +153,11 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
-            dst_non_draft_kv_data_lens=(
-                int(msg[12].decode("ascii")) if len(msg) > 12 else len(msg[4]) // 8
-            ),
             enable_hisparse=(
-                msg[13].decode("ascii") == "1" if len(msg) > 13 else False
+                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
         )
 
 
@@ -438,7 +434,6 @@ class MooncakeKVManager(CommonKVManager):
                 req.mooncake_session_id,
                 kv_chunk.prefill_kv_indices,
                 target_info.dst_kv_ptrs,
-                target_info.dst_non_draft_kv_data_lens,
                 chunked_dst_kv_indice,
                 target_info.dst_tp_rank,
                 target_info.dst_attn_tp_size,
@@ -588,7 +583,6 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         src_data_ptrs: list[int],
         dst_data_ptrs: list[int],
-        dst_non_draft_kv_data_lens: int,
         item_lens: list[int],
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
@@ -620,9 +614,7 @@ class MooncakeKVManager(CommonKVManager):
             ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(
-                    src_data_ptrs, dst_data_ptrs, dst_non_draft_kv_data_lens
-                )
+                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
@@ -699,7 +691,6 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_non_draft_kv_data_lens: int,
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
@@ -707,7 +698,6 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
-            dst_non_draft_kv_data_lens=dst_non_draft_kv_data_lens,
             item_lens=self.kv_args.kv_item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
@@ -719,7 +709,6 @@ class MooncakeKVManager(CommonKVManager):
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_non_draft_kv_data_lens: int,
         dst_kv_indices: npt.NDArray[np.int32],
         page_index_slice: slice,
         executor: concurrent.futures.ThreadPoolExecutor,
@@ -752,7 +741,6 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
-            dst_non_draft_kv_data_lens=len(dst_kv_ptrs),
             item_lens=per_token_item_lens,
             prefill_data_indices=expanded_src,
             dst_data_indices=expanded_dst,
@@ -817,9 +805,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs, dst_kv_ptrs, dst_non_draft_kv_data_lens
-            )
+            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -1022,21 +1008,6 @@ class MooncakeKVManager(CommonKVManager):
             )
 
             if st == StateType.MAMBA:
-                (
-                    src_data_ptrs,
-                    src_item_lens,
-                    src_dim_per_tensor,
-                    dst_data_ptrs,
-                    dst_item_lens,
-                    dst_dim_per_tensor,
-                ) = self._slice_mamba_state_for_pp(
-                    src_data_ptrs,
-                    src_item_lens,
-                    src_dim_per_tensor,
-                    dst_data_ptrs,
-                    dst_item_lens,
-                    dst_dim_per_tensor,
-                )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -1097,7 +1068,6 @@ class MooncakeKVManager(CommonKVManager):
                         mooncake_session_id=req.mooncake_session_id,
                         src_data_ptrs=src_data_ptrs,
                         dst_data_ptrs=dst_data_ptrs,
-                        dst_non_draft_kv_data_lens=len(dst_data_ptrs),
                         item_lens=src_item_lens,
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
@@ -1106,49 +1076,6 @@ class MooncakeKVManager(CommonKVManager):
                     or rc
                 )
         return rc
-
-    def _slice_mamba_state_for_pp(
-        self,
-        src_data_ptrs: list[int],
-        src_item_lens: list[int],
-        src_dim_per_tensor: list[int],
-        dst_data_ptrs: list[int],
-        dst_item_lens: list[int],
-        dst_dim_per_tensor: list[int],
-    ):
-        total_mamba_layer_ids = getattr(self.kv_args, "total_mamba_layer_ids", [])
-        mamba_layer_ids = getattr(self.kv_args, "mamba_layer_ids", [])
-        total_layers = len(total_mamba_layer_ids)
-        local_layers = len(mamba_layer_ids)
-        if total_layers == 0 or local_layers == 0:
-            return (
-                src_data_ptrs,
-                src_item_lens,
-                src_dim_per_tensor,
-                dst_data_ptrs,
-                dst_item_lens,
-                dst_dim_per_tensor,
-            )
-
-        def maybe_slice(values):
-            if not values:
-                return values
-            if len(values) % total_layers == 0:
-                return [
-                    values[base + idx]
-                    for base in range(0, len(values), total_layers)
-                    for idx in mamba_layer_ids
-                ]
-            return values
-
-        return (
-            maybe_slice(src_data_ptrs),
-            maybe_slice(src_item_lens),
-            maybe_slice(src_dim_per_tensor),
-            maybe_slice(dst_data_ptrs),
-            maybe_slice(dst_item_lens),
-            maybe_slice(dst_dim_per_tensor),
-        )
 
     def _send_mamba_state(
         self,
@@ -1347,7 +1274,6 @@ class MooncakeKVManager(CommonKVManager):
                                     req.mooncake_session_id,
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
-                                    target_rank_registration_info.dst_non_draft_kv_data_lens,
                                     req.dst_kv_indices,
                                     kv_chunk.index_slice,
                                     executor,
@@ -1357,7 +1283,6 @@ class MooncakeKVManager(CommonKVManager):
                                     req.mooncake_session_id,
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
-                                    target_rank_registration_info.dst_non_draft_kv_data_lens,
                                     chunked_dst_kv_indice,
                                     executor,
                                 )
@@ -1385,7 +1310,6 @@ class MooncakeKVManager(CommonKVManager):
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
-                                target_rank_registration_info.dst_non_draft_kv_data_lens,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
                                 target_rank_registration_info.dst_attn_tp_size,
@@ -1865,13 +1789,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            non_draft_kv_data_lens = str(
-                getattr(
-                    self.kv_mgr.kv_args,
-                    "non_draft_kv_data_lens",
-                    len(self.kv_mgr.kv_args.kv_data_ptrs),
-                )
-            ).encode("ascii")
             enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
 
             if (
@@ -1901,7 +1818,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
-                        non_draft_kv_data_lens,
                         enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
