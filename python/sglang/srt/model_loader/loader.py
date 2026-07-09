@@ -138,6 +138,10 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
+        if getattr(p, "_skip_device_loading_move", False):
+            # Never-loaded virtual placeholder (e.g. AsymGEMM INT8-preloaded
+            # expert masters): moving it would fault in and copy garbage.
+            continue
         if p.device.type == "cpu":
             original_data = p.data
             device_data = p.data.to(target_device)
@@ -534,7 +538,13 @@ class DefaultModelLoader(BaseModelLoader):
                 server_args.weight_loader_drop_cache_after_load
             )
 
+            skip_names_predicate = getattr(self, "_weight_name_skip_predicate", None)
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                if skip_names_predicate is not None:
+                    logger.warning(
+                        "fastsafetensors load format does not support skipping "
+                        "INT8-preloaded expert master weights; loading them all."
+                    )
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                 )
@@ -548,6 +558,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    skip_names_predicate=skip_names_predicate,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -556,6 +567,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    skip_names_predicate=skip_names_predicate,
                 )
 
         else:
@@ -713,6 +725,25 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+
+        # AsymGEMM unified MoE INT8 preload: expert master weights covered by
+        # an offline INT8 slab are skipped at the safetensors level (their
+        # bytes are never read from disk — they would be released right after
+        # conversion anyway). Never applied to draft/MTP model loads, whose
+        # layer ids would collide with the target model's slab files.
+        self._weight_name_skip_predicate = None
+        if (
+            envs.SGLANG_ASYMGEMM_UNIFIED_MOE.get()
+            and self.load_config.draft_model_idx is None
+        ):
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+                make_expert_weight_skip_predicate,
+            )
+
+            self._weight_name_skip_predicate = make_expert_weight_skip_predicate(
+                quant_config
+            )
+
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(

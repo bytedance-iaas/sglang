@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -73,6 +74,105 @@ def unified_asym_gemm_enabled() -> bool:
 
 def has_unified_asym_gemm_layer(layer: torch.nn.Module) -> bool:
     return getattr(layer, _UNIFIED_LAYER_ATTR, None) is not None
+
+
+# --------------------------------------------------------------------------- #
+# INT8 preload: when an offline INT8 slab covers a layer, its BF16 expert
+# master weights are pure waste — they would be allocated (pinned), read from
+# the checkpoint, and then immediately released after conversion. These
+# helpers let create_weights skip the pinned allocation and the checkpoint
+# weights iterator skip the disk read entirely.
+# --------------------------------------------------------------------------- #
+
+_MASTERS_SKIPPED_ATTR = "_asym_masters_skipped"
+
+# Expert master weights in checkpoint naming: the per-expert form
+# (…layers.N.mlp.experts.E.{gate,up,down}_proj.weight) and the fused form
+# (…layers.N.mlp.experts.{gate_up_proj,down_proj}). MTP draft weights
+# (mtp.…) are never converted to the unified path and must still load.
+_EXPERT_WEIGHT_NAME_RE = re.compile(
+    r"(?!mtp\.)"
+    r".*\.layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?:\d+\.(?:gate_proj|up_proj|down_proj)\.weight"
+    r"|gate_up_proj|down_proj)$"
+)
+
+
+def _int8_slab_exists(layer_id) -> bool:
+    path = envs.SGLANG_ASYMGEMM_UNIFIED_INT8_PATH.get()
+    return bool(path) and os.path.exists(
+        os.path.join(path, f"layer_{layer_id}.safetensors")
+    )
+
+
+def _int8_preload_active() -> bool:
+    """Whether skipping BF16 masters in favor of the offline INT8 slab is on.
+
+    Requires the unified path to actually be usable on this host (the full
+    configurer check) and tp_size == 1 — with TP sharding the per-partition
+    master shapes would never validate against the full-size slab, and the
+    layer would need the masters for its fallback path.
+    """
+    if not unified_asym_gemm_enabled():
+        return False
+    if not envs.SGLANG_ASYMGEMM_UNIFIED_INT8_PATH.get():
+        return False
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        return get_global_server_args().tp_size == 1
+    except ValueError:
+        return False
+
+
+def master_weights_preloaded_as_int8(layer: torch.nn.Module) -> bool:
+    """True when `layer`'s expert masters will come from the INT8 slab, so
+    create_weights may allocate them unpinned (virtual, never touched) and
+    mark the layer as skipped. NOTE: assumes `layer` belongs to the target
+    model — MTP/draft models must not call this (their layer_ids collide
+    with the target's slab files)."""
+    if not _int8_preload_active():
+        return False
+    layer_id = getattr(layer, "layer_id", None)
+    return layer_id is not None and _int8_slab_exists(layer_id)
+
+
+def mark_master_weights_skipped(layer: torch.nn.Module) -> None:
+    setattr(layer, _MASTERS_SKIPPED_ATTR, True)
+
+
+def make_expert_weight_skip_predicate(quant_config):
+    """Build a name-level filter for the checkpoint weights iterator, or None.
+
+    Active only for unquantized (BF16) checkpoints with the INT8 preload on:
+    returns a predicate(name) -> bool that is True for expert master weights
+    of layers covered by an INT8 slab file — the iterator then never calls
+    get_tensor on them, so their bytes are never read from disk.
+    """
+    if quant_config is not None:
+        return None
+    if not _int8_preload_active():
+        return None
+
+    covered: dict = {}
+
+    def _skip(name: str) -> bool:
+        m = _EXPERT_WEIGHT_NAME_RE.match(name)
+        if m is None:
+            return False
+        layer_id = int(m.group("layer"))
+        hit = covered.get(layer_id)
+        if hit is None:
+            hit = covered[layer_id] = _int8_slab_exists(layer_id)
+            if hit:
+                logger.info(
+                    "AsymGEMM unified MoE: skipping checkpoint read of layer "
+                    "%d expert master weights (INT8 slab covers them)",
+                    layer_id,
+                )
+        return hit
+
+    return _skip
 
 
 def _check_convertible(layer: torch.nn.Module) -> str | None:
@@ -197,8 +297,21 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
     if not unified_asym_gemm_enabled():
         return
 
+    # Whether create_weights skipped the pinned master allocation (and the
+    # loader skipped their checkpoint bytes) because an INT8 slab covers this
+    # layer. If so, the masters hold uninitialized memory — every path that
+    # would read them must hard-fail instead of silently computing garbage.
+    masters_skipped = bool(getattr(layer, _MASTERS_SKIPPED_ATTR, False))
+
     reason = _check_convertible(layer)
     if reason is not None:
+        if masters_skipped:
+            raise RuntimeError(
+                f"AsymGEMM unified MoE: layer {getattr(layer, 'layer_id', '?')} "
+                f"skipped loading its expert master weights (INT8 slab present) "
+                f"but cannot take the unified path: {reason}. Unset "
+                "SGLANG_ASYMGEMM_UNIFIED_INT8_PATH or fix the configuration."
+            )
         logger.warning(
             "AsymGEMM unified MoE: layer %s falls back to the existing "
             "asym_gemm path (%s)",
@@ -225,6 +338,14 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
     # Fast path: load INT8 weights pre-quantized offline, skipping the slow
     # per-expert quantization loop. Falls back to None on any mismatch.
     slab = _maybe_load_int8_slab(layer, num_experts, hidden, inter)
+    if slab is None and masters_skipped:
+        raise RuntimeError(
+            f"AsymGEMM unified MoE: layer {getattr(layer, 'layer_id', '?')} "
+            "skipped loading its expert master weights (INT8 slab present) "
+            "but the slab failed to load/validate (see warnings above) — "
+            "online quantization would quantize uninitialized memory. Fix "
+            "the INT8 dir or unset SGLANG_ASYMGEMM_UNIFIED_INT8_PATH."
+        )
 
     # Inject the process-global AMX runtime so every converted MoE layer shares
     # one worker pool (and one total thread budget) instead of building its own.
@@ -348,6 +469,10 @@ def _release_master_weights(layer: torch.nn.Module) -> None:
     expert (BF16: 2 bytes/param of pinned host RAM; FP8: bytes in VRAM plus
     block scales). Replace their storage with empty tensors; the loader's
     device_loading_context restore (a plain .to()) remains a no-op on these.
+
+    For INT8-preloaded layers the masters are untouched virtual placeholders
+    (never pinned, never loaded) — dropping them frees address space only,
+    and the log says so instead of claiming resident memory was freed.
     """
     freed = 0
     for name in (
@@ -363,12 +488,22 @@ def _release_master_weights(layer: torch.nn.Module) -> None:
         freed += data.numel() * data.element_size()
         param.data = torch.empty(0, dtype=data.dtype, device=data.device)
     if freed:
-        logger.info(
-            "AsymGEMM unified MoE: released %.1f MiB of master weights for "
-            "layer %s",
-            freed / 2**20,
-            getattr(layer, "layer_id", "?"),
-        )
+        if getattr(layer, _MASTERS_SKIPPED_ATTR, False):
+            # Nothing real was freed — the placeholders were never loaded or
+            # resident. Keep this out of the INFO log.
+            logger.debug(
+                "AsymGEMM unified MoE: dropped never-loaded master-weight "
+                "placeholders for layer %s (%.1f MiB nominal, virtual only)",
+                getattr(layer, "layer_id", "?"),
+                freed / 2**20,
+            )
+        else:
+            logger.info(
+                "AsymGEMM unified MoE: released %.1f MiB of master weights "
+                "for layer %s",
+                freed / 2**20,
+                getattr(layer, "layer_id", "?"),
+            )
 
 
 def should_use_unified_asym_gemm_forward(

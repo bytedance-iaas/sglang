@@ -901,8 +901,14 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    skip_names_predicate: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    skip_names_predicate: optional filter applied to tensor names BEFORE
+    get_tensor — skipped tensors are never materialized, so (with mmap) their
+    bytes are never read from disk.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -923,10 +929,18 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
+                    if skip_names_predicate is not None and skip_names_predicate(
+                        name
+                    ):
+                        continue
                     yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if skip_names_predicate is not None and skip_names_predicate(
+                        name
+                    ):
+                        continue
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
@@ -992,6 +1006,7 @@ def multi_thread_safetensors_weights_iterator(
     max_workers: int,
     disable_mmap: bool = False,
     drop_cache_after_load: bool = False,
+    skip_names_predicate: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1002,9 +1017,19 @@ def multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+            if skip_names_predicate is not None:
+                result = {
+                    k: v
+                    for k, v in result.items()
+                    if not skip_names_predicate(k)
+                }
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k)
+                    for k in f.keys()
+                    if skip_names_predicate is None or not skip_names_predicate(k)
+                }
 
         return st_file, result
 
@@ -1038,12 +1063,17 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    skip_names_predicate: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+
+    skip_names_predicate: optional filter applied to tensor names BEFORE
+    get_tensor — skipped tensors are never materialized, so (with mmap) their
+    bytes are never read from disk.
     """
     sorted_files = sorted(hf_weights_files)
     if prefetch and not disable_mmap:
@@ -1056,9 +1086,19 @@ def buffered_multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+            if skip_names_predicate is not None:
+                result = {
+                    k: v
+                    for k, v in result.items()
+                    if not skip_names_predicate(k)
+                }
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k)
+                    for k in f.keys()
+                    if skip_names_predicate is None or not skip_names_predicate(k)
+                }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

@@ -188,6 +188,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         self.with_bias = with_bias
 
+        is_asym_gemm = get_moe_runner_backend().is_asym_gemm()
+        # When an offline INT8 slab covers this layer, the BF16 masters are
+        # never read (the checkpoint loader skips their bytes and the unified
+        # path builds from the slab) — allocate them unpinned so torch.empty
+        # stays virtual (no resident pages, no slow cudaHostAlloc) until they
+        # are released after conversion.
+        masters_preloaded = False
+        if is_asym_gemm:
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+                mark_master_weights_skipped,
+                master_weights_preloaded_as_int8,
+            )
+
+            masters_preloaded = master_weights_preloaded_as_int8(layer)
+            if masters_preloaded:
+                mark_master_weights_skipped(layer)
+
         # Fused gate_up_proj (column parallel)
         w13_up_dim = (
             2 * intermediate_size_per_partition
@@ -201,11 +218,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             torch.empty(
                 num_experts, w13_weight_n, w13_weight_k,
                 dtype=params_dtype,
-                device="cpu" if get_moe_runner_backend().is_asym_gemm() else None,
-                pin_memory=get_moe_runner_backend().is_asym_gemm(),
+                device="cpu" if is_asym_gemm else None,
+                pin_memory=is_asym_gemm and not masters_preloaded,
             ),
             requires_grad=False,
         )
+        if masters_preloaded:
+            # Never-loaded virtual placeholder: device_loading_context must
+            # not fault it in and round-trip it through the GPU.
+            w13_weight._skip_device_loading_move = True
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -228,11 +249,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             torch.empty(
                 num_experts, w2_weight_n, w2_weight_k,
                 dtype=params_dtype,
-                device="cpu" if get_moe_runner_backend().is_asym_gemm() else None,
-                pin_memory=get_moe_runner_backend().is_asym_gemm(),
+                device="cpu" if is_asym_gemm else None,
+                pin_memory=is_asym_gemm and not masters_preloaded,
             ),
             requires_grad=False,
         )
+        if masters_preloaded:
+            w2_weight._skip_device_loading_move = True
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
