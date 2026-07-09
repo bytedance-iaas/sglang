@@ -1365,6 +1365,18 @@ class ServerArgs:
         # 16. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
+        # 17. Unified asym_gemm MoE. Piecewise (prefill) capture is not
+        # supported: the imperative unified path cannot record into a graph,
+        # and there is no fallback — the BF16/FP8 master weights are released
+        # after INT8 conversion. Prefill runs on the eager unified path (also
+        # measured ~2x faster than the piecewise BF16 fallback it replaces).
+        # Decode graphs are unaffected: every cuda_graph_bs entry gets a
+        # pre-allocated capturable buffer.
+        if (
+            self.moe_runner_backend == "asym_gemm"
+            and envs.SGLANG_ASYMGEMM_UNIFIED_MOE.get()
+        ):
+            self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
