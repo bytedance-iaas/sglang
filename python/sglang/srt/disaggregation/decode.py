@@ -152,8 +152,7 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
-            for i in reusing
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
@@ -281,6 +280,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         pp_rank: int,
+        prefill_pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -302,6 +302,9 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
+        # Default to the local decode PP size until bootstrap returns the
+        # authoritative prefill topology for this decode instance.
+        self.prefill_pp_size = prefill_pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -379,7 +382,8 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.prefill_pp_size = self.prefill_pp_size
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
@@ -390,6 +394,7 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+        kv_args.non_draft_kv_data_lens = len(kv_data_ptrs)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -421,7 +426,7 @@ class DecodePreallocQueue:
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -533,7 +538,7 @@ class DecodePreallocQueue:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.scheduler.stream_output([req], req.return_logprob)
             return True
         if self._uses_swa_tail_prealloc():
             _, swa_required = self._prealloc_required_tokens(req)
@@ -545,7 +550,7 @@ class DecodePreallocQueue:
                 )
                 logger.error(message)
                 prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                self.scheduler.stream_output([req], req.return_logprob)
                 return True
         return False
 
@@ -610,11 +615,7 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
-            getattr(decode_req.kv_receiver, "conclude_state", None) == KVPoll.Failed
-            for decode_req in self.queue
-        ):
+        if all(decode_req.waiting_for_input for decode_req in self.queue):
             return
 
         polls = poll_and_all_reduce(
@@ -642,7 +643,7 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                if self.scheduler.metrics_reporter.enable_metrics:
+                if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
@@ -783,9 +784,8 @@ class DecodePreallocQueue:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                self.scheduler.output_streamer.stream_output(
-                    [decode_req.req],
-                    decode_req.req.return_logprob,
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
                 )
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -1451,21 +1451,17 @@ class DecodeTransferQueue:
             decode_req.req.hidden_states_tensor = output_hidden_states
 
         if decode_req.req.return_logprob:
-            decode_req.req.logprob.output_token_logprobs_val.append(
+            decode_req.req.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
-            decode_req.req.logprob.output_token_logprobs_idx.append(
+            decode_req.req.output_token_logprobs_idx.append(
                 output_token_logprobs_idx[0].item()
             )
-            decode_req.req.logprob.output_top_logprobs_val.append(
-                output_top_logprobs_val[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
+            decode_req.req.output_top_logprobs_val.append(
+                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
             )
-            decode_req.req.logprob.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
+            decode_req.req.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
             )
 
         decode_req.kv_receiver.clear()
@@ -1518,16 +1514,15 @@ class DecodeTransferQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                self.scheduler.output_streamer.stream_output(
-                    [decode_req.req],
-                    decode_req.req.return_logprob,
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
-                if self.scheduler.metrics_reporter.enable_metrics:
+                if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
@@ -1536,9 +1531,8 @@ class DecodeTransferQueue:
                     indices_to_remove.add(i)
                     # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        self.scheduler.output_streamer.stream_output(
-                            [decode_req.req],
-                            decode_req.req.return_logprob,
+                        self.scheduler.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
                         )
                         if self.scheduler.enable_hisparse:
                             self.scheduler.hisparse_coordinator.request_finished(
@@ -1547,7 +1541,7 @@ class DecodeTransferQueue:
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )
-                        if self.scheduler.metrics_reporter.enable_metrics:
+                        if self.scheduler.enable_metrics:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
@@ -1585,7 +1579,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
+            recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
@@ -1613,7 +1607,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
+            recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
@@ -1663,9 +1657,7 @@ class SchedulerDisaggregationDecodeMixin:
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
             assert self.chunked_req is None
-            self.batch_result_processor.process_batch_result_prebuilt(
-                new_prebuilt_batch
-            )
+            self.process_batch_result_prebuilt(new_prebuilt_batch)
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
@@ -1684,7 +1676,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.running_batch = self.update_running_batch(self.running_batch)
             ret = self.running_batch if not self.running_batch.is_empty() else None
 
-        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        ret = self.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
         return ret

@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -88,8 +89,13 @@ class StandardDispatcher(BaseDispatcher):
 
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
         backend = get_moe_runner_backend()
+        if enable_nextn_moe_sparse_fully_dp():
+            self.moe_ep_size = 1
+            self.moe_ep_rank = 0
+        else:
+            self.moe_ep_size = get_moe_expert_parallel_world_size()
+            self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
@@ -108,7 +114,6 @@ class StandardDispatcher(BaseDispatcher):
         self.num_local_routed_experts = (
             self.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
 

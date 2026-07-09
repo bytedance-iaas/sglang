@@ -322,6 +322,43 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _resolve_speculative_algorithm_alias(
+    speculative_algorithm: Optional[str],
+    speculative_draft_model_path: Optional[str],
+    trust_remote_code: bool = False,
+) -> Optional[str]:
+    """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
+
+    is_gemma4_draft = False
+    if speculative_draft_model_path:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        cfg = get_config(
+            speculative_draft_model_path, trust_remote_code=trust_remote_code
+        )
+        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
+            getattr(cfg, "architectures", None) or []
+        )
+
+    if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
+        raise ValueError(
+            "Gemma4AssistantForCausalLM draft requires "
+            "--speculative-algorithm NEXTN or EAGLE; EAGLE3 is "
+            "not supported for this draft architecture."
+        )
+
+    if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
+        if is_gemma4_draft:
+            logger.info(
+                "Detected Gemma4AssistantForCausalLM draft; "
+                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP."
+            )
+            return "FROZEN_KV_MTP"
+        return "EAGLE"
+
+    return speculative_algorithm
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """
@@ -576,6 +613,7 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+    speculative_moe_tp_size: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -1957,7 +1995,10 @@ class ServerArgs:
                 ):
                     if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
                         self.speculative_moe_runner_backend = "deep_gemm"
-                        self.speculative_moe_a2a_backend = "deepep"
+                        if self.speculative_moe_tp_size == 1:
+                            self.speculative_moe_a2a_backend = "none"
+                        else:
+                            self.speculative_moe_a2a_backend = "deepep"
                         logger.info(
                             "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
@@ -1971,11 +2012,12 @@ class ServerArgs:
                                 "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
                             )
                     else:
-                        self.speculative_moe_runner_backend = "triton"
+                        if self.speculative_moe_runner_backend is None:
+                            logger.info(
+                                "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
+                            )
+                            self.speculative_moe_runner_backend = "triton"
                         self.speculative_moe_a2a_backend = "none"
-                        logger.info(
-                            "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
-                        )
 
         elif model_arch in [
             "DeepseekV4ForCausalLM",
@@ -5539,6 +5581,12 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
         )
+        parser.add_argument(
+            "--speculative-moe-tp-size",
+            type=int,
+            default=ServerArgs.speculative_moe_tp_size,
+            help="TP/EP-MOE size for EAGLE speculative decoding MoE layers only. Default is None, which means use the same size as the normal MoE layers.",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -6910,6 +6958,11 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
+
+        assert self.speculative_moe_tp_size in {
+            1,
+            None,
+        }, "speculative_moe_tp_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         if not is_runai_obj_uri(self.served_model_name):

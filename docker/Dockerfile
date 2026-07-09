@@ -43,11 +43,12 @@ fi
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    apt update && apt install -y --no-install-recommends wget curl software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
@@ -184,8 +185,11 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -388,12 +392,19 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/just-install.sh https://just.systems/install.sh \
+    && sed -i "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" /tmp/just-install.sh \
+    && bash /tmp/just-install.sh --tag 1.42.4 --to /tools \
+    && rm /tmp/just-install.sh \
+    && test -x /tools/just
 
 # Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+RUN curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/oh-my-zsh-install.sh https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh \
+    && sh /tmp/oh-my-zsh-install.sh "" --unattended \
+    && rm /tmp/oh-my-zsh-install.sh \
     && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
@@ -416,7 +427,11 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y \
+    && rm /tmp/rustup-init.sh \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -509,6 +524,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt update -y \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Onion model/data tooling. The onion-ai-data package provides oniond.
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    OS="$(. /etc/os-release && echo "${ID}")" \
+    && VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "https://mirrors.ivolces.com/extra-tools/${OS}/GPG-KEY-system" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/${OS} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends onion-ai-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
@@ -756,11 +784,25 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
     && python3 -m pip config set global.break-system-packages true \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install Onion model/data tooling. The onion-ai-data package provides oniond.
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    OS="$(. /etc/os-release && echo "${ID}")" \
+    && VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "https://mirrors.ivolces.com/extra-tools/${OS}/GPG-KEY-system" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/${OS} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends onion-ai-data \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

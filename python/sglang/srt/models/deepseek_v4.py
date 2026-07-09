@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import time
 from typing import (
     TYPE_CHECKING,
     Iterable,
@@ -42,15 +43,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator_nsa_cp import (
-    nsa_cp_gather_hidden_states,
-    nsa_cp_reduce_scatter_hidden_states,
-)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
-    attn_tp_all_reduce,
-    dp_gather_replicate,
+    dp_gather_partial,
     dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -67,7 +63,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -86,12 +81,6 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
-
-if not _is_hip:
-    from sglang.srt.layers.utils.cp_utils import (
-        prepare_context_parallel_metadata,
-    )
-
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -109,9 +98,6 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
-    )
-    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-        DeepseekV4HipRadixBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -219,16 +205,6 @@ class MQALayer(nn.Module):
 
         rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
 
-        self.rotary_emb = get_rope_wrapper(
-            head_size=self.rope_head_dim,
-            rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_base,
-            rope_scaling=rope_scaling,
-            is_neox_style=False,
-            device=get_global_server_args().device,
-        )
-
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
         assert self.compress_ratio in {0, 4, 128}
@@ -272,7 +248,6 @@ class MQALayer(nn.Module):
                 head_dim=self.head_dim,
                 rotate=False,
                 prefix=add_prefix("compressor", prefix),
-                rotary_emb=getattr(self, "rotary_emb", None),
             )
             if self.compress_ratio == 4:
                 self.indexer = C4Indexer(
@@ -282,11 +257,10 @@ class MQALayer(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("indexer", prefix),
                     alt_streams=self.alt_streams_indexer,
-                    rotary_emb=getattr(self, "rotary_emb", None),
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -341,8 +315,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
-            and attn_tp_size > 1,
+            reduce_results=attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -442,7 +415,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend,
+        attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
@@ -502,7 +475,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend,
+        attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
@@ -556,14 +529,14 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+            assert (
+                not self.wo_b.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(
-                attn_backend,
-                (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
-            )
+            assert isinstance(attn_backend, DeepseekV4AttnBackend)
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -642,8 +615,6 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
-            o = attn_tp_all_reduce(o)
 
         return o
 
@@ -701,6 +672,70 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
+    def prewarm_mhc_token_counts(
+        self, token_counts: Tuple[int, ...], device: torch.device
+    ) -> None:
+        paths = (
+            (
+                "attn",
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.input_layernorm,
+            ),
+            (
+                "ffn",
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm,
+            ),
+        )
+
+        with torch.inference_mode():
+            for num_tokens in token_counts:
+                for path_name, hc_fn, hc_scale, hc_base, norm in paths:
+                    tic = time.perf_counter()
+                    residual = torch.empty(
+                        (num_tokens, self.hc_mult, self.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    y, post, comb, _ = self.hc_pre(
+                        residual,
+                        hc_fn,
+                        hc_scale,
+                        hc_base,
+                        norm=norm,
+                    )
+                    del residual, y, post, comb
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "DeepSeek V4 MHC prewarm path=%s num_tokens=%s completed in %.3fs",
+                        path_name,
+                        num_tokens,
+                        time.perf_counter() - tic,
+                    )
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
+
+        token_counts = get_mhc_pre_token_count_representatives(
+            max_num_tokens, self.hc_mult * self.hidden_size
+        )
+        if not token_counts:
+            return token_counts
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
+            max_num_tokens,
+            token_counts,
+        )
+        self.prewarm_mhc_token_counts(token_counts, device)
+        return token_counts
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -753,22 +788,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
-            from aiter.ops.mhc import mhc_pre
-
-            post, comb, y = mhc_pre(
-                residual=x,
-                fn=hc_fn,
-                hc_scale=hc_scale,
-                hc_base=hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=2.0,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-            )
-            return y, post.squeeze(-1), comb, False
-
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
 
@@ -816,13 +835,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
-
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
-            from aiter.ops.mhc import mhc_post
-
-            result = torch.empty_like(residual)
-            mhc_post(result, x, residual, post, comb)
-            return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -887,30 +899,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not get_moe_a2a_backend().is_none()
         )
         if _use_cp:
-            moe_a2a_backend = get_moe_a2a_backend()
-            if moe_a2a_backend.is_none():
-                hidden_states = nsa_cp_gather_hidden_states(hidden_states)
-            else:
-                cp_moe_backend_supported = (
-                    moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe()
-                )
-                assert cp_moe_backend_supported, (
-                    "CP requires DeepEP (moe_a2a_backend == deepep) or MegaMoE "
-                    "(moe_a2a_backend == megamoe)."
-                )
-                cp_rank = get_attention_cp_rank()
-                cp_size = get_attention_cp_size()
-                input_ids = input_ids[cp_rank::cp_size].contiguous()
-                input_ids_global = input_ids
+            assert get_moe_a2a_backend().is_deepep(), (
+                "CP requires DeepEP (moe_a2a_backend == deepep). "
+                "Only DeepEP is tested with CP's per-rank token split."
+            )
+            cp_rank = get_attention_cp_rank()
+            cp_size = get_attention_cp_size()
+            input_ids = input_ids[cp_rank::cp_size].contiguous()
+            input_ids_global = input_ids
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
-                hidden_states
+                hidden_states,
             )
-            # hidden_states here follow TP_ATTN_FULL semantics: they are replicated
-            # within an attention-TP group. Use replicate gather to avoid summing the
-            # same activations across attention-TP ranks before entering MLP/MoE.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
@@ -923,11 +925,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
-            use_reduce_scatter=_use_cp,
         )
-        if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = nsa_cp_reduce_scatter_hidden_states(hidden_states)
-        elif _use_tp_moe_gather:
+        if _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
@@ -1001,6 +1000,24 @@ class DeepseekV4Model(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
 
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        tic = time.perf_counter()
+        logger.info(
+            "Running DeepSeek V4 MHC prewarm for max_num_tokens=%s",
+            max_num_tokens,
+        )
+        token_counts = self.layers[self.start_layer].prewarm_mhc_token_count_buckets(
+            max_num_tokens, device
+        )
+        logger.info(
+            "DeepSeek V4 MHC prewarm finished in %.3fs for representative token counts: %s",
+            time.perf_counter() - tic,
+            token_counts,
+        )
+        return token_counts
+
     def hc_head(
         self,
         x: torch.Tensor,
@@ -1053,9 +1070,7 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            # Token ids are replicated within an attention-TP group. Use replicate
-            # gather here to avoid summing duplicated ids when attention_tp_size > 1.
-            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
@@ -1064,14 +1079,6 @@ class DeepseekV4Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            if get_moe_a2a_backend().is_none():
-                cp_size = get_attention_cp_size()
-                input_ids = input_ids.reshape(-1, cp_size).T.flatten()
-                input_ids_global = input_ids
-
-        # Upgrade lazy raw metadata on the main stream once before any layer
-        # forks alt-streams; later per-layer calls become no-ops.
-        forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1157,6 +1164,33 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
+
+    def kernel_warmup(self, model_runner) -> None:
+        if not model_runner.is_hybrid_swa:
+            return
+        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+
+        max_num_tokens = model_runner.server_args.chunked_prefill_size
+        if max_num_tokens is None or max_num_tokens <= 0:
+            max_num_tokens = 8192
+
+        token_counts = self.prewarm_mhc_token_count_buckets(
+            max_num_tokens, model_runner.device
+        )
+        model_runner.tp_group.barrier()
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
+            token_counts,
+        )
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1372,7 +1406,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
