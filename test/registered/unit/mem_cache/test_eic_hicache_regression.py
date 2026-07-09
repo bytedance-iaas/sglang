@@ -100,6 +100,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(root.get_last_hash_value(), "root-hash")
         self.assertEqual(child.get_last_hash_value(), "child-hash-1")
         self.assertEqual(child.get_prefix_hash_values(child.parent), ["root-hash"])
+        self.assertFalse(
+            hasattr(root, "hicache_storage_pass_prefix_keys"),
+            "storage pass-prefix config belongs to the cache, not tree nodes",
+        )
 
 
 if __name__ == "__main__":

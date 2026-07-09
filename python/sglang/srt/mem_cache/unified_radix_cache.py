@@ -256,6 +256,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller = None
         self.write_through_threshold = 256
+        self.prefetch_threshold = 256
+        self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -345,6 +347,11 @@ class UnifiedRadixCache(BasePrefixCache):
             f"write_policy={server_args.hicache_write_policy}, "
             f"tp_world_size={self.tp_world_size}, "
             f"transfer_layer_num={self.cache_controller.layer_num}"
+        )
+
+        self.enable_storage = self.cache_controller.enable_storage
+        self.prefetch_threshold = getattr(
+            self.cache_controller, "prefetch_threshold", 256
         )
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
@@ -1440,6 +1447,28 @@ class UnifiedRadixCache(BasePrefixCache):
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----
+
+    def prefetch_from_storage(
+        self,
+        req_id: str,
+        last_host_node: UnifiedTreeNode,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> None:
+        # UnifiedRadixCache does not yet materialize L3-prefetched host-only
+        # nodes. Keep storage prefetch best-effort/no-op so storage backends can
+        # attach without crashing scheduler request admission.
+        return
+
+    def check_prefetch_progress(self, req_id: str) -> bool:
+        return True
+
+    def terminate_prefetch(self, req_id: str) -> None:
+        return
+
+    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        return 0
 
     def init_load_back(
         self,
