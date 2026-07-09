@@ -95,14 +95,7 @@ class EICChunkCache(ChunkCache):
             raise ValueError(f"EICChunkCache only supports MHA and MLA yet")
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = EICCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            load_cache_event=self.load_cache_event,
-            write_policy="write_through",
-            server_args=server_args,
-        )
+        self._init_cache_controller(params, server_args)
         self.ongoing_writing_queue = dict()
         self.background_thread = threading.Thread(
             target=self.background_thread, daemon=True
@@ -110,6 +103,17 @@ class EICChunkCache(ChunkCache):
         self.background_thread.start()
         self._evictable_size = 0
         self.save_docode_cache = True
+
+    def _init_cache_controller(self, params: CacheInitParams, server_args: ServerArgs):
+        self.cache_controller = EICCacheController(
+            params.token_to_kv_pool_allocator,
+            self.token_to_kv_pool_host,
+            self.page_size,
+            tp_group=params.tp_cache_group,
+            load_cache_event=self.load_cache_event,
+            write_policy="write_through",
+            server_args=server_args,
+        )
 
     def get_extra_info(self, server_args: ServerArgs):
         extra_info = {

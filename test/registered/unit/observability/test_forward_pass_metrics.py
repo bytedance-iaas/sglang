@@ -164,6 +164,8 @@ class TestForwardPassMetrics(unittest.TestCase):
             prefill_stats=PrefillStats(
                 log_input_tokens=12,
                 log_hit_tokens=5,
+                log_hit_gpu_tokens=3,
+                log_hit_eic_tokens=2,
                 new_token_ratio=1.0,
                 num_running_reqs=types.SimpleNamespace(),
                 num_new_seqs=2,
@@ -191,6 +193,23 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
+
+    def test_prefill_stats_preserves_eic_hit_breakdown(self):
+        adder = types.SimpleNamespace(
+            log_input_tokens=64,
+            log_hit_tokens=48,
+            log_hit_gpu_tokens=16,
+            log_hit_eic_tokens=32,
+            new_token_ratio=1.0,
+            can_run_list=[object(), object()],
+        )
+
+        stats = PrefillStats.from_adder(adder, running_reqs=[])
+
+        self.assertEqual(stats.log_hit_tokens, 48)
+        self.assertEqual(stats.log_hit_gpu_tokens, 16)
+        self.assertEqual(stats.log_hit_eic_tokens, 32)
+        self.assertEqual(stats.num_new_seqs, 2)
 
     def test_emit_uses_device_timer_gpu_time(self):
         self.scheduler._fpm_uses_device_timer = True

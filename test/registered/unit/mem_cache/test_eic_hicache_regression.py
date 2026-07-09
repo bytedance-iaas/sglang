@@ -1,5 +1,6 @@
 import unittest
 from queue import Queue
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -8,6 +9,7 @@ from sglang.srt.managers.eic_cache_controller import (
     EICCacheController,
     EICCacheOperation,
 )
+from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
 from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
@@ -103,6 +105,31 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertFalse(
             hasattr(root, "hicache_storage_pass_prefix_keys"),
             "storage pass-prefix config belongs to the cache, not tree nodes",
+        )
+
+    def test_eic_chunk_cache_passes_tp_group_to_controller(self):
+        cache = object.__new__(EICChunkCache)
+        cache.page_size = 16
+        cache.load_cache_event = object()
+        cache.token_to_kv_pool_host = object()
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=object(), tp_cache_group=object()
+        )
+        server_args = SimpleNamespace()
+
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_chunk_cache.EICCacheController"
+        ) as controller_cls:
+            EICChunkCache._init_cache_controller(cache, params, server_args)
+
+        controller_cls.assert_called_once_with(
+            params.token_to_kv_pool_allocator,
+            cache.token_to_kv_pool_host,
+            cache.page_size,
+            tp_group=params.tp_cache_group,
+            load_cache_event=cache.load_cache_event,
+            write_policy="write_through",
+            server_args=server_args,
         )
 
 
