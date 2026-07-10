@@ -1020,6 +1020,17 @@ class Scheduler(
             self.draft_worker = None
             self.external_corpus_manager = None
             return
+        import os as _os
+        if (
+            _os.environ.get("SGLANG_ALLOW_PP_SPEC")
+            and self.server_args.pp_size > 1
+            and self.ps.pp_rank != self.server_args.pp_size - 1
+        ):
+            # PP+spec: the draft model (MTP layer) needs final hidden states and
+            # the lm_head, both of which live on the last PP stage only.
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
 
         # Launch a draft worker for speculative decoding. It builds its draft
         # from this process's own config: what differs for the draft — the
@@ -1137,7 +1148,9 @@ class Scheduler(
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
+            # PP+spec: non-last stages have no draft worker; they run the
+            # verify-shaped target forward through the plain tp_worker.
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -4306,31 +4319,83 @@ class Scheduler(
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
-                resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
-                    )
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Only the last PP rank owns real results requiring D2H; other ranks
-                # consume device tensors rebuilt from the output ring.
-                batch_result.copy_done = self.device_module.Event()
-                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
-                    batch_result.copy_to_cpu(
-                        return_logprob=batch.return_logprob,
-                        return_hidden_states=batch.return_hidden_states,
-                    )
+                is_verify_round = self.server_args.pp_size > 1 and not (
+                    batch.forward_mode.is_extend() or batch.is_extend_in_batch
+                )
+                if is_verify_round:
+                    # PP+spec decode: every stage rebuilds the same verify
+                    # input from relayed per-req state (draft lives on the
+                    # last stage only).
+                    self._pp_spec_rebuild_verify_input(batch)
+                if not self.pp_group.is_last_rank:
+                    # PP+spec: non-last stages run only their model chunk on
+                    # the verify-shaped batch; sampling, accept and draft all
+                    # live on the last stage. The plain tp_worker path already
+                    # returns pp_hidden_states_proxy_tensors for relay.
+                    resolve_forward_inputs(batch, self.future_map)
+                    if is_verify_round:
+                        from sglang.srt.speculative.eagle_utils import (
+                            eagle_prepare_for_verify,
+                        )
+
+                        # Isolation is load-bearing: eagle_prepare_for_verify
+                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
+                        # input_ids, out_cache_loc); without the restore the
+                        # next get_next_batch_to_run treats this decode batch
+                        # as extend and re-merges it (duplicate reqs).
+                        with self._forward_isolation(batch, overlap=False):
+                            verify_forward_batch, can_run_cuda_graph = (
+                                eagle_prepare_for_verify(
+                                    batch.spec_info,
+                                    self.req_to_token_pool,
+                                    batch,
+                                    self.tp_worker,
+                                )
+                            )
+                            batch_result = self.tp_worker.forward_batch_generation(
+                                batch=None,
+                                forward_batch=verify_forward_batch,
+                                pp_proxy_tensors=pp_proxy_tensors,
+                                is_verify=True,
+                            )
+                        batch_result.can_run_cuda_graph = can_run_cuda_graph
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    # The verify input is per-round; between iterations
+                    # spec_info must be merge/filter-safe (None on stages
+                    # without a draft worker).
+                    batch.spec_info = None
+                else:
+                    # Non-overlap: drive the V2 worker synchronously (no
+                    # future_map relay / on_publish).
+                    resolve_forward_inputs(batch, self.future_map)
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    if self.server_args.pp_size == 1:
+                        # Sync D2H so the result processor can read CPU tensors.
+                        # Under PP this local result is only relayed (GPU send);
+                        # processing consumes the round-tripped copy, which
+                        # _pp_prep_batch_result already lands on CPU.
+                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
