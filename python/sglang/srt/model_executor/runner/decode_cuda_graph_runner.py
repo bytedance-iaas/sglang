@@ -1307,6 +1307,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                # PP + speculative verify: the plan-stream load ran before the
+                # proxy arrived, so refresh every captured input row here.
+                for key, value in pp_proxy_tensors.tensors.items():
+                    buffer = self.buffers.pp_proxy_tensors.get(key)
+                    if buffer is not None:
+                        buffer[: value.shape[0]].copy_(value)
+            if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
@@ -1513,7 +1523,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # Slice in token rows, not request rows: under speculative verify
+            # each request carries num_tokens_per_bs tokens (identical for
+            # plain decode, where num_tokens_per_bs == 1).
+            return PPProxyTensors(
+                {
+                    k: v[: self.bs * self.captured_req_width]
+                    for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
