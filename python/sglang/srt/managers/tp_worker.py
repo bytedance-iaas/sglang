@@ -89,6 +89,11 @@ class BaseTpWorker(ABC):
     def model_runner(self) -> ModelRunner:
         pass
 
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op for PP ranks that run only the target worker."""
+
     @property
     def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --

@@ -1020,9 +1020,8 @@ class Scheduler(
             self.draft_worker = None
             self.external_corpus_manager = None
             return
-        import os as _os
         if (
-            _os.environ.get("SGLANG_ALLOW_PP_SPEC")
+            envs.SGLANG_ENABLE_PP_SPEC.get()
             and self.server_args.pp_size > 1
             and self.ps.pp_rank != self.server_args.pp_size - 1
         ):
