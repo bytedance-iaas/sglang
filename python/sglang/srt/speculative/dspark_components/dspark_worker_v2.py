@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import get_attn_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -400,7 +400,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _draft_context(self):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
-                stack.enter_context(draft_tp_context(get_attention_tp_group()))
+                stack.enter_context(draft_tp_context(get_attn_tp_group()))
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
             yield
