@@ -1,0 +1,21 @@
+python/sglang/srt/layers/attention/deepseek_v4_backend.py
+  s_421cac7749974e::t_69e39327c3bdbd 531,565-566,792
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "accd761956e7ac2cb06f5e5a24a38c56d0ba5fab",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

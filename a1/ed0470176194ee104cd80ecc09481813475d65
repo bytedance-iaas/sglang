@@ -1,0 +1,135 @@
+test/registered/unit/spec/test_dspark.py
+  s_abe67779897b78::t_f1c5b2bc93ab9d 1022-1107 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4da9e423f670fd1d6d0727","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[1022,1107]}]}]}
+python/sglang/srt/speculative/dspark_disaggregation.py
+  s_abe67779897b78::t_de7df2c4c0f035 17,21-33,35,37,47 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4da9cb23f670fd1d6d06dd","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":17},{"Range":[21,33]},{"Single":35},{"Single":37},{"Single":47}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a1ed0470176194ee104cd80ecc09481813475d65",
+  "prompts": {},
+  "sessions": {
+    "s_abe67779897b78": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4c598d751ef01ce40c1865",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/speculative/dspark_disaggregation.py": [
+      {
+        "hash": "s_abe67779897b78::t_de7df2c4c0f035",
+        "line_ranges": [
+          {
+            "Single": 17
+          },
+          {
+            "Range": [
+              21,
+              33
+            ]
+          },
+          {
+            "Single": 35
+          },
+          {
+            "Single": 37
+          },
+          {
+            "Single": 47
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4da9cb23f670fd1d6d06dd",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 17
+              },
+              {
+                "Range": [
+                  21,
+                  33
+                ]
+              },
+              {
+                "Single": 35
+              },
+              {
+                "Single": 37
+              },
+              {
+                "Single": 47
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "test/registered/unit/spec/test_dspark.py": [
+      {
+        "hash": "s_abe67779897b78::t_f1c5b2bc93ab9d",
+        "line_ranges": [
+          {
+            "Range": [
+              1022,
+              1107
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4da9e423f670fd1d6d0727",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  1022,
+                  1107
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_abe67779897b78": {
+      "tool": "trae",
+      "conversation_id": "6a4c598d751ef01ce40c1865",
+      "session_id": "6a4c598d751ef01ce40c1865",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_abe67779897b78::t_7924ddfee02dcf": {
+      "tool": "trae",
+      "conversation_id": "6a4c598d751ef01ce40c1865",
+      "session_id": "6a4c598d751ef01ce40c1865",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_abe67779897b78::t_de7df2c4c0f035": {
+      "tool": "trae",
+      "conversation_id": "6a4c598d751ef01ce40c1865",
+      "session_id": "6a4c598d751ef01ce40c1865",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_abe67779897b78::t_f1c5b2bc93ab9d": {
+      "tool": "trae",
+      "conversation_id": "6a4c598d751ef01ce40c1865",
+      "session_id": "6a4c598d751ef01ce40c1865",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
