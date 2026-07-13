@@ -1466,6 +1466,7 @@ class SchedulerDisaggregationPrefillMixin:
             not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
             or self.enable_staging
             or req.pending_bootstrap
+            or self.tree_cache.supports_swa()
         ):
             return
 
