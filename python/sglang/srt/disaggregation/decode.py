@@ -2510,7 +2510,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
                         )[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
-                if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+                if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
                     logger.info(
                         "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
                         {
