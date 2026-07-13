@@ -1474,7 +1474,16 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+        kv_indices = req.prefix_indices[req.start_send_idx : cached_end].cpu().numpy()
+        page_indices = kv_to_page_indices(
+            kv_indices, self.token_to_kv_pool_allocator.page_size
+        )
+        if not req.disagg_kv_sender.should_send_kv_chunk(
+            len(page_indices), last_chunk=False
+        ):
+            return
+        req.disagg_kv_sender.send(page_indices, state_indices=None)
+        req.start_send_idx = cached_end
 
     def send_kv_chunk(
         self: Scheduler,
