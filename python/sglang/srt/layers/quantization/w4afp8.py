@@ -12,7 +12,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.awq import AWQConfig, AWQLinearMethod
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQLinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
@@ -44,6 +46,8 @@ class W4AFp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: Optional[List[int]] = None,
         group_size: int = 128,
+        linear_quant_method: Optional[str] = None,
+        linear_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -57,6 +61,8 @@ class W4AFp8Config(QuantizationConfig):
         self.ignored_layers = ignored_layers or []
         self.weight_block_size = [128, 128]
         self.group_size = group_size
+        self.linear_quant_method = linear_quant_method
+        self.linear_quant_config = linear_quant_config
 
     @classmethod
     def get_name(cls) -> str:
@@ -82,13 +88,36 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
-        return cls(
+        group_size = cls.get_from_keys_or(config, ["group_size"], default=32)
+        linear_quant_method = None
+        linear_quant_config = None
+        try:
+            linear_quant_config = GPTQConfig.from_config(config)
+            linear_quant_method = "gptq"
+        except Exception:
+            try:
+                linear_quant_config = AWQConfig.from_config(config)
+                linear_quant_method = "awq"
+            except Exception:
+                linear_quant_config = None
+                linear_quant_method = None
+        cfg = cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            group_size=group_size,
+            linear_quant_method=linear_quant_method,
+            linear_quant_config=linear_quant_config,
         )
+        quant_format = config.get("format")
+        has_ct_schema = bool(config.get("config_groups")) or "compression_config" in config
+        cfg.is_compressed_tensors = (
+            quant_format in ("compressed-tensors", "compressed_tensors")
+            or has_ct_schema
+        )
+        return cfg
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -99,6 +128,19 @@ class W4AFp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
+            if (
+                getattr(self, "is_compressed_tensors", False)
+                and self.linear_quant_method is None
+            ):
+                return UnquantizedLinearMethod()
+            if self.linear_quant_method == "gptq" and isinstance(
+                self.linear_quant_config, GPTQConfig
+            ):
+                return GPTQLinearMethod(self.linear_quant_config)
+            if self.linear_quant_method == "awq" and isinstance(
+                self.linear_quant_config, AWQConfig
+            ):
+                return AWQLinearMethod(self.linear_quant_config)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
@@ -142,9 +184,16 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         assert "weight_loader" in extra_weight_attrs
 
+        use_compressed = getattr(self.quant_config, "is_compressed_tensors", False)
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
+                0,
+                dtype=torch.int8,
+            )
+            if use_compressed
+            else torch.empty(
                 num_experts,
                 intermediate_size_per_partition * 2,
                 hidden_size // 2,
@@ -158,6 +207,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.empty(
+                0,
+                dtype=torch.int8,
+            )
+            if use_compressed
+            else torch.empty(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
@@ -173,6 +227,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
+                0,
+                dtype=torch.float32,
+            )
+            if use_compressed
+            else torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
@@ -185,6 +244,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
+                0,
+                dtype=torch.float32,
+            )
+            if use_compressed
+            else torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
@@ -194,6 +258,71 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        if use_compressed:
+            packed_factor = 8
+            compat_weight_attrs = dict(extra_weight_attrs)
+            compat_weight_attrs.update({"is_transposed": True})
+
+            w13_weight_packed = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    hidden_size // packed_factor,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_packed", w13_weight_packed)
+            set_weight_attrs(w13_weight_packed, compat_weight_attrs)
+
+            w2_weight_packed = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    intermediate_size_per_partition // packed_factor,
+                    hidden_size,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_packed", w2_weight_packed)
+            set_weight_attrs(w2_weight_packed, compat_weight_attrs)
+
+            w13_weight_scale_ct = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    hidden_size // self.quant_config.group_size,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale_ct)
+            set_weight_attrs(w13_weight_scale_ct, compat_weight_attrs)
+
+            w2_weight_scale_ct = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    intermediate_size_per_partition // self.quant_config.group_size,
+                    hidden_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_scale", w2_weight_scale_ct)
+            set_weight_attrs(w2_weight_scale_ct, compat_weight_attrs)
+
+            w13_weight_shape = torch.nn.Parameter(
+                torch.empty(num_experts, 2), requires_grad=False
+            )
+            layer.register_parameter("w13_weight_shape", w13_weight_shape)
+            set_weight_attrs(w13_weight_shape, compat_weight_attrs)
+
+            w2_weight_shape = torch.nn.Parameter(
+                torch.empty(num_experts, 2), requires_grad=False
+            )
+            layer.register_parameter("w2_weight_shape", w2_weight_shape)
+            set_weight_attrs(w2_weight_shape, compat_weight_attrs)
 
         # Input scales
         w13_input_scale = torch.nn.Parameter(
@@ -257,6 +386,113 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
         device = layer.w2_weight.device
+
+        if (
+            hasattr(layer, "w13_weight_packed")
+            and layer.w13_weight_packed.numel() > 0
+            and layer.w13_weight_packed.ne(0).any().item()
+        ):
+            packed = layer.w13_weight_packed
+            num_experts, packed_k, n = packed.shape
+            w13_weight = torch.empty(
+                (num_experts, n, packed_k * 4),
+                dtype=torch.int8,
+                device=packed.device,
+            )
+            for expert_id in range(num_experts):
+                tmp = (
+                    packed[expert_id]
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(torch.uint8)
+                    .to(torch.int8)
+                )
+                w13_weight[expert_id].copy_(tmp)
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            if (
+                hasattr(layer, "w2_weight_packed")
+                and layer.w2_weight_packed.numel() > 0
+                and layer.w2_weight_packed.ne(0).any().item()
+            ):
+                packed = layer.w2_weight_packed
+                num_experts, packed_k, n = packed.shape
+                w2_weight = torch.empty(
+                    (num_experts, n, packed_k * 4),
+                    dtype=torch.int8,
+                    device=packed.device,
+                )
+                for expert_id in range(num_experts):
+                    tmp = (
+                        packed[expert_id]
+                        .transpose(0, 1)
+                        .contiguous()
+                        .view(torch.uint8)
+                        .to(torch.int8)
+                    )
+                    w2_weight[expert_id].copy_(tmp)
+                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+            if (
+                hasattr(layer, "w13_weight_scale")
+                and layer.w13_weight_scale.numel() > 0
+                and layer.w13_weight_scale.ne(0).any().item()
+            ):
+                scales = layer.w13_weight_scale
+                num_experts, k_groups, n = scales.shape
+                w13_scale = torch.empty(
+                    (num_experts, n, k_groups),
+                    dtype=scales.dtype,
+                    device=scales.device,
+                )
+                for expert_id in range(num_experts):
+                    w13_scale[expert_id].copy_(
+                        scales[expert_id].transpose(0, 1).contiguous()
+                    )
+                layer.w13_weight_scale_inv = Parameter(w13_scale, requires_grad=False)
+            if (
+                hasattr(layer, "w2_weight_scale")
+                and layer.w2_weight_scale.numel() > 0
+                and layer.w2_weight_scale.ne(0).any().item()
+            ):
+                scales = layer.w2_weight_scale
+                num_experts, k_groups, n = scales.shape
+                w2_scale = torch.empty(
+                    (num_experts, n, k_groups),
+                    dtype=scales.dtype,
+                    device=scales.device,
+                )
+                for expert_id in range(num_experts):
+                    w2_scale[expert_id].copy_(
+                        scales[expert_id].transpose(0, 1).contiguous()
+                    )
+                layer.w2_weight_scale_inv = Parameter(w2_scale, requires_grad=False)
+            if hasattr(layer, "w13_weight_scale"):
+                layer.w13_weight_scale = Parameter(
+                    torch.empty(0, dtype=layer.w13_weight_scale.dtype, device=device),
+                    requires_grad=False,
+                )
+            if hasattr(layer, "w2_weight_scale"):
+                layer.w2_weight_scale = Parameter(
+                    torch.empty(0, dtype=layer.w2_weight_scale.dtype, device=device),
+                    requires_grad=False,
+                )
+            if hasattr(layer, "w13_weight_shape"):
+                layer.w13_weight_shape = Parameter(
+                    torch.empty(0, dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
+            if hasattr(layer, "w2_weight_shape"):
+                layer.w2_weight_shape = Parameter(
+                    torch.empty(0, dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
+            layer.w13_weight_packed = Parameter(
+                torch.empty(0, dtype=torch.int32, device=device), requires_grad=False
+            )
+            if hasattr(layer, "w2_weight_packed"):
+                layer.w2_weight_packed = Parameter(
+                    torch.empty(0, dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
 
         # Interleave w13_weight_scale (gate_up_proj)
         w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
