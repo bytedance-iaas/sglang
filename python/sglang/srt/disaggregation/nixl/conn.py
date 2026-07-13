@@ -2610,26 +2610,36 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             local_state_indices = state_indices
             local_spec_metadata = spec_metadata
-            if spec_metadata and spec_metadata.get("pp_slices"):
-                pp_rank = int(
-                    bootstrap_info.get(
-                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
-                    )
-                )
-                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
-                local_spec_metadata = {
-                    **spec_metadata,
-                    "target_pp_rank": int(pp_rank),
-                    "pp_slice": pp_slice,
-                }
+            if spec_metadata and spec_metadata.get("dspark_hidden"):
                 local_state_indices = list(
                     state_indices
                     if state_indices is not None
                     else [None] * len(self.kv_mgr.kv_args.state_types)
                 )
+                pp_slice = None
+                if spec_metadata.get("pp_slices"):
+                    pp_rank = int(
+                        bootstrap_info.get(
+                            "target_pp_rank", bootstrap_info.get("pp_rank", 0)
+                        )
+                    )
+                    pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                    local_spec_metadata = (
+                        {
+                            **spec_metadata,
+                            "target_pp_rank": int(pp_rank),
+                            "pp_slice": pp_slice,
+                        }
+                        if pp_slice
+                        else None
+                    )
+                else:
+                    local_spec_metadata = None
                 for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
                     if state_type == StateType.DSPARK_HIDDEN:
-                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        local_state_indices[idx] = (
+                            pp_slice.get("dst_indices", []) if pp_slice else []
+                        )
                         break
             packed_state_indices = (
                 pack_int_lists(

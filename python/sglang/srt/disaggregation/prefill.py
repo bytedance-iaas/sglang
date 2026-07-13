@@ -341,8 +341,23 @@ class PrefillBootstrapQueue:
 
         hidden_start = int(dspark_meta.get("hidden_start", 0))
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
-        pp_slices = dspark_meta.get("pp_slices") or {}
+        raw_pp_slices = dspark_meta.get("pp_slices") or {}
+        pp_slices = {
+            str(pp_rank): dict(pp_slice)
+            for pp_rank, pp_slice in raw_pp_slices.items()
+        }
         local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        if local_pp_slice and int(local_pp_slice.get("pp_rank", self.pp_rank)) != int(
+            self.pp_rank
+        ):
+            message = (
+                "Invalid DSpark hidden metadata from decode: local pp_slice "
+                f"targets pp_rank={local_pp_slice.get('pp_rank')} but this "
+                f"prefill rank is pp_rank={self.pp_rank}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
         dst_indices = [
             int(x)
             for x in (
@@ -365,12 +380,62 @@ class PrefillBootstrapQueue:
             if local_pp_slice
             else len(local_layer_ids) * int(self.scheduler.model_config.hidden_size)
         )
+
+        dspark_state_idx = None
+        for idx, state_type in enumerate(self.kv_manager.kv_args.state_types):
+            if state_type == StateType.DSPARK_HIDDEN:
+                dspark_state_idx = idx
+                break
+        local_transfer_dst_lengths = []
+        local_transfer_dynamic_rows = []
+        transfer_infos = getattr(self.kv_manager, "transfer_infos", {})
+        for info in transfer_infos.get(req.bootstrap_room, {}).values():
+            if dspark_state_idx is not None:
+                dst_state_indices = getattr(info, "dst_state_indices", []) or []
+                if dspark_state_idx < len(dst_state_indices):
+                    local_transfer_dst_lengths.append(
+                        len(dst_state_indices[dspark_state_idx] or [])
+                    )
+            pp_slice = (getattr(info, "spec_metadata", None) or {}).get("pp_slice") or {}
+            dynamic_dst = pp_slice.get("dynamic_dst") or {}
+            if dynamic_dst:
+                local_transfer_dynamic_rows.append(
+                    int(dynamic_dst.get("row_count", 0))
+                )
+
         if not local_layer_ids:
+            if any(length > 0 for length in local_transfer_dst_lengths) or any(
+                row_count > 0 for row_count in local_transfer_dynamic_rows
+            ):
+                message = (
+                    "Invalid DSpark rank-local hidden metadata: this prefill "
+                    f"pp_rank={self.pp_rank} has no local target layers, but "
+                    "received non-empty hidden dst rows: "
+                    f"dst_lengths={local_transfer_dst_lengths}, "
+                    f"dynamic_rows={local_transfer_dynamic_rows}"
+                )
+                logger.error(message)
+                prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return False
             req.dspark_hidden_meta = dict(dspark_meta)
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
             req.dspark_hidden_written = []
             return True
+
+        if (
+            any(length != hidden_len for length in local_transfer_dst_lengths)
+            or any(row_count != hidden_len for row_count in local_transfer_dynamic_rows)
+        ):
+            message = (
+                "Invalid DSpark rank-local hidden metadata: local transfer dst "
+                f"rows must match hidden_len on pp_rank={self.pp_rank}: "
+                f"hidden_len={hidden_len}, dst_lengths={local_transfer_dst_lengths}, "
+                f"dynamic_rows={local_transfer_dynamic_rows}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
 
         if hidden_len != len(dst_indices):
             message = (
