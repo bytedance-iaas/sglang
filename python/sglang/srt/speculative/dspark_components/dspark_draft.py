@@ -368,19 +368,20 @@ class DraftBlockProposer:
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = batch.seq_lens_cpu + draft_width
-            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            # TODO(bonus_anchor): reserved_seq_lens_cpu/reserved_seq_lens_sum
-            # come pre-computed from elsewhere (CUDA-graph-padded reservation
-            # sizing) and are used as-is here, unlike the branch above. Not
-            # verified against bonus_anchor=True -- if this path is ever hit
-            # for a speculators checkpoint, confirm the reservation already
-            # accounts for draft_width (gamma + 1), not just gamma.
-            draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            # TARGET_VERIFY attention backends interpret seq_lens_cpu as the
+            # committed prefix and add the fixed draft width internally when
+            # sizing cache/page-table metadata. Passing prefix + draft_width here
+            # makes verifier metadata longer than the real committed row.
+            draft_seq_lens_cpu = batch.seq_lens_cpu
+            seq_lens_sum = getattr(batch, "seq_lens_sum", None)
+            draft_seq_lens_sum = (
+                int(seq_lens_sum)
+                if seq_lens_sum is not None
+                else int(batch.seq_lens_cpu.sum().item())
+            )
         else:
-            raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
+            draft_seq_lens_cpu = prefix_lens.detach().to("cpu")
+            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum().item())
 
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
