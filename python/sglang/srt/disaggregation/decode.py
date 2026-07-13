@@ -1519,8 +1519,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 dspark_hidden_dynamic_buffers_by_pp = {}
                 dspark_hidden_dynamic_cache_entries_by_pp = {}
                 dspark_hidden_dynamic_register_handles = []
-                dspark_dynamic_reused = 0
-                dspark_dynamic_allocated = 0
                 dspark_dynamic_pool_busy = False
                 for pp_rank, pp_slice in pp_slices.items():
                     cur_indices = [int(x) for x in range(dspark_hidden_len)]
@@ -1535,8 +1533,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             chunk_buffers,
                             chunk_entries,
                             chunk_handles,
-                            reused,
-                            allocated,
+                            _,
+                            _,
                         ) = _DSPARK_HIDDEN_PAGE_POOL.acquire_pages_for_plan(
                             self.kv_manager,
                             int(pp_rank),
@@ -1577,8 +1575,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         dspark_dynamic_pool_busy = True
                         dspark_hidden_dst_indices_by_pp = None
                         break
-                    dspark_dynamic_reused += reused
-                    dspark_dynamic_allocated += allocated
                     dspark_hidden_dynamic_register_handles.extend(chunk_handles)
                     dspark_hidden_dynamic_cache_entries_by_pp[pp_rank] = chunk_entries
                     dspark_hidden_dynamic_buffers_by_pp[pp_rank] = chunk_buffers
@@ -1604,27 +1600,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if dspark_hidden_dst_indices_by_pp is None:
                     continue
                 dspark_hidden_pp_slices = pp_slices
-                logger.info(
-                    "Prepared DSpark PD dynamic hidden receive buffers: rid=%s, "
-                    "target_layer_ids=%s, hidden_len=%s, reused=%s, allocated=%s, "
-                    "pp_slices=%s",
-                    decode_req.req.rid,
-                    target_layer_ids,
-                    dspark_hidden_len,
-                    dspark_dynamic_reused,
-                    dspark_dynamic_allocated,
-                    {
-                        int(pp_rank): {
-                            "layer_ids": pp_slice.get("layer_ids", []),
-                            "slice_start": pp_slice.get("slice_start", 0),
-                            "slice_len": pp_slice.get("slice_len", 0),
-                            "dynamic_nbytes": pp_slice.get("dynamic_dst", {}).get(
-                                "nbytes", 0
-                            ),
-                        }
-                        for pp_rank, pp_slice in pp_slices.items()
-                    },
-                )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
