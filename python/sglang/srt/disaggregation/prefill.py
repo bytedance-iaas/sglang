@@ -1068,6 +1068,17 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
+                if req.pending_bootstrap and i in optimistic_polls:
+                    poll = optimistic_polls[i]
+                    if poll == KVPoll.Failed:
+                        self.handle_bootstrap_failure(req)
+                        advance_logprob_pt(i, req)
+                        continue
+                    if poll == KVPoll.WaitingForInput:
+                        assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(
+                            req
+                        )
+
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
