@@ -2047,11 +2047,13 @@ class NixlKVManager(CommonKVManager):
                 dynamic_dst = None
                 dst_mem_kind_for_state = "VRAM"
                 if st == StateType.DSPARK_HIDDEN:
-                    dynamic_dst = (
-                        (req.spec_metadata or {})
-                        .get("pp_slice", {})
-                        .get("dynamic_dst")
-                    )
+                    pp_slice = (req.spec_metadata or {}).get("pp_slice") or {}
+                    if not pp_slice or not pp_slice.get("layer_ids"):
+                        # This prefill PP rank has no local DSpark target
+                        # layers. Ignore non-row placeholders that may remain
+                        # in dst_state_indices for other ranks.
+                        continue
+                    dynamic_dst = pp_slice.get("dynamic_dst")
                     if dynamic_dst:
                         row_count = int(dynamic_dst.get("row_count", 0))
                         dst_ptrs = [int(dynamic_dst["ptr"])]
