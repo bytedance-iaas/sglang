@@ -24,7 +24,13 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 class DsparkDraftSampler:
     """Draft proposal head folded into the draft graph as a tail hook; with
-    folded_sampling it also Gumbel-samples non-greedy rows in-graph."""
+    folded_sampling it also Gumbel-samples non-greedy rows in-graph.
+
+    ``bonus_anchor`` must match :class:`DraftBlockProposer`: bonus-anchor
+    checkpoints forward ``gamma + 1`` positions but only positions 1..gamma
+    are trained draft predictions. Anchor-first checkpoints forward and sample
+    exactly ``gamma`` positions.
+    """
 
     def __init__(
         self,
@@ -36,10 +42,13 @@ class DsparkDraftSampler:
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
+        bonus_anchor: bool = False,
     ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.bonus_anchor = bool(bonus_anchor)
+        self.draft_width = self.gamma + 1 if self.bonus_anchor else self.gamma
         max_bs = int(max_bs)
         if out is not None:
             assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
@@ -91,10 +100,16 @@ class DsparkDraftSampler:
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        bs = hidden_states.shape[0] // self.draft_width
+        hidden_3d = hidden_states.view(bs, self.draft_width, -1)
+        draft_hidden = (
+            hidden_3d[:, 1:, :].contiguous() if self.bonus_anchor else hidden_3d
+        )
+        base_logits, confidence_tap = self.model.compute_base_logits(
+            draft_hidden.reshape(bs * self.gamma, -1)
+        )
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
+        anchor = input_ids.view(bs, self.draft_width)[:, 0]
 
         if self.folded_sampling:
 
@@ -116,7 +131,7 @@ class DsparkDraftSampler:
         draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
+            hidden_states=draft_hidden,
             sampler=sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
@@ -126,7 +141,7 @@ class DsparkDraftSampler:
             )
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
+                draft_hidden=draft_hidden,
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
@@ -171,6 +186,7 @@ def maybe_build_draft_sampler(
     tp_rank: int,
     confidence_fn=None,
     out=None,
+    bonus_anchor: bool = False,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -202,4 +218,5 @@ def maybe_build_draft_sampler(
         confidence_fn=confidence_fn,
         out=out,
         folded_sampling=folded_sampling,
+        bonus_anchor=bonus_anchor,
     )
