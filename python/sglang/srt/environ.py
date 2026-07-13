@@ -955,6 +955,21 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax-M3 attention: fuse per-head GemmaRMSNorm(q,k) + partial NeoX RoPE
+    # into one in-place JIT kernel (minimax_qknorm_rope) instead of separate
+    # norm + rope launches. Only activates for the verified config (per_head
+    # gemma norm, head_dim=128, rotary_dim=64, neox, no output gate, fp32 cache).
+    SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE = EnvBool(True)
+
+    # MiniMax-M3 sparse attention: fuse the main qkv projection and sparse
+    # index qkv projection into one GEMM.
+    SGLANG_OPT_USE_MINIMAX_FUSED_QKV_INDEX = EnvBool(True)
+
+    # SM90 MXFP8 dense linear: route dense linear layers through the custom
+    # DeepGEMM grouped MXFP8 path. Disable to fall back to the regular MXFP8
+    # linear backend selected by --fp8-gemm-backend, without changing MoE.
+    SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR = EnvBool(True)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")

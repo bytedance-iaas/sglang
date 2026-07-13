@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -168,12 +169,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         self._msa_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
+        if forward_batch.forward_mode.is_target_verify():
+            draft_token_num = int(forward_batch.spec_info.draft_token_num)
+            self._max_seqlen_q = draft_token_num
+        elif extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
         if in_capture and forward_batch.forward_mode.is_decode_or_idle():
             self._max_seqlen_k = self.max_context_len
+        elif forward_batch.forward_mode.is_target_verify():
+            draft_token_num = int(forward_batch.spec_info.draft_token_num)
+            self._max_seqlen_k = (
+                int(forward_batch.seq_lens_cpu.max().item()) + draft_token_num
+            )
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
@@ -237,6 +246,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
+    @staticmethod
+    def _make_kv_index_store_inputs_contiguous(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+    ):
+        return (
+            k.contiguous(),
+            v.contiguous(),
+            idx_k.contiguous(),
+            None if idx_v is None else idx_v.contiguous(),
+        )
+
     def forward(
         self,
         q,
@@ -281,6 +304,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
+            k, v, idx_k, idx_v = self._make_kv_index_store_inputs_contiguous(
+                k, v, idx_k, idx_v
+            )
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
                 forward_batch.out_cache_loc,
@@ -296,24 +322,38 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
+        if forward_batch.forward_mode.is_target_verify():
+            draft_token_num = int(forward_batch.spec_info.draft_token_num)
+            extend_seq_lens = torch.full(
+                (forward_batch.batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            extend_seq_lens_cpu = [draft_token_num] * forward_batch.batch_size
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            seq_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
+            if forward_batch.extend_prefix_lens is not None:
+                prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+            else:
+                prefix_lens = torch.zeros_like(seq_lens)
+
         cu_seqlens = torch.cat(
             [
-                torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
-                ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                torch.zeros(1, dtype=torch.int32, device=extend_seq_lens.device),
+                extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
-            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
-        else:
-            prefix_lens = torch.zeros_like(seq_lens)
-
-        # DP attention pads q beyond the real token count for collective alignment;
-        # trim to actual tokens so the sparse kernel sees consistent shapes.
-        if forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        # In DP attention mode, q may be padded beyond the actual token count
+        # for collective communication alignment. Trim to actual tokens so
+        # the sparse attention kernel sees consistent shapes. Prefer CPU-side
+        # metadata to avoid a GPU-to-CPU sync on every sparse prefill layer.
+        if extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(extend_seq_lens_cpu))
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
@@ -345,7 +385,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             score_type=self.score_type,
             disable_index_value=disable_value,
             use_msa=self.use_msa,
-            seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            seqlens_cpu=extend_seq_lens_cpu,
         )
 
         if actual_num_tokens < original_num_tokens:
@@ -417,6 +457,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        k, v, idx_k, idx_v = self._make_kv_index_store_inputs_contiguous(
+            k, v, idx_k, idx_v
+        )
         self.kv_pool.set_fused_kv_index_buffer(
             layer,
             forward_batch.out_cache_loc,
@@ -523,6 +566,33 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.sparse.get_cuda_graph_seq_len_fill_value()
 
+    def _dense_forward_with_dp_trim(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        mode = forward_batch.forward_mode
+        if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+            original_num_tokens = q.shape[0]
+            if actual_num_tokens < original_num_tokens:
+                o = self.dense.forward(
+                    q[:actual_num_tokens],
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                )
+                pad_len = original_num_tokens - actual_num_tokens
+                return torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
+
+        return self.dense.forward(q, k, v, layer, forward_batch, save_kv_cache)
+
     def forward(
         self,
         q,
@@ -538,29 +608,15 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
 
-        # DP attention pads q to an even length but flashinfer builds qo_indptr from
-        # extend_seq_lens, so padded q.shape[0] != qo_indptr[-1] and paged-prefill
-        # raises. Trim q and re-pad output; k/v stay untrimmed so KV-cache writes
-        # align with out_cache_loc.
-        mode = forward_batch.forward_mode
-        if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
-            original_num_tokens = q.shape[0]
-            if actual_num_tokens < original_num_tokens:
-                o = self.dense.forward(
-                    q[:actual_num_tokens],
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache,
-                    **kwargs,
-                )
-                pad_len = original_num_tokens - actual_num_tokens
-                return torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
-
-        return self.dense.forward(
-            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+        # Dense layers delegate to the stock backend (e.g. flashinfer). Under DP
+        # attention the per-rank token block is padded to an even length
+        # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
+        # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
+        # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
+        # the real token count and re-pad the output; k/v stay untrimmed so the
+        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
+        return self._dense_forward_with_dp_trim(
+            q, k, v, layer, forward_batch, save_kv_cache
         )
 
     def forward_extend(

@@ -589,6 +589,35 @@ def _disable_auto_parser(server_args, attr: str, label: str) -> None:
     server_args.override(source="template-detection", **{attr: None})
 
 
+def _load_config_chat_template(server_args) -> Optional[str]:
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    config = get_config(
+        server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=getattr(server_args, "revision", None),
+        model_config_parser=getattr(server_args, "model_config_parser", "auto"),
+    )
+    text_config = getattr(config, "text_config", None)
+    return next(
+        (
+            candidate
+            for candidate in (
+                getattr(config, "chat_template_jinja", None),
+                getattr(config, "chat_template", None),
+                (
+                    getattr(text_config, "chat_template_jinja", None)
+                    if text_config
+                    else None
+                ),
+                getattr(text_config, "chat_template", None) if text_config else None,
+            )
+            if candidate
+        ),
+        None,
+    )
+
+
 def _resolve_architecture_auto_parsers(server_args) -> None:
     from sglang.srt.utils.hf_transformers_utils import get_config
 
@@ -656,6 +685,11 @@ def resolve_auto_parsers(server_args) -> None:
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
         template = getattr(tokenizer, "chat_template", None)
+    if template is None and not has_explicit_template_without_detection:
+        try:
+            template = _load_config_chat_template(server_args)
+        except Exception as e:
+            logger.warning("Failed to load model config chat template: %s", e)
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(

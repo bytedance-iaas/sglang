@@ -464,6 +464,7 @@ class MiniMaxM3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
         self.is_sparse_attention_layer = is_sparse_attention_layer
         self.disable_index_value = is_sparse_attention_layer and disable_index_value
 
@@ -498,14 +499,24 @@ class MiniMaxM3Attention(nn.Module):
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
 
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
+        self.attention_output_gate = getattr(config, "attention_output_gate", False)
+        if self.attention_output_gate:
+            raise NotImplementedError(
+                "MiniMax-M3 attention_output_gate is not supported"
+            )
 
-        if self.is_sparse_attention_layer:
+        # Sparse-attention-specific config (read from sparse_attention_config).
+        # Only the index-branch dimensions are needed at module level; all
+        # block/topk/local/init knobs live in the sparse attention backend.
+        if self.is_sparse_attention_layer and self.use_qk_norm:
             assert self.qk_norm_type == "per_head", (
                 f"sparse attention only supports qk_norm_type='per_head', "
                 f"got {self.qk_norm_type!r}"
             )
+        if self.is_sparse_attention_layer:
             sparse_cfg = config.sparse_attention_config
             self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
             self.idx_head_dim = sparse_cfg["sparse_index_dim"]
@@ -581,58 +592,67 @@ class MiniMaxM3Attention(nn.Module):
                 )
             self.index_rotary_emb = self.rotary_emb
 
-        if self.qk_norm_type == "per_layer":
-            if attn_tp_size > 1:
-                self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-                self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-            else:
-                self.q_norm = RMSNorm(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-                self.k_norm = RMSNorm(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
-                )
-        elif self.qk_norm_type == "per_head":
-            if self.use_gemma_norm:
-                self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            else:
-                self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            if self.is_sparse_attention_layer:
-                if self.use_gemma_norm:
-                    self.index_q_norm = GemmaRMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+        if self.use_qk_norm:
+            # Use RMSNormTP for proper tensor parallel support. Per-layer norm
+            # weights are defined over the global Q/K widths and sharded here.
+            if self.qk_norm_type == "per_layer":
+                if attn_tp_size > 1:
+                    self.q_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_heads * self.head_dim,
+                        num_heads=self.total_num_heads,
+                        eps=config.rms_norm_eps,
                     )
-                    self.index_k_norm = GemmaRMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+                    self.k_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_kv_heads * self.head_dim,
+                        num_heads=self.total_num_kv_heads,
+                        eps=config.rms_norm_eps,
                     )
                 else:
-                    self.index_q_norm = RMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+                    self.q_norm = RMSNorm(
+                        self.total_num_heads * self.head_dim,
+                        eps=config.rms_norm_eps,
                     )
-                    self.index_k_norm = RMSNorm(
-                        self.idx_head_dim, eps=config.rms_norm_eps
+                    self.k_norm = RMSNorm(
+                        self.total_num_kv_heads * self.head_dim,
+                        eps=config.rms_norm_eps,
                     )
-        elif self.qk_norm_type == "multi_head":
-            self.q_norm = MultiHeadRMSNorm(
-                self.total_num_heads,
-                self.head_dim,
-                eps=config.rms_norm_eps,
-                apply_layernorm_1p=self.use_gemma_norm,
-            )
-            self.k_norm = MultiHeadRMSNorm(
-                self.total_num_kv_heads,
-                self.head_dim,
-                eps=config.rms_norm_eps,
-                apply_layernorm_1p=self.use_gemma_norm,
-            )
-        else:
-            raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
+            elif self.qk_norm_type == "per_head":
+                if self.use_gemma_norm:
+                    self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                    self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                else:
+                    self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                    self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                if self.is_sparse_attention_layer:
+                    if self.use_gemma_norm:
+                        self.index_q_norm = GemmaRMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+                        self.index_k_norm = GemmaRMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+                    else:
+                        self.index_q_norm = RMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+                        self.index_k_norm = RMSNorm(
+                            self.idx_head_dim, eps=config.rms_norm_eps
+                        )
+            elif self.qk_norm_type == "multi_head":
+                self.q_norm = MultiHeadRMSNorm(
+                    self.total_num_heads,
+                    self.head_dim,
+                    eps=config.rms_norm_eps,
+                    apply_layernorm_1p=self.use_gemma_norm,
+                )
+                self.k_norm = MultiHeadRMSNorm(
+                    self.total_num_kv_heads,
+                    self.head_dim,
+                    eps=config.rms_norm_eps,
+                    apply_layernorm_1p=self.use_gemma_norm,
+                )
+            else:
+                raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -646,6 +666,9 @@ class MiniMaxM3Attention(nn.Module):
 
         self._use_fused_qknorm_rope = (
             _is_cuda
+            and self.use_qk_norm
+            and get_server_args().enable_fused_qk_norm_rope
+            and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE.get()
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
             and self.head_dim == 128
@@ -653,8 +676,15 @@ class MiniMaxM3Attention(nn.Module):
             and getattr(self.rotary_emb, "is_neox_style", False)
         )
 
-        self._fuse_qkv_index_enabled = self.is_sparse_attention_layer and (
-            _is_cuda or _is_hip
+        # Fuse the main qkv_proj and the sparse index_qkv_proj into one GEMM
+        # (both project the same hidden input). Built after weight load via
+        # maybe_build_fused_qkv_index(); falls back to two GEMMs when the quant
+        # method does not support a safe output-dim concat (only unquantized
+        # bf16 and mxfp8 are fused; anything else keeps the two projections).
+        self._fuse_qkv_index_enabled = (
+            self.is_sparse_attention_layer
+            and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKV_INDEX.get()
+            and (_is_cuda or _is_hip)
         )
         self._fused_qkv_index = None
         self._fused_main_size = self.q_size + 2 * self.kv_size
@@ -677,6 +707,7 @@ class MiniMaxM3Attention(nn.Module):
 
         self._can_use_rocm_qk_norm_rope_static = (
             _has_rocm_qk_norm_rope
+            and self.use_qk_norm
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
@@ -686,6 +717,7 @@ class MiniMaxM3Attention(nn.Module):
         )
         self._can_use_rocm_index_qk_norm_rope_static = (
             self.is_sparse_attention_layer
+            and self.use_qk_norm
             and _has_rocm_qk_norm_rope
             and self.use_gemma_norm
             and self.index_q_norm.variance_epsilon == self.index_k_norm.variance_epsilon
@@ -718,6 +750,8 @@ class MiniMaxM3Attention(nn.Module):
     def _qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return self.rotary_emb(positions, q, k)
         if self._can_use_rocm_qk_norm_rope(positions, q, k):
             return qk_gemma_rmsnorm_rope(
                 q,
@@ -737,6 +771,8 @@ class MiniMaxM3Attention(nn.Module):
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return q, k
         if self.qk_norm_type == "per_layer":
             if self.attn_tp_size > 1:
                 q, k = MiniMaxM2RMSNormTP.forward_qk(
@@ -762,6 +798,8 @@ class MiniMaxM3Attention(nn.Module):
     def _index_qk_norm_rope(
         self, positions: torch.Tensor, idx_q: torch.Tensor, idx_k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return self.index_rotary_emb(positions, idx_q, idx_k)
         if (
             self._can_use_rocm_index_qk_norm_rope_static
             and positions.dim() == 1
@@ -788,6 +826,9 @@ class MiniMaxM3Attention(nn.Module):
     def _index_qk_norm(
         self, idx_q: torch.Tensor, idx_k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_qk_norm:
+            return idx_q, idx_k
+        # sparse index branch only supports per_head norm; init asserts this.
         idx_q_shape = idx_q.shape
         idx_k_shape = idx_k.shape
         idx_q = idx_q.reshape(-1, self.idx_head_dim)
@@ -817,6 +858,11 @@ class MiniMaxM3Attention(nn.Module):
         qp, ip = self.qkv_proj, self.index_qkv_proj
         qm = qp.quant_method
         if type(ip.quant_method) is not type(qm):
+            return
+        # Some backends convert dense MXFP8 during the loader's post-process
+        # pass. The fused holder skips that pass, so keep the two original
+        # projections when conversion is required.
+        if getattr(qm, "convert_mxfp8_to_block", False):
             return
 
         # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
@@ -1023,6 +1069,7 @@ class MiniMaxM3Attention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
 
         if self._use_fused_qknorm_rope:
+            # Fused per-head GemmaRMSNorm + partial NeoX RoPE, in place on qkv.
             from sglang.jit_kernel.minimax_qknorm_rope import minimax_qknorm_rope
 
             minimax_qknorm_rope(
@@ -1110,7 +1157,8 @@ class MiniMaxM3Attention(nn.Module):
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
-            return output + idx_output
+            combined = output + idx_output
+            return combined
 
         q, k, v, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
@@ -1394,9 +1442,7 @@ class MiniMaxM3Model(nn.Module):
                         hidden_states=hidden_states,
                         residual=residual,
                         captured_last_layer_outputs=(
-                            aux_hidden_states
-                            if getattr(layer, "_is_layer_to_capture", False)
-                            else None
+                            aux_hidden_states if i in self.layers_to_capture else None
                         ),
                     )
 
@@ -1524,9 +1570,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            logits_output = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            return logits_output
         else:
             return hidden_states
 

@@ -13,6 +13,7 @@ from sglang.srt.parser.template_detection import (
     detect_tool_call_parser,
     resolve_auto_parsers,
 )
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -663,6 +664,38 @@ class TestResolveAutoParsers(unittest.TestCase):
 
         self.assertEqual(args.reasoning_parser, "qwen3")
         self.assertEqual(args.tool_call_parser, "qwen")
+
+    def test_resolves_parsers_with_config_chat_template(self):
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([], chat_template=None)
+        config = SimpleNamespace(
+            architectures=["MiniMaxM3SparseForConditionalGeneration"],
+            text_config=SimpleNamespace(chat_template_jinja=self.qwen3_template),
+        )
+
+        with _patch_hf_transformers_utils(
+            Mock(return_value=tokenizer), Mock(return_value=config)
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "qwen3")
+        self.assertEqual(args.tool_call_parser, "qwen")
+
+    def test_template_manager_uses_nested_config_chat_template(self):
+        template = "{% set marker = 'from-config' %}"
+        tokenizer_manager = SimpleNamespace(
+            processor=None,
+            tokenizer=SimpleNamespace(chat_template=None),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    text_config=SimpleNamespace(chat_template_jinja=template)
+                )
+            ),
+        )
+
+        self.assertEqual(
+            TemplateManager()._resolve_hf_chat_template(tokenizer_manager), template
+        )
 
     def test_resolves_reasoning_parser_only(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser=None)
