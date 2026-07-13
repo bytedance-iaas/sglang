@@ -360,7 +360,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.mbs[next_mb_id] is not None:
+                    if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
