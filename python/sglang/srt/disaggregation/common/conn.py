@@ -1086,6 +1086,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        state_metadata: Optional[dict] = None,
     ):
         pass
 

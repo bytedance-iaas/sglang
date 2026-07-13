@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -439,6 +439,7 @@ class PrefillBootstrapQueue:
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
             req.dspark_hidden_written = []
+            req.dspark_hidden_pending_row_ranges = []
             return True
 
         invalid_dynamic_rows = [
@@ -505,6 +506,7 @@ class PrefillBootstrapQueue:
         req.dspark_hidden_src_indices = src_indices
         req.dspark_hidden_dst_indices = dst_indices
         req.dspark_hidden_written = [False] * hidden_len
+        req.dspark_hidden_pending_row_ranges = []
         return True
 
     def _configure_dspark_hidden_capture(
@@ -1019,6 +1021,14 @@ class SchedulerDisaggregationPrefillMixin:
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
                 written[local_start:local_end] = [True] * (local_end - local_start)
+            pending_ranges = getattr(req, "dspark_hidden_pending_row_ranges", None)
+            if pending_ranges is None:
+                pending_ranges = []
+                req.dspark_hidden_pending_row_ranges = pending_ranges
+            if pending_ranges and int(pending_ranges[-1][1]) == int(local_start):
+                pending_ranges[-1] = (int(pending_ranges[-1][0]), int(local_end))
+            else:
+                pending_ranges.append((int(local_start), int(local_end)))
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1611,6 +1621,51 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         state_indices: Optional[List] = None
+        state_metadata: Optional[dict] = None
+
+        def _pop_dspark_hidden_ready_ranges(require_all: bool) -> Tuple[object, list]:
+            src_indices = getattr(req, "dspark_hidden_src_indices", None)
+            if not src_indices:
+                return None, []
+
+            written = getattr(req, "dspark_hidden_written", None)
+            if require_all and written is not None and not all(written):
+                missing = [i for i, ok in enumerate(written) if not ok][:8]
+                raise RuntimeError(
+                    "DSpark hidden rows are incomplete before PD transfer: "
+                    f"rid={req.rid}, missing_offsets={missing}"
+                )
+
+            pending_ranges = list(
+                getattr(req, "dspark_hidden_pending_row_ranges", []) or []
+            )
+            if not pending_ranges:
+                return None, []
+
+            req.dspark_hidden_pending_row_ranges = []
+            row_ranges = [
+                {"row_start": int(row_start), "row_len": int(row_end - row_start)}
+                for row_start, row_end in pending_ranges
+                if int(row_end) > int(row_start)
+            ]
+            if not row_ranges:
+                return None, []
+            return np.asarray(src_indices, dtype=np.int32), row_ranges
+
+        if not last_chunk:
+            state_types = (
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+            )
+            dspark_payload, dspark_row_ranges = _pop_dspark_hidden_ready_ranges(
+                require_all=False
+            )
+            if dspark_payload is not None:
+                state_indices = []
+                for st in state_types:
+                    state_indices.append(
+                        dspark_payload if st == StateType.DSPARK_HIDDEN else None
+                    )
+                state_metadata = {"dspark_hidden_row_ranges": dspark_row_ranges}
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1682,17 +1737,12 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dspark_hidden_payload():
-                src_indices = getattr(req, "dspark_hidden_src_indices", None)
-                if not src_indices:
+                nonlocal state_metadata
+                payload, row_ranges = _pop_dspark_hidden_ready_ranges(require_all=True)
+                if payload is None:
                     return []
-                written = getattr(req, "dspark_hidden_written", None)
-                if written is not None and not all(written):
-                    missing = [i for i, ok in enumerate(written) if not ok][:8]
-                    raise RuntimeError(
-                        "DSpark hidden rows are incomplete before PD transfer: "
-                        f"rid={req.rid}, missing_offsets={missing}"
-                    )
-                return np.asarray(src_indices, dtype=np.int32)
+                state_metadata = {"dspark_hidden_row_ranges": row_ranges}
+                return payload
 
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
@@ -1719,9 +1769,14 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
+        if (
+            not state_indices
+            and not req.disagg_kv_sender.should_send_kv_chunk(
+                len(page_indices), last_chunk
+            )
+        ):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices, state_metadata)
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
@@ -1745,6 +1800,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.dspark_hidden_dst_indices = None
             req.dspark_hidden_meta = None
             req.dspark_hidden_written = None
+            req.dspark_hidden_pending_row_ranges = None
             req.dspark_hidden_capture_layer_ids = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()

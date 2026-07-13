@@ -1020,6 +1020,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        state_metadata: Optional[dict] = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1155,43 +1156,65 @@ class MooncakeKVManager(CommonKVManager):
                     row_chunks = dynamic_dst.get("row_chunks") or [
                         {"row_start": 0, "row_len": len(src_indices)}
                     ]
-                    for row_chunk in row_chunks:
-                        row_start = int(row_chunk.get("row_start", 0))
-                        row_len = int(row_chunk.get("row_len", 0))
-                        if row_len <= 0:
+                    row_ranges = None
+                    if state_metadata:
+                        row_ranges = state_metadata.get("dspark_hidden_row_ranges")
+                    if not row_ranges:
+                        row_ranges = [{"row_start": 0, "row_len": len(src_indices)}]
+                    item_len = int(dynamic_dst.get("item_len", src_item_lens[0]))
+                    for row_range in row_ranges:
+                        send_start = int(row_range.get("row_start", 0))
+                        send_len = int(row_range.get("row_len", 0))
+                        if send_len <= 0:
                             continue
-                        row_end = row_start + row_len
-                        if row_start < 0 or row_end > len(src_indices):
+                        send_end = send_start + send_len
+                        if send_start < 0 or send_end > len(src_indices):
                             raise RuntimeError(
-                                "Invalid DSpark hidden row chunk: "
-                                f"rid={req.rid}, row_start={row_start}, "
-                                f"row_len={row_len}, row_count={len(src_indices)}"
+                                "Invalid DSpark hidden send range: "
+                                f"rid={req.rid}, row_start={send_start}, "
+                                f"row_len={send_len}, row_count={len(src_indices)}"
                             )
-                        if "ptr" in row_chunk:
-                            chunk_dst_data_ptrs = [int(row_chunk["ptr"])]
-                            chunk_dst_indices = list(range(row_len))
-                        else:
-                            chunk_dst_data_ptrs = dst_data_ptrs
-                            chunk_dst_indices = dst_indices_local[
-                                row_start:row_end
-                            ]
-                        rc = (
-                            self._send_kvcache_generic(
-                                mooncake_session_id=req.mooncake_session_id,
-                                src_data_ptrs=src_data_ptrs,
-                                dst_data_ptrs=chunk_dst_data_ptrs,
-                                item_lens=src_item_lens,
-                                prefill_data_indices=np.array(
-                                    src_indices[row_start:row_end], dtype=np.int32
-                                ),
-                                dst_data_indices=np.array(
-                                    chunk_dst_indices, dtype=np.int32
-                                ),
-                                executor=executor,
-                                state_type=st,
+                        for row_chunk in row_chunks:
+                            chunk_start = int(row_chunk.get("row_start", 0))
+                            chunk_len = int(row_chunk.get("row_len", 0))
+                            chunk_end = chunk_start + chunk_len
+                            row_start = max(send_start, chunk_start)
+                            row_end = min(send_end, chunk_end)
+                            row_len = row_end - row_start
+                            if row_len <= 0:
+                                continue
+                            if row_start < 0 or row_end > len(src_indices):
+                                raise RuntimeError(
+                                    "Invalid DSpark hidden row chunk: "
+                                    f"rid={req.rid}, row_start={row_start}, "
+                                    f"row_len={row_len}, row_count={len(src_indices)}"
+                                )
+                            if "ptr" in row_chunk:
+                                chunk_dst_data_ptrs = [
+                                    int(row_chunk["ptr"])
+                                    + int(row_start - chunk_start) * item_len
+                                ]
+                                chunk_dst_indices = list(range(row_len))
+                            else:
+                                chunk_dst_data_ptrs = dst_data_ptrs
+                                chunk_dst_indices = dst_indices_local[row_start:row_end]
+                            rc = (
+                                self._send_kvcache_generic(
+                                    mooncake_session_id=req.mooncake_session_id,
+                                    src_data_ptrs=src_data_ptrs,
+                                    dst_data_ptrs=chunk_dst_data_ptrs,
+                                    item_lens=src_item_lens,
+                                    prefill_data_indices=np.array(
+                                        src_indices[row_start:row_end], dtype=np.int32
+                                    ),
+                                    dst_data_indices=np.array(
+                                        chunk_dst_indices, dtype=np.int32
+                                    ),
+                                    executor=executor,
+                                    state_type=st,
+                                )
+                                or rc
                             )
-                            or rc
-                        )
                     continue
                 rc = (
                     self._send_kvcache_generic(
@@ -1531,15 +1554,16 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             break
 
-                        if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
-                                self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                        if kv_chunk.state_indices and not skip_state:
+                            self.maybe_send_extra(
+                                req,
+                                kv_chunk.state_indices,
+                                executor,
+                                target_rank_registration_info,
+                                state_metadata=kv_chunk.state_metadata,
+                            )
 
+                        if kv_chunk.is_last_chunk:
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req,
@@ -1788,6 +1812,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        state_metadata: Optional[dict] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -1826,6 +1851,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                state_metadata=state_metadata,
                 trace_ctx=trace_ctx,
             )
         )
@@ -1906,6 +1932,7 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        state_metadata: Optional[dict] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -1919,6 +1946,8 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                state_indices=state_indices,
+                state_metadata=state_metadata,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
@@ -1929,6 +1958,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                state_metadata=state_metadata,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
