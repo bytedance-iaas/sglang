@@ -1120,6 +1120,8 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     continue
                 if st == StateType.DSPARK_HIDDEN:
+                    if len(src_indices) == 0:
+                        continue
                     dynamic_dst = (
                         (req.spec_metadata or {})
                         .get("pp_slice", {})
