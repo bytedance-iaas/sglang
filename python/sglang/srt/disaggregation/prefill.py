@@ -866,9 +866,26 @@ class SchedulerDisaggregationPrefillMixin:
                 "transfer_infos",
                 {},
             )
+            kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+            state_types = getattr(kv_mgr.kv_args, "state_types", [])
+            dspark_state_idx = next(
+                (
+                    idx
+                    for idx, state_type in enumerate(state_types)
+                    if state_type == StateType.DSPARK_HIDDEN
+                ),
+                None,
+            )
+            new_dst_indices = [int(x) for x in range(new_hidden_len)]
             for info in transfer_infos.get(req.bootstrap_room, {}).values():
                 if getattr(info, "spec_metadata", None):
                     info.spec_metadata = dict(new_meta)
+                if dspark_state_idx is not None:
+                    while len(info.dst_state_indices) <= dspark_state_idx:
+                        info.dst_state_indices.append([])
+                    info.dst_state_indices[dspark_state_idx] = list(new_dst_indices)
+            if req.bootstrap_room in getattr(kv_mgr, "req_to_dspark_hidden_meta", {}):
+                kv_mgr.req_to_dspark_hidden_meta[req.bootstrap_room] = dict(new_meta)
 
             logger.info(
                 "Adjusted DSpark PD hidden window for prefill cache: rid=%s, "
