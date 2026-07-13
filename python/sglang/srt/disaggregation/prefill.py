@@ -92,6 +92,15 @@ def _pp_stable_rid_hash(rid: str) -> int:
     return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
 
 
+def _is_dspark_pd_prefill_scheduler(scheduler: "Scheduler") -> bool:
+    spec_algorithm = getattr(scheduler, "spec_algorithm", None)
+    return (
+        getattr(scheduler, "disaggregation_mode", None) == DisaggregationMode.PREFILL
+        and spec_algorithm is not None
+        and spec_algorithm.is_dspark()
+    )
+
+
 def maybe_release_metadata_buffer(
     req: Req,
     allocator: ReqToMetadataIdxAllocator,
@@ -642,7 +651,7 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
-                if getattr(self.metadata_buffers, "dspark_hidden_pool", None) is not None:
+                if _is_dspark_pd_prefill_scheduler(self.scheduler):
                     continue
                 if (
                     req.prefill_attempt_count
@@ -656,7 +665,10 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
-                if should_force_retry(req):  # skip checking for testing
+                if (
+                    should_force_retry(req)
+                    and not _is_dspark_pd_prefill_scheduler(self.scheduler)
+                ):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
@@ -729,7 +741,10 @@ class SchedulerDisaggregationPrefillMixin:
             elif (
                 poll == KVPoll.WaitingForInput
                 and req.pending_bootstrap
-                and not should_force_retry(req)
+                and (
+                    not should_force_retry(req)
+                    or _is_dspark_pd_prefill_scheduler(self)
+                )
             ):
                 # Optimistic requests reserved a metadata buffer when popped, so
                 # finalize cannot fail here; if it ever does, the request stays
@@ -895,6 +910,11 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         def trim_hidden_window_for_prefill_cache(req: Req) -> None:
+            if _is_dspark_pd_prefill_scheduler(self):
+                # Keep DSpark hidden metadata decode-owned. Mutating
+                # hidden_start/hidden_len on the prefill side can desynchronize
+                # PP ranks and the transfer worker under main's prefill flow.
+                return
             meta = getattr(req, "dspark_hidden_meta", None)
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not meta or not src_indices:
@@ -1075,7 +1095,9 @@ class SchedulerDisaggregationPrefillMixin:
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
-            if req.pending_bootstrap and has_final_pp_output(req)
+            if req.pending_bootstrap
+            and has_final_pp_output(req)
+            and not _is_dspark_pd_prefill_scheduler(self)
         ]
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1129,7 +1151,11 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_finished_time()
 
                 # Test hook: exercise the release/requeue retry path.
-                if req.pending_bootstrap and should_force_retry(req):
+                if (
+                    req.pending_bootstrap
+                    and should_force_retry(req)
+                    and not _is_dspark_pd_prefill_scheduler(self)
+                ):
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     continue
@@ -1204,7 +1230,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
-                if req.pending_bootstrap and not still_chunking:
+                if (
+                    req.pending_bootstrap
+                    and not still_chunking
+                    and not _is_dspark_pd_prefill_scheduler(self)
+                ):
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -1486,6 +1516,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
+                elif _is_dspark_pd_prefill_scheduler(self):
+                    self.chunked_req = None
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
@@ -1521,6 +1553,7 @@ class SchedulerDisaggregationPrefillMixin:
             not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
             or self.enable_staging
             or req.pending_bootstrap
+            or _is_dspark_pd_prefill_scheduler(self)
             or self.tree_cache.supports_swa()
         ):
             return
