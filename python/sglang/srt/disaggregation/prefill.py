@@ -366,6 +366,14 @@ class PrefillBootstrapQueue:
                 else ([] if pp_slices else dspark_meta.get("dst_indices", []))
             )
         ]
+        local_dynamic_dst = (
+            (local_pp_slice.get("dynamic_dst") or {}) if local_pp_slice else {}
+        )
+        if local_dynamic_dst and int(local_dynamic_dst.get("row_count", 0)) == hidden_len:
+            # Dynamic DSpark hidden buffers are addressed by row offset. The
+            # serialized dst_state_indices may carry chunk-level placeholders;
+            # transfer code expands dynamic_dst.row_count to row offsets.
+            dst_indices = list(range(hidden_len))
         local_layer_ids = (
             [int(x) for x in local_pp_slice.get("layer_ids", [])]
             if local_pp_slice
@@ -390,18 +398,19 @@ class PrefillBootstrapQueue:
         local_transfer_dynamic_rows = []
         transfer_infos = getattr(self.kv_manager, "transfer_infos", {})
         for info in transfer_infos.get(req.bootstrap_room, {}).values():
-            if dspark_state_idx is not None:
-                dst_state_indices = getattr(info, "dst_state_indices", []) or []
-                if dspark_state_idx < len(dst_state_indices):
-                    local_transfer_dst_lengths.append(
-                        len(dst_state_indices[dspark_state_idx] or [])
-                    )
             pp_slice = (getattr(info, "spec_metadata", None) or {}).get("pp_slice") or {}
             dynamic_dst = pp_slice.get("dynamic_dst") or {}
             if dynamic_dst:
                 local_transfer_dynamic_rows.append(
                     int(dynamic_dst.get("row_count", 0))
                 )
+                continue
+            if dspark_state_idx is not None:
+                dst_state_indices = getattr(info, "dst_state_indices", []) or []
+                if dspark_state_idx < len(dst_state_indices):
+                    local_transfer_dst_lengths.append(
+                        len(dst_state_indices[dspark_state_idx] or [])
+                    )
 
         if not local_layer_ids:
             if any(length > 0 for length in local_transfer_dst_lengths) or any(
@@ -423,9 +432,18 @@ class PrefillBootstrapQueue:
             req.dspark_hidden_written = []
             return True
 
-        if (
-            any(length != hidden_len for length in local_transfer_dst_lengths)
-            or any(row_count != hidden_len for row_count in local_transfer_dynamic_rows)
+        invalid_dynamic_rows = [
+            row_count
+            for row_count in local_transfer_dynamic_rows
+            if row_count != hidden_len
+        ]
+        invalid_plain_dst_lengths = [
+            length
+            for length in local_transfer_dst_lengths
+            if length != hidden_len
+        ]
+        if invalid_dynamic_rows or (
+            not local_transfer_dynamic_rows and invalid_plain_dst_lengths
         ):
             message = (
                 "Invalid DSpark rank-local hidden metadata: local transfer dst "
