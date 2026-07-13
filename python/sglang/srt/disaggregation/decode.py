@@ -1600,20 +1600,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     continue
                 if dspark_hidden_dst_indices_by_pp is None:
                     continue
-                if dspark_hidden_dst_indices_by_pp:
-                    dspark_hidden_pp_slices = pp_slices
-                    if pp_size == 1:
-                        dspark_hidden_dst_indices = (
-                            dspark_hidden_dst_indices_by_pp.get(0)
-                        )
-                else:
-                    # This decode PP rank does not own any DSpark target layer.
-                    # Do not send empty DSpark metadata to prefill; normal KV
-                    # transfer is still required.
-                    dspark_hidden_dst_indices_by_pp = None
-                    dspark_hidden_dynamic_buffers_by_pp = None
-                    dspark_hidden_dynamic_cache_entries_by_pp = None
-                    dspark_hidden_dynamic_register_handles = None
+                dspark_hidden_pp_slices = pp_slices
+                if pp_size == 1:
+                    dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,

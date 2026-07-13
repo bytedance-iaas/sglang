@@ -32,10 +32,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import (
-    DSparkHiddenTransferPlan,
-    DisaggregationMode,
-)
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -2050,8 +2047,6 @@ class NixlKVManager(CommonKVManager):
                 dynamic_dst = None
                 dst_mem_kind_for_state = "VRAM"
                 if st == StateType.DSPARK_HIDDEN:
-                    if len(src_indices) == 0:
-                        continue
                     dynamic_dst = (
                         (req.spec_metadata or {})
                         .get("pp_slice", {})
@@ -2059,17 +2054,6 @@ class NixlKVManager(CommonKVManager):
                     )
                     if dynamic_dst:
                         row_count = int(dynamic_dst.get("row_count", 0))
-                        src_row_count = len(src_indices)
-                        if src_row_count == 0:
-                            continue
-                        if src_row_count < row_count:
-                            dynamic_dst = DSparkHiddenTransferPlan.trim_dynamic_dst(
-                                dynamic_dst,
-                                offset=row_count - src_row_count,
-                                new_row_count=src_row_count,
-                                old_row_count=row_count,
-                            )
-                            row_count = src_row_count
                         dst_ptrs = [int(dynamic_dst["ptr"])]
                         src_lens = [int(dynamic_dst["item_len"])]
                         dst_indices = list(range(row_count))
@@ -2626,36 +2610,26 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             local_state_indices = state_indices
             local_spec_metadata = spec_metadata
-            if spec_metadata and spec_metadata.get("dspark_hidden"):
+            if spec_metadata and spec_metadata.get("pp_slices"):
+                pp_rank = int(
+                    bootstrap_info.get(
+                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
+                    )
+                )
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_spec_metadata = {
+                    **spec_metadata,
+                    "target_pp_rank": int(pp_rank),
+                    "pp_slice": pp_slice,
+                }
                 local_state_indices = list(
                     state_indices
                     if state_indices is not None
                     else [None] * len(self.kv_mgr.kv_args.state_types)
                 )
-                pp_slice = None
-                if spec_metadata.get("pp_slices"):
-                    pp_rank = int(
-                        bootstrap_info.get(
-                            "target_pp_rank", bootstrap_info.get("pp_rank", 0)
-                        )
-                    )
-                    pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
-                    local_spec_metadata = (
-                        {
-                            **spec_metadata,
-                            "target_pp_rank": int(pp_rank),
-                            "pp_slice": pp_slice,
-                        }
-                        if pp_slice
-                        else None
-                    )
-                else:
-                    local_spec_metadata = None
                 for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
                     if state_type == StateType.DSPARK_HIDDEN:
-                        local_state_indices[idx] = (
-                            pp_slice.get("dst_indices", []) if pp_slice else []
-                        )
+                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
                         break
             packed_state_indices = (
                 pack_int_lists(

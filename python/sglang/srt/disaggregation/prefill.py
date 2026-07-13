@@ -811,7 +811,7 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
-        def trim_hidden_window_to_forward_start(req: Req, forward_start: int) -> None:
+        def trim_hidden_window_for_prefill_cache(req: Req) -> None:
             meta = getattr(req, "dspark_hidden_meta", None)
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not meta or not src_indices:
@@ -820,7 +820,8 @@ class SchedulerDisaggregationPrefillMixin:
             hidden_start = int(meta.get("hidden_start", 0))
             hidden_len = int(meta.get("hidden_len", len(src_indices)))
             hidden_end = hidden_start + hidden_len
-            new_hidden_start = min(max(hidden_start, int(forward_start)), hidden_end)
+            cached_prefix_len = int(len(req.prefix_indices))
+            new_hidden_start = min(max(hidden_start, cached_prefix_len), hidden_end)
             if new_hidden_start == hidden_start:
                 return
 
@@ -860,33 +861,20 @@ class SchedulerDisaggregationPrefillMixin:
             req.dspark_hidden_meta = new_meta
             req.dspark_hidden_dst_indices = [int(x) for x in range(new_hidden_len)]
 
-            kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-            state_types = getattr(kv_mgr.kv_args, "state_types", [])
-            dspark_state_idx = next(
-                (
-                    idx
-                    for idx, state_type in enumerate(state_types)
-                    if state_type == StateType.DSPARK_HIDDEN
-                ),
-                None,
+            transfer_infos = getattr(
+                self.disagg_prefill_bootstrap_queue.kv_manager,
+                "transfer_infos",
+                {},
             )
-            new_dst_indices = [int(x) for x in range(new_hidden_len)]
-            transfer_infos = getattr(kv_mgr, "transfer_infos", {})
             for info in transfer_infos.get(req.bootstrap_room, {}).values():
                 if getattr(info, "spec_metadata", None):
                     info.spec_metadata = dict(new_meta)
-                if dspark_state_idx is not None:
-                    while len(info.dst_state_indices) <= dspark_state_idx:
-                        info.dst_state_indices.append([])
-                    info.dst_state_indices[dspark_state_idx] = list(new_dst_indices)
-            if req.bootstrap_room in getattr(kv_mgr, "req_to_dspark_hidden_meta", {}):
-                kv_mgr.req_to_dspark_hidden_meta[req.bootstrap_room] = dict(new_meta)
 
-            logger.debug(
-                "Adjusted DSpark PD hidden window to prefill forward start: rid=%s, "
-                "forward_start=%s, hidden_start=%s->%s, hidden_len=%s->%s",
+            logger.info(
+                "Adjusted DSpark PD hidden window for prefill cache: rid=%s, "
+                "cached_prefix_len=%s, hidden_start=%s->%s, hidden_len=%s->%s",
                 req.rid,
-                forward_start,
+                cached_prefix_len,
                 hidden_start,
                 new_hidden_start,
                 hidden_len,
@@ -902,19 +890,16 @@ class SchedulerDisaggregationPrefillMixin:
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not src_indices:
                 continue
+            trim_hidden_window_for_prefill_cache(req)
+            src_indices = getattr(req, "dspark_hidden_src_indices", None)
+            if not src_indices:
+                continue
 
             meta = getattr(req, "dspark_hidden_meta", None) or {}
             hidden_start = int(meta.get("hidden_start", 0))
             hidden_len = int(meta.get("hidden_len", len(src_indices)))
             chunk_end = int(req.extend_range.end)
             chunk_start = chunk_end - extend_len
-            trim_hidden_window_to_forward_start(req, chunk_start)
-            src_indices = getattr(req, "dspark_hidden_src_indices", None)
-            if not src_indices:
-                continue
-            meta = getattr(req, "dspark_hidden_meta", None) or {}
-            hidden_start = int(meta.get("hidden_start", 0))
-            hidden_len = int(meta.get("hidden_len", len(src_indices)))
             write_start = max(chunk_start, hidden_start)
             write_end = min(chunk_end, hidden_start + hidden_len)
             if write_end <= write_start:
@@ -1065,17 +1050,6 @@ class SchedulerDisaggregationPrefillMixin:
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     continue
-
-                if req.pending_bootstrap and i in optimistic_polls:
-                    poll = optimistic_polls[i]
-                    if poll == KVPoll.Failed:
-                        self.handle_bootstrap_failure(req)
-                        advance_logprob_pt(i, req)
-                        continue
-                    if poll == KVPoll.WaitingForInput:
-                        assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(
-                            req
-                        )
 
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
@@ -1464,7 +1438,6 @@ class SchedulerDisaggregationPrefillMixin:
             not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
             or self.enable_staging
             or req.pending_bootstrap
-            or self.tree_cache.supports_swa()
         ):
             return
 
@@ -1473,16 +1446,7 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
-        kv_indices = req.prefix_indices[req.start_send_idx : cached_end].cpu().numpy()
-        page_indices = kv_to_page_indices(
-            kv_indices, self.token_to_kv_pool_allocator.page_size
-        )
-        if not req.disagg_kv_sender.should_send_kv_chunk(
-            len(page_indices), last_chunk=False
-        ):
-            return
-        req.disagg_kv_sender.send(page_indices, state_indices=None)
-        req.start_send_idx = cached_end
+        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
         self: Scheduler,
