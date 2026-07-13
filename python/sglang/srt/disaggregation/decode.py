@@ -1362,8 +1362,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_dynamic_buffers_by_pp = None
             dspark_hidden_dynamic_cache_entries_by_pp = None
             dspark_hidden_dynamic_register_handles = None
-            dspark_hidden_start = total_prefix_len
-            dspark_hidden_len = origin_input_len - total_prefix_len
+            dspark_prompt_len = len(decode_req.req.origin_input_ids)
+            dspark_hidden_start = min(total_prefix_len, dspark_prompt_len)
+            dspark_hidden_len = dspark_prompt_len - dspark_hidden_start
             dspark_prefix_key = None
             state_types = self.kv_manager.kv_args.state_types
             if self.scheduler.spec_algorithm.is_dspark() and (
@@ -2688,7 +2689,40 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                if getattr(decode_req, "dspark_hidden_dst_indices_by_pp", None):
+                    logger.debug(
+                        "DSpark PD decode transfer pending: poll=%s, rid=%s, "
+                        "hidden_start=%s, hidden_len=%s, is_rebootstrap=%s, "
+                        "pd_rebootstrap_in_progress=%s, time_in_transfer=%.3fs",
+                        getattr(poll, "name", str(poll)),
+                        decode_req.req.rid,
+                        int(getattr(decode_req, "dspark_hidden_start", 0)),
+                        len(
+                            next(
+                                iter(
+                                    getattr(
+                                        decode_req,
+                                        "dspark_hidden_dst_indices_by_pp",
+                                        {},
+                                    ).values()
+                                ),
+                                [],
+                            )
+                        ),
+                        bool(getattr(decode_req, "is_rebootstrap", False)),
+                        bool(
+                            getattr(
+                                decode_req.req,
+                                "pd_rebootstrap_in_progress",
+                                False,
+                            )
+                        ),
+                        max(
+                            0.0,
+                            time.time()
+                            - decode_req.req.time_stats.decode_transfer_queue_entry_time,
+                        ),
+                    )
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
