@@ -1221,7 +1221,9 @@ class Req(ReqDllmMixin):
                     cow_mamba=cow_mamba,
                 )
             )
-            if envs.SGLANG_RADIX_FORCE_MISS.get():
+            if envs.SGLANG_RADIX_FORCE_MISS.get() or getattr(
+                self, "force_radix_miss_for_dspark_pd_prefill", False
+            ):
                 match_result = zero_match_result(tree_cache, match_result)
             (
                 self.prefix_indices,
@@ -2845,6 +2847,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        old_bs = len(self.reqs)
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2858,9 +2861,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests. Stale tensors are left as-is: is_empty()
-            # keys off reqs, so callers drop the batch before a forward reads them.
+            # Filter out all requests. Drop token inputs as well so stale
+            # extend tensors cannot be reused accidentally.
             self.reqs = []
+            self.input_ids = None
+            self.prefill_input_ids_cpu = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2889,7 +2894,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
+            if self.input_ids.shape[0] == old_bs:
+                self.input_ids = self.input_ids[keep_indices_device]
+            else:
+                # Extend batches keep flattened token ids; request-level filtering
+                # cannot index them safely.
+                self.input_ids = None
+        if self.prefill_input_ids_cpu is not None:
+            self.prefill_input_ids_cpu = None
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]

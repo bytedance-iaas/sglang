@@ -42,6 +42,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -2409,6 +2410,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        self._maybe_force_dspark_pd_prefill_radix_miss(req)
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
@@ -2432,6 +2434,24 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+
+    def _is_dspark_pd_prefill_enabled(self) -> bool:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return False
+        if self.spec_algorithm.is_dspark():
+            return True
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        kv_manager = getattr(bootstrap_queue, "kv_manager", None)
+        kv_args = getattr(kv_manager, "kv_args", None)
+        return StateType.DSPARK_HIDDEN in (getattr(kv_args, "state_types", []) or [])
+
+    def _maybe_force_dspark_pd_prefill_radix_miss(self, req: Req):
+        if self._is_dspark_pd_prefill_enabled():
+            # Decode owns the DSpark hidden transfer window. Unless decode radix
+            # cache explicitly promises a prefix via decode_prefix_len, prefill
+            # must recompute the full target hidden rows instead of reusing its
+            # local prefix cache.
+            req.force_radix_miss_for_dspark_pd_prefill = True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3026,6 +3046,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            self._maybe_force_dspark_pd_prefill_radix_miss(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

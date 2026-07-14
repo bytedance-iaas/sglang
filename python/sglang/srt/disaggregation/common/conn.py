@@ -173,7 +173,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
-        self._socket_lock = threading.Lock()
+        self._socket_lock = threading.RLock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -965,6 +965,7 @@ class CommonKVSender(BaseKVSender):
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.conclude_state: Optional[KVPoll] = None
+        self.pp_rank = pp_rank
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
@@ -1052,6 +1053,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
         """Common pre-processing for send(): index tracking and CP-rank handling.
 
@@ -1061,7 +1063,10 @@ class CommonKVSender(BaseKVSender):
         """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last_chunk = self.curr_idx == self.num_kv_indices
+        inferred_last_chunk = self.curr_idx == self.num_kv_indices
+        is_last_chunk = (
+            inferred_last_chunk if is_last_chunk is None else bool(is_last_chunk)
+        )
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
@@ -1086,8 +1091,10 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
-    ):
-        pass
+        state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
+    ) -> bool:
+        return False
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
@@ -1107,6 +1114,33 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
+
+    def current_status(self) -> Optional[KVPoll]:
+        if self.bootstrap_room not in self.kv_mgr.request_status:
+            return None
+        return self.kv_mgr.check_status(self.bootstrap_room)
+
+    def has_transfer_infos(self) -> Optional[bool]:
+        transfer_infos = getattr(self.kv_mgr, "transfer_infos", None)
+        if transfer_infos is None:
+            return None
+        return self.bootstrap_room in transfer_infos
+
+    def transfer_infos_progress(self) -> Optional[str]:
+        transfer_infos = getattr(self.kv_mgr, "transfer_infos", None)
+        if transfer_infos is None or self.bootstrap_room not in transfer_infos:
+            return None
+        infos = transfer_infos[self.bootstrap_room]
+        required = None
+        if infos:
+            required = next(iter(infos.values())).required_dst_info_num
+        return f"{len(infos)}/{required}"
+
+    def mark_failed(self, reason: str) -> None:
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if hasattr(self, "conclude_state"):
+            self.conclude_state = KVPoll.Failed
 
     def poll(self) -> KVPoll:
         pass

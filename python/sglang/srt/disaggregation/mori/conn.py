@@ -1415,12 +1415,14 @@ class MoriKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
-    ):
+        state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
+    ) -> bool:
         kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
+            self._prepare_send_indices(kv_indices, state_indices, is_last_chunk)
         )
         if should_skip:
-            return
+            return False
 
         normalized_state = (
             _normalize_state_indices_per_component(state_indices)
@@ -1439,6 +1441,7 @@ class MoriKVSender(CommonKVSender):
             )
         )
         self._maybe_finalize_if_room_failed()
+        return True
 
     def _maybe_finalize_if_room_failed(self) -> None:
         if self.conclude_state is not None:

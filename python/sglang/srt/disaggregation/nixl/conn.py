@@ -1144,25 +1144,25 @@ class NixlKVManager(CommonKVManager):
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
 
-                    if kv_chunk.is_last_chunk:
-                        dst_info = self.decode_kv_args_table[req.agent_name]
-                        if kv_chunk.state_indices:
-                            state_xfer_handles = self.maybe_send_extra(
-                                req.agent_name,
-                                kv_chunk.state_indices,
-                                dst_info.dst_state_data_ptrs,
-                                req.dst_state_indices,
-                                dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
-                                decode_tp_size,
-                                decode_tp_rank=dst_info.decode_tp_rank,
-                                dst_state_item_lens=dst_info.dst_state_item_lens,
-                                dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
-                            )
-                            handles.extend(
-                                h for h in state_xfer_handles if h is not None
-                            )
+                    if kv_chunk.state_indices:
+                        state_xfer_handles = self.maybe_send_extra(
+                            req.agent_name,
+                            kv_chunk.state_indices,
+                            dst_info.dst_state_data_ptrs,
+                            req.dst_state_indices,
+                            dst_info.gpu_id,
+                            f"{req.room}_state_{self.kv_args.engine_rank}",
+                            decode_tp_size,
+                            decode_tp_rank=dst_info.decode_tp_rank,
+                            dst_state_item_lens=dst_info.dst_state_item_lens,
+                            dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                            spec_metadata=req.spec_metadata,
+                            state_metadata=kv_chunk.state_metadata,
+                            rid=req.room,
+                        )
+                        handles.extend(h for h in state_xfer_handles if h is not None)
 
+                    if kv_chunk.is_last_chunk:
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
                         # When no KV pages were sent (decode-side cache hit),
@@ -1171,6 +1171,7 @@ class NixlKVManager(CommonKVManager):
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             aux_notif = (
                                 f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
+                                f"_{kv_chunk.chunk_id}"
                             )
                         else:
                             aux_notif = f"{req.room}_aux"
@@ -1968,6 +1969,9 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int = 0,
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
+        spec_metadata: Optional[dict] = None,
+        state_metadata: Optional[dict] = None,
+        rid: Optional[int] = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2047,11 +2051,13 @@ class NixlKVManager(CommonKVManager):
                 dynamic_dst = None
                 dst_mem_kind_for_state = "VRAM"
                 if st == StateType.DSPARK_HIDDEN:
-                    dynamic_dst = (
-                        (req.spec_metadata or {})
-                        .get("pp_slice", {})
-                        .get("dynamic_dst")
-                    )
+                    pp_slice = (spec_metadata or {}).get("pp_slice") or {}
+                    if not pp_slice or not pp_slice.get("layer_ids"):
+                        # This prefill PP rank has no local DSpark target
+                        # layers. Ignore non-row placeholders that may remain
+                        # in dst_state_indices for other ranks.
+                        continue
+                    dynamic_dst = pp_slice.get("dynamic_dst")
                     if dynamic_dst:
                         row_count = int(dynamic_dst.get("row_count", 0))
                         dst_ptrs = [int(dynamic_dst["ptr"])]
@@ -2067,42 +2073,66 @@ class NixlKVManager(CommonKVManager):
                     row_chunks = dynamic_dst.get("row_chunks") or [
                         {"row_start": 0, "row_len": len(src_indices)}
                     ]
-                    for row_chunk in row_chunks:
-                        row_start = int(row_chunk.get("row_start", 0))
-                        row_len = int(row_chunk.get("row_len", 0))
-                        if row_len <= 0:
+                    row_ranges = None
+                    if state_metadata:
+                        row_ranges = state_metadata.get("dspark_hidden_row_ranges")
+                    if not row_ranges:
+                        row_ranges = [{"row_start": 0, "row_len": len(src_indices)}]
+                    item_len = int(dynamic_dst.get("item_len", src_lens[0]))
+                    for row_range in row_ranges:
+                        send_start = int(row_range.get("row_start", 0))
+                        send_len = int(row_range.get("row_len", 0))
+                        if send_len <= 0:
                             continue
-                        row_end = row_start + row_len
-                        if row_start < 0 or row_end > len(src_indices):
+                        send_end = send_start + send_len
+                        if send_start < 0 or send_end > len(src_indices):
                             raise RuntimeError(
-                                "Invalid DSpark hidden row chunk: "
-                                f"rid={req.rid}, row_start={row_start}, "
-                                f"row_len={row_len}, row_count={len(src_indices)}"
+                                "Invalid DSpark hidden send range: "
+                                f"rid={rid}, row_start={send_start}, "
+                                f"row_len={send_len}, row_count={len(src_indices)}"
                             )
-                        if "ptr" in row_chunk:
-                            chunk_dst_ptrs = [int(row_chunk["ptr"])]
-                            chunk_dst_indices = list(range(row_len))
-                        else:
-                            chunk_dst_ptrs = dst_ptrs
-                            chunk_dst_indices = dst_indices[row_start:row_end]
-                        h = self._send_kvcache_generic(
-                            peer_name=peer_name,
-                            src_data_ptrs=src_ptrs,
-                            dst_data_ptrs=chunk_dst_ptrs,
-                            item_lens=src_lens,
-                            prefill_data_indices=np.array(
-                                src_indices[row_start:row_end], dtype=np.int32
-                            ),
-                            dst_data_indices=np.array(
-                                chunk_dst_indices, dtype=np.int32
-                            ),
-                            dst_gpu_id=dst_gpu_id,
-                            notif=comp_notif,
-                            state_type=st,
-                            dst_mem_kind=dst_mem_kind_for_state,
-                        )
-                        if h is not None:
-                            handles.append(h)
+                        for row_chunk in row_chunks:
+                            chunk_start = int(row_chunk.get("row_start", 0))
+                            chunk_len = int(row_chunk.get("row_len", 0))
+                            chunk_end = chunk_start + chunk_len
+                            row_start = max(send_start, chunk_start)
+                            row_end = min(send_end, chunk_end)
+                            row_len = row_end - row_start
+                            if row_len <= 0:
+                                continue
+                            if row_start < 0 or row_end > len(src_indices):
+                                raise RuntimeError(
+                                    "Invalid DSpark hidden row chunk: "
+                                    f"rid={rid}, row_start={row_start}, "
+                                    f"row_len={row_len}, row_count={len(src_indices)}"
+                                )
+                            if "ptr" in row_chunk:
+                                chunk_dst_ptrs = [
+                                    int(row_chunk["ptr"])
+                                    + int(row_start - chunk_start) * item_len
+                                ]
+                                chunk_dst_indices = list(range(row_len))
+                            else:
+                                chunk_dst_ptrs = dst_ptrs
+                                chunk_dst_indices = dst_indices[row_start:row_end]
+                            h = self._send_kvcache_generic(
+                                peer_name=peer_name,
+                                src_data_ptrs=src_ptrs,
+                                dst_data_ptrs=chunk_dst_ptrs,
+                                item_lens=src_lens,
+                                prefill_data_indices=np.array(
+                                    src_indices[row_start:row_end], dtype=np.int32
+                                ),
+                                dst_data_indices=np.array(
+                                    chunk_dst_indices, dtype=np.int32
+                                ),
+                                dst_gpu_id=dst_gpu_id,
+                                notif=comp_notif,
+                                state_type=st,
+                                dst_mem_kind=dst_mem_kind_for_state,
+                            )
+                            if h is not None:
+                                handles.append(h)
                     continue
                 h = self._send_kvcache_generic(
                     peer_name=peer_name,
@@ -2161,6 +2191,7 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        state_metadata: Optional[dict] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2188,6 +2219,7 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                state_metadata=state_metadata,
             )
         )
         return None
@@ -2257,15 +2289,17 @@ class NixlKVManager(CommonKVManager):
 
         Notification tag layouts:
           aux:         {room}_aux                              -> 2 fields
-          aux (nokv):  {room}_aux_nokv_{pp_rank}               -> 4 fields
+          aux (nokv):  {room}_aux_nokv_{pp_rank}_{expected}    -> 5 fields
                        (decode-side radix cache hit; this pp_rank sent
-                       no KV pages, so expected_kvs_per_pp[pp_rank] = 0)
+                       no KV pages in the last chunk, so expected_kvs_per_pp
+                       is carried explicitly)
         """
         self.transfer_statuses[room].received_aux = True
         # main's "nokv" marker (decode-side radix cache hit, see #19746).
         if len(components) > 3 and components[2] == "nokv":
             pp_rank = int(components[3])
-            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
+            expected = int(components[4]) if len(components) > 4 else 0
+            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = expected
         if self.transfer_statuses[room].num_pp_ranks_expected is None:
             self.transfer_statuses[room].num_pp_ranks_expected = (
                 self.required_prefill_response_num_table.get(room, 1)
@@ -2485,15 +2519,17 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
-    ):
+        state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
+    ) -> bool:
         if self._send_failed:
-            return
+            return False
 
         kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
+            self._prepare_send_indices(kv_indices, state_indices, is_last_chunk)
         )
         if should_skip:
-            return
+            return False
 
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None
@@ -2508,11 +2544,14 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            state_metadata,
         )
         self._record_transfer_indices(kv_indices, state_indices)
-        self.chunk_id += 1
+        if len(kv_indices) > 0:
+            self.chunk_id += 1
         if is_last_chunk:
             self.has_sent = True
+        return True
 
     def poll(self) -> KVPoll:
         if self._send_failed:
@@ -2610,26 +2649,36 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             local_state_indices = state_indices
             local_spec_metadata = spec_metadata
-            if spec_metadata and spec_metadata.get("pp_slices"):
-                pp_rank = int(
-                    bootstrap_info.get(
-                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
-                    )
-                )
-                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
-                local_spec_metadata = {
-                    **spec_metadata,
-                    "target_pp_rank": int(pp_rank),
-                    "pp_slice": pp_slice,
-                }
+            if spec_metadata and spec_metadata.get("dspark_hidden"):
                 local_state_indices = list(
                     state_indices
                     if state_indices is not None
                     else [None] * len(self.kv_mgr.kv_args.state_types)
                 )
+                pp_slice = None
+                if spec_metadata.get("pp_slices"):
+                    pp_rank = int(
+                        bootstrap_info.get(
+                            "target_pp_rank", bootstrap_info.get("pp_rank", 0)
+                        )
+                    )
+                    pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                    local_spec_metadata = (
+                        {
+                            **spec_metadata,
+                            "target_pp_rank": int(pp_rank),
+                            "pp_slice": pp_slice,
+                        }
+                        if pp_slice
+                        else None
+                    )
+                else:
+                    local_spec_metadata = None
                 for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
                     if state_type == StateType.DSPARK_HIDDEN:
-                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        local_state_indices[idx] = (
+                            pp_slice.get("dst_indices", []) if pp_slice else []
+                        )
                         break
             packed_state_indices = (
                 pack_int_lists(

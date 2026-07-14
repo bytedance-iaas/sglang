@@ -62,7 +62,6 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.distributed.utils import get_pp_indices
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, NextBatchPlan, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -540,6 +539,47 @@ class _DSparkHiddenPagePool:
 
 
 _DSPARK_HIDDEN_PAGE_POOL = _DSparkHiddenPagePool()
+
+
+def _validate_dspark_hidden_row_coverage(
+    row_chunks: List[dict],
+    hidden_offset: int,
+    hidden_len: int,
+    raw_hidden_len: int,
+    rid: str,
+    pp_rank: int,
+) -> None:
+    if hidden_len <= 0:
+        return
+    coverage = bytearray(hidden_len)
+    expected_start = int(hidden_offset)
+    expected_end = expected_start + int(hidden_len)
+    for row_chunk in row_chunks:
+        chunk_start = int(row_chunk.get("row_start", 0))
+        chunk_len = int(row_chunk.get("row_len", 0))
+        chunk_end = chunk_start + chunk_len
+        if chunk_len <= 0:
+            continue
+        if chunk_start < 0 or chunk_end > raw_hidden_len:
+            raise RuntimeError(
+                "Invalid DSpark hidden receive row chunk: "
+                f"rid={rid}, pp_rank={pp_rank}, row_start={chunk_start}, "
+                f"row_len={chunk_len}, row_count={raw_hidden_len}"
+            )
+        overlap_start = max(expected_start, chunk_start)
+        overlap_end = min(expected_end, chunk_end)
+        if overlap_end <= overlap_start:
+            continue
+        coverage[overlap_start - expected_start : overlap_end - expected_start] = (
+            b"\x01" * (overlap_end - overlap_start)
+        )
+    if not all(coverage):
+        missing = [i for i, ok in enumerate(coverage) if not ok][:8]
+        raise RuntimeError(
+            "Incomplete DSpark hidden receive row coverage before assemble: "
+            f"rid={rid}, pp_rank={pp_rank}, hidden_offset={hidden_offset}, "
+            f"hidden_len={hidden_len}, missing_offsets={missing}"
+        )
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1216,7 +1256,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         dspark_active_full_prefix_counts = Counter()
-        dspark_full_prefix_limit = 1
+        dspark_full_prefix_limit = 0
         dspark_active_hidden_transfer_reqs = 0
         dspark_active_hidden_transfer_bytes = 0
         dspark_hidden_transfer_queue_limit = 0
@@ -1228,11 +1268,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             configured_prefix_limit = (
                 envs.SGLANG_DSPARK_PD_FULL_HIDDEN_PREFIX_LIMIT.get()
             )
-            dspark_full_prefix_limit = (
-                configured_prefix_limit
-                if configured_prefix_limit > 0
-                else 1
-            )
+            dspark_full_prefix_limit = configured_prefix_limit
             dspark_hidden_transfer_queue_limit = (
                 envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_LIMIT.get()
             )
@@ -1363,8 +1399,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_dynamic_buffers_by_pp = None
             dspark_hidden_dynamic_cache_entries_by_pp = None
             dspark_hidden_dynamic_register_handles = None
-            dspark_hidden_start = total_prefix_len
-            dspark_hidden_len = origin_input_len - total_prefix_len
+            dspark_prompt_len = len(decode_req.req.origin_input_ids)
+            dspark_hidden_start = min(total_prefix_len, dspark_prompt_len)
+            dspark_hidden_len = dspark_prompt_len - dspark_hidden_start
             dspark_prefix_key = None
             state_types = self.kv_manager.kv_args.state_types
             if self.scheduler.spec_algorithm.is_dspark() and (
@@ -1372,7 +1409,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 dspark_prefix_key = self._dspark_prefix_fingerprint(decode_req.req)
                 if (
-                    total_prefix_len == 0
+                    dspark_full_prefix_limit > 0
+                    and total_prefix_len == 0
                     and dspark_prefix_key is not None
                     and dspark_active_full_prefix_counts[dspark_prefix_key]
                     >= dspark_full_prefix_limit
@@ -1520,8 +1558,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 dspark_hidden_dynamic_buffers_by_pp = {}
                 dspark_hidden_dynamic_cache_entries_by_pp = {}
                 dspark_hidden_dynamic_register_handles = []
-                dspark_dynamic_reused = 0
-                dspark_dynamic_allocated = 0
                 dspark_dynamic_pool_busy = False
                 for pp_rank, pp_slice in pp_slices.items():
                     cur_indices = [int(x) for x in range(dspark_hidden_len)]
@@ -1536,8 +1572,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             chunk_buffers,
                             chunk_entries,
                             chunk_handles,
-                            reused,
-                            allocated,
+                            _,
+                            _,
                         ) = _DSPARK_HIDDEN_PAGE_POOL.acquire_pages_for_plan(
                             self.kv_manager,
                             int(pp_rank),
@@ -1578,8 +1614,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         dspark_dynamic_pool_busy = True
                         dspark_hidden_dst_indices_by_pp = None
                         break
-                    dspark_dynamic_reused += reused
-                    dspark_dynamic_allocated += allocated
                     dspark_hidden_dynamic_register_handles.extend(chunk_handles)
                     dspark_hidden_dynamic_cache_entries_by_pp[pp_rank] = chunk_entries
                     dspark_hidden_dynamic_buffers_by_pp[pp_rank] = chunk_buffers
@@ -1605,27 +1639,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if dspark_hidden_dst_indices_by_pp is None:
                     continue
                 dspark_hidden_pp_slices = pp_slices
-                logger.info(
-                    "Prepared DSpark PD dynamic hidden receive buffers: rid=%s, "
-                    "target_layer_ids=%s, hidden_len=%s, reused=%s, allocated=%s, "
-                    "pp_slices=%s",
-                    decode_req.req.rid,
-                    target_layer_ids,
-                    dspark_hidden_len,
-                    dspark_dynamic_reused,
-                    dspark_dynamic_allocated,
-                    {
-                        int(pp_rank): {
-                            "layer_ids": pp_slice.get("layer_ids", []),
-                            "slice_start": pp_slice.get("slice_start", 0),
-                            "slice_len": pp_slice.get("slice_len", 0),
-                            "dynamic_nbytes": pp_slice.get("dynamic_dst", {}).get(
-                                "nbytes", 0
-                            ),
-                        }
-                        for pp_rank, pp_slice in pp_slices.items()
-                    },
-                )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
@@ -2493,6 +2506,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                                 (pp_slice.get("dynamic_dst") or {}).get("row_chunks")
                                 or []
                             )
+                            if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
+                                _validate_dspark_hidden_row_coverage(
+                                    row_chunks,
+                                    hidden_offset,
+                                    hidden_len,
+                                    raw_hidden_len,
+                                    decode_req.req.rid,
+                                    int(pp_rank),
+                                )
                             slice_hidden = _DSPARK_HIDDEN_PAGE_POOL.assemble_pages(
                                 row_chunks,
                                 dynamic_buffer_or_chunks,
@@ -2511,7 +2533,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
                         )[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
-                if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+                if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
                     logger.info(
                         "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
                         {
@@ -2703,7 +2725,40 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                if getattr(decode_req, "dspark_hidden_dst_indices_by_pp", None):
+                    logger.debug(
+                        "DSpark PD decode transfer pending: poll=%s, rid=%s, "
+                        "hidden_start=%s, hidden_len=%s, is_rebootstrap=%s, "
+                        "pd_rebootstrap_in_progress=%s, time_in_transfer=%.3fs",
+                        getattr(poll, "name", str(poll)),
+                        decode_req.req.rid,
+                        int(getattr(decode_req, "dspark_hidden_start", 0)),
+                        len(
+                            next(
+                                iter(
+                                    getattr(
+                                        decode_req,
+                                        "dspark_hidden_dst_indices_by_pp",
+                                        {},
+                                    ).values()
+                                ),
+                                [],
+                            )
+                        ),
+                        bool(getattr(decode_req, "is_rebootstrap", False)),
+                        bool(
+                            getattr(
+                                decode_req.req,
+                                "pd_rebootstrap_in_progress",
+                                False,
+                            )
+                        ),
+                        max(
+                            0.0,
+                            time.time()
+                            - decode_req.req.time_stats.decode_transfer_queue_entry_time,
+                        ),
+                    )
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 

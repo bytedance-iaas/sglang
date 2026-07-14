@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import get_attn_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -400,7 +400,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _draft_context(self):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
-                stack.enter_context(draft_tp_context(get_attention_tp_group()))
+                stack.enter_context(draft_tp_context(get_attn_tp_group()))
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
             yield
@@ -539,7 +539,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+        if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
             logger.info(
                 "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
                 {
@@ -669,7 +669,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
-        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+        if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
             logger.info(
                 "DSPARK_VERIFY_WINDOW_SUMMARY=%s",
                 {
@@ -769,7 +769,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
-        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+        if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
             logger.info(
                 "DSPARK_TARGET_VERIFY_LOGITS_SUMMARY=%s",
                 {
@@ -958,7 +958,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ]
         valid_cache_locs = cache_loc_2d.reshape(-1)[flat_mask]
         target_hidden = tail_hidden.reshape(bs * tail_len, -1)[flat_mask]
-        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+        if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
             logger.info(
                 "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
                 {

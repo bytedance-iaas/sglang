@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -90,6 +91,18 @@ def should_force_retry(req: Req) -> bool:
 def _pp_stable_rid_hash(rid: str) -> int:
     digest = hashlib.blake2b(str(rid).encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+
+
+def _is_dspark_pd_prefill_scheduler(scheduler: "Scheduler") -> bool:
+    spec_algorithm = getattr(scheduler, "spec_algorithm", None)
+    if getattr(scheduler, "disaggregation_mode", None) != DisaggregationMode.PREFILL:
+        return False
+    if spec_algorithm is not None and spec_algorithm.is_dspark():
+        return True
+    bootstrap_queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+    kv_manager = getattr(bootstrap_queue, "kv_manager", None)
+    kv_args = getattr(kv_manager, "kv_args", None)
+    return StateType.DSPARK_HIDDEN in (getattr(kv_args, "state_types", []) or [])
 
 
 def maybe_release_metadata_buffer(
@@ -341,8 +354,23 @@ class PrefillBootstrapQueue:
 
         hidden_start = int(dspark_meta.get("hidden_start", 0))
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
-        pp_slices = dspark_meta.get("pp_slices") or {}
+        raw_pp_slices = dspark_meta.get("pp_slices") or {}
+        pp_slices = {
+            str(pp_rank): dict(pp_slice)
+            for pp_rank, pp_slice in raw_pp_slices.items()
+        }
         local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        if local_pp_slice and int(local_pp_slice.get("pp_rank", self.pp_rank)) != int(
+            self.pp_rank
+        ):
+            message = (
+                "Invalid DSpark hidden metadata from decode: local pp_slice "
+                f"targets pp_rank={local_pp_slice.get('pp_rank')} but this "
+                f"prefill rank is pp_rank={self.pp_rank}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
         dst_indices = [
             int(x)
             for x in (
@@ -351,6 +379,14 @@ class PrefillBootstrapQueue:
                 else ([] if pp_slices else dspark_meta.get("dst_indices", []))
             )
         ]
+        local_dynamic_dst = (
+            (local_pp_slice.get("dynamic_dst") or {}) if local_pp_slice else {}
+        )
+        if local_dynamic_dst and int(local_dynamic_dst.get("row_count", 0)) == hidden_len:
+            # Dynamic DSpark hidden buffers are addressed by row offset. The
+            # serialized dst_state_indices may carry chunk-level placeholders;
+            # transfer code expands dynamic_dst.row_count to row offsets.
+            dst_indices = list(range(hidden_len))
         local_layer_ids = (
             [int(x) for x in local_pp_slice.get("layer_ids", [])]
             if local_pp_slice
@@ -365,12 +401,74 @@ class PrefillBootstrapQueue:
             if local_pp_slice
             else len(local_layer_ids) * int(self.scheduler.model_config.hidden_size)
         )
+
+        dspark_state_idx = None
+        for idx, state_type in enumerate(self.kv_manager.kv_args.state_types):
+            if state_type == StateType.DSPARK_HIDDEN:
+                dspark_state_idx = idx
+                break
+        local_transfer_dst_lengths = []
+        local_transfer_dynamic_rows = []
+        transfer_infos = getattr(self.kv_manager, "transfer_infos", {})
+        for info in transfer_infos.get(req.bootstrap_room, {}).values():
+            pp_slice = (getattr(info, "spec_metadata", None) or {}).get("pp_slice") or {}
+            dynamic_dst = pp_slice.get("dynamic_dst") or {}
+            if dynamic_dst:
+                local_transfer_dynamic_rows.append(
+                    int(dynamic_dst.get("row_count", 0))
+                )
+                continue
+            if dspark_state_idx is not None:
+                dst_state_indices = getattr(info, "dst_state_indices", []) or []
+                if dspark_state_idx < len(dst_state_indices):
+                    local_transfer_dst_lengths.append(
+                        len(dst_state_indices[dspark_state_idx] or [])
+                    )
+
         if not local_layer_ids:
+            if any(length > 0 for length in local_transfer_dst_lengths) or any(
+                row_count > 0 for row_count in local_transfer_dynamic_rows
+            ):
+                message = (
+                    "Invalid DSpark rank-local hidden metadata: this prefill "
+                    f"pp_rank={self.pp_rank} has no local target layers, but "
+                    "received non-empty hidden dst rows: "
+                    f"dst_lengths={local_transfer_dst_lengths}, "
+                    f"dynamic_rows={local_transfer_dynamic_rows}"
+                )
+                logger.error(message)
+                prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return False
             req.dspark_hidden_meta = dict(dspark_meta)
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
             req.dspark_hidden_written = []
+            req.dspark_hidden_sent = []
+            req.dspark_hidden_pending_row_ranges = []
             return True
+
+        invalid_dynamic_rows = [
+            row_count
+            for row_count in local_transfer_dynamic_rows
+            if row_count != hidden_len
+        ]
+        invalid_plain_dst_lengths = [
+            length
+            for length in local_transfer_dst_lengths
+            if length != hidden_len
+        ]
+        if invalid_dynamic_rows or (
+            not local_transfer_dynamic_rows and invalid_plain_dst_lengths
+        ):
+            message = (
+                "Invalid DSpark rank-local hidden metadata: local transfer dst "
+                f"rows must match hidden_len on pp_rank={self.pp_rank}: "
+                f"hidden_len={hidden_len}, dst_lengths={local_transfer_dst_lengths}, "
+                f"dynamic_rows={local_transfer_dynamic_rows}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
 
         if hidden_len != len(dst_indices):
             message = (
@@ -413,6 +511,8 @@ class PrefillBootstrapQueue:
         req.dspark_hidden_src_indices = src_indices
         req.dspark_hidden_dst_indices = dst_indices
         req.dspark_hidden_written = [False] * hidden_len
+        req.dspark_hidden_sent = [False] * hidden_len
+        req.dspark_hidden_pending_row_ranges = []
         return True
 
     def _configure_dspark_hidden_capture(
@@ -559,7 +659,7 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
-                if getattr(self.metadata_buffers, "dspark_hidden_pool", None) is not None:
+                if _is_dspark_pd_prefill_scheduler(self.scheduler):
                     continue
                 if (
                     req.prefill_attempt_count
@@ -573,7 +673,10 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
-                if should_force_retry(req):  # skip checking for testing
+                if (
+                    should_force_retry(req)
+                    and not _is_dspark_pd_prefill_scheduler(self.scheduler)
+                ):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
@@ -646,7 +749,10 @@ class SchedulerDisaggregationPrefillMixin:
             elif (
                 poll == KVPoll.WaitingForInput
                 and req.pending_bootstrap
-                and not should_force_retry(req)
+                and (
+                    not should_force_retry(req)
+                    or _is_dspark_pd_prefill_scheduler(self)
+                )
             ):
                 # Optimistic requests reserved a metadata buffer when popped, so
                 # finalize cannot fail here; if it ever does, the request stays
@@ -812,6 +918,11 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         def trim_hidden_window_for_prefill_cache(req: Req) -> None:
+            if _is_dspark_pd_prefill_scheduler(self):
+                # Keep DSpark hidden metadata decode-owned. Mutating
+                # hidden_start/hidden_len on the prefill side can desynchronize
+                # PP ranks and the transfer worker under main's prefill flow.
+                return
             meta = getattr(req, "dspark_hidden_meta", None)
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not meta or not src_indices:
@@ -916,6 +1027,14 @@ class SchedulerDisaggregationPrefillMixin:
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
                 written[local_start:local_end] = [True] * (local_end - local_start)
+            pending_ranges = getattr(req, "dspark_hidden_pending_row_ranges", None)
+            if pending_ranges is None:
+                pending_ranges = []
+                req.dspark_hidden_pending_row_ranges = pending_ranges
+            if pending_ranges and int(pending_ranges[-1][1]) == int(local_start):
+                pending_ranges[-1] = (int(pending_ranges[-1][0]), int(local_end))
+            else:
+                pending_ranges.append((int(local_start), int(local_end)))
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -992,7 +1111,9 @@ class SchedulerDisaggregationPrefillMixin:
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
-            if req.pending_bootstrap and has_final_pp_output(req)
+            if req.pending_bootstrap
+            and has_final_pp_output(req)
+            and not _is_dspark_pd_prefill_scheduler(self)
         ]
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1046,7 +1167,11 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_finished_time()
 
                 # Test hook: exercise the release/requeue retry path.
-                if req.pending_bootstrap and should_force_retry(req):
+                if (
+                    req.pending_bootstrap
+                    and should_force_retry(req)
+                    and not _is_dspark_pd_prefill_scheduler(self)
+                ):
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     continue
@@ -1121,7 +1246,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
-                if req.pending_bootstrap and not still_chunking:
+                if (
+                    req.pending_bootstrap
+                    and not still_chunking
+                    and not _is_dspark_pd_prefill_scheduler(self)
+                ):
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -1197,10 +1326,70 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        now = time.monotonic()
+        last_log = getattr(self, "_last_disagg_prefill_inflight_log", 0.0)
+        if now - last_log >= 5.0:
+            inflight_states = []
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+                sender = getattr(req, "disagg_kv_sender", None)
+                inflight_states.append(
+                    {
+                        "rid": req.rid,
+                        "room": getattr(req, "bootstrap_room", None),
+                        "poll": int(poll),
+                        "status": (
+                            sender.current_status()
+                            if sender is not None
+                            and hasattr(sender, "current_status")
+                            else None
+                        ),
+                        "pending_bootstrap": bool(
+                            getattr(req, "pending_bootstrap", False)
+                        ),
+                        "pending_final": bool(
+                            getattr(req, "disagg_final_send_pending", False)
+                        ),
+                        "has_transfer_infos": (
+                            sender.has_transfer_infos()
+                            if sender is not None
+                            and hasattr(sender, "has_transfer_infos")
+                            else None
+                        ),
+                        "transfer_infos": (
+                            sender.transfer_infos_progress()
+                            if sender is not None
+                            and hasattr(sender, "transfer_infos_progress")
+                            else None
+                        ),
+                    }
+                )
+            logger.warning(
+                "Disagg prefill inflight status: pp_rank=%s, "
+                "rids_to_check=%s, states=%s",
+                self.ps.pp_rank,
+                rids_to_check,
+                inflight_states,
+            )
+            self._last_disagg_prefill_inflight_log = now
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            # Retry a deferred final send BEFORE the PP consensus gate below.
+            # A rank whose final chunk was rejected (transient reject in
+            # add_transfer_request) stays non-terminal, so its rid never joins
+            # the PP transferred-ids consensus and never appears in
+            # rids_to_check. Gating the retry behind rids_to_check would then
+            # starve it forever: the final is what makes the rid terminal, so
+            # the retry is a prerequisite for consensus, not a consumer of it.
+            if getattr(req, "disagg_final_send_pending", False) and poll not in (
+                KVPoll.Failed,
+                KVPoll.Success,
+            ):
+                self.send_kv_chunk(req, last_chunk=True)
+                undone_reqs.append(req)
+                continue
+
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1403,6 +1592,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
+                elif _is_dspark_pd_prefill_scheduler(self):
+                    self.chunked_req = None
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
@@ -1438,6 +1629,8 @@ class SchedulerDisaggregationPrefillMixin:
             not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
             or self.enable_staging
             or req.pending_bootstrap
+            or _is_dspark_pd_prefill_scheduler(self)
+            or self.tree_cache.supports_swa()
         ):
             return
 
@@ -1446,7 +1639,19 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+        kv_indices = req.prefix_indices[req.start_send_idx : cached_end].cpu().numpy()
+        page_indices = kv_to_page_indices(
+            kv_indices, self.token_to_kv_pool_allocator.page_size
+        )
+        if not req.disagg_kv_sender.should_send_kv_chunk(
+            len(page_indices), last_chunk=False
+        ):
+            return
+        if not req.disagg_kv_sender.send(
+            page_indices, state_indices=None, is_last_chunk=False
+        ):
+            return
+        req.start_send_idx = cached_end
 
     def send_kv_chunk(
         self: Scheduler,
@@ -1470,21 +1675,42 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
+        empty_final_chunk = False
         if end_idx < start_idx:
-            logger.debug(
-                "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
-                req.rid,
-                start_idx,
-                end_idx,
-            )
-            return
+            if last_chunk:
+                logger.warning(
+                    "Sending empty final disagg prefill chunk to preserve final "
+                    "status: rid=%s, bootstrap_room=%s, start_send_idx=%s, "
+                    "end_idx=%s",
+                    req.rid,
+                    req.bootstrap_room,
+                    start_idx,
+                    end_idx,
+                )
+                end_idx = start_idx
+                empty_final_chunk = True
+            else:
+                logger.debug(
+                    "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
+                    req.rid,
+                    start_idx,
+                    end_idx,
+                )
+                return
+        if end_idx == start_idx:
+            empty_final_chunk = last_chunk
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
+        if empty_final_chunk:
+            kv_indices = np.empty((0,), dtype=np.int32)
+        else:
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+                .cpu()
+                .numpy()
+            )
         state_indices: Optional[List] = None
+        state_metadata: Optional[dict] = None
+
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1593,10 +1819,58 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
+        if (
+            not state_indices
+            and not req.disagg_kv_sender.should_send_kv_chunk(
+                len(page_indices), last_chunk
+            )
+        ):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
-        req.start_send_idx = end_idx
+        send_accepted = req.disagg_kv_sender.send(
+            page_indices,
+            state_indices,
+            state_metadata,
+            is_last_chunk=last_chunk,
+        )
+        if not send_accepted:
+            status = None
+            if hasattr(req.disagg_kv_sender, "current_status"):
+                status = req.disagg_kv_sender.current_status()
+            has_transfer_infos = None
+            if hasattr(req.disagg_kv_sender, "has_transfer_infos"):
+                has_transfer_infos = req.disagg_kv_sender.has_transfer_infos()
+            transfer_infos_progress = None
+            if hasattr(req.disagg_kv_sender, "transfer_infos_progress"):
+                transfer_infos_progress = req.disagg_kv_sender.transfer_infos_progress()
+            logger.warning(
+                "Disagg prefill send was not accepted: rid=%s, "
+                "bootstrap_room=%s, is_last_chunk=%s, status=%s, "
+                "has_transfer_infos=%s, transfer_infos=%s",
+                req.rid,
+                req.bootstrap_room,
+                last_chunk,
+                status,
+                has_transfer_infos,
+                transfer_infos_progress,
+            )
+            if last_chunk:
+                if status == KVPoll.Failed:
+                    req.disagg_final_send_pending = False
+                elif status is None:
+                    reason = (
+                        "Final disagg prefill send was rejected after the "
+                        f"transfer room disappeared: rid={req.rid}, "
+                        f"bootstrap_room={req.bootstrap_room}"
+                    )
+                    if hasattr(req.disagg_kv_sender, "mark_failed"):
+                        req.disagg_kv_sender.mark_failed(reason)
+                    req.disagg_final_send_pending = False
+                else:
+                    req.disagg_final_send_pending = True
+            return
+        if last_chunk:
+            req.disagg_final_send_pending = False
+        req.start_send_idx = max(req.start_send_idx, end_idx)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
@@ -1619,6 +1893,8 @@ class SchedulerDisaggregationPrefillMixin:
             req.dspark_hidden_dst_indices = None
             req.dspark_hidden_meta = None
             req.dspark_hidden_written = None
+            req.dspark_hidden_sent = None
+            req.dspark_hidden_pending_row_ranges = None
             req.dspark_hidden_capture_layer_ids = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
