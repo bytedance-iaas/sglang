@@ -224,6 +224,7 @@ class MooncakeKVManager(CommonKVManager):
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
+            self._last_transfer_info_progress_log: Dict[int, float] = {}
             if self.enable_failed_session_probe:
                 self.failed_session_probe_interval = (
                     envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
@@ -1603,6 +1604,18 @@ class MooncakeKVManager(CommonKVManager):
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                logger.warning(
+                                    "Mooncake prefill final status sync: room=%s, "
+                                    "pp_rank=%s, response_rank=%s, status=%s, "
+                                    "dst_infos=%s/%s, is_dummy=%s",
+                                    req.room,
+                                    self.pp_rank,
+                                    prefill_unique_rank,
+                                    status,
+                                    len(polls),
+                                    req.required_dst_info_num,
+                                    req.is_dummy,
+                                )
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
@@ -1617,6 +1630,13 @@ class MooncakeKVManager(CommonKVManager):
                         # still wait for this prefill rank's final response
                         # when PP fan-in is required.
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
+                            logger.warning(
+                                "Mooncake prefill dummy final status sync: room=%s, "
+                                "pp_rank=%s, response_rank=%s",
+                                req.room,
+                                self.pp_rank,
+                                prefill_unique_rank,
+                            )
                             self.update_status(req.room, KVPoll.Success)
                             self.sync_status_to_decode_endpoint(
                                 req.endpoint,
@@ -1740,8 +1760,23 @@ class MooncakeKVManager(CommonKVManager):
 
                     transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
                     self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    current_dst_info_num = len(self.transfer_infos[room])
+                    if current_dst_info_num < required_dst_info_num:
+                        now = time.monotonic()
+                        last_log = self._last_transfer_info_progress_log.get(room, 0.0)
+                        if now - last_log >= 5.0:
+                            logger.warning(
+                                "Waiting for Mooncake decode metadata on prefill: "
+                                "room=%s, pp_rank=%s, dst_infos=%s/%s",
+                                room,
+                                self.pp_rank,
+                                current_dst_info_num,
+                                required_dst_info_num,
+                            )
+                            self._last_transfer_info_progress_log[room] = now
                     # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                    if current_dst_info_num == required_dst_info_num:
+                        self._last_transfer_info_progress_log.pop(room, None)
                         self.req_to_decode_prefix_len[room] = next(
                             (
                                 info.decode_prefix_len

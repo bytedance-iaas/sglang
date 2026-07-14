@@ -1854,15 +1854,19 @@ class SchedulerDisaggregationPrefillMixin:
             has_transfer_infos = None
             if hasattr(req.disagg_kv_sender, "has_transfer_infos"):
                 has_transfer_infos = req.disagg_kv_sender.has_transfer_infos()
+            transfer_infos_progress = None
+            if hasattr(req.disagg_kv_sender, "transfer_infos_progress"):
+                transfer_infos_progress = req.disagg_kv_sender.transfer_infos_progress()
             logger.warning(
                 "Disagg prefill send was not accepted: rid=%s, "
                 "bootstrap_room=%s, is_last_chunk=%s, status=%s, "
-                "has_transfer_infos=%s",
+                "has_transfer_infos=%s, transfer_infos=%s",
                 req.rid,
                 req.bootstrap_room,
                 last_chunk,
                 status,
                 has_transfer_infos,
+                transfer_infos_progress,
             )
             if last_chunk:
                 if status == KVPoll.Failed:
