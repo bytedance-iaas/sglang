@@ -7,7 +7,6 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler import Scheduler
 
 
 class _HostPool:
@@ -115,34 +114,3 @@ def test_finished_request_releases_target_and_draft_hisparse_state():
     SchedulerBatchResultProcessor._finish_hisparse_request(processor, req)
 
     assert calls == [("target", req), ("draft", req)]
-
-
-def test_speculative_commit_updates_target_and_draft_before_next_decode():
-    calls = []
-    reqs = [object()]
-    target = SimpleNamespace(
-        commit_speculative_tokens=lambda got: calls.append(("target", got))
-    )
-    draft = SimpleNamespace(
-        commit_speculative_tokens=lambda got: calls.append(("draft", got))
-    )
-    scheduler = SimpleNamespace(
-        enable_hisparse=True,
-        iter_hisparse_coordinators=lambda: iter((target, draft)),
-    )
-    batch = SimpleNamespace(
-        spec_algorithm=SimpleNamespace(is_none=lambda: False), reqs=reqs
-    )
-
-    Scheduler.commit_hisparse_speculative_tokens(scheduler, batch)
-
-    assert calls == [("target", reqs), ("draft", reqs)]
-
-
-def test_speculative_commit_is_noop_without_hisparse():
-    scheduler = SimpleNamespace(enable_hisparse=False)
-    batch = SimpleNamespace(
-        spec_algorithm=SimpleNamespace(is_none=lambda: False), reqs=[object()]
-    )
-
-    Scheduler.commit_hisparse_speculative_tokens(scheduler, batch)

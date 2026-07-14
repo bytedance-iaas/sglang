@@ -990,12 +990,6 @@ class Scheduler(
         for coordinator in self.iter_hisparse_coordinators():
             coordinator.request_finished(req)
 
-    def commit_hisparse_speculative_tokens(self, batch: ScheduleBatch) -> None:
-        if not self.enable_hisparse or batch.spec_algorithm.is_none():
-            return
-        for coordinator in self.iter_hisparse_coordinators():
-            coordinator.commit_speculative_tokens(batch.reqs)
-
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
@@ -3187,12 +3181,6 @@ class Scheduler(
 
         if batch.is_empty():
             return batch
-
-        # Speculative verification commits a variable-length run rather than
-        # the single token handled by ScheduleBatch.prepare_for_decode().
-        # Persist that run before preparing the next verify step so sparse
-        # attention never observes a committed token with no host mapping.
-        self.commit_hisparse_speculative_tokens(batch)
 
         # Update batch tensors
         batch.prepare_for_decode()

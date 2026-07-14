@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
@@ -534,6 +535,21 @@ def eagle_prepare_for_verify(
             draft_token_num=verify_input.draft_token_num,
             device=device,
         )
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.prepare_verify_slots_spec_v2(
+                req_pool_indices=batch.req_pool_indices,
+                verify_cache_locs=batch.out_cache_loc,
+                num_tokens_per_req=verify_input.draft_token_num,
+                start_positions_cpu=(
+                    batch.seq_lens_cpu
+                    if batch.seq_lens_cpu is not None
+                    else batch.seq_lens.cpu()
+                ),
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -862,7 +878,36 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # barrier has chained to the prev forward -> host stalls a full forward.
     cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    if page_size == 1:
+    hisparse_coordinator = batch.hisparse_coordinator
+    if (
+        hisparse_coordinator is not None
+        and hisparse_coordinator.supports_hisparse_draft_slots()
+    ):
+        allocator = batch.token_to_kv_pool_allocator
+        evict_from_tree_cache(
+            batch.tree_cache,
+            num_needed_tokens + bs * allocator.page_size,
+        )
+        last_loc = get_last_loc(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            cur_kv_lens_device,
+        )
+        device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+            batch.req_pool_indices,
+            nxt_kv_lens_cpu - cur_kv_lens_cpu,
+            cur_kv_lens_cpu,
+        )
+        out_cache_loc = allocator.alloc_extend_with_device_mapping(
+            cur_kv_lens_device,
+            cur_kv_lens_cpu,
+            nxt_kv_lens_device,
+            nxt_kv_lens_cpu,
+            last_loc,
+            num_needed_tokens,
+            device_slots,
+        )
+    elif page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
     else:
         last_loc = get_last_loc(

@@ -1047,6 +1047,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            # Draft-extend is the last consumer of accepted verify slots. Only
+            # now may their deferred host backup and mapping detach complete.
+            # This runs outside the captured graph; graph replay itself keeps
+            # using coordinator-owned, shape-stable physical slot tensors.
+            hisparse_coordinator.finish_pending_draft_extend_backup()
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
@@ -1670,6 +1681,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens,
                 accept_lens,
                 self.speculative_num_draft_tokens,
+            )
+
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and not batch.forward_mode.is_idle()
+        ):
+            hisparse_coordinator.finalize_accepted_tokens_spec_v2(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                verify_cache_locs=batch.out_cache_loc,
+                accept_index=accept_index,
             )
 
         # Update mamba state for hybrid GDN models after verification

@@ -176,6 +176,64 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical tokens and bind them to coordinator-owned device slots.
+
+        Speculative verification writes into the per-request HiSparse extra page.
+        Those physical slots are owned by ``HiSparseCoordinator`` and must not be
+        allocated or freed by the ordinary logical allocator lifecycle.
+        """
+        available = self.logical_attn_allocator.available_size()
+        if available < extend_num_tokens:
+            raise RuntimeError(
+                "HiSparse logical allocation is exhausted: "
+                f"need={extend_num_tokens}, available={available}"
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        logical_indices = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if logical_indices is None:
+            raise RuntimeError(
+                "HiSparse logical alloc_extend failed for coordinator-owned "
+                f"draft slots: need={extend_num_tokens}"
+            )
+        if logical_indices.numel() != device_slots.numel():
+            if logical_state is not None:
+                self.logical_attn_allocator.restore_state(logical_state)
+            raise RuntimeError(
+                "HiSparse draft-slot mapping size mismatch: "
+                f"logical={logical_indices.numel()}, device={device_slots.numel()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[logical_indices] = device_slots
+        if backup_state:
+            return logical_indices, (logical_state, logical_indices.clone())
+        return logical_indices
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor) -> None:
+        """Detach coordinator-owned slots before logical token release."""
+        if logical_indices.numel() > 0:
+            self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -271,6 +329,33 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
         )
+
+    def backup_state(self):
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.hisparse_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
+
+    def restore_state(self, state):
+        if len(state) == 2:
+            # ``alloc_extend_with_device_mapping(..., backup_state=True)`` owns
+            # the physical extra-page slots outside the allocator. Roll back
+            # only the logical allocation and keep the mapping live until
+            # accepted-token finalization clears it transactionally.
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        logical_state, hisparse_state, mapping_snapshot = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        self.hisparse_attn_allocator.restore_state(hisparse_state)
+        self.full_to_hisparse_device_index_mapping[
+            : mapping_snapshot.shape[0]
+        ].copy_(mapping_snapshot)
+        if mapping_snapshot.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            self.full_to_hisparse_device_index_mapping[
+                mapping_snapshot.shape[0] :
+            ] = 0
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
