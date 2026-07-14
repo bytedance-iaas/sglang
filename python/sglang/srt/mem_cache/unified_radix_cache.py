@@ -82,6 +82,18 @@ class UnifiedTreeNode:
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
 
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
+        if node is None or node.hash_value is None:
+            return []
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
+
     @property
     def backuped(self) -> bool:
         """Tree-level: Full KV present on host."""
@@ -392,6 +404,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+        self.enable_storage = self.cache_controller.enable_storage
+        self.prefetch_threshold = getattr(
+            self.cache_controller, "prefetch_threshold", 256
+        )
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
