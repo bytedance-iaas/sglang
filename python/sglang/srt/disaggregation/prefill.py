@@ -1467,6 +1467,11 @@ class SchedulerDisaggregationPrefillMixin:
                 for rid in getattr(self, "_pp_pd_pending_prefill_release_rids", [])
                 if rid not in done_rids
             ]
+            self._pp_pd_prefill_terminal_rid_history = [
+                rid
+                for rid in getattr(self, "_pp_pd_prefill_terminal_rid_history", [])
+                if rid not in done_rids
+            ]
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
