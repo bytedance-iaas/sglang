@@ -1866,7 +1866,7 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_after = sorted(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        logger.warning(
+                        logger.debug(
                             "Mooncake decode status received: room=%s, "
                             "status=%s, prefill_rank=%s, expected=%s, "
                             "arrived_before=%s, arrived_after=%s",
@@ -1892,7 +1892,11 @@ class MooncakeKVManager(CommonKVManager):
                             last_log = self._last_missing_prefill_response_log.get(
                                 bootstrap_room, 0.0
                             )
-                            if now - last_log >= 5.0:
+                            if last_log == 0.0:
+                                self._last_missing_prefill_response_log[
+                                    bootstrap_room
+                                ] = now
+                            elif now - last_log >= 5.0:
                                 arrived = sorted(
                                     self.prefill_response_tracker[bootstrap_room]
                                 )
