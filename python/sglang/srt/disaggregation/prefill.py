@@ -1375,6 +1375,21 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            # Retry a deferred final send BEFORE the PP consensus gate below.
+            # A rank whose final chunk was rejected (transient reject in
+            # add_transfer_request) stays non-terminal, so its rid never joins
+            # the PP transferred-ids consensus and never appears in
+            # rids_to_check. Gating the retry behind rids_to_check would then
+            # starve it forever: the final is what makes the rid terminal, so
+            # the retry is a prerequisite for consensus, not a consumer of it.
+            if getattr(req, "disagg_final_send_pending", False) and poll not in (
+                KVPoll.Failed,
+                KVPoll.Success,
+            ):
+                self.send_kv_chunk(req, last_chunk=True)
+                undone_reqs.append(req)
+                continue
+
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1394,14 +1409,6 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     undone_reqs.append(req)
                     continue
-
-            if getattr(req, "disagg_final_send_pending", False) and poll not in (
-                KVPoll.Failed,
-                KVPoll.Success,
-            ):
-                self.send_kv_chunk(req, last_chunk=True)
-                undone_reqs.append(req)
-                continue
 
             if req.pending_bootstrap and poll != KVPoll.Failed:
                 # prefill finished before bootstrap
