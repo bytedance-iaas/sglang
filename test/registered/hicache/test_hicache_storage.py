@@ -34,6 +34,8 @@ class TestHiCache(CustomTestCase, MMLUMixin):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-hierarchical-cache",
+                "--hicache-io-backend",
+                "kernel",
                 "--mem-fraction-static",
                 0.7,
                 "--hicache-size",
