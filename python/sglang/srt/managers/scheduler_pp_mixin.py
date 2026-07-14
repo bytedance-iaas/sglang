@@ -948,21 +948,15 @@ class SchedulerPPMixin:
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
-            pending_release_rids = getattr(
-                self, "_pp_pd_pending_release_forward_rids", []
-            )
-            if release_rids:
-                pending_release_rids = _pp_ordered_union(
-                    pending_release_rids, release_rids
+            if release_rids is not None:
+                pending_release_rids = getattr(
+                    self, "_pp_pd_pending_release_forward_rids", []
                 )
-            if pending_release_rids:
+                release_rids = _pp_ordered_union(pending_release_rids, release_rids)
                 send_release_work = self._pp_send_pyobj_to_next_stage(
-                    pending_release_rids, async_send=True
+                    release_rids, async_send=True
                 )
-                release_rids = []
                 self._pp_pd_pending_release_forward_rids = []
-            elif release_rids is not None:
-                release_rids = []
         return send_release_work, release_rids
 
     def _pp_pd_buffer_release_ids(self: Scheduler, release_rids: Optional[List[str]]):

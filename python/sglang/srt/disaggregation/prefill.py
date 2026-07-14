@@ -1316,6 +1316,16 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        if rids_to_check is not None:
+            pending_release_rids = getattr(
+                self, "_pp_pd_pending_prefill_release_rids", []
+            )
+            pending_release_rids = list(
+                dict.fromkeys(pending_release_rids + list(rids_to_check))
+            )
+            self._pp_pd_pending_prefill_release_rids = pending_release_rids
+            rids_to_check = pending_release_rids
+
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1449,6 +1459,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
+
+        if rids_to_check is not None and done_reqs:
+            done_rids = {req.rid for req in done_reqs}
+            self._pp_pd_pending_prefill_release_rids = [
+                rid
+                for rid in getattr(self, "_pp_pd_pending_prefill_release_rids", [])
+                if rid not in done_rids
+            ]
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
