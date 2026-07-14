@@ -884,29 +884,37 @@ class SchedulerPPMixin:
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+        curr_transferred_rids = self.get_rids(
+            self.disagg_prefill_inflight_queue,
+            True,
+            [KVPoll.Success, KVPoll.Failed],
+        )
+        curr_transferred_rids = self._pp_pd_update_prefill_terminal_history(
+            curr_transferred_rids
+        )
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = curr_transferred_rids
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            # 2. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = _pp_ordered_intersection(
                 prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
+
+    def _pp_pd_update_prefill_terminal_history(
+        self: Scheduler, terminal_rids: List[str]
+    ) -> List[str]:
+        history = getattr(self, "_pp_pd_prefill_terminal_rid_history", [])
+        history = _pp_ordered_union(history, terminal_rids)
+        if len(history) > 1024:
+            history = history[-1024:]
+        self._pp_pd_prefill_terminal_rid_history = history
+        return history
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,

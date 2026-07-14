@@ -1377,16 +1377,8 @@ class SchedulerDisaggregationPrefillMixin:
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
-                    if poll not in (
-                        KVPoll.Success,
-                        KVPoll.Failed,
-                    ):
-                        undone_reqs.append(req)
-                        continue
-                    logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: releasing terminal prefill rid {req.rid} "
-                        f"without release token; poll={poll}, rids_to_check={rids_to_check}",
-                    )
+                    undone_reqs.append(req)
+                    continue
 
                 # In PP mode, the previous rank may have reached a terminal
                 # state (Success/Failed) while this rank's local poll is still
