@@ -130,6 +130,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
             hisparse_coordinator=coordinator,
+            draft_hisparse_coordinator=None,
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
@@ -137,7 +138,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         result = queue._pre_alloc(req)
 
-        self.assertIs(result, host_indices)
+        self.assertTrue(torch.equal(result, host_indices))
         allocator.alloc_extend_swa_tail.assert_called_once()
         allocator.alloc_logical_only.assert_not_called()
         _, kwargs = allocator.alloc_extend_swa_tail.call_args

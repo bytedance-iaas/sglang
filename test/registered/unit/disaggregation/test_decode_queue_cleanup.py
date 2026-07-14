@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
@@ -184,6 +184,68 @@ class TestDecodeQueueCleanup(CustomTestCase):
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, is_insert=False
         )
+
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_transfer_success_budget_leaves_excess_requests_queued(self, mock_poll):
+        decode_reqs = []
+        for i in range(3):
+            decode_reqs.append(
+                SimpleNamespace(
+                    req=SimpleNamespace(rid=f"success-{i}", finished_reason=None),
+                    kv_receiver=FakeReceiver(),
+                    metadata_buffer_index=i,
+                    hicache_restore_status=HiCacheRestoreResult.READY,
+                )
+            )
+
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = decode_reqs
+        queue.enable_staging = False
+        queue.gloo_group = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.tp_rank = 0
+        queue.tree_cache = MagicMock()
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 3)
+        queue._commit_transfer_to_req = MagicMock()
+
+        scheduler = MagicMock()
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_hisparse = True
+        scheduler.server_args = MagicMock()
+        queue.scheduler = scheduler
+
+        mock_poll.return_value = [KVPoll.Success] * 3
+
+        transferred = queue.pop_transferred(max_successes=2)
+
+        self.assertEqual(
+            [req.rid for req in transferred], ["success-0", "success-1"]
+        )
+        self.assertEqual([entry.req.rid for entry in queue.queue], ["success-2"])
+        self.assertEqual(queue._commit_transfer_to_req.call_count, 2)
+        self.assertEqual(
+            queue.req_to_metadata_buffer_idx_allocator.free.call_args_list,
+            [call(0), call(1)],
+        )
+
+    def test_hisparse_direct_admission_capacity_uses_target_draft_minimum(self):
+        scheduler = Scheduler.__new__(Scheduler)
+
+        def coordinator(available, padded):
+            allocator = SimpleNamespace(
+                hisparse_attn_allocator=SimpleNamespace(
+                    available_size=MagicMock(return_value=available)
+                )
+            )
+            return SimpleNamespace(
+                token_to_kv_pool_allocator=allocator,
+                padded_buffer_size=padded,
+            )
+
+        scheduler.hisparse_coordinator = coordinator(18_624, 6_208)
+        scheduler.draft_hisparse_coordinator = coordinator(12_416, 6_208)
+
+        self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 2)
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

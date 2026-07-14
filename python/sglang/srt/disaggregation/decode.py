@@ -1894,9 +1894,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        max_successes: Optional[int] = None,
+    ) -> List[Req]:
+        """Commit completed transfers up to an optional admission budget.
+
+        Failed transfers are always drained.  Successful transfers beyond the
+        budget remain in ``self.queue`` so HiSparse can apply backpressure
+        instead of committing more requests than its device buffers can hold.
+        """
         if not self.queue:
             return []
+
+        if max_successes is not None:
+            assert max_successes >= 0
 
         if self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(
@@ -1963,6 +1976,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
+                    continue
+                if (
+                    max_successes is not None
+                    and len(transferred_reqs) >= max_successes
                 ):
                     continue
                 self._commit_transfer_to_req(decode_req)
@@ -2244,8 +2262,13 @@ class SchedulerDisaggregationDecodeMixin:
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
+            max_successes = None
+            if self.enable_hisparse:
+                max_successes = self.hisparse_direct_admission_capacity()
             transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
+                self.disagg_decode_transfer_queue.pop_transferred(
+                    max_successes=max_successes
+                )
             )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:

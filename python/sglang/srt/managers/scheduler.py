@@ -998,6 +998,24 @@ class Scheduler(
         for coordinator in self.iter_hisparse_coordinators():
             coordinator.admit_request_direct(req)
 
+    def hisparse_direct_admission_capacity(self) -> int:
+        """Return the number of direct-to-host requests that can be admitted now.
+
+        A PD request is not runnable until both the target and draft HiSparse
+        coordinators own a full per-request device buffer.  The transfer queue
+        may contain more completed requests than those physical pools can hold,
+        so admission must use the minimum live capacity across coordinators.
+        """
+        capacities = []
+        for coordinator in self.iter_hisparse_coordinators():
+            hisparse_allocator = (
+                coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator
+            )
+            available = hisparse_allocator.available_size()
+            capacities.append(available // coordinator.padded_buffer_size)
+
+        return min(capacities, default=0)
+
     def finish_hisparse_request(self, req: Req) -> None:
         for coordinator in self.iter_hisparse_coordinators():
             coordinator.request_finished(req)
