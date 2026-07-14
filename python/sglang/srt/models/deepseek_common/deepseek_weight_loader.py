@@ -76,22 +76,6 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _load_weight_with_context(weight_loader, param, loaded_weight, *args, **kwargs):
-    debug_name = kwargs.pop("debug_name", None)
-    try:
-        return weight_loader(param, loaded_weight, *args, **kwargs)
-    except Exception as exc:
-        raise RuntimeError(
-            "Weight load failed"
-            f" debug_name={debug_name}"
-            f" param_type={type(param).__name__}"
-            f" param_shape={tuple(param.shape)}"
-            f" loaded_shape={tuple(loaded_weight.shape)}"
-            f" args={args}"
-            f" kwargs={kwargs}"
-        ) from exc
-
-
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -251,11 +235,8 @@ class DeepseekV2WeightLoaderMixin:
                         executor=executor,
                         futures=futures,
                         use_async=use_async_loading,
-                        func=_load_weight_with_context,
-                        func_args=(weight_loader, param, loaded_weight, shard_id),
-                        func_kwargs={
-                            "debug_name": name,
-                        },
+                        func=weight_loader,
+                        func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
@@ -274,9 +255,8 @@ class DeepseekV2WeightLoaderMixin:
                             executor=executor,
                             futures=futures,
                             use_async=use_async_loading,
-                            func=_load_weight_with_context,
+                            func=weight_loader,
                             func_args=(
-                                weight_loader,
                                 param,
                                 loaded_weight,
                                 name,
@@ -284,7 +264,6 @@ class DeepseekV2WeightLoaderMixin:
                             func_kwargs={
                                 "shard_id": shard_id,
                                 "expert_id": expert_id,
-                                "debug_name": name,
                             },
                         )
                         break
@@ -358,11 +337,8 @@ class DeepseekV2WeightLoaderMixin:
                                     executor=executor,
                                     futures=futures,
                                     use_async=use_async_loading,
-                                    func=_load_weight_with_context,
-                                    func_args=(weight_loader, param, fused_weight),
-                                    func_kwargs={
-                                        "debug_name": param_name,
-                                    },
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
@@ -391,11 +367,8 @@ class DeepseekV2WeightLoaderMixin:
                                 executor=executor,
                                 futures=futures,
                                 use_async=use_async_loading,
-                                func=_load_weight_with_context,
-                                func_args=(weight_loader, param, loaded_weight),
-                                func_kwargs={
-                                    "debug_name": name,
-                                },
+                                func=weight_loader,
+                                func_args=(param, loaded_weight),
                             )
 
             # Wait for all tasks to complete and raise any exceptions.
