@@ -1346,6 +1346,11 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
+            if getattr(req, "disagg_final_send_pending", False) and poll != KVPoll.Failed:
+                self.send_kv_chunk(req, last_chunk=True)
+                undone_reqs.append(req)
+                continue
+
             if req.pending_bootstrap and poll != KVPoll.Failed:
                 # prefill finished before bootstrap
                 if poll == KVPoll.WaitingForInput:
@@ -1821,7 +1826,39 @@ class SchedulerDisaggregationPrefillMixin:
             is_last_chunk=last_chunk,
         )
         if not send_accepted:
+            status = None
+            if hasattr(req.disagg_kv_sender, "current_status"):
+                status = req.disagg_kv_sender.current_status()
+            has_transfer_infos = None
+            if hasattr(req.disagg_kv_sender, "has_transfer_infos"):
+                has_transfer_infos = req.disagg_kv_sender.has_transfer_infos()
+            logger.warning(
+                "Disagg prefill send was not accepted: rid=%s, "
+                "bootstrap_room=%s, is_last_chunk=%s, status=%s, "
+                "has_transfer_infos=%s",
+                req.rid,
+                req.bootstrap_room,
+                last_chunk,
+                status,
+                has_transfer_infos,
+            )
+            if last_chunk:
+                if status == KVPoll.Failed:
+                    req.disagg_final_send_pending = False
+                elif status is None:
+                    reason = (
+                        "Final disagg prefill send was rejected after the "
+                        f"transfer room disappeared: rid={req.rid}, "
+                        f"bootstrap_room={req.bootstrap_room}"
+                    )
+                    if hasattr(req.disagg_kv_sender, "mark_failed"):
+                        req.disagg_kv_sender.mark_failed(reason)
+                    req.disagg_final_send_pending = False
+                else:
+                    req.disagg_final_send_pending = True
             return
+        if last_chunk:
+            req.disagg_final_send_pending = False
         _commit_dspark_hidden_sent_ranges(dspark_pending_ranges_to_commit)
         req.start_send_idx = end_idx
 

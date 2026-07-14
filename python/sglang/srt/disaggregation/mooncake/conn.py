@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -236,6 +236,7 @@ class MooncakeKVManager(CommonKVManager):
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
+            self._last_missing_prefill_response_log: Dict[int, float] = {}
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
@@ -1810,12 +1811,38 @@ class MooncakeKVManager(CommonKVManager):
                             self.prefill_response_tracker[bootstrap_room]
                         )
                         if arrived_response_num == expected_response_num:
+                            self._last_missing_prefill_response_log.pop(
+                                bootstrap_room, None
+                            )
                             if self.enable_staging:
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
+                        else:
+                            now = time.monotonic()
+                            last_log = self._last_missing_prefill_response_log.get(
+                                bootstrap_room, 0.0
+                            )
+                            if now - last_log >= 5.0:
+                                arrived = sorted(
+                                    self.prefill_response_tracker[bootstrap_room]
+                                )
+                                missing_candidates = sorted(
+                                    set(range(expected_response_num)) - set(arrived)
+                                )
+                                logger.warning(
+                                    "Waiting for Mooncake prefill responses: "
+                                    "room=%s, expected=%s, arrived=%s, missing=%s",
+                                    bootstrap_room,
+                                    expected_response_num,
+                                    arrived,
+                                    missing_candidates,
+                                )
+                                self._last_missing_prefill_response_log[
+                                    bootstrap_room
+                                ] = now
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,

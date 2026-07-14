@@ -1114,6 +1114,23 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
+    def current_status(self) -> Optional[KVPoll]:
+        if self.bootstrap_room not in self.kv_mgr.request_status:
+            return None
+        return self.kv_mgr.check_status(self.bootstrap_room)
+
+    def has_transfer_infos(self) -> Optional[bool]:
+        transfer_infos = getattr(self.kv_mgr, "transfer_infos", None)
+        if transfer_infos is None:
+            return None
+        return self.bootstrap_room in transfer_infos
+
+    def mark_failed(self, reason: str) -> None:
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if hasattr(self, "conclude_state"):
+            self.conclude_state = KVPoll.Failed
+
     def poll(self) -> KVPoll:
         pass
 
