@@ -885,28 +885,51 @@ class SchedulerPPMixin:
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
+        #
+        # Because PP microbatches advance at different phases, a request can go
+        # terminal (Success/Failed) and be popped from a fast rank's inflight
+        # queue in one microbatch while a slower rank only observes it a
+        # microbatch later. A plain intersection over the *current* inflight
+        # snapshots would then never contain that rid on every rank
+        # simultaneously, so the release consensus would never fire and the
+        # request would stay pinned in the inflight queue forever (head-of-line
+        # blocking subsequent bursts). To avoid this, we accumulate recently
+        # terminal rids into a bounded per-rank history and intersect against
+        # that union rather than the momentary snapshot.
+        curr_transferred_rids = self.get_rids(
+            self.disagg_prefill_inflight_queue,
+            True,
+            [KVPoll.Success, KVPoll.Failed],
+        )
+        curr_transferred_rids = self._pp_pd_update_prefill_terminal_history(
+            curr_transferred_rids
+        )
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = curr_transferred_rids
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            # 2. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = _pp_ordered_intersection(
                 prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
+
+    def _pp_pd_update_prefill_terminal_history(
+        self: Scheduler, terminal_rids: List[str]
+    ) -> List[str]:
+        """Accumulate recently terminal prefill rids so PP release consensus can
+        still intersect a rid that has already been popped from a faster rank's
+        inflight queue in a prior microbatch. Bounded to avoid unbounded growth.
+        """
+        history = getattr(self, "_pp_pd_prefill_terminal_rid_history", [])
+        history = _pp_ordered_union(history, terminal_rids)
+        if len(history) > 1024:
+            history = history[-1024:]
+        self._pp_pd_prefill_terminal_rid_history = history
+        return history
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
