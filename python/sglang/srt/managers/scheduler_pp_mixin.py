@@ -1429,7 +1429,7 @@ class SchedulerPPMixin:
             )
             if self.enable_hisparse:
                 for req in released_reqs:
-                    self.hisparse_coordinator.admit_request_direct(req)
+                    self.admit_hisparse_request_direct(req)
             self.waiting_queue.extend(released_reqs)
             return [req.rid for req in released_reqs]
         return None

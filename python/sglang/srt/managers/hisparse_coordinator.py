@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
 from typing import List, NamedTuple, Union
 
 import torch
@@ -65,6 +66,9 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        self.debug_validate_swap_in = (
+            os.environ.get("SGLANG_HISPARSE_DEBUG_VALIDATE_SWAP_IN", "0") == "1"
+        )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -532,6 +536,122 @@ class HiSparseCoordinator:
             reserved_buffer_loc
         )
 
+    def commit_speculative_tokens(self, reqs: List[Req]) -> None:
+        """Commit newly accepted speculative tokens into HiSparse storage.
+
+        Normal decode writes one token directly into the reserved HiSparse device
+        slot and backs the previous token up on the next step.  EAGLE allocates a
+        small tree of ordinary HiSparse slots instead, then commits a variable
+        number of tokens after verification.  Without an explicit commit, those
+        tokens are absent from both ``req_to_host_pool`` and the per-request hot
+        buffer metadata; the next sparse-attention step can therefore select a
+        valid generated token whose host location is still ``-1``.
+
+        This method runs on the scheduler stream after the previous speculative
+        result has been copied to CPU and ``req.kv_committed_len`` has advanced.
+        It backs up every newly committed token, moves the newest one into the
+        reserved device slot expected by the swap-in kernel, and releases the
+        temporary HiSparse slots used by speculative verification.
+
+        DeepSeek-V4 uses compressed C4 positions and has a different speculative
+        lifecycle.  Keep this generic MLA fix scoped to the uncompressed DSA
+        HiSparse pool used by GLM-5.2.
+        """
+        if self.is_dsv4_hisparse:
+            return
+
+        commit_items = []
+        for req in reqs:
+            req_idx = req.req_pool_idx
+            start_pos = int(self.req_to_host_pool_allocated_len[req_idx])
+            end_pos = self.host_token_len(req.kv_committed_len)
+            if end_pos <= start_pos:
+                continue
+
+            logical_locs = self.req_to_token_pool.req_to_token[
+                req_idx, start_pos:end_pos
+            ].to(dtype=torch.int64)
+            device_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+                    logical_locs
+                )
+            )
+            if self.debug_validate_swap_in and torch.any(device_locs <= 0):
+                bad = logical_locs[device_locs <= 0].detach().cpu().tolist()
+                raise RuntimeError(
+                    "HiSparse speculative commit found generated tokens without "
+                    f"device KV mappings: req={req.rid} range=[{start_pos}, "
+                    f"{end_pos}) logical_locs={bad}"
+                )
+
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                req_idx,
+                start_pos,
+                end_pos - start_pos,
+            )
+            reserved_loc = self.req_to_device_buffer[
+                req_idx, self.device_buffer_size
+            ].reshape(1)
+            commit_items.append(
+                (req_idx, logical_locs, device_locs, host_locs, reserved_loc)
+            )
+
+        if not commit_items:
+            return
+
+        all_device_locs = torch.cat([item[2] for item in commit_items])
+        all_host_locs = torch.cat([item[3] for item in commit_items])
+
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                all_host_locs,
+                all_device_locs,
+                io_backend="kernel",
+            )
+            for _, _, device_locs, _, reserved_loc in commit_items:
+                self.mem_pool_device.transfer_values_on_device(
+                    reserved_loc, device_locs[-1:].to(torch.int64)
+                )
+            self._backup_done_event.record()
+            for tensor in (all_host_locs, all_device_locs):
+                if tensor.is_cuda:
+                    tensor.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
+        # Do not recycle the temporary speculative slots until both the host
+        # backup and newest-token device copy have completed.
+        self.wait_for_pending_backup()
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        slots_to_free = []
+        for req_idx, logical_locs, device_locs, _, reserved_loc in commit_items:
+            start_pos = int(self.req_to_host_pool_allocated_len[req_idx]) - len(
+                logical_locs
+            )
+            if start_pos > 0:
+                previous_logical_loc = self.req_to_token_pool.req_to_token[
+                    req_idx, start_pos - 1
+                ].to(dtype=torch.int64)
+                # The previous newest token was already backed up by the prior
+                # commit and owned this request's reserved slot.  The slot is
+                # now being reused by the new newest token.
+                mapping[previous_logical_loc] = 0
+
+            mapping[logical_locs] = 0
+            mapping[logical_locs[-1]] = reserved_loc[0]
+            slots_to_free.append(device_locs[device_locs != reserved_loc[0]])
+
+        slots_to_free = torch.unique(torch.cat(slots_to_free))
+        if slots_to_free.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(slots_to_free)
+
     def _eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,
@@ -817,6 +937,23 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
+        # This validator intentionally performs host reads (``.item()`` and
+        # ``.cpu()``).  Those synchronize the current stream and are illegal
+        # while a CUDA graph is being captured.  The crash under investigation
+        # occurs after the long-context graph threshold forces eager execution,
+        # so skipping capture preserves the exact replay signal without
+        # perturbing graph construction or replay.
+        if (
+            self.debug_validate_swap_in
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._validate_swap_in_metadata(
+                req_pool_indices=req_pool_indices,
+                seq_lens=compressed_seq_lens,
+                top_k_tokens=top_k_result,
+                layer_id=layer_id,
+            )
+
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
@@ -841,3 +978,95 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
         )
         return top_k_indices
+
+    def _validate_swap_in_metadata(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Synchronously validate HiSparse swap-in metadata for crash replay.
+
+        This is intentionally gated by ``SGLANG_HISPARSE_DEBUG_VALIDATE_SWAP_IN``:
+        it performs GPU reductions and host reads that are too expensive for the
+        production path.  A missing host location is valid only when the token is
+        already resident in the per-request device buffer, or when it is the
+        newest token handled by the reserved slot in the swap-in kernel.
+        """
+        num_real_reqs = int(self.num_real_reqs.item())
+        if num_real_reqs <= 0:
+            return
+
+        req_pool_indices = req_pool_indices[:num_real_reqs].to(torch.int64)
+        seq_lens = seq_lens[:num_real_reqs].to(torch.int64)
+        top_k_tokens = top_k_tokens[:num_real_reqs].to(torch.int64)
+
+        max_req_slot = self.req_to_host_pool.shape[0]
+        invalid_req = (req_pool_indices < 0) | (req_pool_indices >= max_req_slot)
+        if torch.any(invalid_req):
+            raise RuntimeError(
+                "HiSparse swap-in invalid request pool indices: "
+                f"req_pool_indices={req_pool_indices.cpu().tolist()} "
+                f"max_req_slot={max_req_slot} layer_id={layer_id}"
+            )
+
+        # The CUDA kernel has a short-sequence fast path that only consumes the
+        # first ``seq_len`` entries.  CUDA-graph capture intentionally leaves
+        # the remaining Top-K entries at -1, so validating all NUM_TOP_K slots
+        # would reject legal capture placeholders before the fast-path return.
+        # Long sequences execute the hash/miss path and must have a valid token
+        # in every Top-K slot; keep the strict checks for those rows.
+        long_sequence = seq_lens > self.device_buffer_size
+        invalid_token = long_sequence.unsqueeze(1) & (
+            (top_k_tokens < 0) | (top_k_tokens >= seq_lens.unsqueeze(1))
+        )
+        safe_tokens = top_k_tokens.clamp(
+            min=0, max=self.req_to_host_pool.shape[1] - 1
+        )
+        host_locs = self.req_to_host_pool[req_pool_indices.unsqueeze(1), safe_tokens]
+
+        buffer_tokens = self.req_device_buffer_tokens[
+            layer_id, req_pool_indices, : self.device_buffer_size
+        ].to(torch.int64)
+        is_device_hit = torch.any(
+            top_k_tokens.unsqueeze(2) == buffer_tokens.unsqueeze(1), dim=2
+        )
+        is_newest = top_k_tokens == (seq_lens.unsqueeze(1) - 1)
+        missing_host = (
+            long_sequence.unsqueeze(1)
+            & (host_locs < 0)
+            & ~is_device_hit
+            & ~is_newest
+        )
+        invalid = invalid_token | missing_host
+        if not torch.any(invalid):
+            return
+
+        bad_rows, bad_cols = torch.where(invalid)
+        limit = min(16, bad_rows.numel())
+        details = []
+        for j in range(limit):
+            row = int(bad_rows[j].item())
+            col = int(bad_cols[j].item())
+            req_idx = int(req_pool_indices[row].item())
+            details.append(
+                {
+                    "batch_row": row,
+                    "topk_col": col,
+                    "req_pool_idx": req_idx,
+                    "seq_len": int(seq_lens[row].item()),
+                    "token": int(top_k_tokens[row, col].item()),
+                    "host_loc": int(host_locs[row, col].item()),
+                    "device_hit": bool(is_device_hit[row, col].item()),
+                    "is_newest": bool(is_newest[row, col].item()),
+                    "host_allocated_len": int(
+                        self.req_to_host_pool_allocated_len[req_idx]
+                    ),
+                }
+            )
+        raise RuntimeError(
+            "HiSparse swap-in metadata validation failed before CUDA kernel: "
+            f"layer_id={layer_id} invalid_count={int(invalid.sum().item())} "
+            f"num_real_reqs={num_real_reqs} details={details}"
+        )

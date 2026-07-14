@@ -204,6 +204,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -404,6 +405,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+        if self._is_long_context_cuda_graph_disabled(forward_batch):
             return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (

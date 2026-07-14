@@ -1234,6 +1234,70 @@ class TestFillOncePolicy(unittest.TestCase):
         self.assertTrue(torch.equal(buf[2:], torch.tensor([99, 99], dtype=torch.int32)))
 
 
+class TestFillFromShapeInvariant(unittest.TestCase):
+    """Reject stale speculative rows instead of silently choosing a prefix."""
+
+    def test_scalar_source_keeps_torch_broadcast_semantics(self):
+        reg = _make_registry(max_bs=4, max_num_tokens=8)
+        reg.register_slot(
+            GraphSlot(
+                name="input_embeds",
+                shape_fn=lambda bs, mt: (bs, 4),
+                dtype=torch.float32,
+                axis="bs",
+            )
+        )
+        fb = _MiniForwardBatch(batch_size=2, input_embeds=torch.tensor(7.0))
+
+        reg.fill_from(
+            fb,
+            raw_bs=2,
+            padded_bs=2,
+            raw_num_tokens=2,
+            padded_num_tokens=2,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("input_embeds").buffer[:2],
+                torch.full((2, 4), 7.0),
+            )
+        )
+
+    def test_batch_axis_mismatch_reports_slot_and_replay_shape_context(self):
+        reg = _make_registry(max_bs=4, max_num_tokens=8)
+        reg.register_slot(
+            GraphSlot(
+                name="input_embeds",
+                shape_fn=lambda bs, mt: (bs, 4),
+                dtype=torch.float32,
+                axis="bs",
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=1,
+            input_embeds=torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        )
+
+        expected = (
+            r"CudaGraphBufferRegistry\.fill_from shape mismatch: "
+            r"slot='input_embeds'.*"
+            r"dst_shape=\(1, 4\).*"
+            r"src_shape=\(2, 4\).*"
+            r"raw_bs=1.*"
+            r"raw_num_tokens=1.*"
+            r"axis='bs'"
+        )
+        with self.assertRaisesRegex(RuntimeError, expected):
+            reg.fill_from(
+                fb,
+                raw_bs=1,
+                padded_bs=1,
+                raw_num_tokens=1,
+                padded_num_tokens=1,
+            )
+
+
 class TestComputedSlots(unittest.TestCase):
     """num_token_non_padded (copy_from_fb + post_fill) and global_num_tokens
     (copy_from_fb=False + post_fill fill)."""

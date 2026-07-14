@@ -194,6 +194,79 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
 
+    def test_singleton_dsa_seed_broadcasts_to_raw_batch(self):
+        """PD warmup may provide one shared seed row for every decode request."""
+
+        raw_seq_lens = [10, 11]
+        raw_bs = len(raw_seq_lens)
+        backend = _RecordingDraftBackend()
+        runner = self._build_runner(backend)
+        runner.buffers.dsa_seed_topk = torch.full(
+            (CAPTURE_BS, 2), -1, dtype=torch.int64
+        )
+        forward_batch = self._build_forward_batch(raw_seq_lens, sum(raw_seq_lens))
+        seed = torch.tensor([[7, 8]], dtype=torch.int64)
+        forward_batch.spec_info.dsa_topk_indices = seed
+
+        runner.execute(forward_batch)
+
+        self.assertTrue(
+            torch.equal(
+                runner.buffers.dsa_seed_topk[:raw_bs], seed.expand(raw_bs, -1)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                runner.buffers.dsa_seed_topk[raw_bs:],
+                torch.zeros(CAPTURE_BS - raw_bs, 2, dtype=torch.int64),
+            ),
+            msg="capture-only padding rows must remain zero",
+        )
+        self.assertEqual(
+            [observation.phase for observation in backend.observations],
+            ["metadata_build", "graph_replay"],
+        )
+
+    def test_non_broadcastable_dsa_seed_batch_is_rejected(self):
+        """A stale multi-row seed is invalid; replay must not crop or zero-pad it."""
+
+        raw_seq_lens = [10, 11, 12]
+        raw_bs = len(raw_seq_lens)
+        for seed_bs in (raw_bs + 1, raw_bs - 1):
+            with self.subTest(seed_bs=seed_bs):
+                backend = _RecordingDraftBackend()
+                runner = self._build_runner(backend)
+                runner.buffers.dsa_seed_topk = torch.full(
+                    (CAPTURE_BS, 2), -1, dtype=torch.int64
+                )
+                original_buffer = runner.buffers.dsa_seed_topk.clone()
+                forward_batch = self._build_forward_batch(
+                    raw_seq_lens, sum(raw_seq_lens)
+                )
+                forward_batch.spec_info.dsa_topk_indices = torch.arange(
+                    seed_bs * 2, dtype=torch.int64
+                ).reshape(seed_bs, 2)
+
+                expected = (
+                    r"EAGLEDraftCudaGraphRunner\.replay dsa_seed_topk "
+                    rf"batch mismatch: raw_bs={raw_bs}, "
+                    rf"seed_shape=\({seed_bs}, 2\), "
+                    rf"target_shape=\({raw_bs}, 2\), "
+                    rf"buffer_shape=\({CAPTURE_BS}, 2\)"
+                )
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    runner.execute(forward_batch)
+
+                self.assertTrue(
+                    torch.equal(runner.buffers.dsa_seed_topk, original_buffer),
+                    msg="invalid seed must be rejected before mutating replay buffers",
+                )
+                self.assertEqual(
+                    backend.observations,
+                    [],
+                    msg="invalid seed must be rejected before graph metadata/replay",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

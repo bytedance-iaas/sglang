@@ -363,6 +363,56 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _draft_pd_transfer_pool(self):
+        """Select the PD destination for draft KV under HiSparse.
+
+        Target HiSparse KV is transferred directly into its host pool.  Draft
+        KV must follow the same rule: registering the small draft device buffer
+        as a 1M-context RDMA destination makes long-context page indices address
+        beyond that buffer and leaves the draft host mapping empty.
+        """
+        if self.draft_token_to_kv_pool is None:
+            return None, None
+        if not self.scheduler.enable_hisparse:
+            return self.draft_token_to_kv_pool, "VRAM"
+
+        draft_coordinator = self.scheduler.draft_hisparse_coordinator
+        if draft_coordinator is None:
+            raise RuntimeError(
+                "HiSparse speculative decode requires a draft HiSparse "
+                "coordinator for PD draft-KV transfer"
+            )
+        return draft_coordinator.mem_pool_host, "DRAM"
+
+    def _allocate_hisparse_host_slots(self, req: Req, fill_len: int) -> torch.Tensor:
+        """Allocate identical target/draft host slots for one PD request."""
+        coordinator = self.scheduler.hisparse_coordinator
+        host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+            coordinator.req_to_host_pool,
+            coordinator.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            0,
+            coordinator.host_token_len(fill_len),
+        )
+
+        draft_coordinator = self.scheduler.draft_hisparse_coordinator
+        if draft_coordinator is None:
+            return host_indices
+
+        draft_host_indices = draft_coordinator.mem_pool_host.alloc_paged_token_slots(
+            draft_coordinator.req_to_host_pool,
+            draft_coordinator.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            0,
+            draft_coordinator.host_token_len(fill_len),
+        )
+        if not torch.equal(host_indices, draft_host_indices):
+            raise RuntimeError(
+                "Target and draft HiSparse host slots diverged during PD "
+                f"preallocation for req={req.rid}"
+            )
+        return host_indices
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -433,13 +483,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
+            draft_transfer_kv_pool, draft_mem_kind = (
+                self._draft_pd_transfer_pool()
+            )
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_transfer_kv_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
-            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+            kv_data_mem_kinds += [draft_mem_kind] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -626,8 +679,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         input_len = self._rebootstrap_prefill_len(req)
-        if input_len > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
+        token_capacity = (
+            self.token_to_kv_pool_allocator.size
+            if self.scheduler.enable_hisparse
+            else self.max_total_num_tokens
+        )
+        if input_len > token_capacity:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {token_capacity}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
@@ -926,9 +984,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
+            draft_coordinator = self.scheduler.draft_hisparse_coordinator
+            if draft_coordinator is not None:
+                draft_allocator = draft_coordinator.token_to_kv_pool_allocator
+                draft_avail = (
+                    draft_allocator.hisparse_attn_allocator.available_size()
+                )
+                hisparse_avail = min(hisparse_avail, draft_avail)
+                padded_buffer_size = max(
+                    self.scheduler.hisparse_coordinator.padded_buffer_size,
+                    draft_coordinator.padded_buffer_size,
+                )
+            else:
+                padded_buffer_size = (
+                    self.scheduler.hisparse_coordinator.padded_buffer_size
+                )
             hisparse_req_budget = max(
                 0,
-                hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
+                hisparse_avail // padded_buffer_size
                 - len(self.transfer_queue.queue),
             )
 
@@ -1499,14 +1572,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=fill_len,
                 )
 
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            # Allocate the same host rows for target and draft.  The PD wire
+            # protocol carries one page-index vector for all registered KV
+            # buffers, so both host allocators must remain lock-step.
+            host_indices = self._allocate_hisparse_host_slots(req, fill_len)
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
@@ -1838,7 +1907,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req.return_logprob,
                 )
                 if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                    self.scheduler.finish_hisparse_request(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
@@ -1862,9 +1931,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     if self.scheduler.enable_hisparse:
-                        self.scheduler.hisparse_coordinator.request_finished(
-                            decode_req.req
-                        )
+                        self.scheduler.finish_hisparse_request(decode_req.req)
                     self._clean_hicache_prefetch_resources(decode_req)
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     if self.scheduler.metrics_reporter.enable_metrics:
@@ -2140,5 +2207,5 @@ class SchedulerDisaggregationDecodeMixin:
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
+                    self.admit_hisparse_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)

@@ -449,6 +449,20 @@ class CudaGraphBufferRegistry:
                     dst = slot.buffer
                 else:
                     dst = slot.buffer[:raw_n]
+            if src.shape != dst.shape:
+                try:
+                    broadcast_shape = torch.broadcast_shapes(src.shape, dst.shape)
+                except RuntimeError:
+                    broadcast_shape = None
+                if broadcast_shape != dst.shape:
+                    raise RuntimeError(
+                        "CudaGraphBufferRegistry.fill_from shape mismatch: "
+                        f"slot={slot.name!r}, "
+                        f"dst_shape={tuple(dst.shape)}, "
+                        f"src_shape={tuple(src.shape)}, "
+                        f"raw_bs={raw_bs}, raw_num_tokens={raw_num_tokens}, "
+                        f"axis={slot.axis!r}"
+                    )
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":

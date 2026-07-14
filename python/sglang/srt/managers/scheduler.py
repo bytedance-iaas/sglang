@@ -952,12 +952,49 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
         if not self.enable_hisparse:
             return
 
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        draft_runner = kv_cache_builder.get_draft_model_runner(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+        if draft_runner is not None:
+            self.draft_hisparse_coordinator = draft_runner.hisparse_coordinator
+            if self.draft_hisparse_coordinator is not None:
+                self.draft_hisparse_coordinator.set_decode_producer_stream(
+                    self.forward_stream
+                )
+
+    def iter_hisparse_coordinators(self):
+        """Yield target and draft HiSparse coordinators without duplicates."""
+        if self.hisparse_coordinator is not None:
+            yield self.hisparse_coordinator
+        if (
+            self.draft_hisparse_coordinator is not None
+            and self.draft_hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            yield self.draft_hisparse_coordinator
+
+    def admit_hisparse_request_direct(self, req: Req) -> None:
+        for coordinator in self.iter_hisparse_coordinators():
+            coordinator.admit_request_direct(req)
+
+    def finish_hisparse_request(self, req: Req) -> None:
+        for coordinator in self.iter_hisparse_coordinators():
+            coordinator.request_finished(req)
+
+    def commit_hisparse_speculative_tokens(self, batch: ScheduleBatch) -> None:
+        if not self.enable_hisparse or batch.spec_algorithm.is_none():
+            return
+        for coordinator in self.iter_hisparse_coordinators():
+            coordinator.commit_speculative_tokens(batch.reqs)
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
@@ -1491,8 +1528,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.destroy()
+        for coordinator in self.iter_hisparse_coordinators():
+            coordinator.destroy()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1886,6 +1923,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            draft_hisparse_coordinator=self.draft_hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
@@ -1907,6 +1945,11 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        token_capacity = (
+            self.token_to_kv_pool_allocator.size
+            if self.enable_hisparse
+            else self.max_total_num_tokens
+        )
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -1916,7 +1959,7 @@ class Scheduler(
                     else 1 << 30
                 ),
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                token_capacity - paged_input_len - self.page_size - 1,
             ),
         )
 
@@ -3144,6 +3187,12 @@ class Scheduler(
 
         if batch.is_empty():
             return batch
+
+        # Speculative verification commits a variable-length run rather than
+        # the single token handled by ScheduleBatch.prepare_for_decode().
+        # Persist that run before preparing the next verify step so sparse
+        # attention never observes a committed token with no host mapping.
+        self.commit_hisparse_speculative_tokens(batch)
 
         # Update batch tensors
         batch.prepare_for_decode()

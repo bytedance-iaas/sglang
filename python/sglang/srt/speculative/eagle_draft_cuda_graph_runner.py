@@ -118,6 +118,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
             if speculative_num_steps is None
@@ -284,10 +285,42 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # EAGLE doesn't use stream_idx / lora variants.
         return ShapeKey(size=bs)
 
+    def _validate_dsa_seed_topk(self, forward_batch: ForwardBatch, raw_bs: int) -> None:
+        buffer = self.buffers.dsa_seed_topk
+        if buffer is None:
+            return
+        seed = forward_batch.spec_info.dsa_topk_indices
+        if seed is None:
+            return
+
+        target = buffer[:raw_bs]
+        seed_shape = tuple(seed.shape)
+        target_shape = tuple(target.shape)
+        buffer_shape = tuple(buffer.shape)
+        # PD disaggregation warmup intentionally reuses one shared DSA seed row
+        # for every request in the synthetic batch.  ``copy_`` supports that
+        # singleton broadcast.  Other mismatched batch axes are stale/non-
+        # broadcastable and must still be rejected before replay state mutates.
+        if not seed_shape or seed_shape[0] not in (1, raw_bs):
+            raise RuntimeError(
+                "EAGLEDraftCudaGraphRunner.replay dsa_seed_topk batch mismatch: "
+                f"raw_bs={raw_bs}, seed_shape={seed_shape}, "
+                f"target_shape={target_shape}, buffer_shape={buffer_shape}"
+            )
+        if seed_shape[1:] != target_shape[1:]:
+            raise RuntimeError(
+                "EAGLEDraftCudaGraphRunner.replay dsa_seed_topk "
+                "trailing shape mismatch: "
+                f"raw_bs={raw_bs}, seed_shape={seed_shape}, "
+                f"target_shape={target_shape}, buffer_shape={buffer_shape}"
+            )
+
     # -----------------------------------------------------------------
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self._is_long_context_cuda_graph_disabled(forward_batch):
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -485,11 +518,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
         buffers = self.buffers
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        self._validate_dsa_seed_topk(forward_batch, raw_bs)
+        self.deepep_adapter.replay()
 
         # Pad to nearest captured shape
         if self.require_mlp_tp_gather:

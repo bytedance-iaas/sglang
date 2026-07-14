@@ -143,6 +143,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
         self.attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
 
         # Disable parent paths that don't apply.
@@ -196,6 +197,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self._is_long_context_cuda_graph_disabled(forward_batch):
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs

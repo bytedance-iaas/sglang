@@ -78,6 +78,16 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    def _finish_hisparse_request(self, req: Req) -> None:
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.request_finished(req)
+        if (
+            self.draft_hisparse_coordinator is not None
+            and self.draft_hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            self.draft_hisparse_coordinator.request_finished(req)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -90,7 +100,7 @@ class SchedulerBatchResultProcessor:
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
+                    self._finish_hisparse_request(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -840,7 +850,7 @@ class SchedulerBatchResultProcessor:
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 if self.server_args.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
+                    self._finish_hisparse_request(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

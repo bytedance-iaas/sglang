@@ -1286,6 +1286,16 @@ class ModelRunnerKVCacheMixin:
 
         else:
             assert self.is_draft_worker
+            if self.enable_hisparse and isinstance(
+                self.token_to_kv_pool, HiSparseDSATokenToKVPool
+            ):
+                assert isinstance(
+                    self.token_to_kv_pool_allocator,
+                    HiSparseTokenToKVPoolAllocator,
+                )
+                self.token_to_kv_pool.register_mapping(
+                    self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                )
             if self.is_hybrid_swa:
                 swa_allocator = getattr(
                     self.token_to_kv_pool_allocator,

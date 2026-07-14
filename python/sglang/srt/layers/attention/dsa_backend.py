@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -18,6 +19,10 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+_LONG_SPEC_FUSED_TOPK_THRESHOLD = int(
+    os.environ.get("SGLANG_DSA_FUSED_TOPK_MAX_SPEC_SEQ_LEN", "131072")
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -1907,7 +1912,11 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        use_fused_topk_transform = (
+            envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not self._disable_fused_topk_for_long_spec(forward_batch)
+        )
+        if use_fused_topk_transform:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2679,7 +2688,11 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        use_fused_topk_transform = (
+            envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not self._disable_fused_topk_for_long_spec(forward_batch)
+        )
+        if use_fused_topk_transform:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2842,13 +2855,48 @@ class DeepseekSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
 
+    def _disable_fused_topk_for_long_spec(self, forward_batch: ForwardBatch) -> bool:
+        forward_mode = forward_batch.forward_mode
+        is_target_verify = forward_mode.is_target_verify()
+        is_draft_extend = False
+        if hasattr(forward_mode, "is_draft_extend"):
+            try:
+                is_draft_extend = forward_mode.is_draft_extend(include_v2=True)
+            except TypeError:
+                is_draft_extend = forward_mode.is_draft_extend()
+        if not is_draft_extend and hasattr(forward_mode, "is_draft_extend_v2"):
+            is_draft_extend = forward_mode.is_draft_extend_v2()
+        if not (is_target_verify or is_draft_extend):
+            return False
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+            return False
+
+        max_seq_len = (
+            int(seq_lens_cpu.max().item())
+            if hasattr(seq_lens_cpu, "max")
+            else max(int(x) for x in seq_lens_cpu)
+        )
+        if max_seq_len < _LONG_SPEC_FUSED_TOPK_THRESHOLD:
+            return False
+
+        logger.warning_once(
+            "Disable DSA fused topk transform for long speculative batch: "
+            "mode=%s max_seq_len=%s threshold=%s",
+            forward_batch.forward_mode,
+            max_seq_len,
+            _LONG_SPEC_FUSED_TOPK_THRESHOLD,
+        )
+        return True
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
         force_unfused = (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
-        )
+        ) or self._disable_fused_topk_for_long_spec(forward_batch)
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(

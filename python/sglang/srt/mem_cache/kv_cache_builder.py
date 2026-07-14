@@ -44,6 +44,22 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def get_draft_model_runner(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the model runner that owns speculative draft state."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        return draft_worker.draft_worker.draft_runner_list[0]
+    return draft_worker.draft_worker.draft_runner
+
+
 def get_draft_kv_pool(
     *,
     draft_worker: BaseTpWorker,
@@ -52,15 +68,12 @@ def get_draft_kv_pool(
 ):
     """Return the draft token-to-KV pool for the current draft worker,
     or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None
-
-    # V2 workers nest the draft runner under `.draft_worker`.
-    if server_args.enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-    else:
-        draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
+    draft_runner = get_draft_model_runner(
+        draft_worker=draft_worker,
+        spec_algorithm=spec_algorithm,
+        server_args=server_args,
+    )
+    return None if draft_runner is None else draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(

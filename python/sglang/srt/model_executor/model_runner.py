@@ -2339,6 +2339,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
+        if self.enable_hisparse:
+            # HiSparse keeps only a physical working set on device while its
+            # allocator owns a larger logical token space backed by host KV.
+            # Request-length admission must use that logical space, not the
+            # device pool profiled by max_total_num_tokens.
+            return self.token_to_kv_pool_allocator.size
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
