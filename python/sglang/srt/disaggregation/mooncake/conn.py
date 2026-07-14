@@ -1438,11 +1438,13 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
-                prefill_unique_rank = (
-                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-                    + self.pp_rank * self.attn_cp_size
-                    + self.attn_cp_rank
-                )
+                prefill_unique_rank = kv_chunk.prefill_response_rank
+                if prefill_unique_rank is None:
+                    prefill_unique_rank = (
+                        self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                        + self.pp_rank * self.attn_cp_size
+                        + self.attn_cp_rank
+                    )
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -1870,6 +1872,7 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
+        prefill_response_rank: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ) -> bool:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -1911,6 +1914,7 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 state_metadata=state_metadata,
+                prefill_response_rank=prefill_response_rank,
                 trace_ctx=trace_ctx,
             )
         )
@@ -2000,6 +2004,11 @@ class MooncakeKVSender(CommonKVSender):
         )
         if should_skip:
             return False
+        prefill_response_rank = (
+            self.kv_mgr.attn_tp_rank * (self.kv_mgr.pp_size * self.kv_mgr.attn_cp_size)
+            + self.pp_rank * self.kv_mgr.attn_cp_size
+            + self.kv_mgr.attn_cp_rank
+        )
 
         if not is_last_chunk:
             accepted = self.kv_mgr.add_transfer_request(
@@ -2009,6 +2018,7 @@ class MooncakeKVSender(CommonKVSender):
                 False,
                 state_indices=state_indices,
                 state_metadata=state_metadata,
+                prefill_response_rank=prefill_response_rank,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
@@ -2020,6 +2030,7 @@ class MooncakeKVSender(CommonKVSender):
                 aux_index=self.aux_index,
                 state_indices=state_indices,
                 state_metadata=state_metadata,
+                prefill_response_rank=prefill_response_rank,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         if not accepted:

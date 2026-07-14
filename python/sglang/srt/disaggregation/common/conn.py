@@ -965,6 +965,7 @@ class CommonKVSender(BaseKVSender):
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.conclude_state: Optional[KVPoll] = None
+        self.pp_rank = pp_rank
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
