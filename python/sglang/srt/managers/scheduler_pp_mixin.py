@@ -338,6 +338,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    self._pp_pd_buffer_release_ids(next_release_rids)
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -947,11 +948,30 @@ class SchedulerPPMixin:
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
-            if release_rids is not None:
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
+            pending_release_rids = getattr(
+                self, "_pp_pd_pending_release_forward_rids", []
+            )
+            if release_rids:
+                pending_release_rids = _pp_ordered_union(
+                    pending_release_rids, release_rids
                 )
+            if pending_release_rids:
+                send_release_work = self._pp_send_pyobj_to_next_stage(
+                    pending_release_rids, async_send=True
+                )
+                release_rids = []
+                self._pp_pd_pending_release_forward_rids = []
+            elif release_rids is not None:
+                release_rids = []
         return send_release_work, release_rids
+
+    def _pp_pd_buffer_release_ids(self: Scheduler, release_rids: Optional[List[str]]):
+        if self.pp_group.is_last_rank or not release_rids:
+            return
+        pending_release_rids = getattr(self, "_pp_pd_pending_release_forward_rids", [])
+        self._pp_pd_pending_release_forward_rids = _pp_ordered_union(
+            pending_release_rids, release_rids
+        )
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
