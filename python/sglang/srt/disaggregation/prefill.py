@@ -1395,7 +1395,10 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-            if getattr(req, "disagg_final_send_pending", False) and poll != KVPoll.Failed:
+            if getattr(req, "disagg_final_send_pending", False) and poll not in (
+                KVPoll.Failed,
+                KVPoll.Success,
+            ):
                 self.send_kv_chunk(req, last_chunk=True)
                 undone_reqs.append(req)
                 continue

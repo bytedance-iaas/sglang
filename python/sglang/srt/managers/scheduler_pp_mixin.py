@@ -338,6 +338,22 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    now = time.monotonic()
+                    last_log = getattr(
+                        self, "_last_pp_prefill_release_recv_log", 0.0
+                    )
+                    if now - last_log >= 5.0:
+                        logger.warning(
+                            "PP prefill release token recv: pp_rank=%s, "
+                            "mb_id=%s, next_mb_id=%s, tmbs_next=%s, "
+                            "release_rids=%s",
+                            self.ps.pp_rank,
+                            mb_id,
+                            next_mb_id,
+                            tmbs[next_mb_id],
+                            next_release_rids,
+                        )
+                        self._last_pp_prefill_release_recv_log = now
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -892,6 +908,7 @@ class SchedulerPPMixin:
         curr_transferred_rids = self._pp_pd_update_prefill_terminal_history(
             curr_transferred_rids
         )
+        prev_transferred_rids = None
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = curr_transferred_rids
@@ -904,6 +921,23 @@ class SchedulerPPMixin:
             transferred_rids = _pp_ordered_intersection(
                 prev_transferred_rids, curr_transferred_rids
             )
+        now = time.monotonic()
+        last_log = getattr(self, "_last_pp_prefill_transfer_consensus_log", 0.0)
+        if now - last_log >= 5.0:
+            logger.warning(
+                "PP prefill transfer consensus: pp_rank=%s, "
+                "prev=%s, curr_terminal_history=%s, output=%s, "
+                "inflight=%s",
+                self.ps.pp_rank,
+                prev_transferred_rids,
+                curr_transferred_rids,
+                transferred_rids,
+                [
+                    getattr(req, "rid", None)
+                    for req in getattr(self, "disagg_prefill_inflight_queue", [])
+                ],
+            )
+            self._last_pp_prefill_transfer_consensus_log = now
         return transferred_rids
 
     def _pp_pd_update_prefill_terminal_history(
@@ -959,6 +993,21 @@ class SchedulerPPMixin:
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
+        now = time.monotonic()
+        last_log = getattr(self, "_last_pp_prefill_release_send_log", 0.0)
+        if send_release_work and now - last_log >= 5.0:
+            logger.warning(
+                "PP prefill release token send: pp_rank=%s, "
+                "is_last_rank=%s, next_first_rank_mb_id=%s, "
+                "tmbs_next_first=%s, transferred_rids=%s, release_rids=%s",
+                self.ps.pp_rank,
+                self.pp_group.is_last_rank,
+                next_first_rank_mb_id,
+                tmbs[next_first_rank_mb_id],
+                transferred_rids,
+                release_rids,
+            )
+            self._last_pp_prefill_release_send_log = now
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
