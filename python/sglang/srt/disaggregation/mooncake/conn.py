@@ -375,20 +375,21 @@ class MooncakeKVManager(CommonKVManager):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
-            self._connect(
-                na.to_tcp(),
-                is_ipv6=na.is_ipv6,
-            ).send_multipart(
-                [
-                    b"CHUNK_READY",
-                    str(req.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(kv_chunk.index_slice.start).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    str(prefill_unique_rank).encode("ascii"),
-                ]
-            )
+            with self._socket_lock:
+                self._connect(
+                    na.to_tcp(),
+                    is_ipv6=na.is_ipv6,
+                ).send_multipart(
+                    [
+                        b"CHUNK_READY",
+                        str(req.room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(kv_chunk.index_slice.start).encode("ascii"),
+                        str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                        req.mooncake_session_id.encode("ascii"),
+                        str(prefill_unique_rank).encode("ascii"),
+                    ]
+                )
         except Exception:
             pass
 
@@ -958,18 +959,18 @@ class MooncakeKVManager(CommonKVManager):
         data: bytes,
     ):
         na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-
-        socket.send_multipart(
-            [
-                MooncakeKVManager.AUX_DATA_HEADER,
-                str(room).encode("ascii"),
-                str(buffer_index).encode("ascii"),
-                str(aux_index).encode("ascii"),
-                struct.pack(">I", len(data)),
-                data,
-            ]
-        )
+        with self._socket_lock:
+            socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+            socket.send_multipart(
+                [
+                    MooncakeKVManager.AUX_DATA_HEADER,
+                    str(room).encode("ascii"),
+                    str(buffer_index).encode("ascii"),
+                    str(aux_index).encode("ascii"),
+                    struct.pack(">I", len(data)),
+                    data,
+                ]
+            )
 
     def _handle_aux_data(self, msg: List[bytes]):
         """Handle AUX_DATA messages received by the decode thread."""
@@ -1377,13 +1378,14 @@ class MooncakeKVManager(CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ]
-        )
+        with self._socket_lock:
+            self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ]
+            )
 
     def transfer_worker(
         self,
@@ -1723,12 +1725,15 @@ class MooncakeKVManager(CommonKVManager):
                     # Send ACK back to decode endpoint
                     try:
                         na = NetworkAddress(decode_ip, decode_port)
-                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                            ]
-                        )
+                        with self._socket_lock:
+                            self._connect(
+                                na.to_tcp(), is_ipv6=na.is_ipv6
+                            ).send_multipart(
+                                [
+                                    b"ABORT_ACK",
+                                    str(room_to_be_aborted).encode("ascii"),
+                                ]
+                            )
                         logger.debug(
                             f"Sent ABORT_ACK for room {room_to_be_aborted} to "
                             f"{decode_ip}:{decode_port}"
@@ -1848,12 +1853,29 @@ class MooncakeKVManager(CommonKVManager):
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
+                        arrived_before = sorted(
+                            self.prefill_response_tracker[bootstrap_room]
+                        )
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
                             self.required_prefill_response_num_table[bootstrap_room]
                         )
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
+                        )
+                        arrived_after = sorted(
+                            self.prefill_response_tracker[bootstrap_room]
+                        )
+                        logger.warning(
+                            "Mooncake decode status received: room=%s, "
+                            "status=%s, prefill_rank=%s, expected=%s, "
+                            "arrived_before=%s, arrived_after=%s",
+                            bootstrap_room,
+                            status,
+                            prefill_rank,
+                            expected_response_num,
+                            arrived_before,
+                            arrived_after,
                         )
                         if arrived_response_num == expected_response_num:
                             self._last_missing_prefill_response_log.pop(
@@ -1888,7 +1910,21 @@ class MooncakeKVManager(CommonKVManager):
                                 self._last_missing_prefill_response_log[
                                     bootstrap_room
                                 ] = now
+                    else:
+                        logger.warning(
+                            "Mooncake decode status ignored for unknown room: "
+                            "room=%s, status=%s, prefill_rank=%s",
+                            bootstrap_room,
+                            status,
+                            prefill_rank,
+                        )
                 elif status == KVPoll.Failed:
+                    logger.warning(
+                        "Mooncake decode failure status received: "
+                        "room=%s, prefill_rank=%s",
+                        bootstrap_room,
+                        prefill_rank,
+                    )
                     self.record_failure(
                         bootstrap_room,
                         "Failed to get kvcache from prefill instance, it might be dead",

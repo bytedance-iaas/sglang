@@ -173,7 +173,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
-        self._socket_lock = threading.Lock()
+        self._socket_lock = threading.RLock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
