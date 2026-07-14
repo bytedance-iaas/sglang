@@ -2268,6 +2268,26 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        if spec_metadata and spec_metadata.get("dspark_hidden"):
+            logger.warning(
+                "Mooncake decode send metadata: room=%s, session=%s, "
+                "required_dst=%s, decode_prefix_len=%s, bootstrap_infos=%s",
+                self.bootstrap_room,
+                self.session_id,
+                self.required_dst_info_num,
+                decode_prefix_len,
+                [
+                    {
+                        "pp_rank": info.get("pp_rank"),
+                        "target_pp_rank": info.get("target_pp_rank"),
+                        "rank_ip": info.get("rank_ip"),
+                        "rank_port": info.get("rank_port"),
+                        "is_dummy": info.get("is_dummy"),
+                    }
+                    for info in self.bootstrap_infos
+                ],
+            )
+
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
