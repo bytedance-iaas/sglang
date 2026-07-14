@@ -921,6 +921,32 @@ class SchedulerPPMixin:
             transferred_rids = _pp_ordered_intersection(
                 prev_transferred_rids, curr_transferred_rids
             )
+            dropped_rids = [
+                rid for rid in prev_transferred_rids if rid not in curr_transferred_rids
+            ]
+            if dropped_rids:
+                logger.warning(
+                    "PP prefill transfer consensus dropped rids: pp_rank=%s, "
+                    "dropped=%s, prev=%s, curr_terminal_history=%s, "
+                    "inflight=%s",
+                    self.ps.pp_rank,
+                    dropped_rids,
+                    prev_transferred_rids,
+                    curr_transferred_rids,
+                    [
+                        {
+                            "rid": getattr(req, "rid", None),
+                            "room": getattr(req, "bootstrap_room", None),
+                            "pending_bootstrap": bool(
+                                getattr(req, "pending_bootstrap", False)
+                            ),
+                            "pending_final": bool(
+                                getattr(req, "disagg_final_send_pending", False)
+                            ),
+                        }
+                        for req in getattr(self, "disagg_prefill_inflight_queue", [])
+                    ],
+                )
         now = time.monotonic()
         last_log = getattr(self, "_last_pp_prefill_transfer_consensus_log", 0.0)
         if now - last_log >= 5.0:
