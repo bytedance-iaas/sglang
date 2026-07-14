@@ -84,6 +84,30 @@ def test_hisparse_pd_allocates_lockstep_target_and_draft_slots():
     assert draft.mem_pool_host.calls == [(2, 0, 8)]
 
 
+def test_hisparse_pd_reserves_complete_request_budget_but_returns_prompt_slice():
+    target = _coordinator(range(520))
+    draft = _coordinator(range(520))
+    queue = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            hisparse_coordinator=target,
+            draft_hisparse_coordinator=draft,
+            model_config=SimpleNamespace(context_len=1024),
+        )
+    )
+    req = SimpleNamespace(
+        req_pool_idx=2,
+        rid="req-reserved",
+        origin_input_ids=list(range(8)),
+        sampling_params=SimpleNamespace(max_new_tokens=512),
+    )
+
+    indices = DecodePreallocQueue._allocate_hisparse_host_slots(queue, req, 8)
+
+    torch.testing.assert_close(indices, torch.arange(8, dtype=torch.int64))
+    assert target.mem_pool_host.calls == [(2, 0, 520)]
+    assert draft.mem_pool_host.calls == [(2, 0, 520)]
+
+
 def test_hisparse_pd_rejects_diverged_target_and_draft_slots():
     queue = SimpleNamespace(
         scheduler=SimpleNamespace(

@@ -385,33 +385,69 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return draft_coordinator.mem_pool_host, "DRAM"
 
     def _allocate_hisparse_host_slots(self, req: Req, fill_len: int) -> torch.Tensor:
-        """Allocate identical target/draft host slots for one PD request."""
+        """Allocate identical target/draft host slots for one PD request.
+
+        The PD wire format uses one page-index vector for both target and draft
+        host buffers.  Reserving only the transferred prompt lets target verify
+        and draft iterations grow their independent host allocators at different
+        rates, so the next request can observe different free-list orders.  Keep
+        the allocators lock-step by reserving the request's complete validated
+        token budget up front, while returning only the prompt slice that the
+        prefill worker will transfer now.
+        """
         coordinator = self.scheduler.hisparse_coordinator
+        sampling_params = getattr(req, "sampling_params", None)
+        max_new_tokens = max(
+            int(getattr(sampling_params, "max_new_tokens", 0) or 0), 0
+        )
+        request_token_budget = (
+            len(getattr(req, "origin_input_ids", ())) + max_new_tokens
+        )
+        reserve_len = max(fill_len, request_token_budget)
+        model_config = getattr(self.scheduler, "model_config", None)
+        context_len = getattr(model_config, "context_len", None)
+        if context_len is not None:
+            reserve_len = min(reserve_len, int(context_len))
+
+        target_transfer_len = coordinator.host_token_len(fill_len)
+        target_reserve_len = coordinator.host_token_len(reserve_len)
         host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
             req.req_pool_idx,
             0,
-            coordinator.host_token_len(fill_len),
+            target_reserve_len,
         )
 
         draft_coordinator = self.scheduler.draft_hisparse_coordinator
         if draft_coordinator is None:
-            return host_indices
+            return host_indices[:target_transfer_len]
 
+        draft_transfer_len = draft_coordinator.host_token_len(fill_len)
+        draft_reserve_len = draft_coordinator.host_token_len(reserve_len)
+        if (target_transfer_len, target_reserve_len) != (
+            draft_transfer_len,
+            draft_reserve_len,
+        ):
+            raise RuntimeError(
+                "Target and draft HiSparse host lengths diverged during PD "
+                f"preallocation for req={req.rid}: "
+                f"target=({target_transfer_len}, {target_reserve_len}), "
+                f"draft=({draft_transfer_len}, {draft_reserve_len})"
+            )
         draft_host_indices = draft_coordinator.mem_pool_host.alloc_paged_token_slots(
             draft_coordinator.req_to_host_pool,
             draft_coordinator.req_to_host_pool_allocated_len,
             req.req_pool_idx,
             0,
-            draft_coordinator.host_token_len(fill_len),
+            draft_reserve_len,
         )
         if not torch.equal(host_indices, draft_host_indices):
             raise RuntimeError(
                 "Target and draft HiSparse host slots diverged during PD "
                 f"preallocation for req={req.rid}"
             )
-        return host_indices
+        return host_indices[:target_transfer_len]
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:

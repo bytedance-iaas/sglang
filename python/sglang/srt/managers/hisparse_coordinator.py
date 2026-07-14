@@ -929,23 +929,36 @@ class HiSparseCoordinator:
             backup_positions = accepted_token_positions[needs_backup]
             backup_req_indices = accepted_req_indices[needs_backup]
             backup_device_locs = accepted_device_locs[needs_backup]
-            host_page_size = getattr(self.mem_pool_host, "page_size", 1)
-            host_alloc_count = (
-                (backup_count + host_page_size - 1) // host_page_size
-            ) * host_page_size
-            host_locs_all = self.mem_pool_host.alloc(host_alloc_count)
-            if host_locs_all is None:
-                mapping[draft_cache_locs] = draft_mapping_snapshot
-                raise RuntimeError(
-                    "HiSparse host allocation failed while finalizing "
-                    f"{backup_count} accepted draft tokens"
-                )
-            host_locs = host_locs_all[:backup_count]
-            if host_alloc_count > backup_count:
-                self.mem_pool_host.free(host_locs_all[backup_count:])
-            host_locs = host_locs.to(device=self.device)
+            # PD preallocation reserves the complete validated request budget in
+            # both target and draft host pools.  Reuse those rows so speculative
+            # acceptance cannot perturb only the target allocator's free-list.
+            # Non-PD paths may not have reserved future rows and retain the
+            # original on-demand allocation behavior.
+            preallocated_host_locs = self.req_to_host_pool[
+                backup_req_indices, backup_positions
+            ]
+            if torch.all(preallocated_host_locs >= 0):
+                host_locs = preallocated_host_locs.to(device=self.device)
+            else:
+                host_page_size = getattr(self.mem_pool_host, "page_size", 1)
+                host_alloc_count = (
+                    (backup_count + host_page_size - 1) // host_page_size
+                ) * host_page_size
+                host_locs_all = self.mem_pool_host.alloc(host_alloc_count)
+                if host_locs_all is None:
+                    mapping[draft_cache_locs] = draft_mapping_snapshot
+                    raise RuntimeError(
+                        "HiSparse host allocation failed while finalizing "
+                        f"{backup_count} accepted draft tokens"
+                    )
+                host_locs = host_locs_all[:backup_count]
+                if host_alloc_count > backup_count:
+                    self.mem_pool_host.free(host_locs_all[backup_count:])
+                host_locs = host_locs.to(device=self.device)
+                self.req_to_host_pool[
+                    backup_req_indices, backup_positions
+                ] = host_locs
             self._backup_device_locs_to_host(host_locs, backup_device_locs)
-            self.req_to_host_pool[backup_req_indices, backup_positions] = host_locs
             mapping[accepted_cache_locs[needs_backup]] = backup_device_locs
 
         offsets = torch.cat(
