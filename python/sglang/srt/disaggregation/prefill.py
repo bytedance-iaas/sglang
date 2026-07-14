@@ -94,11 +94,14 @@ def _pp_stable_rid_hash(rid: str) -> int:
 
 def _is_dspark_pd_prefill_scheduler(scheduler: "Scheduler") -> bool:
     spec_algorithm = getattr(scheduler, "spec_algorithm", None)
-    return (
-        getattr(scheduler, "disaggregation_mode", None) == DisaggregationMode.PREFILL
-        and spec_algorithm is not None
-        and spec_algorithm.is_dspark()
-    )
+    if getattr(scheduler, "disaggregation_mode", None) != DisaggregationMode.PREFILL:
+        return False
+    if spec_algorithm is not None and spec_algorithm.is_dspark():
+        return True
+    bootstrap_queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+    kv_manager = getattr(bootstrap_queue, "kv_manager", None)
+    kv_args = getattr(kv_manager, "kv_args", None)
+    return StateType.DSPARK_HIDDEN in (getattr(kv_args, "state_types", []) or [])
 
 
 def maybe_release_metadata_buffer(

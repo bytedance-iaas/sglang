@@ -42,6 +42,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -2434,11 +2435,18 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _is_dspark_pd_prefill_enabled(self) -> bool:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return False
+        if self.spec_algorithm.is_dspark():
+            return True
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        kv_manager = getattr(bootstrap_queue, "kv_manager", None)
+        kv_args = getattr(kv_manager, "kv_args", None)
+        return StateType.DSPARK_HIDDEN in (getattr(kv_args, "state_types", []) or [])
+
     def _maybe_force_dspark_pd_prefill_radix_miss(self, req: Req):
-        if (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            and self.spec_algorithm.is_dspark()
-        ):
+        if self._is_dspark_pd_prefill_enabled():
             # Decode owns the DSpark hidden transfer window. Unless decode radix
             # cache explicitly promises a prefix via decode_prefix_len, prefill
             # must recompute the full target hidden rows instead of reusing its
