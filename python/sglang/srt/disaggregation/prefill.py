@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -1325,6 +1326,51 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        now = time.monotonic()
+        last_log = getattr(self, "_last_disagg_prefill_inflight_log", 0.0)
+        if now - last_log >= 5.0:
+            inflight_states = []
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+                sender = getattr(req, "disagg_kv_sender", None)
+                inflight_states.append(
+                    {
+                        "rid": req.rid,
+                        "room": getattr(req, "bootstrap_room", None),
+                        "poll": int(poll),
+                        "status": (
+                            sender.current_status()
+                            if sender is not None
+                            and hasattr(sender, "current_status")
+                            else None
+                        ),
+                        "pending_bootstrap": bool(
+                            getattr(req, "pending_bootstrap", False)
+                        ),
+                        "pending_final": bool(
+                            getattr(req, "disagg_final_send_pending", False)
+                        ),
+                        "has_transfer_infos": (
+                            sender.has_transfer_infos()
+                            if sender is not None
+                            and hasattr(sender, "has_transfer_infos")
+                            else None
+                        ),
+                        "transfer_infos": (
+                            sender.transfer_infos_progress()
+                            if sender is not None
+                            and hasattr(sender, "transfer_infos_progress")
+                            else None
+                        ),
+                    }
+                )
+            logger.warning(
+                "Disagg prefill inflight status: pp_rank=%s, "
+                "rids_to_check=%s, states=%s",
+                self.ps.pp_rank,
+                rids_to_check,
+                inflight_states,
+            )
+            self._last_disagg_prefill_inflight_log = now
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
