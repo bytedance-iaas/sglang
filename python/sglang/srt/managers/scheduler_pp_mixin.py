@@ -924,28 +924,53 @@ class SchedulerPPMixin:
             dropped_rids = [
                 rid for rid in prev_transferred_rids if rid not in curr_transferred_rids
             ]
-            if dropped_rids:
+            inflight_states = [
+                {
+                    "rid": getattr(req, "rid", None),
+                    "room": getattr(req, "bootstrap_room", None),
+                    "pending_bootstrap": bool(getattr(req, "pending_bootstrap", False)),
+                    "pending_final": bool(
+                        getattr(req, "disagg_final_send_pending", False)
+                    ),
+                    "status": (
+                        req.disagg_kv_sender.current_status()
+                        if hasattr(getattr(req, "disagg_kv_sender", None), "current_status")
+                        else None
+                    ),
+                }
+                for req in getattr(self, "disagg_prefill_inflight_queue", [])
+            ]
+            inflight_rids = {state["rid"] for state in inflight_states}
+            waiting_local_rids = [rid for rid in dropped_rids if rid in inflight_rids]
+            true_dropped_rids = [
+                rid for rid in dropped_rids if rid not in inflight_rids
+            ]
+            now = time.monotonic()
+            last_waiting_log = getattr(
+                self, "_last_pp_prefill_waiting_local_terminal_log", 0.0
+            )
+            if waiting_local_rids and now - last_waiting_log >= 5.0:
+                logger.warning(
+                    "PP prefill transfer consensus waiting local terminal: "
+                    "pp_rank=%s, waiting=%s, prev=%s, "
+                    "curr_terminal_history=%s, inflight=%s",
+                    self.ps.pp_rank,
+                    waiting_local_rids,
+                    prev_transferred_rids,
+                    curr_transferred_rids,
+                    inflight_states,
+                )
+                self._last_pp_prefill_waiting_local_terminal_log = now
+            if true_dropped_rids:
                 logger.warning(
                     "PP prefill transfer consensus dropped rids: pp_rank=%s, "
                     "dropped=%s, prev=%s, curr_terminal_history=%s, "
                     "inflight=%s",
                     self.ps.pp_rank,
-                    dropped_rids,
+                    true_dropped_rids,
                     prev_transferred_rids,
                     curr_transferred_rids,
-                    [
-                        {
-                            "rid": getattr(req, "rid", None),
-                            "room": getattr(req, "bootstrap_room", None),
-                            "pending_bootstrap": bool(
-                                getattr(req, "pending_bootstrap", False)
-                            ),
-                            "pending_final": bool(
-                                getattr(req, "disagg_final_send_pending", False)
-                            ),
-                        }
-                        for req in getattr(self, "disagg_prefill_inflight_queue", [])
-                    ],
+                    inflight_states,
                 )
         now = time.monotonic()
         last_log = getattr(self, "_last_pp_prefill_transfer_consensus_log", 0.0)
