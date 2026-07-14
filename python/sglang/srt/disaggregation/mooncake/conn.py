@@ -1609,7 +1609,7 @@ class MooncakeKVManager(CommonKVManager):
                                 logger.warning(
                                     "Mooncake prefill final status sync: room=%s, "
                                     "pp_rank=%s, response_rank=%s, status=%s, "
-                                    "dst_infos=%s/%s, is_dummy=%s",
+                                    "dst_infos=%s/%s, is_dummy=%s, dsts=%s",
                                     req.room,
                                     self.pp_rank,
                                     prefill_unique_rank,
@@ -1617,6 +1617,10 @@ class MooncakeKVManager(CommonKVManager):
                                     len(polls),
                                     req.required_dst_info_num,
                                     req.is_dummy,
+                                    [
+                                        f"{endpoint}:{dst_port}"
+                                        for endpoint, dst_port, _ in dst_ranks_infos
+                                    ],
                                 )
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
@@ -1880,6 +1884,13 @@ class MooncakeKVManager(CommonKVManager):
                         if arrived_response_num == expected_response_num:
                             self._last_missing_prefill_response_log.pop(
                                 bootstrap_room, None
+                            )
+                            logger.warning(
+                                "Mooncake decode prefill responses complete: "
+                                "room=%s, expected=%s, arrived=%s",
+                                bootstrap_room,
+                                expected_response_num,
+                                arrived_after,
                             )
                             if self.enable_staging:
                                 handler = self._staging_handler
