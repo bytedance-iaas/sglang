@@ -1940,12 +1940,33 @@ class DeepseekSparseAttnBackend(
                     page_size=1,
                 )
 
-        # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                num_reqs = forward_batch.req_pool_indices.shape[0]
+                num_steps = self.speculative_num_draft_tokens
+                assert topk_indices is not None
+                expected_shape = (num_reqs * num_steps, self.dsa_index_topk)
+                assert topk_indices.shape == expected_shape, (
+                    f"HiSparse speculative top-k shape mismatch: "
+                    f"{topk_indices.shape} != {expected_shape}; "
+                    f"mode={forward_batch.forward_mode}"
+                )
+                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                    forward_batch.req_pool_indices,
+                    metadata.dsa_seqlens_expanded[: num_reqs * num_steps],
+                    topk_indices.view(num_reqs, num_steps, -1),
+                    layer.layer_id,
+                    token_position_space="full",
+                    num_steps=num_steps,
+                ).view(num_reqs * num_steps, -1)
+            else:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2130,6 +2151,7 @@ class DeepseekSparseAttnBackend(
                 forward_batch.seq_lens,
                 topk_indices,
                 layer.layer_id,
+                token_position_space="full",
             )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
@@ -2868,6 +2890,11 @@ class DeepseekSparseAttnBackend(
             is_draft_extend = forward_mode.is_draft_extend_v2()
         if not (is_target_verify or is_draft_extend):
             return False
+        if self.hisparse_coordinator is not None:
+            # HiSparse needs raw token positions so the swap-in kernel can
+            # resolve graph-stable newest/draft slots before page-table
+            # transformation.  Fusing the transform would lose that space.
+            return True
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is None or len(seq_lens_cpu) == 0:

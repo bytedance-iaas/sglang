@@ -926,6 +926,146 @@ class TestHiSparseUnit(unittest.TestCase):
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "draft_slots_uniform")
 
+    def test_multistep_swap_resolves_graph_stable_extra_page_slots(self):
+        """Target-verify must not treat draft extra-page slots as host misses."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size
+        req = _make_req("multistep-extra-page", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
+        self._populate_host_pool(req, fill_len)
+        self.coordinator.admit_request_direct(req)
+
+        req_idx = req.req_pool_idx
+        num_steps = 3
+        extra_start = DEVICE_BUFFER_SIZE + 1
+        draft_positions = torch.arange(
+            fill_len,
+            fill_len + num_steps,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.coordinator.req_device_buffer_tokens[
+            :, req_idx, extra_start : extra_start + num_steps
+        ] = draft_positions
+
+        topk = torch.full(
+            (1, num_steps, TOP_K), -1, dtype=torch.int32, device="cuda"
+        )
+        for step in range(num_steps):
+            topk[0, step, : step + 1] = draft_positions[: step + 1]
+        seq_lens = torch.arange(
+            fill_len + 1,
+            fill_len + num_steps + 1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        req_pool_indices = torch.tensor(
+            [req_idx], dtype=torch.int64, device="cuda"
+        )
+        self.coordinator.num_real_reqs[0] = 1
+
+        # Warm the JIT module before capture; the measured path below must be
+        # graph-capturable and replay the same stable extra-page mappings.
+        self.coordinator.swap_in_selected_pages(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=seq_lens,
+            top_k_result=topk,
+            layer_id=0,
+            token_position_space="full",
+            num_steps=num_steps,
+        )
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            locs = self.coordinator.swap_in_selected_pages(
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=seq_lens,
+                top_k_result=topk,
+                layer_id=0,
+                token_position_space="full",
+                num_steps=num_steps,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected = self.coordinator.req_device_buffer_token_locs[
+            0, req_idx, extra_start : extra_start + num_steps
+        ]
+        for step in range(num_steps):
+            self.assertTrue(
+                torch.equal(locs[0, step, : step + 1], expected[: step + 1])
+            )
+            self.assertTrue(torch.all(locs[0, step, step + 1 :] == -1))
+            self.assertTrue(
+                torch.all(
+                    self.coordinator.req_to_host_pool[
+                        req_idx, fill_len : fill_len + step + 1
+                    ]
+                    == -1
+                )
+            )
+
+        self._cleanup_req(req, kv_loc, logical_only=True)
+        self._assert_sizes_restored(initial, "multistep_extra_page")
+
+    def test_multistep_short_seq_prefers_extra_page_draft_slots(self):
+        """Short-sequence fast path must not alias draft positions to hot slots."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        req = _make_req("multistep-short-extra-page", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+        req_idx = req.req_pool_idx
+        num_steps = 3
+        extra_start = DEVICE_BUFFER_SIZE + 1
+        draft_positions = torch.arange(
+            fill_len,
+            fill_len + num_steps,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.coordinator.req_device_buffer_tokens[
+            :, req_idx, extra_start : extra_start + num_steps
+        ] = draft_positions
+
+        topk = torch.full(
+            (1, num_steps, TOP_K), -1, dtype=torch.int32, device="cuda"
+        )
+        for step in range(num_steps):
+            topk[0, step, 0] = draft_positions[step]
+        seq_lens = torch.arange(
+            fill_len + 1,
+            fill_len + num_steps + 1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        req_pool_indices = torch.tensor(
+            [req_idx], dtype=torch.int64, device="cuda"
+        )
+        self.coordinator.num_real_reqs[0] = 1
+        locs = self.coordinator.swap_in_selected_pages(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=seq_lens,
+            top_k_result=topk,
+            layer_id=0,
+            token_position_space="full",
+            num_steps=num_steps,
+        )
+        torch.cuda.synchronize()
+
+        expected = self.coordinator.req_device_buffer_token_locs[
+            0, req_idx, extra_start : extra_start + num_steps
+        ]
+        self.assertTrue(torch.equal(locs[0, :, 0], expected))
+        self.assertTrue(torch.all(locs[0, :, 1:] == -1))
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "multistep_short_extra_page")
+
     def test_draft_slots_variable_respect_per_request_counts(self):
         """Variable draft slots only populate each request's actual token count."""
         initial = self._get_initial_sizes()

@@ -883,6 +883,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 swap_in_block_size=hisparse_cfg.swap_in_block_size,
+                max_num_steps=self.server_args.speculative_num_draft_tokens or 1,
             )
 
         self.init_routed_experts_capturer()

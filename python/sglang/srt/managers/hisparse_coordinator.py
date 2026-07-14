@@ -59,6 +59,7 @@ class HiSparseCoordinator:
         tp_group,
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
+        max_num_steps: int = 1,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -66,6 +67,7 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        self.max_num_steps = max(max_num_steps, 1)
         self.debug_validate_swap_in = (
             os.environ.get("SGLANG_HISPARSE_DEBUG_VALIDATE_SWAP_IN", "0") == "1"
         )
@@ -179,7 +181,10 @@ class HiSparseCoordinator:
 
         # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
         self.top_k_device_locs_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
+            (max_num_req_slots * self.max_num_steps, self.top_k),
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
@@ -1210,12 +1215,68 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        token_position_space: Literal["compressed", "full"] = "compressed",
+        num_steps: int = 1,
     ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices."""
-        num_reqs = req_pool_indices.size(0)
+        """Swap selected top-k tokens into device memory and return their indices.
 
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        Multi-step speculative calls use req-major tensors shaped
+        ``[num_reqs, num_steps, top_k]`` and a flat req-major sequence-length
+        vector.  The kernel processes all steps for one request in a single
+        block so LRU state and extra-page draft slots remain graph-stable.
+        """
+        num_reqs = req_pool_indices.size(0)
+        needed = num_reqs * num_steps
+
+        if needed > self.top_k_device_locs_buffer.shape[0]:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "HiSparse multi-step output buffer is too small during CUDA "
+                    f"Graph capture: need {needed}, have "
+                    f"{self.top_k_device_locs_buffer.shape[0]}"
+                )
+            self.top_k_device_locs_buffer = torch.full(
+                (needed, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        top_k_indices = self.top_k_device_locs_buffer[:needed]
+        if num_steps > 1:
+            top_k_indices = top_k_indices.view(num_reqs, num_steps, self.top_k)
         top_k_indices.fill_(-1)
+
+        swap_seq_lens = compressed_seq_lens
+        swap_top_k_result = top_k_result
+        if token_position_space == "full" and self.is_dsv4_hisparse:
+            if num_steps > 1:
+                seq_lens_for_compare = compressed_seq_lens.view(
+                    num_reqs, num_steps
+                ).unsqueeze(2)
+            else:
+                seq_lens_for_compare = compressed_seq_lens.unsqueeze(1)
+            valid_compressed_token = (
+                (top_k_result >= 0)
+                & (top_k_result < seq_lens_for_compare)
+                & ((top_k_result + 1) % self.compress_ratio == 0)
+            )
+            swap_top_k_result = torch.where(
+                valid_compressed_token,
+                top_k_result // self.compress_ratio,
+                torch.full_like(top_k_result, -1),
+            )
+            if num_steps > 1:
+                swap_seq_lens = (
+                    compressed_seq_lens.view(num_reqs, num_steps)
+                    // self.compress_ratio
+                ).reshape(-1)
+            else:
+                swap_seq_lens = compressed_seq_lens // self.compress_ratio
+        elif token_position_space != "compressed":
+            assert token_position_space == "full", (
+                f"Unsupported token_position_space={token_position_space}"
+            )
 
         # This validator intentionally performs host reads (``.item()`` and
         # ``.cpu()``).  Those synchronize the current stream and are illegal
@@ -1225,12 +1286,13 @@ class HiSparseCoordinator:
         # perturbing graph construction or replay.
         if (
             self.debug_validate_swap_in
+            and num_steps == 1
             and not torch.cuda.is_current_stream_capturing()
         ):
             self._validate_swap_in_metadata(
                 req_pool_indices=req_pool_indices,
-                seq_lens=compressed_seq_lens,
-                top_k_tokens=top_k_result,
+                seq_lens=swap_seq_lens,
+                top_k_tokens=swap_top_k_result,
                 layer_id=layer_id,
             )
 
@@ -1240,7 +1302,7 @@ class HiSparseCoordinator:
             else load_cache_to_device_buffer_mla
         )
         swap_in_fn(
-            top_k_tokens=top_k_result,
+            top_k_tokens=swap_top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
@@ -1248,14 +1310,15 @@ class HiSparseCoordinator:
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
-            seq_lens=compressed_seq_lens,
+            seq_lens=swap_seq_lens,
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
-            page_size=1,
+            page_size=self.mem_pool_device.page_size if num_steps > 1 else 1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            num_steps=num_steps,
         )
         return top_k_indices
 
