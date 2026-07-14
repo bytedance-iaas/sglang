@@ -338,22 +338,6 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    now = time.monotonic()
-                    last_log = getattr(
-                        self, "_last_pp_prefill_release_recv_log", 0.0
-                    )
-                    if now - last_log >= 5.0:
-                        logger.warning(
-                            "PP prefill release token recv: pp_rank=%s, "
-                            "mb_id=%s, next_mb_id=%s, tmbs_next=%s, "
-                            "release_rids=%s",
-                            self.ps.pp_rank,
-                            mb_id,
-                            next_mb_id,
-                            tmbs[next_mb_id],
-                            next_release_rids,
-                        )
-                        self._last_pp_prefill_release_recv_log = now
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -900,106 +884,29 @@ class SchedulerPPMixin:
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        curr_transferred_rids = self.get_rids(
-            self.disagg_prefill_inflight_queue,
-            True,
-            [KVPoll.Success, KVPoll.Failed],
-        )
-        curr_transferred_rids = self._pp_pd_update_prefill_terminal_history(
-            curr_transferred_rids
-        )
-        prev_transferred_rids = None
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = curr_transferred_rids
+            transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                True,
+                [KVPoll.Success, KVPoll.Failed],
+            )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                True,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = _pp_ordered_intersection(
                 prev_transferred_rids, curr_transferred_rids
             )
-            dropped_rids = [
-                rid for rid in prev_transferred_rids if rid not in curr_transferred_rids
-            ]
-            inflight_states = [
-                {
-                    "rid": getattr(req, "rid", None),
-                    "room": getattr(req, "bootstrap_room", None),
-                    "pending_bootstrap": bool(getattr(req, "pending_bootstrap", False)),
-                    "pending_final": bool(
-                        getattr(req, "disagg_final_send_pending", False)
-                    ),
-                    "status": (
-                        req.disagg_kv_sender.current_status()
-                        if hasattr(getattr(req, "disagg_kv_sender", None), "current_status")
-                        else None
-                    ),
-                }
-                for req in getattr(self, "disagg_prefill_inflight_queue", [])
-            ]
-            inflight_rids = {state["rid"] for state in inflight_states}
-            waiting_local_rids = [rid for rid in dropped_rids if rid in inflight_rids]
-            true_dropped_rids = [
-                rid for rid in dropped_rids if rid not in inflight_rids
-            ]
-            now = time.monotonic()
-            last_waiting_log = getattr(
-                self, "_last_pp_prefill_waiting_local_terminal_log", 0.0
-            )
-            if waiting_local_rids and now - last_waiting_log >= 5.0:
-                logger.warning(
-                    "PP prefill transfer consensus waiting local terminal: "
-                    "pp_rank=%s, waiting=%s, prev=%s, "
-                    "curr_terminal_history=%s, inflight=%s",
-                    self.ps.pp_rank,
-                    waiting_local_rids,
-                    prev_transferred_rids,
-                    curr_transferred_rids,
-                    inflight_states,
-                )
-                self._last_pp_prefill_waiting_local_terminal_log = now
-            if true_dropped_rids:
-                logger.warning(
-                    "PP prefill transfer consensus dropped rids: pp_rank=%s, "
-                    "dropped=%s, prev=%s, curr_terminal_history=%s, "
-                    "inflight=%s",
-                    self.ps.pp_rank,
-                    true_dropped_rids,
-                    prev_transferred_rids,
-                    curr_transferred_rids,
-                    inflight_states,
-                )
-        now = time.monotonic()
-        last_log = getattr(self, "_last_pp_prefill_transfer_consensus_log", 0.0)
-        if now - last_log >= 5.0:
-            logger.warning(
-                "PP prefill transfer consensus: pp_rank=%s, "
-                "prev=%s, curr_terminal_history=%s, output=%s, "
-                "inflight=%s",
-                self.ps.pp_rank,
-                prev_transferred_rids,
-                curr_transferred_rids,
-                transferred_rids,
-                [
-                    getattr(req, "rid", None)
-                    for req in getattr(self, "disagg_prefill_inflight_queue", [])
-                ],
-            )
-            self._last_pp_prefill_transfer_consensus_log = now
         return transferred_rids
-
-    def _pp_pd_update_prefill_terminal_history(
-        self: Scheduler, terminal_rids: List[str]
-    ) -> List[str]:
-        history = getattr(self, "_pp_pd_prefill_terminal_rid_history", [])
-        history = _pp_ordered_union(history, terminal_rids)
-        if len(history) > 1024:
-            history = history[-1024:]
-        self._pp_pd_prefill_terminal_rid_history = history
-        return history
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
@@ -1044,21 +951,6 @@ class SchedulerPPMixin:
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
-        now = time.monotonic()
-        last_log = getattr(self, "_last_pp_prefill_release_send_log", 0.0)
-        if send_release_work and now - last_log >= 5.0:
-            logger.warning(
-                "PP prefill release token send: pp_rank=%s, "
-                "is_last_rank=%s, next_first_rank_mb_id=%s, "
-                "tmbs_next_first=%s, transferred_rids=%s, release_rids=%s",
-                self.ps.pp_rank,
-                self.pp_group.is_last_rank,
-                next_first_rank_mb_id,
-                tmbs[next_first_rank_mb_id],
-                transferred_rids,
-                release_rids,
-            )
-            self._last_pp_prefill_release_send_log = now
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
