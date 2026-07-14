@@ -2409,6 +2409,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        self._maybe_force_dspark_pd_prefill_radix_miss(req)
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
@@ -2432,6 +2433,17 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+
+    def _maybe_force_dspark_pd_prefill_radix_miss(self, req: Req):
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.spec_algorithm.is_dspark()
+        ):
+            # Decode owns the DSpark hidden transfer window. Unless decode radix
+            # cache explicitly promises a prefix via decode_prefix_len, prefill
+            # must recompute the full target hidden rows instead of reusing its
+            # local prefix cache.
+            req.force_radix_miss_for_dspark_pd_prefill = True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3026,6 +3038,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            self._maybe_force_dspark_pd_prefill_radix_miss(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

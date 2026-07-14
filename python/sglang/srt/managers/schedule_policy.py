@@ -114,7 +114,9 @@ def match_prefix_for_req(
             req=req if include_req else None,
         )
     )
-    if envs.SGLANG_RADIX_FORCE_MISS.get():
+    if envs.SGLANG_RADIX_FORCE_MISS.get() or getattr(
+        req, "force_radix_miss_for_dspark_pd_prefill", False
+    ):
         match_result = zero_match_result(tree_cache, match_result)
     (
         req.prefix_indices,
@@ -288,7 +290,9 @@ class SchedulePolicy:
                         key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                     )
                 )
-                if envs.SGLANG_RADIX_FORCE_MISS.get():
+                if envs.SGLANG_RADIX_FORCE_MISS.get() or getattr(
+                    r, "force_radix_miss_for_dspark_pd_prefill", False
+                ):
                     match_result = zero_match_result(
                         self.waiting_queue_radix_tree, match_result
                     )

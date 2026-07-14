@@ -1221,7 +1221,9 @@ class Req(ReqDllmMixin):
                     cow_mamba=cow_mamba,
                 )
             )
-            if envs.SGLANG_RADIX_FORCE_MISS.get():
+            if envs.SGLANG_RADIX_FORCE_MISS.get() or getattr(
+                self, "force_radix_miss_for_dspark_pd_prefill", False
+            ):
                 match_result = zero_match_result(tree_cache, match_result)
             (
                 self.prefix_indices,
