@@ -1619,20 +1619,39 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
+        empty_final_chunk = False
         if end_idx < start_idx:
-            logger.debug(
-                "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
-                req.rid,
-                start_idx,
-                end_idx,
-            )
-            return
+            if last_chunk:
+                logger.warning(
+                    "Sending empty final disagg prefill chunk to preserve final "
+                    "status: rid=%s, bootstrap_room=%s, start_send_idx=%s, "
+                    "end_idx=%s",
+                    req.rid,
+                    req.bootstrap_room,
+                    start_idx,
+                    end_idx,
+                )
+                end_idx = start_idx
+                empty_final_chunk = True
+            else:
+                logger.debug(
+                    "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
+                    req.rid,
+                    start_idx,
+                    end_idx,
+                )
+                return
+        if end_idx == start_idx:
+            empty_final_chunk = last_chunk
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
+        if empty_final_chunk:
+            kv_indices = np.empty((0,), dtype=np.int32)
+        else:
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+                .cpu()
+                .numpy()
+            )
         state_indices: Optional[List] = None
         state_metadata: Optional[dict] = None
 
@@ -1863,7 +1882,7 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             req.disagg_final_send_pending = False
         _commit_dspark_hidden_sent_ranges(dspark_pending_ranges_to_commit)
-        req.start_send_idx = end_idx
+        req.start_send_idx = max(req.start_send_idx, end_idx)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

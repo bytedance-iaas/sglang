@@ -1611,10 +1611,18 @@ class MooncakeKVManager(CommonKVManager):
                                         prefill_unique_rank,
                                     )
                     else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
+                        # Dummy request has no KV/AUX payload, but decode may
+                        # still wait for this prefill rank's final response
+                        # when PP fan-in is required.
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Success,
+                                prefill_unique_rank,
+                            )
 
                     if self.enable_trace:
                         mooncake_trace_slice(
