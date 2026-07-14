@@ -567,6 +567,20 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             server_args.speculative_num_draft_tokens,
         ) = _auto_choose_speculative_params(server_args, model_arch)
 
+    if (
+        model_arch
+        in (
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        )
+        and server_args.speculative_eagle_topk > 1
+    ):
+        raise NotImplementedError(
+            "MiniMax-M3 sparse attention currently supports "
+            "--speculative-eagle-topk=1 only; tree attention masks for topk>1 "
+            "are not implemented in the sparse prefill kernels."
+        )
+
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if server_args.speculative_eagle_topk > 1:
             raise ValueError(

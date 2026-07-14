@@ -61,6 +61,23 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
+def _apply_gemm1_alpha_activation(
+    gateup: torch.Tensor,
+    *,
+    gemm1_alpha: float,
+    gemm1_clamp_limit: Optional[float],
+    gate_up_interleaved: bool,
+) -> torch.Tensor:
+    if gate_up_interleaved:
+        gate, up = gateup[..., ::2], gateup[..., 1::2]
+    else:
+        gate, up = torch.chunk(gateup, chunks=2, dim=-1)
+    if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
+        gate = torch.clamp(gate, max=gemm1_clamp_limit)
+        up = torch.clamp(up, min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1.0)
+
+
 def _use_sm90_mxfp8_fp8_grouped_gemm(quant_info: DeepGemmMoeQuantInfo) -> bool:
     return quant_info.use_mxfp8 and deep_gemm_wrapper.is_sm90_mxfp8_deepgemm_enabled()
 
@@ -184,7 +201,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = False
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        self.use_sigmoid_alpha_swiglu = self.config.gemm1_alpha is not None
+        assert not (
+            self.use_sigmoid_alpha_swiglu and self.swiglu_limit is not None
+        ), (
+            "gemm1_alpha selects sigmoid-alpha SwiGLU, while "
+            "swiglu_limit configures standard clamped SwiGLU. "
+            "Only one activation variant can be configured."
+        )
+        self.use_fused_contiguous_activation = (
+            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get()
+            and not self.use_sigmoid_alpha_swiglu
+        )
+        if self.use_fused_contiguous_activation:
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             self.use_swizzle = True
@@ -297,7 +326,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if self.use_fused_contiguous_activation:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -325,27 +354,35 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del gateup_output
         else:
-            # Hacky byte-equal fallback that reproduces the optimize-branch
-            # code path exactly: bf16 silu_and_mul then a separate per-token
-            # group fp8 quant. Kept behind the mega-moe-memory flag.
+            # Use the unfused path for activation variants that the contiguous
+            # JIT activation does not support, then quantize in a separate pass.
             from sglang.srt.layers.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
 
-            if self.swiglu_limit is not None:
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
+            if self.use_sigmoid_alpha_swiglu:
+                down_input = _apply_gemm1_alpha_activation(
+                    gateup_output,
+                    gemm1_alpha=self.config.gemm1_alpha,
+                    gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                    gate_up_interleaved=self.config.gate_up_interleaved,
                 )
-
-            if not _is_musa:
-                down_input = torch.empty(
-                    (all_tokens, N // 2),
-                    device=gateup_output.device,
-                    dtype=torch.bfloat16,
-                )
-                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
             else:
-                down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+                # Standard SwiGLU, optionally clamped by swiglu_limit.
+                if self.swiglu_limit is not None:
+                    gateup_output = _apply_swiglu_limit(
+                        gateup_output, swiglu_limit=self.swiglu_limit
+                    )
+
+                if not _is_musa:
+                    down_input = torch.empty(
+                        (all_tokens, N // 2),
+                        device=gateup_output.device,
+                        dtype=torch.bfloat16,
+                    )
+                    _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+                else:
+                    down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
             del gateup_output
 
             down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
@@ -628,14 +665,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         if (
             use_sm90_mxfp8 or (use_mxfp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
-        ) and down_input_scale.dtype == torch.float32:
-            import deep_gemm.utils.layout
+        ):
+            if down_input_scale.dtype == torch.float32:
+                import deep_gemm.utils.layout
 
-            down_input_scale = (
-                deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-                    down_input_scale
+                down_input_scale = (
+                    deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                        down_input_scale
+                    )
                 )
-            )
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
@@ -1186,7 +1224,9 @@ def _varlen_deep_gemm_silu_mul_quant(
             assert (
                 not swizzle
             ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        down_input_scale = torch.empty(
+        # Initialize skipped padding scales; invalid UE8M0 values can break the GEMM.
+        scale_factory = torch.ones if packed_ue8m0 else torch.empty
+        down_input_scale = scale_factory(
             (E, N, G),
             device=hidden_states_device,
             dtype=torch.float32,

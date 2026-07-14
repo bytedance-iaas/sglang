@@ -859,12 +859,6 @@ class MiniMaxM3Attention(nn.Module):
         qm = qp.quant_method
         if type(ip.quant_method) is not type(qm):
             return
-        # Some backends convert dense MXFP8 during the loader's post-process
-        # pass. The fused holder skips that pass, so keep the two original
-        # projections when conversion is required.
-        if getattr(qm, "convert_mxfp8_to_block", False):
-            return
-
         # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
         # fused module skips that pass, so keep two separate (converted) GEMMs.
         if getattr(qm, "convert_mxfp8_to_block", False):
@@ -1322,11 +1316,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+        if self.is_layer_sparse:
             hidden_states = self.mlp(
                 hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
+                forward_batch=forward_batch,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+        elif hidden_states.shape[0] != 0:
+            hidden_states = self.mlp(
+                hidden_states,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
             )
 
         if should_allreduce_fusion:

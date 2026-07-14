@@ -70,6 +70,22 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
 
         self.assertFalse(args.disable_overlap_schedule)
 
+    def test_minimax_m3_sparse_rejects_tree_speculation(self):
+        args = _make_spec_args(
+            device="cuda",
+            speculative_eagle_topk=2,
+            speculative_num_draft_tokens=8,
+        )
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["MiniMaxM3SparseForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            )
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "topk>1"):
+            handle_speculative_decoding(args)
+
 
 if __name__ == "__main__":
     unittest.main()
