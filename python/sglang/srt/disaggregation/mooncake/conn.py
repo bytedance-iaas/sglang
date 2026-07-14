@@ -1555,13 +1555,35 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.state_indices and not skip_state:
-                            self.maybe_send_extra(
+                            state_ret = self.maybe_send_extra(
                                 req,
                                 kv_chunk.state_indices,
                                 executor,
                                 target_rank_registration_info,
                                 state_metadata=kv_chunk.state_metadata,
                             )
+                            if state_ret != 0:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    if self.session_failures[req.mooncake_session_id] >= 1:
+                                        self.failed_sessions.add(req.mooncake_session_id)
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed."
+                                        )
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Failed to send state chunk of {kv_chunk.room} to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                )
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                )
+                                break
 
                         if kv_chunk.is_last_chunk:
                             # Only the last chunk we need to send the aux data
@@ -1933,12 +1955,12 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
-    ):
+    ) -> bool:
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
-            return
+            return False
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
@@ -1962,6 +1984,7 @@ class MooncakeKVSender(CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
+        return True
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

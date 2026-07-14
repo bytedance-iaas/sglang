@@ -79,11 +79,12 @@ class FakeKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
-    ):
+    ) -> bool:
         self.has_sent = True
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
+        return True
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")

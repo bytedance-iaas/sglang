@@ -1087,8 +1087,8 @@ class CommonKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
-    ):
-        pass
+    ) -> bool:
+        return False
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:

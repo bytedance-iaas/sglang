@@ -1171,6 +1171,7 @@ class NixlKVManager(CommonKVManager):
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             aux_notif = (
                                 f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
+                                f"_{kv_chunk.chunk_id}"
                             )
                         else:
                             aux_notif = f"{req.room}_aux"
@@ -2288,15 +2289,17 @@ class NixlKVManager(CommonKVManager):
 
         Notification tag layouts:
           aux:         {room}_aux                              -> 2 fields
-          aux (nokv):  {room}_aux_nokv_{pp_rank}               -> 4 fields
+          aux (nokv):  {room}_aux_nokv_{pp_rank}_{expected}    -> 5 fields
                        (decode-side radix cache hit; this pp_rank sent
-                       no KV pages, so expected_kvs_per_pp[pp_rank] = 0)
+                       no KV pages in the last chunk, so expected_kvs_per_pp
+                       is carried explicitly)
         """
         self.transfer_statuses[room].received_aux = True
         # main's "nokv" marker (decode-side radix cache hit, see #19746).
         if len(components) > 3 and components[2] == "nokv":
             pp_rank = int(components[3])
-            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
+            expected = int(components[4]) if len(components) > 4 else 0
+            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = expected
         if self.transfer_statuses[room].num_pp_ranks_expected is None:
             self.transfer_statuses[room].num_pp_ranks_expected = (
                 self.required_prefill_response_num_table.get(room, 1)
@@ -2517,15 +2520,15 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
-    ):
+    ) -> bool:
         if self._send_failed:
-            return
+            return False
 
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
-            return
+            return False
 
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None
@@ -2543,9 +2546,11 @@ class NixlKVSender(CommonKVSender):
             state_metadata,
         )
         self._record_transfer_indices(kv_indices, state_indices)
-        self.chunk_id += 1
+        if len(kv_indices) > 0:
+            self.chunk_id += 1
         if is_last_chunk:
             self.has_sent = True
+        return True
 
     def poll(self) -> KVPoll:
         if self._send_failed:

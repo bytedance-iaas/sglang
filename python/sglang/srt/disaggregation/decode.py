@@ -541,6 +541,47 @@ class _DSparkHiddenPagePool:
 _DSPARK_HIDDEN_PAGE_POOL = _DSparkHiddenPagePool()
 
 
+def _validate_dspark_hidden_row_coverage(
+    row_chunks: List[dict],
+    hidden_offset: int,
+    hidden_len: int,
+    raw_hidden_len: int,
+    rid: str,
+    pp_rank: int,
+) -> None:
+    if hidden_len <= 0:
+        return
+    coverage = bytearray(hidden_len)
+    expected_start = int(hidden_offset)
+    expected_end = expected_start + int(hidden_len)
+    for row_chunk in row_chunks:
+        chunk_start = int(row_chunk.get("row_start", 0))
+        chunk_len = int(row_chunk.get("row_len", 0))
+        chunk_end = chunk_start + chunk_len
+        if chunk_len <= 0:
+            continue
+        if chunk_start < 0 or chunk_end > raw_hidden_len:
+            raise RuntimeError(
+                "Invalid DSpark hidden receive row chunk: "
+                f"rid={rid}, pp_rank={pp_rank}, row_start={chunk_start}, "
+                f"row_len={chunk_len}, row_count={raw_hidden_len}"
+            )
+        overlap_start = max(expected_start, chunk_start)
+        overlap_end = min(expected_end, chunk_end)
+        if overlap_end <= overlap_start:
+            continue
+        coverage[overlap_start - expected_start : overlap_end - expected_start] = (
+            b"\x01" * (overlap_end - overlap_start)
+        )
+    if not all(coverage):
+        missing = [i for i, ok in enumerate(coverage) if not ok][:8]
+        raise RuntimeError(
+            "Incomplete DSpark hidden receive row coverage before assemble: "
+            f"rid={rid}, pp_rank={pp_rank}, hidden_offset={hidden_offset}, "
+            f"hidden_len={hidden_len}, missing_offsets={missing}"
+        )
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -2468,6 +2509,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                                 (pp_slice.get("dynamic_dst") or {}).get("row_chunks")
                                 or []
                             )
+                            if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
+                                _validate_dspark_hidden_row_coverage(
+                                    row_chunks,
+                                    hidden_offset,
+                                    hidden_len,
+                                    raw_hidden_len,
+                                    decode_req.req.rid,
+                                    int(pp_rank),
+                                )
                             slice_hidden = _DSPARK_HIDDEN_PAGE_POOL.assemble_pages(
                                 row_chunks,
                                 dynamic_buffer_or_chunks,

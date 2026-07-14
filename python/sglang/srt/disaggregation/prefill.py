@@ -439,6 +439,7 @@ class PrefillBootstrapQueue:
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
             req.dspark_hidden_written = []
+            req.dspark_hidden_sent = []
             req.dspark_hidden_pending_row_ranges = []
             return True
 
@@ -506,6 +507,7 @@ class PrefillBootstrapQueue:
         req.dspark_hidden_src_indices = src_indices
         req.dspark_hidden_dst_indices = dst_indices
         req.dspark_hidden_written = [False] * hidden_len
+        req.dspark_hidden_sent = [False] * hidden_len
         req.dspark_hidden_pending_row_ranges = []
         return True
 
@@ -1581,7 +1583,8 @@ class SchedulerDisaggregationPrefillMixin:
             len(page_indices), last_chunk=False
         ):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices=None)
+        if not req.disagg_kv_sender.send(page_indices, state_indices=None):
+            return
         req.start_send_idx = cached_end
 
     def send_kv_chunk(
@@ -1623,10 +1626,12 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         state_metadata: Optional[dict] = None
 
-        def _pop_dspark_hidden_ready_ranges(require_all: bool) -> Tuple[object, list]:
+        dspark_pending_ranges_to_commit = []
+
+        def _peek_dspark_hidden_ready_ranges(require_all: bool) -> Tuple[object, list, list]:
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not src_indices:
-                return None, []
+                return None, [], []
 
             written = getattr(req, "dspark_hidden_written", None)
             if require_all and written is not None and not all(written):
@@ -1636,27 +1641,54 @@ class SchedulerDisaggregationPrefillMixin:
                     f"rid={req.rid}, missing_offsets={missing}"
                 )
 
+            sent = getattr(req, "dspark_hidden_sent", None)
             pending_ranges = list(
                 getattr(req, "dspark_hidden_pending_row_ranges", []) or []
             )
             if not pending_ranges:
-                return None, []
+                if require_all and sent is not None and not all(sent):
+                    missing = [i for i, ok in enumerate(sent) if not ok][:8]
+                    raise RuntimeError(
+                        "DSpark hidden rows were written but not sent before PD transfer: "
+                        f"rid={req.rid}, missing_offsets={missing}"
+                    )
+                return None, [], []
 
-            req.dspark_hidden_pending_row_ranges = []
             row_ranges = [
                 {"row_start": int(row_start), "row_len": int(row_end - row_start)}
                 for row_start, row_end in pending_ranges
                 if int(row_end) > int(row_start)
             ]
             if not row_ranges:
-                return None, []
-            return np.asarray(src_indices, dtype=np.int32), row_ranges
+                return None, [], []
+            return np.asarray(src_indices, dtype=np.int32), row_ranges, pending_ranges
+
+        def _commit_dspark_hidden_sent_ranges(ranges: list) -> None:
+            if not ranges:
+                return
+            sent = getattr(req, "dspark_hidden_sent", None)
+            if sent is not None:
+                for row_start, row_end in ranges:
+                    sent[int(row_start) : int(row_end)] = [True] * (
+                        int(row_end) - int(row_start)
+                    )
+            pending_ranges = getattr(req, "dspark_hidden_pending_row_ranges", None)
+            if pending_ranges is not None:
+                req.dspark_hidden_pending_row_ranges = [
+                    pending
+                    for pending in pending_ranges
+                    if pending not in ranges
+                ]
 
         if not last_chunk:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            dspark_payload, dspark_row_ranges = _pop_dspark_hidden_ready_ranges(
+            (
+                dspark_payload,
+                dspark_row_ranges,
+                dspark_pending_ranges_to_commit,
+            ) = _peek_dspark_hidden_ready_ranges(
                 require_all=False
             )
             if dspark_payload is not None:
@@ -1737,8 +1769,12 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dspark_hidden_payload():
-                nonlocal state_metadata
-                payload, row_ranges = _pop_dspark_hidden_ready_ranges(require_all=True)
+                nonlocal state_metadata, dspark_pending_ranges_to_commit
+                (
+                    payload,
+                    row_ranges,
+                    dspark_pending_ranges_to_commit,
+                ) = _peek_dspark_hidden_ready_ranges(require_all=True)
                 if payload is None:
                     return []
                 state_metadata = {"dspark_hidden_row_ranges": row_ranges}
@@ -1776,7 +1812,12 @@ class SchedulerDisaggregationPrefillMixin:
             )
         ):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices, state_metadata)
+        send_accepted = req.disagg_kv_sender.send(
+            page_indices, state_indices, state_metadata
+        )
+        if not send_accepted:
+            return
+        _commit_dspark_hidden_sent_ranges(dspark_pending_ranges_to_commit)
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
@@ -1800,6 +1841,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.dspark_hidden_dst_indices = None
             req.dspark_hidden_meta = None
             req.dspark_hidden_written = None
+            req.dspark_hidden_sent = None
             req.dspark_hidden_pending_row_ranges = None
             req.dspark_hidden_capture_layer_ids = None
         req.pending_bootstrap = True
