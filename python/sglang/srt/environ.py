@@ -281,7 +281,10 @@ class Envs:
     SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_LIMIT = EnvInt(2)
     SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_BYTES = EnvInt(0)
     SGLANG_DSPARK_PD_FULL_HIDDEN_PREFIX_LIMIT = EnvInt(0)
-    SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES = EnvInt(8 * 1024 * 1024)
+    # DeepSeek-V4 DSpark hidden rows are large (e.g. 12288 bf16 ~= 24KB per
+    # row). Too-small chunks consume many registered receive pages per request
+    # and can make the page-pool limit serialize transfers.
+    SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES = EnvInt(32 * 1024 * 1024)
     SGLANG_DSPARK_KERNEL_SCATTER = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_RAGGED_WINDOW = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_SCHEDULE_TOPK = EnvStr("triton")
