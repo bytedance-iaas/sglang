@@ -1836,7 +1836,7 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
-    ):
+    ) -> bool:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
@@ -1847,13 +1847,15 @@ class MooncakeKVManager(CommonKVManager):
             logger.debug(
                 "Request with bootstrap_room=%s already failed", bootstrap_room
             )
-            return
+            return False
 
         if bootstrap_room not in self.transfer_infos:
-            # This means that the current rank is a dummy rank for this request,
-            # and it has already been marked as success, so there is no need to
-            # add further chunks into the transfer queue.
-            return
+            logger.debug(
+                "Request with bootstrap_room=%s has no transfer info yet; "
+                "deferring transfer enqueue",
+                bootstrap_room,
+            )
+            return False
 
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
@@ -1877,6 +1879,7 @@ class MooncakeKVManager(CommonKVManager):
                 trace_ctx=trace_ctx,
             )
         )
+        return True
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -1955,15 +1958,16 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> bool:
         kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
+            self._prepare_send_indices(kv_indices, state_indices, is_last_chunk)
         )
         if should_skip:
             return False
 
         if not is_last_chunk:
-            self.kv_mgr.add_transfer_request(
+            accepted = self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
@@ -1973,7 +1977,7 @@ class MooncakeKVSender(CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
-            self.kv_mgr.add_transfer_request(
+            accepted = self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
@@ -1983,6 +1987,9 @@ class MooncakeKVSender(CommonKVSender):
                 state_metadata=state_metadata,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
+        if not accepted:
+            self.curr_idx -= len(kv_indices)
+            return False
         self._record_transfer_indices(kv_indices, state_indices)
         return True
 

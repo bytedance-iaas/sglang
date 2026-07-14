@@ -1052,6 +1052,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
         """Common pre-processing for send(): index tracking and CP-rank handling.
 
@@ -1061,7 +1062,10 @@ class CommonKVSender(BaseKVSender):
         """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last_chunk = self.curr_idx == self.num_kv_indices
+        inferred_last_chunk = self.curr_idx == self.num_kv_indices
+        is_last_chunk = (
+            inferred_last_chunk if is_last_chunk is None else bool(is_last_chunk)
+        )
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
@@ -1087,6 +1091,7 @@ class CommonKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> bool:
         return False
 

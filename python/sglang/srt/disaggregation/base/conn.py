@@ -129,9 +129,11 @@ class BaseKVSender(ABC):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> bool:
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
+        If is_last_chunk is provided, it is the authoritative final-chunk signal.
         Returns True if the work was accepted by the sender, otherwise False.
         """
         ...

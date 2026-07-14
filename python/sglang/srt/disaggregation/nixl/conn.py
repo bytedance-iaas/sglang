@@ -2520,12 +2520,13 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> bool:
         if self._send_failed:
             return False
 
         kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
+            self._prepare_send_indices(kv_indices, state_indices, is_last_chunk)
         )
         if should_skip:
             return False

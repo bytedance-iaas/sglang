@@ -1583,7 +1583,9 @@ class SchedulerDisaggregationPrefillMixin:
             len(page_indices), last_chunk=False
         ):
             return
-        if not req.disagg_kv_sender.send(page_indices, state_indices=None):
+        if not req.disagg_kv_sender.send(
+            page_indices, state_indices=None, is_last_chunk=False
+        ):
             return
         req.start_send_idx = cached_end
 
@@ -1813,7 +1815,10 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
         send_accepted = req.disagg_kv_sender.send(
-            page_indices, state_indices, state_metadata
+            page_indices,
+            state_indices,
+            state_metadata,
+            is_last_chunk=last_chunk,
         )
         if not send_accepted:
             return

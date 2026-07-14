@@ -79,6 +79,7 @@ class FakeKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         state_metadata: Optional[dict] = None,
+        is_last_chunk: Optional[bool] = None,
     ) -> bool:
         self.has_sent = True
         logger.debug(
