@@ -22,6 +22,7 @@ from .compressed_tensors_wNa16_moe import (
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
+from .compressed_tensors_wmxfp4_afp8_moe import CompressedTensorsWMXFP4AFP8MoE
 
 __all__ = [
     "CompressedTensorsLinearScheme",
@@ -39,6 +40,7 @@ __all__ = [
     "WNA16_SUPPORTED_BITS",
     "CompressedTensorsW4A4Fp4",
     "CompressedTensorsW4A4Nvfp4MoE",
+    "CompressedTensorsWMXFP4AFP8MoE",
     "NPUCompressedTensorsW4A8Int8DynamicMoE",
     "CompressedTensorsMxInt4MoE",
 ]

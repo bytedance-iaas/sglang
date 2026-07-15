@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
+    CompressedTensorsWMXFP4AFP8MoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
@@ -491,6 +492,42 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_fp4_w4a8_group(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """Compressed-tensors W4A8 FP4 MoE: 4-bit float weight with group
+        quant (group_size % 32 == 0) + 8-bit float dynamic per-token
+        activation. Matches the ``fp4gN-pack-quantized`` checkpoint family
+        (e.g. DeepSeek-V4 with group_size=128)."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_float = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        if not is_float:
+            return False
+
+        if weight_quant.num_bits != 4 or input_quant.num_bits != 8:
+            return False
+
+        if weight_quant.strategy != QuantizationStrategy.GROUP.value:
+            return False
+        if input_quant.strategy != QuantizationStrategy.TOKEN.value:
+            return False
+
+        group_size = weight_quant.group_size
+        if not group_size or group_size % 32 != 0:
+            return False
+
+        # Weight is loaded from a static checkpoint, activation is dynamic
+        # per-token FP8.
+        if weight_quant.dynamic or not input_quant.dynamic:
+            return False
+
+        return weight_quant.symmetric and input_quant.symmetric
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -703,6 +740,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_fp4_w4a8_group(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsWMXFP4AFP8MoE")
+            return CompressedTensorsWMXFP4AFP8MoE(weight_quant, input_quant)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

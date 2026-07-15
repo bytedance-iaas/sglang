@@ -10,12 +10,16 @@ from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
 
+FP4G128_PACK_QUANTIZED_FORMAT = "fp4g128-pack-quantized"
+
+
 def is_activation_quantization_format(format: str) -> bool:
     _ACTIVATION_QUANTIZATION_FORMATS = [
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
         CompressionFormat.nvfp4_pack_quantized.value,
+        FP4G128_PACK_QUANTIZED_FORMAT,
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 

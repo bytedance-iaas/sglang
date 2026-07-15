@@ -1196,7 +1196,18 @@ def moe_ep_deepgemm_preprocess(
     compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
 
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
-    m_max = (hidden_states.size(0) // 256 + 1) * 256
+    # Upper bound if every dispatched token landed on a single expert (worst case).
+    conservative_m_max = (hidden_states.size(0) // 256 + 1) * 256
+    if _is_cuda and torch.cuda.is_current_stream_capturing():
+        # CUDA graph capture forbids GPU->CPU sync; fall back to worst-case bound.
+        m_max = conservative_m_max
+    else:
+        # Prefill (non-CUDA-graph) chunks can be very large (e.g. 8192 tokens).
+        # Using the worst-case bound blows up bf16 (num_experts, m_max, N) buffers
+        # in the downstream masked GEMM. Tighten via the actual dispatch counts.
+        m_max_actual = int(masked_m.max().item())
+        m_max = min(conservative_m_max, ((m_max_actual + 255) // 256) * 256)
+        m_max = max(m_max, 256)
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),

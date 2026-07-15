@@ -1378,14 +1378,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         runtime_scale = scale_param.data.repeat_interleave(
                             expand_ratio, dim=2
                         ).contiguous()
-                        # print(
-                        #     "[g128-debug] after-expand",
-                        #     "runtime_scale=",
-                        #     tuple(runtime_scale.shape),
-                        #     "expected_runtime_k_groups=",
-                        #     expected_runtime_k_groups,
-                        #     flush=True,
-                        # )
 
                         expected_runtime_k_groups = k // deepgemm_gran_k
                         if runtime_scale.shape[2] != expected_runtime_k_groups:
@@ -1404,12 +1396,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             num_groups=num_experts,
                             disable_ue8m0_cast=False,
                         )
-                        # print(
-                        #     "[g128-debug] after-transform",
-                        #     "scale_data=",
-                        #     tuple(scale_data.shape),
-                        #     flush=True,
-                        # )
 
                         e8m0_scale_data = torch.empty_strided(
                             scale_data.shape,

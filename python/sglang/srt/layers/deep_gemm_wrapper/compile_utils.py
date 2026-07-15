@@ -416,9 +416,14 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        rhs_s = self.rhs_s
-        if self.rhs_s_e8m0 is not None:
+        # sm90 fp8xfp4 kernel gates scale_b_direct_load / scale_b_e8m0 on
+        # expected_m<=16 (or bm32_skew_fast_path for specific shapes); for
+        # other m the kernel asserts sfb.scalar_type()==kFloat. Match that
+        # here so warmup can compile all m.
+        if self.rhs_s_e8m0 is not None and m <= 16:
             rhs_s = self.rhs_s_e8m0
+        else:
+            rhs_s = self.rhs_s
         deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, rhs_s),
