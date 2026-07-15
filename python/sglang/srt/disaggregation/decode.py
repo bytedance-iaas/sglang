@@ -1017,27 +1017,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
         if self.scheduler.enable_hisparse:
-            hisparse_avail = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            )
-            draft_coordinator = self.scheduler.draft_hisparse_coordinator
-            if draft_coordinator is not None:
-                draft_allocator = draft_coordinator.token_to_kv_pool_allocator
-                draft_avail = (
-                    draft_allocator.hisparse_attn_allocator.available_size()
-                )
-                hisparse_avail = min(hisparse_avail, draft_avail)
-                padded_buffer_size = max(
-                    self.scheduler.hisparse_coordinator.padded_buffer_size,
-                    draft_coordinator.padded_buffer_size,
-                )
-            else:
-                padded_buffer_size = (
-                    self.scheduler.hisparse_coordinator.padded_buffer_size
-                )
             hisparse_req_budget = max(
                 0,
-                hisparse_avail // padded_buffer_size
+                self.scheduler.hisparse_direct_admission_capacity()
                 - len(self.transfer_queue.queue),
             )
 

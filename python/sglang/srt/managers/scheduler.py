@@ -1002,19 +1002,34 @@ class Scheduler(
         """Return the number of direct-to-host requests that can be admitted now.
 
         A PD request is not runnable until both the target and draft HiSparse
-        coordinators own a full per-request device buffer.  The transfer queue
-        may contain more completed requests than those physical pools can hold,
-        so admission must use the minimum live capacity across coordinators.
+        coordinators own a full per-request device buffer.  Target and draft
+        runners may share the same physical HiSparse allocator, so capacity must
+        be computed per allocator using the sum of all per-request demands on
+        that allocator.  Treating the coordinators independently overcommits a
+        shared pool by the number of coordinators and fails on the later
+        ``alloc_device_buffer`` call.
+
+        The transfer queue may contain more completed requests than those
+        physical pools can hold, so the smallest live capacity across unique
+        allocators is the direct-admission budget.
         """
-        capacities = []
+        allocator_budgets = {}
         for coordinator in self.iter_hisparse_coordinators():
             hisparse_allocator = (
                 coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator
             )
-            available = hisparse_allocator.available_size()
-            capacities.append(available // coordinator.padded_buffer_size)
+            allocator_id = id(hisparse_allocator)
+            if allocator_id not in allocator_budgets:
+                allocator_budgets[allocator_id] = [hisparse_allocator, 0]
+            allocator_budgets[allocator_id][1] += coordinator.padded_buffer_size
 
-        return min(capacities, default=0)
+        return min(
+            (
+                allocator.available_size() // per_request_demand
+                for allocator, per_request_demand in allocator_budgets.values()
+            ),
+            default=0,
+        )
 
     def finish_hisparse_request(self, req: Req) -> None:
         for coordinator in self.iter_hisparse_coordinators():

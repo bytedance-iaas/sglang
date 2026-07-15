@@ -247,6 +247,28 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 2)
 
+    def test_hisparse_direct_admission_capacity_sums_shared_allocator_demand(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        shared_physical_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=18_624)
+        )
+        shared_allocator = SimpleNamespace(
+            hisparse_attn_allocator=shared_physical_allocator
+        )
+
+        def coordinator(padded):
+            return SimpleNamespace(
+                token_to_kv_pool_allocator=shared_allocator,
+                padded_buffer_size=padded,
+            )
+
+        scheduler.hisparse_coordinator = coordinator(6_208)
+        scheduler.draft_hisparse_coordinator = coordinator(6_208)
+
+        # One request consumes two buffers from the same physical pool.
+        self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 1)
+        shared_physical_allocator.available_size.assert_called_once_with()
+
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.running_batch = MagicMock()
