@@ -1,0 +1,66 @@
+sgl-kernel/benchmark/bench_cutlass_w4a8_moe_mm_configs.py
+  s_deedc126f22ecb::t_37486424c582eb 314-317 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4ba133e127d6363e6fa633","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[314,317]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ec0884cc703718d7d1f8246ad265f86c0160864c",
+  "prompts": {},
+  "sessions": {
+    "s_deedc126f22ecb": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a465851e127d6363e6f819a",
+        "model": "gpt-5.4__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "sgl-kernel/benchmark/bench_cutlass_w4a8_moe_mm_configs.py": [
+      {
+        "hash": "s_deedc126f22ecb::t_37486424c582eb",
+        "line_ranges": [
+          {
+            "Range": [
+              314,
+              317
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4ba133e127d6363e6fa633",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  314,
+                  317
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_deedc126f22ecb": {
+      "tool": "trae",
+      "conversation_id": "6a465851e127d6363e6f819a",
+      "session_id": "6a465851e127d6363e6f819a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_deedc126f22ecb::t_37486424c582eb": {
+      "tool": "trae",
+      "conversation_id": "6a465851e127d6363e6f819a",
+      "session_id": "6a465851e127d6363e6f819a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

@@ -1,0 +1,63 @@
+python/sglang/srt/speculative/dspark_components/dspark_draft.py
+  s_421cac7749974e::t_dd1b361a1d69a0 333-336,393-396 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5454951456988efbe1cc15","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[333,336]},{"Range":[393,396]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9a21a399cb19e5dce8fb9b91a6ae52b7f2b64666",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/speculative/dspark_components/dspark_draft.py": [
+      {
+        "hash": "s_421cac7749974e::t_dd1b361a1d69a0",
+        "line_ranges": [
+          {
+            "Range": [
+              333,
+              336
+            ]
+          },
+          {
+            "Range": [
+              393,
+              396
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5454951456988efbe1cc15",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  333,
+                  336
+                ]
+              },
+              {
+                "Range": [
+                  393,
+                  396
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {}
+}
