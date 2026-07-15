@@ -23,16 +23,36 @@ class _HostPool:
         num_tokens,
     ):
         self.calls.append((req_pool_idx, start_pos, num_tokens))
-        return self.indices[:num_tokens]
+        selected = self.indices[:num_tokens]
+        req_to_host_pool[req_pool_idx, start_pos : start_pos + num_tokens].copy_(
+            selected
+        )
+        req_to_host_pool_allocated_len[req_pool_idx] = start_pos + num_tokens
+        return selected
 
 
 def _coordinator(indices):
-    return SimpleNamespace(
+    indices = list(indices)
+    request_capacity = max(16, len(indices))
+    coordinator = SimpleNamespace(
         mem_pool_host=_HostPool(indices),
-        req_to_host_pool=torch.full((4, 16), -1, dtype=torch.int64),
+        req_to_host_pool=torch.full(
+            (4, request_capacity), -1, dtype=torch.int64
+        ),
         req_to_host_pool_allocated_len=torch.zeros(4, dtype=torch.int64),
         host_token_len=lambda length: length,
     )
+    coordinator.mem_pool_host.size = len(indices)
+
+    def mirror_host_slots_from(owner, req_pool_idx):
+        allocated_len = int(owner.req_to_host_pool_allocated_len[req_pool_idx])
+        coordinator.req_to_host_pool[req_pool_idx, :allocated_len].copy_(
+            owner.req_to_host_pool[req_pool_idx, :allocated_len]
+        )
+        coordinator.req_to_host_pool_allocated_len[req_pool_idx] = allocated_len
+
+    coordinator.mirror_host_slots_from = mirror_host_slots_from
+    return coordinator
 
 
 def test_hisparse_pd_draft_uses_host_pool():
@@ -66,7 +86,7 @@ def test_hisparse_pd_draft_requires_coordinator():
         DecodePreallocQueue._draft_pd_transfer_pool(queue)
 
 
-def test_hisparse_pd_allocates_lockstep_target_and_draft_slots():
+def test_hisparse_pd_mirrors_target_slots_without_draft_allocation():
     target = _coordinator(range(8))
     draft = _coordinator(range(8))
     queue = SimpleNamespace(
@@ -81,7 +101,8 @@ def test_hisparse_pd_allocates_lockstep_target_and_draft_slots():
 
     torch.testing.assert_close(indices, torch.arange(8, dtype=torch.int64))
     assert target.mem_pool_host.calls == [(2, 0, 8)]
-    assert draft.mem_pool_host.calls == [(2, 0, 8)]
+    assert draft.mem_pool_host.calls == []
+    torch.testing.assert_close(draft.req_to_host_pool[2, :8], indices)
 
 
 def test_hisparse_pd_reserves_complete_request_budget_but_returns_prompt_slice():
@@ -105,20 +126,25 @@ def test_hisparse_pd_reserves_complete_request_budget_but_returns_prompt_slice()
 
     torch.testing.assert_close(indices, torch.arange(8, dtype=torch.int64))
     assert target.mem_pool_host.calls == [(2, 0, 520)]
-    assert draft.mem_pool_host.calls == [(2, 0, 520)]
+    assert draft.mem_pool_host.calls == []
 
 
-def test_hisparse_pd_rejects_diverged_target_and_draft_slots():
+def test_hisparse_pd_mirroring_ignores_draft_free_list_order():
+    target = _coordinator(range(8))
+    draft = _coordinator(range(1, 9))
     queue = SimpleNamespace(
         scheduler=SimpleNamespace(
-            hisparse_coordinator=_coordinator(range(8)),
-            draft_hisparse_coordinator=_coordinator(range(1, 9)),
+            hisparse_coordinator=target,
+            draft_hisparse_coordinator=draft,
         )
     )
     req = SimpleNamespace(req_pool_idx=1, rid="req-diverged")
 
-    with pytest.raises(RuntimeError, match="host slots diverged"):
-        DecodePreallocQueue._allocate_hisparse_host_slots(queue, req, 8)
+    indices = DecodePreallocQueue._allocate_hisparse_host_slots(queue, req, 8)
+
+    torch.testing.assert_close(indices, torch.arange(8, dtype=torch.int64))
+    torch.testing.assert_close(draft.req_to_host_pool[1, :8], indices)
+    assert draft.mem_pool_host.calls == []
 
 
 def test_finished_request_releases_target_and_draft_hisparse_state():

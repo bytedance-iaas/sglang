@@ -197,6 +197,50 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
         self._pending_draft_extend_backup = None
+        # In PD+speculative decode, target and draft buffers are registered
+        # against one page-index vector. The target coordinator owns that
+        # logical slot namespace; the draft coordinator mirrors request maps
+        # and must not independently allocate or free those slot ids.
+        self._host_slot_owner = self
+
+    def mirror_host_slots_from(
+        self, owner: "HiSparseCoordinator", req_pool_idx: int
+    ) -> None:
+        """Mirror one request's canonical host slots from ``owner``.
+
+        The pools hold different layer payloads but the PD wire protocol indexes
+        all registered buffers with the same vector. Mirroring the mapping (as
+        opposed to allocating from the draft free list) remains correct even
+        when the two physical pools expose different token capacities.
+        """
+        if owner is self:
+            return
+        if self.page_size != owner.page_size:
+            raise RuntimeError(
+                "Cannot mirror HiSparse host slots with different page sizes: "
+                f"owner={owner.page_size}, mirror={self.page_size}"
+            )
+
+        allocated_len = int(owner.req_to_host_pool_allocated_len[req_pool_idx])
+        if allocated_len > self.req_to_host_pool.shape[1]:
+            raise RuntimeError(
+                "Draft HiSparse request map is smaller than the target mapping: "
+                f"required={allocated_len}, capacity={self.req_to_host_pool.shape[1]}"
+            )
+
+        owner_indices = owner.req_to_host_pool[req_pool_idx, :allocated_len]
+        if owner_indices.numel() > 0:
+            max_slot = int(owner_indices.max().item())
+            if max_slot >= self.mem_pool_host.size:
+                raise RuntimeError(
+                    "Draft HiSparse host buffer cannot address target slot: "
+                    f"slot={max_slot}, capacity={self.mem_pool_host.size}"
+                )
+
+        self._host_slot_owner = owner
+        self.req_to_host_pool[req_pool_idx, :] = -1
+        self.req_to_host_pool[req_pool_idx, :allocated_len].copy_(owner_indices)
+        self.req_to_host_pool_allocated_len[req_pool_idx] = allocated_len
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -1163,7 +1207,7 @@ class HiSparseCoordinator:
         # Free host memory that was allocated during admit_request_into_staging
         host_indices = self.req_to_host_pool[req.req_pool_idx]
         host_indices = host_indices[host_indices >= 0]
-        if host_indices.numel() > 0:
+        if host_indices.numel() > 0 and self._host_slot_owner is self:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
@@ -1209,7 +1253,7 @@ class HiSparseCoordinator:
 
         host_indices = self.req_to_host_pool[req.req_pool_idx]
         host_indices = host_indices[host_indices >= 0]
-        if host_indices.numel() > 0:
+        if host_indices.numel() > 0 and self._host_slot_owner is self:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
