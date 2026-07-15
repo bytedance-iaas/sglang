@@ -446,6 +446,33 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
 
+    def test_dspark_draft_context_uses_speculative_moe_backends(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        self._init(
+            moe_a2a_backend="none",
+            moe_runner_backend="triton",
+            speculative_moe_runner_backend="deep_gemm",
+            speculative_moe_a2a_backend="deepep",
+        )
+        worker = object.__new__(DSparkWorkerV2)
+        worker._draft_dp_context_enabled = False
+
+        with worker._draft_context():
+            self.assertEqual(get_moe_runner_backend().name, "DEEP_GEMM")
+            self.assertTrue(get_moe_a2a_backend().is_deepep())
+            self.assertTrue(get_flags().moe.disable_fp4_allgather)
+
+        self.assertEqual(get_moe_runner_backend().name, "TRITON")
+        self.assertTrue(get_moe_a2a_backend().is_none())
+        self.assertFalse(get_flags().moe.disable_fp4_allgather)
+
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_runner_backend,

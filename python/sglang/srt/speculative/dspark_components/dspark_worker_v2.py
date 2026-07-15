@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Optional
 
@@ -7,6 +7,10 @@ import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -272,10 +276,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        tp_context = (
+            draft_tp_context(get_parallel().attn_tp_group)
+            if self._draft_dp_context_enabled
+            else nullcontext()
+        )
+        with (
+            tp_context,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
 
     def alloc_memory_pool(
         self,
