@@ -1566,7 +1566,6 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         PoolName.SWA,
         PoolName.DEEPSEEK_V4_C4_STATE,
         PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-        PoolName.DEEPSEEK_V4_C128_STATE,
     }
 
     def __init__(
@@ -1700,7 +1699,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             device_pool.indexer_compress_state_pools,
         ):
             for pool in pools:
-                if pool is None:
+                if pool is None or pool.ratio == 128:
                     continue
                 state_tensor = pool.kv_score_buffer.kv_score
                 page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
