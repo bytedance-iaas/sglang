@@ -1,0 +1,51 @@
+ARG BASE_IMAGE=docker.io/lmsysorg/sglang:nightly-dev-20260712-14bef7cd@sha256:eaae99659c25ee87ba612cca065304ebc50bb4ffc6247af25b47aabb2f8d482c
+FROM ${BASE_IMAGE}
+
+ARG SGLANG_SOURCE_COMMIT
+ARG SGLANG_SOURCE_TREE
+ARG SGLANG_SOURCE_PYTHON_SHA256
+ARG SGLANG_BUILD_URL
+
+LABEL org.opencontainers.image.source="https://github.com/HanHan009527/sglang" \
+      org.opencontainers.image.revision="${SGLANG_SOURCE_COMMIT}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.source.commit="${SGLANG_SOURCE_COMMIT}" \
+      ai.sglang.source.tree="${SGLANG_SOURCE_TREE}" \
+      ai.sglang.source.python-manifest="${SGLANG_SOURCE_PYTHON_SHA256}" \
+      ai.sglang.source.delivery="image-baked-no-runtime-install"
+
+# The dependency image already contains the CUDA, PyTorch, DeepEP, Mooncake,
+# DeepGEMM, and sgl-kernel binaries used by the validated H20 runs. Replace the
+# complete Python source tree at the same editable-install path during image
+# construction. Serving Pods never fetch, patch, mount, or install source.
+RUN rm -rf /sgl-workspace/sglang/python
+COPY python /sgl-workspace/sglang/python
+COPY .glm52-build/tracked-python.manifest /usr/local/share/sglang/tracked-python.manifest
+
+RUN set -euo pipefail; \
+    test -n "${SGLANG_SOURCE_COMMIT}"; \
+    test -n "${SGLANG_SOURCE_TREE}"; \
+    test -n "${SGLANG_SOURCE_PYTHON_SHA256}"; \
+    printf '%s  %s\n' \
+      "${SGLANG_SOURCE_PYTHON_SHA256}" \
+      /usr/local/share/sglang/tracked-python.manifest \
+      | sha256sum --check --status; \
+    cd /sgl-workspace/sglang; \
+    sha256sum --check --status /usr/local/share/sglang/tracked-python.manifest; \
+    find python -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
+    printf 'commit=%s\ntree=%s\ntracked_python_sha256=%s\nbuild_url=%s\n' \
+      "${SGLANG_SOURCE_COMMIT}" \
+      "${SGLANG_SOURCE_TREE}" \
+      "${SGLANG_SOURCE_PYTHON_SHA256}" \
+      "${SGLANG_BUILD_URL}" \
+      > /usr/local/share/sglang/source-provenance.env; \
+    cd /tmp; \
+    python3 -c 'import pathlib, sglang; expected = pathlib.Path("/sgl-workspace/sglang/python/sglang/__init__.py"); actual = pathlib.Path(sglang.__file__).resolve(); print(f"SGLANG_IMAGE_IMPORT_FILE={actual}"); assert actual == expected'
+
+ENV SGLANG_BUILD_COMMIT=${SGLANG_SOURCE_COMMIT} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL} \
+    SGLANG_SOURCE_TREE=${SGLANG_SOURCE_TREE} \
+    SGLANG_SOURCE_PYTHON_SHA256=${SGLANG_SOURCE_PYTHON_SHA256}
+
+WORKDIR /sgl-workspace/sglang
+
