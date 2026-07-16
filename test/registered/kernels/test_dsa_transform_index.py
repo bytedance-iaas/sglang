@@ -231,6 +231,41 @@ class TestDSATransformIndex(CustomTestCase):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
 
+    def test_decode_fast_partial_dp_padding(self):
+        real_rows = 3
+        padded_rows = 4
+        context_length = 8192
+        page_table = self._make_page_table(real_rows, context_length)
+        topk_indices = self._make_topk(real_rows, context_length)
+        topk_indices = torch.cat(
+            [
+                topk_indices,
+                torch.full(
+                    (padded_rows - real_rows, TOPK),
+                    -1,
+                    dtype=topk_indices.dtype,
+                    device=self.device,
+                ),
+            ]
+        )
+        expected = torch.full(
+            (padded_rows, TOPK), -1, dtype=torch.int32, device=self.device
+        )
+        torch.gather(
+            page_table,
+            dim=1,
+            index=topk_indices[:real_rows].clamp(min=0),
+            out=expected[:real_rows],
+        )
+        expected[:real_rows][topk_indices[:real_rows] < 0] = -1
+
+        actual = transform_index_page_table_decode_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
