@@ -647,21 +647,6 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
-    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
-        kv_receiver = decode_req.kv_receiver
-        if kv_receiver is None:
-            return
-
-        try:
-            kv_receiver.clear()
-        except Exception:
-            logger.warning(
-                "Failed to clear decode receiver for aborted prealloc request %s",
-                decode_req.req.rid,
-                exc_info=True,
-            )
-        decode_req.kv_receiver = None
-
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -802,7 +787,8 @@ class DecodePreallocQueue:
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                self._clear_receiver(decode_req)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1505,21 +1491,6 @@ class DecodeTransferQueue:
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _clear_receiver(self, decode_req: DecodeRequest) -> None:
-        kv_receiver = decode_req.kv_receiver
-        if kv_receiver is None:
-            return
-
-        try:
-            kv_receiver.clear()
-        except Exception:
-            logger.warning(
-                "Failed to clear decode receiver for removed transfer request %s",
-                decode_req.req.rid,
-                exc_info=True,
-            )
-        decode_req.kv_receiver = None
-
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -1557,7 +1528,8 @@ class DecodeTransferQueue:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                self._clear_receiver(decode_req)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
