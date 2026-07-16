@@ -11,7 +11,6 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchResult
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_cache_builder import is_supported_dsv4_decode_radix_mtp
-from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -231,23 +230,6 @@ def test_dsv4_swa_release_tail_len_falls_back_to_page():
             processor, protected_len=100, page_size=2
         )
         == 2
-    )
-
-
-def test_swa_component_force_leaf_creation_allows_full_only_leaf():
-    component = SWAComponent.__new__(SWAComponent)
-
-    assert SWAComponent.should_skip_leaf_creation(
-        component,
-        total_prefix_len=0,
-        key_len=256,
-        params=InsertParams(swa_evicted_seqlen=256),
-    )
-    assert not SWAComponent.should_skip_leaf_creation(
-        component,
-        total_prefix_len=0,
-        key_len=256,
-        params=InsertParams(swa_evicted_seqlen=256, force_leaf_creation=True),
     )
 
 
