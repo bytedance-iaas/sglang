@@ -1,0 +1,230 @@
+python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+  s_deedc126f22ecb::t_9e7d8c1e411563 149-154,156-157,167-168,170-174,176,182-183 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4b58a9e127d6363e6f9c51","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[149,154]},{"Range":[156,157]},{"Range":[167,168]},{"Range":[170,174]},{"Single":176},{"Range":[182,183]}]}]}
+sgl-kernel/csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu
+  s_deedc126f22ecb::t_d72dfbc570a950 301-312,316-317,321-322,344-348,351-361,365-366,380-383 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4b5895e127d6363e6f9c0f","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[301,312]},{"Range":[316,317]},{"Range":[321,322]},{"Range":[344,348]},{"Range":[351,361]},{"Range":[365,366]},{"Range":[380,383]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "aa7c14fbd5e5a7afae498cbcf956274313dd6fec",
+  "prompts": {},
+  "sessions": {
+    "s_deedc126f22ecb": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a465851e127d6363e6f819a",
+        "model": "gpt-5.4__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/moe/cutlass_w4a8_moe.py": [
+      {
+        "hash": "s_deedc126f22ecb::t_9e7d8c1e411563",
+        "line_ranges": [
+          {
+            "Range": [
+              149,
+              154
+            ]
+          },
+          {
+            "Range": [
+              156,
+              157
+            ]
+          },
+          {
+            "Range": [
+              167,
+              168
+            ]
+          },
+          {
+            "Range": [
+              170,
+              174
+            ]
+          },
+          {
+            "Single": 176
+          },
+          {
+            "Range": [
+              182,
+              183
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4b58a9e127d6363e6f9c51",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  149,
+                  154
+                ]
+              },
+              {
+                "Range": [
+                  156,
+                  157
+                ]
+              },
+              {
+                "Range": [
+                  167,
+                  168
+                ]
+              },
+              {
+                "Range": [
+                  170,
+                  174
+                ]
+              },
+              {
+                "Single": 176
+              },
+              {
+                "Range": [
+                  182,
+                  183
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "sgl-kernel/csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu": [
+      {
+        "hash": "s_deedc126f22ecb::t_d72dfbc570a950",
+        "line_ranges": [
+          {
+            "Range": [
+              301,
+              312
+            ]
+          },
+          {
+            "Range": [
+              316,
+              317
+            ]
+          },
+          {
+            "Range": [
+              321,
+              322
+            ]
+          },
+          {
+            "Range": [
+              344,
+              348
+            ]
+          },
+          {
+            "Range": [
+              351,
+              361
+            ]
+          },
+          {
+            "Range": [
+              365,
+              366
+            ]
+          },
+          {
+            "Range": [
+              380,
+              383
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4b5895e127d6363e6f9c0f",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  301,
+                  312
+                ]
+              },
+              {
+                "Range": [
+                  316,
+                  317
+                ]
+              },
+              {
+                "Range": [
+                  321,
+                  322
+                ]
+              },
+              {
+                "Range": [
+                  344,
+                  348
+                ]
+              },
+              {
+                "Range": [
+                  351,
+                  361
+                ]
+              },
+              {
+                "Range": [
+                  365,
+                  366
+                ]
+              },
+              {
+                "Range": [
+                  380,
+                  383
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_deedc126f22ecb": {
+      "tool": "trae",
+      "conversation_id": "6a465851e127d6363e6f819a",
+      "session_id": "6a465851e127d6363e6f819a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_deedc126f22ecb::t_9e7d8c1e411563": {
+      "tool": "trae",
+      "conversation_id": "6a465851e127d6363e6f819a",
+      "session_id": "6a465851e127d6363e6f819a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_deedc126f22ecb::t_d72dfbc570a950": {
+      "tool": "trae",
+      "conversation_id": "6a465851e127d6363e6f819a",
+      "session_id": "6a465851e127d6363e6f819a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
