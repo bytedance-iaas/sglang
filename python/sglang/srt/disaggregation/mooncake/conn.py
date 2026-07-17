@@ -61,20 +61,6 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
-
-# #region debug-point A:pd-warmup-report
-def _trae_debug_pd_warmup(hypothesis_id: str, location: str, msg: str, data: dict):
-    logger.info(
-        "[PD-WARMUP-DEBUG] %s hypothesis=%s location=%s data=%s",
-        msg,
-        hypothesis_id,
-        location,
-        data,
-    )
-
-
-# #endregion
-
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -329,25 +315,6 @@ class MooncakeKVManager(CommonKVManager):
                 str(self.rank_port).encode("ascii"),
             ]
         )
-        # #region debug-point A:prefill-ready-sent
-        _trae_debug_pd_warmup(
-            "A",
-            "mooncake/conn.py:notify_dspark_hidden_chunk_ready",
-            "prefill sent DSpark hidden chunk ready",
-            {
-                "room": int(room),
-                "prefill_rank": int(prefill_rank),
-                "hidden_start": int(hidden_start),
-                "row_len": int(row_len),
-                "is_last": bool(is_last_hidden_chunk),
-                "dst_indices": int(len(dst_indices)),
-                "remote": remote,
-                "dst_port": int(dst_port),
-                "ack_host": self.local_ip,
-                "ack_port": int(self.rank_port),
-            },
-        )
-        # #endregion
 
     def wait_dspark_hidden_chunk_ack(
         self,
@@ -390,45 +357,10 @@ class MooncakeKVManager(CommonKVManager):
         key = (int(room), int(prefill_rank), int(hidden_start))
         with self.dspark_hidden_chunk_ack_cv:
             if self.dspark_hidden_chunk_acks.get(key, 0) < int(expected_count):
-                now = time.monotonic()
-                if not hasattr(self, "_dspark_hidden_ack_debug_last_time"):
-                    self._dspark_hidden_ack_debug_last_time = {}
-                last_log_time = self._dspark_hidden_ack_debug_last_time.get(key, 0.0)
-                if now - last_log_time > 5.0:
-                    self._dspark_hidden_ack_debug_last_time[key] = now
-                    # #region debug-point E:prefill-ack-missing
-                    _trae_debug_pd_warmup(
-                        "E",
-                        "mooncake/conn.py:consume_dspark_hidden_chunk_ack",
-                        "prefill has not received DSpark hidden chunk ACK yet",
-                        {
-                            "room": int(room),
-                            "prefill_rank": int(prefill_rank),
-                            "hidden_start": int(hidden_start),
-                            "expected_count": int(expected_count),
-                            "available_count": int(
-                                self.dspark_hidden_chunk_acks.get(key, 0)
-                            ),
-                        },
-                    )
-                    # #endregion
                 return False
             self.dspark_hidden_chunk_acks[key] -= int(expected_count)
             if self.dspark_hidden_chunk_acks[key] <= 0:
                 self.dspark_hidden_chunk_acks.pop(key, None)
-            # #region debug-point E:prefill-ack-consumed
-            _trae_debug_pd_warmup(
-                "E",
-                "mooncake/conn.py:consume_dspark_hidden_chunk_ack",
-                "prefill consumed DSpark hidden chunk ACK",
-                {
-                    "room": int(room),
-                    "prefill_rank": int(prefill_rank),
-                    "hidden_start": int(hidden_start),
-                    "expected_count": int(expected_count),
-                },
-            )
-            # #endregion
             return True
 
     def pop_dspark_hidden_ready_chunks(self, room: int) -> List[dict]:
@@ -1811,26 +1743,6 @@ class MooncakeKVManager(CommonKVManager):
                                 break
                             if not dspark_hidden_done:
                                 dspark_hidden_deferred = True
-                                # #region debug-point E:prefill-hidden-send-deferred
-                                _trae_debug_pd_warmup(
-                                    "E",
-                                    "mooncake/conn.py:transfer_worker",
-                                    "prefill DSpark hidden packet send deferred",
-                                    {
-                                        "room": int(kv_chunk.room),
-                                        "prefill_rank": int(prefill_unique_rank),
-                                        "hidden_start": int(
-                                            kv_chunk.dspark_hidden_start
-                                            if kv_chunk.dspark_hidden_start is not None
-                                            else -1
-                                        ),
-                                        "row_len": int(kv_chunk.dspark_hidden_row_len),
-                                        "packet_idx": int(
-                                            kv_chunk.dspark_hidden_packet_idx
-                                        ),
-                                    },
-                                )
-                                # #endregion
                                 continue
                             if (
                                 kv_chunk.dspark_hidden_start is not None
@@ -1864,20 +1776,6 @@ class MooncakeKVManager(CommonKVManager):
                     if dspark_hidden_failed:
                         continue
                     if waiting_for_ack and not ack_ready:
-                        # #region debug-point E:prefill-requeue-wait-ack
-                        _trae_debug_pd_warmup(
-                            "E",
-                            "mooncake/conn.py:transfer_worker",
-                            "prefill requeued DSpark hidden chunk while waiting for ACK",
-                            {
-                                "room": int(kv_chunk.room),
-                                "prefill_rank": int(prefill_unique_rank),
-                                "hidden_start": int(kv_chunk.dspark_hidden_start),
-                                "row_len": int(kv_chunk.dspark_hidden_row_len),
-                                "expected_acks": int(dspark_hidden_expected),
-                            },
-                        )
-                        # #endregion
                         queue.put(kv_chunk)
                         continue
                     if (
@@ -1885,20 +1783,6 @@ class MooncakeKVManager(CommonKVManager):
                         and not kv_chunk.dspark_hidden_ready_sent
                     ):
                         kv_chunk.dspark_hidden_ready_sent = True
-                        # #region debug-point E:prefill-ready-state-set
-                        _trae_debug_pd_warmup(
-                            "E",
-                            "mooncake/conn.py:transfer_worker",
-                            "prefill marked DSpark hidden ready sent and requeued for ACK",
-                            {
-                                "room": int(kv_chunk.room),
-                                "prefill_rank": int(prefill_unique_rank),
-                                "hidden_start": int(kv_chunk.dspark_hidden_start),
-                                "row_len": int(kv_chunk.dspark_hidden_row_len),
-                                "expected_acks": int(dspark_hidden_expected),
-                            },
-                        )
-                        # #endregion
                         queue.put(kv_chunk)
                         continue
                     current_status = self.request_status.get(kv_chunk.room)
@@ -2214,18 +2098,6 @@ class MooncakeKVManager(CommonKVManager):
                     with self.dspark_hidden_chunk_ack_cv:
                         self.dspark_hidden_chunk_acks[key] += 1
                         self.dspark_hidden_chunk_ack_cv.notify_all()
-                    # #region debug-point E:prefill-bootstrap-ack-received
-                    _trae_debug_pd_warmup(
-                        "E",
-                        "mooncake/conn.py:bootstrap_thread",
-                        "prefill bootstrap thread received DSpark hidden chunk ACK",
-                        {
-                            "room": int(room),
-                            "prefill_rank": int(prefill_rank),
-                            "hidden_start": int(hidden_start),
-                        },
-                    )
-                    # #endregion
                     continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
@@ -2371,23 +2243,6 @@ class MooncakeKVManager(CommonKVManager):
                                 "ack_port": ack_port,
                             }
                         )
-                    # #region debug-point A:decode-ready-received
-                    _trae_debug_pd_warmup(
-                        "A",
-                        "mooncake/conn.py:decode_thread",
-                        "decode received DSpark hidden chunk ready",
-                        {
-                            "room": int(room),
-                            "prefill_rank": int(prefill_rank),
-                            "hidden_start": int(hidden_start),
-                            "row_len": int(row_len),
-                            "is_last": bool(is_last_hidden_chunk),
-                            "dst_indices": int(len(dst_indices)),
-                            "ack_host": ack_host,
-                            "ack_port": int(ack_port),
-                        },
-                    )
-                    # #endregion
                     continue
                 if msg[0] == MooncakeKVManager.DSPARK_HIDDEN_CHUNK_ACK_HEADER:
                     room = int(msg[1].decode("ascii"))
@@ -2397,18 +2252,6 @@ class MooncakeKVManager(CommonKVManager):
                     with self.dspark_hidden_chunk_ack_cv:
                         self.dspark_hidden_chunk_acks[key] += 1
                         self.dspark_hidden_chunk_ack_cv.notify_all()
-                    # #region debug-point E:ack-received
-                    _trae_debug_pd_warmup(
-                        "E",
-                        "mooncake/conn.py:decode_thread",
-                        "Mooncake manager received DSpark hidden chunk ACK",
-                        {
-                            "room": int(room),
-                            "prefill_rank": int(prefill_rank),
-                            "hidden_start": int(hidden_start),
-                        },
-                    )
-                    # #endregion
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
