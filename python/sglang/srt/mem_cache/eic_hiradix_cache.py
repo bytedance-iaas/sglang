@@ -528,7 +528,7 @@ class EICHiRadixCache(RadixCache):
 
     def evict(self, params: EvictParams, retry_times: int = 3) -> EvictResult:
         start_time = time.perf_counter()
-        num_tokens = params.num_tokens
+        num_tokens = max(params.num_tokens, params.swa_num_tokens)
         while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
             self.writing_check()
             self.loading_check()
@@ -547,7 +547,10 @@ class EICHiRadixCache(RadixCache):
             idx = 0
 
             logger.debug(
-                f"evict {num_tokens} tokens, current evictable size {self.evictable_size_}, protect_size {self.protected_size_}, leaves {len(leaves)}"
+                f"evict {num_tokens} tokens, requested full {params.num_tokens}, "
+                f"requested swa {params.swa_num_tokens}, current evictable size "
+                f"{self.evictable_size_}, protect_size {self.protected_size_}, "
+                f"leaves {len(leaves)}"
             )
             while num_evicted < num_tokens and len(eviction_heap):
                 _priority, x = heapq.heappop(eviction_heap)
@@ -593,7 +596,10 @@ class EICHiRadixCache(RadixCache):
                 logger.info(
                     f"only evicted {num_evicted} tokens, less than requested {num_tokens}"
                 )
-            return EvictResult(num_tokens_evicted=num_evicted)
+            return EvictResult(
+                num_tokens_evicted=num_evicted,
+                swa_num_tokens_evicted=num_evicted,
+            )
 
     def _evict_backuped(self, node: TreeNode):
         if node.host_value is None:
