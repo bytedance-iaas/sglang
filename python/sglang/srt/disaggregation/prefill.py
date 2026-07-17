@@ -515,12 +515,15 @@ class PrefillBootstrapQueue:
                 f"hidden row pool: pp_rank={self.pp_rank}, "
                 f"local_layer_ids={local_layer_ids}"
             )
-        hidden_cost = min(hidden_len, len(dst_indices) if streaming_hidden else hidden_len)
-        if hidden_cost > pool.size:
+        source_window_rows = (
+            min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
+        )
+        hidden_cost = 0 if streaming_hidden else source_window_rows
+        if source_window_rows > pool.size:
             return None, (
                 "DSpark hidden rows exceed prefill hidden pool capacity: "
                 f"rid={req.rid}, hidden_len={hidden_len}, "
-                f"required_rows={hidden_cost}, pool_size={pool.size}"
+                f"required_rows={source_window_rows}, pool_size={pool.size}"
             )
 
         hidden_cost = (
@@ -577,7 +580,7 @@ class PrefillBootstrapQueue:
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
         streaming_hidden = bool(dspark_meta.get("streaming_hidden", False))
         window_rows = int(dspark_meta.get("streaming_window_rows", hidden_len))
-        required_rows = min(hidden_len, window_rows if streaming_hidden else hidden_len)
+        required_rows = 0 if streaming_hidden else min(hidden_len, window_rows)
         return required_rows <= pool.size and required_rows > hidden_row_credits
 
     def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
@@ -707,18 +710,29 @@ class PrefillBootstrapQueue:
             self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
-        source_window_rows = min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
-        src_indices = pool.alloc(source_window_rows)
-        if src_indices is None:
-            if source_window_rows > pool.size:
-                message = (
-                    "DSpark hidden rows exceed prefill hidden pool capacity: "
-                    f"rid={req.rid}, hidden_len={hidden_len}, "
-                    f"required_rows={source_window_rows}, pool_size={pool.size}. "
-                    "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
-                    "maximum prompt/hidden transfer length."
-                )
-                self._abort_dspark_hidden_bootstrap(req, message)
+        source_window_rows = (
+            min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
+        )
+        if source_window_rows > pool.size:
+            message = (
+                "DSpark hidden rows exceed prefill hidden pool capacity: "
+                f"rid={req.rid}, hidden_len={hidden_len}, "
+                f"required_rows={source_window_rows}, pool_size={pool.size}. "
+                "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
+                "maximum prompt/hidden transfer length."
+            )
+            self._abort_dspark_hidden_bootstrap(req, message)
+            return False
+        src_indices = None if streaming_hidden else pool.alloc(source_window_rows)
+        if src_indices is None and not streaming_hidden:
+            message = (
+                "DSpark hidden rows exceed prefill hidden pool capacity: "
+                f"rid={req.rid}, hidden_len={hidden_len}, "
+                f"required_rows={source_window_rows}, pool_size={pool.size}. "
+                "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
+                "maximum prompt/hidden transfer length."
+            )
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
         try:
@@ -1241,6 +1255,24 @@ class SchedulerDisaggregationPrefillMixin:
                     :, local_slice_start:local_slice_end
                 ]
             if streaming_hidden:
+                if src_indices is None:
+                    dst_indices = [
+                        int(x)
+                        for x in (
+                            local_pp_slice.get("dst_indices", [])
+                            if local_pp_slice
+                            else meta.get("dst_indices", [])
+                        )
+                    ]
+                    source_window_rows = min(hidden_len, len(dst_indices))
+                    src_indices = pool.alloc(source_window_rows)
+                    if src_indices is None:
+                        raise RuntimeError(
+                            "DSpark streaming hidden source window allocation failed: "
+                            f"rid={req.rid}, rows={source_window_rows}, "
+                            f"free_rows={pool.available_size()}, pool_rows={pool.size}"
+                        )
+                    req.dspark_hidden_src_indices = src_indices
                 rows = local_end - local_start
                 if rows > len(src_indices):
                     raise RuntimeError(
