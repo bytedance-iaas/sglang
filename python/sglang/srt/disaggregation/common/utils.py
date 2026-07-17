@@ -111,15 +111,7 @@ class DSparkHiddenRequestState:
         """Return accepted/future/stale for a streaming hidden chunk."""
         hidden_start = int(chunk.hidden_start)
         if hidden_start > self.next_start:
-            # Prefill may have a longer local radix-cache hit than Decode. In
-            # that case the first recomputed hidden chunk starts after the
-            # requested hidden range start, matching the full-hidden path's
-            # cached-prefix skip. Gaps after streaming has begun are still
-            # protocol errors.
-            if self.next_start == self.start:
-                self.next_start = hidden_start
-            else:
-                return "future"
+            return "future"
         if hidden_start < self.next_start:
             return "stale"
         next_start = hidden_start + int(chunk.row_len)
