@@ -1291,14 +1291,18 @@ class SchedulerDisaggregationPrefillMixin:
                         "DSpark streaming hidden chunk exceeds source window: "
                         f"rid={req.rid}, rows={rows}, window_rows={len(src_indices)}"
                     )
-                write_indices = src_indices[:rows]
+                source_offset = local_start % len(src_indices)
+                if source_offset + rows <= len(src_indices):
+                    write_indices = src_indices[source_offset : source_offset + rows]
+                else:
+                    first_rows = len(src_indices) - source_offset
+                    write_indices = (
+                        src_indices[source_offset:]
+                        + src_indices[: rows - first_rows]
+                    )
             else:
+                rows = local_end - local_start
                 write_indices = src_indices[local_start:local_end]
-            pool.write(
-                write_indices,
-                req_hidden_to_write[chunk_local_start:chunk_local_end],
-            )
-            rows = local_end - local_start
             prev_current_start = getattr(req, "dspark_hidden_current_start", None)
             prev_current_row_len = int(
                 getattr(req, "dspark_hidden_current_row_len", 0) or 0
@@ -1307,29 +1311,59 @@ class SchedulerDisaggregationPrefillMixin:
                 prev_current_start is not None
                 and prev_current_row_len > 0
                 and int(prev_current_start) != int(write_start)
-                and (
+            ):
+                prev_current_src_indices = getattr(
+                    req, "dspark_hidden_current_src_indices", None
+                )
+                if prev_current_src_indices is not None and set(
+                    int(x) for x in prev_current_src_indices
+                ).intersection(int(x) for x in write_indices):
+                    raise RuntimeError(
+                        "DSpark streaming hidden source window would overwrite an "
+                        "in-flight chunk: "
+                        f"rid={req.rid}, old_start={prev_current_start}, "
+                        f"old_rows={prev_current_row_len}, new_start={write_start}, "
+                        f"new_rows={rows}"
+                    )
+                if req.pending_bootstrap:
+                    raise RuntimeError(
+                        "DSpark streaming hidden current chunk would be overwritten "
+                        "before bootstrap is finalized: "
+                        f"rid={req.rid}, old_start={prev_current_start}, "
+                        f"old_rows={prev_current_row_len}, new_start={write_start}, "
+                        f"new_rows={rows}"
+                    )
+                if (
                     _should_log_dspark_hidden_trace(prev_current_start)
                     or _should_log_dspark_hidden_trace(write_start)
+                ):
+                    logger.info(
+                        "[DSPARK-HIDDEN-TRACE] prefill flushing unsent current hidden "
+                        "before overwrite rid=%s room=%s pp_rank=%s old_start=%d "
+                        "old_rows=%d new_start=%d new_rows=%d chunk_start=%d "
+                        "chunk_end=%d hidden_start=%d hidden_len=%d extend_len=%d",
+                        req.rid,
+                        getattr(req, "bootstrap_room", None),
+                        self.ps.pp_rank,
+                        int(prev_current_start),
+                        prev_current_row_len,
+                        int(write_start),
+                        int(rows),
+                        int(chunk_start),
+                        int(chunk_end),
+                        int(hidden_start),
+                        int(hidden_len),
+                        int(extend_len),
+                    )
+                self.send_kv_chunk(
+                    req,
+                    last_chunk=False,
+                    end_idx=int(prev_current_start) + prev_current_row_len,
                 )
-            ):
-                logger.info(
-                    "[DSPARK-HIDDEN-TRACE] prefill overwriting unsent current hidden "
-                    "rid=%s room=%s pp_rank=%s old_start=%d old_rows=%d "
-                    "new_start=%d new_rows=%d chunk_start=%d chunk_end=%d "
-                    "hidden_start=%d hidden_len=%d extend_len=%d",
-                    req.rid,
-                    getattr(req, "bootstrap_room", None),
-                    self.ps.pp_rank,
-                    int(prev_current_start),
-                    prev_current_row_len,
-                    int(write_start),
-                    int(rows),
-                    int(chunk_start),
-                    int(chunk_end),
-                    int(hidden_start),
-                    int(hidden_len),
-                    int(extend_len),
-                )
+            pool.write(
+                write_indices,
+                req_hidden_to_write[chunk_local_start:chunk_local_end],
+            )
             if _should_log_dspark_hidden_trace(
                 write_start, write_end >= hidden_start + hidden_len
             ):
@@ -1353,9 +1387,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             req.dspark_hidden_current_start = write_start
             req.dspark_hidden_current_row_len = rows
-            req.dspark_hidden_current_src_indices = (
-                src_indices[:rows] if streaming_hidden else src_indices[local_start:local_end]
-            )
+            req.dspark_hidden_current_src_indices = write_indices
             req.dspark_hidden_current_is_last = write_end >= hidden_start + hidden_len
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
@@ -1884,7 +1916,7 @@ class SchedulerDisaggregationPrefillMixin:
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(req.extend_range.end, transfer_input_len)
+            seq_len = min(end_idx, transfer_input_len)
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
