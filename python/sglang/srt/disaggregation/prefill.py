@@ -1926,7 +1926,10 @@ class SchedulerDisaggregationPrefillMixin:
             req.req_pool_idx, start_idx:end_idx
         ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
+        should_send_kv_chunk = req.disagg_kv_sender.should_send_kv_chunk(
+            len(page_indices), last_chunk
+        )
+        if not should_send_kv_chunk and not has_current_dspark_hidden:
             return True
         if (
             has_current_dspark_hidden

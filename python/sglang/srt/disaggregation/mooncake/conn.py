@@ -2505,12 +2505,15 @@ class MooncakeKVSender(CommonKVSender):
         dspark_hidden_chunk_meta = self._dspark_hidden_chunk_meta
         self._dspark_hidden_chunk_meta = None
         if not is_last_chunk:
+            source_event = self._source_event
+            self._source_event = None
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
                 False,
                 state_indices=state_indices,
+                source_event=source_event,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 dspark_hidden_start=(
                     dspark_hidden_chunk_meta[0] if dspark_hidden_chunk_meta else None
