@@ -88,6 +88,18 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def clear_dspark_hidden_request_state(req: Req) -> None:
+    req.dspark_hidden_meta = None
+    req.dspark_hidden_src_indices = None
+    req.dspark_hidden_dst_indices = None
+    req.dspark_hidden_written = None
+    req.dspark_hidden_capture_layer_ids = None
+    req.dspark_hidden_current_src_indices = None
+    req.dspark_hidden_current_start = None
+    req.dspark_hidden_current_row_len = 0
+    req.dspark_hidden_current_is_last = False
+
+
 def maybe_release_metadata_buffer(
     req: Req,
     allocator: ReqToMetadataIdxAllocator,
@@ -115,11 +127,9 @@ def maybe_release_metadata_buffer(
         )
         if not worker_released:
             dspark_hidden_pool.free(indices)
-        req.dspark_hidden_src_indices = None
-        req.dspark_hidden_written = None
+        clear_dspark_hidden_request_state(req)
     elif not indices:
-        req.dspark_hidden_src_indices = None
-    req.dspark_hidden_capture_layer_ids = None
+        clear_dspark_hidden_request_state(req)
 
 
 def maybe_release_dspark_hidden_rows(req: Req, dspark_hidden_pool) -> None:
@@ -129,8 +139,7 @@ def maybe_release_dspark_hidden_rows(req: Req, dspark_hidden_pool) -> None:
     indices = getattr(req, "dspark_hidden_src_indices", None)
     if indices:
         dspark_hidden_pool.free(indices)
-        req.dspark_hidden_src_indices = None
-        req.dspark_hidden_written = None
+        clear_dspark_hidden_request_state(req)
 
 
 def maybe_release_dspark_hidden_rows_on_hidden_done(
@@ -148,8 +157,7 @@ def maybe_release_dspark_hidden_rows_on_hidden_done(
     ):
         return False
 
-    req.dspark_hidden_src_indices = None
-    req.dspark_hidden_written = None
+    clear_dspark_hidden_request_state(req)
     return True
 
 

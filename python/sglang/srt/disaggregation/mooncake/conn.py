@@ -165,6 +165,9 @@ class MooncakeKVManager(CommonKVManager):
     DSPARK_HIDDEN_CHUNK_READY_HEADER = b"DSPARK_HIDDEN_CHUNK_READY"
     DSPARK_HIDDEN_CHUNK_ACK_HEADER = b"DSPARK_HIDDEN_CHUNK_ACK"
 
+    def supports_dspark_hidden_streaming(self) -> bool:
+        return True
+
     def __init__(
         self,
         args: KVArgs,
