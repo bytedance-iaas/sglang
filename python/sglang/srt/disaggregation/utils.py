@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from collections import deque
@@ -152,7 +153,36 @@ def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
+    ordered_keys: Optional[List[str]] = None,
 ):
+    if ordered_keys is not None:
+        assert len(ordered_keys) == len(pollers)
+        digest = hashlib.blake2b(digest_size=8)
+        for key in ordered_keys:
+            encoded_key = key.encode("utf-8")
+            digest.update(len(encoded_key).to_bytes(8, "little"))
+            digest.update(encoded_key)
+        signature = torch.tensor(
+            [
+                len(ordered_keys),
+                int.from_bytes(digest.digest(), "little", signed=True),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        signatures_match = True
+        for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+            gathered_signatures = [
+                torch.empty_like(signature) for _ in range(dist.get_world_size(group))
+            ]
+            dist.all_gather(gathered_signatures, signature, group=group)
+            signatures_match &= all(
+                torch.equal(signature, gathered_signature)
+                for gathered_signature in gathered_signatures
+            )
+        if not signatures_match:
+            return [KVPoll.Bootstrapping] * len(pollers)
+
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
     polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)

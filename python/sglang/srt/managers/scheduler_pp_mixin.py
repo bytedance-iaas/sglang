@@ -1527,10 +1527,15 @@ class SchedulerPPMixin:
         """
         Used by PP, get the required rids with the given poll statuses.
         """
+        pollers = [
+            req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue
+        ]
+        ordered_keys = [req.rid if is_send else req.req.rid for req in req_queue]
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
+            pollers,
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=ordered_keys,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
