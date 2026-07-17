@@ -428,6 +428,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self._stage_start = 0
             self._stage_end = len(compression_ratios)
         stage_ratios = compression_ratios[self._stage_start : self._stage_end]
+        stage_layer_num = len(stage_ratios)
 
         assert page_size % swa_page_size == 0
 
@@ -450,7 +451,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             dtype,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            layer_num,
+            stage_layer_num,
             device,
             enable_memory_saver,
         )
