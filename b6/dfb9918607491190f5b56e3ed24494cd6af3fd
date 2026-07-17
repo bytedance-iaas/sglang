@@ -1,0 +1,60 @@
+python/sglang/srt/disaggregation/decode.py
+  s_421cac7749974e::t_e01df6cb654547 66 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5459bb1456988efbe1d141","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":66}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b6dfb9918607491190f5b56e3ed24494cd6af3fd",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/disaggregation/decode.py": [
+      {
+        "hash": "s_421cac7749974e::t_e01df6cb654547",
+        "line_ranges": [
+          {
+            "Single": 66
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5459bb1456988efbe1d141",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 66
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_421cac7749974e": {
+      "tool": "trae",
+      "conversation_id": "6a54516b1456988efbe1cb66",
+      "session_id": "6a54516b1456988efbe1cb66",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_421cac7749974e::t_e01df6cb654547": {
+      "tool": "trae",
+      "conversation_id": "6a54516b1456988efbe1cb66",
+      "session_id": "6a54516b1456988efbe1cb66",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
