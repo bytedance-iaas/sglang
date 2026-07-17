@@ -350,7 +350,12 @@ class PrefillBootstrapQueue:
         return True
 
     def _requires_dspark_hidden_transfer(self, req: Req) -> bool:
-        return bool(self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room))
+        if self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room):
+            return True
+        return (
+            self.scheduler.spec_algorithm.is_dspark()
+            and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
+        )
 
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
@@ -1717,6 +1722,12 @@ class SchedulerDisaggregationPrefillMixin:
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
+                elif self.disagg_prefill_bootstrap_queue._requires_dspark_hidden_transfer(
+                    req
+                ):
+                    self.chunked_req = None
+                    if not self.enable_overlap:
+                        self.optimistic_release_and_requeue(req)
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
