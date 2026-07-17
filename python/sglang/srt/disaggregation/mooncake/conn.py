@@ -61,6 +61,16 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+
+def _should_log_dspark_hidden_trace(
+    hidden_start: Optional[int], is_last: bool = False
+) -> bool:
+    if is_last:
+        return True
+    if hidden_start is None:
+        return False
+    return int(hidden_start) < 4096
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -305,6 +315,22 @@ class MooncakeKVManager(CommonKVManager):
         dst_indices: List[int],
     ) -> None:
         na = NetworkAddress(remote, dst_port)
+        if _should_log_dspark_hidden_trace(hidden_start, is_last_hidden_chunk):
+            logger.info(
+                "[DSPARK-HIDDEN-TRACE] mooncake sending hidden ready "
+                "room=%s prefill_rank=%s hidden_start=%d rows=%d is_last=%s "
+                "dst_rows=%d remote=%s dst_port=%s ack_host=%s ack_port=%s",
+                int(room),
+                int(prefill_rank),
+                int(hidden_start),
+                int(row_len),
+                bool(is_last_hidden_chunk),
+                len(dst_indices),
+                remote,
+                int(dst_port),
+                self.local_ip,
+                int(self.rank_port),
+            )
         self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
             [
                 self.DSPARK_HIDDEN_CHUNK_READY_HEADER,
@@ -2277,6 +2303,22 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     ack_host = msg[7].decode("ascii")
                     ack_port = int(msg[8].decode("ascii"))
+                    if _should_log_dspark_hidden_trace(
+                        hidden_start, is_last_hidden_chunk
+                    ):
+                        logger.info(
+                            "[DSPARK-HIDDEN-TRACE] mooncake decode received hidden ready "
+                            "room=%s prefill_rank=%s hidden_start=%d rows=%d "
+                            "is_last=%s dst_rows=%d ack_host=%s ack_port=%s",
+                            int(room),
+                            int(prefill_rank),
+                            int(hidden_start),
+                            int(row_len),
+                            bool(is_last_hidden_chunk),
+                            len(dst_indices),
+                            ack_host,
+                            int(ack_port),
+                        )
                     with self.dspark_hidden_ready_lock:
                         self.dspark_hidden_ready_chunks[room].append(
                             {
@@ -2422,6 +2464,24 @@ class MooncakeKVManager(CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        if _should_log_dspark_hidden_trace(
+            dspark_hidden_start, dspark_hidden_is_last_chunk
+        ):
+            logger.info(
+                "[DSPARK-HIDDEN-TRACE] mooncake enqueue transfer hidden "
+                "room=%s pp_rank=%s hidden_start=%d rows=%d is_last_hidden=%s "
+                "kv_pages=%d index_slice=(%s,%s) is_last_chunk=%s shard=%d",
+                int(bootstrap_room),
+                int(self.pp_rank),
+                int(dspark_hidden_start),
+                int(dspark_hidden_row_len),
+                bool(dspark_hidden_is_last_chunk),
+                len(kv_indices),
+                index_slice.start,
+                index_slice.stop,
+                bool(is_last_chunk),
+                int(shard_idx),
+            )
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -2548,6 +2608,23 @@ class MooncakeKVSender(CommonKVSender):
 
         dspark_hidden_chunk_meta = self._dspark_hidden_chunk_meta
         self._dspark_hidden_chunk_meta = None
+        if dspark_hidden_chunk_meta and _should_log_dspark_hidden_trace(
+            dspark_hidden_chunk_meta[0], dspark_hidden_chunk_meta[2]
+        ):
+            logger.info(
+                "[DSPARK-HIDDEN-TRACE] mooncake sender send hidden "
+                "room=%s pp_rank=%s hidden_start=%d rows=%d is_last_hidden=%s "
+                "kv_pages=%d index_slice=(%s,%s) is_last_chunk=%s",
+                int(self.bootstrap_room),
+                int(self.kv_mgr.pp_rank),
+                int(dspark_hidden_chunk_meta[0]),
+                int(dspark_hidden_chunk_meta[1]),
+                bool(dspark_hidden_chunk_meta[2]),
+                len(kv_indices),
+                index_slice.start,
+                index_slice.stop,
+                bool(is_last_chunk),
+            )
         if not is_last_chunk:
             source_event = self._source_event
             self._source_event = None
