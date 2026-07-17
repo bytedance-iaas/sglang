@@ -352,10 +352,7 @@ class PrefillBootstrapQueue:
     def _requires_dspark_hidden_transfer(self, req: Req) -> bool:
         if self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room):
             return True
-        return (
-            self.scheduler.spec_algorithm.is_dspark()
-            and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
-        )
+        return StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
 
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
