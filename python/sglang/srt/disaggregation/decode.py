@@ -95,6 +95,20 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
+# #region debug-point A:pd-warmup-report
+def _trae_debug_pd_warmup(hypothesis_id: str, location: str, msg: str, data: dict):
+    logger.info(
+        "[PD-WARMUP-DEBUG] %s hypothesis=%s location=%s data=%s",
+        msg,
+        hypothesis_id,
+        location,
+        data,
+    )
+
+
+# #endregion
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -1345,6 +1359,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     dspark_hidden_start + dspark_hidden_len
                 )
                 decode_req.dspark_hidden_streaming_done = not dspark_hidden_streaming
+                # #region debug-point B:decode-prealloc-streaming
+                _trae_debug_pd_warmup(
+                    "B",
+                    "decode.py:prealloc_dspark_hidden",
+                    "decode preallocated DSpark hidden receive rows",
+                    {
+                        "rid": decode_req.req.rid,
+                        "room": int(decode_req.req.bootstrap_room),
+                        "bootstrap_host": decode_req.req.bootstrap_host,
+                        "bootstrap_port": int(decode_req.req.bootstrap_port),
+                        "streaming": bool(dspark_hidden_streaming),
+                        "hidden_start": int(dspark_hidden_start),
+                        "hidden_len": int(dspark_hidden_len),
+                        "window_rows": int(dspark_hidden_window_rows),
+                        "pool_size": int(dspark_pool.size),
+                        "free_rows": int(dspark_pool.available_size()),
+                        "pp_size": int(pp_size),
+                    },
+                )
+                # #endregion
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
@@ -2353,10 +2387,47 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         pop_chunks = getattr(self.kv_manager, "pop_dspark_hidden_ready_chunks", None)
         if pop_chunks is None:
+            # #region debug-point B:decode-drain-no-pop
+            _trae_debug_pd_warmup(
+                "B",
+                "decode.py:_drain_dspark_hidden_ready_chunks",
+                "decode cannot drain DSpark hidden chunks because pop API is missing",
+                {
+                    "rid": decode_req.req.rid,
+                    "room": int(decode_req.req.bootstrap_room),
+                    "next_start": int(decode_req.dspark_hidden_streaming_next_start),
+                    "end": int(decode_req.dspark_hidden_streaming_end),
+                },
+            )
+            # #endregion
             return
         chunks = pop_chunks(decode_req.req.bootstrap_room)
         if not chunks:
             return
+        # #region debug-point B:decode-drain-chunks
+        _trae_debug_pd_warmup(
+            "B",
+            "decode.py:_drain_dspark_hidden_ready_chunks",
+            "decode popped DSpark hidden ready chunks",
+            {
+                "rid": decode_req.req.rid,
+                "room": int(decode_req.req.bootstrap_room),
+                "chunk_count": int(len(chunks)),
+                "next_start": int(decode_req.dspark_hidden_streaming_next_start),
+                "end": int(decode_req.dspark_hidden_streaming_end),
+                "chunks": [
+                    {
+                        "hidden_start": int(chunk.get("hidden_start", -1)),
+                        "row_len": int(chunk.get("row_len", -1)),
+                        "is_last": bool(chunk.get("is_last_hidden_chunk", False)),
+                        "dst_indices": int(len(chunk.get("dst_indices", []))),
+                        "prefill_rank": int(chunk.get("prefill_rank", -1)),
+                    }
+                    for chunk in chunks[:4]
+                ],
+            },
+        )
+        # #endregion
         dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
         if dspark_pool is None:
             raise RuntimeError("DSpark hidden row pool disappeared on decode.")
@@ -2404,6 +2475,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         f"expected_end={decode_req.dspark_hidden_streaming_end}"
                     )
                 decode_req.dspark_hidden_streaming_done = True
+                # #region debug-point C:decode-hidden-done
+                _trae_debug_pd_warmup(
+                    "C",
+                    "decode.py:_drain_dspark_hidden_ready_chunks",
+                    "decode marked DSpark hidden streaming done",
+                    {
+                        "rid": decode_req.req.rid,
+                        "room": int(decode_req.req.bootstrap_room),
+                        "hidden_start": int(hidden_start),
+                        "row_len": int(row_len),
+                        "next_start": int(
+                            decode_req.dspark_hidden_streaming_next_start
+                        ),
+                        "end": int(decode_req.dspark_hidden_streaming_end),
+                    },
+                )
+                # #endregion
             ack_chunk = getattr(self.kv_manager, "ack_dspark_hidden_chunk", None)
             if ack_chunk is not None:
                 ack_chunk(
@@ -2502,6 +2590,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.dspark_hidden_streaming
                     and not decode_req.dspark_hidden_streaming_done
                 ):
+                    now = time.monotonic()
+                    last_log_time = getattr(
+                        decode_req, "_dspark_hidden_gate_debug_last_time", 0.0
+                    )
+                    if now - last_log_time > 5.0:
+                        decode_req._dspark_hidden_gate_debug_last_time = now
+                        # #region debug-point C:decode-success-gated
+                        _trae_debug_pd_warmup(
+                            "C",
+                            "decode.py:pop_transferred",
+                            "decode KV poll succeeded but waits for DSpark hidden streaming done",
+                            {
+                                "rid": decode_req.req.rid,
+                                "room": int(decode_req.req.bootstrap_room),
+                                "poll": str(poll),
+                                "bootstrap_host": decode_req.req.bootstrap_host,
+                                "bootstrap_port": int(decode_req.req.bootstrap_port),
+                                "next_start": int(
+                                    decode_req.dspark_hidden_streaming_next_start
+                                ),
+                                "end": int(decode_req.dspark_hidden_streaming_end),
+                                "done": bool(
+                                    decode_req.dspark_hidden_streaming_done
+                                ),
+                            },
+                        )
+                        # #endregion
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
