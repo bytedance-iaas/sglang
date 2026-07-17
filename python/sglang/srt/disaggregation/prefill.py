@@ -1257,39 +1257,7 @@ class SchedulerDisaggregationPrefillMixin:
                     :, local_slice_start:local_slice_end
                 ]
             if streaming_hidden:
-                if src_indices is None:
-                    dst_indices = [
-                        int(x)
-                        for x in (
-                            local_pp_slice.get("dst_indices", [])
-                            if local_pp_slice
-                            else meta.get("dst_indices", [])
-                        )
-                    ]
-                    source_window_rows = min(hidden_len, len(dst_indices))
-                    src_indices = pool.alloc(source_window_rows)
-                    if src_indices is None:
-                        raise RuntimeError(
-                            "DSpark streaming hidden source window allocation failed: "
-                            f"rid={req.rid}, rows={source_window_rows}, "
-                            f"free_rows={pool.available_size()}, pool_rows={pool.size}"
-                        )
-                    req.dspark_hidden_src_indices = src_indices
                 rows = local_end - local_start
-                if rows > len(src_indices):
-                    raise RuntimeError(
-                        "DSpark streaming hidden chunk exceeds source window: "
-                        f"rid={req.rid}, rows={rows}, window_rows={len(src_indices)}"
-                    )
-                source_offset = local_start % len(src_indices)
-                if source_offset + rows <= len(src_indices):
-                    write_indices = src_indices[source_offset : source_offset + rows]
-                else:
-                    first_rows = len(src_indices) - source_offset
-                    write_indices = (
-                        src_indices[source_offset:]
-                        + src_indices[: rows - first_rows]
-                    )
             else:
                 rows = local_end - local_start
                 write_indices = src_indices[local_start:local_end]
@@ -1302,19 +1270,6 @@ class SchedulerDisaggregationPrefillMixin:
                 and prev_current_row_len > 0
                 and int(prev_current_start) != int(write_start)
             ):
-                prev_current_src_indices = getattr(
-                    req, "dspark_hidden_current_src_indices", None
-                )
-                if prev_current_src_indices is not None and set(
-                    int(x) for x in prev_current_src_indices
-                ).intersection(int(x) for x in write_indices):
-                    raise RuntimeError(
-                        "DSpark streaming hidden source window would overwrite an "
-                        "in-flight chunk: "
-                        f"rid={req.rid}, old_start={prev_current_start}, "
-                        f"old_rows={prev_current_row_len}, new_start={write_start}, "
-                        f"new_rows={rows}"
-                    )
                 if req.pending_bootstrap:
                     raise RuntimeError(
                         "DSpark streaming hidden current chunk would be overwritten "
@@ -1328,6 +1283,16 @@ class SchedulerDisaggregationPrefillMixin:
                     last_chunk=False,
                     end_idx=int(prev_current_start) + prev_current_row_len,
                 )
+            if streaming_hidden:
+                write_indices = pool.alloc(rows)
+                if write_indices is None:
+                    raise RuntimeError(
+                        "DSpark streaming hidden source chunk allocation failed: "
+                        f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
+                        f"pool_rows={pool.size}. Streaming source rows are released "
+                        "only after the matching hidden chunk ACK."
+                    )
+                req.dspark_hidden_src_indices = write_indices
             pool.write(
                 write_indices,
                 req_hidden_to_write[chunk_local_start:chunk_local_end],
@@ -1853,6 +1818,11 @@ class SchedulerDisaggregationPrefillMixin:
             current_dspark_hidden_src_indices is not None
             and current_dspark_hidden_row_len > 0
         )
+        streaming_dspark_hidden = bool(
+            (getattr(req, "dspark_hidden_meta", None) or {}).get(
+                "streaming_hidden", False
+            )
+        )
 
         state_indices: Optional[List] = None
         if last_chunk or has_current_dspark_hidden:
@@ -1995,9 +1965,13 @@ class SchedulerDisaggregationPrefillMixin:
                     int(current_dspark_hidden_start),
                     int(current_dspark_hidden_row_len),
                     bool(getattr(req, "dspark_hidden_current_is_last", False)),
-                    getattr(req, "dspark_hidden_src_indices", None),
+                    current_dspark_hidden_src_indices
+                    if streaming_dspark_hidden
+                    else getattr(req, "dspark_hidden_src_indices", None),
                 )
         req.disagg_kv_sender.send(page_indices, state_indices)
+        if has_current_dspark_hidden and streaming_dspark_hidden:
+            req.dspark_hidden_src_indices = None
         req.dspark_hidden_current_src_indices = None
         req.dspark_hidden_current_start = None
         req.dspark_hidden_current_row_len = 0

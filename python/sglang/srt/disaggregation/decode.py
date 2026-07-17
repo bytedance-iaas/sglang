@@ -2422,6 +2422,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 hidden,
                 hidden_chunk.hidden_start,
             )
+            if torch.cuda.is_available():
+                torch.cuda.current_stream(
+                    self.scheduler.draft_worker.device
+                ).synchronize()
             ack_chunk = getattr(self.kv_manager, "ack_dspark_hidden_chunk", None)
             if ack_chunk is not None:
                 if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
