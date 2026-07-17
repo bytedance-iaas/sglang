@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.disaggregation.common.conn import CommonKVManager, PrefillServerInfo
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,6 +29,63 @@ class TestDSALayerShardUtils(CustomTestCase):
     def test_empty_tail_shards_have_empty_ranges(self):
         ranges = [get_layer_shard_range(rank, 4, 2) for rank in range(4)]
         self.assertEqual(ranges, [(0, 1), (1, 2), (2, 2), (2, 2)])
+
+    def test_pp_stage_uses_local_layers_with_global_transfer_offset(self):
+        pool = LayerSplitDSATokenToKVPool.__new__(LayerSplitDSATokenToKVPool)
+        pool.layer_shard_rank = 3
+        pool.layer_shard_size = 8
+        pool.start_layer = 39
+        pool.layer_num = 39
+
+        self.assertEqual(pool._owned_local_layer_range(), (15, 20))
+        self.assertTrue(pool._is_layer_owned(54))
+        self.assertTrue(pool._is_layer_owned(58))
+        self.assertFalse(pool._is_layer_owned(53))
+        self.assertEqual(pool._get_layer_owner_rank(54), 3)
+
+        manager = CommonKVManager.__new__(CommonKVManager)
+        manager.kv_args = SimpleNamespace(
+            prefill_start_layer=54,
+            prefill_end_layer=59,
+            mla_compression_ratios=None,
+        )
+        src_ptrs = [100, 101, 102, 103, 104]
+        dst_ptrs = list(range(78))
+
+        src, dst, layers = manager.get_mla_kv_ptrs_with_pp(src_ptrs, dst_ptrs)
+
+        self.assertEqual(src, src_ptrs)
+        self.assertEqual(dst, [54, 55, 56, 57, 58])
+        self.assertEqual(layers, 5)
+
+    def test_layer_split_pd_mapping_collects_every_cp_and_pp_rank(self):
+        manager = CommonKVManager.__new__(CommonKVManager)
+        manager.attn_tp_size = 16
+        manager.attn_cp_size = 1
+        manager.attn_cp_rank = 0
+        manager.pp_size = 1
+        manager.pp_rank = 0
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.enable_all_cp_ranks_for_transfer = False
+        manager.kv_args = SimpleNamespace(engine_rank=0)
+        info = PrefillServerInfo(
+            attn_tp_size=1,
+            attn_cp_size=8,
+            dp_size=1,
+            pp_size=2,
+            page_size=64,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+            enable_dsa_cache_layer_split=True,
+        )
+
+        manager._resolve_rank_mapping(info)
+
+        self.assertEqual(info.target_cp_ranks, list(range(8)))
+        self.assertEqual(info.target_pp_ranks, [0, 1])
+        self.assertEqual(info.required_prefill_response_num, 16)
+        self.assertEqual(info.required_dst_info_num, 16)
 
     def test_prefetch_uses_sync_fallback_without_dedicated_communicator(self):
         broadcasts = []
