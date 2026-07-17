@@ -2046,6 +2046,15 @@ class MooncakeKVManager(CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if waiting_req_bytes[0] == MooncakeKVManager.DSPARK_HIDDEN_CHUNK_ACK_HEADER:
+                    room = int(waiting_req_bytes[1].decode("ascii"))
+                    prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
+                    hidden_start = int(waiting_req_bytes[3].decode("ascii"))
+                    key = (room, prefill_rank, hidden_start)
+                    with self.dspark_hidden_chunk_ack_cv:
+                        self.dspark_hidden_chunk_acks.add(key)
+                        self.dspark_hidden_chunk_ack_cv.notify_all()
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2116,6 +2125,14 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     continue
                 else:
+                    if len(waiting_req_bytes) < 8:
+                        logger.warning(
+                            "Ignoring malformed Mooncake bootstrap message: "
+                            "room=%s frames=%d",
+                            room,
+                            len(waiting_req_bytes),
+                        )
+                        continue
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
                     if room not in self.transfer_infos:
