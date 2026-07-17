@@ -81,11 +81,18 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
-    def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
+    def _new_decode_req(
+        self,
+        rid: str,
+        priority: int,
+        *,
+        input_len: int = 3,
+        failed: bool = False,
+    ):
         req = SimpleNamespace(
             rid=rid,
             priority=priority,
-            origin_input_ids=[1, 2, 3],
+            origin_input_ids=list(range(input_len)),
             output_ids=[],
             req_pool_idx=int(priority) % 8,
             finished_reason=FINISH_ABORT("failed") if failed else None,
@@ -100,9 +107,19 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             kv_receiver=MagicMock(),
             metadata_buffer_index=-1,
             is_rebootstrap=False,
+            admission_bypass_count=0,
         )
 
-    def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
+    def _new_queue(
+        self,
+        decode_reqs,
+        *,
+        low_priority_values_first: bool = False,
+        priority_scheduling: bool = True,
+        admission_policy: str = "fifo",
+        admission_max_bypasses: int = 8,
+        allocatable_tokens: int = 1000,
+    ):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.queue = list(decode_reqs)
         queue.pending_reqs = []
@@ -110,7 +127,11 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
-        queue._allocatable_tokens = MagicMock(return_value=1000)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(
+            return_value=allocatable_tokens
+        )
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
             return torch.arange(
@@ -138,10 +159,14 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.tree_cache = MagicMock()
 
         scheduler = MagicMock()
-        scheduler.enable_priority_scheduling = True
+        scheduler.enable_priority_scheduling = priority_scheduling
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
+        scheduler.server_args.disaggregation_decode_admission_policy = admission_policy
+        scheduler.server_args.disaggregation_decode_admission_max_bypasses = (
+            admission_max_bypasses
+        )
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
@@ -206,6 +231,83 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         self.assertEqual(queue.queue, [])
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
+        )
+
+    def test_fit_first_admits_short_request_behind_memory_blocked_head(self):
+        long_req = self._new_decode_req("long", 0, input_len=10)
+        short_req = self._new_decode_req("short", 0, input_len=3)
+        queue = self._new_queue(
+            [long_req, short_req],
+            priority_scheduling=False,
+            admission_policy="fit_first",
+            allocatable_tokens=5,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual([req.req.rid for req in preallocated], ["short"])
+        self.assertEqual(failed, [])
+        self.assertEqual([req.req.rid for req in queue.queue], ["long"])
+        self.assertEqual(long_req.admission_bypass_count, 1)
+
+    def test_fifo_keeps_short_request_behind_memory_blocked_head(self):
+        long_req = self._new_decode_req("long", 0, input_len=10)
+        short_req = self._new_decode_req("short", 0, input_len=3)
+        queue = self._new_queue(
+            [long_req, short_req],
+            priority_scheduling=False,
+            admission_policy="fifo",
+            allocatable_tokens=5,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(
+            [req.req.rid for req in queue.queue], ["long", "short"]
+        )
+
+    def test_fit_first_does_not_bypass_higher_priority_request(self):
+        high_priority_long = self._new_decode_req("high-long", 10, input_len=10)
+        low_priority_short = self._new_decode_req("low-short", 1, input_len=3)
+        queue = self._new_queue(
+            [low_priority_short, high_priority_long],
+            admission_policy="fit_first",
+            allocatable_tokens=5,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(
+            [req.req.rid for req in queue.queue],
+            ["high-long", "low-short"],
+        )
+
+    def test_fit_first_stops_after_bypass_limit(self):
+        long_req = self._new_decode_req("long", 0, input_len=10)
+        long_req.admission_bypass_count = 1
+        short_req = self._new_decode_req("short", 0, input_len=3)
+        queue = self._new_queue(
+            [long_req, short_req],
+            priority_scheduling=False,
+            admission_policy="fit_first",
+            admission_max_bypasses=1,
+            allocatable_tokens=5,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(
+            [req.req.rid for req in queue.queue], ["long", "short"]
         )
 
 

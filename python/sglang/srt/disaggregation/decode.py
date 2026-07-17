@@ -257,6 +257,7 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    admission_bypass_count: int = 0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -935,7 +936,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Pop requests that can be preallocated under the configured policy.
+
+        FIFO remains the default. ``fit_first`` may bypass a request only when
+        its memory footprint does not fit the current token budget. Global
+        request/metadata/HiSparse slot exhaustion still stops admission because
+        no later request can make those resources available. Priority ordering
+        remains authoritative: only requests with the same priority may pass.
+        """
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
@@ -1013,6 +1021,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        admission_policy = getattr(
+            self.scheduler.server_args,
+            "disaggregation_decode_admission_policy",
+            "fifo",
+        )
+        admission_max_bypasses = getattr(
+            self.scheduler.server_args,
+            "disaggregation_decode_admission_max_bypasses",
+            8,
+        )
+        fit_first = admission_policy == "fit_first" and admission_max_bypasses > 0
+        memory_blocked_reqs: List[DecodeRequest] = []
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1023,6 +1044,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if not decode_req.waiting_for_input:
                 continue
+
+            if memory_blocked_reqs:
+                if any(
+                    blocked.admission_bypass_count >= admission_max_bypasses
+                    for blocked in memory_blocked_reqs
+                ):
+                    break
+                if (
+                    self.scheduler.enable_priority_scheduling
+                    and decode_req.req.priority
+                    != memory_blocked_reqs[0].req.priority
+                ):
+                    break
 
             if self.req_to_token_pool.available_size() <= 0:
                 break
@@ -1091,10 +1125,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if (
+                    fit_first
+                    and decode_req.admission_bypass_count
+                    < admission_max_bypasses
+                ):
+                    memory_blocked_reqs.append(decode_req)
+                    continue
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if (
+                    fit_first
+                    and decode_req.admission_bypass_count
+                    < admission_max_bypasses
+                ):
+                    memory_blocked_reqs.append(decode_req)
+                    continue
                 break
 
             if uses_swa_tail_prealloc:
@@ -1113,6 +1161,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    if (
+                        fit_first
+                        and decode_req.admission_bypass_count
+                        < admission_max_bypasses
+                    ):
+                        memory_blocked_reqs.append(decode_req)
+                        continue
                     break
 
             dst_kv_indices = self._pre_alloc(
@@ -1278,6 +1333,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            for blocked_req in memory_blocked_reqs:
+                blocked_req.admission_bypass_count += 1
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         self.queue = [

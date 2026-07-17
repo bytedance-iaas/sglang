@@ -34,6 +34,24 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_pd_decode_admission_args_parse(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--disaggregation-decode-admission-policy",
+                "fit_first",
+                "--disaggregation-decode-admission-max-bypasses",
+                "4",
+            ]
+        )
+
+        self.assertEqual(args.disaggregation_decode_admission_policy, "fit_first")
+        self.assertEqual(args.disaggregation_decode_admission_max_bypasses, 4)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -156,6 +174,20 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+
+    def test_pd_decode_rejects_negative_admission_bypass_limit(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_admission_policy="fit_first",
+            disaggregation_decode_admission_max_bypasses=-1,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--disaggregation-decode-admission-max-bypasses must be >= 0",
+        ):
+            server_args._handle_pd_disaggregation()
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):

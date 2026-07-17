@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
+    if server_args.disaggregation_decode_admission_max_bypasses < 0:
+        raise ValueError(
+            "--disaggregation-decode-admission-max-bypasses must be >= 0, "
+            f"got {server_args.disaggregation_decode_admission_max_bypasses}"
+        )
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -27,6 +33,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
 
     if server_args.disaggregation_mode == "decode":
+        if server_args.disaggregation_decode_admission_policy == "fit_first":
+            logger.warning(
+                "EXPERIMENTAL: fit-first decode admission is enabled; only "
+                "same-priority requests may bypass a memory-blocked request, "
+                "with at most %d bypasses per blocked request",
+                server_args.disaggregation_decode_admission_max_bypasses,
+            )
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
                 raise ValueError(

@@ -2394,6 +2394,14 @@ class ServerArgs:
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
     ] = False
+    disaggregation_decode_admission_policy: A[
+        Literal["fifo", "fit_first"],
+        "Decode preallocation admission policy in PD mode. 'fifo' preserves strict queue order. 'fit_first' may admit a same-priority request that fits behind a memory-blocked request, bounded by --disaggregation-decode-admission-max-bypasses.",
+    ] = "fifo"
+    disaggregation_decode_admission_max_bypasses: A[
+        int,
+        "Maximum number of later same-priority requests that may pass a memory-blocked decode request under the fit_first admission policy.",
+    ] = 8
     disaggregation_decode_enable_offload_kvcache: A[
         bool,
         "Enable async KV cache offloading on decode server (PD mode).",
@@ -4240,13 +4248,10 @@ class ServerArgs:
                         f"{self.disaggregation_transfer_backend!r}. mori/nixl "
                         "support will be added later by the community."
                     )
-                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
-                    raise ValueError(
-                        "--enable-dsa-cache-layer-split is not supported with "
-                        "pipeline parallelism (pp_size > 1) yet. It requires "
-                        "prefill context parallelism, and CP + PP has not been "
-                        "validated for this feature."
-                    )
+                # CP layer ownership is local to each PP stage, while PD
+                # registration retains the global layer offset and collects all
+                # CP x PP senders. Keep PP support behind the existing explicit
+                # opt-in; live validation still has to prove the combined path.
 
             else:
                 # DeepSeek V3/R1/V3.1
