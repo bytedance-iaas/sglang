@@ -325,6 +325,9 @@ class DecodeRequest:
     dspark_hidden_pp_slices: Optional[Dict[int, dict]] = None
     dspark_hidden_start: int = 0
     dspark_hidden_streaming: bool = False
+    dspark_hidden_streaming_next_start: int = 0
+    dspark_hidden_streaming_end: int = 0
+    dspark_hidden_streaming_done: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1337,6 +1340,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     ]
                 dspark_hidden_pp_slices = pp_slices
                 decode_req.dspark_hidden_streaming = dspark_hidden_streaming
+                decode_req.dspark_hidden_streaming_next_start = int(dspark_hidden_start)
+                decode_req.dspark_hidden_streaming_end = int(
+                    dspark_hidden_start + dspark_hidden_len
+                )
+                decode_req.dspark_hidden_streaming_done = not dspark_hidden_streaming
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
@@ -2054,6 +2062,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.dspark_hidden_dst_indices_by_pp = None
         decode_req.dspark_hidden_pp_slices = None
         decode_req.dspark_hidden_streaming = False
+        decode_req.dspark_hidden_streaming_next_start = 0
+        decode_req.dspark_hidden_streaming_end = 0
+        decode_req.dspark_hidden_streaming_done = False
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2355,22 +2366,44 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "DSpark streaming hidden requires draft_worker.inject_pd_hidden_chunk."
             )
         for chunk in sorted(chunks, key=lambda item: int(item["hidden_start"])):
+            hidden_start = int(chunk["hidden_start"])
             dst_indices = [int(x) for x in chunk.get("dst_indices", [])]
             row_len = int(chunk.get("row_len", len(dst_indices)))
             if row_len <= 0:
                 continue
+            if hidden_start != int(decode_req.dspark_hidden_streaming_next_start):
+                raise RuntimeError(
+                    "DSpark streaming hidden chunk arrived out of order: "
+                    f"rid={decode_req.req.rid}, expected_start="
+                    f"{decode_req.dspark_hidden_streaming_next_start}, "
+                    f"chunk_start={hidden_start}, row_len={row_len}"
+                )
             if len(dst_indices) != row_len:
                 raise RuntimeError(
                     "DSpark hidden chunk dst index length mismatch: "
                     f"rid={decode_req.req.rid}, row_len={row_len}, "
                     f"dst_indices={len(dst_indices)}"
                 )
-            hidden = dspark_pool.read(dst_indices)
+            read_hidden = getattr(dspark_pool, "read_view", dspark_pool.read)
+            hidden = read_hidden(dst_indices)
             inject_chunk(
                 decode_req.req,
                 hidden,
-                int(chunk["hidden_start"]),
+                hidden_start,
             )
+            decode_req.dspark_hidden_streaming_next_start = hidden_start + row_len
+            if chunk.get("is_last_hidden_chunk"):
+                if (
+                    decode_req.dspark_hidden_streaming_next_start
+                    != decode_req.dspark_hidden_streaming_end
+                ):
+                    raise RuntimeError(
+                        "DSpark streaming hidden ended at an unexpected offset: "
+                        f"rid={decode_req.req.rid}, next_start="
+                        f"{decode_req.dspark_hidden_streaming_next_start}, "
+                        f"expected_end={decode_req.dspark_hidden_streaming_end}"
+                    )
+                decode_req.dspark_hidden_streaming_done = True
             ack_chunk = getattr(self.kv_manager, "ack_dspark_hidden_chunk", None)
             if ack_chunk is not None:
                 ack_chunk(
@@ -2378,7 +2411,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     dst_port=int(chunk["ack_port"]),
                     room=int(chunk["room"]),
                     prefill_rank=int(chunk["prefill_rank"]),
-                    hidden_start=int(chunk["hidden_start"]),
+                    hidden_start=hidden_start,
                 )
 
     def _init_staging_handler(self, kv_manager):
@@ -2463,6 +2496,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
+                    continue
+                if (
+                    decode_req.dspark_hidden_streaming
+                    and not decode_req.dspark_hidden_streaming_done
                 ):
                     continue
                 self._commit_transfer_to_req(decode_req)
