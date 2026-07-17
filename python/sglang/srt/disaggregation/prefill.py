@@ -77,16 +77,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _should_log_dspark_hidden_trace(
-    hidden_start: Optional[int], is_last: bool = False
-) -> bool:
-    if is_last:
-        return True
-    if hidden_start is None:
-        return False
-    return int(hidden_start) < 4096
-
-
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
@@ -1333,28 +1323,6 @@ class SchedulerDisaggregationPrefillMixin:
                         f"old_rows={prev_current_row_len}, new_start={write_start}, "
                         f"new_rows={rows}"
                     )
-                if (
-                    _should_log_dspark_hidden_trace(prev_current_start)
-                    or _should_log_dspark_hidden_trace(write_start)
-                ):
-                    logger.info(
-                        "[DSPARK-HIDDEN-TRACE] prefill flushing unsent current hidden "
-                        "before overwrite rid=%s room=%s pp_rank=%s old_start=%d "
-                        "old_rows=%d new_start=%d new_rows=%d chunk_start=%d "
-                        "chunk_end=%d hidden_start=%d hidden_len=%d extend_len=%d",
-                        req.rid,
-                        getattr(req, "bootstrap_room", None),
-                        self.ps.pp_rank,
-                        int(prev_current_start),
-                        prev_current_row_len,
-                        int(write_start),
-                        int(rows),
-                        int(chunk_start),
-                        int(chunk_end),
-                        int(hidden_start),
-                        int(hidden_len),
-                        int(extend_len),
-                    )
                 self.send_kv_chunk(
                     req,
                     last_chunk=False,
@@ -1364,27 +1332,6 @@ class SchedulerDisaggregationPrefillMixin:
                 write_indices,
                 req_hidden_to_write[chunk_local_start:chunk_local_end],
             )
-            if _should_log_dspark_hidden_trace(
-                write_start, write_end >= hidden_start + hidden_len
-            ):
-                logger.info(
-                    "[DSPARK-HIDDEN-TRACE] prefill wrote current hidden "
-                    "rid=%s room=%s pp_rank=%s write_start=%d rows=%d "
-                    "chunk_start=%d chunk_end=%d hidden_start=%d hidden_len=%d "
-                    "src_rows=%d dst_rows=%d is_last=%s",
-                    req.rid,
-                    getattr(req, "bootstrap_room", None),
-                    self.ps.pp_rank,
-                    int(write_start),
-                    int(rows),
-                    int(chunk_start),
-                    int(chunk_end),
-                    int(hidden_start),
-                    int(hidden_len),
-                    len(src_indices or []),
-                    len(getattr(req, "dspark_hidden_dst_indices", []) or []),
-                    bool(write_end >= hidden_start + hidden_len),
-                )
             req.dspark_hidden_current_start = write_start
             req.dspark_hidden_current_row_len = rows
             req.dspark_hidden_current_src_indices = write_indices
@@ -2037,26 +1984,6 @@ class SchedulerDisaggregationPrefillMixin:
             has_current_dspark_hidden
             and hasattr(req.disagg_kv_sender, "set_source_event")
         ):
-            if _should_log_dspark_hidden_trace(
-                current_dspark_hidden_start,
-                bool(getattr(req, "dspark_hidden_current_is_last", False)),
-            ):
-                logger.info(
-                    "[DSPARK-HIDDEN-TRACE] prefill sending current hidden "
-                    "rid=%s room=%s pp_rank=%s hidden_start=%d rows=%d "
-                    "start_send_idx=%d end_idx=%d page_count=%d last_chunk=%s "
-                    "should_send_kv=%s",
-                    req.rid,
-                    getattr(req, "bootstrap_room", None),
-                    self.ps.pp_rank,
-                    int(current_dspark_hidden_start),
-                    int(current_dspark_hidden_row_len),
-                    int(start_idx),
-                    int(end_idx),
-                    len(page_indices),
-                    bool(last_chunk),
-                    bool(should_send_kv_chunk),
-                )
             source_event = self.device_module.Event()
             source_event.record()
             req.disagg_kv_sender.set_source_event(source_event)
