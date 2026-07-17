@@ -2370,17 +2370,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise RuntimeError(
                 "DSpark streaming hidden requires draft_worker.inject_pd_hidden_chunk."
             )
-        for chunk in sorted(chunks, key=lambda item: int(item["hidden_start"])):
+        sorted_chunks = sorted(chunks, key=lambda item: int(item["hidden_start"]))
+        deferred_chunks = []
+        for i, chunk in enumerate(sorted_chunks):
             hidden_start = int(chunk["hidden_start"])
             dst_indices = [int(x) for x in chunk.get("dst_indices", [])]
             row_len = int(chunk.get("row_len", len(dst_indices)))
             if row_len <= 0:
                 continue
-            if hidden_start != int(decode_req.dspark_hidden_streaming_next_start):
+            expected_start = int(decode_req.dspark_hidden_streaming_next_start)
+            if hidden_start > expected_start:
+                deferred_chunks = sorted_chunks[i:]
+                break
+            if hidden_start < expected_start:
                 raise RuntimeError(
                     "DSpark streaming hidden chunk arrived out of order: "
                     f"rid={decode_req.req.rid}, expected_start="
-                    f"{decode_req.dspark_hidden_streaming_next_start}, "
+                    f"{expected_start}, "
                     f"chunk_start={hidden_start}, row_len={row_len}"
                 )
             if len(dst_indices) != row_len:
@@ -2418,6 +2424,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     prefill_rank=int(chunk["prefill_rank"]),
                     hidden_start=hidden_start,
                 )
+        if deferred_chunks:
+            push_chunks = getattr(self.kv_manager, "push_dspark_hidden_ready_chunks", None)
+            if push_chunks is None:
+                raise RuntimeError(
+                    "DSpark streaming hidden received a future chunk but the KV "
+                    "manager cannot defer ready chunks."
+                )
+            push_chunks(decode_req.req.bootstrap_room, deferred_chunks)
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
