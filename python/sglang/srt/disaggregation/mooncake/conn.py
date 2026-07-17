@@ -189,6 +189,8 @@ class MooncakeKVManager(CommonKVManager):
             self.dspark_hidden_done_lock = threading.Lock()
             self.dspark_hidden_chunk_acks = defaultdict(int)
             self.dspark_hidden_chunk_ack_cv = threading.Condition()
+            self.dspark_hidden_inflight_chunks = {}
+            self.dspark_hidden_inflight_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -1607,6 +1609,11 @@ class MooncakeKVManager(CommonKVManager):
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
+                    if kv_chunk.dspark_hidden_start is not None:
+                        with self.dspark_hidden_inflight_lock:
+                            self.dspark_hidden_inflight_chunks.pop(
+                                kv_chunk.room, None
+                            )
                     if (
                         not kv_chunk.dspark_hidden_sent
                         and self._has_dspark_hidden_state(kv_chunk.state_indices)
@@ -1671,6 +1678,22 @@ class MooncakeKVManager(CommonKVManager):
                         kv_chunk.dspark_hidden_start is not None
                         and kv_chunk.dspark_hidden_ready_sent
                     )
+                    hidden_inflight_key = (
+                        (prefill_unique_rank, int(kv_chunk.dspark_hidden_start))
+                        if kv_chunk.dspark_hidden_start is not None
+                        else None
+                    )
+                    if (
+                        hidden_inflight_key is not None
+                        and not kv_chunk.dspark_hidden_ready_sent
+                    ):
+                        with self.dspark_hidden_inflight_lock:
+                            inflight_key = self.dspark_hidden_inflight_chunks.get(
+                                kv_chunk.room
+                            )
+                        if inflight_key is not None and inflight_key != hidden_inflight_key:
+                            queue.put(kv_chunk)
+                            continue
                     ack_ready = False
                     if waiting_for_ack:
                         ack_ready = self.consume_dspark_hidden_chunk_ack(
@@ -1681,6 +1704,17 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         if ack_ready:
                             dspark_hidden_done_count = dspark_hidden_expected
+                            if hidden_inflight_key is not None:
+                                with self.dspark_hidden_inflight_lock:
+                                    if (
+                                        self.dspark_hidden_inflight_chunks.get(
+                                            kv_chunk.room
+                                        )
+                                        == hidden_inflight_key
+                                    ):
+                                        self.dspark_hidden_inflight_chunks.pop(
+                                            kv_chunk.room, None
+                                        )
                         else:
                             dspark_hidden_deferred = True
 
@@ -1731,6 +1765,11 @@ class MooncakeKVManager(CommonKVManager):
                                     f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
+                                if kv_chunk.dspark_hidden_start is not None:
+                                    with self.dspark_hidden_inflight_lock:
+                                        self.dspark_hidden_inflight_chunks.pop(
+                                            kv_chunk.room, None
+                                        )
                                 self.sync_status_to_decode_endpoint(
                                     req.endpoint,
                                     req.dst_port,
@@ -1785,6 +1824,11 @@ class MooncakeKVManager(CommonKVManager):
                         kv_chunk.dspark_hidden_start is not None
                         and not kv_chunk.dspark_hidden_ready_sent
                     ):
+                        if hidden_inflight_key is not None:
+                            with self.dspark_hidden_inflight_lock:
+                                self.dspark_hidden_inflight_chunks[
+                                    kv_chunk.room
+                                ] = hidden_inflight_key
                         kv_chunk.dspark_hidden_ready_sent = True
                         queue.put(kv_chunk)
                         continue
