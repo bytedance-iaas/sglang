@@ -2364,7 +2364,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         pop_chunks = getattr(self.kv_manager, "pop_dspark_hidden_ready_chunks", None)
         if pop_chunks is None:
-            return
+            raise RuntimeError(
+                "DSpark streaming hidden backend is missing ready chunk API."
+            )
         chunks = pop_chunks(decode_req.req.bootstrap_room)
         if not chunks:
             return

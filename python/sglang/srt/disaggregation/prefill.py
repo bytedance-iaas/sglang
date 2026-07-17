@@ -121,7 +121,7 @@ def maybe_release_metadata_buffer(
     if indices and dspark_hidden_pool is not None:
         sender = getattr(req, "disagg_kv_sender", None)
         kv_mgr = getattr(sender, "kv_mgr", None)
-        pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_done", None)
+        pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_request_done", None)
         worker_released = pop_hidden_done is not None and pop_hidden_done(
             getattr(sender, "bootstrap_room", req.bootstrap_room)
         )
@@ -151,7 +151,7 @@ def maybe_release_dspark_hidden_rows_on_hidden_done(
         return False
     sender = getattr(req, "disagg_kv_sender", None)
     kv_mgr = getattr(sender, "kv_mgr", None)
-    pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_done", None)
+    pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_request_done", None)
     if pop_hidden_done is None or not pop_hidden_done(
         getattr(sender, "bootstrap_room", req.bootstrap_room)
     ):

@@ -104,8 +104,17 @@ class DSparkHiddenRequestState:
     def mark_kv_done(self) -> None:
         self.kv_done = True
 
+    def mark_hidden_done(self) -> None:
+        self.hidden_done = True
+
+    def hidden_request_done(self) -> bool:
+        return self.hidden_done
+
+    def kv_request_done(self) -> bool:
+        return self.kv_done
+
     def request_done(self) -> bool:
-        return self.kv_done and self.hidden_done
+        return self.kv_request_done() and self.hidden_request_done()
 
     def accept_chunk(self, chunk: DSparkHiddenChunk) -> str:
         """Return accepted/future/stale for a streaming hidden chunk."""
@@ -126,7 +135,7 @@ class DSparkHiddenRequestState:
                     "DSpark streaming hidden ended at an unexpected offset: "
                     f"next_start={next_start}, expected_end={self.end}"
                 )
-            self.hidden_done = True
+            self.mark_hidden_done()
         self.next_start = next_start
         return "accepted"
 

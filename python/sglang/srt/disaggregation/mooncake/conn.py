@@ -258,7 +258,7 @@ class MooncakeKVManager(CommonKVManager):
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
 
-    def mark_dspark_hidden_done(
+    def mark_dspark_hidden_request_done(
         self,
         bootstrap_room: int,
         state_indices: Optional[List] = None,
@@ -282,7 +282,7 @@ class MooncakeKVManager(CommonKVManager):
             if indices is not None and len(indices) > 0:
                 pool.free([int(idx) for idx in indices])
 
-    def pop_dspark_hidden_done(self, bootstrap_room: int) -> bool:
+    def pop_dspark_hidden_request_done(self, bootstrap_room: int) -> bool:
         if not hasattr(self, "dspark_hidden_done_rooms"):
             return False
         with self.dspark_hidden_done_lock:
@@ -291,6 +291,16 @@ class MooncakeKVManager(CommonKVManager):
                 return False
             self.dspark_hidden_done_rooms.remove(room)
             return True
+
+    def mark_dspark_hidden_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.mark_dspark_hidden_request_done(bootstrap_room, state_indices)
+
+    def pop_dspark_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_dspark_hidden_request_done(bootstrap_room)
 
     def notify_dspark_hidden_chunk_ready(
         self,
@@ -1618,7 +1628,7 @@ class MooncakeKVManager(CommonKVManager):
                         not kv_chunk.dspark_hidden_sent
                         and self._has_dspark_hidden_state(kv_chunk.state_indices)
                     ):
-                        self.mark_dspark_hidden_done(
+                        self.mark_dspark_hidden_request_done(
                             kv_chunk.room,
                             self._dspark_hidden_release_state_indices(kv_chunk),
                         )
@@ -1777,7 +1787,7 @@ class MooncakeKVManager(CommonKVManager):
                                     KVPoll.Failed,
                                     prefill_unique_rank,
                                 )
-                                self.mark_dspark_hidden_done(
+                                self.mark_dspark_hidden_request_done(
                                     kv_chunk.room,
                                     self._dspark_hidden_release_state_indices(kv_chunk),
                                 )
@@ -1842,12 +1852,12 @@ class MooncakeKVManager(CommonKVManager):
                         kv_chunk.dspark_hidden_sent = True
                         if kv_chunk.dspark_hidden_start is not None:
                             if kv_chunk.dspark_hidden_is_last_chunk:
-                                self.mark_dspark_hidden_done(
+                                self.mark_dspark_hidden_request_done(
                                     kv_chunk.room,
                                     self._dspark_hidden_release_state_indices(kv_chunk),
                                 )
                         else:
-                            self.mark_dspark_hidden_done(
+                            self.mark_dspark_hidden_request_done(
                                 kv_chunk.room,
                                 self._dspark_hidden_release_state_indices(kv_chunk),
                             )
@@ -1881,7 +1891,7 @@ class MooncakeKVManager(CommonKVManager):
                                         kv_chunk.state_indices
                                     )
                                 ):
-                                    self.mark_dspark_hidden_done(
+                                    self.mark_dspark_hidden_request_done(
                                         kv_chunk.room,
                                         self._dspark_hidden_release_state_indices(kv_chunk),
                                     )
@@ -2028,7 +2038,7 @@ class MooncakeKVManager(CommonKVManager):
                                         KVPoll.Failed,
                                         prefill_unique_rank,
                                     )
-                                    self.mark_dspark_hidden_done(
+                                    self.mark_dspark_hidden_request_done(
                                         kv_chunk.room,
                                         self._dspark_hidden_release_state_indices(kv_chunk),
                                     )
@@ -2105,12 +2115,12 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.dspark_hidden_start is not None:
                         if kv_chunk.dspark_hidden_is_last_chunk:
-                            self.mark_dspark_hidden_done(
+                            self.mark_dspark_hidden_request_done(
                                 kv_chunk.room,
                                 self._dspark_hidden_release_state_indices(kv_chunk),
                             )
                     else:
-                        self.mark_dspark_hidden_done(
+                        self.mark_dspark_hidden_request_done(
                             kv_chunk.room,
                             self._dspark_hidden_release_state_indices(kv_chunk),
                         )
