@@ -2377,8 +2377,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "DSpark streaming hidden requires draft_worker.inject_pd_hidden_chunk."
             )
         sorted_chunks = sorted(chunks, key=lambda item: int(item["hidden_start"]))
-        deferred_chunks = []
-        for i, chunk in enumerate(sorted_chunks):
+        for chunk in sorted_chunks:
             hidden_chunk = DSparkHiddenChunk(
                 room=int(chunk["room"]),
                 prefill_rank=int(chunk["prefill_rank"]),
@@ -2399,8 +2398,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             chunk_status = hidden_state.accept_chunk(hidden_chunk)
             if chunk_status == "future":
-                deferred_chunks = sorted_chunks[i:]
-                break
+                raise RuntimeError(
+                    "DSpark streaming hidden chunk arrived out of order: "
+                    f"rid={decode_req.req.rid}, "
+                    f"expected_start={hidden_state.next_start}, "
+                    f"chunk_start={hidden_chunk.hidden_start}, "
+                    f"row_len={hidden_chunk.row_len}"
+                )
             if chunk_status == "stale":
                 raise RuntimeError(
                     "DSpark streaming hidden chunk arrived out of order: "
@@ -2431,16 +2435,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     prefill_rank=int(hidden_chunk.prefill_rank),
                     hidden_start=int(hidden_chunk.hidden_start),
                 )
-        if deferred_chunks:
-            push_chunks = getattr(
-                self.kv_manager, "push_dspark_hidden_ready_chunks", None
-            )
-            if push_chunks is None:
-                raise RuntimeError(
-                    "DSpark streaming hidden received a future chunk but the KV "
-                    "manager cannot defer ready chunks."
-                )
-            push_chunks(decode_req.req.bootstrap_room, deferred_chunks)
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""

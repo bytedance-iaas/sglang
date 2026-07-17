@@ -372,12 +372,6 @@ class MooncakeKVManager(CommonKVManager):
         with self.dspark_hidden_ready_lock:
             return self.dspark_hidden_ready_chunks.pop(int(room), [])
 
-    def push_dspark_hidden_ready_chunks(self, room: int, chunks: List[dict]) -> None:
-        if not chunks or not hasattr(self, "dspark_hidden_ready_chunks"):
-            return
-        with self.dspark_hidden_ready_lock:
-            self.dspark_hidden_ready_chunks[int(room)].extend(chunks)
-
     def ack_dspark_hidden_chunk(
         self,
         *,
