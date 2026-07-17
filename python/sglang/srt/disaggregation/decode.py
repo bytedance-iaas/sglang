@@ -1129,8 +1129,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_start = total_prefix_len
             dspark_hidden_len = origin_input_len - total_prefix_len
             state_types = self.kv_manager.kv_args.state_types
-            if self.scheduler.spec_algorithm.is_dspark() and (
-                StateType.DSPARK_HIDDEN in state_types and dspark_hidden_len > 0
+            if (
+                self.scheduler.spec_algorithm.is_dspark()
+                and not _is_fake_transfer(
+                    decode_req.req, self.scheduler.server_args
+                )
+                and StateType.DSPARK_HIDDEN in state_types
+                and dspark_hidden_len > 0
             ):
                 dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
                 if dspark_pool is None:
