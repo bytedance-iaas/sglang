@@ -1170,8 +1170,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if key.startswith("dspark_aux_hidden_states_")
             )
             if aux_keys:
-                hidden_states = torch.cat(
-                    [proxy_tensors[key] for key in aux_keys], dim=-1
+                hidden_states = (
+                    proxy_tensors[aux_keys[0]]
+                    if len(aux_keys) == 1
+                    else torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
                 )
         return hidden_states
 
