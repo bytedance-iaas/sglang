@@ -1311,7 +1311,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
 
-                allocated_hidden_indices = dspark_pool.alloc(dspark_hidden_window_rows)
+                allocated_hidden_indices = dspark_pool.alloc(
+                    dspark_hidden_window_rows,
+                    require_contiguous=dspark_hidden_streaming,
+                )
                 if allocated_hidden_indices is None:
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
@@ -1322,12 +1325,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     ):
                         logger.warning(
                             "DSpark decode hidden pool blocked prealloc: "
-                            "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
+                            "rid=%s window_rows=%d hidden_len=%d free_rows=%d "
+                            "largest_contiguous_rows=%d pool_rows=%d "
                             "prealloc_queue=%d transfer_queue=%d",
                             decode_req.req.rid,
                             dspark_hidden_window_rows,
                             dspark_hidden_len,
                             dspark_pool.available_size(),
+                            dspark_pool.largest_contiguous_size(),
                             dspark_pool.size,
                             len(self.queue),
                             len(self.transfer_queue.queue),

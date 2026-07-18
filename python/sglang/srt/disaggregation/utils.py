@@ -267,7 +267,14 @@ class DSparkHiddenRowPool:
         with self.lock:
             return self._free_count
 
-    def alloc(self, n: int) -> Optional[List[int]]:
+    def largest_contiguous_size(self) -> int:
+        with self.lock:
+            return max(
+                (end - start + 1 for start, end in self._free_intervals),
+                default=0,
+            )
+
+    def alloc(self, n: int, *, require_contiguous: bool = False) -> Optional[List[int]]:
         n = int(n)
         if n <= 0:
             return []
@@ -285,6 +292,9 @@ class DSparkHiddenRowPool:
                     self._free_intervals[interval_idx] = (allocated_end + 1, end)
                 self._free_count -= n
                 return list(range(start, allocated_end + 1))
+
+            if require_contiguous:
+                return None
 
             # Preserve the previous fallback behavior when fragmentation leaves
             # no contiguous run: consume the lowest free rows across intervals.
@@ -417,7 +427,11 @@ class DSparkHiddenRowPool:
         contiguous = all(int(idx) == first + i for i, idx in enumerate(indices))
         if contiguous:
             return self.buffer[first : first + len(indices)]
-        return self.read(indices)
+        raise RuntimeError(
+            "DSpark hidden read_view requires contiguous row indices. "
+            "Streaming Decode allocation must backpressure until a contiguous "
+            "receive window is available."
+        )
 
     def get_state_buf_infos(self):
         if self.size <= 0:
