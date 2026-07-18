@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
@@ -80,6 +81,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    ROUTING_KEY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -157,6 +159,7 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.ROUTING_KEY: self.routing_key_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
@@ -635,6 +638,29 @@ class DataParallelController:
         )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
+
+    def routing_key_scheduler(self, req: Req):
+        """Keep requests with the same routing key on one healthy DP rank.
+
+        Decode radix cache is rank-local under DP attention. Stable routing is
+        therefore required for a conversation's later turns to reuse the KV
+        prefix. Requests without a routing key retain round-robin behavior.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        if not req.routing_key:
+            self.round_robin_scheduler(req)
+            return
+
+        digest = hashlib.sha256(req.routing_key.encode("utf-8")).digest()
+        target_rank = int.from_bytes(digest[:8], "big") % len(self.workers)
+        for offset in range(len(self.workers)):
+            candidate = (target_rank + offset) % len(self.workers)
+            if self.status[candidate]:
+                sock_send(self.workers[candidate], req)
+                return
+
+        raise RuntimeError("No active DP worker is available for routing-key dispatch")
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

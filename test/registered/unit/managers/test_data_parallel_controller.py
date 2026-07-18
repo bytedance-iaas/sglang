@@ -53,12 +53,13 @@ def _make_controller(dp_size: int) -> DataParallelController:
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None, routing_key=None):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        routing_key=routing_key,
     )
 
 
@@ -232,6 +233,35 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         ctl.follow_bootstrap_room_scheduler(_req(routed_dp_rank=3, bootstrap_room=1))
         ctl.workers[3].send_pyobj.assert_called_once()
         ctl.workers[1].send_pyobj.assert_not_called()
+
+
+class TestRoutingKeyScheduler(CustomTestCase):
+    def test_same_key_stays_on_one_worker(self):
+        ctl = _make_controller(dp_size=4)
+
+        for _ in range(3):
+            ctl.routing_key_scheduler(_req(routing_key="conversation-42"))
+
+        call_counts = [worker.send_pyobj.call_count for worker in ctl.workers]
+        self.assertEqual(sorted(call_counts), [0, 0, 0, 3])
+
+    def test_missing_key_falls_back_to_round_robin(self):
+        ctl = _make_controller(dp_size=2)
+
+        ctl.routing_key_scheduler(_req())
+        ctl.routing_key_scheduler(_req())
+
+        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_explicit_rank_takes_precedence_over_key(self):
+        ctl = _make_controller(dp_size=4)
+
+        ctl.routing_key_scheduler(
+            _req(routed_dp_rank=3, routing_key="conversation-42")
+        )
+
+        ctl.workers[3].send_pyobj.assert_called_once()
 
 
 class TestTotalRequestsScheduler(CustomTestCase):
