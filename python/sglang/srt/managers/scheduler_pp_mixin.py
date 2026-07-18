@@ -1000,11 +1000,65 @@ class SchedulerPPMixin:
             }
         if (
             batch.dspark_hidden_capture_layer_ids
+            and not self._pp_should_owner_direct_dspark_hidden(batch)
             and result.logits_output is not None
             and result.logits_output.hidden_states is not None
         ):
             tensor_dict["dspark_aux_hidden_states_0"] = result.logits_output.hidden_states
         return tensor_dict
+
+    def _pp_should_owner_direct_dspark_hidden(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> bool:
+        if not hasattr(self, "disagg_prefill_bootstrap_queue"):
+            return False
+        if not batch or not batch.dspark_hidden_capture_layer_ids:
+            return False
+        capture_reqs = [
+            req
+            for req in batch.reqs
+            if getattr(req, "dspark_hidden_capture_layer_ids", None)
+        ]
+        if not capture_reqs:
+            return False
+        if any(req.pending_bootstrap for req in capture_reqs):
+            return False
+        return all(
+            bool(
+                (getattr(req, "dspark_hidden_meta", None) or {}).get(
+                    "streaming_hidden", False
+                )
+            )
+            for req in capture_reqs
+        )
+
+    def _pp_strip_dspark_aux_hidden_from_proxy(
+        self: Scheduler, result: GenerationBatchResult
+    ) -> None:
+        proxy = result.pp_hidden_states_proxy_tensors
+        if proxy is None:
+            return
+        tensors = proxy.tensors
+        aux_keys = [
+            key for key in tensors if key.startswith("dspark_aux_hidden_states_")
+        ]
+        for key in aux_keys:
+            tensors.pop(key, None)
+
+    def _pp_maybe_send_dspark_owner_direct_hidden(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        if not self._pp_should_owner_direct_dspark_hidden(batch):
+            return
+        send_owner_direct = getattr(
+            self, "send_dspark_owner_direct_hidden_for_batch", None
+        )
+        if send_owner_direct is None:
+            return
+        if send_owner_direct(batch, result):
+            self._pp_strip_dspark_aux_hidden_from_proxy(result)
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
@@ -1280,6 +1334,7 @@ class SchedulerPPMixin:
                     trace_only=True,
                 )
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                self._pp_maybe_send_dspark_owner_direct_hidden(cur_batch, result)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
