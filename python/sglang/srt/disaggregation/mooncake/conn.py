@@ -15,6 +15,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import torch
+import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
