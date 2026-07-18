@@ -222,13 +222,13 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
-            for i, (queue, executor) in enumerate(
+            for i, (transfer_queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
                 threading.Thread(
                     target=self.transfer_worker,
                     args=(
-                        queue,
+                        transfer_queue,
                         executor,
                         (
                             self._staging_ctx.buffers[i]
