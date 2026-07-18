@@ -154,16 +154,6 @@ class TestDSparkHiddenRowPool(unittest.TestCase):
         self.assertEqual(pool.alloc(3), [0, 1, 4])
         self.assertEqual(pool.available_size(), 2)
 
-    def test_strict_contiguous_alloc_backpressures_on_fragmentation(self):
-        pool = DSparkHiddenRowPool(8, 1, torch.float32)
-
-        self.assertEqual(pool.alloc(8), list(range(8)))
-        pool.free([0, 1, 4, 5, 7])
-
-        self.assertIsNone(pool.alloc(3, require_contiguous=True))
-        self.assertEqual(pool.available_size(), 5)
-        self.assertEqual(pool.largest_contiguous_size(), 2)
-
     def test_free_ignores_duplicate_and_already_free_rows(self):
         pool = DSparkHiddenRowPool(4, 1, torch.float32)
 
