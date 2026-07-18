@@ -5,6 +5,7 @@ import dataclasses
 import json
 import logging
 import os
+import queue
 import struct
 import threading
 import time
@@ -13,6 +14,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -253,6 +255,18 @@ class MooncakeKVManager(CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.dspark_hidden_ready_chunks: Dict[int, List[dict]] = defaultdict(list)
             self.dspark_hidden_ready_lock = threading.Lock()
+            self.dspark_hidden_ack_completions = queue.SimpleQueue()
+            self.dspark_hidden_ack_pending_counts = defaultdict(int)
+            self.dspark_hidden_ack_completion_cv = threading.Condition()
+            self.dspark_hidden_acked_chunks: Dict[int, List[dict]] = defaultdict(list)
+            self.dspark_hidden_acked_lock = threading.Lock()
+            self.dspark_hidden_ack_wakeup_endpoint = (
+                f"inproc://dspark-hidden-ack-{id(self)}"
+            )
+            self.dspark_hidden_ack_wakeup_receiver = self._zmq_ctx.socket(zmq.PULL)
+            self.dspark_hidden_ack_wakeup_receiver.bind(
+                self.dspark_hidden_ack_wakeup_endpoint
+            )
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -404,6 +418,118 @@ class MooncakeKVManager(CommonKVManager):
                 str(hidden_start).encode("ascii"),
             ]
         )
+
+    def submit_dspark_hidden_chunk_ack(
+        self,
+        *,
+        event,
+        remote: str,
+        dst_port: int,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+        is_last_hidden_chunk: bool,
+    ) -> None:
+        completion = {
+            "remote": remote,
+            "dst_port": int(dst_port),
+            "room": int(room),
+            "prefill_rank": int(prefill_rank),
+            "hidden_start": int(hidden_start),
+            "is_last_hidden_chunk": bool(is_last_hidden_chunk),
+        }
+        with self.dspark_hidden_ack_completion_cv:
+            self.dspark_hidden_ack_pending_counts[int(room)] += 1
+
+        def wait_for_injection() -> None:
+            try:
+                if event is not None:
+                    with torch.cuda.device(self.kv_args.gpu_id):
+                        event.synchronize()
+                completion["success"] = True
+            except Exception:
+                logger.exception(
+                    "DSpark hidden injection completion failed: room=%s start=%s",
+                    room,
+                    hidden_start,
+                )
+                completion["success"] = False
+            self.dspark_hidden_ack_completions.put(completion)
+            wakeup_sender = self._zmq_ctx.socket(zmq.PUSH)
+            wakeup_sender.setsockopt(zmq.LINGER, 0)
+            try:
+                wakeup_sender.connect(self.dspark_hidden_ack_wakeup_endpoint)
+                wakeup_sender.send(b"ACK_READY")
+            finally:
+                wakeup_sender.close()
+
+        threading.Thread(
+            target=wait_for_injection,
+            name=f"DSparkHiddenAckWaiter-{room}",
+            daemon=True,
+        ).start()
+
+    def _drain_dspark_hidden_ack_completions(self) -> None:
+        while True:
+            try:
+                completion = self.dspark_hidden_ack_completions.get_nowait()
+            except queue.Empty:
+                return
+
+            room = int(completion["room"])
+            try:
+                if completion.pop("success"):
+                    self.ack_dspark_hidden_chunk(
+                        remote=completion["remote"],
+                        dst_port=int(completion["dst_port"]),
+                        room=room,
+                        prefill_rank=int(completion["prefill_rank"]),
+                        hidden_start=int(completion["hidden_start"]),
+                    )
+                    with self.dspark_hidden_acked_lock:
+                        self.dspark_hidden_acked_chunks[room].append(completion)
+                else:
+                    self.record_failure(
+                        room,
+                        "DSpark hidden injection CUDA completion failed: "
+                        f"hidden_start={completion['hidden_start']}",
+                    )
+                    self.update_status(room, KVPoll.Failed)
+            except Exception:
+                logger.exception(
+                    "Failed to send DSpark hidden chunk ACK: room=%s start=%s",
+                    room,
+                    completion["hidden_start"],
+                )
+                self.record_failure(
+                    room,
+                    "Failed to send DSpark hidden chunk ACK: "
+                    f"hidden_start={completion['hidden_start']}",
+                )
+                self.update_status(room, KVPoll.Failed)
+            finally:
+                with self.dspark_hidden_ack_completion_cv:
+                    self.dspark_hidden_ack_pending_counts[room] -= 1
+                    if self.dspark_hidden_ack_pending_counts[room] <= 0:
+                        self.dspark_hidden_ack_pending_counts.pop(room, None)
+                    self.dspark_hidden_ack_completion_cv.notify_all()
+
+    def pop_dspark_hidden_acked_chunks(self, room: int) -> List[dict]:
+        with self.dspark_hidden_acked_lock:
+            return self.dspark_hidden_acked_chunks.pop(int(room), [])
+
+    def wait_dspark_hidden_ack_completions(
+        self, room: int, timeout_s: float = 300.0
+    ) -> bool:
+        room = int(room)
+        deadline = time.monotonic() + float(timeout_s)
+        with self.dspark_hidden_ack_completion_cv:
+            while self.dspark_hidden_ack_pending_counts.get(room, 0) > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.dspark_hidden_ack_completion_cv.wait(timeout=min(remaining, 1.0))
+        return True
 
     def _begin_dspark_hidden_transfer(self, room: int) -> None:
         if not hasattr(self, "dspark_hidden_active_cv"):
@@ -2359,7 +2485,20 @@ class MooncakeKVManager(CommonKVManager):
 
     def start_decode_thread(self):
         def decode_thread():
+            poller = zmq.Poller()
+            poller.register(self.server_socket, zmq.POLLIN)
+            poller.register(self.dspark_hidden_ack_wakeup_receiver, zmq.POLLIN)
             while True:
+                events = dict(poller.poll())
+                if self.dspark_hidden_ack_wakeup_receiver in events:
+                    while True:
+                        try:
+                            self.dspark_hidden_ack_wakeup_receiver.recv(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                    self._drain_dspark_hidden_ack_completions()
+                if self.server_socket not in events:
+                    continue
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)

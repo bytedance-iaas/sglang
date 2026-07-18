@@ -59,6 +59,20 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertTrue(state.kv_request_done())
         self.assertTrue(state.request_done())
 
+    def test_streaming_hidden_completion_can_wait_for_ack(self):
+        state = DSparkHiddenRequestState.streaming_state(0, 8)
+
+        self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
+        self.assertEqual(
+            state.accept_chunk(_chunk(4, 4, is_last=True), defer_hidden_done=True),
+            "accepted",
+        )
+        self.assertEqual(state.next_start, 8)
+        self.assertFalse(state.hidden_request_done())
+
+        state.mark_hidden_done()
+        self.assertTrue(state.hidden_request_done())
+
     def test_streaming_hidden_rejects_future_and_stale_chunks(self):
         state = DSparkHiddenRequestState.streaming_state(0, 8)
 
