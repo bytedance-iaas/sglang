@@ -29,6 +29,9 @@ class TransferKVChunk:
     dspark_hidden_packet_idx: int = 0
     dspark_hidden_sent: bool = False
     dspark_hidden_ready_sent: bool = False
+    dspark_hidden_ack_ready: bool = False
+    dspark_hidden_ack_expected_count: int = 0
+    dspark_hidden_ack_timed_out: bool = False
     dspark_hidden_start: Optional[int] = None
     dspark_hidden_row_len: int = 0
     dspark_hidden_is_last_chunk: bool = False
