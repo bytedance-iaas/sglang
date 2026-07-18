@@ -830,6 +830,7 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()
+        rids_to_check_set = set(rids_to_check) if rids_to_check is not None else None
 
         if len(self.queue) == 0:
             if return_failed_reqs is False:
@@ -845,8 +846,8 @@ class PrefillBootstrapQueue:
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
+                rids_to_check_set is not None
+                and req.rid not in rids_to_check_set
                 and poll != KVPoll.Failed
             ):
                 # In PP mode, successful bootstrap still requires cross-rank

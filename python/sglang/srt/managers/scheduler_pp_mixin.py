@@ -820,6 +820,23 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
+    def _pp_ordered_intersection(
+        self: Scheduler, left: List[str], right: List[str]
+    ) -> List[str]:
+        right_set = set(right)
+        return [rid for rid in left if rid in right_set]
+
+    def _pp_ordered_union(
+        self: Scheduler, left: List[str], right: List[str]
+    ) -> List[str]:
+        seen = set(left)
+        merged = list(left)
+        for rid in right:
+            if rid not in seen:
+                seen.add(rid)
+                merged.append(rid)
+        return merged
+
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
@@ -836,11 +853,11 @@ class SchedulerPPMixin:
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = self._pp_ordered_intersection(
+                prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            bad_bootstrapped_rids = self._pp_ordered_union(
+                prev_bad_bootstrapped_rids, curr_bad_bootstrapped_rids
             )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
@@ -856,8 +873,8 @@ class SchedulerPPMixin:
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_transferred_rids()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            transferred_rids = self._pp_ordered_intersection(
+                prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
 
