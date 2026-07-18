@@ -259,6 +259,7 @@ class MooncakeKVManager(CommonKVManager):
             self.dspark_hidden_ready_chunks: Dict[int, List[dict]] = defaultdict(list)
             self.dspark_hidden_ready_lock = threading.Lock()
             self.dspark_hidden_ack_completions = queue.SimpleQueue()
+            self.dspark_hidden_ack_completion_requests = queue.Queue()
             self.dspark_hidden_ack_pending_counts = defaultdict(int)
             self.dspark_hidden_ack_completion_cv = threading.Condition()
             self.dspark_hidden_acked_chunks: Dict[int, List[dict]] = defaultdict(list)
@@ -270,6 +271,16 @@ class MooncakeKVManager(CommonKVManager):
             self.dspark_hidden_ack_wakeup_receiver.bind(
                 self.dspark_hidden_ack_wakeup_endpoint
             )
+            ack_worker_count = min(
+                4, max(1, int(0.5 * (os.cpu_count() or 1)) // 8)
+            )
+            for worker_idx in range(ack_worker_count):
+                threading.Thread(
+                    target=self._dspark_hidden_ack_completion_worker,
+                    args=(worker_idx,),
+                    name=f"DSparkHiddenAckWorker-{worker_idx}",
+                    daemon=True,
+                ).start()
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -559,34 +570,36 @@ class MooncakeKVManager(CommonKVManager):
         }
         with self.dspark_hidden_ack_completion_cv:
             self.dspark_hidden_ack_pending_counts[int(room)] += 1
+        self.dspark_hidden_ack_completion_requests.put((event, completion))
 
-        def wait_for_injection() -> None:
-            try:
-                if event is not None:
-                    with torch.cuda.device(self.kv_args.gpu_id):
-                        event.synchronize()
-                completion["success"] = True
-            except Exception:
-                logger.exception(
-                    "DSpark hidden injection completion failed: room=%s start=%s",
-                    room,
-                    hidden_start,
-                )
-                completion["success"] = False
-            self.dspark_hidden_ack_completions.put(completion)
-            wakeup_sender = self._zmq_ctx.socket(zmq.PUSH)
-            wakeup_sender.setsockopt(zmq.LINGER, 0)
-            try:
-                wakeup_sender.connect(self.dspark_hidden_ack_wakeup_endpoint)
+    def _dspark_hidden_ack_completion_worker(self, worker_idx: int) -> None:
+        wakeup_sender = self._zmq_ctx.socket(zmq.PUSH)
+        wakeup_sender.setsockopt(zmq.LINGER, 0)
+        try:
+            wakeup_sender.connect(self.dspark_hidden_ack_wakeup_endpoint)
+            while True:
+                event, completion = self.dspark_hidden_ack_completion_requests.get()
+                room = int(completion["room"])
+                hidden_start = int(completion["hidden_start"])
+                success = False
+                try:
+                    if event is not None:
+                        with torch.cuda.device(self.kv_args.gpu_id):
+                            event.synchronize()
+                    success = True
+                except Exception:
+                    logger.exception(
+                        "DSpark hidden injection completion failed: "
+                        "worker=%s room=%s start=%s",
+                        worker_idx,
+                        room,
+                        hidden_start,
+                    )
+                completion["success"] = success
+                self.dspark_hidden_ack_completions.put(completion)
                 wakeup_sender.send(b"ACK_READY")
-            finally:
-                wakeup_sender.close()
-
-        threading.Thread(
-            target=wait_for_injection,
-            name=f"DSparkHiddenAckWaiter-{room}",
-            daemon=True,
-        ).start()
+        finally:
+            wakeup_sender.close()
 
     def _drain_dspark_hidden_ack_completions(self) -> None:
         while True:
