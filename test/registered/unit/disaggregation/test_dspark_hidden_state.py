@@ -1,9 +1,12 @@
 import unittest
 
+import torch
+
 from sglang.srt.disaggregation.common.utils import (
     DSparkHiddenChunk,
     DSparkHiddenRequestState,
 )
+from sglang.srt.disaggregation.utils import DSparkHiddenRowPool
 
 
 def _chunk(start: int, rows: int, is_last: bool = False) -> DSparkHiddenChunk:
@@ -129,6 +132,37 @@ class TestDSparkHiddenRequestState(unittest.TestCase):
         self.assertEqual(chunk.dst_indices, [4, 5])
         self.assertEqual(chunk.ack_host, "127.0.0.1")
         self.assertEqual(chunk.ack_port, 12345)
+
+
+class TestDSparkHiddenRowPool(unittest.TestCase):
+    def test_alloc_prefers_contiguous_rows_and_merges_frees(self):
+        pool = DSparkHiddenRowPool(8, 1, torch.float32)
+
+        self.assertEqual(pool.alloc(3), [0, 1, 2])
+        self.assertEqual(pool.alloc(2), [3, 4])
+        pool.free([1, 2, 3])
+
+        self.assertEqual(pool.alloc(3), [1, 2, 3])
+        self.assertEqual(pool.available_size(), 3)
+
+    def test_alloc_falls_back_to_fragmented_rows_without_global_sorting(self):
+        pool = DSparkHiddenRowPool(8, 1, torch.float32)
+
+        self.assertEqual(pool.alloc(8), list(range(8)))
+        pool.free([0, 1, 4, 5, 7])
+
+        self.assertEqual(pool.alloc(3), [0, 1, 4])
+        self.assertEqual(pool.available_size(), 2)
+
+    def test_free_ignores_duplicate_and_already_free_rows(self):
+        pool = DSparkHiddenRowPool(4, 1, torch.float32)
+
+        allocated = pool.alloc(2)
+        self.assertEqual(allocated, [0, 1])
+        pool.free([0, 0, 1, 3])
+
+        self.assertEqual(pool.available_size(), 4)
+        self.assertEqual(pool.alloc(4), [0, 1, 2, 3])
 
 
 if __name__ == "__main__":
