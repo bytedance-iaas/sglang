@@ -447,6 +447,7 @@ class Scheduler(
             ),
             ps=self.ps,
             tp_group=self.tp_group,
+            pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             enable_eic_cache=self.enable_eic_cache,
         )
@@ -993,6 +994,7 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
