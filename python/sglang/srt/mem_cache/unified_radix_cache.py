@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -285,11 +286,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self.session = StreamingSession(inner=self)
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
+        self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
             else torch.distributed.get_world_size(group=self.tp_group)
         )
+        self.pp_rank = params.pp_rank
+        self.pp_size = params.pp_size
+        self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller = None
@@ -302,6 +309,61 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op) -> None:
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _barrier_attn_groups(self) -> None:
+        waited = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.barrier(group=group)
+                waited = True
+        if not waited and self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
+
+    def _drain_async_work(self) -> None:
+        """Wait for the previous round's PP sends before issuing new ones."""
+        for work in self.work_list:
+            work.wait()
+        self.work_list.clear()
+
+    def _all_reduce(
+        self,
+        data: torch.Tensor,
+        tp_reduce_op: torch.distributed.ReduceOp,
+    ) -> None:
+        """Reduce on PP0's attention groups, then propagate across PP stages."""
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(data, tp_reduce_op)
+        self._pp_sync(data)
+
+    def _pp_sync(self, data: torch.Tensor) -> None:
+        """Propagate PP0's completion count through the PP pipeline."""
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        if self.pp_rank > 0:
+            torch.distributed.recv(
+                data,
+                group_src=self.pp_rank - 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
+            )
+        if self.pp_rank + 1 < self.pp_size:
+            copied_data = data.clone()
+            send_work = torch.distributed.isend(
+                copied_data,
+                group_dst=self.pp_rank + 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
+            )
+            self.work_list.append(send_work)
 
     def reset(self) -> None:
         self._reset_full()
@@ -2103,18 +2165,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
-        # TP sync: MIN across all ranks for consistent tree updates
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
-        finish_count = int(queue_size.item())
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = int(finish_count_tensor.item())
 
         # Process completed acks
         while finish_count > 0:
@@ -2130,19 +2189,27 @@ class UnifiedRadixCache(BasePrefixCache):
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
-        if cc is None or not self.ongoing_load_back:
+        if cc is None:
             return
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_load_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_load_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = int(finish_count_tensor.item())
+
+        while finish_count > 0:
+            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
-        del cc.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -2194,6 +2261,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._drain_async_work()
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
