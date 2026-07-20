@@ -66,6 +66,9 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
+    resolve_hidden_bootstrap_plan,
+)
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -104,7 +107,7 @@ def clear_dspark_hidden_request_state(req: Req) -> None:
 def maybe_release_metadata_buffer(
     req: Req,
     allocator: ReqToMetadataIdxAllocator,
-    dspark_hidden_pool=None,
+    pd_hidden_pool=None,
 ) -> None:
     """
     Release the metadata buffer index allocated for a request in prefill disaggregation mode.
@@ -119,7 +122,7 @@ def maybe_release_metadata_buffer(
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
     indices = getattr(req, "dspark_hidden_src_indices", None)
-    if indices and dspark_hidden_pool is not None:
+    if indices and pd_hidden_pool is not None:
         sender = getattr(req, "disagg_kv_sender", None)
         kv_mgr = getattr(sender, "kv_mgr", None)
         pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_request_done", None)
@@ -127,28 +130,28 @@ def maybe_release_metadata_buffer(
             getattr(sender, "bootstrap_room", req.bootstrap_room)
         )
         if not worker_released:
-            dspark_hidden_pool.free(indices)
+            pd_hidden_pool.free(indices)
         clear_dspark_hidden_request_state(req)
     elif not indices:
         clear_dspark_hidden_request_state(req)
 
 
-def maybe_release_dspark_hidden_rows(req: Req, dspark_hidden_pool) -> None:
+def maybe_release_pd_hidden_rows(req: Req, pd_hidden_pool) -> None:
     """Release source hidden rows once the local RDMA transfer is complete."""
-    if dspark_hidden_pool is None:
+    if pd_hidden_pool is None:
         return
     indices = getattr(req, "dspark_hidden_src_indices", None)
     if indices:
-        dspark_hidden_pool.free(indices)
+        pd_hidden_pool.free(indices)
         clear_dspark_hidden_request_state(req)
 
 
-def maybe_release_dspark_hidden_rows_on_hidden_done(
-    req: Req, dspark_hidden_pool
+def maybe_release_pd_hidden_rows_on_hidden_done(
+    req: Req, pd_hidden_pool
 ) -> bool:
     """Release source hidden rows after DSPARK_HIDDEN finishes, before KV success."""
     indices = getattr(req, "dspark_hidden_src_indices", None)
-    if not indices or dspark_hidden_pool is None:
+    if not indices or pd_hidden_pool is None:
         return False
     sender = getattr(req, "disagg_kv_sender", None)
     kv_mgr = getattr(sender, "kv_mgr", None)
@@ -160,6 +163,12 @@ def maybe_release_dspark_hidden_rows_on_hidden_done(
 
     clear_dspark_hidden_request_state(req)
     return True
+
+
+maybe_release_dspark_hidden_rows = maybe_release_pd_hidden_rows
+maybe_release_dspark_hidden_rows_on_hidden_done = (
+    maybe_release_pd_hidden_rows_on_hidden_done
+)
 
 
 class PrefillBootstrapQueue:
@@ -276,7 +285,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
-            dspark_hidden_pool=getattr(self.metadata_buffers, "dspark_hidden_pool", None),
+            pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
@@ -293,9 +302,7 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
-        kv_manager.dspark_hidden_pool = getattr(
-            self.metadata_buffers, "dspark_hidden_pool", None
-        )
+        kv_manager.pd_hidden_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -412,140 +419,39 @@ class PrefillBootstrapQueue:
         if decode_prefix_len is None:
             return None, None
 
-        hidden_start = int(dspark_meta.get("hidden_start", 0))
-        if hidden_start != int(decode_prefix_len):
-            return None, (
-                "DSpark hidden metadata must align with decode radix prefix: "
-                f"hidden_start={hidden_start}, decode_prefix_len={decode_prefix_len}, "
-                f"rid={req.rid}"
-            )
-
-        prefill_radix_enabled = not bool(self.scheduler.server_args.disable_radix_cache)
-        decode_radix_enabled = bool(
-            dspark_meta.get("decode_radix_cache_enabled", False)
+        plan, error = resolve_hidden_bootstrap_plan(
+            req=req,
+            metadata=dspark_meta,
+            decode_prefix_len=decode_prefix_len,
+            pp_rank=self.pp_rank,
+            model_config=self.scheduler.model_config,
+            model_runner=self.scheduler.tp_worker.model_runner,
+            metadata_buffers=self.metadata_buffers,
+            prefill_radix_enabled=not bool(
+                self.scheduler.server_args.disable_radix_cache
+            ),
         )
-        if prefill_radix_enabled != decode_radix_enabled:
-            return None, (
-                "DSpark hidden PD requires matching prefill/decode radix cache "
-                f"policies: prefill={prefill_radix_enabled}, "
-                f"decode={decode_radix_enabled}, rid={req.rid}"
-            )
-
-        pp_slices = dspark_meta.get("pp_slices") or {}
-        local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
-        if pp_slices and local_pp_slice is None:
-            return None, (
-                "DSpark hidden metadata is missing PP slice for prefill rank: "
-                f"pp_rank={self.pp_rank}, "
-                f"available_pp_slices={sorted(pp_slices.keys())}"
-            )
-        local_layer_ids = (
-            [int(x) for x in local_pp_slice.get("layer_ids", [])]
-            if local_pp_slice
-            else (
-                []
-                if pp_slices
-                else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
-            )
-        )
-        if not local_layer_ids:
+        if error is not None:
+            return None, error
+        assert plan is not None
+        if not plan.local_layer_ids:
             return (metadata_cost, 0), None
 
-        local_slice_len = (
-            int(local_pp_slice.get("slice_len", 0))
-            if local_pp_slice
-            else len(local_layer_ids) * int(self.scheduler.model_config.hidden_size)
-        )
-        expected_hidden_size = len(local_layer_ids) * int(
-            self.scheduler.model_config.hidden_size
-        )
-        if local_slice_len != expected_hidden_size:
-            return None, (
-                "DSpark hidden size mismatch on prefill: "
-                f"layers={local_layer_ids}, expected={expected_hidden_size}, "
-                f"metadata={local_slice_len}, pp_rank={self.pp_rank}"
-            )
-        model_runner = self.scheduler.tp_worker.model_runner
-        spec_aux_config = getattr(model_runner, "spec_aux_config", None)
-        configured_layer_ids = getattr(
-            spec_aux_config, "dflash_target_layer_ids", None
-        )
-        all_target_layer_ids = [
-            int(x) for x in dspark_meta.get("target_layer_ids", local_layer_ids)
-        ]
-        if (
-            configured_layer_ids is not None
-            and list(configured_layer_ids) != all_target_layer_ids
-        ):
-            return None, (
-                "DSpark target layer mismatch between prefill config and decode "
-                f"metadata: prefill={configured_layer_ids}, "
-                f"decode={all_target_layer_ids}"
-            )
-
-        hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
-        streaming_hidden = bool(dspark_meta.get("streaming_hidden", False))
-        dst_indices = [
-            int(x)
-            for x in (
-                local_pp_slice.get("dst_indices", [])
-                if local_pp_slice
-                else dspark_meta.get("dst_indices", [])
-            )
-        ]
-        dst_len_valid = (
-            0 < len(dst_indices) <= hidden_len
-            if streaming_hidden
-            else hidden_len == len(dst_indices)
-        )
-        if (
-            not dst_len_valid
-            or hidden_start < 0
-            or hidden_len < 0
-            or hidden_start + hidden_len > len(req.origin_input_ids)
-        ):
-            return None, (
-                "Invalid DSpark hidden metadata from decode: "
-                f"hidden_start={hidden_start}, hidden_len={hidden_len}, "
-                f"dst_indices={len(dst_indices)}, "
-                f"prompt_len={len(req.origin_input_ids)}, pp_rank={self.pp_rank}"
-            )
-
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
-        if pool is None:
-            return None, (
-                "DSpark hidden metadata targets a prefill PP rank without a "
-                f"hidden row pool: pp_rank={self.pp_rank}, "
-                f"local_layer_ids={local_layer_ids}"
-            )
-        source_window_rows = (
-            min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
-        )
-        hidden_cost = 0 if streaming_hidden else source_window_rows
-        if source_window_rows > pool.size:
-            return None, (
-                "DSpark hidden rows exceed prefill hidden pool capacity: "
-                f"rid={req.rid}, hidden_len={hidden_len}, "
-                f"required_rows={source_window_rows}, pool_size={pool.size}"
-            )
-
-        hidden_cost = (
-            0
-            if getattr(req, "dspark_hidden_src_indices", None) is not None
-            else hidden_cost
-        )
+        hidden_cost = 0 if plan.streaming_hidden else plan.source_window_rows
+        if getattr(req, "dspark_hidden_src_indices", None) is not None:
+            hidden_cost = 0
         if hidden_cost > hidden_row_credits:
             now = time.monotonic()
             if now - self._last_dspark_hidden_credit_warning_time > 30:
                 logger.warning(
-                    "DSpark hidden pool blocked prefill bootstrap: "
+                    "PD hidden pool blocked prefill bootstrap: "
                     "rid=%s hidden_len=%d required_rows=%d free_rows=%d "
                     "pool_rows=%d bootstrap_queue=%d",
                     req.rid,
-                    hidden_len,
+                    plan.hidden_len,
                     hidden_cost,
                     hidden_row_credits,
-                    pool.size,
+                    plan.pool.size,
                     len(self.queue),
                 )
                 self._last_dspark_hidden_credit_warning_time = now
@@ -577,7 +483,7 @@ class PrefillBootstrapQueue:
         if not local_layer_ids or getattr(req, "dspark_hidden_src_indices", None):
             return False
 
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if pool is None:
             return False
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
@@ -614,62 +520,24 @@ class PrefillBootstrapQueue:
     def _finalize_dspark_hidden_bootstrap(
         self, req: Req, dspark_meta: dict, decode_prefix_len: int
     ) -> bool:
-        hidden_start = int(dspark_meta.get("hidden_start", 0))
-        hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
-        if hidden_start != int(decode_prefix_len):
-            message = (
-                "DSpark hidden metadata must align with decode radix prefix: "
-                f"hidden_start={hidden_start}, decode_prefix_len={decode_prefix_len}, "
-                f"rid={req.rid}"
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
+        plan, error = resolve_hidden_bootstrap_plan(
+            req=req,
+            metadata=dspark_meta,
+            decode_prefix_len=decode_prefix_len,
+            pp_rank=self.pp_rank,
+            model_config=self.scheduler.model_config,
+            model_runner=self.scheduler.tp_worker.model_runner,
+            metadata_buffers=self.metadata_buffers,
+            prefill_radix_enabled=not bool(
+                self.scheduler.server_args.disable_radix_cache
+            ),
+        )
+        if error is not None:
+            self._abort_dspark_hidden_bootstrap(req, error)
             return False
 
-        prefill_radix_enabled = not bool(self.scheduler.server_args.disable_radix_cache)
-        decode_radix_enabled = bool(dspark_meta.get("decode_radix_cache_enabled", False))
-        if prefill_radix_enabled != decode_radix_enabled:
-            message = (
-                "DSpark hidden PD requires prefill and decode radix cache policies "
-                "to match. Launch both sides with radix cache enabled, or launch "
-                "both sides with radix cache disabled. "
-                f"prefill_radix_enabled={prefill_radix_enabled}, "
-                f"decode_radix_enabled={decode_radix_enabled}, rid={req.rid}"
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
-
-        pp_slices = dspark_meta.get("pp_slices") or {}
-        local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
-        if pp_slices and local_pp_slice is None:
-            message = (
-                "DSpark hidden metadata is missing PP slice for prefill rank: "
-                f"pp_rank={self.pp_rank}, available_pp_slices={sorted(pp_slices.keys())}"
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
-        dst_indices = [
-            int(x)
-            for x in (
-                local_pp_slice.get("dst_indices", [])
-                if local_pp_slice
-                else ([] if pp_slices else dspark_meta.get("dst_indices", []))
-            )
-        ]
-        local_layer_ids = (
-            [int(x) for x in local_pp_slice.get("layer_ids", [])]
-            if local_pp_slice
-            else (
-                []
-                if pp_slices
-                else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
-            )
-        )
-        local_slice_len = (
-            int(local_pp_slice.get("slice_len", 0))
-            if local_pp_slice
-            else len(local_layer_ids) * int(self.scheduler.model_config.hidden_size)
-        )
-        if not local_layer_ids:
+        assert plan is not None
+        if not plan.local_layer_ids:
             req.dspark_hidden_meta = dict(dspark_meta)
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
@@ -677,118 +545,32 @@ class PrefillBootstrapQueue:
             req.dspark_hidden_owner_direct_sent = False
             return True
 
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
-        if pool is None:
-            message = (
-                "Decode requested DSpark hidden metadata on a prefill PP rank "
-                "that owns target layers, but no hidden row pool was initialized: "
-                f"pp_rank={self.pp_rank}, local_layer_ids={local_layer_ids}"
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
-
-        streaming_hidden = bool(dspark_meta.get("streaming_hidden", False))
-        dst_len_valid = (
-            0 < len(dst_indices) <= hidden_len
-            if streaming_hidden
-            else hidden_len == len(dst_indices)
+        src_indices = (
+            None
+            if plan.streaming_hidden
+            else plan.pool.alloc(plan.source_window_rows)
         )
-        if not dst_len_valid:
+        if src_indices is None and not plan.streaming_hidden:
             message = (
-                "Invalid DSpark hidden metadata from decode: "
-                f"hidden_len={hidden_len}, dst_indices={len(dst_indices)}, "
-                f"pp_rank={self.pp_rank}, streaming_hidden={streaming_hidden}"
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
-        if (
-            hidden_start < 0
-            or hidden_len < 0
-            or hidden_start + hidden_len > len(req.origin_input_ids)
-        ):
-            message = (
-                "Invalid DSpark hidden metadata from decode: "
-                f"hidden_start={hidden_start}, hidden_len={hidden_len}, "
-                f"prompt_len={len(req.origin_input_ids)}"
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
-
-        source_window_rows = (
-            min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
-        )
-        if source_window_rows > pool.size:
-            message = (
-                "DSpark hidden rows exceed prefill hidden pool capacity: "
-                f"rid={req.rid}, hidden_len={hidden_len}, "
-                f"required_rows={source_window_rows}, pool_size={pool.size}. "
-                "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
-                "maximum prompt/hidden transfer length."
-            )
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
-        src_indices = None if streaming_hidden else pool.alloc(source_window_rows)
-        if src_indices is None and not streaming_hidden:
-            message = (
-                "DSpark hidden rows exceed prefill hidden pool capacity: "
-                f"rid={req.rid}, hidden_len={hidden_len}, "
-                f"required_rows={source_window_rows}, pool_size={pool.size}. "
+                "PD hidden rows exceed prefill hidden pool capacity: "
+                f"rid={req.rid}, hidden_len={plan.hidden_len}, "
+                f"required_rows={plan.source_window_rows}, "
+                f"pool_size={plan.pool.size}. "
                 "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
                 "maximum prompt/hidden transfer length."
             )
             self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
-        try:
-            self._configure_dspark_hidden_capture(
-                req, local_layer_ids, local_slice_len, dspark_meta
-            )
-        except Exception as exc:
-            if src_indices:
-                pool.free(src_indices)
-            message = f"Failed to configure DSpark hidden capture: {exc}"
-            self._abort_dspark_hidden_bootstrap(req, message)
-            return False
+        req.dspark_hidden_capture_layer_ids = [int(x) for x in plan.local_layer_ids]
         req.dspark_hidden_meta = dict(dspark_meta)
         req.dspark_hidden_src_indices = src_indices
-        req.dspark_hidden_dst_indices = dst_indices
-        req.dspark_hidden_written = None if streaming_hidden else [False] * hidden_len
+        req.dspark_hidden_dst_indices = plan.dst_indices
+        req.dspark_hidden_written = (
+            None if plan.streaming_hidden else [False] * plan.hidden_len
+        )
         req.dspark_hidden_owner_direct_sent = False
         return True
-
-    def _configure_dspark_hidden_capture(
-        self,
-        req: Req,
-        target_layer_ids: List[int],
-        hidden_size: int,
-        dspark_meta: dict,
-    ) -> None:
-        if not target_layer_ids:
-            raise RuntimeError(
-                f"DSpark hidden metadata for req {req.rid} has empty target_layer_ids."
-            )
-        expected_hidden_size = len(target_layer_ids) * int(
-            self.scheduler.model_config.hidden_size
-        )
-        if expected_hidden_size != int(hidden_size):
-            raise RuntimeError(
-                "DSpark hidden size mismatch on prefill: "
-                f"metadata layers={target_layer_ids}, expected={expected_hidden_size}, "
-                f"pool={hidden_size}"
-            )
-
-        model_runner = self.scheduler.tp_worker.model_runner
-        spec_aux_config = getattr(model_runner, "spec_aux_config", None)
-        configured = getattr(spec_aux_config, "dflash_target_layer_ids", None)
-        all_target_layer_ids = [
-            int(x) for x in dspark_meta.get("target_layer_ids", target_layer_ids)
-        ]
-        if configured is not None and list(configured) != all_target_layer_ids:
-            raise RuntimeError(
-                "DSpark target layer mismatch between prefill config and decode "
-                f"metadata: prefill={configured}, decode={all_target_layer_ids}"
-            )
-        req.dspark_hidden_capture_layer_ids = [int(x) for x in target_layer_ids]
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if not self.create_sender(req, num_kv_heads):
@@ -861,7 +643,7 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if self._requires_dspark_hidden_transfer(req):
-                    # DSpark hidden must be captured for every prefill chunk.
+                    # PD hidden must be captured for every prefill chunk.
                     # Do not run optimistic forward before hidden rows and
                     # capture metadata are materialized.
                     continue
@@ -916,7 +698,7 @@ class PrefillBootstrapQueue:
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
         )
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         hidden_row_credits = pool.available_size() if pool is not None else 0
 
         for req, poll in zip(self.queue, polls):
@@ -1246,7 +1028,7 @@ class SchedulerDisaggregationPrefillMixin:
         *,
         send_owner_direct: bool = False,
     ) -> None:
-        pool = getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None)
+        pool = getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None)
         hidden_states = self._extract_dspark_hidden_states_from_result(result)
         needs_dspark_hidden = any(
             (
@@ -1269,7 +1051,7 @@ class SchedulerDisaggregationPrefillMixin:
                 for req in batch.reqs
             ]
             raise RuntimeError(
-                "DSpark hidden capture was required but forward output has no "
+                "PD hidden capture was required but forward output has no "
                 f"hidden states: batch_capture_layers={batch.dspark_hidden_capture_layer_ids}, "
                 f"reqs={reqs}"
             )
@@ -1336,7 +1118,7 @@ class SchedulerDisaggregationPrefillMixin:
                 local_slice_end = local_slice_start + local_slice_len
                 if req_hidden_to_write.shape[-1] < local_slice_end:
                     raise RuntimeError(
-                        "DSpark hidden width does not match prefill PP slice: "
+                        "PD hidden width does not match prefill PP slice: "
                         f"rid={req.rid}, pp_rank={pp_rank}, "
                         f"hidden_width={req_hidden_to_write.shape[-1]}, "
                         f"slice_start={local_slice_start}, "
@@ -1361,7 +1143,7 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 if req.pending_bootstrap:
                     raise RuntimeError(
-                        "DSpark streaming hidden current chunk would be overwritten "
+                        "PD streaming hidden current chunk would be overwritten "
                         "before bootstrap is finalized: "
                         f"rid={req.rid}, old_start={prev_current_start}, "
                         f"old_rows={prev_current_row_len}, new_start={write_start}, "
@@ -1376,7 +1158,7 @@ class SchedulerDisaggregationPrefillMixin:
                 write_indices = pool.alloc(rows)
                 if write_indices is None:
                     raise RuntimeError(
-                        "DSpark streaming hidden source chunk allocation failed: "
+                        "PD streaming hidden source chunk allocation failed: "
                         f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
                         f"pool_rows={pool.size}. Streaming source rows are released "
                         "only after the matching hidden chunk ACK."
@@ -1638,9 +1420,9 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-            maybe_release_dspark_hidden_rows_on_hidden_done(
+            maybe_release_pd_hidden_rows_on_hidden_done(
                 req,
-                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
+                getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
             )
 
             if req.pending_bootstrap:
@@ -1704,7 +1486,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req,
                 self.req_to_metadata_buffer_idx_allocator,
-                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
+                getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs
@@ -1751,12 +1533,12 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         transferred_rids: List[str] = []
-        dspark_hidden_pool = getattr(
-            self.disagg_metadata_buffers, "dspark_hidden_pool", None
+        pd_hidden_pool = getattr(
+            self.disagg_metadata_buffers, "pd_hidden_pool", None
         )
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            maybe_release_dspark_hidden_rows_on_hidden_done(req, dspark_hidden_pool)
+            maybe_release_pd_hidden_rows_on_hidden_done(req, pd_hidden_pool)
             if poll == KVPoll.Success or poll == KVPoll.Failed:
                 transferred_rids.append(req.rid)
 
@@ -1788,7 +1570,7 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_release_metadata_buffer(
             req,
             self.req_to_metadata_buffer_idx_allocator,
-            getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
+            getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
         )
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2022,7 +1804,7 @@ class SchedulerDisaggregationPrefillMixin:
                     and getattr(req, "dspark_hidden_capture_layer_ids", None)
                 ):
                     raise RuntimeError(
-                        "DSpark hidden row pool was not materialized before PD transfer: "
+                        "PD hidden row pool was not materialized before transfer: "
                         f"rid={req.rid}"
                     )
                 if has_current_dspark_hidden:
@@ -2033,7 +1815,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if written is not None and not all(written):
                     missing = [i for i, ok in enumerate(written) if not ok][:8]
                     raise RuntimeError(
-                        "DSpark hidden rows are incomplete before PD transfer: "
+                        "PD hidden rows are incomplete before transfer: "
                         f"rid={req.rid}, missing_offsets={missing}"
                     )
                 return np.asarray(src_indices, dtype=np.int32)

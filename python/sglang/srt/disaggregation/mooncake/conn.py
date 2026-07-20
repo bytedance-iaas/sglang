@@ -289,7 +289,7 @@ class MooncakeKVManager(CommonKVManager):
             if room in self.dspark_hidden_done_rooms:
                 return
             self.dspark_hidden_done_rooms.add(room)
-        pool = getattr(self, "dspark_hidden_pool", None)
+        pool = getattr(self, "pd_hidden_pool", None)
         state_idx = self._dspark_hidden_state_index()
         if (
             pool is not None
@@ -369,7 +369,7 @@ class MooncakeKVManager(CommonKVManager):
                 if remaining <= 0:
                     self.record_failure(
                         int(room),
-                        "Timed out waiting for DSpark hidden chunk ACK: "
+                        "Timed out waiting for PD hidden chunk ACK: "
                         f"prefill_rank={prefill_rank}, hidden_start={hidden_start}",
                     )
                     self.update_status(int(room), KVPoll.Failed)
@@ -431,7 +431,7 @@ class MooncakeKVManager(CommonKVManager):
                 return False
             if key in self.dspark_hidden_ack_waiters:
                 raise RuntimeError(
-                    "DSpark hidden ACK waiter already exists: "
+                    "PD hidden ACK waiter already exists: "
                     f"room={key[0]}, prefill_rank={key[1]}, hidden_start={key[2]}"
                 )
             kv_chunk.dspark_hidden_ack_expected_count = expected_count
@@ -446,7 +446,7 @@ class MooncakeKVManager(CommonKVManager):
             timed_out_chunk.dspark_hidden_ack_timed_out = True
             self.record_failure(
                 key[0],
-                "Timed out waiting for DSpark hidden chunk ACK: "
+                "Timed out waiting for PD hidden chunk ACK: "
                 f"prefill_rank={key[1]}, hidden_start={key[2]}",
             )
             self.update_status(key[0], KVPoll.Failed)
@@ -568,7 +568,7 @@ class MooncakeKVManager(CommonKVManager):
                 completion["success"] = True
             except Exception:
                 logger.exception(
-                    "DSpark hidden injection completion failed: room=%s start=%s",
+                    "PD hidden injection completion failed: room=%s start=%s",
                     room,
                     hidden_start,
                 )
@@ -584,7 +584,7 @@ class MooncakeKVManager(CommonKVManager):
 
         threading.Thread(
             target=wait_for_injection,
-            name=f"DSparkHiddenAckWaiter-{room}",
+            name=f"PDHiddenAckWaiter-{room}",
             daemon=True,
         ).start()
 
@@ -610,19 +610,19 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     self.record_failure(
                         room,
-                        "DSpark hidden injection CUDA completion failed: "
+                        "PD hidden injection CUDA completion failed: "
                         f"hidden_start={completion['hidden_start']}",
                     )
                     self.update_status(room, KVPoll.Failed)
             except Exception:
                 logger.exception(
-                    "Failed to send DSpark hidden chunk ACK: room=%s start=%s",
+                    "Failed to send PD hidden chunk ACK: room=%s start=%s",
                     room,
                     completion["hidden_start"],
                 )
                 self.record_failure(
                     room,
-                    "Failed to send DSpark hidden chunk ACK: "
+                    "Failed to send PD hidden chunk ACK: "
                     f"hidden_start={completion['hidden_start']}",
                 )
                 self.update_status(room, KVPoll.Failed)
@@ -680,7 +680,7 @@ class MooncakeKVManager(CommonKVManager):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     logger.error(
-                        "Timed out waiting for DSpark hidden transfers to quiesce: "
+                        "Timed out waiting for PD hidden transfers to quiesce: "
                         "room=%s active=%s",
                         room,
                         self.dspark_hidden_active_transfers.get(room, 0),
@@ -1546,7 +1546,7 @@ class MooncakeKVManager(CommonKVManager):
                         row_end = row_start + row_len
                         if row_start < 0 or row_end > len(src_indices):
                             raise RuntimeError(
-                                "Invalid DSpark hidden row chunk: "
+                                "Invalid PD hidden row chunk: "
                                 f"room={req.room}, row_start={row_start}, "
                                 f"row_len={row_len}, row_count={len(src_indices)}"
                             )
@@ -1661,7 +1661,7 @@ class MooncakeKVManager(CommonKVManager):
         return ret
 
     def _free_dspark_hidden_state_indices(self, state_indices: Optional[List]) -> None:
-        pool = getattr(self, "dspark_hidden_pool", None)
+        pool = getattr(self, "pd_hidden_pool", None)
         state_idx = self._dspark_hidden_state_index()
         if (
             pool is None
@@ -1741,7 +1741,7 @@ class MooncakeKVManager(CommonKVManager):
         row_end = row_start + row_len
         if row_start < 0 or row_end > len(src_indices):
             raise RuntimeError(
-                "Invalid DSpark hidden packet: "
+                "Invalid PD hidden packet: "
                 f"room={req.room}, packet_idx={packet_idx}, "
                 f"row_start={row_start}, row_len={row_len}, "
                 f"row_count={len(src_indices)}"
@@ -2086,7 +2086,7 @@ class MooncakeKVManager(CommonKVManager):
                                         )
                                 self.record_failure(
                                     kv_chunk.room,
-                                    "Failed to send DSpark hidden packet "
+                                    "Failed to send PD hidden packet "
                                     f"{kv_chunk.dspark_hidden_packet_idx} of "
                                     f"{kv_chunk.room} to "
                                     f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
@@ -2376,7 +2376,7 @@ class MooncakeKVManager(CommonKVManager):
                                             )
                                     self.record_failure(
                                         kv_chunk.room,
-                                        "Failed to send DSpark hidden packet "
+                                        "Failed to send PD hidden packet "
                                         f"{kv_chunk.dspark_hidden_packet_idx} of "
                                         f"{kv_chunk.room} to "
                                         f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
@@ -2731,16 +2731,6 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        logger.debug(
-                            "DSPARK_HIDDEN_DECODE_STATUS_ACK room=%s "
-                            "prefill_rank=%s arrived=%s expected=%s "
-                            "status=%s",
-                            bootstrap_room,
-                            prefill_rank,
-                            arrived_response_num,
-                            expected_response_num,
-                            status,
-                        )
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
                                 handler = self._staging_handler
@@ -2748,14 +2738,6 @@ class MooncakeKVManager(CommonKVManager):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
-                    else:
-                        logger.debug(
-                            "DSPARK_HIDDEN_DECODE_STATUS_ACK_IGNORED room=%s "
-                            "prefill_rank=%s status=%s reason=missing_request_status",
-                            bootstrap_room,
-                            prefill_rank,
-                            status,
-                        )
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
@@ -3136,14 +3118,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
                 if pp_rank_value is None:
                     raise RuntimeError(
-                        "DSpark PP hidden metadata requires target_pp_rank in "
+                        "PD hidden metadata requires target_pp_rank in "
                         f"bootstrap_info, got keys={sorted(bootstrap_info.keys())}"
                     )
                 pp_rank = int(pp_rank_value)
                 pp_slice = spec_metadata["pp_slices"].get(str(pp_rank))
                 if pp_slice is None:
                     raise RuntimeError(
-                        "DSpark PP hidden metadata is missing slice for "
+                        "PD hidden metadata is missing slice for "
                         f"target_pp_rank={pp_rank}, available_pp_slices="
                         f"{sorted(spec_metadata['pp_slices'].keys())}"
                     )

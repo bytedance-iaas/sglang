@@ -37,8 +37,8 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.common.utils import (
-    DSparkHiddenChunk,
-    DSparkHiddenRequestState,
+    PDHiddenChunk,
+    PDHiddenRequestState,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -109,61 +109,6 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
-
-
-def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
-    sample = hidden.detach()
-    if sample.numel() == 0:
-        return {"shape": list(sample.shape), "sum": 0.0, "absmax": 0.0, "l2": 0.0}
-    flat = sample.reshape(-1)
-    head = flat[: min(8, flat.numel())].float().cpu().tolist()
-    sample_f = sample.float()
-    return {
-        "shape": list(sample.shape),
-        "sum": round(float(sample_f.sum().item()), 6),
-        "absmax": round(float(sample_f.abs().max().item()), 6),
-        "l2": round(float(torch.linalg.vector_norm(sample_f).item()), 6),
-        "head": [round(float(x), 6) for x in head],
-    }
-
-
-def _validate_dspark_hidden_tensor(
-    hidden: torch.Tensor, rid: str, hidden_start: int
-) -> bool:
-    if not envs.SGLANG_DSPARK_DEBUG_DUMP.get():
-        return hidden.numel() > 0
-    sample = hidden.detach().float()
-    if sample.numel() == 0:
-        logger.warning(
-            "Invalid DSpark PD hidden tensor: empty hidden transfer "
-            f"rid={rid}, hidden_start={hidden_start}"
-        )
-        return False
-    if not bool(torch.isfinite(sample).all().item()):
-        logger.warning(
-            "Invalid DSpark PD hidden tensor: NaN/Inf detected "
-            f"rid={rid}, hidden_start={hidden_start}, "
-            f"summary={_dspark_hidden_debug_summary(hidden)}"
-        )
-        return False
-    absmax = float(sample.abs().max().item())
-    l2_norm = float(torch.linalg.vector_norm(sample).item())
-    if absmax == 0.0 or l2_norm == 0.0:
-        logger.warning(
-            "Invalid DSpark PD hidden tensor: all-zero hidden transfer "
-            f"rid={rid}, hidden_start={hidden_start}, "
-            f"summary={_dspark_hidden_debug_summary(hidden)}"
-        )
-        return False
-    if absmax > 1.0e4 or l2_norm > 1.0e8:
-        logger.warning(
-            "Invalid DSpark PD hidden tensor: abnormal norm "
-            f"rid={rid}, hidden_start={hidden_start}, "
-            f"absmax={absmax:.6g}, l2={l2_norm:.6g}, "
-            f"summary={_dspark_hidden_debug_summary(hidden)}"
-        )
-        return False
-    return True
 
 
 class DecodeReqToTokenPool:
@@ -328,8 +273,8 @@ class DecodeRequest:
     dspark_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
     dspark_hidden_pp_slices: Optional[Dict[int, dict]] = None
     dspark_hidden_start: int = 0
-    dspark_hidden_state: DSparkHiddenRequestState = field(
-        default_factory=DSparkHiddenRequestState.disabled
+    dspark_hidden_state: PDHiddenRequestState = field(
+        default_factory=PDHiddenRequestState.disabled
     )
 
     # HiCache Status
@@ -534,7 +479,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
-            dspark_hidden_pool=getattr(self.metadata_buffers, "dspark_hidden_pool", None),
+            pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -1126,10 +1071,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and StateType.DSPARK_HIDDEN in state_types
                 and dspark_hidden_len > 0
             ):
-                dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+                dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
                 if dspark_pool is None:
                     message = (
-                        "DSpark decode requires a hidden row pool for PD metadata "
+                        "PD decode requires a hidden row pool for hidden metadata "
                         "transfer, but none was initialized."
                     )
                     logger.error(message)
@@ -1157,7 +1102,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 target_layer_ids = [int(x) for x in target_layer_ids]
                 if not target_layer_ids:
                     message = (
-                        "DSpark decode could not infer target layer ids for PD "
+                        "PD decode could not infer target layer ids for hidden "
                         "hidden transfer."
                     )
                     logger.error(message)
@@ -1207,7 +1152,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.scheduler.model_config.hidden_size
                 ):
                     message = (
-                        "DSpark PP slice layout does not cover all target layers: "
+                        "PD hidden PP slice layout does not cover all target layers: "
                         f"target_layer_ids={target_layer_ids}, pp_size={pp_size}"
                     )
                     logger.error(message)
@@ -1239,7 +1184,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if not fixed_pool_supported:
                     message = (
-                        "DSpark fixed decode hidden row pool requires the current "
+                        "PD fixed decode hidden row pool requires the current "
                         "PP layout to have exactly one non-empty slice covering the "
                         "full hidden width. Split target layers across PP ranks are "
                         "not supported yet: "
@@ -1264,13 +1209,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.kv_manager.supports_dspark_hidden_streaming()
                     and hasattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk")
                 )
-                if dspark_hidden_streaming:
-                    dspark_hidden_window_rows = min(dspark_hidden_len, dspark_pool.size)
-                else:
-                    dspark_hidden_window_rows = dspark_hidden_len
+                if not dspark_hidden_streaming:
+                    message = (
+                        "PD hidden transfer requires streaming chunk injection support."
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+                dspark_hidden_window_rows = min(dspark_hidden_len, dspark_pool.size)
                 if dspark_hidden_window_rows <= 0:
                     message = (
-                        "DSpark decode hidden receive pool has no streaming rows: "
+                        "PD decode hidden receive pool has no streaming rows: "
                         f"rid={decode_req.req.rid}, hidden_len={dspark_hidden_len}, "
                         f"pool_size={dspark_pool.size}. Increase "
                         "SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS."
@@ -1289,28 +1249,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-                if not dspark_hidden_streaming and dspark_hidden_len > dspark_pool.size:
-                    message = (
-                        "DSpark decode hidden rows exceed receive pool capacity: "
-                        f"rid={decode_req.req.rid}, hidden_len={dspark_hidden_len}, "
-                        f"pool_size={dspark_pool.size}. Increase "
-                        "SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS."
-                    )
-                    logger.error(message)
-                    prepare_abort(
-                        decode_req.req,
-                        message,
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    failed_reqs.append(decode_req)
-                    indices_to_remove.add(i)
-                    continue
-
                 allocated_hidden_indices = dspark_pool.alloc(dspark_hidden_window_rows)
                 if allocated_hidden_indices is None:
                     if prefix_len > 0:
@@ -1321,7 +1259,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         > 30
                     ):
                         logger.warning(
-                            "DSpark decode hidden pool blocked prealloc: "
+                            "PD decode hidden pool blocked prealloc: "
                             "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
                             "prealloc_queue=%d transfer_queue=%d",
                             decode_req.req.rid,
@@ -1350,11 +1288,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 dspark_hidden_pp_slices = pp_slices
                 hidden_end = int(dspark_hidden_start + dspark_hidden_len)
                 decode_req.dspark_hidden_state = (
-                    DSparkHiddenRequestState.streaming_state(
+                    PDHiddenRequestState.streaming_state(
                         int(dspark_hidden_start), hidden_end
                     )
                     if dspark_hidden_streaming
-                    else DSparkHiddenRequestState.full(
+                    else PDHiddenRequestState.full(
                         int(dspark_hidden_start), hidden_end
                     )
                 )
@@ -1547,7 +1485,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             dspark_hidden_pp_slices or {}
                         ).items()
                     },
-                    "hidden_size": int(self.metadata_buffers.dspark_hidden_pool.hidden_size),
+                    "hidden_size": int(self.metadata_buffers.pd_hidden_pool.hidden_size),
                     "target_layer_ids": [int(x) for x in target_layer_ids],
                 }
 
@@ -2064,7 +2002,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.bootstrap_room
         ):
             logger.error(
-                "Timed out waiting for DSpark hidden ACK completion before "
+                "Timed out waiting for PD hidden ACK completion before "
                 "releasing receive rows: rid=%s room=%s",
                 decode_req.req.rid,
                 decode_req.req.bootstrap_room,
@@ -2077,7 +2015,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             pop_acked_chunks(decode_req.req.bootstrap_room)
         indices_by_pp = decode_req.dspark_hidden_dst_indices_by_pp
         indices = decode_req.dspark_hidden_dst_indices
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if pool is not None:
             if indices_by_pp is not None:
                 seen = set()
@@ -2123,12 +2061,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = metadata[:14]
-        output_dspark_prefill_tail_hidden_states = None
-        output_dspark_prefill_tail_valid_mask = None
-        if len(metadata) >= 16:
-            output_dspark_prefill_tail_hidden_states = metadata[14]
-            output_dspark_prefill_tail_valid_mask = metadata[15]
-
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
         expected_room = (
@@ -2227,103 +2159,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
-            if (
-                decode_req.dspark_hidden_dst_indices_by_pp is not None
-                and not decode_req.dspark_hidden_state.streaming
-            ):
-                dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
-                if dspark_pool is None:
-                    raise RuntimeError("DSpark hidden row pool disappeared on decode.")
-                pp_slices = decode_req.dspark_hidden_pp_slices or {}
-                hidden_dst_indices = next(
-                    (
-                        indices
-                        for indices in decode_req.dspark_hidden_dst_indices_by_pp.values()
-                        if indices
-                    ),
-                    [],
-                )
-                raw_hidden_len = len(hidden_dst_indices)
-                hidden_start = int(decode_req.dspark_hidden_start)
-                prefill_cached_len = int(cached_tokens[0].item())
-                received_hidden_start = min(
-                    max(hidden_start, prefill_cached_len),
-                    hidden_start + raw_hidden_len,
-                )
-                hidden_offset = received_hidden_start - hidden_start
-                hidden_len = raw_hidden_len - hidden_offset
-                full_hidden_size = sum(
-                    int(pp_slice.get("slice_len", 0)) for pp_slice in pp_slices.values()
-                )
-                non_empty_slices = []
-                for pp_rank, dst_indices in decode_req.dspark_hidden_dst_indices_by_pp.items():
-                    pp_slice = pp_slices.get(pp_rank) or pp_slices.get(str(pp_rank))
-                    if not pp_slice:
-                        continue
-                    slice_start = int(pp_slice.get("slice_start", 0))
-                    slice_len = int(pp_slice.get("slice_len", 0))
-                    if slice_len <= 0:
-                        continue
-                    non_empty_slices.append(
-                        (slice_start, slice_len, dst_indices)
-                    )
-                if (
-                    len(non_empty_slices) == 1
-                    and non_empty_slices[0][0] == 0
-                    and non_empty_slices[0][1] == full_hidden_size
-                ):
-                    _, _, dst_indices = non_empty_slices[0]
-                    hidden = dspark_pool.read(
-                        dst_indices[hidden_offset : hidden_offset + hidden_len]
-                    )
-                else:
-                    hidden_device = torch.device(getattr(dspark_pool, "device", "cpu"))
-                    hidden = torch.empty(
-                        (hidden_len, full_hidden_size),
-                        dtype=dspark_pool.dtype,
-                        device=hidden_device,
-                    )
-                    for slice_start, slice_len, dst_indices in non_empty_slices:
-                        slice_hidden = dspark_pool.read(
-                            dst_indices[hidden_offset : hidden_offset + hidden_len]
-                        )[:, slice_start : slice_start + slice_len]
-                        hidden[:, slice_start : slice_start + slice_len].copy_(
-                            slice_hidden
-                        )
-                valid_dspark_hidden = _validate_dspark_hidden_tensor(
-                    hidden, decode_req.req.rid, received_hidden_start
-                )
-                if valid_dspark_hidden:
-                    decode_req.req.prefill_tail_hidden_states_tensor = hidden
-                    decode_req.req.prefill_tail_valid_mask = torch.ones(
-                        (hidden.shape[0],), dtype=torch.bool, device=hidden.device
-                    )
-                    decode_req.req.prefill_tail_hidden_start = received_hidden_start
-                else:
-                    decode_req.req.prefill_tail_hidden_states_tensor = None
-                    decode_req.req.prefill_tail_valid_mask = None
-                    decode_req.req.prefill_tail_hidden_start = 0
-            else:
-                if (
-                    output_dspark_prefill_tail_hidden_states is not None
-                    and output_dspark_prefill_tail_valid_mask is not None
-                    and bool(output_dspark_prefill_tail_valid_mask.any().item())
-                ):
-                    valid_dspark_hidden = _validate_dspark_hidden_tensor(
-                        output_dspark_prefill_tail_hidden_states,
-                        decode_req.req.rid,
-                        0,
-                    )
-                    if not valid_dspark_hidden:
-                        output_dspark_prefill_tail_hidden_states = None
-                        output_dspark_prefill_tail_valid_mask = None
-                decode_req.req.prefill_tail_hidden_states_tensor = (
-                    output_dspark_prefill_tail_hidden_states
-                )
-                decode_req.req.prefill_tail_valid_mask = (
-                    output_dspark_prefill_tail_valid_mask
-                )
-                decode_req.req.prefill_tail_hidden_start = 0
 
         if decode_req.req.return_logprob and not replayed_boundary:
             decode_req.req.logprob.output_token_logprobs_val.append(
@@ -2393,22 +2228,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         pop_chunks = getattr(self.kv_manager, "pop_dspark_hidden_ready_chunks", None)
         if pop_chunks is None:
             raise RuntimeError(
-                "DSpark streaming hidden backend is missing ready chunk API."
+                "PD streaming hidden backend is missing ready chunk API."
             )
         chunks = pop_chunks(decode_req.req.bootstrap_room)
         if not chunks:
             return
-        dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if dspark_pool is None:
-            raise RuntimeError("DSpark hidden row pool disappeared on decode.")
+            raise RuntimeError("PD hidden row pool disappeared on decode.")
         inject_chunk = getattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk", None)
         if inject_chunk is None:
             raise RuntimeError(
-                "DSpark streaming hidden requires draft_worker.inject_pd_hidden_chunk."
+                "PD streaming hidden requires draft_worker.inject_pd_hidden_chunk."
             )
         sorted_chunks = sorted(chunks, key=lambda item: int(item["hidden_start"]))
         for chunk in sorted_chunks:
-            hidden_chunk = DSparkHiddenChunk(
+            hidden_chunk = PDHiddenChunk(
                 room=int(chunk["room"]),
                 prefill_rank=int(chunk["prefill_rank"]),
                 hidden_start=int(chunk["hidden_start"]),
@@ -2422,7 +2257,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
             if len(hidden_chunk.dst_indices) != hidden_chunk.row_len:
                 raise RuntimeError(
-                    "DSpark hidden chunk dst index length mismatch: "
+                    "PD hidden chunk dst index length mismatch: "
                     f"rid={decode_req.req.rid}, row_len={hidden_chunk.row_len}, "
                     f"dst_indices={len(hidden_chunk.dst_indices)}"
                 )
@@ -2431,7 +2266,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             if chunk_status == "future":
                 raise RuntimeError(
-                    "DSpark streaming hidden chunk arrived out of order: "
+                    "PD streaming hidden chunk arrived out of order: "
                     f"rid={decode_req.req.rid}, "
                     f"expected_start={hidden_state.next_start}, "
                     f"chunk_start={hidden_chunk.hidden_start}, "
@@ -2439,7 +2274,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             if chunk_status == "stale":
                 raise RuntimeError(
-                    "DSpark streaming hidden chunk arrived out of order: "
+                    "PD streaming hidden chunk arrived out of order: "
                     f"rid={decode_req.req.rid}, "
                     f"expected_start={hidden_state.next_start}, "
                     f"chunk_start={hidden_chunk.hidden_start}, "
@@ -2457,11 +2292,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             if submit_ack is None:
                 raise RuntimeError(
-                    "DSpark streaming hidden backend is missing ACK completion API."
+                    "PD streaming hidden backend is missing ACK completion API."
                 )
             if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
                 raise RuntimeError(
-                    "DSpark streaming hidden chunk is missing ACK endpoint: "
+                    "PD streaming hidden chunk is missing ACK endpoint: "
                     f"rid={decode_req.req.rid}, "
                     f"hidden_start={hidden_chunk.hidden_start}"
                 )
