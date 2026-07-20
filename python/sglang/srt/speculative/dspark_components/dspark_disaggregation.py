@@ -33,7 +33,7 @@ class DSparkDisaggMetadataConfig:
 
 
 @dataclass
-class DSparkHiddenBootstrapPlan:
+class PDHiddenBootstrapPlan:
     hidden_start: int
     hidden_len: int
     streaming_hidden: bool
@@ -109,11 +109,11 @@ def resolve_disagg_metadata_config(
         int(server_args.max_prefill_buffer_tokens() or 0),
         int(max_prefill_tokens or 0),
     )
-    pool_env_value = os.getenv("SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS")
+    pool_env_value = os.getenv("SGLANG_PD_HIDDEN_POOL_TOKENS")
     if mode_value == "decode":
-        pool_env_value = os.getenv("SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS")
+        pool_env_value = os.getenv("SGLANG_PD_HIDDEN_RECV_POOL_TOKENS")
         if pool_env_value is None:
-            pool_env_value = os.getenv("SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS")
+            pool_env_value = os.getenv("SGLANG_PD_HIDDEN_POOL_TOKENS")
     hidden_pool_size = max(
         0,
         int(pool_env_value if pool_env_value is not None else str(default_pool_rows)),
@@ -148,7 +148,7 @@ def resolve_hidden_bootstrap_plan(
     model_runner: Any,
     metadata_buffers: Any,
     prefill_radix_enabled: bool,
-) -> Tuple[Optional[DSparkHiddenBootstrapPlan], Optional[str]]:
+) -> Tuple[Optional[PDHiddenBootstrapPlan], Optional[str]]:
     hidden_start = int(metadata.get("hidden_start", 0))
     hidden_len = int(metadata.get("hidden_len", len(req.origin_input_ids)))
     if hidden_start != int(decode_prefix_len):
@@ -190,7 +190,7 @@ def resolve_hidden_bootstrap_plan(
     )
     if not local_layer_ids:
         return (
-            DSparkHiddenBootstrapPlan(
+            PDHiddenBootstrapPlan(
                 hidden_start=hidden_start,
                 hidden_len=hidden_len,
                 streaming_hidden=bool(metadata.get("streaming_hidden", False)),
@@ -270,7 +270,7 @@ def resolve_hidden_bootstrap_plan(
         )
 
     return (
-        DSparkHiddenBootstrapPlan(
+        PDHiddenBootstrapPlan(
             hidden_start=hidden_start,
             hidden_len=hidden_len,
             streaming_hidden=streaming_hidden,
