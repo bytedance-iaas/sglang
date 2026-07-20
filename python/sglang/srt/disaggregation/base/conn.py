@@ -25,7 +25,7 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
     # Target aux hidden rows used to bootstrap decode-side draft KV.
-    DSPARK_HIDDEN = "dspark_hidden"
+    PD_HIDDEN = "pd_hidden"
 
 
 @dataclasses.dataclass

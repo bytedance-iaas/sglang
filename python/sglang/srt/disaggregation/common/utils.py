@@ -26,16 +26,16 @@ class TransferKVChunk:
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
     kv_sent: bool = False
-    dspark_hidden_packet_idx: int = 0
-    dspark_hidden_sent: bool = False
-    dspark_hidden_ready_sent: bool = False
-    dspark_hidden_ack_ready: bool = False
-    dspark_hidden_ack_expected_count: int = 0
-    dspark_hidden_ack_timed_out: bool = False
-    dspark_hidden_start: Optional[int] = None
-    dspark_hidden_row_len: int = 0
-    dspark_hidden_is_last_chunk: bool = False
-    dspark_hidden_release_indices: Optional[List[int]] = None
+    pd_hidden_packet_idx: int = 0
+    pd_hidden_sent: bool = False
+    pd_hidden_ready_sent: bool = False
+    pd_hidden_ack_ready: bool = False
+    pd_hidden_ack_expected_count: int = 0
+    pd_hidden_ack_timed_out: bool = False
+    pd_hidden_start: Optional[int] = None
+    pd_hidden_row_len: int = 0
+    pd_hidden_is_last_chunk: bool = False
+    pd_hidden_release_indices: Optional[List[int]] = None
     enqueue_time: float = 0.0
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
@@ -144,10 +144,6 @@ class PDHiddenRequestState:
                 self.mark_hidden_done()
         self.next_start = next_start
         return "accepted"
-
-
-DSparkHiddenChunk = PDHiddenChunk
-DSparkHiddenRequestState = PDHiddenRequestState
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

@@ -242,7 +242,7 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
-class DSparkHiddenRowPool:
+class PDHiddenRowPool:
     """Compact row pool for PD hidden-state transfer."""
 
     def __init__(
@@ -500,9 +500,6 @@ class PDHiddenTransferPlan:
         return new_dynamic_dst
 
 
-DSparkHiddenTransferPlan = PDHiddenTransferPlan
-
-
 class MetadataBuffers:
     def __init__(
         self,
@@ -519,9 +516,9 @@ class MetadataBuffers:
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
-        self.pd_hidden_pool: Optional[DSparkHiddenRowPool] = None
+        self.pd_hidden_pool: Optional[PDHiddenRowPool] = None
         if pd_hidden_pool_size > 0 and pd_hidden_size > 0:
-            self.pd_hidden_pool = DSparkHiddenRowPool(
+            self.pd_hidden_pool = PDHiddenRowPool(
                 pd_hidden_pool_size,
                 pd_hidden_size,
                 hidden_states_dtype,
@@ -795,9 +792,9 @@ class MetadataBuffers:
         hidden_size: int,
         dtype: torch.dtype,
         device: str = "cpu",
-    ) -> DSparkHiddenRowPool:
+    ) -> PDHiddenRowPool:
         if self.pd_hidden_pool is None:
-            self.pd_hidden_pool = DSparkHiddenRowPool(
+            self.pd_hidden_pool = PDHiddenRowPool(
                 size=size,
                 hidden_size=hidden_size,
                 dtype=dtype,
@@ -1199,7 +1196,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
-    pd_hidden_pool: Optional[DSparkHiddenRowPool] = None,
+    pd_hidden_pool: Optional[PDHiddenRowPool] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -1319,7 +1316,7 @@ def setup_state_kv_args(
         if data_ptrs:
             append_state_component(
                 kv_args,
-                StateType.DSPARK_HIDDEN,
+                StateType.PD_HIDDEN,
                 data_ptrs,
                 data_lens,
                 item_lens,
