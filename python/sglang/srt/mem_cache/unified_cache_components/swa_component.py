@@ -374,7 +374,9 @@ class SWAComponent(TreeComponent):
         root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
-        swa_uuid_for_lock = None
+        swa_uuid = None
+        uuid_key = "host_uuid" if lock_host else "uuid"
+        lru = self.cache.host_lru_lists[ct] if lock_host else self.cache.lru_lists[ct]
 
         # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
         # skip them and keep walking up. This path is hit when HiCache
@@ -382,23 +384,36 @@ class SWAComponent(TreeComponent):
         cur = node
         while cur != root and swa_lock_size < sliding_window_size:
             comp = cur.component_data[ct]
-            if comp.value is None:
+            value = comp.host_value if lock_host else comp.value
+            if value is None:
                 result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
                 cur = cur.parent
                 continue
-            if comp.lock_ref == 0:
-                key_len = len(cur.key)
-                self.cache.component_evictable_size_[ct] -= key_len
-                self.cache.component_protected_size_[ct] += key_len
-            comp.lock_ref += 1
-            swa_lock_size += len(cur.key)
+
+            ref = comp.host_lock_ref if lock_host else comp.lock_ref
+            if ref == 0:
+                if lock_host:
+                    if lru.in_list(cur):
+                        lru.remove_node(cur)
+                else:
+                    key_len = len(cur.key)
+                    self.cache.component_evictable_size_[ct] -= key_len
+                    self.cache.component_protected_size_[ct] += key_len
+            if lock_host:
+                comp.host_lock_ref = ref + 1
+            else:
+                comp.lock_ref = ref + 1
+            swa_lock_size += len(value)
             if swa_lock_size >= sliding_window_size:
-                if comp.metadata.get("uuid") is None:
-                    comp.metadata["uuid"] = next_component_uuid()
-                swa_uuid_for_lock = comp.metadata["uuid"]
+                if comp.metadata.get(uuid_key) is None:
+                    comp.metadata[uuid_key] = next_component_uuid()
+                swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
-        result.swa_uuid_for_lock = swa_uuid_for_lock
+        if lock_host:
+            result.swa_uuid_for_host_lock = swa_uuid
+        else:
+            result.swa_uuid_for_lock = swa_uuid
         return result
 
     def release_component_lock(
@@ -409,9 +424,14 @@ class SWAComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         root = self.cache.root_node
-        swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
+        swa_uuid_for_lock = (
+            (params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock)
+            if params
+            else None
+        )
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
+        uuid_key = "host_uuid" if lock_host else "uuid"
 
         # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
@@ -420,15 +440,25 @@ class SWAComponent(TreeComponent):
             if cur.id in skip_lock_node_ids:
                 cur = cur.parent
                 continue
-            if comp.lock_ref == 0:
+            ref = comp.host_lock_ref if lock_host else comp.lock_ref
+            if ref == 0:
                 cur = cur.parent
                 continue
-            if comp.lock_ref == 1:
-                key_len = len(cur.key)
-                self.cache.component_evictable_size_[ct] += key_len
-                self.cache.component_protected_size_[ct] -= key_len
-            comp.lock_ref -= 1
-            if swa_uuid_for_lock and comp.metadata.get("uuid") == swa_uuid_for_lock:
+            if ref == 1:
+                if lock_host:
+                    if comp.value is None and comp.host_value is not None:
+                        host_lru = self.cache.host_lru_lists[ct]
+                        if not host_lru.in_list(cur):
+                            host_lru.insert_mru(cur)
+                else:
+                    key_len = len(comp.value)
+                    self.cache.component_evictable_size_[ct] += key_len
+                    self.cache.component_protected_size_[ct] -= key_len
+            if lock_host:
+                comp.host_lock_ref = ref - 1
+            else:
+                comp.lock_ref = ref - 1
+            if swa_uuid_for_lock and comp.metadata.get(uuid_key) == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent
 
