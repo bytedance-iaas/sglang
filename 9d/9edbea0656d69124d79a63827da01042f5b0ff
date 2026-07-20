@@ -1,0 +1,21 @@
+python/sglang/jit_kernel/csrc/deepseek_v4/topk_v1.cuh
+  s_3af354177588a3::t_b55e05a1dd6ab2 396,400
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9d9edbea0656d69124d79a63827da01042f5b0ff",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
