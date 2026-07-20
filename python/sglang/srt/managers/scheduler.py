@@ -99,8 +99,11 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DisableEICReqInput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EICSwitchOutput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -224,6 +227,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICPagedHiRadixCache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -358,6 +365,9 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
+        self.enable_eic_cache = (
+            server_args.enable_eic_cache if self.enable_hierarchical_cache else False
+        )
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -426,36 +436,7 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
-        result = kv_cache_builder.build_kv_cache(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            tp_worker=self.tp_worker,
-            page_size=self.page_size,
-            spec_algorithm=self.spec_algorithm,
-            attn_tp_cpu_group=self.attn_tp_cpu_group,
-            tp_cpu_group=self.tp_cpu_group,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
-            enable_metrics=self.server_args.enable_metrics,
-            enable_kv_cache_events=bool(
-                self.server_args.kv_events_config
-                and self.ps.pp_rank == 0
-                and self.ps.attn_tp_rank == 0
-                and self.ps.attn_cp_rank == 0
-            ),
-            ps=self.ps,
-            tp_group=self.tp_group,
-            pp_group=self.pp_group,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-        )
-        self.is_hybrid_swa = result.is_hybrid_swa
-        self.is_hybrid_ssm = result.is_hybrid_ssm
-        self.sliding_window_size = result.sliding_window_size
-        self.full_tokens_per_layer = result.full_tokens_per_layer
-        self.swa_tokens_per_layer = result.swa_tokens_per_layer
-        self.req_to_token_pool = result.req_to_token_pool
-        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
-        self.disable_radix_cache = result.disable_radix_cache
-        self.tree_cache = result.tree_cache
+        self.init_cache_with_memory_pool()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -1031,6 +1012,38 @@ class Scheduler(
             default=0,
         )
 
+    def init_cache_with_memory_pool(self) -> None:
+        result = kv_cache_builder.build_kv_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            tp_worker=self.tp_worker,
+            page_size=self.page_size,
+            spec_algorithm=self.spec_algorithm,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            enable_metrics=self.server_args.enable_metrics,
+            enable_kv_cache_events=bool(
+                self.server_args.kv_events_config
+                and self.ps.pp_rank == 0
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ),
+            ps=self.ps,
+            tp_group=self.tp_group,
+            pp_group=self.pp_group,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.is_hybrid_swa = result.is_hybrid_swa
+        self.is_hybrid_ssm = result.is_hybrid_ssm
+        self.sliding_window_size = result.sliding_window_size
+        self.full_tokens_per_layer = result.full_tokens_per_layer
+        self.swa_tokens_per_layer = result.swa_tokens_per_layer
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.disable_radix_cache = result.disable_radix_cache
+        self.tree_cache = result.tree_cache
+
     def finish_hisparse_request(self, req: Req) -> None:
         for coordinator in self.iter_hisparse_coordinators():
             coordinator.request_finished(req)
@@ -1543,6 +1556,8 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (EnableEICReqInput, self.enable_eic_cache_wrapped),
+                (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
         )
 
@@ -2944,6 +2959,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            enable_eic_cache=self.enable_eic_cache,
         )
 
         if self.chunked_req is not None:
@@ -2966,6 +2982,12 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+
+        if isinstance(self.tree_cache, EICPagedHiRadixCache):
+            # for batch exists from EIC cache
+            self.tree_cache.match_from_remote(self.waiting_queue)
+
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -4303,6 +4325,74 @@ class Scheduler(
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success=success, message=message)
+
+    def enable_eic_cache_wrapped(self, recv_req: EnableEICReqInput) -> EICSwitchOutput:
+        if not isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot enable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot enable EIC cache while there are pending requests. Please flush the cache first.",
+                )
+
+            self.enable_eic_cache = True
+            self.enable_hierarchical_cache = True
+            self.server_args.enable_hierarchical_cache = True
+            self.server_args.enable_eic_cache = True
+            self.init_cache_with_memory_pool()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+                self.enable_priority_scheduling,
+                self.schedule_low_priority_values_first,
+            )
+            message = "EIC cache enabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
+
+    def disable_eic_cache_wrapped(
+        self, recv_req: DisableEICReqInput
+    ) -> EICSwitchOutput:
+        if isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot disable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot disable EIC cache while there are pending requests. Please flush the cache first.",
+                )
+
+            self.enable_eic_cache = False
+            self.enable_hierarchical_cache = False
+            self.server_args.enable_hierarchical_cache = False
+            self.server_args.enable_eic_cache = False
+            self.init_cache_with_memory_pool()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+                self.enable_priority_scheduling,
+                self.schedule_low_priority_values_first,
+            )
+            message = "EIC cache disabled successfully."
+        else:
+            message = "EIC cache is already disabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time

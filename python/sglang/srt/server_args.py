@@ -2062,6 +2062,14 @@ class ServerArgs:
     # Hierarchical cache
     # -------------------------------------------------------------------------
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_eic_cache: A[
+        bool,
+        "Enable EIC-backed hierarchical cache (requires --enable-hierarchical-cache).",
+    ] = False
+    disable_eic_shared: A[
+        bool,
+        "Disable EIC shared remote lookup; use non-shared write-through/write-back only.",
+    ] = False
     hicache_ratio: A[
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
@@ -6086,6 +6094,11 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
+
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
