@@ -1632,6 +1632,51 @@ class MooncakeKVManager(CommonKVManager):
             self._pd_hidden_release_state_indices(kv_chunk)
         )
 
+    def _release_or_mark_pd_hidden_done(self, kv_chunk: TransferKVChunk) -> None:
+        if kv_chunk.pd_hidden_start is not None:
+            self._free_pd_hidden_chunk_rows(kv_chunk)
+        else:
+            self.mark_pd_hidden_request_done(
+                kv_chunk.room,
+                self._pd_hidden_release_state_indices(kv_chunk),
+            )
+
+    def _finish_pd_hidden_streaming_chunk(
+        self,
+        kv_chunk: TransferKVChunk,
+        hidden_inflight_key: Optional[Tuple[int, int]],
+    ) -> None:
+        self._free_pd_hidden_chunk_rows(kv_chunk)
+        if hidden_inflight_key is not None:
+            with self.pd_hidden_inflight_lock:
+                if self.pd_hidden_inflight_chunks.get(kv_chunk.room) == hidden_inflight_key:
+                    self.pd_hidden_inflight_chunks.pop(kv_chunk.room, None)
+            self._wake_next_pd_hidden_room_waiter(kv_chunk.room)
+
+    def _mark_session_failed_and_sync(
+        self,
+        *,
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        prefill_unique_rank: int,
+        failure_reason: str,
+    ) -> None:
+        with self.session_lock:
+            self.session_failures[req.mooncake_session_id] += 1
+            if self.session_failures[req.mooncake_session_id] >= 1:
+                self.failed_sessions.add(req.mooncake_session_id)
+                logger.error("Session %s failed.", req.mooncake_session_id)
+        self.record_failure(kv_chunk.room, failure_reason)
+        self.update_status(kv_chunk.room, KVPoll.Failed)
+        self._wake_pd_hidden_ack_waiters(kv_chunk.room)
+        self.sync_status_to_decode_endpoint(
+            req.endpoint,
+            req.dst_port,
+            req.room,
+            KVPoll.Failed,
+            prefill_unique_rank,
+        )
+
     def _send_pd_hidden_packet(
         self,
         req: TransferInfo,
@@ -1888,13 +1933,7 @@ class MooncakeKVManager(CommonKVManager):
                         not kv_chunk.pd_hidden_sent
                         and self._has_pd_hidden_state(kv_chunk.state_indices)
                     ):
-                        if kv_chunk.pd_hidden_start is not None:
-                            self._free_pd_hidden_chunk_rows(kv_chunk)
-                        else:
-                            self.mark_pd_hidden_request_done(
-                                kv_chunk.room,
-                                self._pd_hidden_release_state_indices(kv_chunk),
-                            )
+                        self._release_or_mark_pd_hidden_done(kv_chunk)
                     if self.enable_trace:
                         kv_chunk.trace_ctx.trace_slice_end(
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
@@ -1974,20 +2013,8 @@ class MooncakeKVManager(CommonKVManager):
                         ack_ready = kv_chunk.pd_hidden_ack_ready
                         if ack_ready:
                             pd_hidden_done_count = pd_hidden_expected
-                            self._free_pd_hidden_chunk_rows(kv_chunk)
-                            if hidden_inflight_key is not None:
-                                with self.pd_hidden_inflight_lock:
-                                    if (
-                                        self.pd_hidden_inflight_chunks.get(
-                                            kv_chunk.room
-                                        )
-                                        == hidden_inflight_key
-                                    ):
-                                        self.pd_hidden_inflight_chunks.pop(
-                                            kv_chunk.room, None
-                                        )
-                            self._wake_next_pd_hidden_room_waiter(
-                                kv_chunk.room
+                            self._finish_pd_hidden_streaming_chunk(
+                                kv_chunk, hidden_inflight_key
                             )
                         elif kv_chunk.pd_hidden_ack_timed_out:
                             pd_hidden_failed = True
@@ -2023,50 +2050,23 @@ class MooncakeKVManager(CommonKVManager):
                             finally:
                                 self._end_pd_hidden_transfer(kv_chunk.room)
                             if ret != 0:
-                                with self.session_lock:
-                                    self.session_failures[
-                                        req.mooncake_session_id
-                                    ] += 1
-                                    if (
-                                        self.session_failures[req.mooncake_session_id]
-                                        >= 1
-                                    ):
-                                        self.failed_sessions.add(
-                                            req.mooncake_session_id
-                                        )
-                                        logger.error(
-                                            f"Session {req.mooncake_session_id} failed."
-                                        )
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    "Failed to send PD hidden packet "
-                                    f"{kv_chunk.pd_hidden_packet_idx} of "
-                                    f"{kv_chunk.room} to "
-                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                self._mark_session_failed_and_sync(
+                                    kv_chunk=kv_chunk,
+                                    req=req,
+                                    prefill_unique_rank=prefill_unique_rank,
+                                    failure_reason=(
+                                        "Failed to send PD hidden packet "
+                                        f"{kv_chunk.pd_hidden_packet_idx} of "
+                                        f"{kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}"
+                                    ),
                                 )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self._wake_pd_hidden_ack_waiters(kv_chunk.room)
                                 if kv_chunk.pd_hidden_start is not None:
                                     with self.pd_hidden_inflight_lock:
                                         self.pd_hidden_inflight_chunks.pop(
                                             kv_chunk.room, None
                                         )
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    prefill_unique_rank,
-                                )
-                                if kv_chunk.pd_hidden_start is not None:
-                                    self._free_pd_hidden_chunk_rows(kv_chunk)
-                                else:
-                                    self.mark_pd_hidden_request_done(
-                                        kv_chunk.room,
-                                        self._pd_hidden_release_state_indices(
-                                            kv_chunk
-                                        ),
-                                    )
+                                self._release_or_mark_pd_hidden_done(kv_chunk)
                                 pd_hidden_failed = True
                                 break
                             if not pd_hidden_done:
@@ -2127,15 +2127,9 @@ class MooncakeKVManager(CommonKVManager):
                             continue
                         ack_ready = True
                         pd_hidden_done_count = pd_hidden_expected
-                        self._free_pd_hidden_chunk_rows(kv_chunk)
-                        if hidden_inflight_key is not None:
-                            with self.pd_hidden_inflight_lock:
-                                self.pd_hidden_inflight_chunks.pop(
-                                    kv_chunk.room, None
-                                )
-                            self._wake_next_pd_hidden_room_waiter(
-                                kv_chunk.room
-                            )
+                        self._finish_pd_hidden_streaming_chunk(
+                            kv_chunk, hidden_inflight_key
+                        )
                     current_status = self.request_status.get(kv_chunk.room)
                     if (
                         pd_hidden_expected > 0
@@ -2185,15 +2179,7 @@ class MooncakeKVManager(CommonKVManager):
                                         kv_chunk.state_indices
                                     )
                                 ):
-                                    if kv_chunk.pd_hidden_start is not None:
-                                        self._free_pd_hidden_chunk_rows(kv_chunk)
-                                    else:
-                                        self.mark_pd_hidden_request_done(
-                                            kv_chunk.room,
-                                            self._pd_hidden_release_state_indices(
-                                                kv_chunk
-                                            ),
-                                        )
+                                    self._release_or_mark_pd_hidden_done(kv_chunk)
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
@@ -2265,27 +2251,14 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                 )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
-                            self.record_failure(
-                                kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to "
-                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
-                            )
-                            self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self._wake_pd_hidden_ack_waiters(kv_chunk.room)
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint,
-                                req.dst_port,
-                                req.room,
-                                KVPoll.Failed,
-                                prefill_unique_rank,
+                            self._mark_session_failed_and_sync(
+                                kv_chunk=kv_chunk,
+                                req=req,
+                                prefill_unique_rank=prefill_unique_rank,
+                                failure_reason=(
+                                    f"Failed to send kv chunk of {kv_chunk.room} to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}"
+                                ),
                             )
                             break
 
