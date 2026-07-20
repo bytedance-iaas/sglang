@@ -1,0 +1,16 @@
+python/sglang/srt/models/deepseek_v4.py
+  h_11d5c68ede7790 132,136-138,2885,2892-2894,2896,2906,2913,2916-2917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ecc5ca07efd2f21ec639421386d19188ed173abc",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
