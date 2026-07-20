@@ -1,0 +1,23 @@
+python/sglang/srt/environ.py
+  s_3af354177588a3::t_9b0d32052e38c2 869-872
+python/sglang/srt/layers/attention/deepseek_v4_backend.py
+  s_3af354177588a3::t_912e2a1ed67277 1694-1725
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "91878fa9bf938326bb62e11c4f7cd363586f27f3",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

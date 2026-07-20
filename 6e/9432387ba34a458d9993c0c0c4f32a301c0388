@@ -1,0 +1,21 @@
+test/registered/jit/test_dsv4_dcp_topk.py
+  s_3af354177588a3::t_3cb4e11715a513 1-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6e9432387ba34a458d9993c0c0c4f32a301c0388",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

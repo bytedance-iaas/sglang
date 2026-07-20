@@ -1,0 +1,23 @@
+python/sglang/srt/layers/attention/utils.py
+  s_3af354177588a3::t_4ce2ec86f4b9dc 311-357
+test/manual/dsv4/bench_dcp_lse_merge.py
+  s_3af354177588a3::t_91e9462e2da5cf 28,224-226,231-232,243-245,250,276-283,288-289,294-295,308-309,314-315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b2ea138b22727cfb6dd21fc11fa780948b33ddf2",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
