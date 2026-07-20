@@ -81,6 +81,16 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
 
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
+        if getattr(server_args, "enable_eic_cache", False):
+            from sglang.srt.mem_cache.eic_chunk_cache import (
+                EICChunkCache,
+                EICSWAChunkCache,
+            )
+
+            logger.info("use EICChunkCache for decode save")
+            if ctx.is_hybrid_swa:
+                return EICSWAChunkCache(params=params, server_args=server_args)
+            return EICChunkCache(params=params, server_args=server_args)
         if not ctx.is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -104,6 +114,18 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.enable_hierarchical_cache:
+        if getattr(server_args, "enable_eic_cache", False):
+            # EIC has native hierarchical integration; route through its builder
+            # so prefetch results land in the radix tree.
+            from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCacheBuilder
+
+            cache = EICHiRadixCacheBuilder.build(
+                params=params, server_args=server_args
+            )
+            ctx.tp_worker.register_hicache_layer_transfer_counter(
+                cache.cache_controller.layer_done_counter
+            )
+            return cache
         if ctx.is_hybrid_ssm or ctx.is_hybrid_swa:
             # HybridModel launches HiCache via UnifiedRadixCache by default.
             return _create_unified_radix_cache(ctx, server_args, params)
