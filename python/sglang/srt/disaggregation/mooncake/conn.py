@@ -264,7 +264,7 @@ class MooncakeKVManager(CommonKVManager):
             self.pd_hidden_acked_chunks: Dict[int, List[dict]] = defaultdict(list)
             self.pd_hidden_acked_lock = threading.Lock()
             self.pd_hidden_ack_wakeup_endpoint = (
-                f"inproc://dspark-hidden-ack-{id(self)}"
+                f"inproc://pd-hidden-ack-{id(self)}"
             )
             self.pd_hidden_ack_wakeup_receiver = self._zmq_ctx.socket(zmq.PULL)
             self.pd_hidden_ack_wakeup_receiver.bind(
@@ -349,53 +349,6 @@ class MooncakeKVManager(CommonKVManager):
                 str(self.rank_port).encode("ascii"),
             ]
         )
-
-    def wait_pd_hidden_chunk_ack(
-        self,
-        *,
-        room: int,
-        prefill_rank: int,
-        hidden_start: int,
-        expected_count: int = 1,
-        timeout_s: float = 300.0,
-    ) -> bool:
-        key = (int(room), int(prefill_rank), int(hidden_start))
-        deadline = time.monotonic() + float(timeout_s)
-        with self.pd_hidden_chunk_ack_cv:
-            while self.pd_hidden_chunk_acks.get(key, 0) < int(expected_count):
-                if self.request_status.get(int(room)) == KVPoll.Failed:
-                    return False
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.record_failure(
-                        int(room),
-                        "Timed out waiting for PD hidden chunk ACK: "
-                        f"prefill_rank={prefill_rank}, hidden_start={hidden_start}",
-                    )
-                    self.update_status(int(room), KVPoll.Failed)
-                    return False
-                self.pd_hidden_chunk_ack_cv.wait(timeout=min(remaining, 1.0))
-            self.pd_hidden_chunk_acks[key] -= int(expected_count)
-            if self.pd_hidden_chunk_acks[key] <= 0:
-                self.pd_hidden_chunk_acks.pop(key, None)
-            return True
-
-    def consume_pd_hidden_chunk_ack(
-        self,
-        *,
-        room: int,
-        prefill_rank: int,
-        hidden_start: int,
-        expected_count: int = 1,
-    ) -> bool:
-        key = (int(room), int(prefill_rank), int(hidden_start))
-        with self.pd_hidden_chunk_ack_cv:
-            if self.pd_hidden_chunk_acks.get(key, 0) < int(expected_count):
-                return False
-            self.pd_hidden_chunk_acks[key] -= int(expected_count)
-            if self.pd_hidden_chunk_acks[key] <= 0:
-                self.pd_hidden_chunk_acks.pop(key, None)
-            return True
 
     def park_pd_hidden_chunk_for_ack(
         self,
@@ -2337,76 +2290,6 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            has_pd_hidden = (
-                                kv_chunk.state_indices
-                                and not kv_chunk.pd_hidden_sent
-                                and not skip_state
-                                and self._has_pd_hidden_state(kv_chunk.state_indices)
-                            )
-                            if has_pd_hidden:
-                                pd_hidden_expected += 1
-                                self._begin_pd_hidden_transfer(kv_chunk.room)
-                                try:
-                                    ret, pd_hidden_done = (
-                                        self._send_pd_hidden_packet(
-                                            req,
-                                            kv_chunk.state_indices,
-                                            kv_chunk.pd_hidden_packet_idx,
-                                            executor,
-                                        )
-                                    )
-                                finally:
-                                    self._end_pd_hidden_transfer(kv_chunk.room)
-                                if ret != 0:
-                                    with self.session_lock:
-                                        self.session_failures[
-                                            req.mooncake_session_id
-                                        ] += 1
-                                        if (
-                                            self.session_failures[
-                                                req.mooncake_session_id
-                                            ]
-                                            >= 1
-                                        ):
-                                            self.failed_sessions.add(
-                                                req.mooncake_session_id
-                                            )
-                                            logger.error(
-                                                f"Session {req.mooncake_session_id} failed."
-                                            )
-                                    self.record_failure(
-                                        kv_chunk.room,
-                                        "Failed to send PD hidden packet "
-                                        f"{kv_chunk.pd_hidden_packet_idx} of "
-                                        f"{kv_chunk.room} to "
-                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
-                                    )
-                                    self.update_status(kv_chunk.room, KVPoll.Failed)
-                                    self._wake_pd_hidden_ack_waiters(
-                                        kv_chunk.room
-                                    )
-                                    self.sync_status_to_decode_endpoint(
-                                        req.endpoint,
-                                        req.dst_port,
-                                        req.room,
-                                        KVPoll.Failed,
-                                        prefill_unique_rank,
-                                    )
-                                    if kv_chunk.pd_hidden_start is not None:
-                                        self._free_pd_hidden_chunk_rows(kv_chunk)
-                                    else:
-                                        self.mark_pd_hidden_request_done(
-                                            kv_chunk.room,
-                                            self._pd_hidden_release_state_indices(
-                                                kv_chunk
-                                            ),
-                                        )
-                                    break
-                                if not pd_hidden_done:
-                                    pd_hidden_deferred = True
-                                    continue
-                                pd_hidden_done_count += 1
-
                             if kv_chunk.state_indices and not skip_state:
                                 self.maybe_send_extra(
                                     req,
@@ -2612,7 +2495,7 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
-                        dspark_meta = next(
+                        pd_hidden_meta = next(
                             (
                                 info.spec_metadata
                                 for info in self.transfer_infos[room].values()
@@ -2621,8 +2504,8 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             None,
                         )
-                        if dspark_meta:
-                            self.req_to_pd_hidden_meta[room] = dspark_meta
+                        if pd_hidden_meta:
+                            self.req_to_pd_hidden_meta[room] = pd_hidden_meta
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -2674,16 +2557,6 @@ class MooncakeKVManager(CommonKVManager):
                             }
                         )
                     continue
-                if msg[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
-                    room = int(msg[1].decode("ascii"))
-                    prefill_rank = int(msg[2].decode("ascii"))
-                    hidden_start = int(msg[3].decode("ascii"))
-                    key = (room, prefill_rank, hidden_start)
-                    with self.pd_hidden_chunk_ack_cv:
-                        self.pd_hidden_chunk_acks[key] += 1
-                        self.pd_hidden_chunk_ack_cv.notify_all()
-                    continue
-
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
