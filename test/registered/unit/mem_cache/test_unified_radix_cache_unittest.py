@@ -3708,6 +3708,82 @@ class UnifiedRadixCacheSuite:
         cache.dec_lock_ref(leaf, request_lock.to_dec_params())
         self.assertEqual(cd.lock_ref, 0)
 
+    def test_hicache_swa_host_lock_pins_host_only_window_until_release(self):
+        """Async H2D source pages stay out of the host LRU until all loads finish."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps host lock assertions focused")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        ps = self.cfg.page_size
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+        seq = self._make_seq(1, window_pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(seq))
+        ).last_device_node
+
+        self._set_aux_host_tombstone(tree, leaf, ComponentType.SWA)
+        cd = leaf.component_data[ComponentType.SWA]
+        host_lru = tree.host_lru_lists[ComponentType.SWA]
+        self.assertIsNone(cd.value)
+        self.assertIsNotNone(cd.host_value)
+        self.assertTrue(host_lru.in_list(leaf))
+
+        first_lock = tree.inc_host_lock_ref(leaf)
+        second_lock = tree.inc_host_lock_ref(leaf)
+
+        self.assertIsNotNone(first_lock.swa_uuid_for_host_lock)
+        self.assertEqual(
+            first_lock.swa_uuid_for_host_lock,
+            second_lock.swa_uuid_for_host_lock,
+        )
+        self.assertEqual(cd.host_lock_ref, 2)
+        self.assertFalse(host_lru.in_list(leaf))
+
+        tree.dec_host_lock_ref(leaf, first_lock.to_dec_params())
+        self.assertEqual(cd.host_lock_ref, 1)
+        self.assertFalse(host_lru.in_list(leaf))
+
+        tree.dec_host_lock_ref(leaf, second_lock.to_dec_params())
+        self.assertEqual(cd.host_lock_ref, 0)
+        self.assertTrue(host_lru.in_list(leaf))
+
+    def test_hicache_swa_load_back_holds_host_lock_until_ack(self):
+        """The real load-back path releases SWA host locks only after H2D ack."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps host lock assertions focused")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        ps = self.cfg.page_size
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+        seq = self._make_seq(1, window_pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(seq))
+        ).last_device_node
+
+        self._backup_node(tree, leaf)
+        result = tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+
+        cd = leaf.component_data[ComponentType.SWA]
+        host_lru = tree.host_lru_lists[ComponentType.SWA]
+        self.assertIsNone(cd.value)
+        self.assertIsNotNone(cd.host_value)
+        self.assertTrue(host_lru.in_list(leaf))
+
+        self.assertTrue(tree.load_back(leaf))
+        self.assertEqual(cd.host_lock_ref, 1)
+        self.assertFalse(host_lru.in_list(leaf))
+
+        self._finish_pending_loads(tree)
+        self.assertEqual(cd.host_lock_ref, 0)
+        self.assertFalse(host_lru.in_list(leaf))
+
     def test_hicache_swa_load_back_uses_full_pool_capacity(self):
         """load_back should gate Full KV load on Full pool capacity only."""
         if not self.cfg.has_swa:
