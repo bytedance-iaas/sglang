@@ -47,7 +47,9 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.scheduler_mixin import SchedulerDisaggregationInitMixin
+from sglang.srt.disaggregation.scheduler_disaggregation_init import (
+    SchedulerDisaggregationInitMixin,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
