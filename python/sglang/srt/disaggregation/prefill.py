@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     get_dsv4_c128_state_indices,
     get_kv_class,
     get_pd_hidden_capture_layer_ids,
@@ -48,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
+    resolve_disagg_metadata_config,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -122,13 +124,15 @@ def maybe_release_metadata_buffer(
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
     indices = req.pd_hidden_src_indices
-    if indices and pd_hidden_pool is not None:
+    if indices:
         sender = req.disagg_kv_sender
+        if pd_hidden_pool is None and sender is not None:
+            pd_hidden_pool = sender.kv_mgr.pd_hidden_pool
         worker_released = (
             sender is not None
             and sender.kv_mgr.pop_pd_hidden_request_done(sender.bootstrap_room)
         )
-        if not worker_released:
+        if not worker_released and pd_hidden_pool is not None:
             pd_hidden_pool.free(indices)
         clear_pd_hidden_request_state(req)
     elif not indices:
@@ -758,6 +762,176 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    def init_disaggregation(self: Scheduler) -> None:
+        from sglang.srt.configs.model_config import is_minimax_sparse
+        from sglang.srt.disaggregation.decode import (
+            DecodePreallocQueue,
+            DecodeTransferQueue,
+        )
+        from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+        from sglang.srt.mem_cache import kv_cache_builder
+        from sglang.srt.speculative.eagle_utils import (
+            get_draft_recurrent_hidden_state_spec,
+        )
+
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
+        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
+        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+
+        if self.spec_algorithm.carries_draft_hidden_states():
+            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
+            # worker, so a single accessor covers both shapes.
+            draft_runner = self.draft_worker.draft_worker.draft_runner
+            disagg_hidden_size, disagg_hidden_states_dtype = (
+                get_draft_recurrent_hidden_state_spec(draft_runner)
+            )
+        else:
+            disagg_hidden_size = 16  # minimal padding size for RDMA
+            disagg_hidden_states_dtype = torch.float32
+
+        disagg_metadata_config = resolve_disagg_metadata_config(
+            hidden_size=disagg_hidden_size,
+            hidden_states_dtype=disagg_hidden_states_dtype,
+            disaggregation_mode=self.disaggregation_mode,
+            transfer_backend=self.transfer_backend,
+            spec_algorithm=self.spec_algorithm,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            model_runner=self.tp_worker.model_runner,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            gpu_id=self.ps.gpu_id,
+            max_prefill_tokens=self.max_prefill_tokens,
+        )
+        disagg_hidden_size = disagg_metadata_config.hidden_size
+        disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+        metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
+
+        # The PD metadata wire schema must match on P and D even when only D
+        # enables spec decoding; a seedless prefill writes the invalid sentinel.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+        ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            buffer_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
+            )
+
+            # The decode requests polling kv cache
+            self.disagg_decode_transfer_queue = DecodeTransferQueue(
+                gloo_group=self.attn_tp_cpu_group,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                tp_rank=self.ps.tp_rank,
+                metadata_buffers=self.disagg_metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
+            )
+
+            # The decode requests pending for pre-allocation
+            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                scheduler=self,
+                transfer_queue=self.disagg_decode_transfer_queue,
+                tree_cache=self.tree_cache,
+                gloo_group=self.attn_tp_cpu_group,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                dp_size=self.server_args.dp_size,
+                gpu_id=self.ps.gpu_id,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                max_total_num_tokens=self.max_total_num_tokens,
+                pp_rank=self.ps.pp_rank,
+                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
+                transfer_backend=self.transfer_backend,
+            )
+
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # *2 for the headroom.
+            buffer_size = self.max_running_requests * 2
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
+            )
+
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
+                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                gpu_id=self.ps.gpu_id,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                gloo_group=self.attn_tp_cpu_group,
+                max_total_num_tokens=self.max_total_num_tokens,
+                scheduler=self,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                transfer_backend=self.transfer_backend,
+            )
+            # The prefill requests that are in the middle of kv sending
+            self.disagg_prefill_inflight_queue: List[Req] = []
+
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        # Init mm receiver for EPD disaggregation mode
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend
+            in ["zmq_to_scheduler", "mooncake"]
+        ):
+            self.mm_receiver = create_mm_receiver(
+                self.server_args,
+                dtype=self.model_config.dtype,
+                hf_config=self.model_config.hf_config,
+                pp_rank=self.ps.pp_rank,
+                tp_rank=self.ps.tp_rank,
+                tp_group=self.tp_group,
+                scheduler=self,
+            )
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
