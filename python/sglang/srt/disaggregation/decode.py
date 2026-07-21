@@ -2486,7 +2486,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 and hidden_chunk.hidden_start > hidden_state.next_start
                 and hidden_state.next_start == hidden_state.start
             ):
-                logger.debug(
+                logger.warning(
                     "PD hidden initial chunk starts after local state; treating "
                     "the gap as a prefill-side cached hidden prefix: rid=%s "
                     "room=%s local_start=%d chunk_start=%d row_len=%d",
