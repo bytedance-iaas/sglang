@@ -166,9 +166,8 @@ def maybe_release_pd_hidden_rows_on_hidden_done(
 
 
 def fail_pd_hidden_transfer(req: Req, message: str) -> None:
-    """Fail a single request's PD hidden transfer without crashing scheduler."""
+    """Route a PD hidden transfer failure through the standard KV failed path."""
     logger.warning(message)
-    prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
     sender = getattr(req, "disagg_kv_sender", None)
     kv_mgr = getattr(sender, "kv_mgr", None)
     room = getattr(sender, "bootstrap_room", req.bootstrap_room)
@@ -182,6 +181,11 @@ def fail_pd_hidden_transfer(req: Req, message: str) -> None:
             wake_pd_hidden_waiters(room)
     if sender is not None:
         sender.conclude_state = KVPoll.Failed
+
+
+def is_pd_hidden_transfer_failed(req: Req) -> bool:
+    sender = getattr(req, "disagg_kv_sender", None)
+    return getattr(sender, "conclude_state", None) == KVPoll.Failed
 
 
 class PrefillBootstrapQueue:
@@ -1291,7 +1295,7 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                if is_aborted(req):
+                if is_aborted(req) or is_pd_hidden_transfer_failed(req):
                     self.disagg_prefill_inflight_queue.append(req)
                     req.time_stats.set_prefill_transfer_queue_entry_time()
                     advance_logprob_pt(i, req)
