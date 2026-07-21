@@ -214,10 +214,10 @@ def build_kv_cache(
                         "only device-resident L1 cache. Disable hierarchical "
                         "cache / HiCache storage for this experimental path."
                     )
-                if not spec_algorithm.is_none():
+                if not (spec_algorithm.is_none() or spec_algorithm.is_dspark()):
                     raise ValueError(
                         "DeepSeek-V4 decode-side radix cache is incompatible "
-                        "with speculative decoding."
+                        "with non-DSPARK speculative decoding."
                     )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(

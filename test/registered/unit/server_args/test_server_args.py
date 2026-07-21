@@ -231,6 +231,36 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
+    def test_pd_decode_radix_cache_rejects_non_dspark_speculative(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+            speculative_algorithm="EAGLE",
+        )
+        with self.assertRaises(ValueError) as context:
+            server_args._handle_pd_disaggregation()
+
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with non-DSPARK speculative decoding",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_dspark_speculative(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+            speculative_algorithm="dspark",
+        )
+
+        server_args._handle_pd_disaggregation()
+
+        self.assertFalse(server_args.disable_radix_cache)
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
