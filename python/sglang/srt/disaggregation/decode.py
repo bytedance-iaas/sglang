@@ -2475,6 +2475,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+
+        if issubclass(cls, SchedulerDisaggregationPrefillMixin):
+            cls.init_disaggregation = (
+                SchedulerDisaggregationPrefillMixin.init_disaggregation
+            )
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
