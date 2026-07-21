@@ -165,6 +165,25 @@ def maybe_release_pd_hidden_rows_on_hidden_done(
     return True
 
 
+def fail_pd_hidden_transfer(req: Req, message: str) -> None:
+    """Fail a single request's PD hidden transfer without crashing scheduler."""
+    logger.warning(message)
+    prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+    sender = getattr(req, "disagg_kv_sender", None)
+    kv_mgr = getattr(sender, "kv_mgr", None)
+    room = getattr(sender, "bootstrap_room", req.bootstrap_room)
+    if kv_mgr is not None:
+        record_failure = getattr(kv_mgr, "record_failure", None)
+        if record_failure is not None:
+            record_failure(room, message)
+        kv_mgr.update_status(room, KVPoll.Failed)
+        wake_pd_hidden_waiters = getattr(kv_mgr, "_wake_pd_hidden_ack_waiters", None)
+        if wake_pd_hidden_waiters is not None:
+            wake_pd_hidden_waiters(room)
+    if sender is not None:
+        sender.conclude_state = KVPoll.Failed
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -1151,12 +1170,14 @@ class SchedulerDisaggregationPrefillMixin:
             if streaming_hidden:
                 write_indices = pool.alloc(rows)
                 if write_indices is None:
-                    raise RuntimeError(
+                    fail_pd_hidden_transfer(
+                        req,
                         "PD streaming hidden source chunk allocation failed: "
                         f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
                         f"pool_rows={pool.size}. Streaming source rows are released "
-                        "only after the matching hidden chunk ACK."
+                        "only after the matching hidden chunk ACK.",
                     )
+                    continue
                 req.pd_hidden_src_indices = write_indices
             pool.write(
                 write_indices,
@@ -1261,6 +1282,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
+                if is_aborted(req):
+                    self.disagg_prefill_inflight_queue.append(req)
+                    req.time_stats.set_prefill_transfer_queue_entry_time()
                     advance_logprob_pt(i, req)
                     continue
 
