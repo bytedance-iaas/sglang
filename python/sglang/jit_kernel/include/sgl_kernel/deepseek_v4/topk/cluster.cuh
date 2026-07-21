@@ -5,6 +5,7 @@
 
 #include "common.cuh"
 #include "ptx.cuh"
+#include <bit>
 #include <cooperative_groups.h>
 #include <cstdint>
 
@@ -21,7 +22,9 @@ struct ClusterTopK {
   static constexpr uint32_t kNumStages = 4;
   static constexpr uint32_t kMaxLength = kClusterSize * kNumStages * kSizePerStage;
   static constexpr uint32_t kStoreLane = kBlockSize - 1;
-  static constexpr uint32_t kAboveBits = 11;
+  // kAboveBits must satisfy (1 << kAboveBits) - 1 >= K so the packed
+  // (local_equal << kAboveBits) | local_above field can hold prefix_above < K.
+  static constexpr uint32_t kAboveBits = std::bit_width(K);
 
   // ---------------------------------------------------------------------------
   // Shared memory layouts
@@ -202,11 +205,6 @@ struct ClusterTopK {
     constexpr uint32_t kAboveMask = (1 << kAboveBits) - 1;
     static_assert(kAboveMask >= K);
 
-    // Pack local counts -- NO alignment rounding (contiguous layout)
-    static_assert(kMaxTies <= kBlockSize);
-    const auto idx_above = tx < local_above ? params.indices_in[tx] : 0;
-    const auto tie_value = tx < local_equal ? smem->tie_buffer[tx] : Tie{0, 0.0f};
-
     // push to remote shared memory, can reduce latency of reading remote
     if (tx < kClusterSize) {
       const auto value = (local_equal << kAboveBits) | local_above;
@@ -227,14 +225,30 @@ struct ClusterTopK {
     const auto prefix_above = prefix_packed & kAboveMask;
     const auto prefix_equal = prefix_packed >> kAboveBits;
 
-    // Page-translate above elements
-    if (tx < local_above) {
-      params.write(tx + prefix_above, idx_above + offset);
+    // Page-translate above elements. local_above can exceed kBlockSize when K > kBlockSize,
+    // so loop kAbovePerBlock times (1 when K <= kBlockSize).
+    constexpr uint32_t kAbovePerBlock = (K + kBlockSize - 1) / kBlockSize;
+#pragma unroll
+    for (uint32_t i = 0; i < kAbovePerBlock; ++i) {
+      const uint32_t local_idx = tx + i * kBlockSize;
+      if (local_idx < local_above) {
+        const auto idx = params.indices_in[local_idx];
+        params.write(local_idx + prefix_above, idx + offset);
+      }
     }
-    // Contiguous tie store via regular global writes (no TMA, no gaps)
+
+    // Contiguous tie store via regular global writes (no TMA, no gaps).
+    // local_equal is bounded by tie_buffer capacity (kMaxTies); when
+    // kMaxTies > kBlockSize we need multiple iterations to cover it.
+    constexpr uint32_t kTiesPerBlock = (kMaxTies + kBlockSize - 1) / kBlockSize;
     const auto ws = static_cast<WorkSpace*>(_ws);
-    if (tx < local_equal && tx + prefix_equal < kMaxTies) {
-      ws->ties[tx + prefix_equal] = {tie_value.idx + offset, tie_value.score};
+#pragma unroll
+    for (uint32_t i = 0; i < kTiesPerBlock; ++i) {
+      const uint32_t local_idx = tx + i * kBlockSize;
+      if (local_idx < local_equal && local_idx + prefix_equal < kMaxTies) {
+        const auto tie_value = smem->tie_buffer[local_idx];
+        ws->ties[local_idx + prefix_equal] = {tie_value.idx + offset, tie_value.score};
+      }
     }
     // Block 0 writes global metadata {num_above, num_ties}
     if (cluster_rank == kClusterSize - 1 && tx == 0) {

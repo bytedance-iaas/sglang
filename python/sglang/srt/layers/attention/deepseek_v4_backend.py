@@ -256,10 +256,10 @@ class DSV4AttnMetadata:
 
     def init_flashmla_related(self):
         # c4_sparse_topk is set from model_config.index_topk per-model
-        # (small model: 512, large model: 1024).
-        assert self.c4_sparse_topk in (512, 1024), (
+        # (small model: 512, large model: 1024, extra-large model: 4096).
+        assert self.c4_sparse_topk in (512, 1024, 4096), (
             f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
-            "supported: 512 (small) or 1024 (large)"
+            "supported: 512 (small), 1024 (large), or 4096 (extra-large)"
         )
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
@@ -1327,6 +1327,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     speculative_num_steps=self.speculative_num_steps,
                 )
             )
+
     def _split_out_cache_loc_by_step(
         self, out_cache_loc: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
@@ -1345,7 +1346,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             .permute(2, 0, 1)
             .reshape(self.speculative_num_steps, -1)
         )
-    
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         original_out_cache_loc = forward_batch.out_cache_loc
         step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
