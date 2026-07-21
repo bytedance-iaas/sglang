@@ -1043,31 +1043,37 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         pool = getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None)
         hidden_states = self._extract_pd_hidden_states_from_result(result)
-        needs_pd_hidden = any(
-            (
-                getattr(req, "pd_hidden_src_indices", None)
-                or getattr(req, "pd_hidden_capture_layer_ids", None)
-            )
-            and (
-                send_owner_direct
-                or not getattr(req, "pd_hidden_owner_direct_sent", False)
-            )
+        needs_pd_hidden_reqs = [
+            req
             for req in batch.reqs
-        )
-        if pool is not None and needs_pd_hidden and hidden_states is None:
+            if (
+                (
+                    getattr(req, "pd_hidden_src_indices", None)
+                    or getattr(req, "pd_hidden_capture_layer_ids", None)
+                )
+                and (
+                    send_owner_direct
+                    or not getattr(req, "pd_hidden_owner_direct_sent", False)
+                )
+            )
+        ]
+        if pool is not None and needs_pd_hidden_reqs and hidden_states is None:
             reqs = [
                 (
                     req.rid,
                     getattr(req, "pd_hidden_capture_layer_ids", None),
                     bool(getattr(req, "pd_hidden_src_indices", None)),
                 )
-                for req in batch.reqs
+                for req in needs_pd_hidden_reqs
             ]
-            raise RuntimeError(
+            message = (
                 "PD hidden capture was required but forward output has no "
                 f"hidden states: batch_capture_layers={batch.pd_hidden_capture_layer_ids}, "
                 f"reqs={reqs}"
             )
+            for req in needs_pd_hidden_reqs:
+                fail_pd_hidden_transfer(req, message)
+            return
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
