@@ -50,6 +50,10 @@ class PDHiddenKVManagerMixin:
         self.pd_hidden_ack_wakeup_endpoint = f"inproc://pd-hidden-ack-{id(self)}"
         self.pd_hidden_ack_wakeup_receiver = self._zmq_ctx.socket(zmq.PULL)
         self.pd_hidden_ack_wakeup_receiver.bind(self.pd_hidden_ack_wakeup_endpoint)
+        self.pd_hidden_ack_wakeup_sender = self._zmq_ctx.socket(zmq.PUSH)
+        self.pd_hidden_ack_wakeup_sender.setsockopt(zmq.LINGER, 0)
+        self.pd_hidden_ack_wakeup_sender.connect(self.pd_hidden_ack_wakeup_endpoint)
+        self.pd_hidden_ack_wakeup_lock = threading.Lock()
 
     def mark_pd_hidden_request_done(
         self,
@@ -239,11 +243,20 @@ class PDHiddenKVManagerMixin:
         with self.pd_hidden_ack_completion_cv:
             self.pd_hidden_ack_pending_counts[int(room)] += 1
 
+        def trigger_wakeup() -> None:
+            with self.pd_hidden_ack_wakeup_lock:
+                self.pd_hidden_ack_wakeup_sender.send(b"ACK_READY")
+
+        if event is None:
+            completion["success"] = True
+            self.pd_hidden_ack_completions.put(completion)
+            trigger_wakeup()
+            return
+
         def wait_for_injection() -> None:
             try:
-                if event is not None:
-                    with torch.cuda.device(self.kv_args.gpu_id):
-                        event.synchronize()
+                with torch.cuda.device(self.kv_args.gpu_id):
+                    event.synchronize()
                 completion["success"] = True
             except Exception:
                 logger.exception(
@@ -253,13 +266,7 @@ class PDHiddenKVManagerMixin:
                 )
                 completion["success"] = False
             self.pd_hidden_ack_completions.put(completion)
-            wakeup_sender = self._zmq_ctx.socket(zmq.PUSH)
-            wakeup_sender.setsockopt(zmq.LINGER, 0)
-            try:
-                wakeup_sender.connect(self.pd_hidden_ack_wakeup_endpoint)
-                wakeup_sender.send(b"ACK_READY")
-            finally:
-                wakeup_sender.close()
+            trigger_wakeup()
 
         threading.Thread(
             target=wait_for_injection,
