@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_pd_hidden_capture_layer_ids,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -57,7 +58,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -831,29 +831,11 @@ class SchedulerDisaggregationPrefillMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-        self._prepare_pd_hidden_capture_for_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
-
-    def _prepare_pd_hidden_capture_for_batch(
-        self: Scheduler, batch: Optional[ScheduleBatch]
-    ) -> None:
-        dspark_capture_layers = None
-        if batch:
-            for req in batch.reqs:
-                dspark_capture_layers = getattr(
-                    req, "pd_hidden_capture_layer_ids", None
-                )
-                if dspark_capture_layers:
-                    break
-        if dspark_capture_layers:
-            batch.pd_hidden_capture_layer_ids = [
-                int(x) for x in dspark_capture_layers
-            ]
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -1054,7 +1036,8 @@ class SchedulerDisaggregationPrefillMixin:
             ]
             message = (
                 "PD hidden capture was required but forward output has no "
-                f"hidden states: batch_capture_layers={batch.pd_hidden_capture_layer_ids}, "
+                "hidden states: batch_capture_layers="
+                f"{get_pd_hidden_capture_layer_ids(batch.reqs)}, "
                 f"reqs={reqs}"
             )
             for req in needs_pd_hidden_reqs:

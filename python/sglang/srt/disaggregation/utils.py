@@ -80,6 +80,15 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_pd_hidden_capture_layer_ids(reqs: List["Req"]) -> Optional[List[int]]:
+    """Return the per-batch PD hidden capture layers requested by any req."""
+    for req in reqs:
+        layer_ids = getattr(req, "pd_hidden_capture_layer_ids", None)
+        if layer_ids:
+            return [int(x) for x in layer_ids]
+    return None
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
