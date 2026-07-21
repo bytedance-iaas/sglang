@@ -38,7 +38,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.hidden_events import PDHiddenKVManagerMixin
+from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -162,7 +162,7 @@ class KVArgsRegisterInfo:
         )
 
 
-class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
+class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     PD_HIDDEN_CHUNK_READY_HEADER = b"PD_HIDDEN_CHUNK_READY"
     PD_HIDDEN_CHUNK_ACK_HEADER = b"PD_HIDDEN_CHUNK_ACK"
@@ -177,13 +177,15 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        self.pd_hidden_pool = None
+        self.pd_hidden_events = PDHiddenEventManager(self)
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            self._init_prefill_pd_hidden_state()
+            self.pd_hidden_events.init_prefill_state()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -243,13 +245,165 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
                 ).start()
             self.start_prefill_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self._init_decode_pd_hidden_state()
+            self.pd_hidden_events.init_decode_state()
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
+
+    def supports_pd_hidden_streaming(self) -> bool:
+        return self.pd_hidden_events.supports_streaming()
+
+    def mark_pd_hidden_request_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.pd_hidden_events.mark_request_done(
+            bootstrap_room,
+            state_indices,
+        )
+
+    def pop_pd_hidden_request_done(self, bootstrap_room: int) -> bool:
+        return self.pd_hidden_events.pop_request_done(bootstrap_room)
+
+    def mark_pd_hidden_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.mark_pd_hidden_request_done(bootstrap_room, state_indices)
+
+    def pop_pd_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_pd_hidden_request_done(bootstrap_room)
+
+    def park_pd_hidden_chunk_for_ack(
+        self,
+        *,
+        transfer_queue: FastQueue,
+        kv_chunk: TransferKVChunk,
+        prefill_rank: int,
+        expected_count: int,
+        timeout_s: float = 300.0,
+    ) -> bool:
+        return self.pd_hidden_events.park_chunk_for_ack(
+            transfer_queue=transfer_queue,
+            kv_chunk=kv_chunk,
+            prefill_rank=prefill_rank,
+            expected_count=expected_count,
+            timeout_s=timeout_s,
+        )
+
+    def _wake_pd_hidden_ack_waiters(self, room: int) -> None:
+        self.pd_hidden_events.wake_ack_waiters(room)
+
+    def _park_pd_hidden_chunk_behind_room(
+        self, transfer_queue: FastQueue, kv_chunk: TransferKVChunk
+    ) -> None:
+        self.pd_hidden_events.park_chunk_behind_room(transfer_queue, kv_chunk)
+
+    def _wake_next_pd_hidden_room_waiter(self, room: int) -> None:
+        self.pd_hidden_events.wake_next_room_waiter(room)
+
+    def _handle_pd_hidden_chunk_ack(
+        self, room: int, prefill_rank: int, hidden_start: int
+    ) -> None:
+        self.pd_hidden_events.handle_chunk_ack(room, prefill_rank, hidden_start)
+
+    def pop_pd_hidden_ready_chunks(self, room: int) -> List[dict]:
+        return self.pd_hidden_events.pop_ready_chunks(room)
+
+    def submit_pd_hidden_chunk_ack(
+        self,
+        *,
+        event,
+        remote: str,
+        dst_port: int,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+        is_last_hidden_chunk: bool,
+    ) -> None:
+        self.pd_hidden_events.submit_chunk_ack(
+            event=event,
+            remote=remote,
+            dst_port=dst_port,
+            room=room,
+            prefill_rank=prefill_rank,
+            hidden_start=hidden_start,
+            is_last_hidden_chunk=is_last_hidden_chunk,
+        )
+
+    def _drain_pd_hidden_ack_completions(self) -> None:
+        self.pd_hidden_events.drain_ack_completions()
+
+    def pop_pd_hidden_acked_chunks(self, room: int) -> List[dict]:
+        return self.pd_hidden_events.pop_acked_chunks(room)
+
+    def wait_pd_hidden_ack_completions(
+        self, room: int, timeout_s: float = 300.0
+    ) -> bool:
+        return self.pd_hidden_events.wait_ack_completions(room, timeout_s)
+
+    def _begin_pd_hidden_transfer(self, room: int) -> None:
+        self.pd_hidden_events.begin_transfer(room)
+
+    def _end_pd_hidden_transfer(self, room: int) -> None:
+        self.pd_hidden_events.end_transfer(room)
+
+    def _wait_pd_hidden_transfers_quiesced(
+        self, room: int, timeout_s: float = 300.0
+    ) -> bool:
+        return self.pd_hidden_events.wait_transfers_quiesced(room, timeout_s)
+
+    def _pd_hidden_state_index(self) -> Optional[int]:
+        return self.pd_hidden_events.state_index()
+
+    def _has_pd_hidden_state(self, state_indices: Optional[List]) -> bool:
+        return self.pd_hidden_events.has_state(state_indices)
+
+    def _without_pd_hidden_state(
+        self, state_indices: Optional[List]
+    ) -> Optional[List]:
+        return self.pd_hidden_events.without_state(state_indices)
+
+    def _pd_hidden_release_state_indices(
+        self, kv_chunk: TransferKVChunk
+    ) -> Optional[List]:
+        return self.pd_hidden_events.release_state_indices(kv_chunk)
+
+    def _free_pd_hidden_state_indices(self, state_indices: Optional[List]) -> None:
+        self.pd_hidden_events.free_state_indices(state_indices)
+
+    def _free_pd_hidden_chunk_rows(self, kv_chunk: TransferKVChunk) -> None:
+        self.pd_hidden_events.free_chunk_rows(kv_chunk)
+
+    def _release_or_mark_pd_hidden_done(self, kv_chunk: TransferKVChunk) -> None:
+        self.pd_hidden_events.release_or_mark_done(kv_chunk)
+
+    def _finish_pd_hidden_streaming_chunk(
+        self,
+        kv_chunk: TransferKVChunk,
+        hidden_inflight_key: Optional[Tuple[int, int]],
+    ) -> None:
+        self.pd_hidden_events.finish_streaming_chunk(kv_chunk, hidden_inflight_key)
+
+    def _mark_session_failed_and_sync(
+        self,
+        *,
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        prefill_unique_rank: int,
+        failure_reason: str,
+    ) -> None:
+        self.pd_hidden_events.mark_session_failed_and_sync(
+            kv_chunk=kv_chunk,
+            req=req,
+            prefill_unique_rank=prefill_unique_rank,
+            failure_reason=failure_reason,
+        )
 
     def notify_pd_hidden_chunk_ready(
         self,
@@ -1482,8 +1636,8 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
                     if kv_chunk.pd_hidden_start is not None:
-                        with self.pd_hidden_inflight_lock:
-                            self.pd_hidden_inflight_chunks.pop(
+                        with self.pd_hidden_events.inflight_lock:
+                            self.pd_hidden_events.inflight_chunks.pop(
                                 kv_chunk.room, None
                             )
                     if (
@@ -1556,8 +1710,8 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
                         hidden_inflight_key is not None
                         and not kv_chunk.pd_hidden_ready_sent
                     ):
-                        with self.pd_hidden_inflight_lock:
-                            inflight_key = self.pd_hidden_inflight_chunks.get(
+                        with self.pd_hidden_events.inflight_lock:
+                            inflight_key = self.pd_hidden_events.inflight_chunks.get(
                                 kv_chunk.room
                             )
                         if inflight_key is not None and inflight_key != hidden_inflight_key:
@@ -1619,8 +1773,8 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
                                     ),
                                 )
                                 if kv_chunk.pd_hidden_start is not None:
-                                    with self.pd_hidden_inflight_lock:
-                                        self.pd_hidden_inflight_chunks.pop(
+                                    with self.pd_hidden_events.inflight_lock:
+                                        self.pd_hidden_events.inflight_chunks.pop(
                                             kv_chunk.room, None
                                         )
                                 self._release_or_mark_pd_hidden_done(kv_chunk)
@@ -1670,8 +1824,8 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
                         and not kv_chunk.pd_hidden_ready_sent
                     ):
                         if hidden_inflight_key is not None:
-                            with self.pd_hidden_inflight_lock:
-                                self.pd_hidden_inflight_chunks[
+                            with self.pd_hidden_events.inflight_lock:
+                                self.pd_hidden_events.inflight_chunks[
                                     kv_chunk.room
                                 ] = hidden_inflight_key
                         kv_chunk.pd_hidden_ready_sent = True
@@ -2044,13 +2198,13 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
         def decode_thread():
             poller = zmq.Poller()
             poller.register(self.server_socket, zmq.POLLIN)
-            poller.register(self.pd_hidden_ack_wakeup_receiver, zmq.POLLIN)
+            poller.register(self.pd_hidden_events.ack_wakeup_receiver, zmq.POLLIN)
             while True:
                 events = dict(poller.poll())
-                if self.pd_hidden_ack_wakeup_receiver in events:
+                if self.pd_hidden_events.ack_wakeup_receiver in events:
                     while True:
                         try:
-                            self.pd_hidden_ack_wakeup_receiver.recv(zmq.NOBLOCK)
+                            self.pd_hidden_events.ack_wakeup_receiver.recv(zmq.NOBLOCK)
                         except zmq.Again:
                             break
                     self._drain_pd_hidden_ack_completions()
@@ -2073,19 +2227,19 @@ class MooncakeKVManager(PDHiddenKVManagerMixin, CommonKVManager):
                     )
                     ack_host = msg[7].decode("ascii")
                     ack_port = int(msg[8].decode("ascii"))
-                    with self.pd_hidden_ready_lock:
-                        self.pd_hidden_ready_chunks[room].append(
-                            {
-                                "room": room,
-                                "prefill_rank": prefill_rank,
-                                "hidden_start": hidden_start,
-                                "row_len": row_len,
-                                "is_last_hidden_chunk": is_last_hidden_chunk,
-                                "dst_indices": [int(x) for x in dst_indices],
-                                "ack_host": ack_host,
-                                "ack_port": ack_port,
-                            }
-                        )
+                    self.pd_hidden_events.append_ready_chunk(
+                        room,
+                        {
+                            "room": room,
+                            "prefill_rank": prefill_rank,
+                            "hidden_start": hidden_start,
+                            "row_len": row_len,
+                            "is_last_hidden_chunk": is_last_hidden_chunk,
+                            "dst_indices": [int(x) for x in dst_indices],
+                            "ack_host": ack_host,
+                            "ack_port": ack_port,
+                        },
+                    )
                     continue
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
