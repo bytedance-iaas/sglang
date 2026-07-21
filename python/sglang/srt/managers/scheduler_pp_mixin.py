@@ -16,6 +16,7 @@ from tqdm import tqdm
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import (
     get_pd_hidden_capture_layer_ids,
+    get_pd_hidden_req_state as pd_hidden_state,
     poll_and_all_reduce_attn_cp_tp_group,
 )
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -1036,18 +1037,14 @@ class SchedulerPPMixin:
         capture_reqs = [
             req
             for req in batch.reqs
-            if getattr(req, "pd_hidden_capture_layer_ids", None)
+            if pd_hidden_state(req).capture_layer_ids
         ]
         if not capture_reqs:
             return False
         if any(req.pending_bootstrap for req in capture_reqs):
             return False
         return all(
-            bool(
-                (getattr(req, "pd_hidden_meta", None) or {}).get(
-                    "streaming_hidden", False
-                )
-            )
+            bool((pd_hidden_state(req).meta or {}).get("streaming_hidden", False))
             for req in capture_reqs
         )
 
