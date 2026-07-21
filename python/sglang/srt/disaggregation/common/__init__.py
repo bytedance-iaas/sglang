@@ -3,3 +3,4 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
 )
+from sglang.srt.disaggregation.common.pd_hidden import PDHiddenKVManagerMixin
