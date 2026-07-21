@@ -526,6 +526,22 @@ class EICHiRadixCache(RadixCache):
     def swa_protected_size(self):
         return self.protected_size_
 
+    def supports_swa(self) -> bool:
+        # EIC replaces the SWA-capable UnifiedRadixCache in kv_cache_builder, so
+        # it must re-declare SWA support. Without this, supports_swa() falls back
+        # to the RadixCache default (False), ScheduleBatch.maybe_evict_swa() is
+        # gated off, and running sequences never release out-of-window SWA KV ->
+        # the SWA pool fills up and prefill OOMs. The full-attention radix tree is
+        # unaffected: only per-request SWA tails are freed in maybe_evict_swa.
+        return self.sliding_window_size is not None
+
+    def sanity_check(self):
+        # invariant_checker._check_tree_cache() calls this when
+        # is_hybrid_swa and supports_swa(). EIC manages SWA freeing outside the
+        # radix tree (per-request in maybe_evict_swa), so there is no tree
+        # invariant to assert here.
+        pass
+
     def evict(self, params: EvictParams, retry_times: int = 3) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
