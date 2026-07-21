@@ -2214,6 +2214,76 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req) -> None:
+        if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
+            return
+
+        req.dsv4_decode_radix_cache_prompt_once = False
+        req.allow_radix_cache_insert_once = True
+        prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
+        if prompt_len is None:
+            from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            return
+
+        page_size = getattr(self.tree_cache, "page_size", 1)
+        prompt_fill_ids = req.get_fill_ids()[:prompt_len]
+        radix_key_len = len(
+            RadixKey(
+                prompt_fill_ids,
+                req.extra_key,
+                is_bigram=getattr(self.tree_cache, "is_eagle", False),
+            ).page_aligned(page_size)
+        )
+        if radix_key_len <= 0:
+            req.allow_radix_cache_insert_once = False
+            return
+
+        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+        old_full_untruncated_fill_ids = req.full_untruncated_fill_ids
+        old_cache_protected_len = getattr(req, "cache_protected_len", 0)
+        old_swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        req.full_untruncated_fill_ids = prompt_fill_ids
+        req.kv.swa_evicted_seqlen = radix_key_len
+        try:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
+            if (
+                protected_len > 0
+                and hasattr(self.scheduler, "batch_result_processor")
+                and hasattr(
+                    self.scheduler.batch_result_processor,
+                    "_dsv4_swa_release_tail_len",
+                )
+                and hasattr(self.scheduler.token_to_kv_pool_allocator, "free_swa")
+            ):
+                swa_release_tail_len = (
+                    self.scheduler.batch_result_processor._dsv4_swa_release_tail_len(
+                        protected_len, page_size
+                    )
+                )
+                swa_release_start = protected_len - swa_release_tail_len
+                donated_full_indices = self.scheduler.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, swa_release_start:protected_len
+                ]
+                self.scheduler.token_to_kv_pool_allocator.free_swa(donated_full_indices)
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                logger.info(
+                    "DSV4 decode radix prompt inserted: rid=%s "
+                    "prompt_len=%d radix_key_len=%d fill_len=%d",
+                    req.rid,
+                    prompt_len,
+                    radix_key_len,
+                    len(old_full_untruncated_fill_ids),
+                )
+        finally:
+            req.full_untruncated_fill_ids = old_full_untruncated_fill_ids
+            req.kv.swa_evicted_seqlen = old_swa_evicted_seqlen
+            if req.cache_protected_len < old_cache_protected_len:
+                req.cache_protected_len = old_cache_protected_len
+
     def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
         wait_ack_completions = getattr(
             self.kv_manager, "wait_pd_hidden_ack_completions", None
@@ -2332,6 +2402,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
+        self._maybe_insert_dsv4_decode_radix_prompt(decode_req.req)
 
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
