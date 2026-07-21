@@ -33,6 +33,10 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.hidden_state import (
+    get_pd_hidden_capture_layer_ids,
+    get_pd_hidden_req_state as pd_hidden_state,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -43,8 +47,6 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_seed_metadata_dim,
     get_dsv4_c128_state_indices,
     get_kv_class,
-    get_pd_hidden_capture_layer_ids,
-    get_pd_hidden_req_state as pd_hidden_state,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,

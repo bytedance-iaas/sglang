@@ -14,11 +14,11 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import (
+from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
     get_pd_hidden_req_state as pd_hidden_state,
-    poll_and_all_reduce_attn_cp_tp_group,
 )
+from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (

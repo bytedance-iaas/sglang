@@ -42,7 +42,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
-from sglang.srt.disaggregation.utils import get_pd_hidden_capture_layer_ids
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
