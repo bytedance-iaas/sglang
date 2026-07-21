@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
-from sglang.srt.disaggregation.common.pd_hidden import PDHiddenKVManagerMixin
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
     PrefillStagingContext,
@@ -39,6 +38,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.hidden_events import PDHiddenKVManagerMixin
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
