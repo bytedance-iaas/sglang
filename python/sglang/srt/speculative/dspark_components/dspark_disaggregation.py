@@ -148,10 +148,11 @@ def resolve_hidden_bootstrap_plan(
 ) -> Tuple[Optional[PDHiddenBootstrapPlan], Optional[str]]:
     hidden_start = int(metadata.get("hidden_start", 0))
     hidden_len = int(metadata.get("hidden_len", len(req.origin_input_ids)))
-    if hidden_start != int(decode_prefix_len):
+    global_hidden_start = int(metadata.get("global_hidden_start", hidden_start))
+    if global_hidden_start != int(decode_prefix_len):
         return None, (
             "DSpark hidden metadata must align with decode radix prefix: "
-            f"hidden_start={hidden_start}, decode_prefix_len={decode_prefix_len}, "
+            f"hidden_start={global_hidden_start}, decode_prefix_len={decode_prefix_len}, "
             f"rid={req.rid}"
         )
 
@@ -177,7 +178,7 @@ def resolve_hidden_bootstrap_plan(
         if local_pp_slice
         else len(local_layer_ids) * int(model_config.hidden_size)
     )
-    if not local_layer_ids:
+    if not local_layer_ids or hidden_len == 0:
         return (
             PDHiddenBootstrapPlan(
                 hidden_start=hidden_start,
