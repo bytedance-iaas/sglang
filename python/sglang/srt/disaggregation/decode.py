@@ -97,6 +97,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -109,6 +110,26 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+
+def _dsv4_radix_key_debug_fields(
+    token_ids: Any,
+    extra_key: Optional[str],
+    tree_cache: BasePrefixCache,
+) -> Tuple[int, str, str, bool]:
+    page_size = getattr(tree_cache, "page_size", 1)
+    is_bigram = getattr(tree_cache, "is_eagle", False)
+    radix_key = RadixKey(token_ids, extra_key, is_bigram=is_bigram).page_aligned(
+        page_size
+    )
+    if len(radix_key) <= 0:
+        return 0, "-", "-", is_bigram
+
+    first_page = radix_key[: min(page_size, len(radix_key))]
+    first_page_hash = get_hash_str(list(first_page.raw_token_ids()))[:12]
+    full_key_hash = get_hash_str(list(radix_key.raw_token_ids()))[:12]
+    return len(radix_key), first_page_hash, full_key_hash, is_bigram
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -691,6 +712,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 result.best_match_node,
                 result.host_hit_length,
             )
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                (
+                    radix_key_len,
+                    first_page_hash,
+                    full_key_hash,
+                    is_bigram,
+                ) = _dsv4_radix_key_debug_fields(
+                    req.origin_input_ids, req.extra_key, self.tree_cache
+                )
+                logger.info(
+                    "DSV4 decode radix match: rid=%s origin_input_len=%d "
+                    "radix_key_len=%d matched_len=%d host_hit_len=%d "
+                    "first_page_hash=%s full_key_hash=%s extra_key=%r "
+                    "is_bigram=%s",
+                    req.rid,
+                    len(req.origin_input_ids),
+                    radix_key_len,
+                    len(result.device_indices),
+                    result.host_hit_length,
+                    first_page_hash,
+                    full_key_hash,
+                    req.extra_key,
+                    is_bigram,
+                )
         else:
             result = match_prefix_for_req(
                 self.tree_cache,
@@ -2232,6 +2277,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
             protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
+            immediate_match_len = -1
+            first_page_hash = "-"
+            full_key_hash = "-"
+            is_bigram = getattr(self.tree_cache, "is_eagle", False)
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                _, first_page_hash, full_key_hash, is_bigram = (
+                    _dsv4_radix_key_debug_fields(
+                        prompt_fill_ids, req.extra_key, self.tree_cache
+                    )
+                )
+                immediate_match = self.tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(prompt_fill_ids, req.extra_key),
+                        return_full_match=True,
+                    )
+                )
+                immediate_match_len = len(immediate_match.device_indices)
             if (
                 protected_len > 0
                 and hasattr(self.scheduler, "batch_result_processor")
@@ -2254,11 +2316,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "
-                    "prompt_len=%d radix_key_len=%d fill_len=%d",
+                    "prompt_len=%d radix_key_len=%d fill_len=%d "
+                    "protected_len=%d immediate_match_len=%d "
+                    "first_page_hash=%s full_key_hash=%s extra_key=%r "
+                    "is_bigram=%s",
                     req.rid,
                     prompt_len,
                     radix_key_len,
                     len(old_full_untruncated_fill_ids),
+                    protected_len,
+                    immediate_match_len,
+                    first_page_hash,
+                    full_key_hash,
+                    req.extra_key,
+                    is_bigram,
                 )
         finally:
             req.full_untruncated_fill_ids = old_full_untruncated_fill_ids
