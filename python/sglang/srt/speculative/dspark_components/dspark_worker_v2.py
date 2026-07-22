@@ -79,16 +79,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
-        self._draft_dp_context_enabled = (
-            server_args.enable_dp_attention and not self._draft_is_moe
-        )
-        attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
-        if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
-            raise ValueError(
-                "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
-                "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
-                "MoE-under-DP all-reduce."
-            )
+        self._draft_dp_context_enabled = server_args.enable_dp_attention
 
         with self._draft_context():
             bundle = build_draft_tp_worker(
@@ -187,6 +178,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            external_draft_tp_context=self._draft_dp_context_enabled,
         )
         self._verify_epilogue = None
         if (
@@ -512,7 +504,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )

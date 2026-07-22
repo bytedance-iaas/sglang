@@ -238,6 +238,7 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
+        external_draft_tp_context: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -246,12 +247,13 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._external_draft_tp_context = external_draft_tp_context
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
     def _base_logits_context(self):
-        if self._dp_moe_sync:
+        if self._dp_moe_sync and not self._external_draft_tp_context:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
