@@ -110,20 +110,29 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
+        swa_host_hit = 0
         node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
-            if cd.value is None and cd.host_value is not None:
-                # TODO(ispobock): refactor host_hit_length usage
-                return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
+                # TODO(hzh): load_back may currently restore a full host-tombstone
+                # segment whose length exceeds sliding_window_size. Once
+                # load_back is constrained to fetch only one sliding window
+                # worth of pages, cap swa_host_hit at sliding_window_size
+                # here so the scheduler budget matches the actual device-pool
+                # consumption.
+                swa_host_hit += len(cd.host_value)
                 n_swa += len(cd.host_value)
             else:
                 break
             node = node.parent
+        if swa_host_hit > 0:
+            return result._replace(
+                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
+            )
         return result
 
     def update_component_on_insert_overlap(
@@ -250,6 +259,32 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+        else:
+            # Entire leaf is outside the SWA window — left as a tombstone.
+            return
+
+        self._maybe_split_leaf_for_swa_lock(node)
+
+    def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
+        """Cap a fresh SWA leaf at one page-aligned window so locking it pins
+        only one window of SWA pool, not the whole (long chunked-prefill) leaf.
+        """
+        ct = self.component_type
+        cd = leaf.component_data[ct]
+        if leaf is self.cache.root_node or cd.value is None or cd.lock_ref > 0:
+            return
+
+        page_size = self.cache.page_size
+        # Smallest page-aligned size that still covers the sliding window.
+        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        leaf_len = len(leaf.key)
+        if leaf_len <= tail_size:
+            return
+        split_at = leaf_len - tail_size
+        if page_size > 1 and (split_at % page_size != 0 or leaf_len % page_size != 0):
+            return
+
+        self.cache._split_node(leaf.key, leaf, split_at)
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode

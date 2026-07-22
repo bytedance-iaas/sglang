@@ -774,7 +774,10 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
+        # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -1001,6 +1004,14 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def needs_host_load_back(self) -> bool:
+        """Whether any cache layer has a host hit that needs L2 H2D load_back."""
+        return (
+            self.host_hit_length > 0
+            or self.swa_host_hit_length > 0
+            or self.mamba_host_hit_length > 0
+        )
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1057,6 +1068,8 @@ class Req(ReqDllmMixin):
                 self.last_host_node,
                 self.best_match_node,
                 self.host_hit_length,
+                self.swa_host_hit_length,
+                self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
@@ -1064,6 +1077,8 @@ class Req(ReqDllmMixin):
                 match_result.last_host_node,
                 match_result.best_match_node,
                 match_result.host_hit_length,
+                match_result.swa_host_hit_length,
+                match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:

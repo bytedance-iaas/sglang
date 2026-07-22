@@ -110,12 +110,16 @@ def match_prefix_for_req(
         req.last_host_node,
         req.best_match_node,
         req.host_hit_length,
+        req.swa_host_hit_length,
+        req.mamba_host_hit_length,
     ) = (
         match_result.device_indices,
         match_result.last_device_node,
         match_result.last_host_node,
         match_result.best_match_node,
         match_result.host_hit_length,
+        match_result.swa_host_hit_length,
+        match_result.mamba_host_hit_length,
     )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
@@ -546,7 +550,9 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
-    def _swa_budget_for_req(self, extend_input_len: int) -> int:
+    def _swa_budget_for_req(
+        self, extend_input_len: int, swa_host_hit_length: int = 0
+    ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
         With chunked prefill + overlap scheduler, the peak SWA occupancy is:
@@ -561,7 +567,10 @@ class PrefillAdder:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        return max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        if swa_host_hit_length > 0:
+            budget += self.ceil_paged_tokens(swa_host_hit_length)
+        return budget
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -869,7 +878,9 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(req.extend_input_len)
+            swa_needed = self._swa_budget_for_req(
+                req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+            )
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -882,12 +893,14 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
-                swa_needed = self._swa_budget_for_req(req.extend_input_len)
+                swa_needed = self._swa_budget_for_req(
+                    req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                )
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
             eic_prefix_len = 0
-            if req.host_hit_length > 0:
+            if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,

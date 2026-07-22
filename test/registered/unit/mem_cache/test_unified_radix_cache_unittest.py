@@ -246,6 +246,15 @@ class UnifiedRadixCacheSuite:
         req_to_token_pool.alloc([req])
         return req
 
+    def _apply_match_to_req(self, req, match):
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.last_host_node = match.last_host_node
+        req.best_match_node = match.best_match_node
+        req.host_hit_length = match.host_hit_length
+        req.swa_host_hit_length = match.swa_host_hit_length
+        req.mamba_host_hit_length = match.mamba_host_hit_length
+
     def _make_seq(self, start: int, num_pages: int) -> list[int]:
         """Page-aligned token sequence of num_pages pages."""
         page_size = self.cfg.page_size
@@ -812,6 +821,51 @@ class UnifiedRadixCacheSuite:
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
         self.assertEqual(len(m.device_indices), len(seq))
         tree.sanity_check()
+
+    def test_swa_leaf_capped_to_window_on_insert(self):
+        """A long SWA leaf is split so locking it protects one window of SWA
+        while full attention still protects the whole sequence."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+
+        for case in ("long_splits", "short_keeps"):
+            with self.subTest(case=case):
+                tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+                num_pages = tail_pages + 2 if case == "long_splits" else tail_pages
+                seq = self._make_seq(1, num_pages)
+                self._insert(tree, allocator, req_to_token_pool, seq)
+                tree.sanity_check()
+
+                leaf = tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).last_device_node
+                swa_val = leaf.component_data[ComponentType.SWA].value
+                self.assertIsNotNone(swa_val)
+
+                if case == "long_splits":
+                    # Capped to one page-aligned window; prefix is a real ancestor.
+                    self.assertEqual(len(swa_val), tail_size)
+                    self.assertIsNot(leaf.parent, tree.root_node)
+                else:
+                    # Already within one window — no split.
+                    self.assertEqual(len(swa_val), len(seq))
+                    self.assertIs(leaf.parent, tree.root_node)
+
+                lock_result = tree.inc_lock_ref(leaf)
+                # SWA pins one window; full attention pins everything.
+                self.assertEqual(tree.swa_protected_size(), len(swa_val))
+                self.assertEqual(tree.full_protected_size(), len(seq))
+                tree.sanity_check()
+                tree.dec_lock_ref(
+                    leaf,
+                    DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+                )
+                tree.sanity_check()
 
     def test_swa_unfinished_recovery_preserves_locked_full_value(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
@@ -1752,6 +1806,41 @@ class UnifiedRadixCacheSuite:
                 )
         tree.sanity_check()
 
+    def test_hicache_write_through_offloads_swa_split_leaf(self):
+        """A SWA boundary-split leaf should offload normally under write-through."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        ps = self.cfg.page_size
+        tree, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(tree)
+        tree.write_through_threshold = 1
+
+        seq = self._make_seq(1, 2)
+        value = self._alloc(allocator, len(seq))
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(seq),
+                value=value,
+                swa_evicted_seqlen=ps,
+            )
+        )
+        self.assertEqual(result.prefix_len, 0)
+
+        self.assertEqual(len(tree.root_node.children), 1)
+        split_parent = next(iter(tree.root_node.children.values()))
+        self.assertEqual(len(split_parent.children), 1)
+        split_leaf = next(iter(split_parent.children.values()))
+
+        tree.writing_check(write_back=True)
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(split_leaf.evicted)
+        self.assertTrue(split_leaf.backuped)
+        self.assertIn(split_leaf, tree.evictable_host_leaves)
+        tree.sanity_check()
+
     def test_hicache_evict_to_host_updates_aux_lru(self):
         """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [
@@ -1894,7 +1983,26 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.best_match_node, leaf)
         self.assertIs(result.last_device_node, parent)
         self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
-        self.assertEqual(result.host_hit_length, 1)
+        self.assertEqual(result.host_hit_length, len(leaf.key))
+        self.assertEqual(result.swa_host_hit_length, len(leaf.key))
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        parent = chain[-2]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._set_aux_host_tombstone(tree, leaf, ComponentType.SWA)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -1942,10 +2050,7 @@ class UnifiedRadixCacheSuite:
 
         req = self._make_req(req_to_token_pool)
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens), req=req))
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -1984,10 +2089,7 @@ class UnifiedRadixCacheSuite:
 
         req = self._make_req(req_to_token_pool)
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens), req=req))
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -2023,10 +2125,7 @@ class UnifiedRadixCacheSuite:
 
         req = self._make_req(req_to_token_pool)
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens), req=req))
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -2140,14 +2239,10 @@ class UnifiedRadixCacheSuite:
         return tree, allocator, req_to_token_pool, chain, window_pages
 
     def test_hicache_swa_finalize_match_result(self):
-        """finalize_match_result bumps host_hit_length to 1 iff some SWA node
-        within the trailing window is tombstoned (cd.value is None,
-        cd.host_value is not None). Out-of-window tombstones and chains fully
-        on device must leave host_hit_length untouched.
-
-        Sentinel only — never the real SWA token count, since SWA load-back
-        does not grow req.prefix_indices and any non-zero value gets
-        subtracted from extend_input_len in schedule_policy.
+        """finalize_match_result accumulates host_value lengths of SWA tombstones
+        within the trailing sliding window into ``swa_host_hit_length``. Out-of-window
+        tombstones and chains fully on device must leave ``swa_host_hit_length`` at 0.
+        ``host_hit_length`` is Full-KV only and is never written by SWA.
         """
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
@@ -2156,11 +2251,12 @@ class UnifiedRadixCacheSuite:
 
         tree, _, _, chain, window_pages = self._swa_finalize_setup()
         leaf = chain[-1]
+        ps = self.cfg.page_size
         swa_comp = tree.components[ComponentType.SWA]
 
         cases = [
             ("all_on_device", None, 0),
-            ("tombstone_in_window", chain[-window_pages], 1),
+            ("tombstone_in_window", chain[-window_pages], ps),
             ("tombstone_outside_window", chain[-(window_pages + 1)], 0),
         ]
         for name, victim, expected in cases:
@@ -2188,7 +2284,8 @@ class UnifiedRadixCacheSuite:
                     value_chunks=[],
                     best_value_len=0,
                 )
-                self.assertEqual(result.host_hit_length, expected)
+                self.assertEqual(result.host_hit_length, 0)
+                self.assertEqual(result.swa_host_hit_length, expected)
 
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
         """LOAD_BACK commit must:
@@ -2344,6 +2441,7 @@ class UnifiedRadixCacheSuite:
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         tree, _, _, y, x, _ = self._swa_anchor_setup()
         swa_comp = tree.components[ComponentType.SWA]
+        ps = self.cfg.page_size
 
         base = MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64, device=tree.device),
@@ -2358,7 +2456,9 @@ class UnifiedRadixCacheSuite:
             value_chunks=[],
             best_value_len=0,
         )
-        self.assertEqual(result.host_hit_length, 1)
+        # SWA host hit goes to swa_host_hit_length; host_hit_length stays at 0.
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, ps)
 
     def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a SWA tombstone must not
