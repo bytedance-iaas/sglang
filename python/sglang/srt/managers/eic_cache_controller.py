@@ -567,10 +567,14 @@ class EICCacheController(HiCacheController):
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
     ) -> int:
-        if self.disable_shared and not self.mem_pool_host.is_synced(host_indices):
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
+        # Paged mode: host_indices are device-space ids, out of range for the
+        # swa-sized mem_state. mem_state is only used when disable_shared.
+        if self.disable_shared:
+            if not self.mem_pool_host.is_synced(host_indices):
+                raise ValueError(
+                    f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
+                )
         self.mem_pool_device_allocator.free(device_indices)
-        self.mem_pool_host.update_backup(host_indices)
+        if self.disable_shared:
+            self.mem_pool_host.update_backup(host_indices)
         return len(device_indices)

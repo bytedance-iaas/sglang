@@ -326,7 +326,12 @@ class EICStorage(HiCacheStorage):
         self.connection.register_memory(vals, meminfo)
 
     def _pool_buffers(self, memory_pool_host: HostKVCache) -> List[torch.Tensor]:
-        buffer = memory_pool_host.kv_buffer
+        # NSA indexer host has no kv_buffer; use get_hybrid_pool_buffer() if present.
+        get_hybrid = getattr(memory_pool_host, "get_hybrid_pool_buffer", None)
+        if callable(get_hybrid):
+            buffer = get_hybrid()
+        else:
+            buffer = memory_pool_host.kv_buffer
         if buffer is None:
             return []
         if isinstance(buffer, list):

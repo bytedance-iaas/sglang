@@ -378,6 +378,16 @@ class EICHiRadixCache(RadixCache):
 
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
+        # Backstop: reconcile any SWA slots left by per-step prefix eviction
+        # (page-align / load-back re-alloc). free_swa is idempotent.
+        if self.sliding_window_size is not None:
+            if hasattr(self.token_to_kv_pool_allocator, "free_swa"):
+                self.token_to_kv_pool_allocator.free_swa(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :kv_committed_len
+                    ]
+                )
+
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
@@ -518,13 +528,33 @@ class EICHiRadixCache(RadixCache):
         return self.evictable_size_
 
     def swa_evictable_size(self):
-        return self.evictable_size_
+        # EIC radix holds only FULL indices; SWA is allocator-managed. Report 0
+        # to avoid double-counting vs swa_available_size in the idle leak check.
+        return 0
 
     def full_protected_size(self):
         return self.protected_size_
 
     def swa_protected_size(self):
-        return self.protected_size_
+        # No SWA state in the EIC radix tree.
+        return 0
+
+    def supports_swa(self) -> bool:
+        # EIC replaces the SWA-capable UnifiedRadixCache; re-declare SWA support
+        # or maybe_evict_swa is gated off and the SWA pool fills (prefill OOM).
+        return self.sliding_window_size is not None
+
+    def sanity_check(self):
+        # EIC frees SWA outside the radix tree; no tree invariant to assert.
+        pass
+
+    @property
+    def swa_evict_release_prefix(self) -> bool:
+        # EIC lacks SWARadixCache.dec_swa_lock_only, so let maybe_evict_swa drop
+        # this request's out-of-window prefix SWA directly. Safe: SWA attention
+        # never reads past the window, full KV is in the separate full pool, and
+        # reuse reloads SWA from the EIC host backup.
+        return True
 
     def supports_swa(self) -> bool:
         # EIC replaces the SWA-capable UnifiedRadixCache in kv_cache_builder, so

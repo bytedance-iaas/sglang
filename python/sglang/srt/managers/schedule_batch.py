@@ -2707,7 +2707,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert (
             req.cache_protected_len % self.tree_cache.page_size == 0
         ), "cache_protected_len must be page aligned"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+        if not getattr(self.tree_cache, "swa_evict_release_prefix", False):
+            req.swa_evicted_seqlen = max(
+                req.swa_evicted_seqlen, req.cache_protected_len
+            )
 
         # Subtract an extra page_size so the eviction frontier never reaches the
         # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
