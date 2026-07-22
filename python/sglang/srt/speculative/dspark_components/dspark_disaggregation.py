@@ -145,7 +145,6 @@ def resolve_hidden_bootstrap_plan(
     model_config: Any,
     model_runner: Any,
     metadata_buffers: Any,
-    prefill_radix_enabled: bool,
 ) -> Tuple[Optional[PDHiddenBootstrapPlan], Optional[str]]:
     hidden_start = int(metadata.get("hidden_start", 0))
     hidden_len = int(metadata.get("hidden_len", len(req.origin_input_ids)))
@@ -154,14 +153,6 @@ def resolve_hidden_bootstrap_plan(
             "DSpark hidden metadata must align with decode radix prefix: "
             f"hidden_start={hidden_start}, decode_prefix_len={decode_prefix_len}, "
             f"rid={req.rid}"
-        )
-
-    decode_radix_enabled = bool(metadata.get("decode_radix_cache_enabled", False))
-    if prefill_radix_enabled != decode_radix_enabled:
-        return None, (
-            "DSpark hidden PD requires matching prefill/decode radix cache "
-            f"policies: prefill={prefill_radix_enabled}, "
-            f"decode={decode_radix_enabled}, rid={req.rid}"
         )
 
     pp_slices = metadata.get("pp_slices") or {}

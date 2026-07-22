@@ -444,9 +444,6 @@ class PrefillBootstrapQueue:
             model_config=self.scheduler.model_config,
             model_runner=self.scheduler.tp_worker.model_runner,
             metadata_buffers=self.metadata_buffers,
-            prefill_radix_enabled=not bool(
-                self.scheduler.server_args.disable_radix_cache
-            ),
         )
         if error is not None:
             return None, error
@@ -542,9 +539,6 @@ class PrefillBootstrapQueue:
             model_config=self.scheduler.model_config,
             model_runner=self.scheduler.tp_worker.model_runner,
             metadata_buffers=self.metadata_buffers,
-            prefill_radix_enabled=not bool(
-                self.scheduler.server_args.disable_radix_cache
-            ),
         )
         if error is not None:
             self._abort_pd_hidden_bootstrap(req, error)
