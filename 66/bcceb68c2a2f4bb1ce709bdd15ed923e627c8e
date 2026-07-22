@@ -1,0 +1,21 @@
+python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+  s_9587097c1de4ee::t_f6219887b1eadd 47-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "66bcceb68c2a2f4bb1ce709bdd15ed923e627c8e",
+  "prompts": {},
+  "sessions": {
+    "s_9587097c1de4ee": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7d8f-3a4a-7343-81a8-81a07819a86c",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
