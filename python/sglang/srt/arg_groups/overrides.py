@@ -1984,6 +1984,19 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     return {}
 
 
+@register_post_process
+def _shared_expert_tp1_disables_fusion(view: Any) -> dict:
+    if not envs.SGLANG_SHARED_EXPERT_TP1.get():
+        return {}
+    if view.disable_shared_experts_fusion:
+        return {}
+    logger.warning(
+        "SGLANG_SHARED_EXPERT_TP1 is enabled. "
+        "--disable-shared-experts-fusion is automatically set."
+    )
+    return {"disable_shared_experts_fusion": True}
+
+
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
