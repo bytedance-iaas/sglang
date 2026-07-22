@@ -9,13 +9,18 @@ from sglang.srt.managers.eic_cache_controller import (
     EICCacheController,
     EICCacheOperation,
 )
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
-from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICPagedHiRadixCache,
+)
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class FakeHostPool:
@@ -29,6 +34,49 @@ class FakeDeviceAllocator:
 
 
 class TestEICHiCacheRegression(unittest.TestCase):
+    def test_only_eic_hiradix_enables_swa_extend_eviction(self):
+        self.assertFalse(BasePrefixCache.supports_swa_extend_eviction(object()))
+        eic_cache = object.__new__(EICHiRadixCache)
+        paged_eic_cache = object.__new__(EICPagedHiRadixCache)
+        eic_cache.sliding_window_size = 4096
+        paged_eic_cache.sliding_window_size = 4096
+
+        self.assertTrue(eic_cache.supports_swa_extend_eviction())
+        self.assertTrue(paged_eic_cache.supports_swa_extend_eviction())
+
+    def test_eic_hiradix_disables_swa_extend_eviction_without_swa(self):
+        cache = object.__new__(EICHiRadixCache)
+        cache.sliding_window_size = None
+
+        self.assertFalse(cache.supports_swa_extend_eviction())
+
+    def test_eic_hiradix_extend_dispatches_swa_eviction(self):
+        batch = object.__new__(ScheduleBatch)
+        batch.tree_cache = SimpleNamespace(
+            supports_swa=lambda: True,
+            supports_swa_extend_eviction=lambda: True,
+            is_chunk_cache=lambda: False,
+            sliding_window_size=4096,
+            page_size=64,
+        )
+        batch.forward_mode = SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        )
+        req = SimpleNamespace()
+        batch.reqs = [req]
+        batch.prefix_lens = [32768]
+        batch.enable_overlap = False
+        batch._evict_swa = mock.Mock()
+
+        with mock.patch(
+            "sglang.srt.managers.schedule_batch.get_global_server_args",
+            return_value=SimpleNamespace(chunked_prefill_size=8192),
+        ):
+            batch.maybe_evict_swa()
+
+        batch._evict_swa.assert_called_once_with(req, 32768)
+
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.match_req_set = []

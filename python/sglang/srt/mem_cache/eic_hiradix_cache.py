@@ -352,6 +352,16 @@ class EICHiRadixCache(RadixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # EIC's radix tree owns only FULL indices. Clear the request-owned SWA
+        # tail before the mixed allocator frees duplicate/tail FULL pages. The
+        # prefix below swa_evicted_seqlen was already released during eviction.
+        if self.sliding_window_size is not None and hasattr(
+            self.token_to_kv_pool_allocator, "free_swa"
+        ):
+            self.token_to_kv_pool_allocator.free_swa(
+                kv_indices[req.swa_evicted_seqlen :]
+            )
+
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
@@ -377,16 +387,6 @@ class EICHiRadixCache(RadixCache):
                 self._backup_unbacked_path(req.last_node)
 
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-
-        # Backstop: reconcile any SWA slots left by per-step prefix eviction
-        # (page-align / load-back re-alloc). free_swa is idempotent.
-        if self.sliding_window_size is not None:
-            if hasattr(self.token_to_kv_pool_allocator, "free_swa"):
-                self.token_to_kv_pool_allocator.free_swa(
-                    self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, :kv_committed_len
-                    ]
-                )
 
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
@@ -543,6 +543,11 @@ class EICHiRadixCache(RadixCache):
         # EIC replaces the SWA-capable UnifiedRadixCache; re-declare SWA support
         # or maybe_evict_swa is gated off and the SWA pool fills (prefill OOM).
         return self.sliding_window_size is not None
+
+    def supports_swa_extend_eviction(self) -> bool:
+        # The EIC radix tree owns only FULL indices. Request-level SWA slots must
+        # be released during long chunked prefills, as they are for chunk cache.
+        return self.supports_swa()
 
     def sanity_check(self):
         # EIC frees SWA outside the radix tree; no tree invariant to assert.
