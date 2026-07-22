@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -479,12 +478,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         req.last_node = self.tree_cache.root_node
         req.swa_uuid_for_lock = None
-
-    def _sync_pd_hidden_decode_prefix_len(self, prefix_len: int) -> int:
-        """Keep DSpark hidden transfer ranges consistent across decode TP ranks."""
-        tensor = torch.tensor([int(prefix_len)], dtype=torch.int64, device="cpu")
-        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
-        return int(tensor.item())
 
     # SWA caches make the flat size accessors raise and expose full-pool sizes
     # via full_*() instead; pick the full-pool view for SWA, flat otherwise.
@@ -1131,14 +1124,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
-            state_types = self.kv_manager.kv_args.state_types
-            needs_pd_hidden = (
-                self.scheduler.spec_algorithm.is_dspark()
-                and not _is_fake_transfer(
-                    decode_req.req, self.scheduler.server_args
-                )
-                and StateType.PD_HIDDEN in state_types
-            )
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 self.scheduler.server_args.disaggregation_decode_enable_radix_cache
@@ -1168,14 +1153,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
                     prefix_len = self._dsv4_safe_prefix_len(prefix_len)
                     prefix_indices = prefix_indices[:prefix_len]
-
-                    if needs_pd_hidden:
-                        synced_prefix_len = self._sync_pd_hidden_decode_prefix_len(
-                            prefix_len
-                        )
-                        if synced_prefix_len < prefix_len:
-                            prefix_len = synced_prefix_len
-                            prefix_indices = prefix_indices[:prefix_len]
 
                     if self._should_wait_for_dsv4_inflight_prompt(
                         decode_req.req,
@@ -1261,8 +1238,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             pd_hidden_pp_slices = None
             pd_hidden_start = total_prefix_len
             pd_hidden_len = origin_input_len - total_prefix_len
+            state_types = self.kv_manager.kv_args.state_types
             if (
-                needs_pd_hidden
+                self.scheduler.spec_algorithm.is_dspark()
+                and not _is_fake_transfer(
+                    decode_req.req, self.scheduler.server_args
+                )
+                and StateType.PD_HIDDEN in state_types
                 and pd_hidden_len > 0
             ):
                 dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
