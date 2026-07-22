@@ -2606,8 +2606,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"dst_indices={len(hidden_chunk.dst_indices)}"
                 )
             if (
-                self.scheduler.server_args.disaggregation_decode_enable_radix_cache
-                and hidden_chunk.hidden_start > hidden_state.next_start
+                hidden_chunk.hidden_start > hidden_state.next_start
                 and hidden_state.next_start == hidden_state.start
             ):
                 hidden_state.start = int(hidden_chunk.hidden_start)
