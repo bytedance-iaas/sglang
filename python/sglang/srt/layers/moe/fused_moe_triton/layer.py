@@ -525,15 +525,22 @@ class FusedMoE(torch.nn.Module):
                 not self.use_presharded_weights,
             )
         else:
+            expert_data = expert_data.narrow(shard_dim, start, shard_size)
             if not self.use_presharded_weights:
                 if not is_bias and self.use_triton_kernels:
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
-
-            expert_data = expert_data.narrow(shard_dim, start, shard_size)
+                shard_offset = shard_size * tp_rank
+                loaded_dim = loaded_weight.shape[shard_dim]
+                if shard_offset >= loaded_dim:
+                    expert_data.zero_()
+                    return
+                load_size = min(shard_size, loaded_dim - shard_offset)
+                loaded_weight = loaded_weight.narrow(shard_dim, shard_offset, load_size)
+                if load_size != shard_size:
+                    expert_data.zero_()
+                    expert_data.narrow(shard_dim, 0, load_size).copy_(loaded_weight)
+                    return
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -599,9 +606,17 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+                shard_offset = shard_size * tp_rank
+                loaded_dim = loaded_weight.shape[shard_dim]
+                if shard_offset >= loaded_dim:
+                    expert_data.zero_()
+                    return
+                load_size = min(shard_size, loaded_dim - shard_offset)
+                loaded_weight = loaded_weight.narrow(shard_dim, shard_offset, load_size)
+                if load_size != shard_size:
+                    expert_data.zero_()
+                    expert_data.narrow(shard_dim, 0, load_size).copy_(loaded_weight)
+                    return
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
