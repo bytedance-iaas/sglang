@@ -72,6 +72,49 @@ def unified_asym_gemm_enabled() -> bool:
     return asym_gemm_wrapper.ASYMGEMM_UNIFIED_MOE
 
 
+def _gpu_only_host() -> bool:
+    """True when this host has no CPU INT8 kernel (AMX/AVX512-VNNI/AVX2).
+
+    The unified layer still runs, but every expert must stay on the GPU: the
+    CPU bucket would dispatch into cpu_gemm's "none" backend, which rejects
+    INT8 row-major descriptors (int8_rm_eligible → false).
+    """
+    return asym_gemm_wrapper.ASYMGEMM_UNIFIED_CPU_INT8_BACKEND == "none"
+
+
+def _effective_m_cpu() -> int:
+    """SGLANG_ASYMGEMM_UNIFIED_M_CPU, forced to 0 on hosts without a CPU
+    INT8 kernel so no expert ever routes to the dead CPU bucket."""
+    m_cpu = envs.SGLANG_ASYMGEMM_UNIFIED_M_CPU.get()
+    if m_cpu > 0 and _gpu_only_host():
+        logger.warning(
+            "AsymGEMM unified MoE: forcing m_cpu=0 (was %d) — no CPU INT8 "
+            "kernel on this host.",
+            m_cpu,
+        )
+        return 0
+    return m_cpu
+
+
+def _force_gpu_only_dispatch_env() -> None:
+    """Zero the CPU prefill fraction on hosts without a CPU INT8 kernel.
+
+    asym_gemm.unified_moe.runtime reads ASYMGEMM_CPU_PREFILL_FRACTION lazily
+    on first forward (default 0.1), so overriding the env here — before any
+    layer is converted — is sufficient and race-free.
+    """
+    if not _gpu_only_host():
+        return
+    frac = os.environ.get("ASYMGEMM_CPU_PREFILL_FRACTION")
+    if frac not in (None, "0", "0.0"):
+        logger.warning(
+            "AsymGEMM unified MoE: overriding ASYMGEMM_CPU_PREFILL_FRACTION=%s "
+            "to 0 — no CPU INT8 kernel on this host.",
+            frac,
+        )
+    os.environ["ASYMGEMM_CPU_PREFILL_FRACTION"] = "0"
+
+
 def has_unified_asym_gemm_layer(layer: torch.nn.Module) -> bool:
     return getattr(layer, _UNIFIED_LAYER_ATTR, None) is not None
 
@@ -349,6 +392,7 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
 
     # Inject the process-global AMX runtime so every converted MoE layer shares
     # one worker pool (and one total thread budget) instead of building its own.
+    _force_gpu_only_dispatch_env()
     if slab is not None:
         unified_layer = UnifiedMoeLayer.from_int8(
             gate_int8=slab["gate_int8"],
@@ -360,7 +404,7 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
             top_k=layer.top_k,
             cuda_device=torch.cuda.current_device(),
             runtime=_get_cpu_runtime(),
-            m_cpu=envs.SGLANG_ASYMGEMM_UNIFIED_M_CPU.get(),
+            m_cpu=_effective_m_cpu(),
         )
         source = "loaded pre-quantized INT8 for"
     elif not masters_are_bf16:
@@ -395,7 +439,7 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
             top_k=layer.top_k,
             cuda_device=torch.cuda.current_device(),
             runtime=_get_cpu_runtime(),
-            m_cpu=envs.SGLANG_ASYMGEMM_UNIFIED_M_CPU.get(),
+            m_cpu=_effective_m_cpu(),
         )
         source = "quantized"
 
