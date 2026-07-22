@@ -44,7 +44,10 @@ class Mxfp4MarlinMoEMethod:
 
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
+        # Keep the loader tensors at the logical TP shard size. Marlin tile
+        # padding is applied by prepare_moe_mxfp4_layer_for_marlin() after the
+        # checkpoint has been sharded. Padding here makes the generic loader
+        # use a padded TP stride and can index past the full checkpoint tensor.
         hidden_size = round_up(hidden_size, 256)
         self.hidden_pad = hidden_size - layer.hidden_size
 
