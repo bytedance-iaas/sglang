@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A8Mxfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -58,6 +59,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    MXFP4_PACK_QUANTIZED_FORMAT,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
@@ -520,6 +522,29 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_mxfp4a8_fp8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """Detect MXFP4 W4A8: packed E2M1 weights with per-32 E8M0 scales plus
+        dynamic 8-bit float activations (e.g. GLM-5.2 mxfp4-pack-quantized)."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        # MXFP4_PACK_QUANTIZED_FORMAT is None on compressed-tensors < 0.13, where
+        # the format cannot occur anyway -- the comparison then never matches.
+        return (
+            self.quant_format == MXFP4_PACK_QUANTIZED_FORMAT
+            and weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 32
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and input_quant.num_bits == 8
+            and input_quant.type == QuantizationType.FLOAT
+            and input_quant.dynamic
+        )
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -736,6 +761,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_mxfp4a8_fp8(weight_quant, input_quant):
+            # Must precede _is_dynamic_token_w4a8: per-token FP8 activations also
+            # satisfy that predicate, which would raise NotImplementedError here.
+            logger.info_once("Using CompressedTensorsW4A8Mxfp4MoE")
+            return CompressedTensorsW4A8Mxfp4MoE(self, weight_quant, input_quant)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

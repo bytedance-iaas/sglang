@@ -10,14 +10,27 @@ from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
 
-def is_activation_quantization_format(format: str) -> bool:
-    _ACTIVATION_QUANTIZATION_FORMATS = [
+# `mxfp4_pack_quantized` only exists in compressed-tensors >= 0.13. Probing for
+# it keeps older installs degrading to "MXFP4 unsupported" instead of raising
+# AttributeError here, which would break every compressed-tensors model.
+_MXFP4_FORMAT = getattr(CompressionFormat, "mxfp4_pack_quantized", None)
+MXFP4_PACK_QUANTIZED_FORMAT = _MXFP4_FORMAT.value if _MXFP4_FORMAT is not None else None
+
+_ACTIVATION_QUANTIZATION_FORMATS = [
+    fmt
+    for fmt in (
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
         CompressionFormat.nvfp4_pack_quantized.value,
         CompressionFormat.pack_quantized.value,
-    ]
+        MXFP4_PACK_QUANTIZED_FORMAT,
+    )
+    if fmt is not None
+]
+
+
+def is_activation_quantization_format(format: str) -> bool:
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
 
