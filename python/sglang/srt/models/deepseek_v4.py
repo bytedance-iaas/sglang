@@ -1977,7 +1977,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         compute = torch.cuda.current_stream()
         with torch.cuda.stream(comm):
             comm.wait_stream(compute)
-            dp_gather_partial(global_hidden, local, fb)
+            dp_gather_replicate(global_hidden, local, fb)
             state.gather_event = _tbo_event(("gather", sub))
             state.gather_event.record(comm)
         state.gather_keepalive = local
