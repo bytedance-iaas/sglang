@@ -1,3 +1,4 @@
+import sys
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -106,6 +107,37 @@ class TestEICHiCacheRegression(unittest.TestCase):
             hasattr(root, "hicache_storage_pass_prefix_keys"),
             "storage pass-prefix config belongs to the cache, not tree nodes",
         )
+
+    def test_batch_exists_impl_failed_batch_keeps_cardinality(self):
+        # A failed top-level mexist must yield exactly one False per input key.
+        # The EIC outcome object may still carry per-object status codes; if the
+        # loop below falls through to them we would return 2*N results, which
+        # later overflows component_keys indexing in _batch_io_v2. See the
+        # `continue` guard in EICStorage._batch_exists_impl.
+        fake_eic = SimpleNamespace(
+            StatusCode=SimpleNamespace(SUCCESS=0, FAILED=1),
+            StringVector=list,
+            ExistOption=SimpleNamespace,
+        )
+        with mock.patch.dict(sys.modules, {"eic": fake_eic}):
+            from sglang.srt.mem_cache.storage.eic.eic_storage import EICStorage
+
+            storage = object.__new__(EICStorage)
+            storage.eic_namespace = "poc"
+            storage._get_eic_key = lambda keys: list(keys)
+
+            outcome = SimpleNamespace(status_codes=[fake_eic.StatusCode.SUCCESS] * 3)
+            storage.connection = mock.Mock()
+            storage.connection.mexist.return_value = (
+                fake_eic.StatusCode.FAILED,
+                outcome,
+            )
+
+            keys = [f"k{i}" for i in range(3)]
+            result = storage._batch_exists_impl(keys)
+
+        self.assertEqual(result, [False, False, False])
+        self.assertEqual(len(result), len(keys))
 
     def test_eic_chunk_cache_passes_tp_group_to_controller(self):
         cache = object.__new__(EICChunkCache)

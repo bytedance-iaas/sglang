@@ -450,6 +450,7 @@ class EICStorage(HiCacheStorage):
                     f"eic exists {len(keys)} failed, status_code {status_code}"
                 )
                 result.extend([False] * len(batch_keys))
+                continue
             for err_code in exist_outcome.status_codes:
                 result.append(err_code == eic.StatusCode.SUCCESS)
         return result
