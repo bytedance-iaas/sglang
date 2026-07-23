@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -629,7 +630,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
+        if get_global_server_args().enable_eic_cache:
+            # EIC aliases FULL spans onto reused SWA slots; skip reserved page + dedup.
+            swa_indices = torch.unique(swa_indices[swa_indices >= self.page_size])
+        else:
+            swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
