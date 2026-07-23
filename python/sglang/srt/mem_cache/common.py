@@ -53,6 +53,7 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
+    release_cache_protected_prefix: bool = False,
 ) -> None:
     """Release SWA working slots that can no longer be attended to.
 
@@ -60,12 +61,19 @@ def free_swa_out_of_window_slots(
     tokens.  Keeping at least one page below the radix insert frontier prevents
     the last leaf from becoming an all-tombstone leaf when ``page_size`` is
     larger than the model's sliding window (DSV4 uses 256 vs. 128).
+
+    ``cache_protected_len`` remains the eviction floor for caches whose radix
+    tree owns the prefix SWA. EIC has no SWA tree state, so it explicitly opts
+    into releasing out-of-window prefix SWA and restores it from host storage
+    on reuse.
     """
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
-    if page_size > 1 and evict_floor > req.cache_protected_len:
+    evict_floor = getattr(req, "swa_evict_floor", 0)
+    if not release_cache_protected_prefix:
+        evict_floor = max(req.cache_protected_len, evict_floor)
+    if page_size > 1:
         evict_floor = -(-evict_floor // page_size) * page_size
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
 

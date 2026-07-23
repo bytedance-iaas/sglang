@@ -127,12 +127,60 @@ def _make_batch(tree, allocator, pool):
     )
 
 
+def _make_policy_batch(*, release_prefix):
+    """Build a lightweight batch for scheduler eviction-policy tests."""
+    tree = SimpleNamespace(
+        sliding_window_size=8,
+        page_size=8,
+        supports_swa=lambda: True,
+        is_chunk_cache=lambda: False,
+        swa_evict_release_prefix=release_prefix,
+    )
+    pool = SimpleNamespace(req_to_token=torch.arange(64).reshape(1, 64))
+    freed = []
+    allocator = SimpleNamespace(free_swa=lambda slots: freed.append(slots.clone()))
+    return _make_batch(tree, allocator, pool), freed
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
 class TestSWAEvictionBoundary(unittest.TestCase):
+
+    # -- Cache-specific prefix ownership policy --
+
+    def test_radix_policy_preserves_cache_protected_prefix(self):
+        """Tree-owned prefix SWA remains outside scheduler-managed eviction."""
+        batch, freed = _make_policy_batch(release_prefix=False)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=48,
+            swa_evict_floor=0,
+            swa_evicted_seqlen=0,
+        )
+
+        ScheduleBatch._evict_swa(batch, req, pre_len=55)
+
+        self.assertEqual(req.swa_evicted_seqlen, 48)
+        self.assertEqual(freed, [])
+
+    def test_eic_policy_releases_out_of_window_protected_prefix(self):
+        """EIC can release prefix SWA because it has no SWA radix-tree state."""
+        batch, freed = _make_policy_batch(release_prefix=True)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=48,
+            swa_evict_floor=0,
+            swa_evicted_seqlen=0,
+        )
+
+        ScheduleBatch._evict_swa(batch, req, pre_len=55)
+
+        self.assertEqual(req.swa_evicted_seqlen, 40)
+        self.assertEqual(len(freed), 1)
+        torch.testing.assert_close(freed[0], torch.arange(40))
 
     # -- Eviction formula: page_size > window --
 

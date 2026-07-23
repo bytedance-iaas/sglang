@@ -2710,6 +2710,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             is_chunk_cache=self.tree_cache.is_chunk_cache(),
+            release_cache_protected_prefix=getattr(
+                self.tree_cache, "swa_evict_release_prefix", False
+            ),
         )
 
     def __str__(self):
