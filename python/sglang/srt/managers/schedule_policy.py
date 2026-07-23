@@ -567,10 +567,37 @@ class PrefillAdder:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        window = self.tree_cache.sliding_window_size
+        return max(alloc - window, 0) + self._swa_reserved_tokens(
+            swa_host_hit_length
+        )
+
+    def _swa_reserved_tokens(self, swa_host_hit_length: int = 0) -> int:
+        """Return SWA tokens reserved independently of the extend length.
+
+        The reservation covers decode headroom, allocator page slack, and the
+        load-back window charge. It is shared by the normal SWA budget and the
+        pressure-aware chunk cap.
+        """
+        reserved = self.tree_cache.sliding_window_size + self.page_size
         if swa_host_hit_length > 0:
-            budget += self.ceil_paged_tokens(swa_host_hit_length)
-        return budget
+            reserved += self.ceil_paged_tokens(swa_host_hit_length)
+        return reserved
+
+    def _swa_chunk_cap(self, swa_host_hit_length: int = 0) -> int:
+        """Return the largest page-aligned extend chunk SWA can admit now.
+
+        Shrinking a chunk avoids permanently rejecting a request whose full
+        chunk cannot fit the SWA pool. Tokens before the sliding window become
+        evictable at the chunk boundary, so only the reserved window and this
+        transient chunk need to fit simultaneously.
+        """
+        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
+            swa_host_hit_length
+        )
+        if cap <= 0:
+            return 0
+        return cap // self.page_size * self.page_size
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -877,12 +904,18 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
+        chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
+            # A host-hit prefix is loaded back rather than re-prefilled. Its
+            # SWA window is charged separately through swa_host_hit_length.
             swa_needed = self._swa_budget_for_req(
-                req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
             )
             if swa_needed >= self.rem_swa_tokens:
-                return AddReqResult.NO_TOKEN
+                swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                if self.rem_chunk_tokens is None or swa_cap <= 0:
+                    return AddReqResult.NO_TOKEN
+                chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
@@ -893,11 +926,15 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
+                # rem_swa_tokens may decrease after acquiring the tree lock.
                 swa_needed = self._swa_budget_for_req(
-                    req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                    real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
                 )
                 if swa_needed >= self.rem_swa_tokens:
-                    return AddReqResult.NO_TOKEN
+                    swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                    if self.rem_chunk_tokens is None or swa_cap <= 0:
+                        return AddReqResult.NO_TOKEN
+                    chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             eic_prefix_len = 0
             if req.needs_host_load_back():
@@ -964,7 +1001,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 
@@ -980,7 +1017,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
