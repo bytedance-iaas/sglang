@@ -1,0 +1,28 @@
+python/sglang/srt/mem_cache/base_prefix_cache.py
+  s_f4344a6fcff611::t_40cb7a6b647791 322-324
+python/sglang/srt/mem_cache/eic_hiradix_cache.py
+  s_f4344a6fcff611::t_58a31644ef0f31 547-551
+python/sglang/srt/managers/schedule_batch.py
+  s_f4344a6fcff611::t_917836763fa4a9 2686-2689
+test/registered/unit/mem_cache/test_eic_hicache_regression.py
+  s_f4344a6fcff611::t_e30420ca9ee20c 13,15-18,23,37-79
+  s_f4344a6fcff611::t_06f7708ab2947c 12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a032e4ba1f37243d161e3c1d9af216df881d15a5",
+  "prompts": {},
+  "sessions": {
+    "s_f4344a6fcff611": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59e1c3a9-0db7-4f6f-bde8-669075b3db07",
+        "model": "unknown"
+      },
+      "human_author": "chenkailun.c <chenkailun.c@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
