@@ -83,6 +83,13 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
+class LRURefreshPhase(str, Enum):
+
+    WALKDOWN = "walkdown"  # touching a node while walking through the tree
+    MATCH_END = "match_end"  # end of a successful prefix match
+    INSERT_END = "insert_end"  # after a new/updated leaf is committed
+
+
 def get_and_increase_time_counter() -> float64:
     global _LAST_ACCESS_TIME_COUNTER_FLOAT
     ret = _LAST_ACCESS_TIME_COUNTER_FLOAT
@@ -114,6 +121,29 @@ class TreeComponent(ABC):
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        ct = self.component_type
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                if node.component_data[ct].value is None:
+                    return
+                self.cache.lru_lists[ct].reset_node_mru(node)
+            case LRURefreshPhase.MATCH_END:
+                self.cache.lru_lists[ct].reset_node_and_parents_mru(
+                    node, root_node, self.node_has_component_data
+                )
+            case LRURefreshPhase.INSERT_END:
+                # WALKDOWN already refreshed every node on the insert path
+                # (including the new leaf), so there is nothing more to do.
+                return
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     @abstractmethod
     def create_match_validator(
@@ -341,6 +371,12 @@ class TreeComponent(ABC):
         or effective_cache_len <= 0); treat as "no insert happened".
         ``insert_params`` is None only on the disabled path; on early-return
         paths it is still provided so components can free their resources."""
+        pass
+
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
+        """Release component resources that are outside the active window."""
         pass
 
     # ---- HiCache Hooks ----

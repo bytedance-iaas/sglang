@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -41,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     ComponentType,
     EvictLayer,
     FullComponent,
+    LRURefreshPhase,
     MambaComponent,
     SWAComponent,
     TreeComponent,
@@ -184,6 +186,24 @@ class UnifiedLRUList:
                 self._remove_node(node)
                 self._add_node_after(prev_node, node)
                 prev_node = node
+            node = node.parent
+
+    def reset_node_and_window_ancestors_mru(
+        self,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+        window_size: int,
+        should_include,
+    ):
+        prev_node = self.head
+        accumulated = 0
+        while node != root_node and accumulated < window_size:
+            if should_include(node):
+                assert node.id in self.cache
+                self._remove_node(node)
+                self._add_node_after(prev_node, node)
+                prev_node = node
+            accumulated += len(node.key)
             node = node.parent
 
     def in_list(self, node: Optional[UnifiedTreeNode]):
@@ -715,6 +735,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(
+                    req, effective_cache_len - 1, insert_params
+                )
+
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
@@ -887,9 +913,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
-            self.lru_lists[comp.component_type].reset_node_and_parents_mru(
-                node_update, self.root_node, comp.node_has_component_data
-            )
+            comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -976,7 +1000,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
-            self._for_each_component_lru(node, UnifiedLRUList.reset_node_mru)
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
     def _add_new_node(
         self,
@@ -1094,6 +1121,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 params=params,
                 result=result,
             )
+
+        if target_node is not self.root_node:
+            for component in self._components_tuple:
+                if component.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                component.refresh_lru(
+                    LRURefreshPhase.INSERT_END, target_node, self.root_node
+                )
+
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
         return result

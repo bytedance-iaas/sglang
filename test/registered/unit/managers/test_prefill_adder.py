@@ -527,6 +527,79 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder._swa_budget_for_req(extend), expected)
 
+    def test_swa_chunk_cap_reserves_window_page_and_host_hit(self):
+        self.mock_tree_cache.sliding_window_size = 128
+        self.mock_token_allocator.swa_available_size.return_value = 500
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=2048,
+        )
+        adder.is_hybrid_swa = True
+
+        # 500 - (128 window + 64 page slack) = 308, page-aligned to 256.
+        self.assertEqual(adder._swa_chunk_cap(), 256)
+        # A 65-token host hit is charged as two 64-token pages.
+        self.assertEqual(adder._swa_chunk_cap(swa_host_hit_length=65), 128)
+
+    def test_add_one_req_shrinks_chunk_to_swa_capacity(self):
+        self.mock_tree_cache.sliding_window_size = 128
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.swa_available_size.return_value = 512
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=2048,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req("swa-pressure", priority=0, max_new_tokens=128)
+        req.extend_input_len = 2048
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.prefix_indices = []
+        req.fill_ids = list(range(req.extend_input_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        # 512 - (128 window + 64 page slack) = 320 tokens.
+        req.set_extend_input_len.assert_called_once_with(320)
+        self.assertEqual(len(req.fill_ids), 320)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(result, AddReqResult.CONTINUE)
+
+    def test_add_one_req_defers_when_swa_reservation_does_not_fit(self):
+        self.mock_tree_cache.sliding_window_size = 128
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.swa_available_size.return_value = 192
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=2048,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req("swa-full", priority=0, max_new_tokens=128)
+        req.extend_input_len = 2048
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.prefix_indices = []
+        req.fill_ids = list(range(req.extend_input_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        req.set_extend_input_len.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
         # the fix would regress non-SWA models.

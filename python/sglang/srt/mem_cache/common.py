@@ -19,6 +19,7 @@ _is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
@@ -41,6 +42,61 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
 
 def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
+
+
+def free_swa_out_of_window_slots(
+    req: Req,
+    pre_len: int,
+    *,
+    sliding_window_size: int,
+    page_size: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    is_chunk_cache: bool = False,
+    release_cache_protected_prefix: bool = False,
+) -> None:
+    """Release SWA working slots that can no longer be attended to.
+
+    The radix-cache path deliberately retains ``max(window, page)`` trailing
+    tokens.  Keeping at least one page below the radix insert frontier prevents
+    the last leaf from becoming an all-tombstone leaf when ``page_size`` is
+    larger than the model's sliding window (DSV4 uses 256 vs. 128).
+
+    ``cache_protected_len`` remains the eviction floor for caches whose radix
+    tree owns the prefix SWA. EIC has no SWA tree state, so it explicitly opts
+    into releasing out-of-window prefix SWA and restores it from host storage
+    on reuse.
+    """
+    assert (
+        req.cache_protected_len % page_size == 0
+    ), "cache_protected_len must be page aligned"
+    evict_floor = getattr(req, "swa_evict_floor", 0)
+    if not release_cache_protected_prefix:
+        evict_floor = max(req.cache_protected_len, evict_floor)
+    if page_size > 1:
+        evict_floor = -(-evict_floor // page_size) * page_size
+    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
+
+    if is_chunk_cache:
+        # Chunk cache builds no radix tree, so there is no tombstone-leaf risk.
+        evict_threshold = pre_len - sliding_window_size
+    else:
+        # Page-aligning below and retaining max(window, page) keeps the frontier
+        # strictly below page_floor(seq_len) without an extra page margin.
+        evict_threshold = pre_len - max(sliding_window_size, page_size)
+
+    new_swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_threshold)
+    if page_size > 1:
+        new_swa_evicted_seqlen = (
+            new_swa_evicted_seqlen // page_size
+        ) * page_size
+
+    if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+        free_slots = req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+        ]
+        token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):

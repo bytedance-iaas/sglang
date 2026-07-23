@@ -7,7 +7,7 @@ handling for this, creating an incorrect non-tombstone node that caused
 inflated swa_evictable_size_, negative usage, and potential double-free.
 
 Two-sided fix:
-1. _evict_swa subtracts extra page_size (preventive).
+1. _evict_swa retains max(window, page) on the radix path (preventive).
 2. _insert_helper early-returns on case 3 (defensive).
 
 Tests use real tree/allocator/pool with mock Req/ScheduleBatch wrappers.
@@ -127,6 +127,21 @@ def _make_batch(tree, allocator, pool):
     )
 
 
+def _make_policy_batch(*, release_prefix):
+    """Build a lightweight batch for scheduler eviction-policy tests."""
+    tree = SimpleNamespace(
+        sliding_window_size=8,
+        page_size=8,
+        supports_swa=lambda: True,
+        is_chunk_cache=lambda: False,
+        swa_evict_release_prefix=release_prefix,
+    )
+    pool = SimpleNamespace(req_to_token=torch.arange(64).reshape(1, 64))
+    freed = []
+    allocator = SimpleNamespace(free_swa=lambda slots: freed.append(slots.clone()))
+    return _make_batch(tree, allocator, pool), freed
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -134,10 +149,43 @@ def _make_batch(tree, allocator, pool):
 
 class TestSWAEvictionBoundary(unittest.TestCase):
 
+    # -- Cache-specific prefix ownership policy --
+
+    def test_radix_policy_preserves_cache_protected_prefix(self):
+        """Tree-owned prefix SWA remains outside scheduler-managed eviction."""
+        batch, freed = _make_policy_batch(release_prefix=False)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=48,
+            swa_evict_floor=0,
+            swa_evicted_seqlen=0,
+        )
+
+        ScheduleBatch._evict_swa(batch, req, pre_len=55)
+
+        self.assertEqual(req.swa_evicted_seqlen, 48)
+        self.assertEqual(freed, [])
+
+    def test_eic_policy_releases_out_of_window_protected_prefix(self):
+        """EIC can release prefix SWA because it has no SWA radix-tree state."""
+        batch, freed = _make_policy_batch(release_prefix=True)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=48,
+            swa_evict_floor=0,
+            swa_evicted_seqlen=0,
+        )
+
+        ScheduleBatch._evict_swa(batch, req, pre_len=55)
+
+        self.assertEqual(req.swa_evicted_seqlen, 40)
+        self.assertEqual(len(freed), 1)
+        torch.testing.assert_close(freed[0], torch.arange(40))
+
     # -- Eviction formula: page_size > window --
 
     def test_formula_page_gt_window_sweep(self):
-        """Sweep page_size > window combinations. The -page_size fix must
+        """Sweep page_size > window combinations. The page-aware frontier must
         prevent eviction from reaching page_floor(seq_len)."""
         for page_size in [4, 8, 16, 32, 64, 128, 256]:
             for window in [1, 2, 4, 8]:
@@ -171,7 +219,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
     # -- Eviction formula: page_size <= window --
 
     def test_formula_page_leq_window(self):
-        """page_size <= window: -page_size fix causes no regression."""
+        """page_size <= window: retaining one window causes no regression."""
         page_size, window = 4, 8
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
@@ -195,7 +243,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
     # -- Eviction formula: page_size == 1 --
 
     def test_formula_page_size_1(self):
-        """page_size=1: no floor alignment, -1 just means one less token evicted."""
+        """page_size=1: retain exactly max(window, page)=window tokens."""
         page_size, window = 1, 4
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
@@ -210,7 +258,10 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
             self.assertLess(req.swa_evicted_seqlen, seq_len)
-            self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+            self.assertEqual(
+                req.swa_evicted_seqlen,
+                max(0, seq_len - 1 - max(window, page_size)),
+            )
 
             tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
@@ -218,13 +269,13 @@ class TestSWAEvictionBoundary(unittest.TestCase):
     # -- Eviction formula: no-op when seq too short --
 
     def test_formula_noop_short_sequence(self):
-        """pre_len - window - page_size < 0: eviction stays at 0."""
+        """pre_len - max(window, page_size) < 0: eviction stays at 0."""
         page_size, window = 8, 4
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
-        seq_len = page_size + window - 2  # = 10, formula gives 10-1-4-8 = -3
+        seq_len = page_size - 1  # formula gives 7-1-max(4, 8) < 0
         alloc_size = (seq_len + page_size - 1) // page_size * page_size
         kv = _swa_alloc(allocator, alloc_size)
         pool.write((0, slice(0, alloc_size)), kv)
@@ -260,7 +311,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         req2 = _make_req(1, list(range(second_len)), 0, tree)
         batch = _make_batch(tree, allocator, pool)
 
-        # pre_len=15: 15-2-8=5, floor to 8 -> 0. Eviction stays within matched.
+        # pre_len=15: 15-max(2, 8)=7, floor to 8 -> 0.
         ScheduleBatch._evict_swa(batch, req2, first_len - 1)
         self.assertLessEqual(req2.swa_evicted_seqlen, first_len)
 
@@ -281,7 +332,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             page_size=page_size, sliding_window_size=window
         )
 
-        # seq_len=25: insert_length=24, evicted should be 8 (1 page)
+        # seq_len=25: insert_length=24, evicted should be 16 (2 pages)
         seq_len = page_size * 3 + 1
         alloc_size = (seq_len + page_size - 1) // page_size * page_size
         kv = _swa_alloc(allocator, alloc_size)
@@ -383,7 +434,10 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             batch = _make_batch(tree, allocator, pool)
             ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
-            self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+            self.assertEqual(
+                req.swa_evicted_seqlen,
+                max(0, seq_len - 1 - max(window, page_size)),
+            )
 
             tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
