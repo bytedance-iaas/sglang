@@ -133,6 +133,19 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _make_eager_idle_topk_result(
+    x: torch.Tensor, index_topk: int, return_indices: bool
+) -> Optional[torch.Tensor]:
+    if not return_indices:
+        return None
+    return torch.full(
+        (x.shape[0], index_topk),
+        -1,
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
@@ -1483,6 +1496,27 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
+        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
+        x_meta = x[0] if isinstance(x, tuple) else x
+
+        # A DP-attention idle rank can be physically padded with dummy tokens so
+        # it participates in the eager MLP/EP collectives of active ranks. It has
+        # no real request rows, however, so its DSA page table remains empty.
+        # Calling DeepGEMM paged-MQA with the padded q rows then violates its
+        # block-table batch contract (`_batch_size == batch_size`). CUDA graphs
+        # already capture graph-shaped idle metadata; keep that path unchanged.
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_idle()
+            and not get_is_capture_mode()
+        ):
+            topk_result = _make_eager_idle_topk_result(
+                x_meta, self.index_topk, return_indices
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
+
         if _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
@@ -1490,10 +1524,6 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
-
-        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
-        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
-        x_meta = x[0] if isinstance(x, tuple) else x
 
         in_piecewise_or_breakable_cuda_graph = (
             _is_in_piecewise_or_breakable_cuda_graph()
