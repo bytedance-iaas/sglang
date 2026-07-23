@@ -1,0 +1,21 @@
+python/sglang/srt/mem_cache/storage/eic/eic_storage.py
+  s_f4344a6fcff611::t_2e26bf0bce500c 453
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f371a680703dec82797024b474824fa035853a6",
+  "prompts": {},
+  "sessions": {
+    "s_f4344a6fcff611": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59e1c3a9-0db7-4f6f-bde8-669075b3db07",
+        "model": "unknown"
+      },
+      "human_author": "chenkailun.c <chenkailun.c@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

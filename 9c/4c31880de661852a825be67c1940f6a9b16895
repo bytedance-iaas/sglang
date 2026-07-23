@@ -1,0 +1,33 @@
+python/sglang/srt/mem_cache/base_prefix_cache.py
+  s_f4344a6fcff611::t_7f0e16a475e45a 322-324
+python/sglang/srt/mem_cache/swa_memory_pool.py
+  s_f4344a6fcff611::t_844708ed9b826c 805,809-812
+  s_f4344a6fcff611::t_59dd0264f05b2b 368-380,389,392-415,467-469,514-518,563-564,584-585,589-591,613-615,623-627,629-633,652,659-660,666,671-701,704-763,772-781
+  s_f4344a6fcff611::t_3f16a905deac47 782-784
+  s_f4344a6fcff611::t_0093232ed1ac4d 803-804
+  s_f4344a6fcff611::t_b600e2065166d6 813-815
+  s_f4344a6fcff611::t_841ee4a7d3c468 785,796,816
+python/sglang/srt/mem_cache/eic_hiradix_cache.py
+  s_f4344a6fcff611::t_236feb0ea4b3a7 554-558
+  s_f4344a6fcff611::t_c1bebb2c3450a7 159-165
+python/sglang/srt/managers/schedule_batch.py
+  s_f4344a6fcff611::t_c1b3528e24ca0a 2686-2689
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9c4c31880de661852a825be67c1940f6a9b16895",
+  "prompts": {},
+  "sessions": {
+    "s_f4344a6fcff611": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59e1c3a9-0db7-4f6f-bde8-669075b3db07",
+        "model": "unknown"
+      },
+      "human_author": "chenkailun.c <chenkailun.c@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

@@ -1,0 +1,30 @@
+python/sglang/srt/mem_cache/eic_hiradix_cache.py
+  s_f4344a6fcff611::t_067d2ec5b66bda 159-166
+  s_f4344a6fcff611::t_236feb0ea4b3a7 555-559
+python/sglang/srt/managers/schedule_batch.py
+  s_f4344a6fcff611::t_c1b3528e24ca0a 2686-2689
+python/sglang/srt/mem_cache/base_prefix_cache.py
+  s_f4344a6fcff611::t_7f0e16a475e45a 322-324
+python/sglang/srt/mem_cache/swa_memory_pool.py
+  s_f4344a6fcff611::t_59dd0264f05b2b 368-372,381,384-402,454-456,501-505,550-552,572-573,576-579,601-603,611-615,636,643-644,650,655-692,695-759,768-781,792-793,800-803,807-814
+python/sglang/srt/mem_cache/hisparse_memory_pool.py
+  s_f4344a6fcff611::t_14f2a2b0956833 572-574
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "21b059af88115cfd9d70538783c47bc56c8fae81",
+  "prompts": {},
+  "sessions": {
+    "s_f4344a6fcff611": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59e1c3a9-0db7-4f6f-bde8-669075b3db07",
+        "model": "unknown"
+      },
+      "human_author": "chenkailun.c <chenkailun.c@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
