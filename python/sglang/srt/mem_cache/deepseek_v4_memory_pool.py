@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
@@ -160,6 +161,37 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        page_indices = torch.unique_consecutive(indices // self.page_size)
+        kv_cache_cpu = []
+        chunk_size = max(1, self.cpu_offloading_chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(page_indices), chunk_size):
+                chunk_page_indices = page_indices[i : i + chunk_size]
+                kv_cache_cpu[-1].append(
+                    self.kv_buffer[layer_id][chunk_page_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        page_indices = torch.unique_consecutive(indices // self.page_size)
+        chunk_size = max(1, self.cpu_offloading_chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), chunk_size):
+                chunk_page_indices = page_indices[i : i + chunk_size]
+                kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
+                assert kv_cpu.shape[0] == len(chunk_page_indices)
+                self.kv_buffer[layer_id][chunk_page_indices] = kv_cpu.to(
+                    self.kv_buffer[0].device, non_blocking=True
+                )
+        current_platform.synchronize()
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
@@ -346,6 +378,40 @@ class DeepSeekV4IndexerPool(KVCache):
             page_size=self.page_size,
             type="indexer",
         )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        page_indices = torch.unique_consecutive(indices // self.page_size)
+        index_k_cpu = []
+        chunk_size = max(1, self.cpu_offloading_chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            index_k_cpu.append([])
+            for i in range(0, len(page_indices), chunk_size):
+                chunk_page_indices = page_indices[i : i + chunk_size]
+                index_k_cpu[-1].append(
+                    self.index_k_with_scale_buffer[layer_id][
+                        chunk_page_indices
+                    ].to("cpu", non_blocking=True)
+                )
+        current_platform.synchronize()
+        return index_k_cpu
+
+    def load_cpu_copy(self, index_k_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        page_indices = torch.unique_consecutive(indices // self.page_size)
+        chunk_size = max(1, self.cpu_offloading_chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), chunk_size):
+                chunk_page_indices = page_indices[i : i + chunk_size]
+                idx_cpu = index_k_cpu[layer_id][i // chunk_size]
+                assert idx_cpu.shape[0] == len(chunk_page_indices)
+                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = (
+                    idx_cpu.to(
+                        self.index_k_with_scale_buffer[0].device,
+                        non_blocking=True,
+                    )
+                )
+        current_platform.synchronize()
 
 
 class DeepSeekV4LayerItem(NamedTuple):
@@ -751,6 +817,210 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         self.c4_indexer_kv_pool.set_index_k_scale_buffer(
             compress_layer_id, loc, index_k, index_k_scale
+        )
+
+    def validate_cpu_snapshot_support(self) -> None:
+        """Fail early for DSV4 layouts whose state cannot be restored safely."""
+        if isinstance(self.c4_kv_pool, HiSparseC4DevicePool):
+            raise RuntimeError(
+                "DSV4 decode retraction CPU snapshots do not support HiSparse C4 "
+                "device pools yet. Disable HiSparse or disable configurations that "
+                "can retract decode requests."
+            )
+        if ONLINE_C128:
+            raise RuntimeError(
+                "DSV4 decode retraction CPU snapshots currently support offline "
+                "C128 state only. Disable SGLANG_OPT_USE_ONLINE_COMPRESS."
+            )
+
+    @staticmethod
+    def _compressed_indices_from_full(
+        indices: torch.Tensor, ratio: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mask = (indices + 1) % ratio == 0
+        return indices[mask] // ratio, mask
+
+    @staticmethod
+    def _filter_state_cpu_copy(state_cpu, row_mask: torch.Tensor):
+        if state_cpu is None:
+            return None
+        return [None if tensor is None else tensor[row_mask] for tensor in state_cpu]
+
+    def _get_state_cpu_copy(
+        self,
+        state_pools: List[Optional[CompressStatePool]],
+        swa_indices: Optional[torch.Tensor],
+    ):
+        if swa_indices is None or swa_indices.numel() == 0:
+            return None
+
+        current_platform.synchronize()
+        state_cpu = []
+        for pool in state_pools:
+            if pool is None:
+                state_cpu.append(None)
+                continue
+            state_locs = pool.translate_from_swa_loc_to_state_loc(swa_indices)
+            state_cpu.append(
+                pool.kv_score_buffer.kv_score[state_locs].to(
+                    "cpu", non_blocking=True
+                )
+            )
+        current_platform.synchronize()
+        return state_cpu
+
+    def _load_state_cpu_copy(
+        self,
+        state_pools: List[Optional[CompressStatePool]],
+        state_cpu,
+        swa_indices: torch.Tensor,
+    ) -> None:
+        if state_cpu is None or swa_indices.numel() == 0:
+            return
+
+        current_platform.synchronize()
+        for pool, cpu_tensor in zip(state_pools, state_cpu):
+            if pool is None or cpu_tensor is None:
+                continue
+            state_locs = pool.translate_from_swa_loc_to_state_loc(swa_indices)
+            assert cpu_tensor.shape[0] == len(state_locs)
+            pool.kv_score_buffer.kv_score[state_locs] = cpu_tensor.to(
+                pool.kv_score_buffer.kv_score.device, non_blocking=True
+            )
+            pool.kv_score_buffer[-1].clear()
+        current_platform.synchronize()
+
+    def _filter_swa_cpu_copy(
+        self,
+        swa_cpu,
+        old_swa_indices: Optional[torch.Tensor],
+        row_mask: torch.Tensor,
+    ):
+        if swa_cpu is None or bool(torch.all(row_mask).item()):
+            return swa_cpu
+        if old_swa_indices is None:
+            raise RuntimeError(
+                "Cannot filter a legacy DSV4 SWA CPU snapshot without source indices"
+            )
+
+        old_swa_indices = old_swa_indices.to(row_mask.device)
+        old_page_indices = torch.unique_consecutive(
+            old_swa_indices // self.swa_kv_pool.page_size
+        )
+        kept_page_indices = torch.unique_consecutive(
+            old_swa_indices[row_mask] // self.swa_kv_pool.page_size
+        )
+        page_mask = torch.isin(old_page_indices, kept_page_indices)
+        chunk_size = max(
+            1,
+            self.swa_kv_pool.cpu_offloading_chunk_size
+            // self.swa_kv_pool.page_size,
+        )
+
+        filtered = []
+        for layer_chunks in swa_cpu:
+            if not layer_chunks:
+                filtered.append([])
+                continue
+            layer_cpu = torch.cat(layer_chunks, dim=0)[page_mask]
+            filtered.append(
+                [
+                    layer_cpu[i : i + chunk_size]
+                    for i in range(0, len(layer_cpu), chunk_size)
+                ]
+            )
+        return filtered
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        """Snapshot committed DSV4 target KV/state for decode retraction.
+
+        SWA is sparse after window eviction, so the save-time mask and source
+        indices are part of the snapshot contract.  Compression state is saved
+        from the same SWA-owned rows; speculative verify is synchronized before
+        retraction by ``ScheduleBatch.filter_batch``.
+        """
+        self.validate_cpu_snapshot_support()
+        c4_indices, _ = self._compressed_indices_from_full(indices, 4)
+        c128_indices, _ = self._compressed_indices_from_full(indices, 128)
+
+        swa_mask = None
+        swa_indices = None
+        swa_cpu = None
+        full_to_swa_index_mapping = getattr(self, "full_to_swa_index_mapping", None)
+        if full_to_swa_index_mapping is not None:
+            mapped_swa_indices = full_to_swa_index_mapping[indices]
+            swa_mask = mapped_swa_indices > 0
+            if torch.any(swa_mask):
+                swa_indices = mapped_swa_indices[swa_mask]
+                swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices)
+            swa_mask = swa_mask.cpu()
+
+        return {
+            "format_version": 1,
+            "swa": swa_cpu,
+            "swa_mask": swa_mask,
+            "swa_indices": None if swa_indices is None else swa_indices.cpu(),
+            "c4": self.c4_kv_pool.get_cpu_copy(c4_indices),
+            "c4_indexer": self.c4_indexer_kv_pool.get_cpu_copy(c4_indices),
+            "c128": self.c128_kv_pool.get_cpu_copy(c128_indices),
+            "attention_state": self._get_state_cpu_copy(
+                self.compress_state_pools, swa_indices
+            ),
+            "indexer_state": self._get_state_cpu_copy(
+                self.indexer_compress_state_pools, swa_indices
+            ),
+        }
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        """Restore a DSV4 snapshot into a newly allocated request mapping."""
+        self.validate_cpu_snapshot_support()
+        if kv_cache_cpu.get("format_version") != 1:
+            raise RuntimeError("Unsupported DSV4 CPU snapshot format")
+
+        c4_indices, _ = self._compressed_indices_from_full(indices, 4)
+        c128_indices, _ = self._compressed_indices_from_full(indices, 128)
+        self.c4_kv_pool.load_cpu_copy(kv_cache_cpu["c4"], c4_indices)
+        self.c4_indexer_kv_pool.load_cpu_copy(
+            kv_cache_cpu["c4_indexer"], c4_indices
+        )
+        self.c128_kv_pool.load_cpu_copy(kv_cache_cpu["c128"], c128_indices)
+
+        swa_cpu = kv_cache_cpu.get("swa")
+        full_to_swa_index_mapping = getattr(self, "full_to_swa_index_mapping", None)
+        if swa_cpu is None or full_to_swa_index_mapping is None:
+            return
+
+        mapped_swa_indices = full_to_swa_index_mapping[indices]
+        new_swa_mask = mapped_swa_indices > 0
+        old_swa_mask = kv_cache_cpu.get("swa_mask")
+        if old_swa_mask is not None:
+            old_swa_mask = old_swa_mask.to(indices.device)
+            row_mask = new_swa_mask[old_swa_mask].cpu()
+            swa_indices = mapped_swa_indices[old_swa_mask][
+                row_mask.to(indices.device)
+            ]
+        else:
+            row_mask = new_swa_mask.cpu()
+            swa_indices = mapped_swa_indices[new_swa_mask]
+
+        if swa_indices.numel() == 0:
+            return
+
+        swa_cpu = self._filter_swa_cpu_copy(
+            swa_cpu, kv_cache_cpu.get("swa_indices"), row_mask
+        )
+        self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_indices)
+        self._load_state_cpu_copy(
+            self.compress_state_pools,
+            self._filter_state_cpu_copy(
+                kv_cache_cpu.get("attention_state"), row_mask
+            ),
+            swa_indices,
+        )
+        self._load_state_cpu_copy(
+            self.indexer_compress_state_pools,
+            self._filter_state_cpu_copy(kv_cache_cpu.get("indexer_state"), row_mask),
+            swa_indices,
         )
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
