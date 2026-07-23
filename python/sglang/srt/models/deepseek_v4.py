@@ -1762,9 +1762,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            # hidden_states follow TP_ATTN_FULL semantics and are replicated within
-            # an attention-TP group, so avoid summing duplicate activations here.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
