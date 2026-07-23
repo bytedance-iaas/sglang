@@ -659,6 +659,19 @@ class CudaGraphRunner:
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
+        # The AsymGEMM unified MoE captures a host-node chain over fixed
+        # pinned buffers; those buffers must cover the *final* capture batch
+        # sizes, which can differ from server_args.cuda_graph_bs (clamped to
+        # max_running_requests, spec-decode token multipliers, ...).
+        from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+            ensure_capturable_batch_sizes,
+        )
+
+        ensure_capturable_batch_sizes(
+            model_runner.model,
+            [bs * self.num_tokens_per_bs for bs in self.capture_bs],
+        )
+
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL

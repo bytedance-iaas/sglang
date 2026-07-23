@@ -58,6 +58,20 @@ def _get_cpu_runtime():
         from asym_gemm.unified_moe import _C
 
         threads = envs.SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS.get()
+        import glob
+
+        num_numa_nodes = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
+        if os.getenv("ASYMGEMM_NUMA_TP", "0") == "1" and num_numa_nodes < 2:
+            # The unified layer only splits its slab across nodes when the
+            # host actually has two; a dual pool here would strand half the
+            # thread budget on a pool that never receives work.
+            logger.warning(
+                "AsymGEMM unified MoE: ignoring ASYMGEMM_NUMA_TP=1 — host has "
+                "%d NUMA node(s); using a single %d-thread pool.",
+                num_numa_nodes,
+                threads,
+            )
+            os.environ["ASYMGEMM_NUMA_TP"] = "0"
         if os.getenv("ASYMGEMM_NUMA_TP", "0") == "1":
             # NUMA tensor-parallel pool pair: workers bound to node 0 / node
             # 1, matching the node-local expert slab halves the unified layer
@@ -443,6 +457,10 @@ def maybe_create_unified_asym_gemm_layer(layer: torch.nn.Module) -> None:
         )
         source = "quantized"
 
+    if os.getenv("ASYMGEMM_ADAPTIVE", "0") == "1":
+        # Cost-model makespan partition of streamed experts instead of the
+        # static m_cpu / prefill-fraction heuristics (rates refit online).
+        unified_layer.set_adaptive(True)
     setattr(layer, _UNIFIED_LAYER_ATTR, unified_layer)
     logger.info(
         "AsymGEMM unified MoE: %s layer %s "
@@ -503,6 +521,29 @@ def _maybe_init_capturable_decode(unified_layer) -> None:
             "INT8 conversion). Pass --disable-cuda-graph or fix the asym_gemm "
             f"build. Underlying error: {e}"
         ) from e
+
+
+def ensure_capturable_batch_sizes(model: torch.nn.Module, batch_sizes) -> None:
+    """Extend every converted layer's capturable decode buffers to cover
+    ``batch_sizes`` — the CUDA-graph runner's *final* capture token counts.
+
+    The load-time init covers server_args.cuda_graph_bs, but the runner
+    clamps/extends that list (max_running_requests, token multipliers), and a
+    capture at an uncovered size has no fallback. Idempotent and cheap for
+    sizes that already have buffers. Called from CudaGraphRunner.__init__,
+    i.e. always outside capture.
+    """
+    if not unified_asym_gemm_enabled():
+        return
+    sizes = sorted({int(b) for b in batch_sizes if int(b) >= 1})
+    if not sizes:
+        return
+    from asym_gemm.unified_moe.capturable import init_capturable_decode
+
+    for module in model.modules():
+        unified_layer = getattr(module, _UNIFIED_LAYER_ATTR, None)
+        if unified_layer is not None:
+            init_capturable_decode(unified_layer, sizes)
 
 
 def _release_master_weights(layer: torch.nn.Module) -> None:
