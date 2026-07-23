@@ -2280,7 +2280,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
-        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2292,18 +2291,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
+            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            snapshot_ok = self.release_req(
-                idx,
-                len(sorted_indices),
-                server_args,
-                isolate_snapshot_failure=True,
-            )
-            if snapshot_ok:
-                retracted_reqs.append(req)
-            else:
-                reqs_to_abort.append(req)
+            self.release_req(idx, len(sorted_indices), server_args)
 
+        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2317,14 +2309,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            # The request is already terminal, so there is no reason to spend
-            # CPU memory/time snapshotting KV that will never be resumed.
-            self.release_req(
-                last_idx,
-                0,
-                server_args,
-                offload_kv_cache=False,
-            )
+            self.release_req(last_idx, 0, server_args)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2338,35 +2323,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(
-        self,
-        idx: int,
-        remaing_req_count: int,
-        server_args: ServerArgs,
-        *,
-        isolate_snapshot_failure: bool = False,
-        offload_kv_cache: bool = True,
-    ) -> bool:
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
             self.hisparse_coordinator.retract_req(req)
 
-        snapshot_error = None
-        if server_args.disaggregation_mode == "decode" and offload_kv_cache:
-            try:
-                req.offload_kv_cache(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-            except Exception as exc:
-                if not isolate_snapshot_failure:
-                    raise
-                snapshot_error = exc
-                logger.exception(
-                    "Failed to snapshot KV for retracted request %s; aborting "
-                    "the request without stopping the scheduler",
-                    req.rid,
-                )
+        if server_args.disaggregation_mode == "decode":
+            req.offload_kv_cache(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2374,15 +2340,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
-        if snapshot_error is not None:
-            req.to_finish = FINISH_ABORT(
-                "Failed to snapshot KV cache during decode retraction: "
-                f"{type(snapshot_error).__name__}: {snapshot_error}",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                err_type=type(snapshot_error).__name__,
-            )
-            return False
-        return True
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status

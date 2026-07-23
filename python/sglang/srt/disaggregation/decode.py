@@ -294,10 +294,6 @@ class DecodePreallocQueue:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            # Decode retraction is a normal pressure-control path. Unsupported
-            # DSV4 layouts must fail at startup rather than at 99% KV usage.
-            self.token_to_kv_pool.validate_cpu_snapshot_support()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
@@ -728,6 +724,7 @@ class DecodePreallocQueue:
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
@@ -736,34 +733,7 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
-            try:
-                req.load_kv_cache(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Failed to restore KV for retracted request %s; aborting "
-                    "the request without stopping the scheduler",
-                    req.rid,
-                )
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-                if hasattr(req, "kv_cache_cpu"):
-                    del req.kv_cache_cpu
-                full_allocatable_tokens += full_required
-                if uses_swa_tail_prealloc:
-                    swa_allocatable_tokens += swa_required
-                prepare_abort(
-                    req,
-                    "Failed to restore KV cache after decode retraction: "
-                    f"{type(exc).__name__}: {exc}",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                self.scheduler.output_streamer.stream_output(
-                    [req], req.return_logprob
-                )
-                continue
-
-            resumed_reqs.append(req)
+            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
         self.retracted_queue = [
             entry
