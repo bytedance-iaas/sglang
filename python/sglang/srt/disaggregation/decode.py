@@ -305,6 +305,7 @@ class DecodeRequest:
     pd_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
     pd_hidden_pp_slices: Optional[Dict[int, dict]] = None
     pd_hidden_start: int = 0
+    pd_hidden_tp_row_partition_size: int = 1
     pd_hidden_state: PDHiddenRequestState = field(
         default_factory=PDHiddenRequestState.disabled
     )
@@ -1344,6 +1345,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 target_pp_ranks = list(
                     getattr(decode_req.kv_receiver, "target_pp_ranks", None) or [0]
                 )
+                prefill_tp_size = int(
+                    getattr(
+                        getattr(decode_req.kv_receiver, "prefill_info", None),
+                        "attn_tp_size",
+                        1,
+                    )
+                    or 1
+                )
+                target_tp_ranks = list(
+                    getattr(decode_req.kv_receiver, "target_tp_ranks", None) or []
+                )
+                # Partition PD hidden rows only when this decode rank receives
+                # every prefill TP partition. Otherwise a decode TP rank still
+                # needs the full hidden stream from its mapped prefill TP rank.
+                tp_row_partition_size = (
+                    prefill_tp_size
+                    if prefill_tp_size > 1
+                    and len({int(x) % prefill_tp_size for x in target_tp_ranks})
+                    == prefill_tp_size
+                    else 1
+                )
                 pp_size = max(target_pp_ranks) + 1 if target_pp_ranks else 1
                 pp_slices = {}
                 slice_start = 0
@@ -1367,6 +1389,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "slice_start": int(slice_start),
                         "slice_len": int(slice_len),
                         "dst_indices": [],
+                        "tp_row_partition_size": int(tp_row_partition_size),
                     }
                     slice_start += slice_len
                 if slice_start != len(target_layer_ids) * int(
@@ -1530,6 +1553,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.pd_hidden_dst_indices_by_pp = pd_hidden_dst_indices_by_pp
             decode_req.pd_hidden_pp_slices = pd_hidden_pp_slices
             decode_req.pd_hidden_start = pd_hidden_start
+            decode_req.pd_hidden_tp_row_partition_size = (
+                tp_row_partition_size if pd_hidden_pp_slices is not None else 1
+            )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -2608,9 +2634,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if (
                 hidden_chunk.hidden_start > hidden_state.next_start
                 and hidden_state.next_start == hidden_state.start
+                and int(getattr(decode_req, "pd_hidden_tp_row_partition_size", 1)) <= 1
             ):
                 hidden_state.start = int(hidden_chunk.hidden_start)
                 hidden_state.next_start = int(hidden_chunk.hidden_start)
+            if (
+                hidden_chunk.is_last_hidden_chunk
+                and hidden_chunk.hidden_start + hidden_chunk.row_len
+                != hidden_state.end
+            ):
+                hidden_chunk.is_last_hidden_chunk = False
             chunk_status = hidden_state.accept_chunk(
                 hidden_chunk, defer_hidden_done=True
             )

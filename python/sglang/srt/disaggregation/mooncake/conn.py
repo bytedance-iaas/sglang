@@ -69,6 +69,19 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def _pd_hidden_tp_row_partition(
+    hidden_len: int, tp_rank: int, tp_size: int
+) -> Tuple[int, int]:
+    hidden_len = int(hidden_len)
+    tp_size = max(1, int(tp_size))
+    tp_rank = int(tp_rank) % tp_size
+    base = hidden_len // tp_size
+    rem = hidden_len % tp_size
+    row_start = tp_rank * base + min(tp_rank, rem)
+    row_len = base + (1 if tp_rank < rem else 0)
+    return row_start, row_len
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -2686,6 +2699,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         f"target_pp_rank={pp_rank}, available_pp_slices="
                         f"{sorted(spec_metadata['pp_slices'].keys())}"
                     )
+                pp_slice = dict(pp_slice)
                 local_spec_metadata = {
                     **spec_metadata,
                     "target_pp_rank": int(pp_rank),
@@ -2698,7 +2712,46 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
                 for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
                     if state_type == StateType.PD_HIDDEN:
-                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        dst_indices = [int(x) for x in pp_slice.get("dst_indices", [])]
+                        tp_partition_size = int(
+                            pp_slice.get("tp_row_partition_size", 1) or 1
+                        )
+                        if tp_partition_size > 1 and dst_indices:
+                            target_tp_rank = int(
+                                bootstrap_info.get(
+                                    "target_tp_rank",
+                                    bootstrap_info.get("tp_rank", 0),
+                                )
+                            )
+                            row_offset, row_len = _pd_hidden_tp_row_partition(
+                                int(spec_metadata.get("hidden_len", len(dst_indices))),
+                                target_tp_rank,
+                                tp_partition_size,
+                            )
+                            dst_indices = dst_indices[
+                                row_offset : row_offset + row_len
+                            ]
+                            pp_slice["dst_indices"] = dst_indices
+                            pp_slice["tp_row_offset"] = int(row_offset)
+                            pp_slice["tp_row_len"] = int(row_len)
+                            local_pp_slices = dict(
+                                spec_metadata.get("pp_slices") or {}
+                            )
+                            local_pp_slices[str(pp_rank)] = pp_slice
+                            local_spec_metadata = {
+                                **local_spec_metadata,
+                                "global_hidden_start": int(
+                                    spec_metadata.get("hidden_start", 0)
+                                ),
+                                "hidden_start": int(
+                                    spec_metadata.get("hidden_start", 0)
+                                )
+                                + int(row_offset),
+                                "hidden_len": int(row_len),
+                                "pp_slices": local_pp_slices,
+                                "pp_slice": pp_slice,
+                            }
+                        local_state_indices[idx] = dst_indices
                         break
 
             with lock:
