@@ -2649,6 +2649,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
+                and getattr(self.tree_cache, "allow_swa_lock_release", lambda: True)()
             )
 
             # Eviction_interval: trade-off between SWA token waste and eviction overhead

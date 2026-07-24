@@ -322,7 +322,11 @@ class LRUList:
                 x_lru = getattr(x, self.prv)
 
             if self.is_swa_list:
-                evictable_size = tree_cache.swa_evictable_size()
+                evictable_size = (
+                    tree_cache.swa_evictable_size_
+                    if tree_cache._keep_swa_mapping_for_radix_cache()
+                    else tree_cache.swa_evictable_size()
+                )
                 lru_list_evictable_size = self.sanity_check_evictable_size()
             else:
                 evictable_size = tree_cache.full_evictable_size()
@@ -360,6 +364,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.reset()
 
     ##### Public API #####
+
+    def _keep_swa_mapping_for_radix_cache(self) -> bool:
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        keep_mapping = getattr(kvcache, "requires_swa_mapping_for_radix_cache", None)
+        return bool(keep_mapping is not None and keep_mapping())
+
+    def allow_swa_lock_release(self) -> bool:
+        return not self._keep_swa_mapping_for_radix_cache()
 
     def supports_swa(self) -> bool:
         assert (
@@ -563,6 +575,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         start_time = time.perf_counter()
         full_num_tokens = params.num_tokens
         swa_num_tokens = params.swa_num_tokens
+        if self._keep_swa_mapping_for_radix_cache() and swa_num_tokens > 0:
+            # The SWA mapping is part of the radix-cached state for these pools.
+            # Reclaim the whole radix node instead of freeing SWA-only sidecars.
+            full_num_tokens = max(full_num_tokens, swa_num_tokens)
+            swa_num_tokens = 0
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -603,7 +620,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 x = x_next
 
-        if swa_num_evicted < swa_num_tokens:
+        if (
+            swa_num_evicted < swa_num_tokens
+            and not self._keep_swa_mapping_for_radix_cache()
+        ):
+            # Some compressed-KV pools derive compressor state slots from the
+            # full->SWA mapping. For them, SWA can only be reclaimed together
+            # with the full radix node.
             # get the least recently used node that is not locked, doesn't have to be a leaf
             x = self.swa_lru_list.get_lru_no_lock()
 
@@ -782,6 +805,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
+        if self._keep_swa_mapping_for_radix_cache():
+            return
+
         while node != self.root_node:
             assert (
                 not node.swa_tombstone
@@ -821,6 +847,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         return self.full_evictable_size_
 
     def swa_evictable_size(self) -> int:
+        if self._keep_swa_mapping_for_radix_cache():
+            return 0
         return self.swa_evictable_size_
 
     def protected_size(self) -> Tuple[int, int]:
