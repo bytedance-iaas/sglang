@@ -378,13 +378,13 @@ class EICHiRadixCache(RadixCache):
 
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
-        # Backstop: reconcile any SWA slots left by per-step prefix eviction
-        # (page-align / load-back re-alloc). free_swa is idempotent.
+        # Backstop SWA slots not released by per-step eviction or FULL cleanup.
         if self.sliding_window_size is not None:
             if hasattr(self.token_to_kv_pool_allocator, "free_swa"):
                 self.token_to_kv_pool_allocator.free_swa(
                     self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, :kv_committed_len
+                        req.req_pool_idx,
+                        req.swa_evicted_seqlen : kv_committed_len,
                     ]
                 )
 
@@ -564,6 +564,10 @@ class EICHiRadixCache(RadixCache):
         # the SWA pool fills up and prefill OOMs. The full-attention radix tree is
         # unaffected: only per-request SWA tails are freed in maybe_evict_swa.
         return self.sliding_window_size is not None
+
+    def eic_swa_extend_eviction(self) -> bool:
+        # EIC radix owns only FULL indices, so free out-of-window SWA in extend.
+        return self.supports_swa()
 
     def sanity_check(self):
         # invariant_checker._check_tree_cache() calls this when

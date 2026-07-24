@@ -164,6 +164,27 @@ class TestEICHiCacheRegression(unittest.TestCase):
             server_args=server_args,
         )
 
+    def test_free_swa_skips_reserved_page_and_dedups_aliases(self):
+        # free_swa must drop reserved-page sentinels + dedup aliases under EIC.
+        from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+
+        alloc = object.__new__(SWATokenToKVPoolAllocator)
+        alloc.page_size = 256
+        alloc.swa_attn_allocator = mock.Mock()
+        alloc.full_to_swa_index_mapping = torch.tensor(
+            [6, 8, 10, 21, 512, 512, 512, 768], dtype=torch.int64
+        )
+        alloc._expand_to_full_pages = lambda idx: idx
+
+        with mock.patch(
+            "sglang.srt.mem_cache.swa_memory_pool.get_global_server_args",
+            return_value=SimpleNamespace(enable_eic_cache=True),
+        ):
+            SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(8))
+
+        freed = alloc.swa_attn_allocator.free.call_args[0][0]
+        self.assertEqual(sorted(freed.tolist()), [512, 768])
+
 
 if __name__ == "__main__":
     unittest.main()
