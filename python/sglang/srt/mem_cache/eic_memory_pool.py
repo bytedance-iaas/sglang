@@ -1675,11 +1675,11 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         return "kernel"
 
     def _estimate_page_bytes(self, device_pool) -> int:
+        # Scheme B: only FULL-attention (KV-sourced) pools are persisted to L2.
+        # SWA KV and the compress-state rings follow the sliding window and are
+        # recomputed locally on reuse, so they are excluded here and in
+        # _build_page_specs.
         page_bytes = 0
-        if device_pool.swa_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.swa_kv_pool.kv_buffer) * int(
-                device_pool.swa_kv_pool.bytes_per_page_padded
-            )
         if device_pool.c4_kv_pool.kv_buffer:
             page_bytes += len(device_pool.c4_kv_pool.kv_buffer) * int(
                 device_pool.c4_kv_pool.bytes_per_page_padded
@@ -1693,16 +1693,6 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             page_bytes += len(device_pool.c128_kv_pool.kv_buffer) * int(
                 device_pool.c128_kv_pool.bytes_per_page_padded
             )
-
-        for pools in (
-            device_pool.compress_state_pools,
-            device_pool.indexer_compress_state_pools,
-        ):
-            for pool in pools:
-                if pool is None or pool.ratio == 128:
-                    continue
-                state_tensor = pool.kv_score_buffer.kv_score
-                page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
         return page_bytes
 
     def get_size_per_token(self):
@@ -1713,92 +1703,66 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         for name, entry in self.host_pool_group.entry_map.items():
             if name == PoolName.KV:
                 continue
+            # Scheme B: SWA-sourced pools (SWA KV + compress-state rings) are not
+            # persisted to L2; their window is recomputed locally on reuse.
+            if name in self._SWA_SOURCED_POOLS:
+                continue
+            if name not in self._KV_SOURCED_POOLS:
+                raise ValueError(f"Unsupported DeepSeek V4 EIC pool: {name}")
             host_pool = entry.host_pool
             dummy = host_pool.get_dummy_flat_data_page()
             if dummy.numel() == 0:
                 continue
-            if name in self._SWA_SOURCED_POOLS:
-                source = PoolName.SWA
-            elif name in self._KV_SOURCED_POOLS:
-                source = PoolName.KV
-            else:
-                raise ValueError(f"Unsupported DeepSeek V4 EIC pool: {name}")
             specs.append(
                 {
                     "name": name,
                     "host_pool": host_pool,
-                    "source": source,
                     "numel": dummy.numel(),
                 }
             )
         return specs
 
-    def _swa_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
-        return self.device_pool.translate_loc_from_full_to_swa(full_indices).to(
-            torch.int64
-        )
-
     def alloc_device_indices(self, allocator, need_size: int):
+        # Scheme B: L2 restores only FULL KV; the SWA window is recomputed on
+        # reuse (the last max(window, page) tokens are re-prefilled), so do not
+        # consume the scarce SWA pool for the loaded prefix. Its full->swa
+        # mapping stays unset (0); those out-of-window positions are never read.
         full_allocator = getattr(allocator, "full_attn_allocator", None)
-        swa_allocator = getattr(allocator, "swa_attn_allocator", None)
-        if full_allocator is None or swa_allocator is None:
+        if full_allocator is None:
             return allocator.alloc(need_size)
-
-        full_indices = full_allocator.alloc(need_size)
-        if full_indices is None:
-            return None
-        swa_indices = swa_allocator.alloc(need_size)
-        if swa_indices is None:
-            full_allocator.free(full_indices)
-            return None
-        allocator.set_full_to_swa_mapping(full_indices, swa_indices)
-        return full_indices
+        return full_allocator.alloc(need_size)
 
     def _build_pool_transfers(self, full_indices: torch.Tensor):
+        # Scheme B: page_specs are all KV-sourced (FULL), so no full->swa
+        # translation happens on the backup/restore path.
         full_host_indices = full_indices.detach().cpu().to(torch.int64)
-        swa_device_indices = self._swa_indices(full_indices)
-        swa_host_indices = swa_device_indices.detach().cpu().to(torch.int64)
-
-        transfers = []
-        for spec in self.page_specs:
-            if spec["source"] == PoolName.SWA:
-                host_indices = swa_host_indices
-                device_indices = swa_device_indices
-            else:
-                host_indices = full_host_indices
-                device_indices = full_indices
-            transfers.append(
-                PoolTransfer(
-                    name=spec["name"],
-                    host_indices=host_indices,
-                    device_indices=device_indices,
-                )
+        transfers = [
+            PoolTransfer(
+                name=spec["name"],
+                host_indices=full_host_indices,
+                device_indices=full_indices,
             )
-        return full_host_indices, swa_host_indices, transfers
+            for spec in self.page_specs
+        ]
+        return full_host_indices, transfers
 
-    def _pack_page(self, full_page_start: int, swa_page_start: int) -> torch.Tensor:
+    def _pack_page(self, full_page_start: int) -> torch.Tensor:
         pieces = []
         for spec in self.page_specs:
-            page_start = (
-                swa_page_start if spec["source"] == PoolName.SWA else full_page_start
-            )
             pieces.append(
-                spec["host_pool"].get_data_page(page_start, flat=True).view(torch.uint8)
+                spec["host_pool"]
+                .get_data_page(full_page_start, flat=True)
+                .view(torch.uint8)
             )
         return torch.cat(pieces).contiguous()
 
-    def _unpack_page(
-        self, full_page_start: int, swa_page_start: int, page_data: torch.Tensor
-    ) -> None:
+    def _unpack_page(self, full_page_start: int, page_data: torch.Tensor) -> None:
         offset = 0
         page_data = page_data.view(torch.uint8)
         for spec in self.page_specs:
             next_offset = offset + spec["numel"]
-            page_start = (
-                swa_page_start if spec["source"] == PoolName.SWA else full_page_start
-            )
             spec["host_pool"].set_from_flat_data_page(
-                page_start, page_data[offset:next_offset]
+                full_page_start, page_data[offset:next_offset]
             )
             offset = next_offset
 
@@ -1847,9 +1811,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         assert len(dst_tensors) == page_count * self.page_chunk_count, (
             "Length of dst_tensors must equal pages * DSv4 EIC chunks per page"
         )
-        full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
-            device_indices
-        )
+        full_host_indices, transfers = self._build_pool_transfers(device_indices)
         self.host_pool_group.backup_from_device_all_layer(
             self.device_pool,
             full_host_indices,
@@ -1861,10 +1823,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
         for page_id in range(page_count):
             token_offset = page_id * self.page_size
-            page = self._pack_page(
-                full_host_indices[token_offset].item(),
-                swa_host_indices[token_offset].item(),
-            )
+            page = self._pack_page(full_host_indices[token_offset].item())
             for chunk_id in range(self.page_chunk_count):
                 chunk_offset = chunk_id * self.eic_chunk_bytes
                 chunk_end = min(chunk_offset + self.eic_chunk_bytes, self.page_bytes)
@@ -1883,9 +1842,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         if page_count == 0:
             return
         device_indices = device_indices[: page_count * self.page_size]
-        full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
-            device_indices
-        )
+        full_host_indices, transfers = self._build_pool_transfers(device_indices)
 
         for page_id in range(page_count):
             pieces = []
@@ -1900,11 +1857,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 )
             page_data = torch.cat(pieces)
             token_offset = page_id * self.page_size
-            self._unpack_page(
-                full_host_indices[token_offset].item(),
-                swa_host_indices[token_offset].item(),
-                page_data,
-            )
+            self._unpack_page(full_host_indices[token_offset].item(), page_data)
         torch.cuda.current_stream().synchronize()
 
         for layer_id in range(self.transfer_layer_num):

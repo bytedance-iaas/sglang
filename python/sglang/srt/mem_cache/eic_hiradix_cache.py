@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
+from sglang.srt.mem_cache.common import swa_retained_tail
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
@@ -234,6 +235,16 @@ class EICHiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
         super().__init__(params)
+
+        # Scheme B: SWA KV is not persisted to L2. On reuse the last
+        # swa_retained_tail tokens are re-prefilled so their SWA window is
+        # recomputed locally (fresh == full compute). Constant per instance;
+        # init_next_round_input caps the match key by this many trailing tokens.
+        self.swa_l2_recompute_tail = (
+            swa_retained_tail(self.sliding_window_size, self.page_size)
+            if self.sliding_window_size is not None
+            else 0
+        )
 
         self.save_decode_cache = True
         config_file = get_eic_config_file_path()
