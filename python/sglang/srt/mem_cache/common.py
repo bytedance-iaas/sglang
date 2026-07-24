@@ -44,6 +44,14 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+def swa_retained_tail(sliding_window_size: int, page_size: int) -> int:
+    """Trailing tokens whose SWA must stay live: the sliding window, but at
+    least one page so a page larger than the window (DSV4: 256 vs 128) never
+    leaves an all-tombstone leaf. Single source for the out-of-window eviction
+    frontier and EIC Scheme-B's recompute-tail."""
+    return max(sliding_window_size, page_size)
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,
@@ -83,7 +91,7 @@ def free_swa_out_of_window_slots(
     else:
         # Page-aligning below and retaining max(window, page) keeps the frontier
         # strictly below page_floor(seq_len) without an extra page margin.
-        evict_threshold = pre_len - max(sliding_window_size, page_size)
+        evict_threshold = pre_len - swa_retained_tail(sliding_window_size, page_size)
 
     new_swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_threshold)
     if page_size > 1:
