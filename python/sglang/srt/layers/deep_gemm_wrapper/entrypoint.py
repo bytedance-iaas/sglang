@@ -132,6 +132,79 @@ def grouped_gemm_nt_f8fp4bf16_masked(
         )
 
 
+def _resolve_deepgemm_fp8fp4_contig_kernel():
+    for kernel_name in (
+        "m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma",
+        "m_grouped_fp8_fp4_gemm_nt_contiguous",
+        "m_grouped_fp8_fp4_gemm_nt_contig_sm90_fused_wgmma",
+        "m_grouped_fp8_fp4_gemm_nt_contig",
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contiguous",
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contig",
+    ):
+        kernel = getattr(deep_gemm, kernel_name, None)
+        if kernel is not None:
+            return kernel
+    available = [
+        name
+        for name in dir(deep_gemm)
+        if "fp4" in name and ("contig" in name or "contiguous" in name)
+    ]
+    raise RuntimeError(
+        "DeepGEMM does not expose an SM90 FP8xFP4 contiguous grouped GEMM. "
+        "Expected one of: "
+        "m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma, "
+        "m_grouped_fp8_fp4_gemm_nt_contiguous, "
+        "m_grouped_fp8_fp4_gemm_nt_contig_sm90_fused_wgmma, "
+        "m_grouped_fp8_fp4_gemm_nt_contig, "
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contiguous, "
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contig. "
+        f"Available DeepGEMM fp4 contig symbols: {available}"
+    )
+
+
+def grouped_gemm_nt_f8fp4bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    gran_k_a: int = 128,
+    gran_k_b: int = 32,
+):
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG
+
+    if m == 0:
+        return
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    kernel = _resolve_deepgemm_fp8fp4_contig_kernel()
+    call_variants = (
+        dict(gran_k=gran_k_a, gran_k_a=gran_k_a, gran_k_b=gran_k_b),
+        dict(gran_k_a=gran_k_a, gran_k_b=gran_k_b),
+        dict(recipe_a=(1, gran_k_a), recipe_b=(1, gran_k_b)),
+        {},
+    )
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        last_type_error = None
+        for kwargs in call_variants:
+            try:
+                return kernel(lhs, rhs, out, m_indices, **kwargs)
+            except TypeError as exc:
+                last_type_error = exc
+                message = str(exc)
+                if not (
+                    "argument" in message
+                    or "keyword" in message
+                    or "incompatible function arguments" in message
+                ):
+                    raise
+        assert last_type_error is not None
+        raise last_type_error
+
+
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:

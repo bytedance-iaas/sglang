@@ -246,7 +246,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
-        hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
 
@@ -258,12 +257,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )
 
-        w13_weight_fp8 = (
-            quant_info.w13_weight,
-            quant_info.w13_scale,
-        )
-        w2_weight_fp8 = (quant_info.w2_weight, quant_info.w2_scale)
-
         gateup_output = torch.empty(
             (all_tokens, N),
             device=hidden_states_device,
@@ -272,14 +265,39 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_fp4_experts:
+            if quant_info.w13_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
+                all_tokens,
+                quant_info.w13_weight.shape[0],
+                all_tokens,
+                N,
+                K,
+            ):
+                w13_scale_for_gemm = quant_info.w13_scale_e8m0
+            else:
+                w13_scale_for_gemm = quant_info.w13_scale
+            w13_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
+                w13_scale_for_gemm,
+                logical_k=K,
+                gran_k_b=32,
+            )
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
+                (hidden_states, hidden_states_scale),
+                (quant_info.w13_weight, w13_scale_for_gemm),
+                gateup_output,
+                m_indices,
+                gran_k_a=128,
+                gran_k_b=32,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                (quant_info.w13_weight, quant_info.w13_scale),
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -359,14 +377,40 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_fp4_experts:
+            down_k = down_input_fp8.shape[1]
+            if quant_info.w2_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
+                all_tokens,
+                quant_info.w2_weight.shape[0],
+                all_tokens,
+                K,
+                down_k,
+            ):
+                w2_scale_for_gemm = quant_info.w2_scale_e8m0
+            else:
+                w2_scale_for_gemm = quant_info.w2_scale
+            w2_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
+                w2_scale_for_gemm,
+                logical_k=down_k,
+                gran_k_b=32,
+            )
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
+                (down_input_fp8, down_input_scale),
+                (quant_info.w2_weight, w2_scale_for_gemm),
+                down_output,
+                m_indices,
+                gran_k_a=128,
+                gran_k_b=32,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                (quant_info.w2_weight, quant_info.w2_scale),
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         return down_output
 

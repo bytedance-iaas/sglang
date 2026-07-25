@@ -105,6 +105,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8FP4BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_F8FP4BF16_CONTIG = auto()
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
@@ -171,6 +172,13 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
+        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG:
+            logger.info(
+                "Skipping DeepGEMM precompile for GROUPED_GEMM_NT_F8FP4BF16_CONTIG; "
+                "it depends on optional local DeepGEMM SM90 FP8xFP4 bindings."
+            )
+            return
+
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
@@ -273,6 +281,15 @@ class _BaseWarmupExecutor:
                 + num_groups * n * ceil_div(k, 32) * rhs_scale_bytes
                 + num_groups * 4
                 + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG:
+            rhs_scale_bytes = 4 + (1 if DEEPGEMM_FP4_SCALE_B_UE8M0 else 0)
+            return (
+                max_m * k
+                + num_groups * n * ceil_div(k, 2)
+                + num_groups * n * ceil_div(k, 32) * rhs_scale_bytes
+                + max_m * 4
+                + max_m * n * 2
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
