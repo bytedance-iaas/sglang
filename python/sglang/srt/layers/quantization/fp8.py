@@ -1623,6 +1623,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                 f"fp4_group_size={fp4_group_size}"
                             )
 
+                        # Keep the original checkpoint group scale for the SM90
+                        # FP8xFP4 contiguous kernel. Masked kernels use the
+                        # expanded/transformed runtime scale below.
+                        scale_param.fp4_group_scale_data = scale_param.data.contiguous()
+
                         # DeepGEMM sm90 fp8×fp4 kernel still expects scale layout indexed
                         # with granularity 32 on K dimension. For a g128 checkpoint, each
                         # scale should be repeated across 4 contiguous 32-sized subgroups.
@@ -2427,6 +2432,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 w13_scale_e8m0=getattr(w13_scale, "scale_e8m0_data", None),
                 w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
+                w13_scale_fp4_group=getattr(w13_scale, "fp4_group_scale_data", None),
+                w2_scale_fp4_group=getattr(w2_scale, "fp4_group_scale_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,

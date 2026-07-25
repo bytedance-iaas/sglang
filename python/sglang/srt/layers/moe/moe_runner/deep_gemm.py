@@ -174,6 +174,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w2_scale: Optional[torch.Tensor] = None
     w13_scale_e8m0: Optional[torch.Tensor] = None
     w2_scale_e8m0: Optional[torch.Tensor] = None
+    w13_scale_fp4_group: Optional[torch.Tensor] = None
+    w2_scale_fp4_group: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
@@ -266,20 +268,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         if quant_info.is_fp4_experts:
-            if quant_info.w13_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
-                all_tokens,
-                quant_info.w13_weight.shape[0],
-                all_tokens,
-                N,
-                K,
-            ):
-                w13_scale_for_gemm = quant_info.w13_scale_e8m0
-            else:
-                w13_scale_for_gemm = quant_info.w13_scale
-            w13_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
-                w13_scale_for_gemm,
-                logical_k=K,
-                gran_k_b=32,
+            w13_scale_for_gemm = (
+                quant_info.w13_scale_fp4_group
+                if quant_info.w13_scale_fp4_group is not None
+                else quant_info.w13_scale
             )
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
                 (hidden_states, hidden_states_scale),
@@ -378,21 +370,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         if quant_info.is_fp4_experts:
-            down_k = down_input_fp8.shape[1]
-            if quant_info.w2_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
-                all_tokens,
-                quant_info.w2_weight.shape[0],
-                all_tokens,
-                K,
-                down_k,
-            ):
-                w2_scale_for_gemm = quant_info.w2_scale_e8m0
-            else:
-                w2_scale_for_gemm = quant_info.w2_scale
-            w2_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
-                w2_scale_for_gemm,
-                logical_k=down_k,
-                gran_k_b=32,
+            w2_scale_for_gemm = (
+                quant_info.w2_scale_fp4_group
+                if quant_info.w2_scale_fp4_group is not None
+                else quant_info.w2_scale
             )
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
                 (down_input_fp8, down_input_scale),
