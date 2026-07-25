@@ -56,7 +56,11 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
-from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
+from sglang.kernels.ops.attention.utils import (
+    cp_lse_a2a_out_rs,
+    cp_lse_ag_out_reduce_scatter,
+    cp_lse_ag_out_rs,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -1982,7 +1986,45 @@ class DeepseekV4AttnBackend(
                         torch.zeros_like(o),
                         o,
                     )
-                o = cp_lse_ag_out_rs(o, lse, get_dcp_group()).to(o_dtype)
+                if envs.SGLANG_DSV4_DCP_A2A_LSE_VERIFY.get():
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(
+                            "SGLANG_DSV4_DCP_A2A_LSE_VERIFY requires "
+                            "--disable-cuda-graph"
+                        )
+                    ref_o, ref_lse = cp_lse_ag_out_rs(
+                        o, lse, get_dcp_group(), return_lse=True
+                    )
+                    a2a_o, a2a_lse = cp_lse_a2a_out_rs(
+                        o, lse, get_dcp_group(), return_lse=True
+                    )
+                    torch.testing.assert_close(
+                        a2a_lse,
+                        ref_lse,
+                        rtol=1e-6,
+                        atol=1e-6,
+                        msg=lambda msg: (
+                            f"DSV4 DCP A2A LSE mismatch at layer {layer_id}: {msg}"
+                        ),
+                    )
+                    torch.testing.assert_close(
+                        a2a_o,
+                        ref_o,
+                        rtol=2e-3,
+                        atol=2e-3,
+                        msg=lambda msg: (
+                            f"DSV4 DCP A2A output mismatch at layer {layer_id}: {msg}"
+                        ),
+                    )
+                    o = a2a_o.to(o_dtype)
+                elif envs.SGLANG_DSV4_DCP_A2A_LSE.get():
+                    o = cp_lse_a2a_out_rs(o, lse, get_dcp_group()).to(o_dtype)
+                elif envs.SGLANG_DSV4_DCP_AG_RS.get():
+                    o = cp_lse_ag_out_reduce_scatter(
+                        o, lse, get_dcp_group()
+                    ).to(o_dtype)
+                else:
+                    o = cp_lse_ag_out_rs(o, lse, get_dcp_group()).to(o_dtype)
 
             return o
 
