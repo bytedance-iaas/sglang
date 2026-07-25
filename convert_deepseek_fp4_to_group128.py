@@ -51,6 +51,20 @@ FP4_TABLE = torch.tensor(
     dtype=torch.float32,
 )
 
+FP4_ABS_THRESHOLDS = torch.tensor(
+    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+    dtype=torch.float32,
+)
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+    return device
+
 
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
@@ -85,7 +99,7 @@ def is_fp4_expert_weight(name: str, tensor: torch.Tensor) -> bool:
     )
 
 
-def unpack_fp4_values(packed: torch.Tensor) -> torch.Tensor:
+def unpack_fp4_values(packed: torch.Tensor, fp4_table: torch.Tensor) -> torch.Tensor:
     """把 packed int8 中的两个 nibble 解成 FP4 码本值。"""
     if packed.dtype != torch.int8 or packed.ndim != 2:
         raise ValueError(f"expected int8 2D packed tensor, got {packed.dtype}, {packed.shape}")
@@ -95,7 +109,7 @@ def unpack_fp4_values(packed: torch.Tensor) -> torch.Tensor:
     low = packed_u8 & 0x0F
     high = (packed_u8 >> 4) & 0x0F
     values = torch.stack(
-        (FP4_TABLE[low.long()], FP4_TABLE[high.long()]),
+        (fp4_table[low.long()], fp4_table[high.long()]),
         dim=-1,
     ).reshape(out_dim, packed_in_dim * 2)
     return values
@@ -105,9 +119,10 @@ def dequant_fp4_grouped(
     packed: torch.Tensor,
     scale: torch.Tensor,
     src_group_size: int,
+    fp4_table: torch.Tensor,
 ) -> torch.Tensor:
     """按源 group_size 反量化得到实值张量。"""
-    fp4 = unpack_fp4_values(packed)
+    fp4 = unpack_fp4_values(packed, fp4_table)
     out_dim, in_dim = fp4.shape
     expected_scale_shape = (out_dim, in_dim // src_group_size)
     if tuple(scale.shape) != expected_scale_shape:
@@ -115,13 +130,29 @@ def dequant_fp4_grouped(
             f"scale shape mismatch: got {tuple(scale.shape)}, expected {expected_scale_shape}"
         )
 
-    full_scale = scale.float().repeat_interleave(src_group_size, dim=1)
-    return fp4 * full_scale
+    grouped = fp4.view(out_dim, in_dim // src_group_size, src_group_size)
+    real = grouped * scale.float().unsqueeze(-1)
+    return real.reshape(out_dim, in_dim)
+
+
+def nearest_fp4_nibble(
+    normalized: torch.Tensor,
+    abs_thresholds: torch.Tensor,
+) -> torch.Tensor:
+    """Map normalized values to nearest E2M1-like FP4 code without 16-way distance."""
+    abs_value = normalized.abs()
+    level = torch.bucketize(abs_value.contiguous(), abs_thresholds).to(torch.uint8)
+    negative = normalized < 0
+    signed_level = level + negative.to(torch.uint8) * 8
+    # FP4_TABLE has +0 at code 0 and -0 at code 8. The old argmin path chose
+    # code 0 on zero ties, so keep all near-zero values canonicalized to 0.
+    return torch.where(level == 0, level, signed_level)
 
 
 def quantize_real_to_fp4(
     real: torch.Tensor,
     dst_group_size: int,
+    fp4_abs_thresholds: torch.Tensor,
     eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """把实值重新量化到 FP4，并生成新的 group scale。"""
@@ -140,9 +171,7 @@ def quantize_real_to_fp4(
     new_scale = torch.clamp(max_abs / 6.0, min=eps)
 
     normalized = grouped / new_scale.unsqueeze(-1)
-    codebook = FP4_TABLE.view(1, 1, 1, 16)
-    dist = (normalized.unsqueeze(-1) - codebook).abs()
-    nibble = dist.argmin(dim=-1).to(torch.uint8)
+    nibble = nearest_fp4_nibble(normalized, fp4_abs_thresholds)
 
     # 打包回 int8：偶数列放低 4 bit，奇数列放高 4 bit。
     nibble = nibble.view(out_dim, in_dim)
@@ -160,9 +189,20 @@ def regroup_fp4_tensor(
     scale: torch.Tensor,
     src_group_size: int,
     dst_group_size: int,
+    fp4_table: torch.Tensor,
+    fp4_abs_thresholds: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    real = dequant_fp4_grouped(packed, scale, src_group_size=src_group_size)
-    return quantize_real_to_fp4(real, dst_group_size=dst_group_size)
+    real = dequant_fp4_grouped(
+        packed,
+        scale,
+        src_group_size=src_group_size,
+        fp4_table=fp4_table,
+    )
+    return quantize_real_to_fp4(
+        real,
+        dst_group_size=dst_group_size,
+        fp4_abs_thresholds=fp4_abs_thresholds,
+    )
 
 
 def convert_config(src_dir: Path, out_dir: Path, dst_group_size: int) -> None:
@@ -226,6 +266,17 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--src-group-size", type=int, default=32)
     parser.add_argument("--dst-group-size", type=int, default=128)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="转换计算设备：auto/cpu/cuda/cuda:0 等。默认 auto，有 CUDA 就用 CUDA。",
+    )
+    parser.add_argument(
+        "--empty-cache-every",
+        type=int,
+        default=0,
+        help="CUDA 模式下每处理多少个 shard 调用一次 torch.cuda.empty_cache()，0 表示不主动清理。",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--resume",
@@ -247,6 +298,9 @@ def main() -> None:
 
     src_dir = args.input_dir.resolve()
     out_dir = args.output_dir.resolve()
+    device = resolve_device(args.device)
+    fp4_table = FP4_TABLE.to(device)
+    fp4_abs_thresholds = FP4_ABS_THRESHOLDS.to(device)
 
     index_path = src_dir / "model.safetensors.index.json"
     if not index_path.exists():
@@ -273,9 +327,10 @@ def main() -> None:
         by_file.setdefault(file_name, []).append(name)
 
     emitted_map: dict[str, str] = {}
+    shard_sizes: dict[str, int] = {}
     ordered_files = sorted(by_file)
     total_files = len(ordered_files)
-    print(f"starting conversion: {total_files} shard(s)", flush=True)
+    print(f"starting conversion: {total_files} shard(s), device={device}", flush=True)
 
     for file_idx, file_name in enumerate(ordered_files, start=1):
         src_file = src_dir / file_name
@@ -283,9 +338,10 @@ def main() -> None:
         expected_names = set(by_file[file_name])
 
         if args.resume and out_file.exists():
-            existing_keys, _ = read_existing_shard_keys_and_size(out_file)
+            existing_keys, existing_size = read_existing_shard_keys_and_size(out_file)
             if expected_names.issubset(existing_keys):
                 emitted_map.update({name: file_name for name in expected_names})
+                shard_sizes[file_name] = existing_size
                 if file_idx == 1 or file_idx % args.progress_every == 0 or file_idx == total_files:
                     print(
                         f"[{file_idx}/{total_files}] skipping existing completed shard: {file_name}",
@@ -314,17 +370,22 @@ def main() -> None:
                     scale_name = name.removesuffix(".weight") + ".scale"
                     if scale_name not in key_set:
                         raise KeyError(f"missing scale tensor for {name}: {scale_name}")
+                    tensor_on_device = tensor.to(device, non_blocking=True)
+                    scale_on_device = reader.get_tensor(scale_name).to(device, non_blocking=True)
                     new_weight, new_scale = regroup_fp4_tensor(
-                        tensor,
-                        reader.get_tensor(scale_name),
+                        tensor_on_device,
+                        scale_on_device,
                         src_group_size=args.src_group_size,
                         dst_group_size=args.dst_group_size,
+                        fp4_table=fp4_table,
+                        fp4_abs_thresholds=fp4_abs_thresholds,
                     )
-                    state_dict[name] = new_weight
-                    state_dict[scale_name] = new_scale
+                    state_dict[name] = new_weight.cpu()
+                    state_dict[scale_name] = new_scale.cpu()
                     emitted_map[name] = file_name
                     emitted_map[scale_name] = file_name
                     consumed.add(scale_name)
+                    del tensor_on_device, scale_on_device, new_weight, new_scale
                     continue
 
                 if name.endswith(".scale"):
@@ -334,12 +395,18 @@ def main() -> None:
                     state_dict[name] = tensor
                 emitted_map[name] = file_name
 
+        shard_sizes[file_name] = sum(
+            tensor.numel() * tensor.element_size() for tensor in state_dict.values()
+        )
         save_file(state_dict, out_file, metadata={"format": "pt"})
+        if (
+            device.type == "cuda"
+            and args.empty_cache_every > 0
+            and file_idx % args.empty_cache_every == 0
+        ):
+            torch.cuda.empty_cache()
 
-    total_size = 0
-    for file_name in sorted(set(emitted_map.values())):
-        _, shard_size = read_existing_shard_keys_and_size(out_dir / file_name)
-        total_size += shard_size
+    total_size = sum(shard_sizes.values())
 
     save_json(
         out_dir / "model.safetensors.index.json",
