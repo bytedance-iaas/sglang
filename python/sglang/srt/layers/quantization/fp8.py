@@ -1539,8 +1539,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
-            # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
-            from sglang.srt.layers import deep_gemm_wrapper
+            # For fp8 moe run with deepgemm, non-FP4 expert scales may need UE8M0
+            # requantization; FP4 expert scales stay in checkpoint group layout.
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
             # Check if MoE will actually use DeepGEMM runner
@@ -1591,28 +1591,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         build_mega_moe_experts_weights(layer)
                     return
 
-                if (
-                    will_use_deepgemm
-                    and deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
-                ):
-                    from deep_gemm import transform_sf_into_required_layout
-
+                if will_use_deepgemm:
                     fp4_group_size = self.quant_config.fp4_group_size
-                    deepgemm_gran_k = 32
-
-                    if fp4_group_size % deepgemm_gran_k != 0:
-                        raise ValueError(
-                            f"fp4_group_size={fp4_group_size} must be divisible by "
-                            f"DeepGEMM gran_k={deepgemm_gran_k}"
-                        )
-
-                    expand_ratio = fp4_group_size // deepgemm_gran_k
 
                     for scale_param, weight_param in [
                         (layer.w13_weight_scale_inv, layer.w13_weight),
                         (layer.w2_weight_scale_inv, layer.w2_weight),
                     ]:
-                        num_experts, n, k_groups_loaded = scale_param.data.shape
+                        _, _, k_groups_loaded = scale_param.data.shape
                         k = weight_param.shape[2] * 2
 
                         expected_loaded_k_groups = k // fp4_group_size
@@ -1622,72 +1608,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                 f"expected {expected_loaded_k_groups} for k={k}, "
                                 f"fp4_group_size={fp4_group_size}"
                             )
-
-                        # Keep the original checkpoint group scale for the SM90
-                        # FP8xFP4 contiguous kernel. Masked kernels use the
-                        # expanded/transformed runtime scale below.
-                        scale_param.fp4_group_scale_data = scale_param.data.contiguous()
-
-                        # DeepGEMM sm90 fp8×fp4 kernel still expects scale layout indexed
-                        # with granularity 32 on K dimension. For a g128 checkpoint, each
-                        # scale should be repeated across 4 contiguous 32-sized subgroups.
-                        runtime_scale = scale_param.data.repeat_interleave(
-                            expand_ratio, dim=2
-                        ).contiguous()
-                        # print(
-                        #     "[g128-debug] after-expand",
-                        #     "runtime_scale=",
-                        #     tuple(runtime_scale.shape),
-                        #     "expected_runtime_k_groups=",
-                        #     expected_runtime_k_groups,
-                        #     flush=True,
-                        # )
-
-                        expected_runtime_k_groups = k // deepgemm_gran_k
-                        if runtime_scale.shape[2] != expected_runtime_k_groups:
-                            raise ValueError(
-                                f"Expanded runtime FP4 scale shape mismatch: got last dim="
-                                f"{runtime_scale.shape[2]}, expected {expected_runtime_k_groups} "
-                                f"for k={k}, deepgemm_gran_k={deepgemm_gran_k}"
-                            )
-
-                        tma_aligned_n_e8m0 = ((n + 15) // 16) * 16
-                        scale_data = transform_sf_into_required_layout(
-                            runtime_scale,
-                            mn=n,
-                            k=k,
-                            recipe=(1, deepgemm_gran_k),
-                            num_groups=num_experts,
-                            disable_ue8m0_cast=False,
-                        )
-                        # print(
-                        #     "[g128-debug] after-transform",
-                        #     "scale_data=",
-                        #     tuple(scale_data.shape),
-                        #     flush=True,
-                        # )
-
-                        e8m0_scale_data = torch.empty_strided(
-                            scale_data.shape,
-                            (
-                                tma_aligned_n_e8m0 * scale_data.shape[2],
-                                1,
-                                tma_aligned_n_e8m0,
-                            ),
-                            device=scale_data.device,
-                            dtype=torch.uint8,
-                        )
-                        e8m0_scale_data.copy_(
-                            (torch.floor(torch.log2(scale_data.float())) + 127).to(
-                                torch.uint8
-                            )
-                        )
-
-                        scale_param.scale_e8m0_data = e8m0_scale_data
-                        scale_param.data = scale_data
-
-                    layer.w13_weight_scale_inv.format_ue8m0 = True
-                    layer.w2_weight_scale_inv.format_ue8m0 = True
 
             if (
                 not self.is_fp4_expert
@@ -2430,10 +2350,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                w13_scale_e8m0=getattr(w13_scale, "scale_e8m0_data", None),
-                w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
-                w13_scale_fp4_group=getattr(w13_scale, "fp4_group_scale_data", None),
-                w2_scale_fp4_group=getattr(w2_scale, "fp4_group_scale_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,

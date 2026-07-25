@@ -87,7 +87,7 @@ def grouped_gemm_nt_f8fp4bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     gran_k_a: int = 128,
-    gran_k_b: int = 32,
+    gran_k_b: int = 128,
     masked_m_max_hint: Optional[int] = None,
     active_groups_hint: Optional[int] = None,
 ):
@@ -168,7 +168,7 @@ def grouped_gemm_nt_f8fp4bf16_contig(
     out: torch.Tensor,
     m_indices: torch.Tensor,
     gran_k_a: int = 128,
-    gran_k_b: int = 32,
+    gran_k_b: int = 128,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape

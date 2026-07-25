@@ -7,42 +7,6 @@ import einops
 import torch
 
 
-def _expand_fp4_scale_for_deepgemm_runtime(
-    scale: torch.Tensor,
-    logical_k: int,
-    gran_k_b: int = 32,
-) -> torch.Tensor:
-    """Expand FP4 expert scale on K dimension for DeepGEMM runtime ABI.
-
-    Checkpoint may store FP4 scales with group_size=128, while current DeepGEMM
-    sm90 fp8 x fp4 kernel expects scale groups indexed with gran_k_b=32.
-    In that case, repeat each stored scale along the last dim so that:
-        scale.shape[-1] == ceil_div(logical_k, gran_k_b)
-
-    This does not change checkpoint semantics: one g128 scale is reused for the
-    four contiguous g32 sub-groups it covers.
-    """
-    if scale is None:
-        return scale
-
-    expected_k_groups = (logical_k + gran_k_b - 1) // gran_k_b
-    current_k_groups = scale.shape[2]
-
-    if current_k_groups == expected_k_groups:
-        return scale
-
-    if expected_k_groups % current_k_groups != 0:
-        raise ValueError(
-            f"Cannot expand FP4 scale for DeepGEMM runtime: "
-            f"current shape={tuple(scale.shape)}, "
-            f"logical_k={logical_k}, gran_k_b={gran_k_b}, "
-            f"expected_k_groups={expected_k_groups}"
-        )
-
-    repeat = expected_k_groups // current_k_groups
-    return scale.repeat_interleave(repeat, dim=2).contiguous()
-
-
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -103,17 +67,6 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
-def _fp4_e8m0_scale_supported(
-    _expected_m: int,
-    _num_groups: int,
-    _m: int,
-    _n: int,
-    _k: int,
-    _masked_m_max_hint: Optional[int] = None,
-) -> bool:
-    return deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
-
-
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -172,12 +125,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
-    w13_scale_e8m0: Optional[torch.Tensor] = None
-    w2_scale_e8m0: Optional[torch.Tensor] = None
-    w13_scale_fp4_group: Optional[torch.Tensor] = None
-    w2_scale_fp4_group: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
-    # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
+    # DSV4 mxfp4 layout flag; selects FP8xFP4 DeepGEMM kernels downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
 
@@ -268,18 +217,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         if quant_info.is_fp4_experts:
-            w13_scale_for_gemm = (
-                quant_info.w13_scale_fp4_group
-                if quant_info.w13_scale_fp4_group is not None
-                else quant_info.w13_scale
-            )
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
                 (hidden_states, hidden_states_scale),
-                (quant_info.w13_weight, w13_scale_for_gemm),
+                (quant_info.w13_weight, quant_info.w13_scale),
                 gateup_output,
                 m_indices,
                 gran_k_a=128,
-                gran_k_b=32,
+                gran_k_b=128,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -370,18 +314,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         if quant_info.is_fp4_experts:
-            w2_scale_for_gemm = (
-                quant_info.w2_scale_fp4_group
-                if quant_info.w2_scale_fp4_group is not None
-                else quant_info.w2_scale
-            )
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
                 (down_input_fp8, down_input_scale),
-                (quant_info.w2_weight, w2_scale_for_gemm),
+                (quant_info.w2_weight, quant_info.w2_scale),
                 down_output,
                 m_indices,
                 gran_k_a=128,
-                gran_k_b=32,
+                gran_k_b=128,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -505,7 +444,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             recipe_a = (quant_info.block_shape[0], gran_k_act)
         elif quant_info.is_fp4_experts:
-            recipe_a, recipe_b = (1, 128), (1, 32)
+            recipe_a, recipe_b = (1, 128), (1, 128)
         else:
             recipe_a, recipe_b = None, None
 
@@ -532,37 +471,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         if is_fp4_experts:
-            if quant_info.w13_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
-                gemm_expected_m, num_groups, m, n, k, runner_input.masked_m_max_hint
-            ):
-                w13_scale_for_gemm = quant_info.w13_scale_e8m0
-            else:
-                w13_scale_for_gemm = w13_scale
-
-            w13_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
-                w13_scale_for_gemm,
-                logical_k=k,
-                gran_k_b=32,
-            )
-
             # print(
             #     "[g128-debug] gemm0-input",
             #     "lhs_act=", tuple(hidden_states.shape),
             #     "lhs_scale=", tuple(hidden_states_scale.shape) if hidden_states_scale is not None else None,
             #     "rhs_weight=", tuple(w13_weight.shape),
-            #     "rhs_scale=", tuple(w13_scale_for_gemm.shape),
-            #     "expected_rhs_scale_kgroups=", (k + 32 - 1) // 32,
+            #     "rhs_scale=", tuple(w13_scale.shape),
+            #     "expected_rhs_scale_kgroups=", (k + 128 - 1) // 128,
             #     flush=True,
             # )
 
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (hidden_states, hidden_states_scale),
-                (w13_weight, w13_scale_for_gemm),
+                (w13_weight, w13_scale),
                 gateup_output,
                 masked_m,
                 gemm_expected_m,
                 gran_k_a=128,
-                gran_k_b=32,
+                gran_k_b=128,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
@@ -685,43 +611,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             }
 
         if is_fp4_experts:
-            down_k = down_input.shape[2]
-            if quant_info.w2_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
-                gemm_expected_m,
-                num_groups,
-                m,
-                n,
-                down_k,
-                runner_input.masked_m_max_hint,
-            ):
-                w2_scale_for_gemm = quant_info.w2_scale_e8m0
-            else:
-                w2_scale_for_gemm = w2_scale
-
-            w2_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
-                w2_scale_for_gemm,
-                logical_k=down_k,
-                gran_k_b=32,
-            )
-
             # print(
             #     "[g128-debug] gemm1-input",
             #     "lhs_act=", tuple(down_input.shape),
             #     "lhs_scale=", tuple(down_input_scale.shape) if down_input_scale is not None else None,
             #     "rhs_weight=", tuple(w2_weight.shape),
-            #     "rhs_scale=", tuple(w2_scale_for_gemm.shape),
-            #     "expected_rhs_scale_kgroups=", (down_k + 32 - 1) // 32,
+            #     "rhs_scale=", tuple(w2_scale.shape),
+            #     "expected_rhs_scale_kgroups=", (down_input.shape[2] + 128 - 1) // 128,
             #     flush=True,
             # )
 
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (down_input, down_input_scale),
-                (w2_weight, w2_scale_for_gemm),
+                (w2_weight, w2_scale),
                 down_output,
                 masked_m,
                 gemm_expected_m,
                 gran_k_a=128,
-                gran_k_b=32,
+                gran_k_b=128,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
