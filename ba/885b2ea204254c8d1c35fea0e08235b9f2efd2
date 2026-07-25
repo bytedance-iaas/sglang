@@ -1,0 +1,49 @@
+python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+  s_25f30d39e75a32::t_f16fe8b50b0dbb 210-216,221
+  s_25f30d39e75a32::t_99d0fb33becfc9 207-209,217-220,222-226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ba885b2ea204254c8d1c35fea0e08235b9f2efd2",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_25f30d39e75a32": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3290da7cb3eaebe2eb9adc",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {
+    "s_25f30d39e75a32": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_99d0fb33becfc9": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_f16fe8b50b0dbb": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

@@ -1,0 +1,21 @@
+test/manual/dsv4/bench_dcp_c4_indexer.py
+  s_3af354177588a3::t_8375bc5c1b8e95 25,28,31,42-46,95-99,116-132,142-144,151-155,157-158,163-174,330,349-350,352-358,387,389-406,433-446,477-489,498,503,505,514-568,571-581,599-612,614-615,617-675,678-683,689-695,704-707,709-722,730-732
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d07f1e6ebc29d8ed04a426705b2288f2368dd3f6",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

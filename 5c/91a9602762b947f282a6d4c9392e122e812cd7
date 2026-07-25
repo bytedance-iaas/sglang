@@ -1,0 +1,30 @@
+.gitignore
+  s_a43a7a56d77e55::t_04e81ba43cd4e6 283
+  s_071d0bf34ab4c4::t_797b7dd34b5058 282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5c91a9602762b947f282a6d4c9392e122e812cd7",
+  "prompts": {},
+  "sessions": {
+    "s_071d0bf34ab4c4": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-d25cd400-d529-4e56-a3bb-b9b07e8af3b5",
+        "model": "default"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    },
+    "s_a43a7a56d77e55": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-c125c81f-66c8-4fe9-aea0-3b31eb6348ba",
+        "model": "default"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

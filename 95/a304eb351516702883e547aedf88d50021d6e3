@@ -1,0 +1,273 @@
+KVRoadMap.md
+  bc724571dc077ef2 157-159,161-210 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a202ebb8acd8a2c99d7e7b1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[157,159]},{"Range":[161,210]}]}]}
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  bc724571dc077ef2 382-408,423-494,661-687,784-817 gitai:{"mixed_line_ranges":[{"Range":[382,385]},{"Range":[388,389]}],"operations":[{"operation_id":"6a202ebb8acd8a2c99d7e7b1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[382,408]},{"Range":[423,494]},{"Range":[661,687]},{"Range":[784,817]}]}]}
+scripts/build_rotated_kv_calib.py
+  bc724571dc077ef2 1-699 gitai:{"mixed_line_ranges":[{"Single":659},{"Single":663},{"Range":[666,668]},{"Single":672},{"Single":678},{"Single":680},{"Single":689}],"operations":[{"operation_id":"6a202ebb8acd8a2c99d7e7b1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[1,699]}]}]}
+python/sglang/srt/mem_cache/rotated_quant_memory_pool.py
+  bc724571dc077ef2 419-448 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a202ebb8acd8a2c99d7e7b1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[419,448]}]}]}
+test/manual/quant/test_rotated_kv_quant_e2e.py
+  bc724571dc077ef2 1-581 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a202ebb8acd8a2c99d7e7b1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[1,581]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "95a304eb351516702883e547aedf88d50021d6e3",
+  "prompts": {
+    "bc724571dc077ef2": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a1ff1998acd8a2c99d7e3ea",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>",
+      "messages": [],
+      "total_additions": 729,
+      "total_deletions": 16,
+      "accepted_lines": 698,
+      "overriden_lines": 15
+    }
+  },
+  "attestation_metadata": {
+    "KVRoadMap.md": [
+      {
+        "hash": "bc724571dc077ef2",
+        "line_ranges": [
+          {
+            "Range": [
+              157,
+              159
+            ]
+          },
+          {
+            "Range": [
+              161,
+              210
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a202ebb8acd8a2c99d7e7b1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  157,
+                  159
+                ]
+              },
+              {
+                "Range": [
+                  161,
+                  210
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/mem_cache/rotated_quant_memory_pool.py": [
+      {
+        "hash": "bc724571dc077ef2",
+        "line_ranges": [
+          {
+            "Range": [
+              419,
+              448
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a202ebb8acd8a2c99d7e7b1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  419,
+                  448
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py": [
+      {
+        "hash": "bc724571dc077ef2",
+        "line_ranges": [
+          {
+            "Range": [
+              382,
+              408
+            ]
+          },
+          {
+            "Range": [
+              423,
+              494
+            ]
+          },
+          {
+            "Range": [
+              661,
+              687
+            ]
+          },
+          {
+            "Range": [
+              784,
+              817
+            ]
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Range": [
+              382,
+              385
+            ]
+          },
+          {
+            "Range": [
+              388,
+              389
+            ]
+          }
+        ],
+        "operations": [
+          {
+            "operation_id": "6a202ebb8acd8a2c99d7e7b1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  382,
+                  408
+                ]
+              },
+              {
+                "Range": [
+                  423,
+                  494
+                ]
+              },
+              {
+                "Range": [
+                  661,
+                  687
+                ]
+              },
+              {
+                "Range": [
+                  784,
+                  817
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/build_rotated_kv_calib.py": [
+      {
+        "hash": "bc724571dc077ef2",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              699
+            ]
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Single": 659
+          },
+          {
+            "Single": 663
+          },
+          {
+            "Range": [
+              666,
+              668
+            ]
+          },
+          {
+            "Single": 672
+          },
+          {
+            "Single": 678
+          },
+          {
+            "Single": 680
+          },
+          {
+            "Single": 689
+          }
+        ],
+        "operations": [
+          {
+            "operation_id": "6a202ebb8acd8a2c99d7e7b1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  699
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "test/manual/quant/test_rotated_kv_quant_e2e.py": [
+      {
+        "hash": "bc724571dc077ef2",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              581
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a202ebb8acd8a2c99d7e7b1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  581
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "bc724571dc077ef2": {
+      "tool": "trae",
+      "conversation_id": "6a1ff1998acd8a2c99d7e3ea",
+      "session_id": "6a1ff1998acd8a2c99d7e3ea",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
