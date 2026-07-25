@@ -363,6 +363,9 @@ class Envs:
     # 0 preserves the existing behavior. This is useful for long cached-prefix
     # hits, which otherwise become one very large synchronous transfer.
     SGLANG_DISAGGREGATION_KV_TRANSFER_CHUNK_SIZE = EnvInt(0)
+    # Emit five-second aggregate diagnostics for Mooncake prefill transfer
+    # queues, high-level send stages, and synchronous engine calls.
+    SGLANG_DISAGGREGATION_TRANSFER_DEBUG = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)

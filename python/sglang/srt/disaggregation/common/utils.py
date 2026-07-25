@@ -38,6 +38,7 @@ class TransferKVChunk:
     pd_hidden_is_last_chunk: bool = False
     pd_hidden_release_indices: Optional[List[int]] = None
     enqueue_time: float = 0.0
+    queue_index: Optional[int] = None
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
