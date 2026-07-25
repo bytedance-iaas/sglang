@@ -305,7 +305,9 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        activation_scheme = cls.get_from_keys_or(
+            config, ["activation_scheme"], "dynamic"
+        )
         packed_modules_mapping = (
             cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
         )
@@ -322,7 +324,7 @@ class Fp8Config(QuantizationConfig):
             ignored_layers = normalized
 
         fp4_group_size = cls.get_from_keys_or(
-            config, ["expert_group_size", "group_size"], 32
+            config, ["fp4_group_size", "expert_group_size", "group_size"], 32
         )
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8:
