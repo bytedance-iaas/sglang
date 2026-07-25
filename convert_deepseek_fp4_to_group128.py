@@ -245,7 +245,7 @@ def convert_config(src_dir: Path, out_dir: Path, dst_group_size: int) -> None:
     quant_config["fp4_group_size"] = dst_group_size
     quant_config["quant_method"] = "fp8"
     quant_config["activation_scheme"] = "dynamic"
-    quant_config.pop("weight_block_size", None)
+    quant_config.setdefault("weight_block_size", [128, 128])
     quant_config.pop("fmt", None)
     quant_config.pop("scale_fmt", None)
     save_json(out_dir / "config.json", config)
