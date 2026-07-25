@@ -366,7 +366,7 @@ def _resolve_deepgemm_fp8fp4_contig_kernel():
     ):
         kernel = getattr(deep_gemm, kernel_name, None)
         if kernel is not None:
-            return kernel
+            return kernel, ("sm90_fused" if "sm90" in kernel_name else "generic")
     available = [
         name
         for name in dir(deep_gemm)
@@ -387,28 +387,28 @@ def _run_deepgemm_fp8fp4_contig(
     gran_k_a: int = 128,
     gran_k_b: int = 128,
 ):
-    kernel = _resolve_deepgemm_fp8fp4_contig_kernel()
-    call_variants = (
-        dict(gran_k=gran_k_a, gran_k_a=gran_k_a, gran_k_b=gran_k_b),
-        dict(gran_k_a=gran_k_a, gran_k_b=gran_k_b),
-        dict(recipe_a=(1, gran_k_a), recipe_b=(1, gran_k_b)),
-        {},
+    kernel, kernel_kind = _resolve_deepgemm_fp8fp4_contig_kernel()
+    if kernel_kind == "sm90_fused":
+        assert gran_k_a == gran_k_b
+        return kernel(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            gran_k=gran_k_a,
+            compiled_dims="nk",
+            use_psum_layout=False,
+        )
+    return kernel(
+        lhs,
+        rhs,
+        out,
+        m_indices,
+        recipe_a=(1, gran_k_a),
+        recipe_b=(1, gran_k_b),
+        disable_ue8m0_cast=True,
+        use_psum_layout=False,
     )
-    last_type_error = None
-    for kwargs in call_variants:
-        try:
-            return kernel(lhs, rhs, out, m_indices, **kwargs)
-        except TypeError as exc:
-            last_type_error = exc
-            message = str(exc)
-            if not (
-                "argument" in message
-                or "keyword" in message
-                or "incompatible function arguments" in message
-            ):
-                raise
-    assert last_type_error is not None
-    raise last_type_error
 
 
 class _GroupedContFp8Fp4WarmupExecutor(_BaseWarmupExecutor):

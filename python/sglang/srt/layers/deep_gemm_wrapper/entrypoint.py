@@ -143,7 +143,7 @@ def _resolve_deepgemm_fp8fp4_contig_kernel():
     ):
         kernel = getattr(deep_gemm, kernel_name, None)
         if kernel is not None:
-            return kernel
+            return kernel, ("sm90_fused" if "sm90" in kernel_name else "generic")
     available = [
         name
         for name in dir(deep_gemm)
@@ -180,29 +180,29 @@ def grouped_gemm_nt_f8fp4bf16_contig(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    kernel = _resolve_deepgemm_fp8fp4_contig_kernel()
-    call_variants = (
-        dict(gran_k=gran_k_a, gran_k_a=gran_k_a, gran_k_b=gran_k_b),
-        dict(gran_k_a=gran_k_a, gran_k_b=gran_k_b),
-        dict(recipe_a=(1, gran_k_a), recipe_b=(1, gran_k_b)),
-        {},
-    )
+    kernel, kernel_kind = _resolve_deepgemm_fp8fp4_contig_kernel()
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        last_type_error = None
-        for kwargs in call_variants:
-            try:
-                return kernel(lhs, rhs, out, m_indices, **kwargs)
-            except TypeError as exc:
-                last_type_error = exc
-                message = str(exc)
-                if not (
-                    "argument" in message
-                    or "keyword" in message
-                    or "incompatible function arguments" in message
-                ):
-                    raise
-        assert last_type_error is not None
-        raise last_type_error
+        if kernel_kind == "sm90_fused":
+            assert gran_k_a == gran_k_b
+            return kernel(
+                lhs,
+                rhs,
+                out,
+                m_indices,
+                gran_k=gran_k_a,
+                compiled_dims="nk",
+                use_psum_layout=False,
+            )
+        return kernel(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            recipe_a=(1, gran_k_a),
+            recipe_b=(1, gran_k_b),
+            disable_ue8m0_cast=True,
+            use_psum_layout=False,
+        )
 
 
 def _ensure_cuda(
