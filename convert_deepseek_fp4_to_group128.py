@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import shutil
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,33 @@ def resolve_device(device_arg: str) -> torch.device:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
     return device
+
+
+def resolve_devices(
+    device_arg: str,
+    devices_arg: str | None,
+    num_gpu_workers: int,
+) -> list[str]:
+    if devices_arg:
+        devices = [item.strip() for item in devices_arg.split(",") if item.strip()]
+        if not devices:
+            raise ValueError("--devices was set but no valid device was provided")
+        return [str(resolve_device(device)) for device in devices]
+
+    if num_gpu_workers < 1:
+        raise ValueError(f"--num-gpu-workers must be >= 1, got {num_gpu_workers}")
+    if num_gpu_workers == 1:
+        return [str(resolve_device(device_arg))]
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("--num-gpu-workers > 1 requires CUDA")
+    device_count = torch.cuda.device_count()
+    if device_count < num_gpu_workers:
+        raise RuntimeError(
+            f"Requested {num_gpu_workers} GPU workers, but only {device_count} "
+            "CUDA device(s) are visible"
+        )
+    return [f"cuda:{idx}" for idx in range(num_gpu_workers)]
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -260,6 +289,262 @@ def read_existing_shard_keys_and_size(path: Path) -> tuple[set[str], int]:
     return keys, total_size
 
 
+def convert_shard(
+    *,
+    file_idx: int,
+    total_files: int,
+    file_name: str,
+    names: list[str],
+    src_dir: Path,
+    out_dir: Path,
+    src_group_size: int,
+    dst_group_size: int,
+    device: torch.device,
+    fp4_table: torch.Tensor,
+    fp4_abs_thresholds: torch.Tensor,
+    resume: bool,
+    progress_every: int,
+) -> tuple[dict[str, str], int]:
+    src_file = src_dir / file_name
+    out_file = out_dir / file_name
+    expected_names = set(names)
+
+    if resume and out_file.exists():
+        existing_keys, existing_size = read_existing_shard_keys_and_size(out_file)
+        if expected_names.issubset(existing_keys):
+            if file_idx == 1 or file_idx % progress_every == 0 or file_idx == total_files:
+                print(
+                    f"[{file_idx}/{total_files}] skipping existing completed shard: "
+                    f"{file_name}",
+                    flush=True,
+                )
+            return {name: file_name for name in expected_names}, existing_size
+        print(
+            f"[{file_idx}/{total_files}] existing shard incomplete, regenerating: "
+            f"{file_name}",
+            flush=True,
+        )
+    elif file_idx == 1 or file_idx % progress_every == 0 or file_idx == total_files:
+        print(
+            f"[{file_idx}/{total_files}] converting shard on {device}: {file_name}",
+            flush=True,
+        )
+
+    state_dict: dict[str, torch.Tensor] = {}
+    emitted_map: dict[str, str] = {}
+    with safe_open(src_file, framework="pt", device="cpu") as reader:
+        key_set = set(reader.keys())
+        consumed: set[str] = set()
+        for name in names:
+            if name in consumed:
+                continue
+            if name not in key_set:
+                continue
+            tensor = reader.get_tensor(name)
+
+            if is_fp4_expert_weight(name, tensor):
+                scale_name = name.removesuffix(".weight") + ".scale"
+                if scale_name not in key_set:
+                    raise KeyError(f"missing scale tensor for {name}: {scale_name}")
+                tensor_on_device = tensor.to(device, non_blocking=True)
+                scale_on_device = reader.get_tensor(scale_name).to(
+                    device, non_blocking=True
+                )
+                new_weight, new_scale = regroup_fp4_tensor(
+                    tensor_on_device,
+                    scale_on_device,
+                    src_group_size=src_group_size,
+                    dst_group_size=dst_group_size,
+                    fp4_table=fp4_table,
+                    fp4_abs_thresholds=fp4_abs_thresholds,
+                )
+                state_dict[name] = new_weight.cpu()
+                state_dict[scale_name] = new_scale.cpu()
+                emitted_map[name] = file_name
+                emitted_map[scale_name] = file_name
+                consumed.add(scale_name)
+                del tensor_on_device, scale_on_device, new_weight, new_scale
+                continue
+
+            if name.endswith(".scale"):
+                # 非 expert 的 scale 先原样保留；如果目标后端也要求改布局，需要再单独处理。
+                state_dict[name] = tensor.float()
+            else:
+                state_dict[name] = tensor
+            emitted_map[name] = file_name
+
+    shard_size = sum(
+        tensor.numel() * tensor.element_size() for tensor in state_dict.values()
+    )
+    save_file(state_dict, out_file, metadata={"format": "pt"})
+    return emitted_map, shard_size
+
+
+def convert_shards_on_device(
+    *,
+    worker_id: int,
+    device_arg: str,
+    tasks: list[tuple[int, int, str, list[str]]],
+    src_dir: str,
+    out_dir: str,
+    src_group_size: int,
+    dst_group_size: int,
+    resume: bool,
+    progress_every: int,
+    empty_cache_every: int,
+    result_queue: mp.Queue,
+) -> None:
+    try:
+        torch.set_num_threads(min(8, os.cpu_count() or 1))
+        device = resolve_device(device_arg)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        fp4_table = FP4_TABLE.to(device)
+        fp4_abs_thresholds = FP4_ABS_THRESHOLDS.to(device)
+
+        for local_idx, (file_idx, total_files, file_name, names) in enumerate(
+            tasks, start=1
+        ):
+            emitted_map, shard_size = convert_shard(
+                file_idx=file_idx,
+                total_files=total_files,
+                file_name=file_name,
+                names=names,
+                src_dir=Path(src_dir),
+                out_dir=Path(out_dir),
+                src_group_size=src_group_size,
+                dst_group_size=dst_group_size,
+                device=device,
+                fp4_table=fp4_table,
+                fp4_abs_thresholds=fp4_abs_thresholds,
+                resume=resume,
+                progress_every=progress_every,
+            )
+            result_queue.put(("result", file_name, emitted_map, shard_size))
+            if (
+                device.type == "cuda"
+                and empty_cache_every > 0
+                and local_idx % empty_cache_every == 0
+            ):
+                torch.cuda.empty_cache()
+
+        result_queue.put(("done", worker_id))
+    except BaseException:
+        result_queue.put(("error", worker_id, traceback.format_exc()))
+
+
+def run_parallel_conversion(
+    *,
+    devices: list[str],
+    tasks: list[tuple[int, int, str, list[str]]],
+    src_dir: Path,
+    out_dir: Path,
+    src_group_size: int,
+    dst_group_size: int,
+    resume: bool,
+    progress_every: int,
+    empty_cache_every: int,
+) -> tuple[dict[str, str], dict[str, int]]:
+    if len(devices) == 1:
+        device = resolve_device(devices[0])
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        fp4_table = FP4_TABLE.to(device)
+        fp4_abs_thresholds = FP4_ABS_THRESHOLDS.to(device)
+        emitted_map: dict[str, str] = {}
+        shard_sizes: dict[str, int] = {}
+        for local_idx, (file_idx, total_files, file_name, names) in enumerate(
+            tasks, start=1
+        ):
+            shard_emitted_map, shard_size = convert_shard(
+                file_idx=file_idx,
+                total_files=total_files,
+                file_name=file_name,
+                names=names,
+                src_dir=src_dir,
+                out_dir=out_dir,
+                src_group_size=src_group_size,
+                dst_group_size=dst_group_size,
+                device=device,
+                fp4_table=fp4_table,
+                fp4_abs_thresholds=fp4_abs_thresholds,
+                resume=resume,
+                progress_every=progress_every,
+            )
+            emitted_map.update(shard_emitted_map)
+            shard_sizes[file_name] = shard_size
+            if (
+                device.type == "cuda"
+                and empty_cache_every > 0
+                and local_idx % empty_cache_every == 0
+            ):
+                torch.cuda.empty_cache()
+        return emitted_map, shard_sizes
+
+    task_groups: list[list[tuple[int, int, str, list[str]]]] = [
+        [] for _ in devices
+    ]
+    for idx, task in enumerate(tasks):
+        task_groups[idx % len(devices)].append(task)
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes: list[mp.Process] = []
+    for worker_id, (device_arg, worker_tasks) in enumerate(zip(devices, task_groups)):
+        if not worker_tasks:
+            continue
+        process = ctx.Process(
+            target=convert_shards_on_device,
+            kwargs={
+                "worker_id": worker_id,
+                "device_arg": device_arg,
+                "tasks": worker_tasks,
+                "src_dir": str(src_dir),
+                "out_dir": str(out_dir),
+                "src_group_size": src_group_size,
+                "dst_group_size": dst_group_size,
+                "resume": resume,
+                "progress_every": progress_every,
+                "empty_cache_every": empty_cache_every,
+                "result_queue": result_queue,
+            },
+        )
+        process.start()
+        processes.append(process)
+
+    emitted_map: dict[str, str] = {}
+    shard_sizes: dict[str, int] = {}
+    done_workers = 0
+    try:
+        while done_workers < len(processes):
+            message = result_queue.get()
+            kind = message[0]
+            if kind == "result":
+                _, file_name, shard_emitted_map, shard_size = message
+                emitted_map.update(shard_emitted_map)
+                shard_sizes[file_name] = shard_size
+            elif kind == "done":
+                done_workers += 1
+            elif kind == "error":
+                _, worker_id, error_text = message
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                raise RuntimeError(
+                    f"conversion worker {worker_id} failed:\n{error_text}"
+                )
+            else:
+                raise RuntimeError(f"unknown worker message: {message!r}")
+    finally:
+        for process in processes:
+            process.join()
+
+    failed = [process.exitcode for process in processes if process.exitcode not in (0,)]
+    if failed:
+        raise RuntimeError(f"conversion worker exit code(s): {failed}")
+    return emitted_map, shard_sizes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert packed FP4 tensors to group_size=128 FP4.")
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -270,6 +555,20 @@ def main() -> None:
         "--device",
         default="auto",
         help="转换计算设备：auto/cpu/cuda/cuda:0 等。默认 auto，有 CUDA 就用 CUDA。",
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help=(
+            "逗号分隔的转换设备列表，例如 cuda:0,cuda:1。设置后会覆盖 --device "
+            "和 --num-gpu-workers。"
+        ),
+    )
+    parser.add_argument(
+        "--num-gpu-workers",
+        type=int,
+        default=1,
+        help="使用前 N 张 CUDA GPU 并行转换。默认 1，设置为 8 会使用 cuda:0 到 cuda:7。",
     )
     parser.add_argument(
         "--empty-cache-every",
@@ -298,9 +597,7 @@ def main() -> None:
 
     src_dir = args.input_dir.resolve()
     out_dir = args.output_dir.resolve()
-    device = resolve_device(args.device)
-    fp4_table = FP4_TABLE.to(device)
-    fp4_abs_thresholds = FP4_ABS_THRESHOLDS.to(device)
+    devices = resolve_devices(args.device, args.devices, args.num_gpu_workers)
 
     index_path = src_dir / "model.safetensors.index.json"
     if not index_path.exists():
@@ -326,85 +623,27 @@ def main() -> None:
     for name, file_name in weight_map.items():
         by_file.setdefault(file_name, []).append(name)
 
-    emitted_map: dict[str, str] = {}
-    shard_sizes: dict[str, int] = {}
     ordered_files = sorted(by_file)
     total_files = len(ordered_files)
-    print(f"starting conversion: {total_files} shard(s), device={device}", flush=True)
-
-    for file_idx, file_name in enumerate(ordered_files, start=1):
-        src_file = src_dir / file_name
-        out_file = out_dir / file_name
-        expected_names = set(by_file[file_name])
-
-        if args.resume and out_file.exists():
-            existing_keys, existing_size = read_existing_shard_keys_and_size(out_file)
-            if expected_names.issubset(existing_keys):
-                emitted_map.update({name: file_name for name in expected_names})
-                shard_sizes[file_name] = existing_size
-                if file_idx == 1 or file_idx % args.progress_every == 0 or file_idx == total_files:
-                    print(
-                        f"[{file_idx}/{total_files}] skipping existing completed shard: {file_name}",
-                        flush=True,
-                    )
-                continue
-            print(
-                f"[{file_idx}/{total_files}] existing shard incomplete, regenerating: {file_name}",
-                flush=True,
-            )
-        elif file_idx == 1 or file_idx % args.progress_every == 0 or file_idx == total_files:
-            print(f"[{file_idx}/{total_files}] converting shard: {file_name}", flush=True)
-
-        state_dict: dict[str, torch.Tensor] = {}
-        with safe_open(src_file, framework="pt", device="cpu") as reader:
-            key_set = set(reader.keys())
-            consumed: set[str] = set()
-            for name in by_file[file_name]:
-                if name in consumed:
-                    continue
-                if name not in key_set:
-                    continue
-                tensor = reader.get_tensor(name)
-
-                if is_fp4_expert_weight(name, tensor):
-                    scale_name = name.removesuffix(".weight") + ".scale"
-                    if scale_name not in key_set:
-                        raise KeyError(f"missing scale tensor for {name}: {scale_name}")
-                    tensor_on_device = tensor.to(device, non_blocking=True)
-                    scale_on_device = reader.get_tensor(scale_name).to(device, non_blocking=True)
-                    new_weight, new_scale = regroup_fp4_tensor(
-                        tensor_on_device,
-                        scale_on_device,
-                        src_group_size=args.src_group_size,
-                        dst_group_size=args.dst_group_size,
-                        fp4_table=fp4_table,
-                        fp4_abs_thresholds=fp4_abs_thresholds,
-                    )
-                    state_dict[name] = new_weight.cpu()
-                    state_dict[scale_name] = new_scale.cpu()
-                    emitted_map[name] = file_name
-                    emitted_map[scale_name] = file_name
-                    consumed.add(scale_name)
-                    del tensor_on_device, scale_on_device, new_weight, new_scale
-                    continue
-
-                if name.endswith(".scale"):
-                    # 非 expert 的 scale 先原样保留；如果目标后端也要求改布局，需要再单独处理。
-                    state_dict[name] = tensor.float()
-                else:
-                    state_dict[name] = tensor
-                emitted_map[name] = file_name
-
-        shard_sizes[file_name] = sum(
-            tensor.numel() * tensor.element_size() for tensor in state_dict.values()
-        )
-        save_file(state_dict, out_file, metadata={"format": "pt"})
-        if (
-            device.type == "cuda"
-            and args.empty_cache_every > 0
-            and file_idx % args.empty_cache_every == 0
-        ):
-            torch.cuda.empty_cache()
+    tasks = [
+        (file_idx, total_files, file_name, by_file[file_name])
+        for file_idx, file_name in enumerate(ordered_files, start=1)
+    ]
+    print(
+        f"starting conversion: {total_files} shard(s), devices={','.join(devices)}",
+        flush=True,
+    )
+    emitted_map, shard_sizes = run_parallel_conversion(
+        devices=devices,
+        tasks=tasks,
+        src_dir=src_dir,
+        out_dir=out_dir,
+        src_group_size=args.src_group_size,
+        dst_group_size=args.dst_group_size,
+        resume=args.resume,
+        progress_every=args.progress_every,
+        empty_cache_every=args.empty_cache_every,
+    )
 
     total_size = sum(shard_sizes.values())
 
