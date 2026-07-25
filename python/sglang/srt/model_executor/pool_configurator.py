@@ -55,6 +55,7 @@ class MemoryPoolConfig:
     c4_max_total_num_tokens: int = 0
     c128_max_total_num_tokens: int = 0
     c4_state_pool_size: int = 0
+    c4_indexer_state_pool_size: int = 0
     c128_state_pool_size: int = 0
 
     mem_fraction_static: Optional[float] = None
@@ -518,6 +519,7 @@ class _DSV4PoolSizes:
     c4_max_total_num_tokens: int
     c128_max_total_num_tokens: int
     c4_state_pool_size: int
+    c4_indexer_state_pool_size: int
     c128_state_pool_size: int
 
 
@@ -547,6 +549,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
         self.swa_page_size = cfg.window_size
         self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
+        self.dcp_size = max(int(getattr(kvc.server_args, "dcp_size", 1)), 1)
         self.is_speculative = kvc.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
             kvc.server_args.max_speculative_num_draft_tokens or 0
@@ -560,7 +563,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             kvc.server_args.disaggregation_decode_extra_slots or 0
         )
-        if kvc.server_args.enable_hisparse:
+        self.enable_hisparse = kvc.server_args.enable_hisparse
+        if self.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(
@@ -579,7 +583,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
-        self.bytes_per_full_token = self._get_bytes_per_full_token()
+        (
+            self.sharded_bytes_per_full_token,
+            self.replicated_bytes_per_full_token,
+        ) = self._get_bytes_per_full_token_components()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
@@ -587,7 +594,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
             draft_layers = 1
             target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            speculative_scale = (target_layers + draft_layers) / target_layers
+            self.sharded_bytes_per_full_token *= speculative_scale
+            self.replicated_bytes_per_full_token *= speculative_scale
+
+        # DCP shards sequence-addressed SWA/C4/C128 KV pools across ranks.
+        # Compression state and the C4 indexer cache are still rank-local
+        # replicas, so solve capacity from the per-rank cost of one logical
+        # token rather than multiplying the DCP=1 capacity blindly.
+        self.bytes_per_full_token = (
+            self.sharded_bytes_per_full_token / self.dcp_size
+            + self.replicated_bytes_per_full_token
+        )
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -619,7 +637,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
 
-    def _get_bytes_per_full_token(self) -> float:
+    def _get_bytes_per_full_token_components(self) -> tuple[float, float]:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
@@ -648,11 +666,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
-        return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * indexer_bytes * self.num_layers_ca4
+        c4_kv_bytes = c4_frac * kv_bytes * self.num_layers_ca4
+        sharded_bytes = self.swa_ratio * kv_bytes * self.num_layers_total + (
+            1 / 128 * kv_bytes * self.num_layers_ca128
+        )
+        if not self.enable_hisparse:
+            sharded_bytes += c4_kv_bytes
+
+        replicated_bytes = (
+            # DCP can shard C4 indexer scoring work, but its cache storage is
+            # still addressed in the global C4 page space on every rank.
+            1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + self.swa_ratio
@@ -660,16 +684,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * c4_indexer_state_bytes
             * self.num_layers_ca4
         )
+        # HiSparse still allocates every logical C4 device page on each rank.
+        if self.enable_hisparse:
+            replicated_bytes += c4_kv_bytes
+
+        return sharded_bytes, replicated_bytes
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        c4_state_pool_size = swa_tokens // self.swa_page_size * self.c4_ring_size
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
+            c4_state_pool_size=c4_state_pool_size,
+            c4_indexer_state_pool_size=c4_state_pool_size,
             c128_state_pool_size=0,
         )
 
@@ -721,6 +752,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"c4={sizes.c4_max_total_num_tokens}, "
             f"c128={sizes.c128_max_total_num_tokens}, "
             f"c4_state={sizes.c4_state_pool_size}, "
+            f"c4_indexer_state={sizes.c4_indexer_state_pool_size}, "
             f"c128_state={sizes.c128_state_pool_size}"
         )
         return MemoryPoolConfig(
@@ -730,6 +762,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_max_total_num_tokens=sizes.c4_max_total_num_tokens,
             c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
             c4_state_pool_size=sizes.c4_state_pool_size,
+            c4_indexer_state_pool_size=sizes.c4_indexer_state_pool_size,
             c128_state_pool_size=sizes.c128_state_pool_size,
         )
 
@@ -768,6 +801,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         logger.info(
             f"DSV4 memory calculation: "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
+            f"sharded_bytes_per_full_token="
+            f"{self.sharded_bytes_per_full_token:.2f}, "
+            f"replicated_bytes_per_full_token="
+            f"{self.replicated_bytes_per_full_token:.2f}, "
+            f"dcp_size={self.dcp_size}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
