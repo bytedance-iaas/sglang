@@ -14,10 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-    DEEPGEMM_FP4_SCALE_B_UE8M0,
-    ENABLE_JIT_DEEPGEMM,
-)
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -172,14 +169,10 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG:
-            logger.info(
-                "Skipping DeepGEMM precompile for GROUPED_GEMM_NT_F8FP4BF16_CONTIG; "
-                "it depends on optional local DeepGEMM SM90 FP8xFP4 bindings."
-            )
-            return
-
-        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        if kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG,
+        ):
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
@@ -245,6 +238,7 @@ class _BaseWarmupExecutor:
         return {
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG: _GroupedContFp8Fp4WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED: _GroupedMaskedFp8Fp4WarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
@@ -274,20 +268,18 @@ class _BaseWarmupExecutor:
                 + num_groups * max_m * n * 2
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED:
-            rhs_scale_bytes = 4 + (1 if DEEPGEMM_FP4_SCALE_B_UE8M0 else 0)
             return (
                 num_groups * max_m * k
                 + num_groups * n * ceil_div(k, 2)
-                + num_groups * n * ceil_div(k, 32) * rhs_scale_bytes
+                + num_groups * n * ceil_div(k, 128) * 4
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG:
-            rhs_scale_bytes = 4 + (1 if DEEPGEMM_FP4_SCALE_B_UE8M0 else 0)
             return (
                 max_m * k
                 + num_groups * n * ceil_div(k, 2)
-                + num_groups * n * ceil_div(k, 32) * rhs_scale_bytes
+                + num_groups * n * ceil_div(k, 128) * 4
                 + max_m * 4
                 + max_m * n * 2
             ) / _GB
@@ -363,6 +355,85 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
+def _resolve_deepgemm_fp8fp4_contig_kernel():
+    for kernel_name in (
+        "m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma",
+        "m_grouped_fp8_fp4_gemm_nt_contiguous",
+        "m_grouped_fp8_fp4_gemm_nt_contig_sm90_fused_wgmma",
+        "m_grouped_fp8_fp4_gemm_nt_contig",
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contiguous",
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contig",
+    ):
+        kernel = getattr(deep_gemm, kernel_name, None)
+        if kernel is not None:
+            return kernel
+    available = [
+        name
+        for name in dir(deep_gemm)
+        if "fp4" in name and ("contig" in name or "contiguous" in name)
+    ]
+    raise RuntimeError(
+        "DeepGEMM does not expose an SM90 FP8xFP4 contiguous grouped GEMM. "
+        f"Available DeepGEMM fp4 contig symbols: {available}"
+    )
+
+
+def _run_deepgemm_fp8fp4_contig(
+    lhs,
+    rhs,
+    out,
+    m_indices,
+    *,
+    gran_k_a: int = 128,
+    gran_k_b: int = 128,
+):
+    kernel = _resolve_deepgemm_fp8fp4_contig_kernel()
+    call_variants = (
+        dict(gran_k=gran_k_a, gran_k_a=gran_k_a, gran_k_b=gran_k_b),
+        dict(gran_k_a=gran_k_a, gran_k_b=gran_k_b),
+        dict(recipe_a=(1, gran_k_a), recipe_b=(1, gran_k_b)),
+        {},
+    )
+    last_type_error = None
+    for kwargs in call_variants:
+        try:
+            return kernel(lhs, rhs, out, m_indices, **kwargs)
+        except TypeError as exc:
+            last_type_error = exc
+            message = str(exc)
+            if not (
+                "argument" in message
+                or "keyword" in message
+                or "incompatible function arguments" in message
+            ):
+                raise
+    assert last_type_error is not None
+    raise last_type_error
+
+
+class _GroupedContFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q = torch.empty(
+            (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
+        )
+        self.rhs_s = torch.empty(
+            (num_groups, n, ceil_div(k, 128)), device="cuda", dtype=torch.float32
+        )
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        _run_deepgemm_fp8fp4_contig(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            self.m_indices[:m],
+            gran_k_a=128,
+            gran_k_b=128,
+        )
+
+
 class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
@@ -409,37 +480,25 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
         self.rhs_q = torch.empty(
             (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
         )
-        rhs_s_k = ceil_div(k, 32)
+        rhs_s_k = ceil_div(k, 128)
         self.rhs_s = torch.empty(
             (num_groups, n, rhs_s_k), device="cuda", dtype=torch.float32
         )
-        self.rhs_s_e8m0 = None
-        if DEEPGEMM_FP4_SCALE_B_UE8M0:
-            tma_aligned_n = ceil_div(n, 16) * 16
-            self.rhs_s_e8m0 = torch.empty_strided(
-                (num_groups, n, rhs_s_k),
-                (tma_aligned_n * rhs_s_k, 1, tma_aligned_n),
-                device="cuda",
-                dtype=torch.uint8,
-            )
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
 
     def execute(self, m):
-        rhs_s = self.rhs_s
-        if self.rhs_s_e8m0 is not None:
-            rhs_s = self.rhs_s_e8m0
         deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
             (self.lhs_q, self.lhs_s),
-            (self.rhs_q, rhs_s),
+            (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
             expected_m=m,
             gran_k=128,
             gran_k_a=128,
-            gran_k_b=32,
+            gran_k_b=128,
         )
 
 
