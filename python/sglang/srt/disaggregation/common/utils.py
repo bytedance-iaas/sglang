@@ -24,6 +24,7 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
+    token_position_offset: int = 0
     chunk_id: Optional[int] = None
     kv_sent: bool = False
     pd_hidden_packet_idx: int = 0
@@ -37,6 +38,7 @@ class TransferKVChunk:
     pd_hidden_is_last_chunk: bool = False
     pd_hidden_release_indices: Optional[List[int]] = None
     enqueue_time: float = 0.0
+    queue_index: Optional[int] = None
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext

@@ -359,6 +359,13 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    # Maximum number of KV indices carried by one Mooncake transfer work item.
+    # 0 preserves the existing behavior. This is useful for long cached-prefix
+    # hits, which otherwise become one very large synchronous transfer.
+    SGLANG_DISAGGREGATION_KV_TRANSFER_CHUNK_SIZE = EnvInt(0)
+    # Emit five-second aggregate diagnostics for Mooncake prefill transfer
+    # queues, high-level send stages, and synchronous engine calls.
+    SGLANG_DISAGGREGATION_TRANSFER_DEBUG = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
@@ -907,6 +914,29 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Master gate for DeepSeek V4 Decode Context Parallel (DCP). When False
+    # (default), DSv4 hook rejects --dcp-size > 1 with a clear error so users
+    # cannot enable an unvalidated combination by accident. Flip to 1 once
+    # numerical-equivalence regression has been verified on the target cluster.
+    SGLANG_DSV4_ENABLE_DCP = EnvBool(False)
+    # Default DeepSeek V4 DCP decode path: each rank scores only the C4 indexer
+    # entries owned by its DCP shard, then gathers local top-k candidates and
+    # merges them into the global C4 sparse top-k. Set to 0 for fallback.
+    SGLANG_DSV4_DCP_SHARD_C4_INDEXER = EnvBool(True)
+    # Use one packed candidate collective for the sharded C4 top-k merge.
+    # Set to 0 to use the legacy unpacked merge.
+    SGLANG_DSV4_DCP_C4_PACKED_TOPK = EnvBool(True)
+    # Default DSV4 DCP attention merge: gather LSEs, then reduce-scatter the
+    # corrected FP32 output along the head dimension. Set to 0 for fallback.
+    SGLANG_DSV4_DCP_AG_RS = EnvBool(True)
+    # Experimental DSV4 DCP attention merge: exchange per-destination head
+    # chunks with all-to-all. This remains opt-in because it regresses smaller
+    # batches and increases CUDA graph memory.
+    SGLANG_DSV4_DCP_A2A_LSE = EnvBool(False)
+    # Debug-only validation for the A2A LSE merge. Run both the reference and
+    # A2A paths on the same real FlashMLA tensors and assert numerical parity.
+    # This mode requires decode CUDA graphs to be disabled.
+    SGLANG_DSV4_DCP_A2A_LSE_VERIFY = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
