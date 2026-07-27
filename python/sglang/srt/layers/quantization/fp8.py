@@ -1593,13 +1593,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 if will_use_deepgemm:
                     fp4_group_size = self.quant_config.fp4_group_size
-                    masked_gran_k = 32
-                    if fp4_group_size % masked_gran_k != 0:
-                        raise ValueError(
-                            f"fp4_group_size={fp4_group_size} must be divisible by "
-                            f"DeepGEMM masked gran_k={masked_gran_k}"
-                        )
-                    masked_expand_ratio = fp4_group_size // masked_gran_k
 
                     for scale_param, weight_param in [
                         (layer.w13_weight_scale_inv, layer.w13_weight),
@@ -1615,15 +1608,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                 f"expected {expected_loaded_k_groups} for k={k}, "
                                 f"fp4_group_size={fp4_group_size}"
                             )
-
-                        # Keep checkpoint group scale as the canonical parameter
-                        # for contiguous GEMM, but provide a K/32 runtime scale
-                        # for masked GEMM to hit DeepGEMM's small-M fast path.
-                        scale_param.fp4_masked_scale_data = (
-                            scale_param.data.repeat_interleave(
-                                masked_expand_ratio, dim=2
-                            ).contiguous()
-                        )
 
             if (
                 not self.is_fp4_expert
@@ -2366,10 +2350,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                w13_scale_fp4_masked=getattr(
-                    w13_scale, "fp4_masked_scale_data", None
-                ),
-                w2_scale_fp4_masked=getattr(w2_scale, "fp4_masked_scale_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
