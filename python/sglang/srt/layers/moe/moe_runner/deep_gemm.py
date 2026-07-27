@@ -92,6 +92,37 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
+def _get_fp4_group128_masked_scale(
+    masked_scale: Optional[torch.Tensor],
+    *,
+    scale_name: str,
+    n: int,
+    k: int,
+) -> torch.Tensor:
+    if masked_scale is None:
+        raise RuntimeError(
+            f"{scale_name} missing BF16 MN-major FP4 masked scale cache; "
+            "DeepGEMM FP4 masked path must use group128 scale layout."
+        )
+    expected_k_groups = ceil_div(k, 128)
+    expected_stride_1 = ceil_div(n, 8) * 8
+    if (
+        masked_scale.dtype != torch.bfloat16
+        or masked_scale.dim() != 3
+        or masked_scale.shape[1] != n
+        or masked_scale.shape[2] != expected_k_groups
+        or masked_scale.stride(1) != 1
+        or masked_scale.stride(2) != expected_stride_1
+    ):
+        raise RuntimeError(
+            f"{scale_name} must be BF16 MN-major/TMA-aligned group128 scale, "
+            f"got shape={tuple(masked_scale.shape)}, stride={tuple(masked_scale.stride())}, "
+            f"dtype={masked_scale.dtype}, expected n={n}, k_groups={expected_k_groups}, "
+            f"stride[1]=1, stride[2]={expected_stride_1}"
+        )
+    return masked_scale
+
+
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -479,10 +510,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         if is_fp4_experts:
-            w13_scale_for_gemm = (
-                quant_info.w13_scale_fp4_masked
-                if quant_info.w13_scale_fp4_masked is not None
-                else w13_scale
+            w13_scale_for_gemm = _get_fp4_group128_masked_scale(
+                quant_info.w13_scale_fp4_masked,
+                scale_name="w13_scale_fp4_masked",
+                n=n,
+                k=k,
             )
             # print(
             #     "[g128-debug] gemm0-input",
@@ -624,10 +656,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             }
 
         if is_fp4_experts:
-            w2_scale_for_gemm = (
-                quant_info.w2_scale_fp4_masked
-                if quant_info.w2_scale_fp4_masked is not None
-                else w2_scale
+            w2_scale_for_gemm = _get_fp4_group128_masked_scale(
+                quant_info.w2_scale_fp4_masked,
+                scale_name="w2_scale_fp4_masked",
+                n=n,
+                k=down_input.shape[2],
             )
             # print(
             #     "[g128-debug] gemm1-input",
