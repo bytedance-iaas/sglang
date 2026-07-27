@@ -1,0 +1,21 @@
+python/sglang/srt/layers/attention/deepseek_v4_backend.py
+  s_16dfd85b073934::t_6f4da2bed2c3b8 1879-1914,1935-1944
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5e0f0a454a2d1699317db259d21561c33e9f0086",
+  "prompts": {},
+  "sessions": {
+    "s_16dfd85b073934": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cb2e419d-3273-4708-9da4-35c52f383074",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
