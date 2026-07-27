@@ -482,11 +482,11 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
         )
         rhs_s_k = ceil_div(k, 128)
         aligned_n = ceil_div(n, 8) * 8
-        self.rhs_s = torch.empty(
+        self.rhs_s = torch.empty_strided(
             (num_groups, n, rhs_s_k),
+            (aligned_n * rhs_s_k, 1, aligned_n),
             device="cuda",
             dtype=torch.bfloat16,
-            stride=(aligned_n * rhs_s_k, 1, aligned_n),
         )
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
         self.out = torch.empty(
