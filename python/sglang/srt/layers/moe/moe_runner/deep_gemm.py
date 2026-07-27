@@ -103,6 +103,8 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m_sum_hint: Optional[int] = None
     active_expert_count_hint: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    use_psum_layout: bool = False
+    expected_m_for_psum_layout: Optional[int] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -224,6 +226,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 m_indices,
                 gran_k_a=128,
                 gran_k_b=128,
+                use_psum_layout=runner_input.use_psum_layout,
+                expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -321,6 +325,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 m_indices,
                 gran_k_a=128,
                 gran_k_b=128,
+                use_psum_layout=runner_input.use_psum_layout,
+                expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -949,6 +955,14 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device="cpu",
         ).cuda(non_blocking=True)
     expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+    use_psum_layout = (
+        quant_info.is_fp4_experts
+        and all_tokens > 0
+        and all(count % 128 == 0 for count in num_recv_tokens_per_expert)
+    )
+    expected_m_for_psum_layout = (
+        max(num_recv_tokens_per_expert) if use_psum_layout else None
+    )
 
     ep_scatter(
         hidden_states,
@@ -966,6 +980,9 @@ def pre_permute_deepep_normal_to_deep_gemm(
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
 
+    if use_psum_layout:
+        m_indices = torch.cumsum(num_recv_tokens_per_expert_gpu, dim=0)
+
     running_state["output_index"] = output_index
 
     return DeepGemmRunnerInput(
@@ -973,6 +990,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states_scale=input_tensor_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
+        use_psum_layout=use_psum_layout,
+        expected_m_for_psum_layout=expected_m_for_psum_layout,
     )
 
 

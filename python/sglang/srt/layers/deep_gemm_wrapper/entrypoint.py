@@ -169,6 +169,8 @@ def grouped_gemm_nt_f8fp4bf16_contig(
     m_indices: torch.Tensor,
     gran_k_a: int = 128,
     gran_k_b: int = 128,
+    use_psum_layout: bool = False,
+    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -191,7 +193,8 @@ def grouped_gemm_nt_f8fp4bf16_contig(
                 m_indices,
                 gran_k=gran_k_a,
                 compiled_dims="nk",
-                use_psum_layout=False,
+                use_psum_layout=use_psum_layout,
+                expected_m_for_psum_layout=expected_m_for_psum_layout,
             )
         return kernel(
             lhs,
@@ -201,7 +204,8 @@ def grouped_gemm_nt_f8fp4bf16_contig(
             recipe_a=(1, gran_k_a),
             recipe_b=(1, gran_k_b),
             disable_ue8m0_cast=True,
-            use_psum_layout=False,
+            use_psum_layout=use_psum_layout,
+            expected_m_for_psum_layout=expected_m_for_psum_layout,
         )
 
 
