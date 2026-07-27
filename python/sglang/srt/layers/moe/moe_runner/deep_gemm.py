@@ -981,7 +981,9 @@ def pre_permute_deepep_normal_to_deep_gemm(
         dispose_tensor(hidden_states_scale)
 
     if use_psum_layout:
-        m_indices = torch.cumsum(num_recv_tokens_per_expert_gpu, dim=0)
+        m_indices = torch.cumsum(
+            num_recv_tokens_per_expert_gpu, dim=0, dtype=torch.int32
+        ).contiguous()
 
     running_state["output_index"] = output_index
 
