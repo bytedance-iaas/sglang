@@ -1598,7 +1598,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         (layer.w13_weight_scale_inv, layer.w13_weight),
                         (layer.w2_weight_scale_inv, layer.w2_weight),
                     ]:
-                        _, _, k_groups_loaded = scale_param.data.shape
+                        num_experts, n, k_groups_loaded = scale_param.data.shape
                         k = weight_param.shape[2] * 2
 
                         expected_loaded_k_groups = k // fp4_group_size
@@ -1608,6 +1608,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                 f"expected {expected_loaded_k_groups} for k={k}, "
                                 f"fp4_group_size={fp4_group_size}"
                             )
+
+                        # DeepGEMM's gran_k_b=128 masked path has a BF16 SFB
+                        # fast path when scale B is MN-major and TMA aligned.
+                        # Keep the canonical checkpoint scale unchanged for
+                        # contig, and cache an optimized masked-only view.
+                        aligned_n = ((n + 7) // 8) * 8
+                        masked_scale = torch.empty_strided(
+                            (num_experts, n, k_groups_loaded),
+                            (aligned_n * k_groups_loaded, 1, aligned_n),
+                            dtype=torch.bfloat16,
+                            device=scale_param.data.device,
+                        )
+                        masked_scale.copy_(scale_param.data.to(torch.bfloat16))
+                        scale_param.fp4_masked_scale_data = masked_scale
 
             if (
                 not self.is_fp4_expert
@@ -2350,6 +2364,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
+                w13_scale_fp4_masked=getattr(
+                    w13_scale, "fp4_masked_scale_data", None
+                ),
+                w2_scale_fp4_masked=getattr(w2_scale, "fp4_masked_scale_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
