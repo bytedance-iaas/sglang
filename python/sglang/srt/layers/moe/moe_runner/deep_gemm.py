@@ -127,6 +127,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
+    w13_scale_fp4_masked: Optional[torch.Tensor] = None
+    w2_scale_fp4_masked: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects FP8xFP4 DeepGEMM kernels downstream.
     is_fp4_experts: bool = False
@@ -477,24 +479,30 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         if is_fp4_experts:
+            w13_scale_for_gemm = (
+                quant_info.w13_scale_fp4_masked
+                if quant_info.w13_scale_fp4_masked is not None
+                else w13_scale
+            )
+            w13_gran_k_b = 32 if quant_info.w13_scale_fp4_masked is not None else 128
             # print(
             #     "[g128-debug] gemm0-input",
             #     "lhs_act=", tuple(hidden_states.shape),
             #     "lhs_scale=", tuple(hidden_states_scale.shape) if hidden_states_scale is not None else None,
             #     "rhs_weight=", tuple(w13_weight.shape),
-            #     "rhs_scale=", tuple(w13_scale.shape),
-            #     "expected_rhs_scale_kgroups=", (k + 128 - 1) // 128,
+            #     "rhs_scale=", tuple(w13_scale_for_gemm.shape),
+            #     "expected_rhs_scale_kgroups=", (k + w13_gran_k_b - 1) // w13_gran_k_b,
             #     flush=True,
             # )
 
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (hidden_states, hidden_states_scale),
-                (w13_weight, w13_scale),
+                (w13_weight, w13_scale_for_gemm),
                 gateup_output,
                 masked_m,
                 gemm_expected_m,
                 gran_k_a=128,
-                gran_k_b=128,
+                gran_k_b=w13_gran_k_b,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
@@ -617,24 +625,30 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             }
 
         if is_fp4_experts:
+            w2_scale_for_gemm = (
+                quant_info.w2_scale_fp4_masked
+                if quant_info.w2_scale_fp4_masked is not None
+                else w2_scale
+            )
+            w2_gran_k_b = 32 if quant_info.w2_scale_fp4_masked is not None else 128
             # print(
             #     "[g128-debug] gemm1-input",
             #     "lhs_act=", tuple(down_input.shape),
             #     "lhs_scale=", tuple(down_input_scale.shape) if down_input_scale is not None else None,
             #     "rhs_weight=", tuple(w2_weight.shape),
-            #     "rhs_scale=", tuple(w2_scale.shape),
-            #     "expected_rhs_scale_kgroups=", (down_input.shape[2] + 128 - 1) // 128,
+            #     "rhs_scale=", tuple(w2_scale_for_gemm.shape),
+            #     "expected_rhs_scale_kgroups=", (down_input.shape[2] + w2_gran_k_b - 1) // w2_gran_k_b,
             #     flush=True,
             # )
 
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (down_input, down_input_scale),
-                (w2_weight, w2_scale),
+                (w2_weight, w2_scale_for_gemm),
                 down_output,
                 masked_m,
                 gemm_expected_m,
                 gran_k_a=128,
-                gran_k_b=128,
+                gran_k_b=w2_gran_k_b,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
