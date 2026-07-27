@@ -799,7 +799,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if envs.SGLANG_ENABLE_KVBIT.get():
             from kvbit.integration.sglang import install_kvbit
 
-            self._kvbit_stores = install_kvbit(self)
+            self._kvbit_stores = install_kvbit(
+                self,
+                bits=envs.SGLANG_KVBIT_BITS.get(),
+                mode=envs.SGLANG_KVBIT_MODE.get(),
+            )
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
