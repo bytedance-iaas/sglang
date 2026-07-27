@@ -2529,6 +2529,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "q_a_proj",
                 "kv_a_proj_with_mqa",
             ]
+        self.packed_modules_mapping["gate_up_proj"] = [
+            "gate_proj",
+            "up_proj",
+        ]
 
         # Quant configs like Quark may rely on the model to provide fused-module
         # mappings so exclusion checks can unfuse derived names back to the

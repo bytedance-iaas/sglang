@@ -153,7 +153,9 @@ class DeepseekV2WeightLoaderMixin:
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
-            params_dict = dict(self.named_parameters())
+            # Keep alias parameters such as weight/weight_packed visible for
+            # quantized layers that register both names to the same tensor.
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
             weight_names = []
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
@@ -224,6 +226,8 @@ class DeepseekV2WeightLoaderMixin:
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
