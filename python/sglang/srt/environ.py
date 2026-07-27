@@ -877,6 +877,13 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # KVBit low-bit KV cache plugin (opt-in). Wraps DeepSeekV4TokenToKVPool
+    # SWA write/read to build a rotated+packed KV mirror. No-op unless
+    # SGLANG_ENABLE_KVBIT is set. See kvbit docs/INTEGRATION_ROADMAP.md.
+    SGLANG_ENABLE_KVBIT = EnvBool(False)
+    SGLANG_KVBIT_BITS = EnvInt(4)                # 3 or 4 (BU3/BU4)
+    SGLANG_KVBIT_MODE = EnvStr("capture_only")   # off|capture_only|hybrid|full_kvbit
+
 
 envs = Envs()
 EnvField._allow_set_name = False

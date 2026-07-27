@@ -792,6 +792,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             token_oracle_manager=self._token_oracle_manager,
         )
 
+        # KVBit low-bit KV cache plugin. Same hook point as canary: after the
+        # pool is allocated and before init_device_graphs so warmup forwards
+        # captured into the graph see the wrapped pool. No-op unless
+        # SGLANG_ENABLE_KVBIT is set; lazy-imported to keep kvbit optional.
+        if envs.SGLANG_ENABLE_KVBIT.get():
+            from kvbit.integration.sglang import install_kvbit
+
+            self._kvbit_stores = install_kvbit(self)
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
