@@ -1,0 +1,21 @@
+python/sglang/srt/model_executor/model_runner.py
+  s_888e5c438e91ed::t_17fff4d3fdf796 802-806
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5c9e8f37aba196c9a677882b2f51d055dab6e160",
+  "prompts": {},
+  "sessions": {
+    "s_888e5c438e91ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c5121e7-5caf-4be9-8181-606040e3a205",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
