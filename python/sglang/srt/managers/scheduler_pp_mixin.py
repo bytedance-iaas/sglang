@@ -38,7 +38,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils import (
+    DynamicGradMode,
+    broadcast_pyobj,
+    point_to_point_pyobj,
+    require_attn_tp_gather,
+)
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -51,6 +56,17 @@ PPReleasePayload = Union[List[str], PPTransferStatus]
 PP_COMMITTED_RELEASE_CACHE_SIZE = 16384
 PP_PENDING_RELEASE_MAX_RIDS = 4096
 PP_PENDING_RELEASE_MAX_WAIT_SECONDS = 600
+
+
+def should_pp_allgather_tensors(
+    *,
+    enable_dsa_prefill_context_parallel: bool,
+    require_attn_tp_gather_: bool,
+) -> bool:
+    """Whether PP tensors are replicated across attention-TP ranks."""
+    return (
+        not enable_dsa_prefill_context_parallel and not require_attn_tp_gather_
+    )
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -799,9 +815,19 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
-        self.require_attn_tp_allgather = (
-            not get_parallel().enable_dsa_prefill_context_parallel
+        # The send-slice/receive-all-gather optimization is valid only when every
+        # attention-TP rank owns an identical PP tensor. A2A MoE and fully-DP
+        # dense layers leave model outputs token-scattered; slicing each rank's
+        # distinct tensor and then all-gathering silently splices unrelated rows.
+        # In that layout each PP lane must send its local tensor intact.
+        #
+        # DSA prefill CP likewise carries rank-local PP tensors and already
+        # bypassed this optimization.
+        self.require_attn_tp_allgather = should_pp_allgather_tensors(
+            enable_dsa_prefill_context_parallel=(
+                get_parallel().enable_dsa_prefill_context_parallel
+            ),
+            require_attn_tp_gather_=require_attn_tp_gather(self.server_args),
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size

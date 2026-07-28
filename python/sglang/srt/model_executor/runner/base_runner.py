@@ -61,6 +61,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def resolve_pp_proxy_num_tokens(
+    *,
+    tensor_name: str,
+    num_tokens: int,
+    forward_mode: ForwardMode,
+    pp_rank: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+    require_attn_tp_gather_: bool,
+) -> int:
+    """Return the rank-local PP proxy width used by dummy/capture forwards.
+
+    A non-first PP stage receives the previous stage's rank-local hidden states.
+    Extend CP sends every proxy tensor as a CP-local slice. Outside CP, an A2A
+    MoE boundary carries TP-local hidden/residual rows, while DSA top-k indices
+    remain full-token metadata consumed after the next stage gathers attention
+    inputs.
+    """
+    if pp_rank == 0:
+        return num_tokens
+
+    split_size = 1
+    if forward_mode == ForwardMode.EXTEND and attn_cp_size > 1:
+        split_size = attn_cp_size
+    elif (
+        tensor_name != "topk_indices"
+        and require_attn_tp_gather_
+        and attn_tp_size > 1
+    ):
+        split_size = attn_tp_size
+
+    # ForwardBatch.prepare_mlp_sync_batch pads the global token width before
+    # reduce-scatter. Capture/replay must mirror that padding for odd decode
+    # batch sizes (for example, bs=1 with attention TP=2 has one local row).
+    return (num_tokens + split_size - 1) // split_size
+
+
 def _allocate_decode_buffers(
     *,
     device: torch.device,
@@ -477,16 +514,23 @@ class BaseRunner(ABC):
             extend_start_loc = None
 
         if mr.server_args.pp_size > 1:
-            # PP0 already cp-split hidden_states before send.
-            pp_hidden_tokens = num_tokens
-            if (
-                capture_forward_mode == ForwardMode.EXTEND
-                and mr.ps.pp_rank != 0
-                and mr.ps.attn_cp_size > 1
-            ):
-                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {
+                    k: v[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=k,
+                            num_tokens=num_tokens,
+                            forward_mode=capture_forward_mode,
+                            pp_rank=mr.ps.pp_rank,
+                            attn_tp_size=mr.ps.attn_tp_size,
+                            attn_cp_size=mr.ps.attn_cp_size,
+                            require_attn_tp_gather_=require_attn_tp_gather(
+                                mr.server_args
+                            ),
+                        )
+                    ]
+                    for k, v in buffers.pp_proxy_tensors.items()
+                }
             )
 
         # TP-gather requirements for global token metadata.

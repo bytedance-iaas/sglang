@@ -25,6 +25,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
+    copy_pp_proxy_tensors_to_graph_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -943,6 +944,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             cache_loc_dtype=torch.int64,
             source=src,
         )
+        hs.fill_(9)  # stale data from a larger previous graph replay
         self.assertTrue(reg.has_slot("pp_proxy_tensors.hidden_states"))
         self.assertEqual(
             reg.get_slot("pp_proxy_tensors.hidden_states").buffer.data_ptr(),
@@ -962,7 +964,26 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             pp_proxy_tensors=pp,
         )
         self.assertTrue(torch.all(hs[:3] == 1))
-        self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
+        self.assertTrue(torch.all(hs[3:] == 0))  # stale padded tail cleared
+
+    def test_direct_pp_proxy_copy_clears_stale_tail(self):
+        hidden = torch.full((8, 2), 9, dtype=torch.int32)
+        residual = torch.full((8, 2), 7, dtype=torch.int32)
+        pp = SimpleNamespace(
+            tensors={
+                "hidden_states": torch.ones((3, 2), dtype=torch.int32),
+                "residual": torch.full((5, 2), 2, dtype=torch.int32),
+            }
+        )
+
+        copy_pp_proxy_tensors_to_graph_buffers(
+            {"hidden_states": hidden, "residual": residual}, pp
+        )
+
+        self.assertTrue(torch.all(hidden[:3] == 1))
+        self.assertTrue(torch.all(hidden[3:] == 0))
+        self.assertTrue(torch.all(residual[:5] == 2))
+        self.assertTrue(torch.all(residual[5:] == 0))
 
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (

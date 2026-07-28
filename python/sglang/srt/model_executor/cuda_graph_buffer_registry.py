@@ -65,6 +65,44 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         _foreach_copy(group_dsts, group_srcs)
 
 
+def zero_pp_proxy_buffer_tail(
+    buffer: torch.Tensor, source: torch.Tensor
+) -> None:
+    """Clear graph-resident PP rows that are not overwritten by ``source``.
+
+    A padded CUDA-graph replay may expose more PP proxy rows than the live
+    batch provides. Those rows participate in attention-TP collectives for
+    token-scattered PP layouts, so retaining data from a previous replay can
+    corrupt real tokens even though the final graph output is sliced back to
+    the raw batch size.
+    """
+    source_len = source.shape[0]
+    if source_len > buffer.shape[0]:
+        raise ValueError(
+            f"PP proxy source length {source_len} exceeds graph buffer "
+            f"length {buffer.shape[0]}"
+        )
+    if source_len < buffer.shape[0]:
+        buffer[source_len:].zero_()
+
+
+def copy_pp_proxy_tensors_to_graph_buffers(
+    destination: Dict[str, torch.Tensor], source: Any
+) -> None:
+    """Copy live PP proxy rows and clear every graph-buffer tail."""
+    for key, buffer in destination.items():
+        src = source.tensors.get(key)
+        if src is None:
+            continue
+        if src.shape[0] > buffer.shape[0]:
+            raise ValueError(
+                f"PP proxy tensor {key!r} has {src.shape[0]} rows, but its "
+                f"graph buffer has only {buffer.shape[0]}"
+            )
+        buffer[: src.shape[0]].copy_(src)
+        zero_pp_proxy_buffer_tail(buffer, src)
+
+
 class PaddingPolicy(Enum):
     """How to handle ``raw_n < padded_n`` for a slot.
 
@@ -746,6 +784,17 @@ def build_decode_registry(
 
                 return _fn
 
+            def _pp_zero_tail(key):
+                def _fn(buf, _fb, ctx):
+                    ppx = ctx.pp_proxy_tensors
+                    if ppx is None:
+                        return
+                    src = ppx.tensors.get(key)
+                    if src is not None:
+                        zero_pp_proxy_buffer_tail(buf, src)
+
+                return _fn
+
             for _key, _backing in pp.items():
                 reg.register_slot(
                     GraphSlot(
@@ -755,6 +804,7 @@ def build_decode_registry(
                         axis="none",
                         padding_policy=PaddingPolicy.KEEP_PAD,
                         source_fn=_pp_source(_key),
+                        post_fill=_pp_zero_tail(_key),
                     ),
                     bind=_backing,
                 )
