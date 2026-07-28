@@ -154,6 +154,10 @@ class EICHiRadixCache(RadixCache):
         self.tp_group = params.tp_cache_group
         self.tp_size = self.tp_group.size()
         self.rank = self.tp_group.rank()
+        # PP stages store each layer-shard's KV under a distinct EIC namespace
+        # (deploy_key embeds pp_rank), so per-stage load-back can succeed/fail
+        # independently. loading_check reconciles the admitted length across PP.
+        self.pp_group = params.pp_cache_group
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.sliding_window_size = params.sliding_window_size
         self.load_cache_event = threading.Event()
@@ -463,6 +467,18 @@ class EICHiRadixCache(RadixCache):
                 f"queue size {queue_size.item()}"
             )
 
+    def _pp_reduce_min(self, tensor):
+        # PP stages store their layers' KV in distinct EIC namespaces, so
+        # per-stage load-back completes independently. MIN across PP keeps the
+        # radix tree (and thus the admitted extend_len) identical on every stage.
+        if (
+            self.pp_group is not None
+            and torch.distributed.get_world_size(group=self.pp_group) > 1
+        ):
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
+
     def loading_check(self):
         if len(self.ongoing_load_back) == 0:
             return
@@ -477,12 +493,20 @@ class EICHiRadixCache(RadixCache):
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
+        self._pp_reduce_min(queue_size)
         ack_list = []
         complete_tokens = []
         for _ in range(queue_size.item()):
             ack_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
             ack_list.append(ack_id)
             complete_tokens.append(complete_token)
+        # Load thread is a single FIFO consumer, so ack order is identical on
+        # every rank; complete_token is CP-reduced in the controller, MIN it
+        # across PP too so every stage truncates each node to the same length.
+        if ack_list:
+            ct = torch.tensor(complete_tokens, dtype=torch.int64)
+            self._pp_reduce_min(ct)
+            complete_tokens = ct.tolist()
         for ack_id, complete_token in zip(ack_list, complete_tokens):
             start_node, end_node, total_token_num = self.ongoing_load_back[ack_id]
             self.dec_lock_ref(end_node)
@@ -1248,6 +1272,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
                 group=self.tp_group,
             )
             eic_prefix_lens = eic_prefix_len_tensor.tolist()
+        # MIN across PP so the load-back decision is identical on every stage,
+        # else loading_check's PP reduce deadlocks on a divergent req set.
+        eic_prefix_len_tensor = torch.tensor(eic_prefix_lens, dtype=torch.int64)
+        self._pp_reduce_min(eic_prefix_len_tensor)
+        eic_prefix_lens = eic_prefix_len_tensor.tolist()
         for i, (last_node, req, local_prefix_len, local_evict_len) in enumerate(
             fetch_list
         ):
