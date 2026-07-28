@@ -186,5 +186,45 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(sorted(freed.tolist()), [512, 768])
 
 
+    def test_loading_check_reduces_load_back_across_pp(self):
+        # PP stages store their layers' KV in distinct EIC namespaces, so a
+        # shared node can load back a different token count per stage. Without a
+        # PP-group MIN on both the drain count and complete_token, the radix
+        # tree truncates differently per stage and the admitted extend_len
+        # diverges -> fused_q_norm_rope batch_size crash. Assert both are
+        # reduced over pp_group with MIN.
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
+
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.tp_group = None  # TP reduces (group=None) are ignored by the test
+        cache.pp_group = object()
+        node = SimpleNamespace()
+        cache.ongoing_load_back = {0: (node, node, 64)}  # start==end: loop is a no-op
+        q = Queue()
+        q.put((0, 64))
+        cache.cache_controller = SimpleNamespace(ack_load_queue=q)
+        cache.dec_lock_ref = lambda n: None
+
+        pp_reduces = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+            if group is cache.pp_group:
+                pp_reduces.append(tensor.numel())
+
+        with mock.patch.object(
+            torch.distributed, "get_world_size", return_value=2
+        ), mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=fake_all_reduce
+        ):
+            EICPagedHiRadixCache.loading_check(cache)
+
+        # Both the drain count and the complete_token vector are MIN-reduced
+        # over the PP group (each numel==1 for this single-ack case).
+        self.assertEqual(
+            pp_reduces, [1, 1], "expected drain-count + complete_token PP reduces"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
