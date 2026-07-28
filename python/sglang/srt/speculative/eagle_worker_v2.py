@@ -1254,7 +1254,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         elif self._pp_enabled:
             # Under PP the verify input is built from the raw draft tree relayed
-            # from the last PP rank of the previous iteration.
+            # from the last PP rank of the previous iteration. A PD decode
+            # worker is different on its first iteration: disaggregation
+            # restores an EagleDraftInput from the prefill metadata, but there
+            # is no previous local PP iteration whose last rank could have
+            # produced EaglePPVerifyInputRaw. Seed that iteration with the same
+            # dummy tree used for the unified prefill-to-decode transition.
+            # The PP last rank will publish a real draft tree for every
+            # following iteration.
+            if isinstance(batch.spec_info, EagleDraftInput):
+                batch.input_ids = batch.spec_info.bonus_tokens
+                batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+                    batch, self.speculative_num_draft_tokens
+                )
             verify_input = self._build_verify_input_from_pp_raw(batch)
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])

@@ -454,10 +454,26 @@ class EaglePPVerifyInputRaw(SpecInput):
         placeholder tree (each req's bonus token replicated num_draft times)
         is constructed here.
         """
-        bs = len(batch.reqs)
+        return cls.build_dummy_from_bonus_tokens(
+            bonus_tokens=batch.input_ids,
+            num_draft=num_draft,
+        )
+
+    @classmethod
+    def build_dummy_from_bonus_tokens(
+        cls, bonus_tokens: torch.Tensor, num_draft: int
+    ) -> "EaglePPVerifyInputRaw":
+        """Build the first PP verify tree from prefill's bonus tokens.
+
+        PD decode creates an :class:`EagleDraftInput` for each newly
+        transferred request.  Converting it to this CPU relay form before
+        merging lets a new request join a running PP batch whose spec input is
+        already an ``EaglePPVerifyInputRaw``.
+        """
+        bonus_tokens = bonus_tokens.tolist()
+        bs = len(bonus_tokens)
         parent_width = max(num_draft - 1, 0)
 
-        bonus_tokens = batch.input_ids.tolist()
         draft_tokens = [bonus_tokens[i : i + 1] * num_draft for i in range(bs)]
         parent_row = list(range(-1, parent_width - 1))
         parent_list = [parent_row[:] for _ in range(bs)]
@@ -474,9 +490,20 @@ class EaglePPVerifyInputRaw(SpecInput):
         )
 
     def filter_batch(
-        self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = False,
+        new_indices_cpu: Optional[List[int]] = None,
     ):
-        idx = new_indices.tolist()
+        # ScheduleBatch.filter_batch passes this argument for every speculative
+        # input. Unlike EagleDraftInput, this CPU-side PP relay has not already
+        # been filtered by the verifier, so it always selects the kept rows.
+        del has_been_filtered
+        idx = (
+            new_indices_cpu
+            if new_indices_cpu is not None
+            else new_indices.tolist()
+        )
 
         def pick(lst):
             return [lst[i] for i in idx]

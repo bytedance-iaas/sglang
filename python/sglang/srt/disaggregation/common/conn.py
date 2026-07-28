@@ -850,6 +850,30 @@ class CommonKVManager(BaseKVManager):
         # Regular MLA PP slicing
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + len(src_kv_ptrs)
+
+        # With matching PP topologies the decode rank registers only its local
+        # stage buffers. If speculative decoding is enabled only on decode,
+        # draft-model buffers are appended after those main-model buffers, so
+        # the list is longer than the prefill list even though both ranks own
+        # the same target layers. A global [start_layer:end_layer] slice would
+        # be empty on every stage after PP0. Detect the local-stage layout by
+        # its inability to cover the global end layer and select only the
+        # leading target-model buffers; the appended draft cache is populated
+        # locally by the decode worker.
+        if len(dst_kv_ptrs) < end_layer:
+            if len(dst_kv_ptrs) < len(src_kv_ptrs):
+                raise ValueError(
+                    "Decode MLA KV pointer list is shorter than the matching "
+                    "prefill PP stage: "
+                    f"src={len(src_kv_ptrs)}, dst={len(dst_kv_ptrs)}, "
+                    f"prefill_layers=[{start_layer}, {end_layer})."
+                )
+            return (
+                src_kv_ptrs,
+                dst_kv_ptrs[: len(src_kv_ptrs)],
+                len(src_kv_ptrs),
+            )
+
         # Decode pp size should be equal to prefill pp size or 1
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
