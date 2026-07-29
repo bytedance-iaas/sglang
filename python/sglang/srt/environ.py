@@ -919,6 +919,17 @@ class Envs:
     # Use one packed candidate collective for the sharded C4 top-k merge.
     # Set to 0 to use the legacy unpacked merge.
     SGLANG_DSV4_DCP_C4_PACKED_TOPK = EnvBool(True)
+    # Default DSV4 DCP attention merge: gather LSEs, then reduce-scatter the
+    # corrected FP32 output along the head dimension. Set to 0 for fallback.
+    SGLANG_DSV4_DCP_AG_RS = EnvBool(True)
+    # Experimental DSV4 DCP attention merge: exchange per-destination head
+    # chunks with all-to-all. This remains opt-in because it regresses smaller
+    # batches and increases CUDA graph memory.
+    SGLANG_DSV4_DCP_A2A_LSE = EnvBool(False)
+    # Debug-only validation for the A2A LSE merge. Run both the reference and
+    # A2A paths on the same real FlashMLA tensors and assert numerical parity.
+    # This mode requires decode CUDA graphs to be disabled.
+    SGLANG_DSV4_DCP_A2A_LSE_VERIFY = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
