@@ -2309,14 +2309,6 @@ class DeepseekV4Model(nn.Module):
                     if key.startswith("pd_aux_hidden_states_")
                 )
             ]
-            if hidden_states.shape[0] != positions.shape[0]:
-                rids = getattr(forward_batch, "rids", None)
-                raise RuntimeError(
-                    "PP proxy hidden token count does not match current positions: "
-                    f"pp_rank={self.pp_group.rank_in_group}, "
-                    f"hidden_tokens={hidden_states.shape[0]}, "
-                    f"position_tokens={positions.shape[0]}, rids={rids}"
-                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
@@ -2342,6 +2334,21 @@ class DeepseekV4Model(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+
+        # The first PP rank applies prefill-CP sharding before sending hidden
+        # states downstream. Later PP ranks must apply the same sharding to
+        # positions before comparing token counts with the received PP tensor.
+        if (
+            not self.pp_group.is_first_rank
+            and hidden_states.shape[0] != positions.shape[0]
+        ):
+            rids = getattr(forward_batch, "rids", None)
+            raise RuntimeError(
+                "PP proxy hidden token count does not match current positions: "
+                f"pp_rank={self.pp_group.rank_in_group}, "
+                f"hidden_tokens={hidden_states.shape[0]}, "
+                f"position_tokens={positions.shape[0]}, rids={rids}"
+            )
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):

@@ -24,6 +24,7 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
+    token_position_offset: int = 0
     chunk_id: Optional[int] = None
     kv_sent: bool = False
     pd_hidden_packet_idx: int = 0
