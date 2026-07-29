@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     pass
 
 _TOPK_V2_MAX_SUPPORTED_LENGTH = 262144
+_C4_TOPK = 512
 
 
 def _maybe_copy_flashmla_sched_meta(dst, src) -> bool:
@@ -97,6 +98,33 @@ Some other notes:
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 
+def get_dcp_sharded_c4_seq_lens(
+    c4_seq_lens: torch.Tensor,
+    c4_page_size: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Return lengths after interleaving logical C4 pages across DCP ranks."""
+
+    assert c4_page_size > 0
+    assert dcp_world_size > 0
+    assert 0 <= dcp_rank < dcp_world_size
+
+    shape = c4_seq_lens.shape
+    seq_lens = c4_seq_lens.reshape(-1).to(torch.int64)
+    full_pages = seq_lens // c4_page_size
+    tail = seq_lens % c4_page_size
+
+    # Count full logical pages p where p % world_size == rank.
+    local_full_pages = torch.clamp(
+        (full_pages + dcp_world_size - 1 - dcp_rank) // dcp_world_size,
+        min=0,
+    )
+    owns_tail = (tail > 0) & ((full_pages % dcp_world_size) == dcp_rank)
+    local_tail = torch.where(owns_tail, tail, torch.zeros_like(tail))
+    return (local_full_pages * c4_page_size + local_tail).to(torch.int32).view(shape)
+
+
 def copy_metadata(
     *,
     src,
@@ -104,8 +132,10 @@ def copy_metadata(
     check_eq_fields: List[str],
     copy_fields: List[str],
     assign_fields: Optional[List[str]] = None,
+    preserve_fields: Optional[List[str]] = None,
 ):
     assign_fields = assign_fields or []
+    preserve_fields = preserve_fields or []
 
     for field_name in check_eq_fields:
         src_val = getattr(src, field_name)
@@ -132,7 +162,31 @@ def copy_metadata(
         if not _maybe_copy_flashmla_sched_meta(dst_val, src_val):
             setattr(dst, field_name, src_val)
 
-    provided_fields = check_eq_fields + copy_fields + assign_fields
+    # CUDA graphs retain workspace addresses captured in kernel arguments. The
+    # replay metadata may own equivalent scratch tensors, but replacing or
+    # copying them is unnecessary and can invalidate the captured contract.
+    for field_name in preserve_fields:
+        src_val = getattr(src, field_name)
+        dst_val = getattr(dst, field_name)
+        if src_val is None or dst_val is None:
+            assert (
+                src_val is None and dst_val is None
+            ), f"{field_name=} {src_val=} {dst_val=}"
+            continue
+        assert isinstance(src_val, torch.Tensor) and isinstance(
+            dst_val, torch.Tensor
+        ), f"{field_name=} must contain matching tensors"
+        assert (
+            src_val.shape == dst_val.shape
+        ), f"{field_name=} {src_val.shape=} {dst_val.shape=}"
+        assert (
+            src_val.dtype == dst_val.dtype
+        ), f"{field_name=} {src_val.dtype=} {dst_val.dtype=}"
+        assert (
+            src_val.device == dst_val.device
+        ), f"{field_name=} {src_val.device=} {dst_val.device=}"
+
+    provided_fields = check_eq_fields + copy_fields + assign_fields + preserve_fields
     provided_fields_unique = set(provided_fields)
     assert len(provided_fields) == len(
         provided_fields_unique
@@ -163,40 +217,90 @@ class PagedIndexerMetadata:
     c4_seq_lens: torch.Tensor
     use_prefill_cuda_graph: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
+    dcp_world_size: int = field(init=False, repr=False, default=1)
+    dcp_rank: int = field(init=False, repr=False, default=0)
+    dcp_local_page_table: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
+    dcp_local_c4_seq_lens: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
+    dcp_deep_gemm_metadata: Any = field(init=False, repr=False, default=None)
+    dcp_local_topk_candidates: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
+    dcp_gathered_topk_candidates: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
         init=False, repr=False, default=None
     )
 
-    def __post_init__(self):
+    def _make_deep_gemm_metadata(self, c4_seq_lens: torch.Tensor):
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
-            self.deep_gemm_metadata = None
+            return None
+
+        import deep_gemm
+
+        use_jit_indexer = (
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+            or c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+        )
+        if use_jit_indexer:
+            from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
         else:
-            import deep_gemm
+            from deep_gemm import get_paged_mqa_logits_metadata
 
-            use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+        _c4 = c4_seq_lens.to(torch.int32)
+        if _c4.dim() == 1:
+            _c4 = _c4.unsqueeze(-1)
+        metadata = get_paged_mqa_logits_metadata(
+            _c4,
+            self.c4_page_size,
+            deep_gemm.get_num_sms(),
+        )
+        assert isinstance(metadata, torch.Tensor)
+        return metadata
 
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
+    def __post_init__(self):
+        self.deep_gemm_metadata = self._make_deep_gemm_metadata(self.c4_seq_lens)
 
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+        if envs.SGLANG_DSV4_DCP_SHARD_C4_INDEXER.get() and not is_hip():
+            from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
+
+            dcp_group = get_dcp_group_no_assert()
+            if dcp_group is not None and dcp_group.world_size > 1:
+                self.dcp_world_size = dcp_group.world_size
+                self.dcp_rank = dcp_group.rank_in_group
+                self.dcp_local_page_table = self.page_table[
+                    :, self.dcp_rank :: self.dcp_world_size
+                ].contiguous()
+                self.dcp_local_c4_seq_lens = get_dcp_sharded_c4_seq_lens(
+                    self.c4_seq_lens,
+                    self.c4_page_size,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                )
+                self.dcp_deep_gemm_metadata = self._make_deep_gemm_metadata(
+                    self.dcp_local_c4_seq_lens
+                )
+                if envs.SGLANG_DSV4_DCP_C4_PACKED_TOPK.get():
+                    batch_size = self.page_table.shape[0]
+                    self.dcp_local_topk_candidates = torch.empty(
+                        (batch_size, _C4_TOPK),
+                        dtype=torch.int64,
+                        device=self.page_table.device,
+                    )
+                    self.dcp_gathered_topk_candidates = torch.empty(
+                        (self.dcp_world_size * batch_size, _C4_TOPK),
+                        dtype=torch.int64,
+                        device=self.page_table.device,
+                    )
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
@@ -242,13 +346,27 @@ class PagedIndexerMetadata:
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+        copy_fields += [
+            "dcp_local_page_table",
+            "dcp_local_c4_seq_lens",
+            "dcp_deep_gemm_metadata",
+            "topk_metadata",
+        ]
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size", "use_prefill_cuda_graph"],
+            check_eq_fields=[
+                "page_size",
+                "use_prefill_cuda_graph",
+                "dcp_world_size",
+                "dcp_rank",
+            ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
+            preserve_fields=[
+                "dcp_local_topk_candidates",
+                "dcp_gathered_topk_candidates",
+            ],
         )
         self.nonpaged_plan = None
 

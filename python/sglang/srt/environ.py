@@ -912,6 +912,13 @@ class Envs:
     # cannot enable an unvalidated combination by accident. Flip to 1 once
     # numerical-equivalence regression has been verified on the target cluster.
     SGLANG_DSV4_ENABLE_DCP = EnvBool(False)
+    # Default DeepSeek V4 DCP decode path: each rank scores only the C4 indexer
+    # entries owned by its DCP shard, then gathers local top-k candidates and
+    # merges them into the global C4 sparse top-k. Set to 0 for fallback.
+    SGLANG_DSV4_DCP_SHARD_C4_INDEXER = EnvBool(True)
+    # Use one packed candidate collective for the sharded C4 top-k merge.
+    # Set to 0 to use the legacy unpacked merge.
+    SGLANG_DSV4_DCP_C4_PACKED_TOPK = EnvBool(True)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
