@@ -1,0 +1,21 @@
+python/sglang/srt/mem_cache/hiradix_cache.py
+  s_529464cdfbf979::t_fd2a0b1d580b08 1141-1147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6e5f3166fa4b1f06f4b42ebb3fb37edc300ceac9",
+  "prompts": {},
+  "sessions": {
+    "s_529464cdfbf979": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f63ee-7d5b-7863-a278-77cf383d0060",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

@@ -1,0 +1,18 @@
+python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+  h_11d5c68ede7790 29
+python/sglang/srt/models/deepseek_v4.py
+  h_11d5c68ede7790 4,10-11,14,32-37,44-46,79,132-137,164-168,170-194,505-506,510-512,524,849,920,963,1174,1239,1243-1256,1263,1408,1429,1485,1493-1503,1522,1565,1635,2107-2110,2120,2155-2157,2296-2301,2303-2307,2338-2345,2371-2373,2389,2447-2448,2450-2459,2537-2539,2543,2545-2546,2562,2570-2574,2682,2787-2798,2886,2893-2895,2897,2907,2914,2917-2918
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "131522b1d1d87588b1f7d962372933deaaa107d4",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

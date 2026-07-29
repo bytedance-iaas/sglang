@@ -1,0 +1,21 @@
+test/manual/dsv4/bench_c128_decode.py
+  s_3af354177588a3::t_e914e91160dc2f 33-35,39-44,378-403,540-543,571,596-598,630-633
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2c8a1a1b2d7cc5c4441238f01dc796886be8122b",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

@@ -1,0 +1,21 @@
+python/sglang/srt/disaggregation/decode.py
+  s_557257fbfff219::t_ca9e007d0f1d5e 2909-2912
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f77b136cc5f16514e0aac1d5223e60889b73ee03",
+  "prompts": {},
+  "sessions": {
+    "s_557257fbfff219": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a13bd50b92406e25bd5e498",
+        "model": "Doubao-Seed-2.1-Pro__dev"
+      },
+      "human_author": "luoroger37 <luowenjie.roger7@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
