@@ -2433,6 +2433,13 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
+        if isinstance(self.tree_cache, EICPagedHiRadixCache):
+            # EIC remote prefetch. Must run here -- before the PP-divergent
+            # early-returns and calc_priority below -- so every PP stage calls
+            # it in lockstep (its PP all_reduce would otherwise hang) and sees
+            # the waiting queue in FIFO order (a clean per-stage prefix).
+            self.tree_cache.match_from_remote(self.waiting_queue)
+
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
@@ -2511,10 +2518,6 @@ class Scheduler(
                     self.waiting_queue,
                     self.running_batch.reqs,
                 )
-
-        if isinstance(self.tree_cache, EICPagedHiRadixCache):
-            # for batch exists from EIC cache
-            self.tree_cache.match_from_remote(self.waiting_queue)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:

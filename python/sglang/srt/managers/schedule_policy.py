@@ -945,11 +945,7 @@ class PrefillAdder:
                         req=req,
                     )
                 )
-                logger.debug(
-                    f"req {req.rid} init load back, last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
-                )
                 if self.enable_eic_cache:
-                    loading_check_start_ts = time.perf_counter()
                     while not self.tree_cache.loading_complete(req.last_node):
                         time.sleep(0.001)
                     load_sucess = req.last_node.value is not None
@@ -961,9 +957,6 @@ class PrefillAdder:
                             last_gpu_node = last_gpu_node.parent
                         assert complete_token_num >= 0
                         req.last_node = last_gpu_node
-                        logger.error(
-                            f"req {req.rid} after load back failed, last node:{last_gpu_node.id}, complete_token_num:{complete_token_num}"
-                        )
                         if complete_token_num > 0:
                             new_indices = new_indices[:complete_token_num]
                         else:
@@ -972,13 +965,6 @@ class PrefillAdder:
                                 dtype=torch.int64,
                                 device=req.prefix_indices.device,
                             )
-                    loading_check_end_ts = time.perf_counter()
-                    logger.debug(
-                        f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
-                    )
-                logger.debug(
-                    f"after eic sync, req {req.rid} last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
-                )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)

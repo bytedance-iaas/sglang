@@ -33,6 +33,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.match_req_set = []
+        cache.tp_size = 1
+        cache.pp_size = 1
+        cache.pp_group = None
         cache.cache_controller = mock.Mock()
         cache._match_for_remote_fetch = mock.Mock(
             side_effect=AssertionError("empty remote key should be skipped")
@@ -50,6 +53,56 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache._match_for_remote_fetch.assert_not_called()
         cache.cache_controller.batch_find_longest_prefix_in_eic.assert_not_called()
         self.assertEqual(cache.match_req_set, [])
+
+    def test_match_from_remote_gates_and_indexes_by_queue(self):
+        # match_from_remote first MIN-reduces the queue length (num_ready gate),
+        # then reduces a vector indexed by queue position -- both PP-invariant
+        # lengths. Here we capture the CP/TP reduce (PP uses p2p, tested
+        # separately); the shapes are what keep the reduces in lockstep.
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.match_req_set = []
+        cache.tp_size = 2
+        cache.tp_group = object()
+        cache.pp_size = 1
+        cache.pp_group = None
+        cache.page_size = 1
+        cache.load_remote_threshold = 1
+        cache.eic_check_max_num = 0
+        cache.root_node = object()
+        cache._insert_remote_node = mock.Mock()
+        node = SimpleNamespace(id=1, content_hash=None)
+
+        # Fetch only the middle req; the others' prefix already covers the key.
+        def match(root, key):
+            match.i += 1
+            return (0, 0, node) if match.i == 2 else (len(key), 0, node)
+
+        match.i = 0
+        cache._match_for_remote_fetch = match
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [8]
+        reqs = [
+            mock.Mock(rid=r, origin_input_ids=list(range(8)), output_ids=[9], extra_key=None)
+            for r in ("a", "b", "c")
+        ]
+
+        captured = []
+
+        def fake_all_reduce(t, op=None, group=None):
+            if group is cache.tp_group:
+                captured.append(t.tolist())
+
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ), mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=fake_all_reduce
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, reqs)
+
+        # First the num_ready gate (scalar == queue length), then the per-slot
+        # vector (length == queue, only the fetched middle slot carries the hit).
+        self.assertEqual(captured, [3, [0, 8, 0]])
 
     def test_eic_controller_write_uses_queue_api(self):
         controller = object.__new__(EICCacheController)
@@ -186,44 +239,53 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(sorted(freed.tolist()), [512, 768])
 
 
-    def test_loading_check_reduces_load_back_across_pp(self):
-        # PP stages store their layers' KV in distinct EIC namespaces, so a
-        # shared node can load back a different token count per stage. Without a
-        # PP-group MIN on both the drain count and complete_token, the radix
-        # tree truncates differently per stage and the admitted extend_len
-        # diverges -> fused_q_norm_rope batch_size crash. Assert both are
-        # reduced over pp_group with MIN.
+    def test_pp_bcast_from_first_is_nonblocking_isend(self):
+        # PP consensus must be a non-blocking isend down the pipeline: the stages
+        # run out of phase, so a collective or a blocking send/recv (which makes
+        # one stage wait for another) deadlocks. First stage isends its value
+        # downstream (queued in work_list) and keeps it; a later stage overwrites
+        # with the upstream (PP0's) value via recv. No all_reduce anywhere.
         from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
 
-        cache = object.__new__(EICPagedHiRadixCache)
-        cache.tp_group = None  # TP reduces (group=None) are ignored by the test
-        cache.pp_group = object()
-        node = SimpleNamespace()
-        cache.ongoing_load_back = {0: (node, node, 64)}  # start==end: loop is a no-op
-        q = Queue()
-        q.put((0, 64))
-        cache.cache_controller = SimpleNamespace(ack_load_queue=q)
-        cache.dec_lock_ref = lambda n: None
+        # first stage (rank 0 of 2): isend downstream, never recv
+        c0 = object.__new__(EICPagedHiRadixCache)
+        c0.pp_size, c0.pp_rank, c0.pp_group, c0.work_list = 2, 0, object(), []
+        sent = []
 
-        pp_reduces = []
-
-        def fake_all_reduce(tensor, op=None, group=None):
-            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
-            if group is cache.pp_group:
-                pp_reduces.append(tensor.numel())
+        def fake_isend(t, group_dst=None, group=None, tag=None):
+            sent.append((group_dst, t.item()))
+            return "work"
 
         with mock.patch.object(
-            torch.distributed, "get_world_size", return_value=2
+            torch.distributed, "isend", side_effect=fake_isend
         ), mock.patch.object(
-            torch.distributed, "all_reduce", side_effect=fake_all_reduce
+            torch.distributed, "recv", side_effect=AssertionError("source never recvs")
+        ), mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=AssertionError("no collective")
         ):
-            EICPagedHiRadixCache.loading_check(cache)
+            t = torch.tensor(5, dtype=torch.int64)
+            EICPagedHiRadixCache._pp_bcast_from_first(c0, t)
+        self.assertEqual(sent, [(1, 5)])
+        self.assertEqual(c0.work_list, ["work"])  # drained next round
+        self.assertEqual(t.item(), 5)  # authoritative source keeps its value
 
-        # Both the drain count and the complete_token vector are MIN-reduced
-        # over the PP group (each numel==1 for this single-ack case).
-        self.assertEqual(
-            pp_reduces, [1, 1], "expected drain-count + complete_token PP reduces"
-        )
+        # last stage (rank 1 of 2): recv overwrites with PP0's value, no isend
+        c1 = object.__new__(EICPagedHiRadixCache)
+        c1.pp_size, c1.pp_rank, c1.pp_group, c1.work_list = 2, 1, object(), []
+
+        def fake_recv(t, group_src=None, group=None, tag=None):
+            t.fill_(3)  # PP0's authoritative value
+
+        with mock.patch.object(
+            torch.distributed, "recv", side_effect=fake_recv
+        ), mock.patch.object(
+            torch.distributed, "isend", side_effect=AssertionError("last rank sends nothing")
+        ), mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=AssertionError("no collective")
+        ):
+            t = torch.tensor(8, dtype=torch.int64)
+            EICPagedHiRadixCache._pp_bcast_from_first(c1, t)
+        self.assertEqual(t.item(), 3)
 
 
 if __name__ == "__main__":

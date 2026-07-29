@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.eic_memory_pool import (
     EICDeepSeekV4TokenToKVPoolHost,
@@ -158,6 +159,9 @@ class EICHiRadixCache(RadixCache):
         # (deploy_key embeds pp_rank), so per-stage load-back can succeed/fail
         # independently. loading_check reconciles the admitted length across PP.
         self.pp_group = params.pp_cache_group
+        self.pp_rank = params.pp_rank
+        self.pp_size = params.pp_size
+        self.work_list = []
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.sliding_window_size = params.sliding_window_size
         self.load_cache_event = threading.Event()
@@ -229,6 +233,11 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        # async admission: reqs whose load-back was kicked but not yet admitted
+        # (rid -> (last_node, new_indices)). Mirrors ongoing_prefetch. Replaces
+        # the schedule_policy busy-wait, so loading_check runs only from the
+        # PP-aligned check_hicache_events -> its PP consensus can't deadlock.
+        self.ongoing_load_admit = {}
         # EIC is native to this cache (no pluggable L3 HiCacheStorage backend);
         # is_fully_idle() uses this flag to skip ongoing_prefetch/backup checks.
         self.enable_storage = False
@@ -273,6 +282,7 @@ class EICHiRadixCache(RadixCache):
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         self.ongoing_load_back = {}
+        self.ongoing_load_admit = {}
         self.ongoing_write_through = {}
         super().reset()
 
@@ -467,17 +477,44 @@ class EICHiRadixCache(RadixCache):
                 f"queue size {queue_size.item()}"
             )
 
-    def _pp_reduce_min(self, tensor):
-        # PP stages store their layers' KV in distinct EIC namespaces, so
-        # per-stage load-back completes independently. MIN across PP keeps the
-        # radix tree (and thus the admitted extend_len) identical on every stage.
-        if (
-            self.pp_group is not None
-            and torch.distributed.get_world_size(group=self.pp_group) > 1
-        ):
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+    def _pp_bcast_from_first(self, tensor):
+        # Broadcast PP0's value down the pipeline: each stage overwrites its
+        # value with the upstream one, so the admitted length is identical
+        # everywhere. The pipeline runs stages out of phase, so any scheme where
+        # a stage BLOCKS waiting for another deadlocks (an all_reduce, or a
+        # blocking send/recv). A non-blocking isend down the stages never blocks
+        # the sender; the send is drained next round (_drain_async_work).
+        # NOTE: this is PP0-authoritative, not a true cross-PP MIN. Under EIC
+        # partial mget failure a downstream stage that loaded back fewer tokens
+        # than PP0 keeps unloaded (garbage) KV for the gap -- a known limitation,
+        # tracked for the pipelined-MIN follow-up.
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        tag = P2PTag.HIRADIX_PP_SYNC
+        if self.pp_rank > 0:
+            torch.distributed.recv(
+                tensor, group_src=self.pp_rank - 1, group=self.pp_group, tag=tag
             )
+        if self.pp_rank + 1 < self.pp_size:
+            copied = tensor.clone()
+            self.work_list.append(
+                torch.distributed.isend(
+                    copied, group_dst=self.pp_rank + 1, group=self.pp_group, tag=tag
+                )
+            )
+
+    def _drain_async_work(self):
+        for work in self.work_list:
+            work.wait()
+        self.work_list.clear()
+
+    def _reduce_min(self, tensor):
+        # CP/TP is synchronous -> a real MIN; PP is out-of-phase -> PP0-authoritative.
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        self._pp_bcast_from_first(tensor)
 
     def loading_check(self):
         if len(self.ongoing_load_back) == 0:
@@ -493,20 +530,19 @@ class EICHiRadixCache(RadixCache):
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-        self._pp_reduce_min(queue_size)
+        # NOTE: no PP sync here. EIC acks arrive asynchronously so per-stage
+        # ack_load_queue sizes differ; a PP0-authoritative queue_size would make
+        # a lagging stage get_nowait() past its queue and crash, and the
+        # complete_token vector lengths would not match. Cross-PP consistency of
+        # the truncated tree needs a true MIN, which deadlocks the out-of-phase
+        # pipeline -- deferred to the pipelined-MIN follow-up. Each stage
+        # truncates locally (CP-consistent); harmless while attn_cp_size == 1.
         ack_list = []
         complete_tokens = []
         for _ in range(queue_size.item()):
             ack_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
             ack_list.append(ack_id)
             complete_tokens.append(complete_token)
-        # Load thread is a single FIFO consumer, so ack order is identical on
-        # every rank; complete_token is CP-reduced in the controller, MIN it
-        # across PP too so every stage truncates each node to the same length.
-        if ack_list:
-            ct = torch.tensor(complete_tokens, dtype=torch.int64)
-            self._pp_reduce_min(ct)
-            complete_tokens = ct.tolist()
         for ack_id, complete_token in zip(ack_list, complete_tokens):
             start_node, end_node, total_token_num = self.ongoing_load_back[ack_id]
             self.dec_lock_ref(end_node)
@@ -603,9 +639,13 @@ class EICHiRadixCache(RadixCache):
     def evict(self, params: EvictParams, retry_times: int = 3) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
-        while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
+        # Throttle on the write-through backlog only. loading_check() holds a PP
+        # collective; this loop fires on per-stage memory pressure (divergent
+        # cadence), so calling it here would deadlock the PP group. The load
+        # backlog drains at the single lockstep site (check_hicache_events) and
+        # in the schedule_policy busy-wait, both PP-uniform.
+        while len(self.ongoing_write_through) > 50:
             self.writing_check()
-            self.loading_check()
             time.sleep(0.1)
 
         num_evicted = 0
@@ -776,6 +816,66 @@ class EICHiRadixCache(RadixCache):
         self.loading_check()
         return node.id not in self.ongoing_load_back.keys()
 
+    def check_load_back_progress(self, req) -> bool:
+        # SCAFFOLD for the Part-2 follow-up (async admission), NOT wired in yet --
+        # the active path is the schedule_policy busy-wait. Verified in isolation
+        # that wiring this WITHOUT a PP-consistent loading_check diverges
+        # extend_input_len across PP and crashes (main_norm_rope.cuh:183, even at
+        # cp=1). Part 2 must call this from the scheduler gate AND make
+        # loading_check MIN complete_token + synchronize ongoing_load_back deletion
+        # across PP via a non-blocking isend+irecv delayed-MIN (a blocking recv
+        # deadlocks the out-of-phase pipeline). Mirrors check_prefetch_progress.
+        # First call kicks the async load and defers (False); later calls stay
+        # False while the ack is in flight; once loading_check has drained the
+        # ack, finalize prefix_indices/extend_input_len and admit (True).
+        if req.rid not in self.ongoing_load_admit:
+            if not req.needs_host_load_back():
+                return True
+            new_indices, req.last_node = self.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.best_match_node,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+            self.ongoing_load_admit[req.rid] = (req.last_node, new_indices)
+            # init_load_back may fall back to a resident ancestor with no async
+            # load registered -> finalize right away.
+            if req.last_node.id not in self.ongoing_load_back:
+                return self._finalize_load_admit(req)
+            return False
+        if req.last_node.id in self.ongoing_load_back:
+            return False  # still loading; loading_check advances it next steps
+        return self._finalize_load_admit(req)
+
+    def _finalize_load_admit(self, req) -> bool:
+        _, new_indices = self.ongoing_load_admit.pop(req.rid)
+        # Relocated from schedule_policy's old busy-wait finalize block: on
+        # partial failure walk the evicted tail down to the resident node and
+        # truncate new_indices to the actually-loaded (device-resident) slots.
+        load_success = req.last_node.value is not None
+        complete_token_num = len(new_indices)
+        if not load_success:
+            gpu_node = req.last_node
+            while gpu_node.evicted:
+                complete_token_num -= len(gpu_node.key)
+                gpu_node = gpu_node.parent
+            assert complete_token_num >= 0
+            req.last_node = gpu_node
+            if complete_token_num > 0:
+                new_indices = new_indices[:complete_token_num]
+            else:
+                new_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=req.prefix_indices.device
+                )
+        req._eic_loaded_len = len(new_indices)
+        req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        prefix_len = len(req.prefix_indices)
+        req.cache_protected_len = prefix_len
+        req.last_matched_prefix_len = prefix_len
+        return True
+
     def init_load_back(
         self,
         params: InitLoadBackParams,
@@ -804,6 +904,7 @@ class EICHiRadixCache(RadixCache):
         return producer_index
 
     def check_hicache_events(self):
+        self._drain_async_work()
         self.writing_check()
         self.loading_check()
 
@@ -1212,85 +1313,66 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         return total_prefix_length
 
     def match_from_remote(self, waiting_queue: List[Req]):
-        compute_keys = []
-        prev_hashes = []
-        fetch_list = []
+        # waiting_queue is the same global stream on every rank, but a PP stage
+        # can lag by a few requests (async forward). Gate on the common prefix so
+        # every reduce below has a PP-invariant length and can't deadlock, even
+        # if the local trees diverged.
+        num_ready = torch.tensor(len(waiting_queue), dtype=torch.int64, device="cpu")
+        self._reduce_min(num_ready)
+        # PP0-authoritative length -> the reduce vector below is the same size on
+        # every stage (so its p2p bcast can't hang). A lagging stage reads only
+        # the reqs it actually has (local_n); the rest of the vector stays 0.
+        num_ready = int(num_ready.item())
+        if num_ready == 0:
+            return
+        local_n = min(num_ready, len(waiting_queue))
         if len(self.match_req_set) > 1000:
             self.match_req_set = self.match_req_set[500:]
+
+        fetches = []  # (slot, last_node, evict_len, compute_key, prev_hash)
         eic_keys = 0
-        for req in waiting_queue:
-            logger.debug(f"req {req.rid} match from eic")
+        for slot in range(local_n):
+            req = waiting_queue[slot]
             if req.rid in self.match_req_set:
                 continue
             fill_ids = req.origin_input_ids + req.output_ids
             req_tokens = fill_ids[: len(fill_ids) - 1]
             if len(req_tokens) == 0:
-                logger.debug(
-                    f"req {req.rid} skip loading from eic: no committed tokens"
-                )
                 continue
             req_key = RadixKey(req_tokens, req.extra_key)
-            local_prefix_len, local_evict_len, last_node = self._match_for_remote_fetch(
+            prefix_len, evict_len, last_node = self._match_for_remote_fetch(
                 self.root_node, req_key
             )
-            if (
-                len(req_key) - local_prefix_len + local_evict_len
-                < self.load_remote_threshold
-            ):
-                # skip loading from eic if the remaining key is too short
-                logger.debug(f"req {req.rid} skip loading from eic")
+            if len(req_key) - prefix_len + evict_len < self.load_remote_threshold:
                 continue
-            compute_keys.append(req_key[local_prefix_len:])
             if _need_calculate_hash(last_node, self.page_size):
                 self._calculate_content_hash(last_node)
-            prev_hashes.append(
-                last_node.content_hash[-1] if last_node.content_hash else None
-            )
-            fetch_list.append((last_node, req, local_prefix_len, local_evict_len))
             self.match_req_set.append(req.rid)
-            eic_keys += (len(req_key) - local_prefix_len) // self.page_size
-            if self.eic_check_max_num > 0 and eic_keys >= self.eic_check_max_num:
-                logger.info(
-                    f"eic check max num {self.eic_check_max_num} reached, stop matching"
-                )
+            prev_hash = last_node.content_hash[-1] if last_node.content_hash else None
+            fetches.append((slot, last_node, evict_len, req_key[prefix_len:], prev_hash))
+            eic_keys += (len(req_key) - prefix_len) // self.page_size
+            if 0 < self.eic_check_max_num <= eic_keys:
                 break
-        if len(fetch_list) == 0:
-            return
-        # batch exist
-        eic_prefix_lens = self.cache_controller.batch_find_longest_prefix_in_eic(
-            compute_keys, prev_hashes
-        )
-        if len(eic_prefix_lens) == 0 or len(eic_prefix_lens) != len(fetch_list):
-            return
-        if self.tp_size > 1:
-            eic_prefix_len_tensor = torch.tensor(
-                eic_prefix_lens, dtype=torch.int64, device="cpu"
+
+        # Query EIC per fetched slot, scatter into a queue-length vector (0 =
+        # miss/fail), then MIN over CP/TP+PP so the admitted prefix -- and thus
+        # the radix tree -- is identical on every stage.
+        eic_prefix_lens = [0] * num_ready
+        if fetches:
+            lens = self.cache_controller.batch_find_longest_prefix_in_eic(
+                [f[3] for f in fetches], [f[4] for f in fetches]
             )
-            torch.distributed.all_reduce(
-                eic_prefix_len_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            eic_prefix_lens = eic_prefix_len_tensor.tolist()
-        # MIN across PP so the load-back decision is identical on every stage,
-        # else loading_check's PP reduce deadlocks on a divergent req set.
-        eic_prefix_len_tensor = torch.tensor(eic_prefix_lens, dtype=torch.int64)
-        self._pp_reduce_min(eic_prefix_len_tensor)
-        eic_prefix_lens = eic_prefix_len_tensor.tolist()
-        for i, (last_node, req, local_prefix_len, local_evict_len) in enumerate(
-            fetch_list
-        ):
-            eic_prefix_len = eic_prefix_lens[i]
-            if eic_prefix_len + local_evict_len < self.load_remote_threshold:
-                continue
-            eic_key = compute_keys[i][:eic_prefix_len]
-            logger.debug(
-                f"req {req.rid} match from eic, "
-                f"last node {last_node.id}, "
-                f"local prefix len {local_prefix_len}, "
-                f"eic prefix len {eic_prefix_len}"
-            )
-            self._insert_remote_node(last_node, eic_key)
+            if len(lens) == len(fetches):
+                for (slot, *_), n in zip(fetches, lens):
+                    eic_prefix_lens[slot] = n
+        len_tensor = torch.tensor(eic_prefix_lens, dtype=torch.int64, device="cpu")
+        self._reduce_min(len_tensor)
+        eic_prefix_lens = len_tensor.tolist()
+
+        for slot, last_node, evict_len, compute_key, _ in fetches:
+            eic_len = eic_prefix_lens[slot]
+            if eic_len + evict_len >= self.load_remote_threshold:
+                self._insert_remote_node(last_node, compute_key[:eic_len])
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
