@@ -201,6 +201,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "marlin",
     "asym_gemm",
+    "hybridgemm",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -1365,14 +1366,18 @@ class ServerArgs:
         # 16. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 17. Unified asym_gemm MoE. Piecewise (prefill) capture is not
-        # supported: the imperative unified path cannot record into a graph,
-        # and there is no fallback — the BF16/FP8 master weights are released
-        # after INT8 conversion. Prefill runs on the eager unified path (also
-        # measured ~2x faster than the piecewise BF16 fallback it replaces).
-        # Decode graphs are unaffected: every cuda_graph_bs entry gets a
-        # pre-allocated capturable buffer.
-        if (
+        # 17. Unified asym_gemm/hybridgemm MoE. Piecewise (prefill) capture is
+        # not supported: the imperative unified path cannot record into a
+        # graph, and there is no fallback — the BF16/FP8 master weights are
+        # released after INT8 conversion. Prefill runs on the eager unified
+        # path (also measured ~2x faster than the piecewise BF16 fallback it
+        # replaces). Decode graphs are unaffected: every cuda_graph_bs entry
+        # gets a pre-allocated capturable buffer. hybridgemm always runs the
+        # unified path (_handle_moe_kernel_config forces
+        # SGLANG_ASYMGEMM_UNIFIED_MOE on for it, but that runs *after* this
+        # method — so hybridgemm is checked unconditionally here rather than
+        # via the env var, which wouldn't be set yet).
+        if self.moe_runner_backend == "hybridgemm" or (
             self.moe_runner_backend == "asym_gemm"
             and envs.SGLANG_ASYMGEMM_UNIFIED_MOE.get()
         ):
@@ -3192,6 +3197,38 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+
+        if self.moe_runner_backend == "hybridgemm":
+            assert is_sm90_supported(), (
+                "'hybridgemm' MoE runner backend requires an SM90 (Hopper) "
+                "GPU — the fused host+HBM kernel it uses is Hopper-only. Use "
+                "'asym_gemm' on other architectures."
+            )
+            assert self.quantization in (None, "fp8", "modelopt_fp8"), (
+                f"Invalid quantization {self.quantization!r} for 'hybridgemm' "
+                "MoE runner backend: like 'asym_gemm', it quantizes MoE "
+                "experts to INT8 internally (from BF16 masters, or "
+                "'fp8'/'modelopt_fp8' block-scaled masters via a "
+                "pre-quantized INT8 slab)."
+            )
+            # hybridgemm only exists inside the unified CPU+GPU MoE path — a
+            # plain AsymGemmRunnerCore forward would silently behave exactly
+            # like 'asym_gemm' (same runner core, see MoeRunnerBackend.
+            # is_asym_gemm()) and never touch the hybrid kernel at all.
+            if not envs.SGLANG_ASYMGEMM_UNIFIED_MOE.get():
+                envs.SGLANG_ASYMGEMM_UNIFIED_MOE.set(True)
+                logger.info(
+                    "'hybridgemm' MoE runner backend selected: enabling "
+                    "SGLANG_ASYMGEMM_UNIFIED_MOE."
+                )
+            # AsymGEMM's unified runtime reads this directly (not through
+            # sglang's env registry) to fuse the cached (HBM) and streamed
+            # (pinned-host) GPU-bucket partitions into one hybrid kernel
+            # launch per projection instead of two separate launches — see
+            # AsymGEMM's hybridGEMM_usage.md §8. ASYMGEMM_HYBRID_S_HOST is
+            # settable directly by the user to override the CTA-split
+            # heuristic; sglang does not wrap it.
+            os.environ.setdefault("ASYMGEMM_HYBRID_KERNEL", "1")
 
         # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
         # Exception: GptOssForCausalLM wraps the entire MoE block in its own
