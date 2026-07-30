@@ -910,10 +910,10 @@ def pre_permute_deepep_ll_to_deep_gemm(
             1,
             ceil_div(topk_ids.numel(), runner_config.num_local_experts),
         )
-        # BM16 bounds dense overhead while recovering common sparse-hot cases.
+        # BM32/BN128 reduces redundant decode/WGMMA work for sparse-hot groups.
         if expected_m <= 8:
-            fp4_block_m_override = 16
-            fp4_block_n_override = 256
+            fp4_block_m_override = 32
+            fp4_block_n_override = 128
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights

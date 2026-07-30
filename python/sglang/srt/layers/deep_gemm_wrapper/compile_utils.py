@@ -515,8 +515,8 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
                 gran_k=128,
                 gran_k_a=128,
                 gran_k_b=128,
-                block_m_override=16,
-                block_n_override=256,
+                block_m_override=32,
+                block_n_override=128,
             )
 
 
