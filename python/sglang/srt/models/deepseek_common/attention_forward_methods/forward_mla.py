@@ -421,6 +421,25 @@ class DeepseekMLAForwardMixin:
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+        # Q-FHT fold (kvbit no_alloc): when the MLA nope latent is stored kvbit
+        # 4bit Hadamard-ROTATED (K_nope @ R, R = kv_lora_rank Hadamard, symmetric),
+        # fold the rotation to the query side so the decode kernel reads rotated
+        # K directly without per-K inverse-rotate. q_nope_out is the absorbed
+        # query (q_nope @ W_kc, shape (n_tokens, n_heads, kv_lora_rank)); apply
+        # q_nope_out <- q_nope_out @ R so q_nope_out @ K_nope^T == (q_nope_out @ R)
+        # @ (K_nope @ R)^T. Gated by SGLANG_KVBIT_NO_ALLOC; no-op otherwise.
+        if envs.SGLANG_KVBIT_NO_ALLOC:
+            R = getattr(self, "_kvbit_qfht_R", None)
+            if R is None or R.shape[0] != self.kv_lora_rank:
+                from kvbit.rotation import build_hadamard
+
+                R = build_hadamard(
+                    self.kv_lora_rank, dtype=torch.float32, device=q_nope_out.device
+                )
+                self._kvbit_qfht_R = R
+            # (n_tokens, n_heads, kv_lora_rank) @ (kv_lora_rank, kv_lora_rank)
+            q_nope_out = (q_nope_out.float() @ R).to(q_nope_out.dtype)
+
         return (
             q_pe,
             k_pe,
