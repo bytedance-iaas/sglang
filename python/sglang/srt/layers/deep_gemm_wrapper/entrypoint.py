@@ -88,6 +88,8 @@ def grouped_gemm_nt_f8fp4bf16_masked(
     overlap_args: Optional[Any] = None,
     gran_k_a: int = 128,
     gran_k_b: int = 128,
+    block_m_override: Optional[int] = None,
+    block_n_override: Optional[int] = None,
     masked_m_max_hint: Optional[int] = None,
     active_groups_hint: Optional[int] = None,
 ):
@@ -127,6 +129,8 @@ def grouped_gemm_nt_f8fp4bf16_masked(
             gran_k=gran_k_a,
             gran_k_a=gran_k_a,
             gran_k_b=gran_k_b,
+            block_m_override=block_m_override,
+            block_n_override=block_n_override,
             masked_m_max_hint=masked_m_max_hint,
             active_groups_hint=active_groups_hint,
         )

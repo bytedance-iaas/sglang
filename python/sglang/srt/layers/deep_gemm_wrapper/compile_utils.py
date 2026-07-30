@@ -494,7 +494,8 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+        kernel = deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
+        kernel(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,
@@ -504,6 +505,19 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
             gran_k_a=128,
             gran_k_b=128,
         )
+        if m <= 8:
+            kernel(
+                (self.lhs_q, self.lhs_s),
+                (self.rhs_q, self.rhs_s),
+                self.out,
+                masked_m=self.masked_m,
+                expected_m=m,
+                gran_k=128,
+                gran_k_a=128,
+                gran_k_b=128,
+                block_m_override=16,
+                block_n_override=256,
+            )
 
 
 class _BF16F32WarmupExecutor(_BaseWarmupExecutor):

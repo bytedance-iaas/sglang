@@ -133,6 +133,8 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m_max_hint: Optional[int] = None
     masked_m_sum_hint: Optional[int] = None
     active_expert_count_hint: Optional[int] = None
+    fp4_block_m_override: Optional[int] = None
+    fp4_block_n_override: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
     use_psum_layout: bool = False
     expected_m_for_psum_layout: Optional[int] = None
@@ -534,6 +536,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm_expected_m,
                 gran_k_a=128,
                 gran_k_b=128,
+                block_m_override=runner_input.fp4_block_m_override,
+                block_n_override=runner_input.fp4_block_n_override,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
@@ -680,6 +684,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm_expected_m,
                 gran_k_a=128,
                 gran_k_b=128,
+                block_m_override=runner_input.fp4_block_m_override,
+                block_n_override=runner_input.fp4_block_n_override,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
@@ -895,6 +901,8 @@ def pre_permute_deepep_ll_to_deep_gemm(
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
+    fp4_block_m_override = None
+    fp4_block_n_override = None
     # DeepEP-LL uses floor(avg) + 1; FP4 layout selection needs the exact ceil.
     if quant_info.is_fp4_experts:
         assert runner_config.num_local_experts is not None
@@ -902,6 +910,10 @@ def pre_permute_deepep_ll_to_deep_gemm(
             1,
             ceil_div(topk_ids.numel(), runner_config.num_local_experts),
         )
+        # BM16 bounds dense overhead while recovering common sparse-hot cases.
+        if expected_m <= 8:
+            fp4_block_m_override = 16
+            fp4_block_n_override = 256
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -917,6 +929,8 @@ def pre_permute_deepep_ll_to_deep_gemm(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        fp4_block_m_override=fp4_block_m_override,
+        fp4_block_n_override=fp4_block_n_override,
         masked_m_max_hint=getattr(dispatch_output, "masked_m_max_hint", None),
         masked_m_sum_hint=getattr(dispatch_output, "masked_m_sum_hint", None),
         active_expert_count_hint=getattr(
