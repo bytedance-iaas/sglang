@@ -2,6 +2,7 @@ import hashlib
 import heapq
 import logging
 import os
+import pickle
 import threading
 import time
 from functools import partial
@@ -18,7 +19,6 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
-    InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
     MatchResult,
@@ -148,6 +148,13 @@ def nsa_pool_transfer(
 
 class EICHiRadixCache(RadixCache):
 
+    # PP verdict protocol knobs (see the __init__ comment block).
+    _KIND_SPAN, _KIND_FINAL = 0, 1
+    _VERDICT_CAP = 64  # verdict rows per DAG round; overflow waits a round
+    _EPOCH_CAP = 65536  # rid->epoch entries; eviction horizon >> stale lifetime
+    _TOMBSTONE_TTL = 4096  # rounds a released rid keeps dropping stragglers
+    _GC_AGE = 8192  # rounds before orphaned rank0 report entries are dropped
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -162,12 +169,42 @@ class EICHiRadixCache(RadixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list = []
-        # EIC host load-back runs only for a single PP stage (pp_size<=1); under PP>1
-        # it is disabled because its cross-PP length reconciliation would need rank0
-        # to receive a peer report in the scheduler thread, which deadlocks the
-        # out-of-phase pipeline in this gloo build. See loading_check.
-        self.pending_report = {}  # rid_hash -> local admit len, awaiting resolution
-        self._admit_verdict = {}  # rid_hash -> resolved admit len, consumed by the gate
+        # --- Cross-PP load-back reconciliation (two-phase verdict protocol) ---
+        # Each PP stage load-backs from its own EIC namespace (deploy_key embeds
+        # pp_rank), so per-stage loaded amounts -- and, transitively, radix trees
+        # and allocator headroom -- would diverge, breaking SPMD scheduling
+        # (divergent extend_input_len => main_norm_rope assert at cp>1).
+        # Two GPU-proven constraints shape the protocol: this gloo build's p2p is
+        # effectively synchronous, and PP rank0 is the pipeline-output receiver,
+        # so rank0 must NEVER post a receive in the scheduler thread; the only
+        # safe p2p shape is the rank0-isend-down DAG at the lockstep site.
+        # Hence: reports go UP through the default-PG TCPStore (non-collective
+        # KV RPCs to a separate daemon -- not a p2p receive), verdicts come DOWN
+        # on the DAG in a fixed tensor, so every stage applies the same decision
+        # in the same scheduling loop (admission timing = batch composition).
+        # Two phases keep every tree/allocator mutation PP-uniform:
+        #   SPAN  = min over stages of (device_match + host_hit): fixes the
+        #           allocation BEFORE any load is kicked (quota never exceeds the
+        #           local host chain, so the alloc is a pure function of SPAN);
+        #   FINAL = min over stages of (device_match + actually loaded): fixes
+        #           the admitted prefix; the [FINAL, SPAN) tail is freed at a
+        #           verdict boundary on every stage in the same loop.
+        # Wire key = (rid_hash, epoch); the epoch kills stale-report pairing
+        # when a client reuses a rid after an abort.
+        self.ongoing_load_admit = {}  # rid -> per-req reconciliation state
+        self._admit_verdict = {}  # rid_hash -> FINAL admit len, consumed by the gate
+        self._h_rid = {}  # rid_hash -> rid, resolves incoming verdicts
+        self._rid_epoch = {}  # rid -> gate-entry ordinal; FIFO-capped, never reset
+        self._report_outbox = {}  # stage>0, tp0: (h, epoch, kind) -> report payload
+        self._span_reports = {}  # rank0 tp0: (h, epoch) -> ({stage: (d, hh)}, born)
+        self._load_reports = {}  # rank0 tp0: (h, epoch) -> ({stage: d+loaded}, born)
+        self._await_load = {}  # rank0 tp0: (h, epoch) -> (span, loaders, {stage: d}, born)
+        self._verdict_outbox = []  # rank0 tp0: formed verdicts awaiting a DAG slot
+        self._tombstone = {}  # rid_hash -> expiry round; released rids drop stragglers
+        self._pub_seq = 0  # stage>0: next store seq; bumps ONLY after a good set
+        self._next_seq = {}  # rank0: stage -> next store seq to drain
+        self._round = 0  # loading_check counter (tombstone/GC clock)
+        self._store_handle = None  # lazy default-PG TCPStore (tp0 lanes only)
         self._loadback_rid = {}  # load-back node_id -> rid (maps an EIC ack to its req)
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.sliding_window_size = params.sliding_window_size
@@ -240,11 +277,6 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
-        # async admission: reqs whose load-back was kicked but not yet admitted
-        # (rid -> (last_node, new_indices)). Mirrors ongoing_prefetch. Replaces
-        # the schedule_policy busy-wait, so loading_check runs only from the
-        # PP-aligned check_hicache_events -> its PP consensus can't deadlock.
-        self.ongoing_load_admit = {}
         # EIC is native to this cache (no pluggable L3 HiCacheStorage backend);
         # is_fully_idle() uses this flag to skip ongoing_prefetch/backup checks.
         self.enable_storage = False
@@ -253,6 +285,30 @@ class EICHiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 3
         )
         self.load_back_threshold = 10
+        if self.pp_size > 1:
+            # The verdict protocol assumes lockstep candidate iteration and
+            # lockstep releases. These knobs break that: cache-aware policies
+            # re-match every waiting req per loop from per-stage trees (and
+            # clobber frozen matches), storage prefetch skips the gate per stage
+            # asynchronously, dp-attention lanes have private waiting queues,
+            # and the waiting timeout releases by per-stage clocks.
+            if server_args.schedule_policy != "fcfs":
+                raise ValueError(
+                    "EIC host load-back under PP requires schedule_policy=fcfs"
+                )
+            if getattr(server_args, "hicache_storage_backend", None):
+                raise ValueError(
+                    "EIC under PP is incompatible with hicache_storage_backend"
+                )
+            if server_args.enable_dp_attention:
+                raise ValueError(
+                    "EIC host load-back under PP is incompatible with dp-attention"
+                )
+            if float(os.getenv("SGLANG_REQ_WAITING_TIMEOUT", "-1")) > 0:
+                raise ValueError(
+                    "EIC host load-back under PP requires SGLANG_REQ_WAITING_TIMEOUT "
+                    "to stay disabled (per-stage clocks release non-lockstep)"
+                )
         super().__init__(params)
 
         self.save_decode_cache = True
@@ -291,9 +347,18 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_load_back = {}
         self.ongoing_load_admit = {}
         self.ongoing_write_through = {}
-        self.pending_report = {}
         self._admit_verdict = {}
+        self._h_rid = {}
         self._loadback_rid = {}
+        self._report_outbox = {}
+        self._span_reports = {}
+        self._load_reports = {}
+        self._await_load = {}
+        self._verdict_outbox = []
+        # Comm-layer state deliberately survives reset: seq counters must stay
+        # monotonic (a pre-reset store batch may still be in flight), epochs
+        # must never reuse, tombstones expire by round. Flush is idle-gated, so
+        # everything cleared above can only reference dead rids.
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -520,14 +585,44 @@ class EICHiRadixCache(RadixCache):
         self._pp_bcast_from_first(tensor)
 
     def loading_check(self):
-        # Single stage: drain acks and resolve locally. PP>1: host load-back is
-        # disabled (its cross-PP reconciliation would need PP0 to receive a peer
-        # report in the scheduler thread -> deadlocks the out-of-phase pipeline in
-        # this gloo build), so pending_report stays empty and this is a no-op. The
-        # true PP-consistent load-back is the pipeline-piggyback follow-up.
+        # The lockstep heartbeat of the verdict protocol: called exactly once per
+        # get_new_batch_prefill on every rank, before any early return, so the
+        # k-th VERDICT bcast pairs with the k-th recv on every stage and a
+        # verdict lands at the same batch-forming call everywhere.
+        self._round += 1
         self._drain_local_acks()
-        for h in list(self.pending_report):
-            self._admit_verdict[h] = self.pending_report.pop(h)
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        if self.rank == 0:
+            # tp0 speaks for its stage (reports are TP-uniform: complete_token
+            # is MIN-reduced inside the cache controller before the ack).
+            if self.pp_rank == 0:
+                self._drain_peer_reports()
+                self._form_verdicts()
+            else:
+                self._publish_reports()
+        buf = torch.zeros(1 + self._VERDICT_CAP * 4, dtype=torch.int64, device="cpu")
+        if self.pp_rank == 0:
+            if self.rank == 0:
+                n = min(len(self._verdict_outbox), self._VERDICT_CAP)
+                buf[0] = n
+                for i in range(n):
+                    buf[1 + i * 4 : 5 + i * 4] = torch.tensor(
+                        self._verdict_outbox[i], dtype=torch.int64
+                    )
+                del self._verdict_outbox[:n]
+            if self.tp_size > 1:
+                # Equalize the tp0-only poll result across this stage's lanes
+                # BEFORE it forks into the per-lane DAGs. Unconditional: the
+                # trigger is tp0-local, a skipped collective wedges the stage.
+                torch.distributed.broadcast(buf, group=self.tp_group, group_src=0)
+        self._pp_bcast_from_first(buf, tag=P2PTag.HIRADIX_PP_VERDICT)
+        # The packed tensor is the single source of truth on EVERY rank
+        # (including rank0): overflow verdicts wait in the outbox, so cap
+        # overflow can never desync which loop a req admits in.
+        self._apply_verdicts(buf)
+        if self._round % 1024 == 0:
+            self._sweep()
 
     def _rid_hash(self, rid):
         # Stable 56-bit id (fits a positive int64); hash() is per-process salted so
@@ -535,6 +630,224 @@ class EICHiRadixCache(RadixCache):
         return int.from_bytes(
             hashlib.blake2b(rid.encode(), digest_size=7).digest(), "big"
         )
+
+    @property
+    def _store(self):
+        # The default process group's TCPStore: non-collective KV RPCs served by
+        # a separate daemon thread -- polling it is NOT a p2p receive, so the
+        # rank0-must-never-receive constraint does not apply. Exceptions must
+        # propagate: a swallowed set with a bumped seq is a permanent hole the
+        # drain side polls forever (and a dead store means a dead job anyway).
+        if self._store_handle is None:
+            from torch.distributed import distributed_c10d
+
+            self._store_handle = distributed_c10d._get_default_store()
+        return self._store_handle
+
+    def _bump_epoch(self, rid):
+        # Per-rid gate-entry ordinal; never reused within a process, so a stale
+        # in-flight report of a released incarnation can never pair with a fresh
+        # one (client-supplied rids may repeat after an abort). Re-insertion
+        # keeps the FIFO cap tracking recency.
+        epoch = self._rid_epoch.pop(rid, 0) + 1
+        self._rid_epoch[rid] = epoch
+        while len(self._rid_epoch) > self._EPOCH_CAP:
+            self._rid_epoch.pop(next(iter(self._rid_epoch)))
+        return epoch
+
+    def _queue_report(self, st, kind, value):
+        if self.pp_size <= 1 or self.rank != 0:
+            return
+        key = (st["h"], st["epoch"])
+        if self.pp_rank == 0:
+            # rank0's own column feeds the decision tables directly.
+            table = (
+                self._span_reports if kind == self._KIND_SPAN else self._load_reports
+            )
+            table.setdefault(key, ({}, self._round))[0][0] = value
+        else:
+            self._report_outbox[(st["h"], st["epoch"], kind)] = value
+
+    def _publish_reports(self):
+        if not self._report_outbox:
+            return
+        payload = pickle.dumps(self._report_outbox)
+        self._store.set(f"eiclb/{self.pp_rank}/{self._pub_seq}", payload)
+        self._pub_seq += 1  # only after a successful set (no holes, ever)
+        self._report_outbox = {}
+
+    def _drain_peer_reports(self):
+        for stage in range(1, self.pp_size):
+            seq = self._next_seq.get(stage, 0)
+            while self._store.check([f"eiclb/{stage}/{seq}"]):
+                key = f"eiclb/{stage}/{seq}"
+                batch = pickle.loads(self._store.get(key))
+                self._store.delete_key(key)
+                seq += 1
+                for (h, epoch, kind), value in batch.items():
+                    tomb = self._tombstone.get(h)
+                    if tomb is not None and epoch <= tomb[0]:
+                        continue  # a released incarnation's straggler; a fresh
+                        # re-gate of the same rid carries a higher epoch and
+                        # must pass, or the retry wedges forever.
+                    table = (
+                        self._span_reports
+                        if kind == self._KIND_SPAN
+                        else self._load_reports
+                    )
+                    table.setdefault((h, epoch), ({}, self._round))[0][stage] = value
+            self._next_seq[stage] = seq
+
+    def _form_verdicts(self):
+        threshold = max(self.load_back_threshold, 1)
+        for key, (sr, _) in list(self._span_reports.items()):
+            if len(sr) < self.pp_size:
+                continue
+            del self._span_reports[key]
+            span = min(d + hh for d, hh in sr.values())
+            # A loader must clear the load threshold; every stage evaluates the
+            # same condition from the same numbers at span-apply time.
+            loaders = frozenset(s for s, (d, _) in sr.items() if span - d >= threshold)
+            if loaders:
+                dmap = {s: d for s, (d, _) in sr.items()}
+                self._await_load[key] = (span, loaders, dmap, self._round)
+                self._verdict_outbox.append((*key, self._KIND_SPAN, span))
+            else:
+                self._verdict_outbox.append(
+                    (*key, self._KIND_FINAL, min(d for d, _ in sr.values()))
+                )
+        for key, (lr, _) in list(self._load_reports.items()):
+            aw = self._await_load.get(key)
+            if aw is None or not aw[1] <= lr.keys():
+                continue
+            span, loaders, dmap, _ = aw
+            del self._load_reports[key]
+            del self._await_load[key]
+            # Admissible = what EVERY stage actually holds: loaders their loaded
+            # length, non-loaders their device match, all capped by the span.
+            final = min(
+                [span]
+                + [lr[s] for s in loaders]
+                + [d for s, d in dmap.items() if s not in loaders]
+            )
+            self._verdict_outbox.append((*key, self._KIND_FINAL, final))
+
+    def _apply_verdicts(self, buf):
+        for i in range(int(buf[0].item())):
+            h, epoch, kind, value = (int(x) for x in buf[1 + i * 4 : 5 + i * 4])
+            rid = self._h_rid.get(h)
+            st = self.ongoing_load_admit.get(rid) if rid is not None else None
+            if st is None or st["epoch"] != epoch:
+                continue  # released rid or a dead incarnation's verdict
+            if kind == self._KIND_SPAN:
+                self._apply_span(rid, st, value)
+            else:
+                self._admit_verdict[h] = value
+
+    def _apply_span(self, rid, st, span):
+        # SPAN is a cross-stage MIN, so quota = span - d never exceeds this
+        # stage's own host chain: the allocation is a pure function of the
+        # (uniform) verdict and allocator deltas stay PP-uniform. allow_evict is
+        # off under PP -- an alloc-failure eviction would mutate one stage's
+        # tree only; degrading to loaded=0 re-converges at FINAL instead.
+        st["span"] = span
+        d, hh = st["d"], st["hh"]
+        node = st["best_match_node"]
+        if (
+            span - d >= max(self.load_back_threshold, 1)
+            and node is not None
+            and self._swa_headroom_ok(span - d)
+        ):
+            node = self._clip_host_chain(node, d + hh - span, span - d)
+            if node is not None:
+                indices = self.load_back(node, allow_evict=self.pp_size <= 1)
+                if indices is not None:
+                    st["node_id"] = node.id
+                    st["load_node"] = node
+                    st["alloc"] = len(indices)
+                    st["new_indices"] = indices
+                    self._loadback_rid[node.id] = rid
+                    return  # the LOADED report follows the local EIC ack
+        # Nothing kicked on this stage: its admissible length is device-only.
+        if self.pp_size <= 1 or self.pp_group is None:
+            self._admit_verdict[st["h"]] = d
+        else:
+            self._queue_report(st, self._KIND_FINAL, d)
+
+    def _swa_headroom_ok(self, quota):
+        # A hybrid-SWA load allocates quota SWA slots that are released only
+        # when the admitted req actually batches (maybe_evict_swa) -- but the
+        # adder budgets fresh SWA for that batch without knowing about them.
+        # Unbounded kicks can therefore drain the (small) SWA pool to zero and
+        # deadlock admission outright: loads hold all SWA, batching would
+        # release it, batching needs SWA. Keep half the pool clear of load-back
+        # allocations. Per-stage headroom may diverge; an asymmetric kick-skip
+        # just degrades that stage's report to device-only, which the FINAL
+        # verdict reconciles (same class as the alloc-failure degrade).
+        swa = getattr(
+            self.cache_controller.mem_pool_device_allocator, "swa_attn_allocator", None
+        )
+        if swa is None:
+            return True
+        return swa.available_size() >= quota + swa.size // 2
+
+    def _clip_host_chain(self, node, excess, quota):
+        # Cut the evicted chain `excess` tokens above its bottom so the load
+        # covers exactly [d, span). The cut lands on a verdict boundary
+        # (PP-uniform) and touches only evicted (host-side) nodes, so device
+        # node shapes stay PP-uniform. Returns None unless the clipped chain
+        # still runs EXACTLY quota (= span - d) tokens down to the first
+        # resident ancestor: during the span round trip the frozen chain can
+        # break (host eviction / failed write ack) or its resident frontier can
+        # move (a concurrent same-prefix load kick makes [d, x) resident; an
+        # insert recompute re-evicts below d) -- loading anything but the frozen
+        # [d, span) would silently break the cross-stage uniformity the verdict
+        # promised, so any mismatch degrades to a device-only report instead.
+        while excess > 0 and node.evicted:
+            if not node.backuped:
+                return None
+            if len(node.key) <= excess:
+                excess -= len(node.key)
+                node = node.parent
+            else:
+                node = self._split_node(node.key, node, len(node.key) - excess)
+                excess = 0
+        if excess > 0 or not node.evicted:
+            return None
+        chain_len = 0
+        walk = node
+        while walk.evicted:
+            if not walk.backuped:
+                return None
+            chain_len += len(walk.key)
+            walk = walk.parent
+        if chain_len != quota:
+            return None
+        return node
+
+    def _sweep(self):
+        self._tombstone = {
+            h: t for h, t in self._tombstone.items() if t[1] > self._round
+        }
+        if self.rank != 0 or self.pp_rank != 0:
+            return
+        horizon = self._round - self._GC_AGE
+        for table in (self._span_reports, self._load_reports, self._await_load):
+            for key in list(table):
+                if table[key][-1] > horizon:
+                    continue
+                if self._h_rid.get(key[0]) is None:
+                    # dead-rid straggler (e.g. a report drained after a release
+                    # already purged its pairing state) -- plain garbage.
+                    del table[key]
+                else:
+                    logger.warning(
+                        "EIC PP load-back wedged: rid_hash=%d has waited %d+ "
+                        "rounds for peer reports (a stage's EIC ack may never "
+                        "have arrived); the req stays deferred until aborted.",
+                        key[0],
+                        self._GC_AGE,
+                    )
 
     def _drain_local_acks(self):
         queue_size = torch.tensor(
@@ -548,16 +861,21 @@ class EICHiRadixCache(RadixCache):
         for _ in range(int(queue_size.item())):
             node_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
             rid = self._loadback_rid.pop(node_id, None)
-            if rid is None or rid not in self.ongoing_load_admit:
-                # req aborted before its load landed -> free it here (with the true
-                # completed count) so its KV isn't pinned/leaked.
+            st = self.ongoing_load_admit.get(rid) if rid is not None else None
+            if st is None or st.get("node_id") != node_id:
+                # Req released before its load landed (the node_id check keeps a
+                # dead incarnation's ack from being attributed to a re-gated
+                # same-rid retry). Free the WHOLE span (a verdict-uniform
+                # boundary); a partial free at the per-stage completed count
+                # would fork device node shapes across stages.
                 if node_id in self.ongoing_load_back:
-                    self._free_failed_loadback(node_id, complete_token)
+                    self._free_failed_loadback(node_id, 0)
                 continue
-            st = self.ongoing_load_admit[rid]
             st["complete"] = complete_token
-            # local_actual becomes known post-load: device match + actually loaded.
-            self.pending_report[st["h"]] = st["device_match"] + complete_token
+            if self.pp_size <= 1 or self.pp_group is None:
+                self._admit_verdict[st["h"]] = st["d"] + complete_token
+            else:
+                self._queue_report(st, self._KIND_FINAL, st["d"] + complete_token)
 
     def _free_failed_loadback(self, node_id, complete_token):
         # Local cleanup: release the load lock and free the failed-load tail so the
@@ -759,6 +1077,9 @@ class EICHiRadixCache(RadixCache):
             assert x.lock_ref == 0 and x.host_value is not None
 
             assert self.cache_controller.evict_host(x.host_value) > 0
+            # Null the freed backup: frozen references (a deferring req's load
+            # chain) probe `backuped` and must degrade, not DMA from freed slots.
+            x.host_value = None
             for k, v in x.parent.children.items():
                 if v == x:
                     break
@@ -768,7 +1089,10 @@ class EICHiRadixCache(RadixCache):
                 heapq.heappush(leaves, x.parent)
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self,
+        node: TreeNode,
+        mem_quota: Optional[int] = None,
+        allow_evict: bool = True,
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
         start_time = time.perf_counter()
@@ -798,7 +1122,7 @@ class EICHiRadixCache(RadixCache):
         device_indices = self.cache_controller.load(
             host_indices=host_indices, node_id=last_hit_node.id
         )
-        if device_indices is None:
+        if device_indices is None and allow_evict:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
@@ -823,143 +1147,124 @@ class EICHiRadixCache(RadixCache):
         return device_indices
 
     def check_load_back_progress(self, req) -> bool:
-        # Per-candidate admission gate. First encounter kicks the local load-back
-        # (if any) and records this stage's local_actual; the req then defers until
-        # the PP0-authoritative verdict (loading_check) lands, at which point the
-        # prefix is clamped to the cross-PP MIN and the req admits. Every num_ready
-        # candidate passes here -- even cold ones -- so rank0 always gets a full
-        # report set for the rid and the MIN can never leak/hang.
+        # Per-candidate admission gate. Under PP EVERY candidate passes here
+        # (host metadata is per-stage, so needs_host_load_back can't select
+        # candidates uniformly; gating all keeps report keysets symmetric,
+        # keyed by rid). First encounter freezes (d, hh), locks the device
+        # prefix and emits the SPAN report; the req then defers until the FINAL
+        # verdict lands -- in the same DAG slot on every stage, so all stages
+        # admit it in the same batch-forming loop. pp<=1 short-circuits both
+        # verdicts locally (cold reqs admit with zero deferral, as before).
         h = self._rid_hash(req.rid)
         if req.rid not in self.ongoing_load_admit:
-            device_match = len(req.prefix_indices)
-            new_indices, node_id = None, None
-            if req.needs_host_load_back():
-                new_indices, req.last_node = self.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
-                    )
-                )
-                if req.last_node.id in self.ongoing_load_back:
-                    node_id = req.last_node.id
-                    self._loadback_rid[node_id] = req.rid
-            self.ongoing_load_admit[req.rid] = {
+            d = len(req.prefix_indices)
+            hh = req.host_hit_length if req.needs_host_load_back() else 0
+            # Lock the frozen device prefix across the verdict round trips so
+            # eviction can't reclaim slots the reports promised (lock the
+            # deepest RESIDENT ancestor -- last_node itself may be an evicted
+            # host node). Released in finalize/release.
+            lock_node = req.last_node
+            while lock_node.evicted:
+                lock_node = lock_node.parent
+            self.inc_lock_ref(lock_node)
+            st = {
                 "h": h,
-                "new_indices": new_indices,
-                "node_id": node_id,
-                "device_match": device_match,
+                "epoch": self._bump_epoch(req.rid),
+                "d": d,
+                "hh": hh,
+                "best_match_node": req.best_match_node if hh > 0 else None,
+                "deferred_lock": lock_node,
+                "span": None,
+                "alloc": 0,
+                "node_id": None,
+                "load_node": None,
+                "new_indices": None,
                 "complete": None,
-                "deferred_lock": None,
             }
-            if node_id is None:
-                # nothing async to wait on -> local_actual is known now.
-                extra = len(new_indices) if new_indices is not None else 0
-                self.pending_report[h] = device_match + extra
+            self.ongoing_load_admit[req.rid] = st
+            self._h_rid[h] = req.rid
             if self.pp_size <= 1 or self.pp_group is None:
-                if h in self.pending_report:
-                    self._admit_verdict[h] = self.pending_report.pop(h)
-            if h in self._admit_verdict:
-                return self._finalize_load_admit(req)
-            if node_id is None:
-                # Deferring a device-only / fell-back req: load_back took no lock, so
-                # lock the frozen device prefix ourselves so eviction can't reclaim
-                # its slots across the verdict round-trip. Released in finalize.
-                self.inc_lock_ref(req.last_node)
-                self.ongoing_load_admit[req.rid]["deferred_lock"] = req.last_node
-            return False
+                self._apply_span(req.rid, st, d + hh)
+            else:
+                self._queue_report(st, self._KIND_SPAN, (d, hh))
         if h not in self._admit_verdict:
-            return False  # still loading / awaiting peers; loading_check advances it
+            return False  # loading / awaiting verdicts; loading_check advances it
         return self._finalize_load_admit(req)
 
     def _finalize_load_admit(self, req) -> bool:
         st = self.ongoing_load_admit.pop(req.rid)
-        h, new_indices, node_id, device_match = (
-            st["h"],
-            st["new_indices"],
-            st["node_id"],
-            st["device_match"],
-        )
+        h, d = st["h"], st["d"]
+        self._h_rid.pop(h, None)
         admit = self._admit_verdict.pop(h)
-        dl = st.get("deferred_lock")
-        if dl is not None:
-            self.dec_lock_ref(dl)  # release the defer-time device-prefix lock
-        # host_hit == last_node's tree depth beyond device_match (the FULL host
-        # portion attempted, not just what loaded); host_hit == 0 when cold or
-        # when init_load_back fell back to a resident ancestor.
-        host_hit = len(new_indices) if new_indices is not None else 0
-        loaded = 0
-        if node_id is not None:
-            # free the local failed-load tail (garbage KV) and release the load lock.
-            loaded = st["complete"] or 0
-            self._free_failed_loadback(node_id, loaded)
-        if new_indices is not None and loaded > 0:
-            req.prefix_indices = torch.cat([req.prefix_indices, new_indices[:loaded]])
+        self.dec_lock_ref(st["deferred_lock"])
+        if st["node_id"] is not None:
+            # A FINAL verdict needs every loader's post-ack report, so it can
+            # never outrun the local DMA or the local KV. Loud beats a silent
+            # free of in-flight memory / a silent cross-stage length fork.
+            assert st["complete"] is not None, "EIC PP verdict before local load ack"
+            assert admit <= d + st["complete"], "EIC PP verdict exceeds local KV"
+            # Free [admit, d + alloc): the failed tail AND loaded-beyond-verdict
+            # in one cut at a verdict boundary, keeping trees and allocator
+            # accounting PP-identical.
+            self._free_failed_loadback(st["node_id"], max(admit - d, 0))
+        else:
+            assert admit <= d, "EIC PP verdict beyond device match without a load"
+        if st["new_indices"] is not None and admit > d:
+            req.prefix_indices = torch.cat(
+                [req.prefix_indices, st["new_indices"][: admit - d]]
+            )
         if admit < len(req.prefix_indices):
             req.prefix_indices = req.prefix_indices[:admit]
         prefix_len = len(req.prefix_indices)
-        # Repoint last_node at the deepest RESIDENT node still spanning the clamped
-        # prefix (bottom depth >= prefix_len), skipping the just-evicted failed
-        # tail. Seed at last_node's TRUE tree depth (device_match + host_hit); the
-        # sum of key lengths on the path is split-invariant so this stays exact.
-        # inc_lock_ref(last_node) then protects every slot the req reads (an
-        # over-locked resident tail past prefix_len is harmless).
-        node = req.last_node
-        depth = device_match + host_hit
+        # Repoint last_node at the deepest RESIDENT node still spanning the
+        # clamped prefix, seeding at the load chain's true depth (d + alloc);
+        # path key lengths are split-invariant so the walk stays exact.
+        node = st["load_node"] if st["load_node"] is not None else st["deferred_lock"]
+        depth = d + st["alloc"]
         while node is not self.root_node and (
             node.value is None or depth - len(node.key) >= prefix_len
         ):
             depth -= len(node.key)
             node = node.parent
         req.last_node = node
-        req._eic_loaded_len = max(0, prefix_len - device_match)
+        req._eic_loaded_len = max(0, prefix_len - d)
         req.set_extend_input_len(len(req.fill_ids) - prefix_len)
         req.cache_protected_len = prefix_len
         req.last_matched_prefix_len = prefix_len
         return True
 
     def release_load_admit(self, rid):
-        # Cleanup for a deferring candidate removed from the waiting queue WITHOUT
-        # admitting (abort / waiting-timeout / queued-limit): release every lock and
-        # drop all per-req reconciliation state so KV isn't pinned and is_fully_idle
-        # isn't wedged. No-op if the rid never entered the gate.
+        # Cleanup for a deferring candidate removed from the waiting queue
+        # WITHOUT admitting (abort / queued-limit): release every lock, drop all
+        # per-req state, and tombstone the wire key so straggler reports and
+        # verdicts of this incarnation die on arrival. Releases ride the same
+        # relayed request stream on every stage, so the whole-span free below
+        # stays PP-uniform. No-op if the rid never entered the gate.
         st = self.ongoing_load_admit.pop(rid, None)
         if st is None:
             return
         h = st["h"]
-        self.pending_report.pop(h, None)
+        self._h_rid.pop(h, None)
         self._admit_verdict.pop(h, None)
-        if st["deferred_lock"] is not None:
-            self.dec_lock_ref(st["deferred_lock"])
+        self.dec_lock_ref(st["deferred_lock"])
         node_id = st["node_id"]
         if node_id is not None and node_id in self.ongoing_load_back:
             if st["complete"] is not None:
-                # load already landed -> release its lock + free the failed tail now.
                 self._loadback_rid.pop(node_id, None)
-                self._free_failed_loadback(node_id, st["complete"])
-            # else: load still in flight -> leave it; _drain_local_acks frees the ack.
-
-    def init_load_back(
-        self,
-        params: InitLoadBackParams,
-    ):
-        last_node = params.best_match_node
-        mem_quota = params.mem_quota
-        if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
-            if loading_values is not None:
-                logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
-                )
-                return loading_values, last_node
-
-            while last_node.evicted:
-                last_node = last_node.parent
-
-        return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
-            last_node,
-        )
+                self._free_failed_loadback(node_id, 0)  # whole span: uniform boundary
+            # else: load still in flight -> _drain_local_acks frees it at ack.
+        if self.pp_size > 1 and self.pp_group is not None:
+            self._tombstone[h] = (st["epoch"], self._round + self._TOMBSTONE_TTL)
+            key = (h, st["epoch"])
+            for kind in (self._KIND_SPAN, self._KIND_FINAL):
+                self._report_outbox.pop((h, st["epoch"], kind), None)
+            self._span_reports.pop(key, None)
+            self._load_reports.pop(key, None)
+            self._await_load.pop(key, None)
+            if self._verdict_outbox:
+                self._verdict_outbox = [
+                    v for v in self._verdict_outbox if v[0] != h
+                ]
 
     def ready_to_load_host_cache(self):
         producer_index = self.cache_controller.layer_done_counter.update_producer()
@@ -1507,7 +1812,10 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         return len(host_indices)
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self,
+        node: TreeNode,
+        mem_quota: Optional[int] = None,
+        allow_evict: bool = True,
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
         start_time = time.perf_counter()
@@ -1565,7 +1873,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             node_id=last_hit_node.id,
             content_hash=host_content_hash,
         )
-        if device_indices is None:
+        if device_indices is None and allow_evict:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load_page(
                 host_indices=host_indices,

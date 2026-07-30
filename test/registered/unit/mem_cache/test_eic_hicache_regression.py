@@ -297,16 +297,22 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(t.item(), 3)
 
 
-    def test_loading_check_single_stage_reconciles_locally(self):
-        # With one PP stage the local_actual is already global.
+    def test_drain_acks_single_stage_resolves_locally(self):
+        # With one PP stage the local ack IS the verdict: d + complete.
         cache = object.__new__(EICPagedHiRadixCache)
-        cache.pp_size, cache.pp_group = 1, None
-        cache.pending_report = {}
+        cache.pp_size, cache.pp_group, cache.tp_size = 1, None, 1
         cache._admit_verdict = {}
-        cache._drain_local_acks = lambda: cache.pending_report.update({10: 8})
-        EICPagedHiRadixCache.loading_check(cache)
-        self.assertEqual(cache._admit_verdict, {10: 8})
-        self.assertEqual(cache.pending_report, {})
+        cache._loadback_rid = {55: "r0"}
+        cache.ongoing_load_admit = {
+            "r0": {"h": 10, "d": 4, "node_id": 55, "complete": None}
+        }
+        cache.ongoing_load_back = {}
+        q = Queue()
+        q.put((55, 8))
+        cache.cache_controller = SimpleNamespace(ack_load_queue=q)
+        EICPagedHiRadixCache._drain_local_acks(cache)
+        self.assertEqual(cache._admit_verdict, {10: 12})
+        self.assertEqual(cache.ongoing_load_admit["r0"]["complete"], 8)
 
     def test_finalize_cross_pp_clamp_keeps_spanning_resident_last_node(self):
         # Device-only warm req, cross-PP MIN 10 lands MID-node (below this stage's
@@ -315,6 +321,8 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache = object.__new__(EICPagedHiRadixCache)
         root = FakeTreeNode(0, True, None)
         cache.root_node = root
+        cache.dec_lock_ref = lambda node: None
+        cache._h_rid = {7: "r0"}
         node_a = FakeTreeNode(8, True, root)  # covers (0, 8]
         node_b = FakeTreeNode(4, True, node_a)  # covers (8, 12], spans clamp 10
         req = mock.Mock()
@@ -325,9 +333,12 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache.ongoing_load_admit = {
             "r0": {
                 "h": 7,
-                "new_indices": None,
+                "d": 12,
+                "alloc": 0,
                 "node_id": None,
-                "device_match": 12,
+                "load_node": None,
+                "new_indices": None,
+                "deferred_lock": node_b,
                 "complete": None,
             }
         }
@@ -340,14 +351,18 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(req._eic_loaded_len, 0)
         self.assertEqual(cache.ongoing_load_admit, {})
         self.assertEqual(cache._admit_verdict, {})
+        self.assertEqual(cache._h_rid, {})
 
     def test_finalize_partial_load_lands_on_resident_not_evicted_tail(self):
-        # Partial load-back (loaded 10 < host_hit 16): the failed tail node is
+        # Partial load-back (loaded 10 < span alloc 16): the failed tail node is
         # evicted. last_node must land on the deepest RESIDENT node at depth 14
-        # (device 4 + loaded 10), NOT the evicted tail the walk skips over.
+        # (device 4 + loaded 10), NOT the evicted tail the walk skips over; the
+        # whole [14, 20) tail is freed at the verdict boundary.
         cache = object.__new__(EICPagedHiRadixCache)
         root = FakeTreeNode(0, True, None)
         cache.root_node = root
+        cache.dec_lock_ref = lambda node: None
+        cache._h_rid = {9: "r1"}
         node_a = FakeTreeNode(4, True, root)  # device match, (0, 4]
         node_c = FakeTreeNode(10, True, node_a)  # loaded host, (4, 14]
         node_d = FakeTreeNode(6, False, node_c)  # failed tail, evicted, (14, 20]
@@ -359,21 +374,321 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache.ongoing_load_admit = {
             "r1": {
                 "h": 9,
-                "new_indices": torch.arange(100, 116, dtype=torch.int64),  # 16 slots
+                "d": 4,
+                "alloc": 16,
                 "node_id": 55,
-                "device_match": 4,
+                "load_node": node_d,
+                "new_indices": torch.arange(100, 116, dtype=torch.int64),
+                "deferred_lock": node_a,
                 "complete": 10,
             }
         }
-        cache._admit_verdict = {9: 14}  # no cross-PP clamp below the loaded length
-        cache._free_failed_loadback = lambda nid, c: None  # tree already reflects free
+        cache._admit_verdict = {9: 14}  # FINAL == this stage's loaded length
+        freed = []
+        cache._free_failed_loadback = lambda nid, c: freed.append((nid, c))
         ok = EICPagedHiRadixCache._finalize_load_admit(cache, req)
         self.assertTrue(ok)
+        self.assertEqual(freed, [(55, 10)])  # free [14, 20) at the verdict boundary
         self.assertEqual(len(req.prefix_indices), 14)  # 4 device + 10 loaded
         self.assertEqual(req.prefix_indices[4:].tolist(), list(range(100, 110)))
         self.assertIs(req.last_node, node_c)  # resident node at depth 14, not node_d
         req.set_extend_input_len.assert_called_once_with(20 - 14)
         self.assertEqual(req._eic_loaded_len, 10)
+
+    # ---- two-stage lockstep protocol tests --------------------------------
+
+    class FakeStore:
+        def __init__(self):
+            self.kv = {}
+
+        def set(self, key, value):
+            self.kv[key] = value
+
+        def get(self, key):
+            return self.kv[key]
+
+        def check(self, keys):
+            return all(k in self.kv for k in keys)
+
+        def delete_key(self, key):
+            return self.kv.pop(key, None) is not None
+
+    def _make_stage(self, pp_rank, store, dag_box, pp_size=2):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.pp_size, cache.pp_rank = pp_size, pp_rank
+        cache.pp_group = object() if pp_size > 1 else None
+        cache.tp_size, cache.rank, cache.tp_group = 1, 0, None
+        cache.load_back_threshold = 10
+        cache.root_node = FakeTreeNode(0, True, None)
+        cache.ongoing_load_admit = {}
+        cache.ongoing_load_back = {}
+        cache._admit_verdict = {}
+        cache._h_rid = {}
+        cache._rid_epoch = {}
+        cache._loadback_rid = {}
+        cache._report_outbox = {}
+        cache._span_reports = {}
+        cache._load_reports = {}
+        cache._await_load = {}
+        cache._verdict_outbox = []
+        cache._tombstone = {}
+        cache._pub_seq = 0
+        cache._next_seq = {}
+        cache._round = 0
+        cache._store_handle = store
+        cache.locks = []
+        cache.inc_lock_ref = lambda node: cache.locks.append(node)
+        cache.dec_lock_ref = lambda node: cache.locks.remove(node)
+        cache.freed = []
+        cache._free_failed_loadback = lambda nid, c: cache.freed.append((nid, c))
+        cache._clip_host_chain = lambda node, excess, quota: node
+        if pp_rank == 0:
+            # rank0 isends: record the packed verdicts for this round.
+            cache._pp_bcast_from_first = lambda buf, tag=None: dag_box.__setitem__(
+                "buf", buf.clone()
+            )
+        else:
+            # rank>0 blocking-recv: the k-th recv pairs with the k-th send.
+            cache._pp_bcast_from_first = lambda buf, tag=None: buf.copy_(
+                dag_box["buf"]
+            )
+        q = Queue()
+        cache.cache_controller = SimpleNamespace(
+            ack_load_queue=q, mem_pool_device_allocator=SimpleNamespace()
+        )
+        return cache
+
+    def _make_req(self, rid, d, hh, load_node_id):
+        node = mock.Mock()
+        node.evicted = False
+        node.value = [1]
+        node.key = list(range(max(hh, 1)))
+        node.parent = None
+        node.id = load_node_id
+        req = mock.Mock()
+        req.rid = rid
+        req.prefix_indices = torch.arange(d, dtype=torch.int64)
+        req.fill_ids = list(range(64))
+        req.host_hit_length = hh
+        req.needs_host_load_back = lambda: hh > 0
+        req.best_match_node = node
+        req.last_node = node
+        return req
+
+    def test_two_stage_load_back_reconciles_span_and_final(self):
+        # Host metadata diverges (hh 16 vs 12): SPAN = min(4+16, 4+12) = 16, both
+        # stages allocate quota 12 in the SAME round; loads land 12 vs 8: FINAL =
+        # min(16, 4+12, 4+8) = 12; both admit 12 in the SAME round and free the
+        # [12, 16) tail with identical arguments.
+        store, box = self.FakeStore(), {}
+        s0 = self._make_stage(0, store, box)
+        s1 = self._make_stage(1, store, box)
+        for s in (s0, s1):
+            s.load_back = lambda node, allow_evict=None: torch.arange(
+                12, dtype=torch.int64
+            )
+        r0 = self._make_req("req-a", 4, 16, load_node_id=100)
+        r1 = self._make_req("req-a", 4, 12, load_node_id=200)
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s1, r1))
+        # round 1: s1 publishes its span report; s0 sees only its own.
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        self.assertEqual(s0.ongoing_load_admit["req-a"]["node_id"], None)
+        # round 2: s0 drains the store, forms SPAN=16, both stages kick alloc 12.
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        self.assertEqual(s0.ongoing_load_admit["req-a"]["alloc"], 12)
+        self.assertEqual(s1.ongoing_load_admit["req-a"]["alloc"], 12)
+        self.assertEqual(
+            s0.ongoing_load_admit["req-a"]["span"],
+            s1.ongoing_load_admit["req-a"]["span"],
+        )
+        # acks land: stage0 loads 12/12, stage1 only 8/12.
+        s0.cache_controller.ack_load_queue.put((100, 12))
+        s1.cache_controller.ack_load_queue.put((200, 8))
+        # round 3: acks drain; s1 publishes its LOADED report.
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        # round 4: s0 drains it, forms FINAL=12, both apply in the same round.
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s1, r1))
+        self.assertEqual(len(r0.prefix_indices), 12)
+        self.assertEqual(len(r1.prefix_indices), 12)
+        r0.set_extend_input_len.assert_called_once_with(64 - 12)
+        r1.set_extend_input_len.assert_called_once_with(64 - 12)
+        # identical uniform-boundary frees: [FINAL, SPAN) == complete arg 8.
+        self.assertEqual(s0.freed, [(100, 8)])
+        self.assertEqual(s1.freed, [(200, 8)])
+        # no leaked state, no leaked locks.
+        for s in (s0, s1):
+            self.assertEqual(s.ongoing_load_admit, {})
+            self.assertEqual(s._admit_verdict, {})
+            self.assertEqual(s._h_rid, {})
+            self.assertEqual(s.locks, [])
+        self.assertEqual(store.kv, {})  # every store batch consumed and deleted
+
+    def test_two_stage_cold_req_single_round_trip(self):
+        # No stage has host data: SPAN decision short-circuits to FINAL=min(d)
+        # (one round trip), both admit device-only in the same round.
+        store, box = self.FakeStore(), {}
+        s0 = self._make_stage(0, store, box)
+        s1 = self._make_stage(1, store, box)
+        r0 = self._make_req("req-b", 8, 0, load_node_id=0)
+        r1 = self._make_req("req-b", 8, 0, load_node_id=0)
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s1, r1))
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s1, r1))
+        self.assertEqual(len(r0.prefix_indices), 8)
+        self.assertEqual(len(r1.prefix_indices), 8)
+        for s in (s0, s1):
+            self.assertEqual(s.locks, [])
+
+    def test_release_tombstones_and_drops_straggler_verdicts(self):
+        # Release after the span reports are in flight: the late verdict and any
+        # straggler reports must die on arrival (epoch/tombstone), leaving no
+        # state and no locks behind.
+        store, box = self.FakeStore(), {}
+        s0 = self._make_stage(0, store, box)
+        s1 = self._make_stage(1, store, box)
+        r0 = self._make_req("req-c", 4, 16, load_node_id=100)
+        r1 = self._make_req("req-c", 4, 16, load_node_id=200)
+        EICPagedHiRadixCache.check_load_back_progress(s0, r0)
+        EICPagedHiRadixCache.check_load_back_progress(s1, r1)
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)  # s1's span report is now in the store
+        EICPagedHiRadixCache.release_load_admit(s0, "req-c")
+        EICPagedHiRadixCache.release_load_admit(s1, "req-c")
+        h = s0._rid_hash("req-c")
+        self.assertIn(h, s0._tombstone)
+        # rank0 drains the straggler AFTER the release: tombstone drops it.
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)
+        self.assertEqual(s0._span_reports, {})
+        self.assertEqual(s0._verdict_outbox, [])
+        for s in (s0, s1):
+            self.assertEqual(s.ongoing_load_admit, {})
+            self.assertEqual(s.locks, [])
+
+    def test_rid_reuse_after_release_still_reconciles(self):
+        # A client retry reuses the rid within the tombstone TTL. The tombstone
+        # must kill only the RELEASED incarnation's stragglers; the retry's
+        # higher-epoch reports must pass or the retry wedges forever.
+        store, box = self.FakeStore(), {}
+        s0 = self._make_stage(0, store, box)
+        s1 = self._make_stage(1, store, box)
+        EICPagedHiRadixCache.check_load_back_progress(
+            s0, self._make_req("req-d", 8, 0, load_node_id=0)
+        )
+        EICPagedHiRadixCache.check_load_back_progress(
+            s1, self._make_req("req-d", 8, 0, load_node_id=0)
+        )
+        EICPagedHiRadixCache.loading_check(s0)
+        EICPagedHiRadixCache.loading_check(s1)  # epoch-1 span report published
+        EICPagedHiRadixCache.release_load_admit(s0, "req-d")
+        EICPagedHiRadixCache.release_load_admit(s1, "req-d")
+        # retry: same rid re-enters the gate (epoch 2) while tombstoned.
+        r0 = self._make_req("req-d", 8, 0, load_node_id=0)
+        r1 = self._make_req("req-d", 8, 0, load_node_id=0)
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s1, r1))
+        for _ in range(3):
+            EICPagedHiRadixCache.loading_check(s0)
+            EICPagedHiRadixCache.loading_check(s1)
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s0, r0))
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s1, r1))
+        self.assertEqual(len(r0.prefix_indices), 8)
+
+    def test_stale_ack_after_release_is_orphaned_not_attributed(self):
+        # Release with the load still in flight, then the same rid re-gates.
+        # The OLD incarnation's ack must be orphan-freed (whole span), never
+        # attributed to the new incarnation (whose node_id differs).
+        store, box = self.FakeStore(), {}
+        s0 = self._make_stage(0, store, box)
+        s1 = self._make_stage(1, store, box)
+        for s in (s0, s1):
+            s.load_back = lambda node, allow_evict=None, _s=s: (
+                _s.ongoing_load_back.__setitem__(node.id, (node, node, 12)),
+                torch.arange(12, dtype=torch.int64),
+            )[1]
+        r0 = self._make_req("req-e", 4, 16, load_node_id=100)
+        r1 = self._make_req("req-e", 4, 16, load_node_id=200)
+        EICPagedHiRadixCache.check_load_back_progress(s0, r0)
+        EICPagedHiRadixCache.check_load_back_progress(s1, r1)
+        for _ in range(2):  # span verdict forms and applies -> loads kicked
+            EICPagedHiRadixCache.loading_check(s0)
+            EICPagedHiRadixCache.loading_check(s1)
+        self.assertEqual(s0.ongoing_load_admit["req-e"]["node_id"], 100)
+        EICPagedHiRadixCache.release_load_admit(s0, "req-e")
+        EICPagedHiRadixCache.release_load_admit(s1, "req-e")
+        # same rid re-gates (epoch 2, no load kicked yet: node_id None)
+        EICPagedHiRadixCache.check_load_back_progress(
+            s0, self._make_req("req-e", 4, 16, load_node_id=101)
+        )
+        # the old incarnation's ack lands now: must orphan-free the WHOLE span.
+        s0.cache_controller.ack_load_queue.put((100, 12))
+        EICPagedHiRadixCache.loading_check(s0)
+        self.assertEqual(s0.freed, [(100, 0)])
+        self.assertIsNone(s0.ongoing_load_admit["req-e"]["complete"])
+
+    def test_pp1_cold_req_admits_with_zero_deferral(self):
+        # pp<=1 keeps the old behavior: a cold/device-only req admits on its
+        # FIRST gate pass, no verdict round trip.
+        s = self._make_stage(0, self.FakeStore(), {}, pp_size=1)
+        req = self._make_req("req-f", 8, 0, load_node_id=0)
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s, req))
+        self.assertEqual(len(req.prefix_indices), 8)
+        self.assertEqual(s.locks, [])
+        self.assertEqual(s.ongoing_load_admit, {})
+
+    def test_pp1_warm_req_kicks_at_gate_and_admits_on_ack(self):
+        # pp<=1 warm path: load kicks at gate entry, req defers, the local ack
+        # IS the verdict (d + complete), failed tail freed at that boundary.
+        s = self._make_stage(0, self.FakeStore(), {}, pp_size=1)
+        s.load_back = lambda node, allow_evict=None: torch.arange(
+            16, dtype=torch.int64
+        )
+        req = self._make_req("req-g", 4, 16, load_node_id=100)
+        self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s, req))
+        self.assertEqual(s.ongoing_load_admit["req-g"]["node_id"], 100)
+        s.cache_controller.ack_load_queue.put((100, 10))
+        EICPagedHiRadixCache.loading_check(s)
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s, req))
+        self.assertEqual(len(req.prefix_indices), 14)  # 4 device + 10 loaded
+        self.assertEqual(s.freed, [(100, 10)])
+        self.assertEqual(s.locks, [])
+
+    def test_finalize_asserts_on_verdict_before_ack(self):
+        # I5 enforcement: a FINAL verdict may never land before the local ack
+        # when a load was kicked -- silent free of in-flight DMA otherwise.
+        s = self._make_stage(0, self.FakeStore(), {}, pp_size=1)
+        s.dec_lock_ref = lambda n: None
+        node = self._make_req("x", 4, 16, load_node_id=100).best_match_node
+        req = self._make_req("req-h", 4, 16, load_node_id=100)
+        s.ongoing_load_admit = {
+            "req-h": {
+                "h": 5,
+                "d": 4,
+                "alloc": 12,
+                "node_id": 100,
+                "load_node": node,
+                "new_indices": torch.arange(12, dtype=torch.int64),
+                "deferred_lock": node,
+                "complete": None,
+            }
+        }
+        s._h_rid = {5: "req-h"}
+        s._admit_verdict = {5: 10}
+        with self.assertRaises(AssertionError):
+            EICPagedHiRadixCache._finalize_load_admit(s, req)
 
 
 if __name__ == "__main__":

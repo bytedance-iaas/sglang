@@ -2564,14 +2564,14 @@ class Scheduler(
             )
             if not deferring_load_back:
                 req.init_next_round_input(tc)
-            # PP>1: EIC host load-back is disabled. Its cross-PP length reconciliation
-            # needs PP0 to RECEIVE a peer report in the scheduler thread, which
-            # deadlocks the out-of-phase pipeline in this gloo build (PP0 is the
-            # pipeline's output receiver). Admission falls to the PP-uniform device
-            # match; full host-load-back-under-PP is the pipeline-piggyback follow-up.
-            if self.enable_eic_cache and tc.pp_size <= 1 and (
+            # PP>1 gates EVERY candidate (not only needs_host_load_back): host
+            # metadata is per-stage (EIC write acks fail per namespace), so the
+            # needs flag itself can diverge across stages; gating all candidates
+            # keeps the cross-PP report keysets symmetric, keyed by rid.
+            if self.enable_eic_cache and (
                 deferring_load_back
                 or req.needs_host_load_back()
+                or tc.pp_size > 1
             ):
                 if not tc.check_load_back_progress(req):
                     continue
