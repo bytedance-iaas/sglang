@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.mem_cache.memory_pool import KVBit4MLATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
 if is_cuda():
@@ -1638,6 +1639,26 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
+        # KVBit no_alloc bypass: when the pool is KVBit4MLATokenToKVPool, the
+        # nope latent is stored as 4bit (Hadamard-rotated + groupwise quantized)
+        # and the full BF16 kv_buffer is NOT allocated. Skip fa3 / flashmla and
+        # run the kvbit-owned triton paged MLA decode kernel, which reads the
+        # 4bit packed store + raw rope buffer on-the-fly. Q-FHT (applied in
+        # forward_absorb_prepare) folded the Hadamard to the query side, so the
+        # kernel reads rotated K directly. page_table_1 + dsa_cache_seqlens are
+        # exactly the page_table / cache_seqlens the kernel expects (page_size=1).
+        if envs.SGLANG_KVBIT_NO_ALLOC and isinstance(
+            self.token_to_kv_pool, KVBit4MLATokenToKVPool
+        ):
+            return self._forward_kvbit(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                layer=layer,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                forward_batch=forward_batch,
+            )
+
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1779,6 +1800,63 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_kvbit(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        layer: RadixAttention,
+        metadata: DSAMetadata,
+        topk_indices: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """KVBit no_alloc decode: absorbed MLA attention via the kvbit triton
+        paged kernel, reading 4bit nope latent + raw rope on-the-fly (no fa3,
+        no full BF16 kv_buffer). q_nope is already Q-FHT-folded (q@R) by
+        forward_absorb_prepare; the kernel reads rotated K directly.
+        """
+        from kvbit.triton_kernels import mla_decode_fwd
+
+        pool = self.token_to_kv_pool
+        local = layer.layer_id - pool.start_layer
+        kvbit_packed = pool.kvbit_packed[local]   # (num_slots, row_bytes) uint8
+        rope_buffer = pool.rope_buffer[local]      # (num_slots, 1, qk_rope) bf16
+
+        # page_table_1 (topk-transformed slot indices, page_size=1) +
+        # dsa_cache_seqlens_int32 (valid KV length per seq, clipped to topk)
+        # are exactly the 2D page_table / cache_seqlens the kernel expects.
+        page_table_1 = self._get_fused_topk_page_table(topk_indices) if (
+            topk_indices is not None and envs.SGLANG_DSA_FUSE_TOPK.get()
+        ) else transform_index_page_table_decode(
+            page_table=metadata.page_table_1,
+            topk_indices=topk_indices,
+            page_size=1,
+        )
+        cache_seqlens = metadata.dsa_cache_seqlens_int32
+        bs = q_nope.shape[0]
+
+        # num_kv_splits: a simple static policy (ceil(seq_len / target_split)).
+        # For Phase-1 correctness use 1 split; Phase-2 tuning will set per-seq
+        # splits from cache_seqlens (like triton_backend get_num_kv_splits).
+        max_kv_splits = max(1, min(self.num_splits, 8))
+        num_kv_splits = torch.full((bs,), 1, dtype=torch.int32, device=q_nope.device)
+
+        out = mla_decode_fwd(
+            q_nope.contiguous(),
+            q_rope.contiguous(),
+            kvbit_packed,
+            rope_buffer,
+            page_table_1,
+            cache_seqlens,
+            num_kv_splits=num_kv_splits,
+            max_kv_splits=int(num_kv_splits[0]),
+            sm_scale=layer.scaling,
+            kv_lora_rank=layer.v_head_dim,       # == kv_lora_rank (attn_mqa uses kv_lora_rank as v_head_dim)
+            qk_rope_head_dim=layer.head_dim - layer.v_head_dim,
+            bits=pool.kvbit_bits,
+            group_size=pool.kvbit_group_size,
+        )
+        return out
 
     def _forward_flashmla_sparse(
         self,
