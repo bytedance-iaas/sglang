@@ -557,7 +557,7 @@ class ModelRunnerKVCacheMixin:
             # (GLM-5.2). The decode path bypasses fa3 via a kvbit triton kernel
             # (see dsa_backend.py). NOT for fp8 DSA (kvbit4 needs the bf16 path).
             if (
-                envs.SGLANG_KVBIT_NO_ALLOC
+                envs.SGLANG_KVBIT_NO_ALLOC.get()
                 and not self.enable_hisparse
                 and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
                 and not (

@@ -1647,7 +1647,7 @@ class DeepseekSparseAttnBackend(
         # forward_absorb_prepare) folded the Hadamard to the query side, so the
         # kernel reads rotated K directly. page_table_1 + dsa_cache_seqlens are
         # exactly the page_table / cache_seqlens the kernel expects (page_size=1).
-        if envs.SGLANG_KVBIT_NO_ALLOC and isinstance(
+        if envs.SGLANG_KVBIT_NO_ALLOC.get() and isinstance(
             self.token_to_kv_pool, KVBit4MLATokenToKVPool
         ):
             # Split q into (n_tokens, n_heads, nope/rope) for the kvbit kernel.

@@ -433,7 +433,7 @@ class DeepseekMLAForwardMixin:
         # Prefill keeps unfolded q + unrotated K (get_key_buffer inverse-rotates)
         # so the flashmla/fa3 path stays in the native latent domain end-to-end.
         # Gated by SGLANG_KVBIT_NO_ALLOC; no-op otherwise.
-        if envs.SGLANG_KVBIT_NO_ALLOC and forward_batch.forward_mode.is_decode_or_idle():
+        if envs.SGLANG_KVBIT_NO_ALLOC.get() and forward_batch.forward_mode.is_decode_or_idle():
             R = getattr(self, "_kvbit_qfht_R", None)
             if R is None or R.shape[0] != self.kv_lora_rank:
                 from kvbit.rotation import build_hadamard
