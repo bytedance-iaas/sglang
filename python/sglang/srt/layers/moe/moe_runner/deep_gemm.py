@@ -123,31 +123,6 @@ def _get_fp4_group128_masked_scale(
     return masked_scale
 
 
-def _resolve_fp4_masked_hints(
-    runner_input: "DeepGemmRunnerInput",
-) -> Tuple[Optional[int], Optional[int]]:
-    if runner_input.masked_m_max_hint is not None:
-        return runner_input.masked_m_max_hint, runner_input.active_expert_count_hint
-
-    mode = envs.SGLANG_DG_FP4_MASKED_HINT_MODE.get().lower()
-    if mode == "none":
-        return None, None
-
-    if mode == "sparse":
-        max_expected_m = envs.SGLANG_DG_FP4_MASKED_HINT_MAX_EXPECTED_M.get()
-        if runner_input.expected_m is None or runner_input.expected_m > max_expected_m:
-            return None, None
-    elif mode != "force":
-        raise ValueError(
-            "SGLANG_DG_FP4_MASKED_HINT_MODE must be one of: none, sparse, force"
-        )
-
-    return (
-        envs.SGLANG_DG_FP4_MASKED_HINT_MAX.get(),
-        envs.SGLANG_DG_FP4_MASKED_HINT_ACTIVE.get(),
-    )
-
-
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -491,12 +466,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
-        fp4_masked_m_max_hint: Optional[int] = None
-        fp4_active_groups_hint: Optional[int] = None
-        if is_fp4_experts:
-            fp4_masked_m_max_hint, fp4_active_groups_hint = _resolve_fp4_masked_hints(
-                runner_input
-            )
 
         if use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
@@ -565,8 +534,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm_expected_m,
                 gran_k_a=128,
                 gran_k_b=128,
-                masked_m_max_hint=fp4_masked_m_max_hint,
-                active_groups_hint=fp4_active_groups_hint,
+                masked_m_max_hint=runner_input.masked_m_max_hint,
+                active_groups_hint=runner_input.active_expert_count_hint,
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
@@ -711,8 +680,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm_expected_m,
                 gran_k_a=128,
                 gran_k_b=128,
-                masked_m_max_hint=fp4_masked_m_max_hint,
-                active_groups_hint=fp4_active_groups_hint,
+                masked_m_max_hint=runner_input.masked_m_max_hint,
+                active_groups_hint=runner_input.active_expert_count_hint,
             )
         else:
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
