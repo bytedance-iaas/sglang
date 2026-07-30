@@ -2112,6 +2112,9 @@ class Scheduler(
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
+                if self.enable_eic_cache:
+                    # Release any in-flight EIC load-admit lock/state (deferring req).
+                    self.tree_cache.release_load_admit(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2142,6 +2145,8 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                if self.enable_eic_cache:
+                    self.tree_cache.release_load_admit(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2550,7 +2555,27 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            # EIC host load-back admits asynchronously via check_load_back_progress;
+            # a deferring req keeps its frozen match (re-matching a mutated tree would
+            # double-count) until its load resolves.
+            tc = self.tree_cache
+            deferring_load_back = (
+                self.enable_eic_cache and req.rid in tc.ongoing_load_admit
+            )
+            if not deferring_load_back:
+                req.init_next_round_input(tc)
+            # PP>1: EIC host load-back is disabled. Its cross-PP length reconciliation
+            # needs PP0 to RECEIVE a peer report in the scheduler thread, which
+            # deadlocks the out-of-phase pipeline in this gloo build (PP0 is the
+            # pipeline's output receiver). Admission falls to the PP-uniform device
+            # match; full host-load-back-under-PP is the pipeline-piggyback follow-up.
+            if self.enable_eic_cache and tc.pp_size <= 1 and (
+                deferring_load_back
+                or req.needs_host_load_back()
+            ):
+                if not tc.check_load_back_progress(req):
+                    continue
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3156,6 +3181,11 @@ class Scheduler(
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
+                # EIC in-flight cross-PP admits. Gate ONLY on ongoing_load_admit:
+                # it is the PP-symmetric per-req marker (every stage registers on
+                # first encounter, all finalize at the verdict step). pending_report
+                # /_reports are rank0-only bookkeeping and would desync idle per rank.
+                idle &= len(getattr(tc, "ongoing_load_admit", ())) == 0
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
@@ -3410,6 +3440,8 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
+            if self.enable_eic_cache:
+                self.tree_cache.release_load_admit(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

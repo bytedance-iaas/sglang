@@ -1,3 +1,4 @@
+import hashlib
 import heapq
 import logging
 import os
@@ -155,13 +156,19 @@ class EICHiRadixCache(RadixCache):
         self.tp_group = params.tp_cache_group
         self.tp_size = self.tp_group.size()
         self.rank = self.tp_group.rank()
-        # PP stages store each layer-shard's KV under a distinct EIC namespace
-        # (deploy_key embeds pp_rank), so per-stage load-back can succeed/fail
-        # independently. loading_check reconciles the admitted length across PP.
+        # deploy_key embeds pp_rank, so each PP stage load-backs independently;
+        # loading_check reconciles the admitted length across stages.
         self.pp_group = params.pp_cache_group
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list = []
+        # EIC host load-back runs only for a single PP stage (pp_size<=1); under PP>1
+        # it is disabled because its cross-PP length reconciliation would need rank0
+        # to receive a peer report in the scheduler thread, which deadlocks the
+        # out-of-phase pipeline in this gloo build. See loading_check.
+        self.pending_report = {}  # rid_hash -> local admit len, awaiting resolution
+        self._admit_verdict = {}  # rid_hash -> resolved admit len, consumed by the gate
+        self._loadback_rid = {}  # load-back node_id -> rid (maps an EIC ack to its req)
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.sliding_window_size = params.sliding_window_size
         self.load_cache_event = threading.Event()
@@ -284,6 +291,9 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_load_back = {}
         self.ongoing_load_admit = {}
         self.ongoing_write_through = {}
+        self.pending_report = {}
+        self._admit_verdict = {}
+        self._loadback_rid = {}
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -477,20 +487,13 @@ class EICHiRadixCache(RadixCache):
                 f"queue size {queue_size.item()}"
             )
 
-    def _pp_bcast_from_first(self, tensor):
-        # Broadcast PP0's value down the pipeline: each stage overwrites its
-        # value with the upstream one, so the admitted length is identical
-        # everywhere. The pipeline runs stages out of phase, so any scheme where
-        # a stage BLOCKS waiting for another deadlocks (an all_reduce, or a
-        # blocking send/recv). A non-blocking isend down the stages never blocks
-        # the sender; the send is drained next round (_drain_async_work).
-        # NOTE: this is PP0-authoritative, not a true cross-PP MIN. Under EIC
-        # partial mget failure a downstream stage that loaded back fewer tokens
-        # than PP0 keeps unloaded (garbage) KV for the gap -- a known limitation,
-        # tracked for the pipelined-MIN follow-up.
+    def _pp_bcast_from_first(self, tensor, tag=P2PTag.HIRADIX_PP_SYNC):
+        # PP0-authoritative broadcast down the pipeline via non-blocking isend
+        # (blocking/collective PP ops deadlock the out-of-phase pipeline). Each
+        # logical stream passes its OWN tag so independent bcasts (num_ready vs the
+        # admission verdict) never share a FIFO slot and can't cross-match.
         if self.pp_size <= 1 or self.pp_group is None:
             return
-        tag = P2PTag.HIRADIX_PP_SYNC
         if self.pp_rank > 0:
             torch.distributed.recv(
                 tensor, group_src=self.pp_rank - 1, group=self.pp_group, tag=tag
@@ -517,68 +520,75 @@ class EICHiRadixCache(RadixCache):
         self._pp_bcast_from_first(tensor)
 
     def loading_check(self):
-        if len(self.ongoing_load_back) == 0:
-            return
-        loading_check_start_time = time.perf_counter()
+        # Single stage: drain acks and resolve locally. PP>1: host load-back is
+        # disabled (its cross-PP reconciliation would need PP0 to receive a peer
+        # report in the scheduler thread -> deadlocks the out-of-phase pipeline in
+        # this gloo build), so pending_report stays empty and this is a no-op. The
+        # true PP-consistent load-back is the pipeline-piggyback follow-up.
+        self._drain_local_acks()
+        for h in list(self.pending_report):
+            self._admit_verdict[h] = self.pending_report.pop(h)
+
+    def _rid_hash(self, rid):
+        # Stable 56-bit id (fits a positive int64); hash() is per-process salted so
+        # not PP-uniform. ponytail: collision-free for a batch-sized in-flight set.
+        return int.from_bytes(
+            hashlib.blake2b(rid.encode(), digest_size=7).digest(), "big"
+        )
+
+    def _drain_local_acks(self):
         queue_size = torch.tensor(
             self.cache_controller.ack_load_queue.qsize(), dtype=torch.int
         )
-        if torch.distributed.get_world_size(group=self.tp_group) > 1:
-            # synchrnoize TP workers to make the same update to radix cache
+        if self.tp_size > 1:
+            # TP/CP share a namespace -> acks match; MIN guards qsize skew only.
             torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
+                queue_size, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
-        # NOTE: no PP sync here. EIC acks arrive asynchronously so per-stage
-        # ack_load_queue sizes differ; a PP0-authoritative queue_size would make
-        # a lagging stage get_nowait() past its queue and crash, and the
-        # complete_token vector lengths would not match. Cross-PP consistency of
-        # the truncated tree needs a true MIN, which deadlocks the out-of-phase
-        # pipeline -- deferred to the pipelined-MIN follow-up. Each stage
-        # truncates locally (CP-consistent); harmless while attn_cp_size == 1.
-        ack_list = []
-        complete_tokens = []
-        for _ in range(queue_size.item()):
-            ack_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
-            ack_list.append(ack_id)
-            complete_tokens.append(complete_token)
-        for ack_id, complete_token in zip(ack_list, complete_tokens):
-            start_node, end_node, total_token_num = self.ongoing_load_back[ack_id]
-            self.dec_lock_ref(end_node)
-            failed_token_num = total_token_num - complete_token
-            while end_node != start_node:
-                if failed_token_num >= len(end_node.value):
-                    # node load back full fail
-                    # no need to delete failed node because the kvcache will be set after compute
-                    self.cache_controller.mem_pool_device_allocator.free(end_node.value)
-                    self.evictable_size_ -= len(end_node.value)
-                    failed_token_num -= len(end_node.value)
-                    end_node.value = None
-                    end_node.host_value = None
-                    self._update_leaf_status(end_node)
-                    self._update_leaf_status(end_node.parent)
-                elif failed_token_num > 0:
-                    # node load back partial fail, split node
-                    split_len = len(end_node.value) - failed_token_num
-                    self._split_node(end_node.key, end_node, split_len)
-                    self.evictable_size_ -= failed_token_num
-                    self.cache_controller.mem_pool_device_allocator.free(end_node.value)
-                    failed_token_num -= len(end_node.value)
-                    end_node.value = None
-                    end_node.host_value = None
-                    self._update_leaf_status(end_node)
-                    self._update_leaf_status(end_node.parent)
-                    assert failed_token_num == 0, "failed_token_num should be zero"
-                end_node = end_node.parent
-            # clear the reference
-            del self.ongoing_load_back[ack_id]
-        cost_time = time.perf_counter() - loading_check_start_time
-        if cost_time > 1:
-            logger.warning(
-                f"loading check cost {cost_time:.3f} seconds, "
-                f"queue size {queue_size.item()}"
-            )
+        for _ in range(int(queue_size.item())):
+            node_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
+            rid = self._loadback_rid.pop(node_id, None)
+            if rid is None or rid not in self.ongoing_load_admit:
+                # req aborted before its load landed -> free it here (with the true
+                # completed count) so its KV isn't pinned/leaked.
+                if node_id in self.ongoing_load_back:
+                    self._free_failed_loadback(node_id, complete_token)
+                continue
+            st = self.ongoing_load_admit[rid]
+            st["complete"] = complete_token
+            # local_actual becomes known post-load: device match + actually loaded.
+            self.pending_report[st["h"]] = st["device_match"] + complete_token
+
+    def _free_failed_loadback(self, node_id, complete_token):
+        # Local cleanup: release the load lock and free the failed-load tail so the
+        # tree never holds garbage KV. Per-stage; the tree may diverge across PP.
+        start_node, end_node, total_token_num = self.ongoing_load_back.pop(node_id)
+        self.dec_lock_ref(end_node)
+        failed_token_num = total_token_num - complete_token
+        while end_node != start_node:
+            if failed_token_num >= len(end_node.value):
+                # node load back full fail
+                # no need to delete failed node because the kvcache will be set after compute
+                self.cache_controller.mem_pool_device_allocator.free(end_node.value)
+                self.evictable_size_ -= len(end_node.value)
+                failed_token_num -= len(end_node.value)
+                end_node.value = None
+                end_node.host_value = None
+                self._update_leaf_status(end_node)
+                self._update_leaf_status(end_node.parent)
+            elif failed_token_num > 0:
+                # node load back partial fail, split node
+                split_len = len(end_node.value) - failed_token_num
+                self._split_node(end_node.key, end_node, split_len)
+                self.evictable_size_ -= failed_token_num
+                self.cache_controller.mem_pool_device_allocator.free(end_node.value)
+                failed_token_num -= len(end_node.value)
+                end_node.value = None
+                end_node.host_value = None
+                self._update_leaf_status(end_node)
+                self._update_leaf_status(end_node.parent)
+                assert failed_token_num == 0, "failed_token_num should be zero"
+            end_node = end_node.parent
 
     # TODO: is not correct for eic, but neednt to be fixed rightnow
     def evictable_size(self):
@@ -812,69 +822,122 @@ class EICHiRadixCache(RadixCache):
 
         return device_indices
 
-    def loading_complete(self, node: TreeNode):
-        self.loading_check()
-        return node.id not in self.ongoing_load_back.keys()
-
     def check_load_back_progress(self, req) -> bool:
-        # SCAFFOLD for the Part-2 follow-up (async admission), NOT wired in yet --
-        # the active path is the schedule_policy busy-wait. Verified in isolation
-        # that wiring this WITHOUT a PP-consistent loading_check diverges
-        # extend_input_len across PP and crashes (main_norm_rope.cuh:183, even at
-        # cp=1). Part 2 must call this from the scheduler gate AND make
-        # loading_check MIN complete_token + synchronize ongoing_load_back deletion
-        # across PP via a non-blocking isend+irecv delayed-MIN (a blocking recv
-        # deadlocks the out-of-phase pipeline). Mirrors check_prefetch_progress.
-        # First call kicks the async load and defers (False); later calls stay
-        # False while the ack is in flight; once loading_check has drained the
-        # ack, finalize prefix_indices/extend_input_len and admit (True).
+        # Per-candidate admission gate. First encounter kicks the local load-back
+        # (if any) and records this stage's local_actual; the req then defers until
+        # the PP0-authoritative verdict (loading_check) lands, at which point the
+        # prefix is clamped to the cross-PP MIN and the req admits. Every num_ready
+        # candidate passes here -- even cold ones -- so rank0 always gets a full
+        # report set for the rid and the MIN can never leak/hang.
+        h = self._rid_hash(req.rid)
         if req.rid not in self.ongoing_load_admit:
-            if not req.needs_host_load_back():
-                return True
-            new_indices, req.last_node = self.init_load_back(
-                InitLoadBackParams(
-                    best_match_node=req.best_match_node,
-                    host_hit_length=req.host_hit_length,
-                    req=req,
+            device_match = len(req.prefix_indices)
+            new_indices, node_id = None, None
+            if req.needs_host_load_back():
+                new_indices, req.last_node = self.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=req.best_match_node,
+                        host_hit_length=req.host_hit_length,
+                        req=req,
+                    )
                 )
-            )
-            self.ongoing_load_admit[req.rid] = (req.last_node, new_indices)
-            # init_load_back may fall back to a resident ancestor with no async
-            # load registered -> finalize right away.
-            if req.last_node.id not in self.ongoing_load_back:
+                if req.last_node.id in self.ongoing_load_back:
+                    node_id = req.last_node.id
+                    self._loadback_rid[node_id] = req.rid
+            self.ongoing_load_admit[req.rid] = {
+                "h": h,
+                "new_indices": new_indices,
+                "node_id": node_id,
+                "device_match": device_match,
+                "complete": None,
+                "deferred_lock": None,
+            }
+            if node_id is None:
+                # nothing async to wait on -> local_actual is known now.
+                extra = len(new_indices) if new_indices is not None else 0
+                self.pending_report[h] = device_match + extra
+            if self.pp_size <= 1 or self.pp_group is None:
+                if h in self.pending_report:
+                    self._admit_verdict[h] = self.pending_report.pop(h)
+            if h in self._admit_verdict:
                 return self._finalize_load_admit(req)
+            if node_id is None:
+                # Deferring a device-only / fell-back req: load_back took no lock, so
+                # lock the frozen device prefix ourselves so eviction can't reclaim
+                # its slots across the verdict round-trip. Released in finalize.
+                self.inc_lock_ref(req.last_node)
+                self.ongoing_load_admit[req.rid]["deferred_lock"] = req.last_node
             return False
-        if req.last_node.id in self.ongoing_load_back:
-            return False  # still loading; loading_check advances it next steps
+        if h not in self._admit_verdict:
+            return False  # still loading / awaiting peers; loading_check advances it
         return self._finalize_load_admit(req)
 
     def _finalize_load_admit(self, req) -> bool:
-        _, new_indices = self.ongoing_load_admit.pop(req.rid)
-        # Relocated from schedule_policy's old busy-wait finalize block: on
-        # partial failure walk the evicted tail down to the resident node and
-        # truncate new_indices to the actually-loaded (device-resident) slots.
-        load_success = req.last_node.value is not None
-        complete_token_num = len(new_indices)
-        if not load_success:
-            gpu_node = req.last_node
-            while gpu_node.evicted:
-                complete_token_num -= len(gpu_node.key)
-                gpu_node = gpu_node.parent
-            assert complete_token_num >= 0
-            req.last_node = gpu_node
-            if complete_token_num > 0:
-                new_indices = new_indices[:complete_token_num]
-            else:
-                new_indices = torch.empty(
-                    (0,), dtype=torch.int64, device=req.prefix_indices.device
-                )
-        req._eic_loaded_len = len(new_indices)
-        req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        st = self.ongoing_load_admit.pop(req.rid)
+        h, new_indices, node_id, device_match = (
+            st["h"],
+            st["new_indices"],
+            st["node_id"],
+            st["device_match"],
+        )
+        admit = self._admit_verdict.pop(h)
+        dl = st.get("deferred_lock")
+        if dl is not None:
+            self.dec_lock_ref(dl)  # release the defer-time device-prefix lock
+        # host_hit == last_node's tree depth beyond device_match (the FULL host
+        # portion attempted, not just what loaded); host_hit == 0 when cold or
+        # when init_load_back fell back to a resident ancestor.
+        host_hit = len(new_indices) if new_indices is not None else 0
+        loaded = 0
+        if node_id is not None:
+            # free the local failed-load tail (garbage KV) and release the load lock.
+            loaded = st["complete"] or 0
+            self._free_failed_loadback(node_id, loaded)
+        if new_indices is not None and loaded > 0:
+            req.prefix_indices = torch.cat([req.prefix_indices, new_indices[:loaded]])
+        if admit < len(req.prefix_indices):
+            req.prefix_indices = req.prefix_indices[:admit]
         prefix_len = len(req.prefix_indices)
+        # Repoint last_node at the deepest RESIDENT node still spanning the clamped
+        # prefix (bottom depth >= prefix_len), skipping the just-evicted failed
+        # tail. Seed at last_node's TRUE tree depth (device_match + host_hit); the
+        # sum of key lengths on the path is split-invariant so this stays exact.
+        # inc_lock_ref(last_node) then protects every slot the req reads (an
+        # over-locked resident tail past prefix_len is harmless).
+        node = req.last_node
+        depth = device_match + host_hit
+        while node is not self.root_node and (
+            node.value is None or depth - len(node.key) >= prefix_len
+        ):
+            depth -= len(node.key)
+            node = node.parent
+        req.last_node = node
+        req._eic_loaded_len = max(0, prefix_len - device_match)
+        req.set_extend_input_len(len(req.fill_ids) - prefix_len)
         req.cache_protected_len = prefix_len
         req.last_matched_prefix_len = prefix_len
         return True
+
+    def release_load_admit(self, rid):
+        # Cleanup for a deferring candidate removed from the waiting queue WITHOUT
+        # admitting (abort / waiting-timeout / queued-limit): release every lock and
+        # drop all per-req reconciliation state so KV isn't pinned and is_fully_idle
+        # isn't wedged. No-op if the rid never entered the gate.
+        st = self.ongoing_load_admit.pop(rid, None)
+        if st is None:
+            return
+        h = st["h"]
+        self.pending_report.pop(h, None)
+        self._admit_verdict.pop(h, None)
+        if st["deferred_lock"] is not None:
+            self.dec_lock_ref(st["deferred_lock"])
+        node_id = st["node_id"]
+        if node_id is not None and node_id in self.ongoing_load_back:
+            if st["complete"] is not None:
+                # load already landed -> release its lock + free the failed tail now.
+                self._loadback_rid.pop(node_id, None)
+                self._free_failed_loadback(node_id, st["complete"])
+            # else: load still in flight -> leave it; _drain_local_acks frees the ack.
 
     def init_load_back(
         self,
@@ -1323,9 +1386,9 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         # every stage (so its p2p bcast can't hang). A lagging stage reads only
         # the reqs it actually has (local_n); the rest of the vector stays 0.
         num_ready = int(num_ready.item())
+        local_n = min(num_ready, len(waiting_queue))
         if num_ready == 0:
             return
-        local_n = min(num_ready, len(waiting_queue))
         if len(self.match_req_set) > 1000:
             self.match_req_set = self.match_req_set[500:]
 

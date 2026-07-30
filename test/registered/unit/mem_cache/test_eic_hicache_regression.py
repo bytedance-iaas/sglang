@@ -19,6 +19,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
+class FakeTreeNode:
+    # Minimal radix node for the finalize last_node walk: len(key), value (None ==
+    # evicted), parent. Depth bookkeeping uses the sum of key lengths on the path.
+    def __init__(self, key_len: int, resident: bool, parent):
+        self.key = list(range(key_len))
+        self.value = [0] if resident else None
+        self.parent = parent
+
+
 class FakeHostPool:
     def alloc(self, size: int):
         return torch.arange(size, dtype=torch.int32)
@@ -286,6 +295,85 @@ class TestEICHiCacheRegression(unittest.TestCase):
             t = torch.tensor(8, dtype=torch.int64)
             EICPagedHiRadixCache._pp_bcast_from_first(c1, t)
         self.assertEqual(t.item(), 3)
+
+
+    def test_loading_check_single_stage_reconciles_locally(self):
+        # With one PP stage the local_actual is already global.
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.pp_size, cache.pp_group = 1, None
+        cache.pending_report = {}
+        cache._admit_verdict = {}
+        cache._drain_local_acks = lambda: cache.pending_report.update({10: 8})
+        EICPagedHiRadixCache.loading_check(cache)
+        self.assertEqual(cache._admit_verdict, {10: 8})
+        self.assertEqual(cache.pending_report, {})
+
+    def test_finalize_cross_pp_clamp_keeps_spanning_resident_last_node(self):
+        # Device-only warm req, cross-PP MIN 10 lands MID-node (below this stage's
+        # device match 12). last_node must stay the resident node SPANNING depth 10
+        # (bottom 12 >= 10) so inc_lock_ref protects every slot the req reads.
+        cache = object.__new__(EICPagedHiRadixCache)
+        root = FakeTreeNode(0, True, None)
+        cache.root_node = root
+        node_a = FakeTreeNode(8, True, root)  # covers (0, 8]
+        node_b = FakeTreeNode(4, True, node_a)  # covers (8, 12], spans clamp 10
+        req = mock.Mock()
+        req.rid = "r0"
+        req.prefix_indices = torch.arange(12, dtype=torch.int64)
+        req.fill_ids = list(range(20))
+        req.last_node = node_b
+        cache.ongoing_load_admit = {
+            "r0": {
+                "h": 7,
+                "new_indices": None,
+                "node_id": None,
+                "device_match": 12,
+                "complete": None,
+            }
+        }
+        cache._admit_verdict = {7: 10}
+        ok = EICPagedHiRadixCache._finalize_load_admit(cache, req)
+        self.assertTrue(ok)
+        self.assertEqual(len(req.prefix_indices), 10)
+        self.assertIs(req.last_node, node_b)  # spanning resident node kept
+        req.set_extend_input_len.assert_called_once_with(20 - 10)
+        self.assertEqual(req._eic_loaded_len, 0)
+        self.assertEqual(cache.ongoing_load_admit, {})
+        self.assertEqual(cache._admit_verdict, {})
+
+    def test_finalize_partial_load_lands_on_resident_not_evicted_tail(self):
+        # Partial load-back (loaded 10 < host_hit 16): the failed tail node is
+        # evicted. last_node must land on the deepest RESIDENT node at depth 14
+        # (device 4 + loaded 10), NOT the evicted tail the walk skips over.
+        cache = object.__new__(EICPagedHiRadixCache)
+        root = FakeTreeNode(0, True, None)
+        cache.root_node = root
+        node_a = FakeTreeNode(4, True, root)  # device match, (0, 4]
+        node_c = FakeTreeNode(10, True, node_a)  # loaded host, (4, 14]
+        node_d = FakeTreeNode(6, False, node_c)  # failed tail, evicted, (14, 20]
+        req = mock.Mock()
+        req.rid = "r1"
+        req.prefix_indices = torch.arange(4, dtype=torch.int64)
+        req.fill_ids = list(range(20))
+        req.last_node = node_d
+        cache.ongoing_load_admit = {
+            "r1": {
+                "h": 9,
+                "new_indices": torch.arange(100, 116, dtype=torch.int64),  # 16 slots
+                "node_id": 55,
+                "device_match": 4,
+                "complete": 10,
+            }
+        }
+        cache._admit_verdict = {9: 14}  # no cross-PP clamp below the loaded length
+        cache._free_failed_loadback = lambda nid, c: None  # tree already reflects free
+        ok = EICPagedHiRadixCache._finalize_load_admit(cache, req)
+        self.assertTrue(ok)
+        self.assertEqual(len(req.prefix_indices), 14)  # 4 device + 10 loaded
+        self.assertEqual(req.prefix_indices[4:].tolist(), list(range(100, 110)))
+        self.assertIs(req.last_node, node_c)  # resident node at depth 14, not node_d
+        req.set_extend_input_len.assert_called_once_with(20 - 14)
+        self.assertEqual(req._eic_loaded_len, 10)
 
 
 if __name__ == "__main__":
