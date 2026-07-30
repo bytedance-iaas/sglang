@@ -82,6 +82,7 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    host_insert_dropped: bool = False
 
 
 @dataclasses.dataclass
