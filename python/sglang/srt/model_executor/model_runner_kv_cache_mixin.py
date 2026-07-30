@@ -580,6 +580,9 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                     use_dsa=True,
                     override_kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    index_head_dim=get_dsa_index_head_dim(
+                        self.model_config.hf_config
+                    ),
                 )
             else:
                 PoolCls = (

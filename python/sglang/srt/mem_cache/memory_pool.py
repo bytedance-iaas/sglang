@@ -2185,187 +2185,6 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
-class KVBit4MLATokenToKVPool(MLATokenToKVPool):
-    """MLA KV pool that stores the nope latent (kv_lora_rank) as kvbit 4bit
-    (Hadamard-rotated + groupwise quantized + BU4 packed) and the rope tail as
-    raw BF16 — the no_alloc store for GLM-5.2 / DSA bf16 path.
-
-    This is the sglang-native KV store for kvbit's no_alloc route (built in
-    sglang, not monkey-patched). The decode path bypasses fa3 entirely: a
-    kvbit-owned triton paged decode kernel reads ``kvbit_packed`` (4bit rotated
-    nope) + ``rope_buffer`` (bf16 rope) on-the-fly, so the full-size BF16
-    ``kv_buffer`` is never needed and is NOT allocated (no_alloc → real HBM
-    win, ~2.77x token capacity: 416 B/token vs 1152 B/token native).
-
-    Per-token per-layer bytes:
-      - nope 4bit: code_bytes(kv_lora_rank*4/8) + header(num_groups*4)
-        = 256 + 32 = 288 B (kv_lora_rank=512, group_size=64 → 8 groups)
-      - rope BF16: qk_rope_head_dim*2 = 128 B
-      - total 416 B vs native 1152 B (kv_cache_dim=576 * 2) = 0.361x.
-
-    ``set_mla_kv_buffer`` encodes the nope latent via kvbit (lazy-imported) and
-    scatters into ``kvbit_packed``; rope is copied raw into ``rope_buffer``.
-    ``get_key_buffer`` materializes the full BF16 pool (4bit decode + concat
-    rope) — used only by the prefill/fa3 fallback path; the decode bypass
-    kernel reads the packed stores directly and never calls this.
-
-    kvbit's Hadamard rotation is valid here because the MLA nope latent
-    (kv_lora_rank) is position-INdependent (unlike Qwen3.5's full-RoPE K, which
-    has no nope block and is NOT a kvbit rotation target). With Q-FHT, the
-    rotation folds to the query side (``q_nope_absorbed @ R``) so the decode
-    kernel skips the per-K inverse-rotate and uses the rotated latent directly.
-    """
-
-    # kvbit 4bit config — fixed for the GLM-5.2 production layout.
-    kvbit_bits: int = 4
-    kvbit_group_size: int = 64
-
-    def _create_buffers(self):
-        from kvbit.layout import packed_row_bytes
-
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                m = self.size + self.page_size
-                self.store_dtype = torch.uint8
-                # 4bit packed rotated nope latent: (m, row_bytes) uint8.
-                self._kvbit_row_bytes = packed_row_bytes(
-                    dim=self.kv_lora_rank,
-                    bits=self.kvbit_bits,
-                    rope_dim=0,  # nope-only block; rope stored separately
-                    group_size=self.kvbit_group_size,
-                )
-                self.kvbit_packed = [
-                    torch.zeros(
-                        (m, self._kvbit_row_bytes),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                # Raw BF16 rope tail: (m, 1, qk_rope_head_dim). Kept native
-                # (rope is position-dependent, not kvbit-compressed; 128 B/token
-                # is 11% of native KV — keeping it native is fine, the win is
-                # the nope 512 -> 4bit).
-                self.rope_buffer = [
-                    torch.zeros(
-                        (m, 1, self.qk_rope_head_dim),
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                # Placeholder kv_buffer (1 byte) so code that references
-                # kv_buffer (data_ptrs, get_contiguous_buf_infos, disagg) does
-                # not crash. The decode bypass kernel reads kvbit_packed +
-                # rope_buffer, never kv_buffer.
-                self.kv_buffer = [
-                    torch.zeros(1, dtype=self.store_dtype, device=self.device)
-                    for _ in range(self.layer_num)
-                ]
-
-    def _clear_buffers(self):
-        del self.kvbit_packed
-        del self.rope_buffer
-        del self.kv_buffer
-
-    def get_kv_size_bytes(self):
-        # Report the real compressed footprint, not the 1-byte placeholder.
-        kv_size_bytes = 0
-        for i in range(self.layer_num):
-            kv_size_bytes += get_tensor_size_bytes(self.kvbit_packed[i])
-            kv_size_bytes += get_tensor_size_bytes(self.rope_buffer[i])
-        return kv_size_bytes
-
-    def get_key_buffer(self, layer_id: int):
-        """Materialize the full BF16 kv_buffer (4bit decode + concat rope).
-
-        Used by the prefill / fa3 fallback path only. The decode bypass kernel
-        reads ``kvbit_packed`` + ``rope_buffer`` directly and does NOT call
-        this. Decoding the whole pool every call is O(pool_size) — acceptable
-        for prefill (infrequent), NOT for decode (the bypass kernel avoids it).
-        """
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        from kvbit.store import decode_kv_rows
-
-        local = layer_id - self.start_layer
-        packed = self.kvbit_packed[local]  # (m, row_bytes) uint8
-        m = packed.shape[0]
-        # Decode 4bit -> UNROTATED nope latent (inverse-Hadamard applied). This
-        # path serves the prefill / fa3 fallback, where the query is NOT Q-FHT
-        # folded (the fold is decode-only) and attention must run in the native
-        # latent domain. The decode bypass kernel does NOT use this — it reads
-        # the rotated 4bit store directly and inverse-rotates its own output.
-        nope_bf16 = decode_kv_rows(
-            packed,
-            bits=self.kvbit_bits,
-            nope_dim=self.kv_lora_rank,
-            rope_dim=0,
-            group_size=self.kvbit_group_size,
-            rotation=None,  # build_hadamard(kv_lora_rank) inside
-            dtype=self.dtype,
-            rotate=True,
-        )  # (m, kv_lora_rank) bf16 — unrotated latent
-        rope_bf16 = self.rope_buffer[local].reshape(m, self.qk_rope_head_dim)
-        out = torch.cat([nope_bf16, rope_bf16], dim=-1).reshape(
-            m, 1, self.kv_cache_dim
-        )
-        return out
-
-    def get_value_buffer(self, layer_id: int):
-        # MLA absorbed form: V is the nope latent (same as K_nope); the W_dv
-        # up-projection happens after attention. get_key_buffer already
-        # materializes the full latent; value = its nope slice.
-        return self.get_key_buffer(layer_id)[..., : self.kv_lora_rank]
-
-    def get_kv_buffer(self, layer_id: int):
-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
-
-    def set_mla_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k_nope: torch.Tensor,
-        cache_k_rope: torch.Tensor,
-    ):
-        """Encode nope latent (512) as kvbit 4bit rotated, scatter; rope raw.
-
-        ``cache_k_nope``: (num_tokens, 1, kv_lora_rank) BF16 — the
-        position-INdependent MLA latent (kvbit Hadamard-rotates + 4bit-quants
-        it). ``cache_k_rope``: (num_tokens, 1, qk_rope_head_dim) BF16 — raw
-        rope, copied as-is.
-        """
-        maybe_detect_oob(
-            loc, 0, self.size + self.page_size, "set_mla_kv_buffer (KVBit4-MLA)"
-        )
-        from kvbit.store import encode_kv_rows
-
-        layer_id = layer.layer_id
-        local = layer_id - self.start_layer
-        n = cache_k_nope.shape[0]
-        # nope: (n, kv_lora_rank) → kvbit 4bit packed (rotated). encode_kv_rows
-        # expects (..., nope_dim + rope_dim); rope_dim=0 here (nope-only).
-        nope = cache_k_nope.reshape(n, self.kv_lora_rank).to(torch.bfloat16)
-        packed = encode_kv_rows(
-            nope,
-            bits=self.kvbit_bits,
-            nope_dim=self.kv_lora_rank,
-            rope_dim=0,
-            group_size=self.kvbit_group_size,
-            rotation=None,  # build_hadamard(kv_lora_rank) inside
-            bf16_rotate=True,  # match production: BF16 tensor-core matmul
-            rotate=True,
-        )  # PackedKVRows.data: (n, row_bytes) uint8
-        # Graph-safe scatter (device-side index assign, no host sync).
-        self.kvbit_packed[local][loc] = packed.data
-        # rope: raw BF16 copy into rope_buffer.
-        rope = cache_k_rope.reshape(n, 1, self.qk_rope_head_dim).to(self.dtype)
-        self.rope_buffer[local][loc] = rope
-
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
@@ -2619,3 +2438,226 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+
+
+class KVBit4MLATokenToKVPool(DSATokenToKVPool):
+    """MLA KV pool that stores the nope latent (kv_lora_rank) as kvbit 4bit
+    (Hadamard-rotated + groupwise quantized + BU4 packed) and the rope tail as
+    raw BF16 — the no_alloc store for GLM-5.2 / DSA bf16 path.
+
+    Subclass of ``DSATokenToKVPool`` so the DSA indexer K cache
+    (``index_k_with_scale_buffer``, 128-dim, used for top-k routing) is
+    allocated and served UNCOMPRESSED — the indexer must stay exact; kvbit
+    only compresses the MLA attention latent. Only the MLA KV buffer
+    (``kv_buffer``) is overridden: 4bit packed rotated nope + raw BF16 rope,
+    no full BF16 kv_buffer (no_alloc → ~2.77x token capacity: 416 B/token vs
+    1152 B/token native).
+
+    Per-token per-layer bytes (MLA latent only; indexer buffer is separate):
+      - nope 4bit: code_bytes(kv_lora_rank*4/8) + header(num_groups*4)
+        = 256 + 32 = 288 B (kv_lora_rank=512, group_size=64 → 8 groups)
+      - rope BF16: qk_rope_head_dim*2 = 128 B
+      - total 416 B vs native 1152 B (kv_cache_dim=576 * 2) = 0.361x.
+
+    The decode path bypasses fa3 entirely: a kvbit-owned triton paged decode
+    kernel reads ``kvbit_packed`` (4bit rotated nope) + ``rope_buffer`` (bf16
+    rope) on-the-fly. ``get_key_buffer`` materializes the full BF16 pool
+    (4bit decode + concat rope) for the prefill/fa3 fallback only. With Q-FHT,
+    the Hadamard rotation folds to the query side (``q_nope_absorbed @ R``) so
+    the decode kernel reads the rotated latent directly; prefill keeps
+    unfolded q + unrotated K (get_key_buffer inverse-rotates).
+    """
+
+    # kvbit 4bit config — fixed for the GLM-5.2 production layout.
+    kvbit_bits: int = 4
+    kvbit_group_size: int = 64
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        use_dsa: bool = True,
+        override_kv_cache_dim: Optional[int] = None,
+        index_head_dim: int = 128,
+        index_buf_size: Optional[int] = None,
+    ):
+        # Defer to DSATokenToKVPool: it allocates the indexer K cache
+        # (index_k_with_scale_buffer) and calls MLATokenToKVPool.__init__ which
+        # calls _create_buffers (our override below builds the 4bit store
+        # instead of the bf16 kv_buffer). kv_cache_dim passed as the DSA
+        # kv_cache_dim arg.
+        kv_cache_dim = (
+            override_kv_cache_dim
+            if override_kv_cache_dim is not None
+            else (kv_lora_rank + qk_rope_head_dim)
+        )
+        super().__init__(
+            size,
+            page_size,
+            kv_lora_rank,
+            dtype,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            index_head_dim,
+            enable_memory_saver,
+            kv_cache_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            index_buf_size=index_buf_size,
+        )
+
+    def _create_buffers(self):
+        from kvbit.layout import packed_row_bytes
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                self.store_dtype = torch.uint8
+                # 4bit packed rotated nope latent: (m, row_bytes) uint8.
+                self._kvbit_row_bytes = packed_row_bytes(
+                    dim=self.kv_lora_rank,
+                    bits=self.kvbit_bits,
+                    rope_dim=0,  # nope-only block; rope stored separately
+                    group_size=self.kvbit_group_size,
+                )
+                self.kvbit_packed = [
+                    torch.zeros(
+                        (m, self._kvbit_row_bytes),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # Raw BF16 rope tail: (m, 1, qk_rope_head_dim). Kept native
+                # (rope is position-dependent, not kvbit-compressed; 128 B/token
+                # is 11% of native KV — keeping it native is fine, the win is
+                # the nope 512 -> 4bit).
+                self.rope_buffer = [
+                    torch.zeros(
+                        (m, 1, self.qk_rope_head_dim),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # Placeholder kv_buffer (1 byte) so code that references
+                # kv_buffer (data_ptrs, get_contiguous_buf_infos, disagg) does
+                # not crash. The decode bypass kernel reads kvbit_packed +
+                # rope_buffer, never kv_buffer.
+                self.kv_buffer = [
+                    torch.zeros(1, dtype=self.store_dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+    def _clear_buffers(self):
+        del self.kvbit_packed
+        del self.rope_buffer
+        del self.kv_buffer
+        del self.index_k_with_scale_buffer
+
+    def get_kv_size_bytes(self):
+        # Report the real compressed footprint, not the 1-byte placeholder.
+        kv_size_bytes = 0
+        for i in range(self.layer_num):
+            kv_size_bytes += get_tensor_size_bytes(self.kvbit_packed[i])
+            kv_size_bytes += get_tensor_size_bytes(self.rope_buffer[i])
+        return kv_size_bytes
+
+    def get_key_buffer(self, layer_id: int):
+        """Materialize the full BF16 kv_buffer (4bit decode + concat rope).
+
+        Used by the prefill / fa3 fallback path only. The decode bypass kernel
+        reads ``kvbit_packed`` + ``rope_buffer`` directly and does NOT call
+        this. Decoding the whole pool every call is O(pool_size) — acceptable
+        for prefill (infrequent), NOT for decode (the bypass kernel avoids it).
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        from kvbit.store import decode_kv_rows
+
+        local = layer_id - self.start_layer
+        packed = self.kvbit_packed[local]  # (m, row_bytes) uint8
+        m = packed.shape[0]
+        # Decode 4bit -> UNROTATED nope latent (inverse-Hadamard applied). This
+        # path serves the prefill / fa3 fallback, where the query is NOT Q-FHT
+        # folded (the fold is decode-only) and attention must run in the native
+        # latent domain. The decode bypass kernel does NOT use this — it reads
+        # the rotated 4bit store directly and inverse-rotates its own output.
+        nope_bf16 = decode_kv_rows(
+            packed,
+            bits=self.kvbit_bits,
+            nope_dim=self.kv_lora_rank,
+            rope_dim=0,
+            group_size=self.kvbit_group_size,
+            rotation=None,  # build_hadamard(kv_lora_rank) inside
+            dtype=self.dtype,
+            rotate=True,
+        )  # (m, kv_lora_rank) bf16 — unrotated latent
+        rope_bf16 = self.rope_buffer[local].reshape(m, self.qk_rope_head_dim)
+        out = torch.cat([nope_bf16, rope_bf16], dim=-1).reshape(
+            m, 1, self.kv_cache_dim
+        )
+        return out
+
+    def get_value_buffer(self, layer_id: int):
+        # MLA absorbed form: V is the nope latent (same as K_nope); the W_dv
+        # up-projection happens after attention. get_key_buffer already
+        # materializes the full latent; value = its nope slice.
+        return self.get_key_buffer(layer_id)[..., : self.kv_lora_rank]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        """Encode nope latent (512) as kvbit 4bit rotated, scatter; rope raw.
+
+        ``cache_k_nope``: (num_tokens, 1, kv_lora_rank) BF16 — the
+        position-INdependent MLA latent (kvbit Hadamard-rotates + 4bit-quants
+        it). ``cache_k_rope``: (num_tokens, 1, qk_rope_head_dim) BF16 — raw
+        rope, copied as-is.
+        """
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_mla_kv_buffer (KVBit4-MLA)"
+        )
+        from kvbit.store import encode_kv_rows
+
+        layer_id = layer.layer_id
+        local = layer_id - self.start_layer
+        n = cache_k_nope.shape[0]
+        # nope: (n, kv_lora_rank) → kvbit 4bit packed (rotated). encode_kv_rows
+        # expects (..., nope_dim + rope_dim); rope_dim=0 here (nope-only).
+        nope = cache_k_nope.reshape(n, self.kv_lora_rank).to(torch.bfloat16)
+        packed = encode_kv_rows(
+            nope,
+            bits=self.kvbit_bits,
+            nope_dim=self.kv_lora_rank,
+            rope_dim=0,
+            group_size=self.kvbit_group_size,
+            rotation=None,  # build_hadamard(kv_lora_rank) inside
+            bf16_rotate=True,  # match production: BF16 tensor-core matmul
+            rotate=True,
+        )  # PackedKVRows.data: (n, row_bytes) uint8
+        # Graph-safe scatter (device-side index assign, no host sync).
+        self.kvbit_packed[local][loc] = packed.data
+        # rope: raw BF16 copy into rope_buffer.
+        rope = cache_k_rope.reshape(n, 1, self.qk_rope_head_dim).to(self.dtype)
+        self.rope_buffer[local][loc] = rope
