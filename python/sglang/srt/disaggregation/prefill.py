@@ -355,6 +355,7 @@ class PrefillBootstrapQueue:
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in self.queue],
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -447,6 +448,7 @@ class SchedulerDisaggregationPrefillMixin:
             [req.disagg_kv_sender for req in candidates],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in candidates],
         )
         failed = set()
         for req, poll in zip(candidates, polls):
@@ -643,6 +645,7 @@ class SchedulerDisaggregationPrefillMixin:
                 [req.disagg_kv_sender for _, req in optimistic_reqs],
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
+                ordered_keys=[req.rid for _, req in optimistic_reqs],
             )
             optimistic_polls = {
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
@@ -773,6 +776,7 @@ class SchedulerDisaggregationPrefillMixin:
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
 
         undone_reqs: List[Req] = []
@@ -882,6 +886,7 @@ class SchedulerDisaggregationPrefillMixin:
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
 
         transferred_rids: List[str] = []
@@ -955,6 +960,7 @@ class SchedulerDisaggregationPrefillMixin:
             [req.disagg_kv_sender],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid],
         )
         return self.handle_pending_bootstrap(
             req, polls[0], defer_release=self.enable_overlap
