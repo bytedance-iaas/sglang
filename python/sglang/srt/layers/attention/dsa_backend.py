@@ -1650,9 +1650,25 @@ class DeepseekSparseAttnBackend(
         if envs.SGLANG_KVBIT_NO_ALLOC and isinstance(
             self.token_to_kv_pool, KVBit4MLATokenToKVPool
         ):
+            # Split q into (n_tokens, n_heads, nope/rope) for the kvbit kernel.
+            # This mirrors the reshape below (~L1664) but MUST be done here: the
+            # bypass returns before that point, and `q_nope` is not a parameter
+            # of forward_decode, so referencing it without this derivation is a
+            # NameError. Use local names so the downstream fa3 reshape is untouched.
+            if q_rope is not None:
+                kvb_q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                kvb_q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+            else:
+                kvb_q_all = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
+                kvb_q_nope = kvb_q_all[:, :, : layer.v_head_dim]
+                kvb_q_rope = kvb_q_all[:, :, layer.v_head_dim :]
             return self._forward_kvbit(
-                q_nope=q_nope,
-                q_rope=q_rope,
+                q_nope=kvb_q_nope,
+                q_rope=kvb_q_rope,
                 layer=layer,
                 metadata=metadata,
                 topk_indices=topk_indices,
@@ -1835,10 +1851,13 @@ class DeepseekSparseAttnBackend(
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         bs = q_nope.shape[0]
 
-        # num_kv_splits: a simple static policy (ceil(seq_len / target_split)).
-        # For Phase-1 correctness use 1 split; Phase-2 tuning will set per-seq
-        # splits from cache_seqlens (like triton_backend get_num_kv_splits).
-        max_kv_splits = max(1, min(self.num_splits, 8))
+        # Phase-1 correctness: 1 KV split per seq. ``max_kv_splits`` MUST be a
+        # host literal — deriving it from the GPU ``num_kv_splits`` tensor via
+        # ``int(num_kv_splits[0])`` would CUDA->CPU sync and break CUDA-graph
+        # capture. Phase-2 will set per-seq splits from cache_seqlens (like
+        # triton_backend get_num_kv_splits) with a preallocated metadata tensor
+        # and a literal max.
+        max_kv_splits = 1
         num_kv_splits = torch.full((bs,), 1, dtype=torch.int32, device=q_nope.device)
 
         out = mla_decode_fwd(
@@ -1849,10 +1868,10 @@ class DeepseekSparseAttnBackend(
             page_table_1,
             cache_seqlens,
             num_kv_splits=num_kv_splits,
-            max_kv_splits=int(num_kv_splits[0]),
+            max_kv_splits=max_kv_splits,
             sm_scale=layer.scaling,
-            kv_lora_rank=layer.v_head_dim,       # == kv_lora_rank (attn_mqa uses kv_lora_rank as v_head_dim)
-            qk_rope_head_dim=layer.head_dim - layer.v_head_dim,
+            kv_lora_rank=pool.kv_lora_rank,
+            qk_rope_head_dim=pool.qk_rope_head_dim,
             bits=pool.kvbit_bits,
             group_size=pool.kvbit_group_size,
         )
