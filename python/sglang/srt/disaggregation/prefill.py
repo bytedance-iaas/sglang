@@ -345,18 +345,17 @@ class PrefillBootstrapQueue:
         failed_reqs = []
         indices_to_remove = set()
 
-        if len(self.queue) == 0:
-            if return_failed_reqs is False:
-                return []
-            else:
-                return [], []
-
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
             ordered_keys=[req.rid for req in self.queue],
         )
+        if len(self.queue) == 0:
+            if return_failed_reqs is False:
+                return []
+            else:
+                return [], []
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if (
@@ -442,14 +441,14 @@ class SchedulerDisaggregationPrefillMixin:
         the post-forward bootstrap check.
         """
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
-        if not candidates:
-            return
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in candidates],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
             ordered_keys=[req.rid for req in candidates],
         )
+        if not candidates:
+            return
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
@@ -640,16 +639,15 @@ class SchedulerDisaggregationPrefillMixin:
             for i, req in enumerate(batch.reqs)
             if req.pending_bootstrap and req.inflight_middle_chunks <= 0
         ]
-        if optimistic_reqs:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for _, req in optimistic_reqs],
-                self.attn_cp_cpu_group,
-                self.attn_tp_cpu_group,
-                ordered_keys=[req.rid for _, req in optimistic_reqs],
-            )
-            optimistic_polls = {
-                idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
-            }
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for _, req in optimistic_reqs],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for _, req in optimistic_reqs],
+        )
+        optimistic_polls = {
+            idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
+        }
 
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
@@ -767,9 +765,6 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
-        if len(self.disagg_prefill_inflight_queue) == 0:
-            return []
-
         done_reqs = []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -778,6 +773,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
             ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
+        if len(self.disagg_prefill_inflight_queue) == 0:
+            return []
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue

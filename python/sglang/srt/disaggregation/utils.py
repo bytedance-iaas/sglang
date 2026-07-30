@@ -205,6 +205,11 @@ def poll_and_all_reduce_attn_cp_tp_group(
 
             if not pollers:
                 return [KVPoll.Bootstrapping] * len(local_key_to_index)
+        elif not pollers:
+            # All participants proved that the keyed queue is empty. Returning
+            # before polling is now collective-safe because every rank took
+            # part in the signature reduction above.
+            return []
 
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
