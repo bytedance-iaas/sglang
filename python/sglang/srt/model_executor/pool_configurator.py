@@ -132,11 +132,32 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if envs.SGLANG_KVBIT_NO_ALLOC.get():
+                # kvbit no_alloc: the MLA latent is NOT stored as full bf16. The
+                # nope latent (kv_lora_rank) is kvbit 4bit packed (Hadamard-
+                # rotated + groupwise quantized + BU4): code_bytes + header_bytes
+                # per layer; the rope tail (qk_rope_head_dim) stays raw bf16.
+                # Use the real compressed per-layer cost so the scheduler admits
+                # ~3x more tokens for the same HBM budget. Indexer buffer (added
+                # below) is unchanged — it stays uncompressed.
+                from kvbit.layout import packed_row_bytes
+
+                kvbit_bits = 4
+                kvbit_group_size = 64
+                nope_bytes_per_layer = packed_row_bytes(
+                    dim=model_config.kv_lora_rank,
+                    bits=kvbit_bits,
+                    rope_dim=0,  # nope-only; rope stored separately
+                    group_size=kvbit_group_size,
+                )
+                rope_bytes_per_layer = model_config.qk_rope_head_dim * kv_size
+                cell_size = (nope_bytes_per_layer + rope_bytes_per_layer) * num_layers
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
