@@ -914,6 +914,11 @@ def pre_permute_deepep_ll_to_deep_gemm(
         if expected_m <= 8:
             fp4_block_m_override = 32
             fp4_block_n_override = 128
+        # With staged-SFB A-padding alias, BN256 retains eight pipeline stages
+        # and reduces CTA/A-load duplication for the MTP verify range.
+        elif 16 < expected_m <= 32:
+            fp4_block_m_override = 32
+            fp4_block_n_override = 256
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights

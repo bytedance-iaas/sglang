@@ -518,6 +518,19 @@ class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
                 block_m_override=32,
                 block_n_override=128,
             )
+        elif 16 < m <= 32:
+            kernel(
+                (self.lhs_q, self.lhs_s),
+                (self.rhs_q, self.rhs_s),
+                self.out,
+                masked_m=self.masked_m,
+                expected_m=m,
+                gran_k=128,
+                gran_k_a=128,
+                gran_k_b=128,
+                block_m_override=32,
+                block_n_override=256,
+            )
 
 
 class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
