@@ -67,6 +67,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _MediaInputValidationError(ValueError):
+    pass
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -196,6 +200,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request, prev_response, tokenizer
                 )
 
+        except _MediaInputValidationError as e:
+            return self.create_error_response(str(e))
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
@@ -386,6 +392,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream=request.stream,
             )
 
+            media_error = self._validate_media_content(chat_request)
+            if media_error:
+                raise _MediaInputValidationError(media_error)
+
             # Follow SGLang's _process_messages pattern
             is_multimodal = self.tokenizer_manager.model_config.is_multimodal
             processed_messages = self._process_messages(chat_request, is_multimodal)
@@ -398,6 +408,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_prompts = [processed_messages.prompt_ids]
                 engine_prompts = [processed_messages.prompt_ids]
 
+        except _MediaInputValidationError:
+            raise
         except Exception as e:
             logger.warning(f"Chat processing failed, using fallback: {e}")
             # Fallback to simple encoding
