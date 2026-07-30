@@ -1135,7 +1135,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
-                self._release_pd_hidden_rows(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
