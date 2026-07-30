@@ -422,13 +422,18 @@ class DeepseekMLAForwardMixin:
             )
 
         # Q-FHT fold (kvbit no_alloc): when the MLA nope latent is stored kvbit
-        # 4bit Hadamard-ROTATED (K_nope @ R, R = kv_lora_rank Hadamard, symmetric),
-        # fold the rotation to the query side so the decode kernel reads rotated
-        # K directly without per-K inverse-rotate. q_nope_out is the absorbed
-        # query (q_nope @ W_kc, shape (n_tokens, n_heads, kv_lora_rank)); apply
-        # q_nope_out <- q_nope_out @ R so q_nope_out @ K_nope^T == (q_nope_out @ R)
-        # @ (K_nope @ R)^T. Gated by SGLANG_KVBIT_NO_ALLOC; no-op otherwise.
-        if envs.SGLANG_KVBIT_NO_ALLOC:
+        # 4bit Hadamard-ROTATED (K_nope @ R, R = kv_lora_rank Hadamard, symmetric
+        # & orthogonal), fold the rotation to the query side so the decode kernel
+        # reads rotated K directly without per-K inverse-rotate. q_nope_out is the
+        # absorbed query (q_nope @ W_kc, shape (n_tokens, n_heads, kv_lora_rank));
+        # apply q_nope_out <- q_nope_out @ R so q_nope_out @ K_nope^T == (q_nope_out
+        # @ R) @ (K_nope @ R)^T. DECODE ONLY: the kvbit bypass kernel reads rotated
+        # K and inverse-rotates its own output (compensating the V-path rotation,
+        # since MLA's V == K_nope latent) before the model's W_vc up-projection.
+        # Prefill keeps unfolded q + unrotated K (get_key_buffer inverse-rotates)
+        # so the flashmla/fa3 path stays in the native latent domain end-to-end.
+        # Gated by SGLANG_KVBIT_NO_ALLOC; no-op otherwise.
+        if envs.SGLANG_KVBIT_NO_ALLOC and forward_batch.forward_mode.is_decode_or_idle():
             R = getattr(self, "_kvbit_qfht_R", None)
             if R is None or R.shape[0] != self.kv_lora_rank:
                 from kvbit.rotation import build_hadamard

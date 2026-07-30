@@ -2295,8 +2295,11 @@ class KVBit4MLATokenToKVPool(MLATokenToKVPool):
         local = layer_id - self.start_layer
         packed = self.kvbit_packed[local]  # (m, row_bytes) uint8
         m = packed.shape[0]
-        # Decode 4bit rotated nope → BF16 latent (inverse-Hadamard applied).
-        # rotate=True: the nope block was Hadamard-rotated at encode time.
+        # Decode 4bit -> UNROTATED nope latent (inverse-Hadamard applied). This
+        # path serves the prefill / fa3 fallback, where the query is NOT Q-FHT
+        # folded (the fold is decode-only) and attention must run in the native
+        # latent domain. The decode bypass kernel does NOT use this — it reads
+        # the rotated 4bit store directly and inverse-rotates its own output.
         nope_bf16 = decode_kv_rows(
             packed,
             bits=self.kvbit_bits,
@@ -2306,7 +2309,7 @@ class KVBit4MLATokenToKVPool(MLATokenToKVPool):
             rotation=None,  # build_hadamard(kv_lora_rank) inside
             dtype=self.dtype,
             rotate=True,
-        )  # (m, kv_lora_rank) bf16
+        )  # (m, kv_lora_rank) bf16 — unrotated latent
         rope_bf16 = self.rope_buffer[local].reshape(m, self.qk_rope_head_dim)
         out = torch.cat([nope_bf16, rope_bf16], dim=-1).reshape(
             m, 1, self.kv_cache_dim

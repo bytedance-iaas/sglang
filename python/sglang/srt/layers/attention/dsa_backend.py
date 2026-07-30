@@ -1875,6 +1875,23 @@ class DeepseekSparseAttnBackend(
             bits=pool.kvbit_bits,
             group_size=pool.kvbit_group_size,
         )
+        # Inverse-rotate the V-path. In MLA absorbed form V == K_nope latent, so
+        # attending over rotated K (K@R) produces output in the ROTATED domain
+        # (attn_out_native @ R). The model then up-projects via W_vc expecting
+        # the native latent, so undo the rotation: out @ R. R is symmetric
+        # (R^T == R) and orthogonal (R @ R == I), so out @ R == attn_out_native.
+        # This closes the Q-FHT round-trip (query folded in forward_absorb_prepare,
+        # decode-only) without touching fa3 / W_vc. fp32 matmul matches the query
+        # fold; cached on the backend (R is identical for every layer).
+        R = getattr(self, "_kvbit_decode_R", None)
+        if R is None or R.shape[0] != pool.kv_lora_rank:
+            from kvbit.rotation import build_hadamard
+
+            R = build_hadamard(
+                pool.kv_lora_rank, dtype=torch.float32, device=out.device
+            )
+            self._kvbit_decode_R = R
+        out = (out.float() @ R).to(out.dtype)
         return out
 
     def _forward_flashmla_sparse(
