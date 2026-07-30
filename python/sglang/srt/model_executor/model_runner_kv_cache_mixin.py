@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    KVBit4MLATokenToKVPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
@@ -550,31 +551,64 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
-            )
-            pool_kwargs = {}
-            if self.enable_hisparse:
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+            # kvbit no_alloc: store the MLA nope latent as kvbit 4bit (Hadamard
+            # rotated + groupwise quantized) + raw BF16 rope, drop the full BF16
+            # kv_buffer. Gated by SGLANG_KVBIT_NO_ALLOC=1 on the DSA bf16 path
+            # (GLM-5.2). The decode path bypasses fa3 via a kvbit triton kernel
+            # (see dsa_backend.py). NOT for fp8 DSA (kvbit4 needs the bf16 path).
+            if (
+                envs.SGLANG_KVBIT_NO_ALLOC
+                and not self.enable_hisparse
+                and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
+                and not (
+                    self.kv_cache_dtype == torch.float8_e4m3fn
+                    and self.calculate_mla_kv_cache_dim()
+                    != self.model_config.kv_lora_rank
+                    + self.model_config.qk_rope_head_dim
+                )
+            ):
+                self.token_to_kv_pool = KVBit4MLATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    use_dsa=True,
+                    override_kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                )
+            else:
+                PoolCls = (
+                    HiSparseDSATokenToKVPool
+                    if self.enable_hisparse
+                    else DSATokenToKVPool
+                )
+                pool_kwargs = {}
+                if self.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-                pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                    self.server_args
-                ).host_to_device_ratio
-            self.token_to_kv_pool = PoolCls(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
-                **pool_kwargs,
-            )
+                    pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
+                        self.server_args
+                    ).host_to_device_ratio
+                self.token_to_kv_pool = PoolCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                    **pool_kwargs,
+                )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):

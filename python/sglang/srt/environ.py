@@ -883,6 +883,11 @@ class Envs:
     SGLANG_ENABLE_KVBIT = EnvBool(False)
     SGLANG_KVBIT_BITS = EnvInt(4)                # 3 or 4 (BU3/BU4)
     SGLANG_KVBIT_MODE = EnvStr("capture_only")   # off|capture_only|hybrid|full_kvbit
+    # KVBit no_alloc (sglang-native): store the MLA nope latent as kvbit 4bit
+    # (Hadamard-rotated + groupwise quantized) + raw BF16 rope, drop the full
+    # BF16 kv_buffer. Decode bypasses fa3 via a kvbit triton kernel. DSA bf16
+    # path only (GLM-5.2). ~2.77x token capacity. See kvbit docs/multi_model_arch.md.
+    SGLANG_KVBIT_NO_ALLOC = EnvBool(False)
 
 
 envs = Envs()
