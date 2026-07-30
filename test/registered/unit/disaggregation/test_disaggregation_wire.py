@@ -30,26 +30,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
-    @patch("sglang.srt.disaggregation.utils.dist.get_world_size", return_value=2)
     @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
-    @patch("sglang.srt.disaggregation.utils.dist.all_gather")
-    def test_rank_local_queue_order_is_canonicalized_before_poll(
-        self, all_gather, _all_reduce, _get_world_size
-    ):
-        canonical_digest = __import__("hashlib").blake2b(digest_size=8)
-        for key in ("request-a", "request-b"):
-            encoded_key = key.encode("utf-8")
-            canonical_digest.update(len(encoded_key).to_bytes(8, "little"))
-            canonical_digest.update(encoded_key)
-
-        def emulate_remote_canonical_order(output_tensors, input_tensor, _group):
-            for output_tensor in output_tensors:
-                output_tensor.copy_(input_tensor)
-            output_tensors[1][1] = int.from_bytes(
-                canonical_digest.digest(), "little", signed=True
-            )
-
-        all_gather.side_effect = emulate_remote_canonical_order
+    def test_rank_local_queue_order_is_canonicalized_before_poll(self, _all_reduce):
         poller_b = Mock()
         poller_b.poll.return_value = KVPoll.Success
         poller_a = Mock()
@@ -67,28 +49,36 @@ class TestDisaggregationWire(unittest.TestCase):
         poller_b.poll.assert_called_once_with()
 
     @patch("sglang.srt.disaggregation.utils.dist.get_world_size", return_value=2)
-    @patch("sglang.srt.disaggregation.utils.dist.all_gather")
-    def test_rank_local_queue_mismatch_defers_positional_poll(
-        self, all_gather, _get_world_size
+    @patch("sglang.srt.disaggregation.utils.dist.all_gather_object")
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_rank_local_queue_mismatch_polls_common_requests(
+        self, all_reduce, all_gather_object, _get_world_size
     ):
-        def emulate_rank_mismatch(output_tensors, input_tensor, group):
-            for output_tensor in output_tensors:
-                output_tensor.copy_(input_tensor)
-            if group == "attn-tp":
-                output_tensors[1][0] += 1
+        def emulate_rank_mismatch(tensor, op=None, group=None):
+            if tensor.dtype == torch.int64:
+                tensor[2] -= 1
 
-        all_gather.side_effect = emulate_rank_mismatch
-        poller = Mock()
+        def emulate_remote_keys(output, local_keys, group=None):
+            output[0] = local_keys
+            output[1] = (
+                ["request-a", "request-c"] if group == "attn-tp" else ["request-a"]
+            )
 
+        all_reduce.side_effect = emulate_rank_mismatch
+        all_gather_object.side_effect = emulate_remote_keys
+        poller_b = Mock()
+        poller_a = Mock()
+        poller_a.poll.return_value = KVPoll.WaitingForInput
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [poller],
+            [poller_b, poller_a],
             "attn-cp",
             "attn-tp",
-            ordered_keys=["request-a"],
+            ordered_keys=["request-b", "request-a"],
         )
 
-        self.assertEqual(polls, [KVPoll.Bootstrapping])
-        poller.poll.assert_not_called()
+        self.assertEqual(polls, [KVPoll.Bootstrapping, KVPoll.WaitingForInput])
+        poller_b.poll.assert_not_called()
+        poller_a.poll.assert_called_once_with()
 
     def test_int_lists_roundtrip(self):
         cases = [
