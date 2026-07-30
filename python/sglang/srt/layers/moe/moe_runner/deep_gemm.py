@@ -895,6 +895,13 @@ def pre_permute_deepep_ll_to_deep_gemm(
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
+    # DeepEP-LL uses floor(avg) + 1; FP4 layout selection needs the exact ceil.
+    if quant_info.is_fp4_experts:
+        assert runner_config.num_local_experts is not None
+        expected_m = max(
+            1,
+            ceil_div(topk_ids.numel(), runner_config.num_local_experts),
+        )
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
