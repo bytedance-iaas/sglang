@@ -219,8 +219,15 @@ def poll_and_all_reduce_attn_cp_tp_group(
     attn_tp_cpu_group: dist.ProcessGroup,
     ordered_keys: Optional[List[str]] = None,
 ):
+    canonical_to_local_indices = None
     if ordered_keys is not None:
         assert len(ordered_keys) == len(pollers)
+        assert len(set(ordered_keys)) == len(ordered_keys)
+        canonical_to_local_indices = sorted(
+            range(len(ordered_keys)), key=ordered_keys.__getitem__
+        )
+        ordered_keys = [ordered_keys[i] for i in canonical_to_local_indices]
+        pollers = [pollers[i] for i in canonical_to_local_indices]
         digest = hashlib.blake2b(digest_size=8)
         for key in ordered_keys:
             encoded_key = key.encode("utf-8")
@@ -259,7 +266,14 @@ def poll_and_all_reduce_attn_cp_tp_group(
         op=dist.ReduceOp.MIN,
         group=attn_cp_cpu_group,
     )
-    return tensor_to_reduce.tolist()
+    polls = tensor_to_reduce.tolist()
+    if canonical_to_local_indices is None:
+        return polls
+
+    local_order_polls = [KVPoll.Bootstrapping] * len(polls)
+    for canonical_index, local_index in enumerate(canonical_to_local_indices):
+        local_order_polls[local_index] = polls[canonical_index]
+    return local_order_polls
 
 
 def poll_and_all_reduce_with_staging(
