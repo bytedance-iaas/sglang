@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsWMXFP4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
@@ -59,6 +60,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     is_activation_quantization_format,
+    MXFP4_PACK_QUANTIZED_FORMAT,
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -144,6 +146,22 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        del user_quant
+        if hf_quant_cfg is None:
+            return None
+
+        quant_method = str(hf_quant_cfg.get("quant_method", "")).lower()
+        quant_format = str(hf_quant_cfg.get("format", "")).lower()
+        if (
+            quant_method in {"compressed-tensors", "compressed_tensors"}
+            and quant_format == MXFP4_PACK_QUANTIZED_FORMAT
+        ):
+            return "compressed-tensors"
+
+        return None
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
@@ -491,6 +509,36 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_mxfp4_w4a8_group(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        if self.quant_format != MXFP4_PACK_QUANTIZED_FORMAT:
+            return False
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_float_type = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_bits = weight_quant.num_bits == 4 and input_quant.num_bits == 8
+        is_strategy = (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+        )
+        is_dynamic = (not weight_quant.dynamic) and input_quant.dynamic
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+
+        # The current Marlin-backed path only supports MXFP4 group_size=32.
+        return (
+            is_float_type
+            and is_bits
+            and is_strategy
+            and is_dynamic
+            and is_symmetric
+            and weight_quant.group_size == 32
+        )
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -703,6 +751,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_mxfp4_w4a8_group(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsWMXFP4AFP8MoE")
+            return CompressedTensorsWMXFP4AFP8MoE(
+                quant_config=self,
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+            )
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

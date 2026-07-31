@@ -9,6 +9,8 @@ from typing import Iterable, List, Mapping, Optional
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
+MXFP4_PACK_QUANTIZED_FORMAT = "mxfp4-pack-quantized"
+
 
 def is_activation_quantization_format(format: str) -> bool:
     _ACTIVATION_QUANTIZATION_FORMATS = [
@@ -16,6 +18,7 @@ def is_activation_quantization_format(format: str) -> bool:
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
         CompressionFormat.nvfp4_pack_quantized.value,
+        MXFP4_PACK_QUANTIZED_FORMAT,
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 

@@ -8,6 +8,7 @@ from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from .compressed_tensors_w4a8_int8_moe import NPUCompressedTensorsW4A8Int8DynamicMoE
+from .compressed_tensors_wmxfp4_afp8_moe import CompressedTensorsWMXFP4AFP8MoE
 from .compressed_tensors_w8a8_fp8 import CompressedTensorsW8A8Fp8
 from .compressed_tensors_w8a8_fp8_moe import CompressedTensorsW8A8Fp8MoE
 from .compressed_tensors_w8a8_int8 import (
@@ -39,6 +40,7 @@ __all__ = [
     "WNA16_SUPPORTED_BITS",
     "CompressedTensorsW4A4Fp4",
     "CompressedTensorsW4A4Nvfp4MoE",
+    "CompressedTensorsWMXFP4AFP8MoE",
     "NPUCompressedTensorsW4A8Int8DynamicMoE",
     "CompressedTensorsMxInt4MoE",
 ]

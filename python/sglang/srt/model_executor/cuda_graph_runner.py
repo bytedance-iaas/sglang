@@ -176,6 +176,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    pp_proxy_topk_width: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers as a namespace adopted by
     ``build_decode_registry(source=...)``."""
@@ -213,6 +214,13 @@ def _allocate_decode_buffers(
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
                     (max_bs, hidden_size), dtype=dtype
+                )
+            if pp_proxy_topk_width is not None and pp_proxy_topk_width > 0:
+                # DSA shared-topk layers can span PP stages. CUDA-graph capture
+                # replays stage-local proxy buffers, so the proxy registry needs
+                # a concrete topk slot in addition to hidden_states/residual.
+                pp_proxy_tensors["topk_indices"] = torch.zeros(
+                    (max_bs, pp_proxy_topk_width), dtype=torch.int32
                 )
         else:
             pp_proxy_tensors = None
@@ -597,6 +605,9 @@ class CudaGraphRunner:
             ),
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
+            ),
+            pp_proxy_topk_width=getattr(
+                self.model_runner.model_config.hf_config, "index_topk", None
             ),
         )
         share_input_buffers_in(self.buffers)

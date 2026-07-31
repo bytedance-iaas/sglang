@@ -123,6 +123,39 @@ if _is_npu:
     )
 
 
+def _get_glm_shared_experts_fusion_disable_reason(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[str]:
+    quant_method_name = None if quant_config is None else quant_config.get_name()
+    if quant_method_name not in {"compressed-tensors", "compressed_tensors", "mxfp4"}:
+        return None
+
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return None
+
+    quant_format = quantization_config.get("format")
+    if not isinstance(quant_format, str) or not quant_format.endswith("pack-quantized"):
+        return None
+
+    ignore_patterns = quantization_config.get("ignore", [])
+    if not isinstance(ignore_patterns, list):
+        return None
+
+    # These checkpoints keep shared experts as plain gate/up/down weights while
+    # routed experts use packed MoE tensors. The fused remap path expects both
+    # sides to share the same packed parameter layout.
+    if not any("shared_experts" in pattern for pattern in ignore_patterns):
+        return None
+
+    return (
+        "GLM packed-quantized checkpoints with ignored shared_experts store "
+        "shared experts as loose weights while routed experts use packed MoE "
+        "weights."
+    )
+
+
 class Glm4MoeMLP(nn.Module):
     def __init__(
         self,
@@ -1219,6 +1252,11 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+
+        if disable_reason is None:
+            disable_reason = _get_glm_shared_experts_fusion_disable_reason(
+                self.config, self.quant_config
+            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True

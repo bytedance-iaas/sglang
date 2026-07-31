@@ -301,6 +301,7 @@ def quant_dequant_mxfp4(
 
 
 class Mxfp4Config(QuantizationConfig):
+    _MXFP4_PACKED_FORMAT = "mxfp4-pack-quantized"
 
     def __init__(
         self,
@@ -312,14 +313,29 @@ class Mxfp4Config(QuantizationConfig):
         self.ignored_layers = ignored_layers
 
     @classmethod
-    def from_config(cls, config):
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if hf_quant_cfg is None:
+            return None
 
-        quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+        quant_format = hf_quant_cfg.get("format")
+        if quant_format == cls._MXFP4_PACKED_FORMAT:
+            return "mxfp4"
+
+        return None
+
+    @classmethod
+    def from_config(cls, config):
+        quant_method = str(cls.get_from_keys_or(config, ["quant_method"], "")).lower()
+        quant_format = str(cls.get_from_keys_or(config, ["format"], "")).lower()
+        is_checkpoint_mxfp4_serialized = (
+            "mxfp4" in quant_method or quant_format == cls._MXFP4_PACKED_FORMAT
+        )
+        ignored_layers = cls.get_from_keys_or(config, ["ignore"], None)
 
         if _is_hip:
             if mxfp_supported():
-                return cls(
+                quant_config = cls(
+                    ignored_layers=ignored_layers,
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
             else:
@@ -328,8 +344,16 @@ class Mxfp4Config(QuantizationConfig):
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
                 )
+        else:
+            quant_config = cls(
+                ignored_layers=ignored_layers,
+                is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+            )
 
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        quant_config.packed_modules_mapping = (
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
+        )
+        return quant_config
 
     @classmethod
     def get_min_capability(cls) -> int:

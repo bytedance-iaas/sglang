@@ -330,7 +330,6 @@ class DeepseekV2WeightLoaderMixin:
                                     )
                                 )
                                 param = params_dict[param_name]
-
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )

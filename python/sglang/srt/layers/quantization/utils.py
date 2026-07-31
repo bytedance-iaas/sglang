@@ -46,6 +46,9 @@ ScalarType, scalar_types = get_scalar_types()
 
 
 def _module_path_match(ignored: str, prefix: str) -> bool:
+    if ignored.startswith("re:"):
+        return re.match(ignored[3:], prefix.rstrip(".")) is not None
+
     # Match on dotted module-path boundaries so that `mlp.gate` does NOT
     # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
     # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`

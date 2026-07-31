@@ -717,14 +717,21 @@ def build_decode_registry(
         pp = getattr(source, "pp_proxy_tensors", None)
         if pp is not None:
 
-            def _pp_source(key):
+            def _pp_source(key, fallback):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    if ppx is None:
+                        return fallback
+                    # Some PP proxy fields are request-dependent (for example,
+                    # DSA topk carry only exists when the next stage needs it).
+                    # Use a stable zero fallback so replay never reuses stale
+                    # data from a previous request when a key is absent.
+                    return ppx.tensors.get(key, fallback)
 
                 return _fn
 
             for _key, _backing in pp.items():
+                _fallback = torch.zeros_like(_backing)
                 reg.register_slot(
                     GraphSlot(
                         name=f"pp_proxy_tensors.{_key}",
@@ -732,7 +739,7 @@ def build_decode_registry(
                         dtype=_backing.dtype,
                         axis="none",
                         padding_policy=PaddingPolicy.KEEP_PAD,
-                        source_fn=_pp_source(_key),
+                        source_fn=_pp_source(_key, _fallback),
                     ),
                     bind=_backing,
                 )

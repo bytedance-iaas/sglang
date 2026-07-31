@@ -32,9 +32,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
+from sglang.srt.models.glm4_moe import (
+    Glm4MoeDecoderLayer,
+    Glm4MoeForCausalLM,
+    _get_glm_shared_experts_fusion_disable_reason,
+)
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +136,18 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         ):
             quant_config = None
         self.quant_config = quant_config
+        disable_reason = _get_glm_shared_experts_fusion_disable_reason(
+            config, quant_config
+        )
+        if (
+            disable_reason is not None
+            and not get_global_server_args().disable_shared_experts_fusion
+        ):
+            get_global_server_args().disable_shared_experts_fusion = True
+            log_info_on_rank0(
+                logger,
+                f"{disable_reason} Shared experts fusion optimization is disabled.",
+            )
 
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
