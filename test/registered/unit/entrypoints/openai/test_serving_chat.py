@@ -10,6 +10,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
 import json
 import unittest
 import uuid
@@ -22,11 +23,13 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ResponsesRequest,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -819,24 +822,102 @@ class ServingChatTestCase(unittest.TestCase):
         out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
         self.assertIn("<｜User｜>say hi", out)
 
-        # Multiple text parts concat with single space; non-text parts dropped.
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": "x"}},
-                ],
-            }
-        ]
-        for i, msg in enumerate(messages):
-            if isinstance(msg.get("content"), list):
-                messages[i] = process_content_for_template_format(
-                    msg, "string", [], [], [], []
+    def test_text_only_model_rejects_media_before_generation(self):
+        media_parts = {
+            "image_url": {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.png"},
+            },
+            "video_url": {
+                "type": "video_url",
+                "video_url": {"url": "https://example.com/video.mp4"},
+            },
+            "audio_url": {
+                "type": "audio_url",
+                "audio_url": {"url": "https://example.com/audio.wav"},
+            },
+        }
+
+        for media_type, media_part in media_parts.items():
+            with self.subTest(media_type=media_type):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                media_part,
+                            ],
+                        }
+                    ],
                 )
-        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-        self.assertIn("<｜User｜>describe", out)
-        self.assertNotIn("image_url", out)
+                response = get_or_create_event_loop().run_until_complete(
+                    self.chat.handle_request(request, self.fastapi_request)
+                )
+                error = json.loads(response.body)
+                self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(error["type"], "BadRequestError")
+                self.assertIn(media_type, error["message"])
+        self.tm.generate_request.assert_not_called()
+
+    def test_media_validation_does_not_reject_supported_content(self):
+        text_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_reference", "name": "get_weather"}],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(text_request))
+
+        self.tm.model_config.is_multimodal = True
+        multimodal_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(multimodal_request))
+
+    def test_text_only_responses_rejects_media_before_generation(self):
+        serving = OpenAIServingResponses(self.tm, self.template_manager)
+        serving._process_messages = Mock()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe it"},
+                        {
+                            "type": "input_image",
+                            "image_url": "http://example.com/cat.png",
+                        },
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn(
+            b"received unsupported content type 'image_url'", response.body
+        )
+        serving._process_messages.assert_not_called()
+        self.tm.generate_request.assert_not_called()
 
     def test_dsv4_task_and_reminder_encode_end_to_end(self):
         """Task + latest_reminder plumb through to the dsv4 encoder correctly."""
