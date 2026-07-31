@@ -269,6 +269,8 @@ class EICStorage(HiCacheStorage):
         self.is_mla_model = hicache_config.is_mla_model
         self.rank = hicache_config.tp_rank
         self.world_size = hicache_config.tp_size
+        self.pp_rank = hicache_config.pp_rank
+        self.pp_size = hicache_config.pp_size
         self.page_size = self.memory_pool_host.page_size
         self.registered_pools = {}
         self.logical_anchor = self.memory_pool_host.kv_buffer is None
@@ -350,12 +352,16 @@ class EICStorage(HiCacheStorage):
         self._register_tensors(self._pool_buffers(host_pool))
 
     def _init_eic_prefix(self):
+        # Same content hash means different bytes per stage; without this the
+        # stages overwrite each other's KV. Suffix only when pp_size > 1 so
+        # existing single-stage keys stay valid.
+        pp = f"_pp{self.pp_size}_{self.pp_rank}" if self.pp_size > 1 else ""
         if self.is_mla_model:
             self.eic_prefix = (
-                f"{self.model_name}_mla_att_{self.host_kvcache_layout}@sglang"
+                f"{self.model_name}_mla_att_{self.host_kvcache_layout}{pp}@sglang"
             )
         else:
-            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_@sglang"
+            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}{pp}_@sglang"
 
     def _get_eic_key(self, keys: List[str]) -> str:
         return [f"{self.eic_prefix}_{key}" for key in keys]

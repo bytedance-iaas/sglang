@@ -237,9 +237,14 @@ class EICCacheController(HiCacheController):
         """
         Write the KV cache to host memory.
         """
-        ret = self.mem_pool_host.assign_flat_data(
-            operation.host_indices, operation.data, operation.device_indices
-        )
+        try:
+            ret = self.mem_pool_host.assign_flat_data(
+                operation.host_indices, operation.data, operation.device_indices
+            )
+        except Exception as e:
+            # Must still ack: otherwise the node stays writing forever.
+            logger.exception(f"Write to eic raised, node: {operation.node_id}: {e}")
+            ret = False
         if not ret:
             logger.error(f"Failed to write to host memory {operation.node_id}")
         result = 0 if ret else 1
@@ -274,19 +279,24 @@ class EICCacheController(HiCacheController):
         """
         Load the KV cache from host memory to device memory.
         """
-        mask = self.mem_pool_host.get_flat_data(
-            operation.host_indices, operation.device_indices
-        )
+        try:
+            mask = self.mem_pool_host.get_flat_data(
+                operation.host_indices, operation.device_indices
+            )
+        except Exception as e:
+            # Must still ack: a skipped ack strands the request until abort.
+            logger.exception(f"Load from eic raised, node: {operation.node_id}: {e}")
+            mask = []
+        # Short mask = backend bailed out early, so the tail is a miss; all(mask)
+        # would read it as a full hit.
         completed_tokens = 0
-        if not all(mask):
+        for ret in mask:
+            if not ret:
+                break
+            completed_tokens += 1
+        completed_tokens = min(completed_tokens, len(operation.host_indices))
+        if completed_tokens < len(operation.host_indices):
             logger.warning(f"Failed to load from eic, node: {operation.node_id}")
-            for ret in mask:
-                if ret:
-                    completed_tokens += 1
-                else:
-                    break
-        else:
-            completed_tokens = len(operation.host_indices)
 
         if self.tp_world_size > 1:
             temp_tensor = torch.tensor(
@@ -319,9 +329,13 @@ class EICCacheController(HiCacheController):
         while self.write_wait_event.is_set():
             time.sleep(0.01)
         logger.debug(f"write device indices: {operation.device_indices}")
-        ret = self.mem_pool_host.assign_page_data(
-            operation.content_hash, operation.data, operation.device_indices
-        )
+        try:
+            ret = self.mem_pool_host.assign_page_data(
+                operation.content_hash, operation.data, operation.device_indices
+            )
+        except Exception as e:
+            logger.exception(f"Write to eic raised, node: {operation.node_id}: {e}")
+            ret = False
         if not ret:
             logger.error(f"Failed to write to host memory {operation.node_id}")
         result = 0 if ret else 1
@@ -343,19 +357,21 @@ class EICCacheController(HiCacheController):
         assert len(operation.host_indices) == self.page_size * len(
             operation.content_hash
         )
-        mask = self.mem_pool_host.get_page_data(
-            operation.content_hash, operation.device_indices
-        )
+        try:
+            mask = self.mem_pool_host.get_page_data(
+                operation.content_hash, operation.device_indices
+            )
+        except Exception as e:
+            logger.exception(f"Load from eic raised, node: {operation.node_id}: {e}")
+            mask = []
         completed_tokens = 0
-        if not all(mask):
+        for ret in mask:
+            if not ret:
+                break
+            completed_tokens += self.page_size
+        completed_tokens = min(completed_tokens, len(operation.host_indices))
+        if completed_tokens < len(operation.host_indices):
             logger.debug(f"Failed to load from eic, node: {operation.node_id}")
-            for ret in mask:
-                if ret:
-                    completed_tokens += self.page_size
-                else:
-                    break
-        else:
-            completed_tokens = len(operation.host_indices)
 
         if self.tp_world_size > 1:
             temp_tensor = torch.tensor(

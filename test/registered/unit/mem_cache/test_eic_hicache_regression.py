@@ -690,6 +690,46 @@ class TestEICHiCacheRegression(unittest.TestCase):
         with self.assertRaises(AssertionError):
             EICPagedHiRadixCache._finalize_load_admit(s, req)
 
+    def _make_load_controller(self, page_data):
+        cc = object.__new__(EICCacheController)
+        cc.tp_world_size = 1
+        cc.page_size = 4
+        cc.ack_load_queue = Queue()
+        cc.mem_pool_host = SimpleNamespace(
+            get_page_data=mock.Mock(side_effect=page_data)
+        )
+        return cc
+
+    def _load_op(self):
+        op = object.__new__(EICCacheOperation)
+        op.node_id = 7
+        op.content_hash = ["h0", "h1", "h2"]
+        op.host_indices = torch.arange(12, dtype=torch.int64)
+        op.device_indices = torch.arange(12, dtype=torch.int64)
+        return op
+
+    def test_load_acks_zero_when_backend_raises(self):
+        # A missing ack strands the request holding its KV until abort, and
+        # under PP it also blocks the verdict for every other stage.
+        cc = self._make_load_controller(RuntimeError("eic client blew up"))
+        EICCacheController.load_operation_shared(cc, self._load_op())
+        self.assertEqual(cc.ack_load_queue.get_nowait(), (7, 0))
+
+    def test_short_all_true_mask_is_not_full_success(self):
+        # The backend bails out early on failure, returning fewer mask entries
+        # than pages; all(mask) would read that as a complete hit.
+        cc = self._make_load_controller([[True]])
+        EICCacheController.load_operation_shared(cc, self._load_op())
+        self.assertEqual(cc.ack_load_queue.get_nowait(), (7, 4))
+
+        cc = self._make_load_controller([[]])
+        EICCacheController.load_operation_shared(cc, self._load_op())
+        self.assertEqual(cc.ack_load_queue.get_nowait(), (7, 0))
+
+    def test_full_mask_acks_every_token(self):
+        cc = self._make_load_controller([[True, True, True]])
+        EICCacheController.load_operation_shared(cc, self._load_op())
+        self.assertEqual(cc.ack_load_queue.get_nowait(), (7, 12))
 
 if __name__ == "__main__":
     unittest.main()
