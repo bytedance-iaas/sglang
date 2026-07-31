@@ -293,7 +293,7 @@ class EICHiRadixCache(RadixCache):
             # clobber frozen matches), storage prefetch skips the gate per stage
             # asynchronously, dp-attention lanes have private waiting queues,
             # and the waiting timeout releases by per-stage clocks.
-            if getattr(server_args, "hicache_storage_backend", None):
+            if server_args.hicache_storage_backend:
                 raise ValueError(
                     "EIC under PP is incompatible with hicache_storage_backend"
                 )
@@ -601,11 +601,12 @@ class EICHiRadixCache(RadixCache):
             if self.rank == 0:
                 n = min(len(self._verdict_outbox), self._VERDICT_CAP)
                 buf[0] = n
-                for i in range(n):
-                    buf[1 + i * 4 : 5 + i * 4] = torch.tensor(
-                        self._verdict_outbox[i], dtype=torch.int64
+                if n:
+                    buf[1 : 1 + n * 4] = torch.tensor(
+                        [x for row in self._verdict_outbox[:n] for x in row],
+                        dtype=torch.int64,
                     )
-                del self._verdict_outbox[:n]
+                    del self._verdict_outbox[:n]
             if self.tp_size > 1:
                 # Equalize the tp0-only poll result across this stage's lanes
                 # BEFORE it forks into the per-lane DAGs. Unconditional: the
@@ -1719,20 +1720,18 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         # Query EIC per fetched slot, scatter into a queue-length vector (0 =
         # miss/fail), then MIN over CP/TP+PP so the admitted prefix -- and thus
         # the radix tree -- is identical on every stage.
-        eic_prefix_lens = [0] * num_ready
+        len_tensor = torch.zeros(num_ready, dtype=torch.int64, device="cpu")
         if fetches:
             lens = self.cache_controller.batch_find_longest_prefix_in_eic(
                 [f[3] for f in fetches], [f[4] for f in fetches]
             )
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
-                    eic_prefix_lens[slot] = n
-        len_tensor = torch.tensor(eic_prefix_lens, dtype=torch.int64, device="cpu")
+                    len_tensor[slot] = n
         self._reduce_min(len_tensor)
-        eic_prefix_lens = len_tensor.tolist()
 
         for slot, last_node, evict_len, compute_key, _ in fetches:
-            eic_len = eic_prefix_lens[slot]
+            eic_len = int(len_tensor[slot])
             if eic_len + evict_len >= self.load_remote_threshold:
                 self._insert_remote_node(last_node, compute_key[:eic_len])
 

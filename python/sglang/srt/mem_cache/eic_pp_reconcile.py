@@ -75,11 +75,15 @@ class EICPPReconciler:
         return self._store_handle
 
     @classmethod
+    def buf_len(cls, extra_scalars):
+        return extra_scalars + 1 + cls.VERDICT_CAP * 3
+
+    @classmethod
     def pack_rows(cls, rows, buf, base):
         buf[base] = len(rows)
-        for i, row in enumerate(rows):
-            buf[base + 1 + i * 3 : base + 4 + i * 3] = torch.tensor(
-                row, dtype=torch.int64
+        if rows:
+            buf[base + 1 : base + 1 + len(rows) * 3] = torch.tensor(
+                [x for row in rows for x in row], dtype=torch.int64
             )
 
     @classmethod
@@ -116,9 +120,10 @@ class EICPPReconciler:
         if not self.enabled:
             return
         self._tombstone[h] = (epoch, self.round + self.TOMBSTONE_TTL)
-        self._outbox = {k: v for k, v in self._outbox.items() if k[0] != h}
-        self._reports = {k: v for k, v in self._reports.items() if k[0] != h}
-        self._verdicts = [v for v in self._verdicts if v[0] != h]
+        self._outbox.pop((h, epoch), None)
+        self._reports.pop((h, epoch), None)
+        if self._verdicts:
+            self._verdicts = [v for v in self._verdicts if v[0] != h]
 
     def collect(self):
         """One round on tp0. PP0 returns up to VERDICT_CAP (h, epoch, min) rows;

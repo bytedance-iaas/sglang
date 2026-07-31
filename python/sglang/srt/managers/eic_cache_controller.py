@@ -263,6 +263,8 @@ class EICCacheController(HiCacheController):
     def _completed_prefix(mask, step, limit):
         # Short mask = backend bailed out early, so the tail is a miss; all(mask)
         # would read it as a full hit.
+        if len(mask) * step >= limit and all(mask):
+            return limit
         completed = 0
         for ret in mask:
             if not ret:

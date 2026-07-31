@@ -2332,9 +2332,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # second receive chain at this site deadlocks against the pipeline's
         # own sends (PP0 waits in _pp_commit_comm_work for a recv the next
         # stage only reaches after finishing this call).
-        buf = torch.zeros(
-            2 + EICPPReconciler.VERDICT_CAP * 3, dtype=torch.int64, device="cpu"
-        )
+        buf = torch.zeros(EICPPReconciler.buf_len(1), dtype=torch.int64, device="cpu")
         rows = self._pp_prefetch.collect()
         if self.pp_rank == 0:
             count = torch.tensor(finish_count, dtype=torch.int, device="cpu")
