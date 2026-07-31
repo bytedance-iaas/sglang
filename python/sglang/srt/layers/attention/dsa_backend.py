@@ -1457,6 +1457,43 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
+
+        # KVBit no_alloc bypass for speculative target_verify: verify goes
+        # through forward_extend (not forward_decode), which otherwise calls
+        # get_key_buffer (full-pool 4bit->bf16 materialize) — that OOMs on
+        # large pools AND runs every verify step (hot path). Route verify to
+        # the same kvbit paged decode kernel as decode: the kernel reads the
+        # 4bit store directly. Under target_verify, sglang has already
+        # expanded page_table_1 (repeat_interleave to bs*next_n) and
+        # dsa_cache_seqlens_int32 (per-draft-token递增 prefix) in
+        # init_forward_metadata, so the kernel's per-program (cur_batch) index
+        # aligns with both — no extra metadata wiring needed. Q-FHT fold for
+        # verify is gated separately in forward_absorb_prepare.
+        if (
+            envs.SGLANG_KVBIT_NO_ALLOC.get()
+            and isinstance(self.token_to_kv_pool, KVBit4MLATokenToKVPool)
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            if q_rope is not None:
+                kvb_q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                kvb_q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+            else:
+                kvb_q_all = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
+                kvb_q_nope = kvb_q_all[:, :, : layer.v_head_dim]
+                kvb_q_rope = kvb_q_all[:, :, layer.v_head_dim :]
+            return self._forward_kvbit(
+                q_nope=kvb_q_nope,
+                q_rope=kvb_q_rope,
+                layer=layer,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                forward_batch=forward_batch,
+            )
+
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
@@ -1666,6 +1703,11 @@ class DeepseekSparseAttnBackend(
                 )
                 kvb_q_nope = kvb_q_all[:, :, : layer.v_head_dim]
                 kvb_q_rope = kvb_q_all[:, :, layer.v_head_dim :]
+            # Align topk_indices with q (bs*next_n) before the kernel transform.
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(
+                    topk_indices, kvb_q_nope.shape[0]
+                )
             return self._forward_kvbit(
                 q_nope=kvb_q_nope,
                 q_rope=kvb_q_rope,
