@@ -611,6 +611,13 @@ class Envs:
 
     # Unified radix cache
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+    # Keep the upstream-compatible scheduler synchronization as the default.
+    # "layered_flags" moves only L2 completion coordination to a dedicated
+    # background Gloo group; allocation, transfer, and radix visibility remain
+    # on the existing UnifiedRadixCache path.
+    SGLANG_HICACHE_PP_SYNC_MODE = EnvStr("legacy")
+    SGLANG_HICACHE_PP_PROGRESS_INTERVAL_MS = EnvFloat(1.0)
+    SGLANG_HICACHE_PP_STALL_TIMEOUT_S = EnvFloat(30.0)
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
