@@ -432,8 +432,15 @@ class DeepseekMLAForwardMixin:
         # since MLA's V == K_nope latent) before the model's W_vc up-projection.
         # Prefill keeps unfolded q + unrotated K (get_key_buffer inverse-rotates)
         # so the flashmla/fa3 path stays in the native latent domain end-to-end.
-        # Gated by SGLANG_KVBIT_NO_ALLOC; no-op otherwise.
-        if envs.SGLANG_KVBIT_NO_ALLOC.get() and forward_batch.forward_mode.is_decode_or_idle():
+        # Gated by SGLANG_KVBIT_NO_ALLOC; no-op otherwise. Covers BOTH pure
+        # decode and speculative target_verify: verify also reads the rotated
+        # 4bit KV store (set_mla_kv_buffer rotates unconditionally), so the
+        # query MUST be Q-FHT folded there too, else (unfolded q) @ (rotated
+        # K)^T gives wrong scores. draft_extend stays unfolded (prefill-domain).
+        if envs.SGLANG_KVBIT_NO_ALLOC.get() and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             R = getattr(self, "_kvbit_qfht_R", None)
             if R is None or R.shape[0] != self.kv_lora_rank:
                 from kvbit.rotation import build_hadamard
