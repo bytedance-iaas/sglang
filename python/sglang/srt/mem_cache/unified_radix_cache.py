@@ -385,6 +385,103 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.work_list.append(send_work)
 
+    def _init_hicache_pp_sync_mode(
+        self, server_args: ServerArgs, params: CacheInitParams
+    ) -> None:
+        mode = envs.SGLANG_HICACHE_PP_SYNC_MODE.get().strip().lower()
+        if mode not in {"legacy", "batched"}:
+            raise ValueError(
+                "SGLANG_HICACHE_PP_SYNC_MODE must be 'legacy' or 'batched', "
+                f"got {mode!r}."
+            )
+
+        self._hicache_pp_sync_mode = mode
+        if mode == "legacy":
+            return
+
+        from sglang.srt.distributed.parallel_state import get_world_group
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        world_group = get_world_group()
+        expected_world_size = server_args.tp_size * server_args.pp_size
+        checks = (
+            (
+                isinstance(
+                    params.token_to_kv_pool_allocator.get_kvcache(),
+                    DeepSeekV4TokenToKVPool,
+                ),
+                "non-DSV4 KV pool",
+            ),
+            (self.pp_size > 1, "PP size <= 1"),
+            (server_args.hicache_storage_backend is None, "L3 enabled"),
+            (
+                server_args.hicache_write_policy == "write_through",
+                f"write policy {server_args.hicache_write_policy!r}",
+            ),
+            (not server_args.enable_eic_cache, "EIC enabled"),
+            (not server_args.enable_dp_attention, "DP attention enabled"),
+            (server_args.dp_size == 1, f"DP size {server_args.dp_size}"),
+            (
+                world_group.world_size == expected_world_size,
+                f"world size {world_group.world_size} != TP×PP {expected_world_size}",
+            ),
+        )
+        unsupported_reasons = [reason for supported, reason in checks if not supported]
+
+        if unsupported_reasons:
+            raise ValueError(
+                "SGLANG_HICACHE_PP_SYNC_MODE=batched requires DSV4, PP>1, "
+                "DP=1, L2-only write-through HiCache, and no EIC: "
+                + "; ".join(unsupported_reasons)
+            )
+
+        # Use a dedicated Gloo group. The world CPU group is also used by PP
+        # scheduler traffic, so inserting a new collective there could violate
+        # its point-to-point ordering.
+        self._hicache_pp_sync_group = torch.distributed.new_group(
+            ranks=world_group.ranks,
+            backend="gloo",
+        )
+        self._hicache_pp_sync_counts = torch.zeros(
+            2, dtype=torch.int32, device="cpu"
+        )
+        logger.info(
+            "Using batched HiCache PP completion synchronization across %d ranks",
+            world_group.world_size,
+        )
+
+    def _uses_batched_hicache_pp_sync(self) -> bool:
+        return getattr(self, "_hicache_pp_sync_mode", "legacy") == "batched"
+
+    @staticmethod
+    def _count_ready_hicache_acks(ack_queue: list) -> int:
+        finish_count = 0
+        for _, finish_event, _ in ack_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        return finish_count
+
+    def _sync_hicache_completion_counts(self) -> tuple[int, int]:
+        """Synchronize ready write/load ACK prefixes with one CPU collective."""
+        cc = self.cache_controller
+        if cc is None:
+            raise RuntimeError(
+                "Batched HiCache PP synchronization lost its cache controller"
+            )
+
+        counts = self._hicache_pp_sync_counts
+        counts[0] = self._count_ready_hicache_acks(cc.ack_write_queue)
+        counts[1] = self._count_ready_hicache_acks(cc.ack_load_queue)
+        torch.distributed.all_reduce(
+            counts,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self._hicache_pp_sync_group,
+        )
+        return int(counts[0].item()), int(counts[1].item())
+
     def reset(self) -> None:
         self._reset_full()
 
@@ -486,6 +583,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        self._init_hicache_pp_sync_mode(server_args, params)
 
         # State initialization
         self.write_through_threshold = (
@@ -2176,6 +2274,36 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    def _validated_hicache_acks(
+        self,
+        queue: list,
+        ongoing: dict,
+        finish_count: int,
+        *,
+        kind: str,
+    ) -> list[list[int]]:
+        if len(queue) < finish_count:
+            raise RuntimeError(
+                f"HiCache {kind} ACK queue diverged: pp_rank={self.pp_rank}, "
+                f"count={finish_count}, queue={len(queue)}, ongoing={len(ongoing)}"
+            )
+
+        ready_acks = queue[:finish_count]
+        for _, finish_event, ack_list in ready_acks:
+            if not finish_event.query():
+                raise RuntimeError(
+                    f"HiCache {kind} ACK readiness diverged: "
+                    f"pp_rank={self.pp_rank}, ack_ids={ack_list}"
+                )
+
+            missing_ids = [ack_id for ack_id in ack_list if ack_id not in ongoing]
+            if missing_ids:
+                raise RuntimeError(
+                    f"HiCache {kind} ACK IDs diverged: pp_rank={self.pp_rank}, "
+                    f"missing_ids={missing_ids}, ongoing={len(ongoing)}"
+                )
+        return [ack_list for _, _, ack_list in ready_acks]
+
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
@@ -2305,9 +2433,39 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        self._drain_async_work()
-        self.writing_check()
-        self.loading_check()
+        if self._uses_batched_hicache_pp_sync():
+            write_count, load_count = self._sync_hicache_completion_counts()
+            cc = self.cache_controller
+            assert cc is not None
+            write_acks = self._validated_hicache_acks(
+                cc.ack_write_queue,
+                self.ongoing_write_through,
+                write_count,
+                kind="write",
+            )
+            load_acks = self._validated_hicache_acks(
+                cc.ack_load_queue,
+                self.ongoing_load_back,
+                load_count,
+                kind="load",
+            )
+            del cc.ack_write_queue[:write_count]
+            del cc.ack_load_queue[:load_count]
+            for ack_list in write_acks:
+                for ack_id in ack_list:
+                    node, params = self.ongoing_write_through.pop(ack_id)
+                    self.dec_lock_ref(node, params)
+            for ack_list in load_acks:
+                for ack_id in ack_list:
+                    node, lock_params, host_lock_params = (
+                        self.ongoing_load_back.pop(ack_id)
+                    )
+                    self.dec_lock_ref(node, lock_params)
+                    self.dec_host_lock_ref(node, host_lock_params)
+        else:
+            self._drain_async_work()
+            self.writing_check()
+            self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -2317,6 +2475,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
+        # The scheduler already called check_hicache_events() earlier in the
+        # same scheduling pass. Batched mode consumed write and load ACKs there
+        # with one collective, so repeating the write-only sync here would
+        # restore the decode hot-path overhead this mode is meant to remove.
+        if self._uses_batched_hicache_pp_sync():
+            return
         self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
