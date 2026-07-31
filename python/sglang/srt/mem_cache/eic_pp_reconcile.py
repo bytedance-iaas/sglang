@@ -1,6 +1,6 @@
-"""PP-consistent per-request verdicts for storage prefetch.
+"""PP-consistent per-request verdicts for EIC storage prefetch.
 
-Storage keys are pp-scoped, so pipeline stages hit independently and the same
+EIC storage keys are pp-scoped, so pipeline stages hit independently and the same
 request can resolve to a different prefetch length per stage, forking the
 admitted prefix. Stages report their local result UP through the default
 process group's TCPStore (non-collective KV RPCs, so PP0 polling is not a p2p
@@ -20,7 +20,7 @@ import pickle
 logger = logging.getLogger(__name__)
 
 
-class PPReconciler:
+class EICPPReconciler:
     VERDICT_CAP = 32
     EPOCH_CAP = 65536
     TOMBSTONE_TTL = 4096
@@ -33,6 +33,7 @@ class PPReconciler:
         self.pp_size = pp_size
         self.pp_group = pp_group
         self.rank = rank
+        self.eic = False
 
         self.round = 0
         self._store_handle = None
@@ -46,7 +47,7 @@ class PPReconciler:
 
     @property
     def enabled(self):
-        return self.pp_size > 1 and self.pp_group is not None
+        return self.eic and self.pp_size > 1 and self.pp_group is not None
 
     @property
     def store(self):

@@ -11,7 +11,7 @@ from sglang.srt.managers.eic_cache_controller import (
     EICCacheOperation,
 )
 from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
-from sglang.srt.mem_cache.pp_reconcile import PPReconciler
+from sglang.srt.mem_cache.eic_pp_reconcile import EICPPReconciler
 from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
@@ -732,16 +732,17 @@ class TestEICHiCacheRegression(unittest.TestCase):
         EICCacheController.load_operation_shared(cc, self._load_op())
         self.assertEqual(cc.ack_load_queue.get_nowait(), (7, 12))
     def _make_reconciler(self, pp_rank, store, pp_size=2):
-        r = PPReconciler(
+        r = EICPPReconciler(
             prefix="hipf", pp_rank=pp_rank, pp_size=pp_size, pp_group=object(), rank=0
         )
+        r.eic = True
         r._store_handle = store
         return r
 
     def test_reconciler_min_across_stages(self):
         store = self.FakeStore()
         s0, s1 = self._make_reconciler(0, store), self._make_reconciler(1, store)
-        h = PPReconciler.rid_hash("r")
+        h = EICPPReconciler.rid_hash("r")
         s0.report(h, 1, 512)
         s1.report(h, 1, 256)
         self.assertEqual(s1.collect(), [])
@@ -749,13 +750,13 @@ class TestEICHiCacheRegression(unittest.TestCase):
 
     def test_reconciler_waits_for_every_stage(self):
         s0 = self._make_reconciler(0, self.FakeStore())
-        s0.report(PPReconciler.rid_hash("r"), 1, 512)
+        s0.report(EICPPReconciler.rid_hash("r"), 1, 512)
         self.assertEqual(s0.collect(), [])
 
     def test_reconciler_tombstone_is_epoch_aware(self):
         store = self.FakeStore()
         s0, s1 = self._make_reconciler(0, store), self._make_reconciler(1, store)
-        h = PPReconciler.rid_hash("r")
+        h = EICPPReconciler.rid_hash("r")
         s0.release(h, 1)
         s1.report(h, 1, 256)
         s1.report(h, 2, 128)

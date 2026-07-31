@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.pp_reconcile import PPReconciler
+from sglang.srt.mem_cache.eic_pp_reconcile import EICPPReconciler
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -426,7 +426,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_backup: dict = {}
         self._pp_prefetch_gate: dict = {}
         self._pp_prefetch_verdict: dict = {}
-        self._pp_prefetch = PPReconciler(
+        self._pp_prefetch = EICPPReconciler(
             prefix="hipf",
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
@@ -456,12 +456,7 @@ class UnifiedRadixCache(BasePrefixCache):
             attach_hybrid_pool_to_unified_cache,
         )
 
-        if server_args.hicache_storage_backend is not None and self.pp_size > 1:
-            # The prefetch verdict admits every request in the same round on
-            # every stage; anything that lets stages act on private state
-            # breaks that. LPM reorders the queue per local tree, and the
-            # waiting timeout aborts on per-stage clocks. Degrade instead of
-            # crashing: run without the storage tier.
+        if server_args.hicache_storage_backend == "eic" and self.pp_size > 1:
             reason = None
             if server_args.schedule_policy != "fcfs":
                 reason = "--schedule-policy must be fcfs"
@@ -474,12 +469,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             if reason is not None:
                 logger.error(
-                    "hicache_storage_backend under PP: %s; disabling the "
+                    "eic hicache_storage_backend under PP: %s; disabling the "
                     "storage tier",
                     reason,
                 )
                 server_args = copy.copy(server_args)
                 server_args.hicache_storage_backend = None
+        self._pp_prefetch.eic = server_args.hicache_storage_backend == "eic"
 
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":
@@ -1921,7 +1917,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _check_prefetch_progress_pp(self, req_id: str) -> bool:
         # Terminate locally before reporting: that is what makes the free safe.
-        h = PPReconciler.rid_hash(req_id)
+        h = EICPPReconciler.rid_hash(req_id)
         st = self._pp_prefetch_gate.get(req_id)
         if st is None:
             local = self._prefetch_local_result(req_id)
@@ -2014,7 +2010,7 @@ class UnifiedRadixCache(BasePrefixCache):
         st = self._pp_prefetch_gate.pop(rid, None)
         if st is None:
             return
-        h = PPReconciler.rid_hash(rid)
+        h = EICPPReconciler.rid_hash(rid)
         self._pp_prefetch_verdict.pop((h, st["epoch"]), None)
         self._pp_prefetch.release(h, st["epoch"])
 
@@ -2343,7 +2339,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # second receive chain at this site deadlocks against the pipeline's
         # own sends (PP0 waits in _pp_commit_comm_work for a recv the next
         # stage only reaches after finishing this call).
-        cap = PPReconciler.VERDICT_CAP
+        cap = EICPPReconciler.VERDICT_CAP
         buf = torch.zeros(2 + cap * 3, dtype=torch.int64, device="cpu")
         rows = self._pp_prefetch.collect()
         if self.pp_rank == 0:
@@ -2359,7 +2355,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for i in range(int(buf[1].item())):
             h, epoch, value = (int(x) for x in buf[2 + i * 3 : 5 + i * 3])
             self._pp_prefetch_verdict[(h, epoch)] = value
-        while len(self._pp_prefetch_verdict) > PPReconciler.EPOCH_CAP:
+        while len(self._pp_prefetch_verdict) > EICPPReconciler.EPOCH_CAP:
             self._pp_prefetch_verdict.pop(next(iter(self._pp_prefetch_verdict)))
         return int(buf[0].item())
 
