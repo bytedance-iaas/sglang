@@ -518,16 +518,21 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
+        # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
+        # where alloc = min(extend, rem_chunk). A cached prefix funds the part of
+        # the sliding window that the request will not refill or decode itself.
         cases = [
-            # (extend, rem_chunk, window, page, expected, label)
-            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
-            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
-            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
-            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
-            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
+            # (extend, max_new, rem_chunk, window, page, expected, label)
+            (64, 512, None, 128, 16, 128 + 16, "long_decode_hits_window"),
+            (64, 32, None, 128, 16, 96 + 16, "short_request"),
+            (10, 20, None, 512, 8, 30 + 8, "short_cached_resume"),
+            (300, 512, None, 128, 16, 300 + 16, "extend_over_window"),
+            (200, 512, 50, 64, 8, 64 + 8, "chunk_cap_binds"),
+            (2000, 256, 1024, 512, 16, 1024 + 16, "multi_chunk"),
+            (0, 512, None, 128, 16, 128 + 16, "decode_only_long"),
+            (0, 40, None, 128, 16, 40 + 16, "decode_only_short"),
         ]
-        for extend, rem_chunk, window, page, expected, label in cases:
+        for extend, max_new, rem_chunk, window, page, expected, label in cases:
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
@@ -535,7 +540,96 @@ class TestPrefillAdder(CustomTestCase):
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
-                self.assertEqual(adder._swa_budget_for_req(extend), expected)
+                self.assertEqual(
+                    adder._swa_budget_for_req(extend, max_new), expected
+                )
+
+    def test_swa_admission_admits_short_cached_resume_at_two_window_pool(self):
+        window, page, rem_swa = 128, 8, 100
+        prefix, extend = 200, 16
+        self.mock_token_allocator.swa_available_size.return_value = rem_swa
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = window
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        adder = self.create_adder(self.create_running_batch(), page_size=page)
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req(
+            "resume", priority=0, max_new_tokens=40, output_len=10
+        )
+        req.prefix_indices = list(range(prefix))
+        req.full_untruncated_fill_ids = list(range(prefix + extend))
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIn(req, adder.can_run_list)
+        self.assertIsNot(result, AddReqResult.NO_TOKEN)
+
+    def test_swa_admission_shrinks_chunk_to_make_progress(self):
+        page, window, rem_swa = 64, 128, 384
+        self.mock_token_allocator.swa_available_size.return_value = rem_swa
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = window
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page,
+            rem_chunk_tokens=1024,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req("large", priority=0, max_new_tokens=128)
+        req.full_untruncated_fill_ids = list(range(2048))
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIsNot(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(req.extend_range.length, 192)
+        self.assertIs(adder.new_chunked_req, req)
+
+    def test_swa_new_tokens_clamps_remaining_not_total(self):
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS as CLIP
+
+        adder = self.create_adder(self.create_running_batch())
+        cases = [
+            (100, 10, 90),
+            (40, 100, 0),
+            (CLIP + 6000, 100, CLIP),
+            (CLIP + 6000, CLIP + 100, CLIP),
+        ]
+        for max_new, generated, expected in cases:
+            with self.subTest(max_new=max_new, generated=generated):
+                req = self.create_mock_req(
+                    "remaining",
+                    priority=0,
+                    max_new_tokens=max_new,
+                    output_len=generated,
+                )
+                self.assertEqual(adder._swa_new_tokens(req), expected)
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
