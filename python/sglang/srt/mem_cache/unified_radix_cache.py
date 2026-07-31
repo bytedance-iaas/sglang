@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.pp_reconcile import PPReconciler
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -421,6 +422,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
+        self._pp_prefetch_gate: dict = {}
+        self._pp_prefetch_verdict: dict = {}
+        self._pp_prefetch = PPReconciler(
+            prefix="hipf",
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            pp_group=self.pp_group,
+            rank=self.tp_group.rank() if self.tp_group is not None else 0,
+        )
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -1849,9 +1859,67 @@ class UnifiedRadixCache(BasePrefixCache):
         return can_terminate or operation_terminated
 
     def check_prefetch_progress(self, req_id: str) -> bool:
-        if req_id not in self.ongoing_prefetch:
-            return True
+        if not self._pp_prefetch.enabled:
+            local = self._prefetch_local_result(req_id)
+            if local is None:
+                return False
+            if local[0] is None:
+                return True
+            return self._commit_prefetch(req_id, local[0], local[0], local[1])
+        return self._check_prefetch_progress_pp(req_id)
 
+    def _prefetch_local_result(self, req_id: str):
+        """(completed_tokens, hash_value) once this stage is done, else None.
+
+        completed_tokens is None when the stage has nothing to commit at all.
+        """
+        if req_id not in self.ongoing_prefetch:
+            return (None, None)
+        operation = self.ongoing_prefetch[req_id][3]
+        if operation.host_indices is None:
+            return (None, None)
+        if not self.can_terminate_prefetch(operation):
+            return None
+
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+            operation
+        )
+        if self.tp_world_size > 1:
+            tensor = torch.tensor(completed_tokens, dtype=torch.int)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            completed_tokens = int(tensor.item())
+        return (completed_tokens, hash_value)
+
+    def _check_prefetch_progress_pp(self, req_id: str) -> bool:
+        # Terminate locally before reporting: that is what makes the free safe.
+        h = PPReconciler.rid_hash(req_id)
+        st = self._pp_prefetch_gate.get(req_id)
+        if st is None:
+            local = self._prefetch_local_result(req_id)
+            if local is None:
+                return False
+            epoch = self._pp_prefetch.bump_epoch(req_id)
+            st = {"epoch": epoch, "completed": local[0], "hash_value": local[1]}
+            self._pp_prefetch_gate[req_id] = st
+            self._pp_prefetch.report(h, epoch, local[0] if local[0] is not None else 0)
+
+        verdict = self._pp_prefetch_verdict.pop((h, st["epoch"]), None)
+        if verdict is None:
+            return False
+        del self._pp_prefetch_gate[req_id]
+        if st["completed"] is None:
+            return True
+        return self._commit_prefetch(
+            req_id, min(verdict, st["completed"]), st["completed"], st["hash_value"]
+        )
+
+    def _commit_prefetch(
+        self, req_id: str, min_completed_tokens: int, completed_tokens: int, hash_value
+    ) -> bool:
+        if req_id not in self.ongoing_prefetch:
+            return True  # revoked while the verdict was in flight
         (
             last_host_node,
             prefetch_key,
@@ -1860,25 +1928,6 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
-            return True
-        if not self.can_terminate_prefetch(operation):
-            return False
-
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = int(completed_tokens_tensor.item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -1934,8 +1983,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def _release_pp_prefetch(self, rid: str) -> None:
+        st = self._pp_prefetch_gate.pop(rid, None)
+        if st is None:
+            return
+        h = PPReconciler.rid_hash(rid)
+        self._pp_prefetch_verdict.pop((h, st["epoch"]), None)
+        self._pp_prefetch.release(h, st["epoch"])
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self._release_pp_prefetch(rid)
         if rid not in self.ongoing_prefetch:
             return
 
@@ -2235,9 +2293,14 @@ class UnifiedRadixCache(BasePrefixCache):
                     break
                 finish_count += 1
 
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = int(finish_count_tensor.item())
+        if self._pp_prefetch.enabled:
+            finish_count = self._loading_check_pp(finish_count)
+        else:
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = int(finish_count_tensor.item())
 
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
@@ -2247,6 +2310,31 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
             finish_count -= 1
+
+    def _loading_check_pp(self, finish_count: int) -> int:
+        # Prefetch verdicts ride the tensor loading_check already _pp_syncs; a
+        # second receive chain at this site deadlocks against the pipeline's
+        # own sends (PP0 waits in _pp_commit_comm_work for a recv the next
+        # stage only reaches after finishing this call).
+        cap = PPReconciler.VERDICT_CAP
+        buf = torch.zeros(2 + cap * 3, dtype=torch.int64, device="cpu")
+        rows = self._pp_prefetch.collect()
+        if self.pp_rank == 0:
+            count = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+            self._all_reduce_attn_groups(count, torch.distributed.ReduceOp.MIN)
+            buf[0] = int(count.item())
+            buf[1] = len(rows)
+            for i, row in enumerate(rows):
+                buf[2 + i * 3 : 5 + i * 3] = torch.tensor(row, dtype=torch.int64)
+            if self.tp_world_size > 1:
+                torch.distributed.broadcast(buf, group=self.tp_group, group_src=0)
+        self._pp_sync(buf)
+        for i in range(int(buf[1].item())):
+            h, epoch, value = (int(x) for x in buf[2 + i * 3 : 5 + i * 3])
+            self._pp_prefetch_verdict[(h, epoch)] = value
+        while len(self._pp_prefetch_verdict) > PPReconciler.EPOCH_CAP:
+            self._pp_prefetch_verdict.pop(next(iter(self._pp_prefetch_verdict)))
+        return int(buf[0].item())
 
     # ---- HiCache: Scheduler Entry Points ----
 

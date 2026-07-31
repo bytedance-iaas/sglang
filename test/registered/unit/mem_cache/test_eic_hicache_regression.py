@@ -11,6 +11,7 @@ from sglang.srt.managers.eic_cache_controller import (
     EICCacheOperation,
 )
 from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
+from sglang.srt.mem_cache.pp_reconcile import PPReconciler
 from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
@@ -730,6 +731,43 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cc = self._make_load_controller([[True, True, True]])
         EICCacheController.load_operation_shared(cc, self._load_op())
         self.assertEqual(cc.ack_load_queue.get_nowait(), (7, 12))
+    def _make_reconciler(self, pp_rank, store, pp_size=2):
+        r = PPReconciler(
+            prefix="hipf", pp_rank=pp_rank, pp_size=pp_size, pp_group=object(), rank=0
+        )
+        r._store_handle = store
+        return r
+
+    def test_reconciler_min_across_stages(self):
+        store = self.FakeStore()
+        s0, s1 = self._make_reconciler(0, store), self._make_reconciler(1, store)
+        h = PPReconciler.rid_hash("r")
+        s0.report(h, 1, 512)
+        s1.report(h, 1, 256)
+        self.assertEqual(s1.collect(), [])
+        self.assertEqual(s0.collect(), [(h, 1, 256)])
+
+    def test_reconciler_waits_for_every_stage(self):
+        s0 = self._make_reconciler(0, self.FakeStore())
+        s0.report(PPReconciler.rid_hash("r"), 1, 512)
+        self.assertEqual(s0.collect(), [])
+
+    def test_reconciler_tombstone_is_epoch_aware(self):
+        store = self.FakeStore()
+        s0, s1 = self._make_reconciler(0, store), self._make_reconciler(1, store)
+        h = PPReconciler.rid_hash("r")
+        s0.release(h, 1)
+        s1.report(h, 1, 256)
+        s1.report(h, 2, 128)
+        s1.collect()
+        s0._drain_peers()
+        self.assertNotIn((h, 1), s0._reports)
+        self.assertIn((h, 2), s0._reports)
+
+    def test_reconciler_epoch_never_reused(self):
+        r = self._make_reconciler(0, self.FakeStore())
+        self.assertEqual([r.bump_epoch("r"), r.bump_epoch("r")], [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()
