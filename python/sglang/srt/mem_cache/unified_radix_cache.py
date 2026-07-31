@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -453,6 +455,31 @@ class UnifiedRadixCache(BasePrefixCache):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
         )
+
+        if server_args.hicache_storage_backend is not None and self.pp_size > 1:
+            # The prefetch verdict admits every request in the same round on
+            # every stage; anything that lets stages act on private state
+            # breaks that. LPM reorders the queue per local tree, and the
+            # waiting timeout aborts on per-stage clocks. Degrade instead of
+            # crashing: run without the storage tier.
+            reason = None
+            if server_args.schedule_policy != "fcfs":
+                reason = "--schedule-policy must be fcfs"
+            elif server_args.enable_dp_attention:
+                reason = "dp_attention is incompatible"
+            elif float(os.getenv("SGLANG_REQ_WAITING_TIMEOUT", "-1")) > 0:
+                reason = (
+                    "SGLANG_REQ_WAITING_TIMEOUT must be unset (per-stage "
+                    "clocks release out of lockstep)"
+                )
+            if reason is not None:
+                logger.error(
+                    "hicache_storage_backend under PP: %s; disabling the "
+                    "storage tier",
+                    reason,
+                )
+                server_args = copy.copy(server_args)
+                server_args.hicache_storage_backend = None
 
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":

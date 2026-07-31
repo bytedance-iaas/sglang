@@ -106,6 +106,18 @@ class HiRadixCache(RadixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
+        if self.enable_storage and self.pp_size > 1:
+            # Storage keys are pp-scoped, so stages hit independently; this
+            # cache has no cross-PP reconciliation of the prefetched length, so
+            # host trees fork per stage. Only UnifiedRadixCache
+            # (SGLANG_ENABLE_UNIFIED_RADIX_TREE=1) reconciles. Degrade instead
+            # of crashing: run without the storage tier.
+            logger.error(
+                "hicache_storage_backend with pipeline parallelism requires the "
+                "unified radix tree (SGLANG_ENABLE_UNIFIED_RADIX_TREE=1); "
+                "disabling the storage tier"
+            )
+            self.enable_storage = False
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
 
