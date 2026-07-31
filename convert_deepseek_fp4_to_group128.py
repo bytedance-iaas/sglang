@@ -8,7 +8,13 @@
 
 脚本会处理：
 - `layers.*.ffn.experts.*.weight`
-- `layers.*.ffn.shared_experts.*.weight`
+- `mtp.*.ffn.experts.*.weight`
+
+`shared_experts` 在 DeepSeek-V4-Pro-DSpark 中是 FP8，不做 FP4 重量化。
+
+DeepSeek-V4-Pro-DSpark 的 config 使用 `quant_method=fp8` 描述非 expert
+权重，同时使用 `expert_dtype=fp4` 标识 packed FP4 experts。脚本会将其识别为
+FP4 + FP8 mixed checkpoint，而不是误判成纯 FP8 checkpoint。
 
 注意：
 - 这不是 AWQ/GPTQ/Marlin 那类 `bits=4, group_size=128` 的线性 INT4 格式转换。
@@ -106,11 +112,17 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
         f.write("\n")
 
 
-def looks_like_fp8_config(src_dir: Path) -> bool:
+def has_fp4_expert_config(config: dict[str, Any]) -> bool:
+    return str(config.get("expert_dtype", "")).lower() == "fp4"
+
+
+def looks_like_pure_fp8_config(src_dir: Path) -> bool:
     config_path = src_dir / "config.json"
     if not config_path.exists():
         return False
     config = load_json(config_path)
+    if has_fp4_expert_config(config):
+        return False
     quant_config = config.get("quantization_config", {})
     return (
         quant_config.get("quant_method") == "fp8"
@@ -121,11 +133,82 @@ def looks_like_fp8_config(src_dir: Path) -> bool:
 
 def is_fp4_expert_weight(name: str, tensor: torch.Tensor) -> bool:
     return (
-        (".ffn.experts." in name or ".ffn.shared_experts." in name)
+        ".ffn.experts." in name
         and name.endswith(".weight")
         and tensor.dtype == torch.int8
         and tensor.ndim == 2
     )
+
+
+def is_fp4_expert_weight_name(name: str) -> bool:
+    return ".ffn.experts." in name and name.endswith(".weight")
+
+
+def expert_scale_name(weight_name: str) -> str:
+    return weight_name.removesuffix(".weight") + ".scale"
+
+
+def validate_source_index(
+    config: dict[str, Any],
+    weight_map: dict[str, str],
+    src_group_size: int,
+) -> int:
+    expert_weights = [
+        name for name in weight_map if is_fp4_expert_weight_name(name)
+    ]
+    if not expert_weights:
+        raise ValueError(
+            "model.safetensors.index.json contains no DeepSeek-style FP4 expert weights"
+        )
+
+    missing_scales: list[str] = []
+    cross_shard_scales: list[str] = []
+    for weight_name in expert_weights:
+        scale_name = expert_scale_name(weight_name)
+        if scale_name not in weight_map:
+            missing_scales.append(scale_name)
+        elif weight_map[scale_name] != weight_map[weight_name]:
+            cross_shard_scales.append(
+                f"{weight_name} ({weight_map[weight_name]}) / "
+                f"{scale_name} ({weight_map[scale_name]})"
+            )
+
+    if missing_scales:
+        sample = ", ".join(missing_scales[:5])
+        raise ValueError(
+            f"{len(missing_scales)} expert scale tensor(s) are missing; sample: {sample}"
+        )
+    if cross_shard_scales:
+        sample = "; ".join(cross_shard_scales[:3])
+        raise ValueError(
+            f"{len(cross_shard_scales)} expert weight/scale pair(s) are split "
+            f"across shards; sample: {sample}"
+        )
+
+    quant_config = config.get("quantization_config", {})
+    scale_format = str(quant_config.get("scale_fmt", "")).lower()
+    if scale_format not in ("", "ue8m0"):
+        raise ValueError(
+            f"unsupported source expert scale format {scale_format!r}; "
+            "expected UE8M0 or an unspecified floating-point scale"
+        )
+    if src_group_size != 32 and scale_format == "ue8m0":
+        print(
+            f"warning: source config uses UE8M0 scales but --src-group-size="
+            f"{src_group_size}; DeepSeek-V4-Pro-DSpark uses 32",
+            flush=True,
+        )
+
+    base_count = sum(name.startswith("layers.") for name in expert_weights)
+    mtp_count = sum(name.startswith("mtp.") for name in expert_weights)
+    print(
+        "validated FP4 expert index: "
+        f"weights={len(expert_weights)}, base={base_count}, mtp={mtp_count}, "
+        f"source_scale_format={scale_format or 'float'}, "
+        f"source_group_size={src_group_size}",
+        flush=True,
+    )
+    return len(expert_weights)
 
 
 def unpack_fp4_values(packed: torch.Tensor, fp4_table: torch.Tensor) -> torch.Tensor:
@@ -240,6 +323,7 @@ def convert_config(src_dir: Path, out_dir: Path, dst_group_size: int) -> None:
         return
 
     config = load_json(config_path)
+    config["expert_dtype"] = "fp4"
     quant_config = config.setdefault("quantization_config", {})
     quant_config["group_size"] = dst_group_size
     quant_config["fp4_group_size"] = dst_group_size
@@ -342,14 +426,23 @@ def convert_shard(
                 continue
             tensor = reader.get_tensor(name)
 
-            if is_fp4_expert_weight(name, tensor):
-                scale_name = name.removesuffix(".weight") + ".scale"
+            if is_fp4_expert_weight_name(name):
+                if not is_fp4_expert_weight(name, tensor):
+                    raise ValueError(
+                        f"expected packed int8 2D FP4 expert weight for {name}, "
+                        f"got dtype={tensor.dtype}, shape={tuple(tensor.shape)}"
+                    )
+                scale_name = expert_scale_name(name)
                 if scale_name not in key_set:
                     raise KeyError(f"missing scale tensor for {name}: {scale_name}")
+                scale = reader.get_tensor(scale_name)
+                if not scale.is_floating_point():
+                    raise ValueError(
+                        f"expected floating-point expert scale for {scale_name}, "
+                        f"got dtype={scale.dtype}"
+                    )
                 tensor_on_device = tensor.to(device, non_blocking=True)
-                scale_on_device = reader.get_tensor(scale_name).to(
-                    device, non_blocking=True
-                )
+                scale_on_device = scale.to(device, non_blocking=True)
                 new_weight, new_scale = regroup_fp4_tensor(
                     tensor_on_device,
                     scale_on_device,
@@ -591,7 +684,10 @@ def main() -> None:
     parser.add_argument(
         "--skip-input-format-check",
         action="store_true",
-        help="跳过 config.json 的输入格式检查。仅当你确认目录虽然写着 fp8，但实际 expert 权重仍是 packed FP4 时使用。",
+        help=(
+            "跳过 config.json 的输入格式检查。expert_dtype=fp4 的 FP4+FP8 mixed "
+            "checkpoint（包括 DeepSeek-V4-Pro-DSpark）会自动识别，不需要此参数。"
+        ),
     )
     args = parser.parse_args()
 
@@ -603,15 +699,33 @@ def main() -> None:
     if not index_path.exists():
         raise FileNotFoundError(index_path)
 
-    if looks_like_fp8_config(src_dir) and not args.skip_input_format_check:
+    config_path = src_dir / "config.json"
+    config = load_json(config_path) if config_path.exists() else {}
+    if looks_like_pure_fp8_config(src_dir) and not args.skip_input_format_check:
         raise ValueError(
-            "input config.json looks like an FP8 checkpoint already. "
-            "If your actual expert weights are still packed FP4 and only config.json is misleading, "
+            "input config.json looks like a pure FP8 checkpoint without "
+            "expert_dtype=fp4. If its expert weights are actually packed FP4, "
             "rerun with --skip-input-format-check."
+        )
+    if (
+        config
+        and not has_fp4_expert_config(config)
+        and not args.skip_input_format_check
+    ):
+        raise ValueError(
+            "input config.json does not declare expert_dtype=fp4; "
+            "rerun with --skip-input-format-check only after verifying the expert tensors"
         )
 
     if args.overwrite and args.resume:
         raise ValueError("--overwrite and --resume are mutually exclusive")
+    if args.src_group_size <= 0 or args.dst_group_size <= 0:
+        raise ValueError("source and destination group sizes must be positive")
+    if args.dst_group_size % args.src_group_size != 0:
+        raise ValueError(
+            f"--dst-group-size={args.dst_group_size} must be divisible by "
+            f"--src-group-size={args.src_group_size}"
+        )
 
     if out_dir.exists() and any(out_dir.iterdir()) and not args.overwrite and not args.resume:
         raise FileExistsError(f"{out_dir} is not empty; pass --overwrite to continue")
@@ -619,6 +733,7 @@ def main() -> None:
 
     index = load_json(index_path)
     weight_map = index["weight_map"]
+    validate_source_index(config, weight_map, args.src_group_size)
     by_file: dict[str, list[str]] = {}
     for name, file_name in weight_map.items():
         by_file.setdefault(file_name, []).append(name)
@@ -646,6 +761,15 @@ def main() -> None:
     )
 
     total_size = sum(shard_sizes.values())
+    input_names = set(weight_map)
+    output_names = set(emitted_map)
+    if input_names != output_names:
+        missing = sorted(input_names - output_names)
+        unexpected = sorted(output_names - input_names)
+        raise RuntimeError(
+            "converted checkpoint tensor index mismatch: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
 
     save_json(
         out_dir / "model.safetensors.index.json",
