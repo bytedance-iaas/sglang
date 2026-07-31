@@ -259,6 +259,17 @@ class EICCacheController(HiCacheController):
         ret = result == 0
         self.ack_write_queue.put((operation.node_id, ret))
 
+    @staticmethod
+    def _completed_prefix(mask, step, limit):
+        # Short mask = backend bailed out early, so the tail is a miss; all(mask)
+        # would read it as a full hit.
+        completed = 0
+        for ret in mask:
+            if not ret:
+                break
+            completed += step
+        return min(completed, limit)
+
     def batch_torch_cat(self, data_list: List[torch.Tensor], split_dim: int):
         """
         Batch torch.cat to avoid OOM.
@@ -287,14 +298,7 @@ class EICCacheController(HiCacheController):
             # Must still ack: a skipped ack strands the request until abort.
             logger.exception(f"Load from eic raised, node: {operation.node_id}: {e}")
             mask = []
-        # Short mask = backend bailed out early, so the tail is a miss; all(mask)
-        # would read it as a full hit.
-        completed_tokens = 0
-        for ret in mask:
-            if not ret:
-                break
-            completed_tokens += 1
-        completed_tokens = min(completed_tokens, len(operation.host_indices))
+        completed_tokens = self._completed_prefix(mask, 1, len(operation.host_indices))
         if completed_tokens < len(operation.host_indices):
             logger.warning(f"Failed to load from eic, node: {operation.node_id}")
 
@@ -364,12 +368,9 @@ class EICCacheController(HiCacheController):
         except Exception as e:
             logger.exception(f"Load from eic raised, node: {operation.node_id}: {e}")
             mask = []
-        completed_tokens = 0
-        for ret in mask:
-            if not ret:
-                break
-            completed_tokens += self.page_size
-        completed_tokens = min(completed_tokens, len(operation.host_indices))
+        completed_tokens = self._completed_prefix(
+            mask, self.page_size, len(operation.host_indices)
+        )
         if completed_tokens < len(operation.host_indices):
             logger.debug(f"Failed to load from eic, node: {operation.node_id}")
 

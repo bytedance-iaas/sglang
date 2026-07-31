@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import threading
 import time
 from collections import defaultdict
@@ -35,7 +34,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.eic_pp_reconcile import EICPPReconciler
+from sglang.srt.mem_cache.eic_pp_reconcile import (
+    EICPPReconciler,
+    eic_pp_unsupported_reason,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -457,16 +459,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         if server_args.hicache_storage_backend == "eic" and self.pp_size > 1:
-            reason = None
-            if server_args.schedule_policy != "fcfs":
-                reason = "--schedule-policy must be fcfs"
-            elif server_args.enable_dp_attention:
-                reason = "dp_attention is incompatible"
-            elif float(os.getenv("SGLANG_REQ_WAITING_TIMEOUT", "-1")) > 0:
-                reason = (
-                    "SGLANG_REQ_WAITING_TIMEOUT must be unset (per-stage "
-                    "clocks release out of lockstep)"
-                )
+            reason = eic_pp_unsupported_reason(server_args)
             if reason is not None:
                 logger.error(
                     "eic hicache_storage_backend under PP: %s; disabling the "
@@ -2339,21 +2332,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # second receive chain at this site deadlocks against the pipeline's
         # own sends (PP0 waits in _pp_commit_comm_work for a recv the next
         # stage only reaches after finishing this call).
-        cap = EICPPReconciler.VERDICT_CAP
-        buf = torch.zeros(2 + cap * 3, dtype=torch.int64, device="cpu")
+        buf = torch.zeros(
+            2 + EICPPReconciler.VERDICT_CAP * 3, dtype=torch.int64, device="cpu"
+        )
         rows = self._pp_prefetch.collect()
         if self.pp_rank == 0:
             count = torch.tensor(finish_count, dtype=torch.int, device="cpu")
             self._all_reduce_attn_groups(count, torch.distributed.ReduceOp.MIN)
             buf[0] = int(count.item())
-            buf[1] = len(rows)
-            for i, row in enumerate(rows):
-                buf[2 + i * 3 : 5 + i * 3] = torch.tensor(row, dtype=torch.int64)
+            EICPPReconciler.pack_rows(rows, buf, 1)
             if self.tp_world_size > 1:
                 torch.distributed.broadcast(buf, group=self.tp_group, group_src=0)
         self._pp_sync(buf)
-        for i in range(int(buf[1].item())):
-            h, epoch, value = (int(x) for x in buf[2 + i * 3 : 5 + i * 3])
+        for h, epoch, value in EICPPReconciler.unpack_rows(buf, 1):
             self._pp_prefetch_verdict[(h, epoch)] = value
         while len(self._pp_prefetch_verdict) > EICPPReconciler.EPOCH_CAP:
             self._pp_prefetch_verdict.pop(next(iter(self._pp_prefetch_verdict)))

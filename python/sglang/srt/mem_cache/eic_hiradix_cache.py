@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.eic_pp_reconcile import eic_pp_unsupported_reason
 from sglang.srt.mem_cache.eic_memory_pool import (
     EICDeepSeekV4TokenToKVPoolHost,
     EICMHATokenToKVPoolHost,
@@ -292,23 +293,13 @@ class EICHiRadixCache(RadixCache):
             # clobber frozen matches), storage prefetch skips the gate per stage
             # asynchronously, dp-attention lanes have private waiting queues,
             # and the waiting timeout releases by per-stage clocks.
-            if server_args.schedule_policy != "fcfs":
-                raise ValueError(
-                    "EIC host load-back under PP requires schedule_policy=fcfs"
-                )
             if getattr(server_args, "hicache_storage_backend", None):
                 raise ValueError(
                     "EIC under PP is incompatible with hicache_storage_backend"
                 )
-            if server_args.enable_dp_attention:
-                raise ValueError(
-                    "EIC host load-back under PP is incompatible with dp-attention"
-                )
-            if float(os.getenv("SGLANG_REQ_WAITING_TIMEOUT", "-1")) > 0:
-                raise ValueError(
-                    "EIC host load-back under PP requires SGLANG_REQ_WAITING_TIMEOUT "
-                    "to stay disabled (per-stage clocks release non-lockstep)"
-                )
+            reason = eic_pp_unsupported_reason(server_args)
+            if reason is not None:
+                raise ValueError(f"EIC host load-back under PP: {reason}")
         super().__init__(params)
 
         self.save_decode_cache = True
@@ -552,12 +543,16 @@ class EICHiRadixCache(RadixCache):
                 f"queue size {queue_size.item()}"
             )
 
+    @property
+    def _pp_active(self):
+        return self.pp_size > 1 and self.pp_group is not None
+
     def _pp_bcast_from_first(self, tensor, tag=P2PTag.HIRADIX_PP_SYNC):
         # PP0-authoritative broadcast down the pipeline via non-blocking isend
         # (blocking/collective PP ops deadlock the out-of-phase pipeline). Each
         # logical stream passes its OWN tag so independent bcasts (num_ready vs the
         # admission verdict) never share a FIFO slot and can't cross-match.
-        if self.pp_size <= 1 or self.pp_group is None:
+        if not self._pp_active:
             return
         if self.pp_rank > 0:
             torch.distributed.recv(
@@ -591,7 +586,7 @@ class EICHiRadixCache(RadixCache):
         # verdict lands at the same batch-forming call everywhere.
         self._round += 1
         self._drain_local_acks()
-        if self.pp_size <= 1 or self.pp_group is None:
+        if not self._pp_active:
             return
         if self.rank == 0:
             # tp0 speaks for its stage (reports are TP-uniform: complete_token
@@ -733,8 +728,10 @@ class EICHiRadixCache(RadixCache):
             self._verdict_outbox.append((*key, self._KIND_FINAL, final))
 
     def _apply_verdicts(self, buf):
-        for i in range(int(buf[0].item())):
-            h, epoch, kind, value = (int(x) for x in buf[1 + i * 4 : 5 + i * 4])
+        n = int(buf[0].item())
+        flat = buf[1 : 1 + n * 4].tolist()
+        for i in range(0, n * 4, 4):
+            h, epoch, kind, value = flat[i : i + 4]
             rid = self._h_rid.get(h)
             st = self.ongoing_load_admit.get(rid) if rid is not None else None
             if st is None or st["epoch"] != epoch:
@@ -750,7 +747,6 @@ class EICHiRadixCache(RadixCache):
         # (uniform) verdict and allocator deltas stay PP-uniform. allow_evict is
         # off under PP -- an alloc-failure eviction would mutate one stage's
         # tree only; degrading to loaded=0 re-converges at FINAL instead.
-        st["span"] = span
         d, hh = st["d"], st["hh"]
         node = st["best_match_node"]
         if (
@@ -762,14 +758,13 @@ class EICHiRadixCache(RadixCache):
             if node is not None:
                 indices = self.load_back(node, allow_evict=self.pp_size <= 1)
                 if indices is not None:
-                    st["node_id"] = node.id
                     st["load_node"] = node
                     st["alloc"] = len(indices)
                     st["new_indices"] = indices
                     self._loadback_rid[node.id] = rid
                     return  # the LOADED report follows the local EIC ack
         # Nothing kicked on this stage: its admissible length is device-only.
-        if self.pp_size <= 1 or self.pp_group is None:
+        if not self._pp_active:
             self._admit_verdict[st["h"]] = d
         else:
             self._queue_report(st, self._KIND_FINAL, d)
@@ -862,7 +857,7 @@ class EICHiRadixCache(RadixCache):
             node_id, complete_token = self.cache_controller.ack_load_queue.get_nowait()
             rid = self._loadback_rid.pop(node_id, None)
             st = self.ongoing_load_admit.get(rid) if rid is not None else None
-            if st is None or st.get("node_id") != node_id:
+            if st is None or st["load_node"] is None or st["load_node"].id != node_id:
                 # Req released before its load landed (the node_id check keeps a
                 # dead incarnation's ack from being attributed to a re-gated
                 # same-rid retry). Free the WHOLE span (a verdict-uniform
@@ -872,7 +867,7 @@ class EICHiRadixCache(RadixCache):
                     self._free_failed_loadback(node_id, 0)
                 continue
             st["complete"] = complete_token
-            if self.pp_size <= 1 or self.pp_group is None:
+            if not self._pp_active:
                 self._admit_verdict[st["h"]] = st["d"] + complete_token
             else:
                 self._queue_report(st, self._KIND_FINAL, st["d"] + complete_token)
@@ -1155,8 +1150,9 @@ class EICHiRadixCache(RadixCache):
         # verdict lands -- in the same DAG slot on every stage, so all stages
         # admit it in the same batch-forming loop. pp<=1 short-circuits both
         # verdicts locally (cold reqs admit with zero deferral, as before).
-        h = self._rid_hash(req.rid)
-        if req.rid not in self.ongoing_load_admit:
+        st = self.ongoing_load_admit.get(req.rid)
+        h = st["h"] if st is not None else self._rid_hash(req.rid)
+        if st is None:
             d = len(req.prefix_indices)
             hh = req.host_hit_length if req.needs_host_load_back() else 0
             # Lock the frozen device prefix across the verdict round trips so
@@ -1174,16 +1170,14 @@ class EICHiRadixCache(RadixCache):
                 "hh": hh,
                 "best_match_node": req.best_match_node if hh > 0 else None,
                 "deferred_lock": lock_node,
-                "span": None,
                 "alloc": 0,
-                "node_id": None,
                 "load_node": None,
                 "new_indices": None,
                 "complete": None,
             }
             self.ongoing_load_admit[req.rid] = st
             self._h_rid[h] = req.rid
-            if self.pp_size <= 1 or self.pp_group is None:
+            if not self._pp_active:
                 self._apply_span(req.rid, st, d + hh)
             else:
                 self._queue_report(st, self._KIND_SPAN, (d, hh))
@@ -1197,7 +1191,7 @@ class EICHiRadixCache(RadixCache):
         self._h_rid.pop(h, None)
         admit = self._admit_verdict.pop(h)
         self.dec_lock_ref(st["deferred_lock"])
-        if st["node_id"] is not None:
+        if st["load_node"] is not None:
             # A FINAL verdict needs every loader's post-ack report, so it can
             # never outrun the local DMA or the local KV. Loud beats a silent
             # free of in-flight memory / a silent cross-stage length fork.
@@ -1206,7 +1200,7 @@ class EICHiRadixCache(RadixCache):
             # Free [admit, d + alloc): the failed tail AND loaded-beyond-verdict
             # in one cut at a verdict boundary, keeping trees and allocator
             # accounting PP-identical.
-            self._free_failed_loadback(st["node_id"], max(admit - d, 0))
+            self._free_failed_loadback(st["load_node"].id, max(admit - d, 0))
         else:
             assert admit <= d, "EIC PP verdict beyond device match without a load"
         if st["new_indices"] is not None and admit > d:
@@ -1227,7 +1221,7 @@ class EICHiRadixCache(RadixCache):
             depth -= len(node.key)
             node = node.parent
         req.last_node = node
-        req._eic_loaded_len = max(0, prefix_len - d)
+        req.eic_loaded_len = max(0, prefix_len - d)
         req.set_extend_input_len(len(req.fill_ids) - prefix_len)
         req.cache_protected_len = prefix_len
         req.last_matched_prefix_len = prefix_len
@@ -1247,13 +1241,13 @@ class EICHiRadixCache(RadixCache):
         self._h_rid.pop(h, None)
         self._admit_verdict.pop(h, None)
         self.dec_lock_ref(st["deferred_lock"])
-        node_id = st["node_id"]
+        node_id = st["load_node"].id if st["load_node"] is not None else None
         if node_id is not None and node_id in self.ongoing_load_back:
             if st["complete"] is not None:
                 self._loadback_rid.pop(node_id, None)
                 self._free_failed_loadback(node_id, 0)  # whole span: uniform boundary
             # else: load still in flight -> _drain_local_acks frees it at ack.
-        if self.pp_size > 1 and self.pp_group is not None:
+        if self._pp_active:
             self._tombstone[h] = (st["epoch"], self._round + self._TOMBSTONE_TTL)
             key = (h, st["epoch"])
             for kind in (self._KIND_SPAN, self._KIND_FINAL):
@@ -1483,7 +1477,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
     ):
         self.calculate_hash_fn = get_content_hash
         self.load_remote_threshold = 100
-        self.match_req_set = []
+        self.match_req_set = {}  # rid -> None, insertion-ordered for FIFO trim
         self.eic_check_max_num = -1
         super().__init__(params, server_args)
 
@@ -1695,7 +1689,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         if num_ready == 0:
             return
         if len(self.match_req_set) > 1000:
-            self.match_req_set = self.match_req_set[500:]
+            self.match_req_set = dict(list(self.match_req_set.items())[500:])
 
         fetches = []  # (slot, last_node, evict_len, compute_key, prev_hash)
         eic_keys = 0
@@ -1715,7 +1709,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
                 continue
             if _need_calculate_hash(last_node, self.page_size):
                 self._calculate_content_hash(last_node)
-            self.match_req_set.append(req.rid)
+            self.match_req_set[req.rid] = None
             prev_hash = last_node.content_hash[-1] if last_node.content_hash else None
             fetches.append((slot, last_node, evict_len, req_key[prefix_len:], prev_hash))
             eic_keys += (len(req_key) - prefix_len) // self.page_size

@@ -943,7 +943,7 @@ class PrefillAdder:
             eic_prefix_len = 0
             if self.enable_eic_cache:
                 # Load-back already resolved by the async admission gate.
-                eic_prefix_len = getattr(req, "_eic_loaded_len", 0)
+                eic_prefix_len = req.eic_loaded_len
             elif req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(

@@ -17,7 +17,24 @@ import hashlib
 import logging
 import pickle
 
+import torch
+
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+
+def eic_pp_unsupported_reason(server_args):
+    if server_args.schedule_policy != "fcfs":
+        return "schedule_policy must be fcfs"
+    if server_args.enable_dp_attention:
+        return "dp_attention is incompatible"
+    if envs.SGLANG_REQ_WAITING_TIMEOUT.get() > 0:
+        return (
+            "SGLANG_REQ_WAITING_TIMEOUT must stay unset "
+            "(per-stage clocks release out of lockstep)"
+        )
+    return None
 
 
 class EICPPReconciler:
@@ -56,6 +73,20 @@ class EICPPReconciler:
 
             self._store_handle = distributed_c10d._get_default_store()
         return self._store_handle
+
+    @classmethod
+    def pack_rows(cls, rows, buf, base):
+        buf[base] = len(rows)
+        for i, row in enumerate(rows):
+            buf[base + 1 + i * 3 : base + 4 + i * 3] = torch.tensor(
+                row, dtype=torch.int64
+            )
+
+    @classmethod
+    def unpack_rows(cls, buf, base):
+        n = int(buf[base].item())
+        flat = buf[base + 1 : base + 1 + n * 3].tolist()
+        return [tuple(flat[i : i + 3]) for i in range(0, n * 3, 3)]
 
     @staticmethod
     def rid_hash(rid):

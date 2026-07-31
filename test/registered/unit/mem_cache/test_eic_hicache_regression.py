@@ -42,7 +42,7 @@ class FakeDeviceAllocator:
 class TestEICHiCacheRegression(unittest.TestCase):
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
-        cache.match_req_set = []
+        cache.match_req_set = {}
         cache.tp_size = 1
         cache.pp_size = 1
         cache.pp_group = None
@@ -62,7 +62,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
 
         cache._match_for_remote_fetch.assert_not_called()
         cache.cache_controller.batch_find_longest_prefix_in_eic.assert_not_called()
-        self.assertEqual(cache.match_req_set, [])
+        self.assertEqual(cache.match_req_set, {})
 
     def test_match_from_remote_gates_and_indexes_by_queue(self):
         # match_from_remote first MIN-reduces the queue length (num_ready gate),
@@ -70,7 +70,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         # lengths. Here we capture the CP/TP reduce (PP uses p2p, tested
         # separately); the shapes are what keep the reduces in lockstep.
         cache = object.__new__(EICPagedHiRadixCache)
-        cache.match_req_set = []
+        cache.match_req_set = {}
         cache.tp_size = 2
         cache.tp_group = object()
         cache.pp_size = 1
@@ -305,7 +305,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache._admit_verdict = {}
         cache._loadback_rid = {55: "r0"}
         cache.ongoing_load_admit = {
-            "r0": {"h": 10, "d": 4, "node_id": 55, "complete": None}
+            "r0": {"h": 10, "d": 4, "load_node": SimpleNamespace(id=55), "complete": None}
         }
         cache.ongoing_load_back = {}
         q = Queue()
@@ -336,7 +336,6 @@ class TestEICHiCacheRegression(unittest.TestCase):
                 "h": 7,
                 "d": 12,
                 "alloc": 0,
-                "node_id": None,
                 "load_node": None,
                 "new_indices": None,
                 "deferred_lock": node_b,
@@ -349,7 +348,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(req.prefix_indices), 10)
         self.assertIs(req.last_node, node_b)  # spanning resident node kept
         req.set_extend_input_len.assert_called_once_with(20 - 10)
-        self.assertEqual(req._eic_loaded_len, 0)
+        self.assertEqual(req.eic_loaded_len, 0)
         self.assertEqual(cache.ongoing_load_admit, {})
         self.assertEqual(cache._admit_verdict, {})
         self.assertEqual(cache._h_rid, {})
@@ -367,6 +366,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         node_a = FakeTreeNode(4, True, root)  # device match, (0, 4]
         node_c = FakeTreeNode(10, True, node_a)  # loaded host, (4, 14]
         node_d = FakeTreeNode(6, False, node_c)  # failed tail, evicted, (14, 20]
+        node_d.id = 55
         req = mock.Mock()
         req.rid = "r1"
         req.prefix_indices = torch.arange(4, dtype=torch.int64)
@@ -377,7 +377,6 @@ class TestEICHiCacheRegression(unittest.TestCase):
                 "h": 9,
                 "d": 4,
                 "alloc": 16,
-                "node_id": 55,
                 "load_node": node_d,
                 "new_indices": torch.arange(100, 116, dtype=torch.int64),
                 "deferred_lock": node_a,
@@ -394,7 +393,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(req.prefix_indices[4:].tolist(), list(range(100, 110)))
         self.assertIs(req.last_node, node_c)  # resident node at depth 14, not node_d
         req.set_extend_input_len.assert_called_once_with(20 - 14)
-        self.assertEqual(req._eic_loaded_len, 10)
+        self.assertEqual(req.eic_loaded_len, 10)
 
     # ---- two-stage lockstep protocol tests --------------------------------
 
@@ -495,16 +494,12 @@ class TestEICHiCacheRegression(unittest.TestCase):
         # round 1: s1 publishes its span report; s0 sees only its own.
         EICPagedHiRadixCache.loading_check(s0)
         EICPagedHiRadixCache.loading_check(s1)
-        self.assertEqual(s0.ongoing_load_admit["req-a"]["node_id"], None)
+        self.assertEqual(s0.ongoing_load_admit["req-a"]["load_node"], None)
         # round 2: s0 drains the store, forms SPAN=16, both stages kick alloc 12.
         EICPagedHiRadixCache.loading_check(s0)
         EICPagedHiRadixCache.loading_check(s1)
         self.assertEqual(s0.ongoing_load_admit["req-a"]["alloc"], 12)
         self.assertEqual(s1.ongoing_load_admit["req-a"]["alloc"], 12)
-        self.assertEqual(
-            s0.ongoing_load_admit["req-a"]["span"],
-            s1.ongoing_load_admit["req-a"]["span"],
-        )
         # acks land: stage0 loads 12/12, stage1 only 8/12.
         s0.cache_controller.ack_load_queue.put((100, 12))
         s1.cache_controller.ack_load_queue.put((200, 8))
@@ -627,7 +622,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         for _ in range(2):  # span verdict forms and applies -> loads kicked
             EICPagedHiRadixCache.loading_check(s0)
             EICPagedHiRadixCache.loading_check(s1)
-        self.assertEqual(s0.ongoing_load_admit["req-e"]["node_id"], 100)
+        self.assertEqual(s0.ongoing_load_admit["req-e"]["load_node"].id, 100)
         EICPagedHiRadixCache.release_load_admit(s0, "req-e")
         EICPagedHiRadixCache.release_load_admit(s1, "req-e")
         # same rid re-gates (epoch 2, no load kicked yet: node_id None)
@@ -659,7 +654,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         )
         req = self._make_req("req-g", 4, 16, load_node_id=100)
         self.assertFalse(EICPagedHiRadixCache.check_load_back_progress(s, req))
-        self.assertEqual(s.ongoing_load_admit["req-g"]["node_id"], 100)
+        self.assertEqual(s.ongoing_load_admit["req-g"]["load_node"].id, 100)
         s.cache_controller.ack_load_queue.put((100, 10))
         EICPagedHiRadixCache.loading_check(s)
         self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s, req))
@@ -679,7 +674,6 @@ class TestEICHiCacheRegression(unittest.TestCase):
                 "h": 5,
                 "d": 4,
                 "alloc": 12,
-                "node_id": 100,
                 "load_node": node,
                 "new_indices": torch.arange(12, dtype=torch.int64),
                 "deferred_lock": node,
