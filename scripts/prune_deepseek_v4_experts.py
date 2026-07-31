@@ -149,6 +149,50 @@ def _expected_keys_by_shard(weight_map: dict[str, str]) -> dict[str, set[str]]:
     return result
 
 
+def _reconcile_weight_map(
+    input_dir: Path, indexed_weight_map: dict[str, str]
+) -> dict[str, str]:
+    actual_weight_map = {}
+    for shard in sorted(set(indexed_weight_map.values())):
+        shard_path = input_dir / shard
+        with safe_open(shard_path, framework="pt", device="cpu") as file:
+            for name in file.keys():  # noqa: SIM118 - safe_open is not iterable.
+                previous_shard = actual_weight_map.setdefault(name, shard)
+                if previous_shard != shard:
+                    raise ValueError(
+                        f"Tensor {name} exists in both {previous_shard} and {shard}."
+                    )
+
+    indexed_names = set(indexed_weight_map)
+    actual_names = set(actual_weight_map)
+    stale_names = sorted(indexed_names - actual_names)
+    unindexed_names = sorted(actual_names - indexed_names)
+    relocated_names = sorted(
+        name
+        for name in indexed_names & actual_names
+        if indexed_weight_map[name] != actual_weight_map[name]
+    )
+    if stale_names:
+        print(
+            f"Ignore {len(stale_names)} stale index entries absent from shards: "
+            f"{stale_names[:10]}",
+            flush=True,
+        )
+    if unindexed_names:
+        print(
+            f"Add {len(unindexed_names)} shard tensors missing from the index: "
+            f"{unindexed_names[:10]}",
+            flush=True,
+        )
+    if relocated_names:
+        print(
+            f"Correct {len(relocated_names)} tensors mapped to the wrong shard: "
+            f"{relocated_names[:10]}",
+            flush=True,
+        )
+    return actual_weight_map
+
+
 def _validate_shard_keys(path: Path, expected_keys: set[str]) -> None:
     with safe_open(path, framework="pt", device="cpu") as file:
         actual_keys = set(file.keys())
@@ -305,7 +349,7 @@ def main() -> None:
         )
 
     source_index = _read_json(input_dir / _INDEX_NAME)
-    source_weight_map = source_index["weight_map"]
+    source_weight_map = _reconcile_weight_map(input_dir, source_index["weight_map"])
     output_weight_map = {
         name: shard
         for name, shard in source_weight_map.items()
