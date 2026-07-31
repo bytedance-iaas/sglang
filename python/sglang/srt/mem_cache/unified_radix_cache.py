@@ -386,12 +386,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.work_list.append(send_work)
 
     def reset(self) -> None:
-        layered_completion = getattr(self, "_layered_pp_completion", None)
-        if layered_completion is not None:
-            layered_completion.before_reset()
         self._reset_full()
-        if layered_completion is not None:
-            layered_completion.after_reset()
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
@@ -535,11 +530,6 @@ class UnifiedRadixCache(BasePrefixCache):
             cache=self,
             server_args=server_args,
         )
-
-    def shutdown(self) -> None:
-        layered_completion = getattr(self, "_layered_pp_completion", None)
-        if layered_completion is not None:
-            layered_completion.shutdown()
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
