@@ -7,11 +7,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.mem_cache.hybrid_cache.pp_completion_coordinator import (
-    CompletionKind,
-    CompletionTargets,
-)
-from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -28,21 +23,6 @@ class _FakeWork:
 
 class _Holder:
     pass
-
-
-class _FakeCoordinator:
-    def __init__(self, targets: CompletionTargets):
-        self._targets = targets
-        self.published = []
-
-    def targets(self):
-        return self._targets
-
-    def publish_local(self, kind, **state):
-        self.published.append((kind, state))
-
-    def report_scheduler_fatal(self, message):
-        raise RuntimeError(message)
 
 
 class TestUnifiedRadixCachePPSync(unittest.TestCase):
@@ -162,69 +142,6 @@ class TestUnifiedRadixCachePPSync(unittest.TestCase):
         finish_event.synchronize.assert_called_once()
         holder.dec_lock_ref.assert_called_once_with(node, lock_params)
         self.assertEqual(holder.cache_controller.ack_write_queue, [])
-
-    def test_layered_write_commit_has_no_scheduler_collective_or_event_wait(self):
-        tree = object.__new__(UnifiedRadixCache)
-        finish_event = mock.Mock()
-        finish_event.query.return_value = True
-        node = SimpleNamespace(
-            key=RadixKey([1, 2, 3, 4]),
-            hash_value=["logical-page-hash"],
-        )
-        lock_params = object()
-        tree.cache_controller = SimpleNamespace(
-            ack_write_queue=[(None, finish_event, [17])],
-            ack_load_queue=[],
-        )
-        tree.ongoing_write_through = {17: (node, lock_params)}
-        tree.ongoing_load_back = {}
-        tree.enable_storage = False
-        tree.pp_rank = 2
-        tree.dec_lock_ref = mock.Mock()
-        tree._pp_completion_coordinator = _FakeCoordinator(
-            CompletionTargets(write_prepare=1, write_commit=1)
-        )
-        tree._layered_observed = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        tree._layered_ready = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        tree._layered_prepared = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        tree._layered_committed = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        tree._layered_prepared_digest = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        tree._layered_committed_digest = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-
-        with mock.patch.object(
-            torch.distributed, "all_reduce"
-        ) as all_reduce, mock.patch.object(
-            torch.distributed, "recv"
-        ) as recv, mock.patch.object(
-            torch.distributed, "isend"
-        ) as isend:
-            tree._check_layered_completions((CompletionKind.WRITE,))
-
-        all_reduce.assert_not_called()
-        recv.assert_not_called()
-        isend.assert_not_called()
-        finish_event.synchronize.assert_not_called()
-        tree.dec_lock_ref.assert_called_once_with(node, lock_params)
-        self.assertEqual(tree.cache_controller.ack_write_queue, [])
-        self.assertEqual(tree.ongoing_write_through, {})
 
 
 if __name__ == "__main__":

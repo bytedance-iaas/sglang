@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import atexit
-import hashlib
 import logging
 import threading
 import time
 from collections import defaultdict
-from datetime import timedelta
 from functools import lru_cache, partial
 from queue import Empty
 from typing import TYPE_CHECKING, Any, Optional
@@ -14,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -36,10 +32,6 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
-)
-from sglang.srt.mem_cache.hybrid_cache.pp_completion_coordinator import (
-    CompletionKind,
-    PPHiCacheCompletionCoordinator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -325,36 +317,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
-        self.hicache_pp_sync_mode = "legacy"
-        self._pp_completion_group: Optional[torch.distributed.ProcessGroup] = None
-        self._pp_completion_coordinator: Optional[
-            PPHiCacheCompletionCoordinator
-        ] = None
-        self._pp_completion_shutdown = False
-        self._layered_observed = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        self._layered_ready = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        self._layered_prepared = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        self._layered_committed = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        self._layered_prepared_digest = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
-        self._layered_committed_digest = {
-            CompletionKind.WRITE: 0,
-            CompletionKind.LOAD: 0,
-        }
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller = None
@@ -424,12 +386,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self.work_list.append(send_work)
 
     def reset(self) -> None:
-        if self._pp_completion_coordinator is not None:
-            self._quiesce_layered_completions()
+        layered_completion = getattr(self, "_layered_pp_completion", None)
+        if layered_completion is not None:
+            layered_completion.before_reset()
         self._reset_full()
-        if self._pp_completion_coordinator is not None:
-            self._reset_layered_completion_state()
-            self._pp_completion_coordinator.reset_epoch()
+        if layered_completion is not None:
+            layered_completion.after_reset()
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
@@ -480,15 +442,6 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node=self.root_node,
             best_match_node=self.root_node,
         )
-
-    def _reset_layered_completion_state(self) -> None:
-        for kind in CompletionKind:
-            self._layered_observed[kind] = 0
-            self._layered_ready[kind] = 0
-            self._layered_prepared[kind] = 0
-            self._layered_committed[kind] = 0
-            self._layered_prepared_digest[kind] = 0
-            self._layered_committed_digest[kind] = 0
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -571,129 +524,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 "SGLANG_HICACHE_PP_SYNC_MODE must be 'legacy' or "
                 f"'layered_flags', got {mode!r}"
             )
-        self.hicache_pp_sync_mode = mode
         if mode == "legacy":
             return
 
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
+        from sglang.srt.mem_cache.hybrid_cache.pp_layered_completion import (
+            PPHiCacheLayeredCompletion,
         )
 
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        unsupported: list[str] = []
-        if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
-            unsupported.append(f"cache={type(kvcache).__name__}, expected DSV4")
-        if self.pp_size <= 1:
-            unsupported.append(f"pp_size={self.pp_size}, expected > 1")
-        if server_args.hicache_storage_backend is not None:
-            unsupported.append("L3 storage is enabled")
-        if server_args.hicache_write_policy != "write_through":
-            unsupported.append(
-                f"write_policy={server_args.hicache_write_policy!r}, "
-                "expected 'write_through'"
-            )
-        if server_args.enable_eic_cache:
-            unsupported.append("EIC is enabled")
-        if unsupported:
-            raise ValueError(
-                "SGLANG_HICACHE_PP_SYNC_MODE=layered_flags only replaces "
-                "DeepSeek-V4 UnifiedRadixCache PP completion synchronization "
-                "for L2-only write-through: " + "; ".join(unsupported)
-            )
-        if not torch.distributed.is_initialized():
-            raise RuntimeError(
-                "layered_flags requires an initialized distributed process group"
-            )
-
-        stall_timeout_s = envs.SGLANG_HICACHE_PP_STALL_TIMEOUT_S.get()
-        self._pp_completion_group = self._create_pp_completion_group(
+        self._layered_pp_completion = PPHiCacheLayeredCompletion(
+            cache=self,
             server_args=server_args,
-            timeout_s=stall_timeout_s,
         )
-        self._pp_completion_coordinator = PPHiCacheCompletionCoordinator(
-            process_group=self._pp_completion_group,
-            interval_ms=envs.SGLANG_HICACHE_PP_PROGRESS_INTERVAL_MS.get(),
-            stall_timeout_s=stall_timeout_s,
-        )
-        self._pp_completion_coordinator.start()
-        self._pp_completion_shutdown = False
-        atexit.register(self.shutdown)
-        logger.info(
-            "Enabled completion-only layered-flags HiCache PP sync: "
-            "rank=%s, group_size=%s, interval_ms=%s",
-            torch.distributed.get_rank(group=self._pp_completion_group),
-            torch.distributed.get_world_size(group=self._pp_completion_group),
-            envs.SGLANG_HICACHE_PP_PROGRESS_INTERVAL_MS.get(),
-        )
-
-    @staticmethod
-    def _create_pp_completion_group(
-        *, server_args: ServerArgs, timeout_s: float
-    ) -> torch.distributed.ProcessGroup:
-        """Create one dedicated Gloo completion group per attention-DP replica."""
-
-        world_ranks = list(get_world_group().ranks)
-        expected_world_size = server_args.tp_size * server_args.pp_size
-        if len(world_ranks) != expected_world_size:
-            raise RuntimeError(
-                "Cannot derive HiCache completion rank layout: "
-                f"world_size={len(world_ranks)}, tp_size={server_args.tp_size}, "
-                f"pp_size={server_args.pp_size}"
-            )
-        attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-        if server_args.tp_size % attn_dp_size != 0:
-            raise RuntimeError(
-                "HiCache completion group requires tp_size divisible by "
-                f"attention dp size: tp_size={server_args.tp_size}, "
-                f"attn_dp_size={attn_dp_size}"
-            )
-
-        replica_width = server_args.tp_size // attn_dp_size
-        current_rank = torch.distributed.get_rank()
-        selected_group = None
-        selected_ranks = None
-        # Every rank creates every group in the same order, as required by
-        # torch.distributed.new_group.
-        for attn_dp_rank in range(attn_dp_size):
-            positions = [
-                pp_rank * server_args.tp_size + attn_dp_rank * replica_width + lane
-                for pp_rank in range(server_args.pp_size)
-                for lane in range(replica_width)
-            ]
-            ranks = [world_ranks[position] for position in positions]
-            group = torch.distributed.new_group(
-                ranks=ranks,
-                backend="gloo",
-                timeout=timedelta(seconds=timeout_s),
-            )
-            if current_rank in ranks:
-                selected_group = group
-                selected_ranks = ranks
-        if selected_group is None:
-            raise RuntimeError(
-                "Current rank is absent from every HiCache completion group: "
-                f"rank={current_rank}, world_ranks={world_ranks}"
-            )
-        logger.info(
-            "Created HiCache completion group: rank=%s, ranks=%s",
-            current_rank,
-            selected_ranks,
-        )
-        return selected_group
 
     def shutdown(self) -> None:
-        if self._pp_completion_coordinator is None or self._pp_completion_shutdown:
-            return
-        coordinator = self._pp_completion_coordinator
-        group = self._pp_completion_group
-        coordinator.close(
-            timeout_s=envs.SGLANG_HICACHE_PP_STALL_TIMEOUT_S.get()
-        )
-        if group is not None and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group(group)
-        self._pp_completion_coordinator = None
-        self._pp_completion_group = None
-        self._pp_completion_shutdown = True
+        layered_completion = getattr(self, "_layered_pp_completion", None)
+        if layered_completion is not None:
+            layered_completion.shutdown()
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
@@ -2360,316 +2206,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
-    @staticmethod
-    def _extend_completion_digest(
-        digest: int, sequence: int, operation_fingerprint: int
-    ) -> int:
-        hasher = hashlib.blake2b(digest_size=8)
-        hasher.update(int(digest).to_bytes(8, byteorder="little", signed=False))
-        hasher.update(int(sequence).to_bytes(8, byteorder="little", signed=False))
-        hasher.update(
-            int(operation_fingerprint).to_bytes(
-                8, byteorder="little", signed=False
-            )
-        )
-        return int.from_bytes(hasher.digest(), byteorder="little") & ((1 << 63) - 1)
-
-    @staticmethod
-    def _completion_node_fingerprint(node: UnifiedTreeNode) -> int:
-        """Hash logical node identity without physical slots or local node IDs."""
-
-        hasher = hashlib.blake2b(digest_size=8)
-        key = node.key
-        if key is not None:
-            hasher.update(len(key).to_bytes(8, byteorder="little", signed=False))
-            hasher.update(str(key.extra_key).encode("utf-8"))
-            hasher.update(bytes([int(key.is_bigram)]))
-        hashes = node.hash_value or []
-        if hashes:
-            # Page hashes are chained, so the last value plus the node length
-            # identifies the full logical node without re-hashing every page
-            # on each scheduler poll.
-            encoded = hashes[-1].encode("utf-8")
-            hasher.update(len(encoded).to_bytes(4, byteorder="little"))
-            hasher.update(encoded)
-        elif key is not None:
-            # hash_value is normally populated for page-aligned radix nodes.
-            # Token IDs are only a deterministic fallback for tests and early
-            # construction paths.
-            for token_id in key.token_ids:
-                hasher.update(int(token_id).to_bytes(8, "little", signed=True))
-        return int.from_bytes(hasher.digest(), byteorder="little") & ((1 << 63) - 1)
-
-    def _layered_queue(self, kind: CompletionKind):
-        if kind == CompletionKind.WRITE:
-            return self.cache_controller.ack_write_queue
-        return self.cache_controller.ack_load_queue
-
-    def _layered_ongoing(self, kind: CompletionKind):
-        if kind == CompletionKind.WRITE:
-            return self.ongoing_write_through
-        return self.ongoing_load_back
-
-    def _layered_fatal(self, kind: CompletionKind, message: str) -> None:
-        detail = (
-            "HiCache layered completion divergence: "
-            f"kind={kind.name.lower()}, pp_rank={self.pp_rank}, "
-            f"queue={len(self._layered_queue(kind))}, "
-            f"ongoing={len(self._layered_ongoing(kind))}, "
-            f"observed={self._layered_observed[kind]}, "
-            f"ready={self._layered_ready[kind]}, "
-            f"prepared={self._layered_prepared[kind]}, "
-            f"committed={self._layered_committed[kind]}: {message}"
-        )
-        coordinator = self._pp_completion_coordinator
-        if coordinator is not None:
-            coordinator.report_scheduler_fatal(detail)
-        raise RuntimeError(detail)
-
-    def _layered_extend_ack_digest(
-        self,
-        kind: CompletionKind,
-        *,
-        digest: int,
-        frontier: int,
-        ack_ids: list[int],
-    ) -> tuple[int, int]:
-        ongoing = self._layered_ongoing(kind)
-        if not ack_ids:
-            self._layered_fatal(kind, "encountered an ACK without operations")
-        for ack_id in ack_ids:
-            entry = ongoing.get(ack_id)
-            if entry is None:
-                self._layered_fatal(
-                    kind,
-                    f"ack_id={ack_id} is absent from the ongoing operation map",
-                )
-            node = entry[0]
-            frontier += 1
-            digest = self._extend_completion_digest(
-                digest,
-                frontier,
-                self._completion_node_fingerprint(node),
-            )
-        return frontier, digest
-
-    def _poll_layered_ready(self, kind: CompletionKind) -> None:
-        frontier = self._layered_committed[kind]
-        digest = self._layered_committed_digest[kind]
-        observed = frontier
-        ready = True
-        for _, finish_event, ack_ids in self._layered_queue(kind):
-            observed += len(ack_ids)
-            if not ready:
-                continue
-            if not finish_event.query():
-                ready = False
-                continue
-            frontier, digest = self._layered_extend_ack_digest(
-                kind,
-                digest=digest,
-                frontier=frontier,
-                ack_ids=ack_ids,
-            )
-        if observed < self._layered_observed[kind]:
-            self._layered_fatal(
-                kind,
-                f"local observed frontier regressed to {observed}",
-            )
-        if frontier < self._layered_ready[kind]:
-            self._layered_fatal(
-                kind,
-                f"local ready frontier regressed to {frontier}",
-            )
-        self._layered_observed[kind] = observed
-        self._layered_ready[kind] = frontier
-
-    def _prepare_layered_frontier(
-        self, kind: CompletionKind, target: int
-    ) -> None:
-        if target <= self._layered_prepared[kind]:
-            return
-        if target > self._layered_ready[kind]:
-            self._layered_fatal(
-                kind,
-                f"prepare target {target} exceeds local ready "
-                f"{self._layered_ready[kind]}",
-            )
-
-        frontier = self._layered_committed[kind]
-        digest = self._layered_committed_digest[kind]
-        for _, finish_event, ack_ids in self._layered_queue(kind):
-            ack_end = frontier + len(ack_ids)
-            if ack_end > target:
-                break
-            if not finish_event.query():
-                self._layered_fatal(
-                    kind,
-                    f"prepare target {target} includes an unfinished ACK",
-                )
-            frontier, digest = self._layered_extend_ack_digest(
-                kind,
-                digest=digest,
-                frontier=frontier,
-                ack_ids=ack_ids,
-            )
-
-        # ACK merging may differ across stages.  Prepare only at a local ACK
-        # boundary; the coordinator commits after every rank reaches the same
-        # absolute operation frontier and digest.
-        if frontier > self._layered_prepared[kind]:
-            self._layered_prepared[kind] = frontier
-            self._layered_prepared_digest[kind] = digest
-
-    def _consume_layered_frontier(
-        self, kind: CompletionKind, target: int
-    ) -> None:
-        if target <= self._layered_committed[kind]:
-            return
-        if target > self._layered_prepared[kind]:
-            self._layered_fatal(
-                kind,
-                f"commit target {target} exceeds local prepared "
-                f"{self._layered_prepared[kind]}",
-            )
-
-        queue = self._layered_queue(kind)
-        frontier = self._layered_committed[kind]
-        digest = self._layered_committed_digest[kind]
-        while frontier < target:
-            if not queue:
-                self._layered_fatal(
-                    kind,
-                    f"queue exhausted before commit target {target}",
-                )
-            _, finish_event, ack_ids = queue[0]
-            if frontier + len(ack_ids) > target:
-                self._layered_fatal(
-                    kind,
-                    f"commit target {target} splits a local ACK ending at "
-                    f"{frontier + len(ack_ids)}",
-                )
-            if not finish_event.query():
-                self._layered_fatal(
-                    kind,
-                    f"commit target {target} reached an unfinished ACK",
-                )
-            queue.pop(0)
-            frontier, digest = self._layered_extend_ack_digest(
-                kind,
-                digest=digest,
-                frontier=frontier,
-                ack_ids=ack_ids,
-            )
-            ongoing = self._layered_ongoing(kind)
-            for ack_id in ack_ids:
-                entry = ongoing.pop(ack_id, None)
-                if entry is None:
-                    self._layered_fatal(
-                        kind,
-                        f"ack_id={ack_id} disappeared while committing",
-                    )
-                if kind == CompletionKind.WRITE:
-                    node, lock_params = entry
-                    self.dec_lock_ref(node, lock_params)
-                    if self.enable_storage:
-                        self.write_backup_storage(node)
-                else:
-                    node, lock_params, host_lock_params = entry
-                    self.dec_lock_ref(node, lock_params)
-                    self.dec_host_lock_ref(node, host_lock_params)
-
-        self._layered_committed[kind] = frontier
-        self._layered_committed_digest[kind] = digest
-
-    def _publish_layered_state(self, kind: CompletionKind) -> None:
-        coordinator = self._pp_completion_coordinator
-        if coordinator is None:
-            self._layered_fatal(kind, "completion coordinator is not initialized")
-        coordinator.publish_local(
-            kind,
-            observed=self._layered_observed[kind],
-            ready=self._layered_ready[kind],
-            prepared=self._layered_prepared[kind],
-            committed=self._layered_committed[kind],
-            prepared_digest=self._layered_prepared_digest[kind],
-        )
-
-    def _check_layered_completions(
-        self, kinds: tuple[CompletionKind, ...]
-    ) -> None:
-        coordinator = self._pp_completion_coordinator
-        if coordinator is None:
-            raise RuntimeError("layered_flags completion coordinator is not initialized")
-
-        # This is the entire scheduler-side protocol.  It contains no
-        # distributed collective, P2P send/recv, Work.wait, or CUDA event
-        # synchronize.  CUDA completion is observed only through query().
-        coordinator.targets()
-        for kind in kinds:
-            self._poll_layered_ready(kind)
-            self._publish_layered_state(kind)
-
-        targets = coordinator.targets()
-        prepare_targets = {
-            CompletionKind.WRITE: targets.write_prepare,
-            CompletionKind.LOAD: targets.load_prepare,
-        }
-        for kind in kinds:
-            self._prepare_layered_frontier(kind, prepare_targets[kind])
-            self._publish_layered_state(kind)
-
-        targets = coordinator.targets()
-        commit_targets = {
-            CompletionKind.WRITE: targets.write_commit,
-            CompletionKind.LOAD: targets.load_commit,
-        }
-        for kind in kinds:
-            self._consume_layered_frontier(kind, commit_targets[kind])
-            self._publish_layered_state(kind)
-
-    def _quiesce_layered_completions(self) -> None:
-        coordinator = self._pp_completion_coordinator
-        if coordinator is None:
-            return
-        deadline = time.monotonic() + envs.SGLANG_HICACHE_PP_STALL_TIMEOUT_S.get()
-        while True:
-            self._check_layered_completions(
-                (CompletionKind.WRITE, CompletionKind.LOAD)
-            )
-            local_done = all(
-                self._layered_ready[kind]
-                == self._layered_observed[kind]
-                == self._layered_prepared[kind]
-                == self._layered_committed[kind]
-                for kind in CompletionKind
-            )
-            queues_empty = (
-                not self.cache_controller.ack_write_queue
-                and not self.cache_controller.ack_load_queue
-                and not self.ongoing_write_through
-                and not self.ongoing_load_back
-            )
-            if local_done and queues_empty:
-                return
-            if time.monotonic() >= deadline:
-                coordinator.report_scheduler_fatal(
-                    "Timed out quiescing HiCache layered completion state: "
-                    f"pp_rank={self.pp_rank}, write="
-                    f"({self._layered_ready[CompletionKind.WRITE]}, "
-                    f"{self._layered_prepared[CompletionKind.WRITE]}, "
-                    f"{self._layered_committed[CompletionKind.WRITE]}), load="
-                    f"({self._layered_ready[CompletionKind.LOAD]}, "
-                    f"{self._layered_prepared[CompletionKind.LOAD]}, "
-                    f"{self._layered_committed[CompletionKind.LOAD]})"
-                )
-                raise RuntimeError(
-                    "Timed out quiescing HiCache layered completion state"
-                )
-            time.sleep(
-                envs.SGLANG_HICACHE_PP_PROGRESS_INTERVAL_MS.get() / 1000.0
-            )
-
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
@@ -2693,8 +2229,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if getattr(self, "hicache_pp_sync_mode", "legacy") == "layered_flags":
-            self._check_layered_completions((CompletionKind.WRITE,))
+        layered_completion = getattr(self, "_layered_pp_completion", None)
+        if layered_completion is not None:
+            layered_completion.check_write()
             return
 
         # Every rank must enter the all_reduce below; ongoing_write_through can
@@ -2726,8 +2263,9 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
-        if getattr(self, "hicache_pp_sync_mode", "legacy") == "layered_flags":
-            self._check_layered_completions((CompletionKind.LOAD,))
+        layered_completion = getattr(self, "_layered_pp_completion", None)
+        if layered_completion is not None:
+            layered_completion.check_load()
             return
         finish_count = 0
         if self.pp_rank == 0:
@@ -2806,10 +2344,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        if getattr(self, "hicache_pp_sync_mode", "legacy") == "layered_flags":
-            self._check_layered_completions(
-                (CompletionKind.WRITE, CompletionKind.LOAD)
-            )
+        layered_completion = getattr(self, "_layered_pp_completion", None)
+        if layered_completion is not None:
+            layered_completion.check_all()
         else:
             self._drain_async_work()
             self.writing_check()
