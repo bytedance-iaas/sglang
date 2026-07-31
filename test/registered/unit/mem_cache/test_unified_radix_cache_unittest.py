@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
+    _OngoingPrefetch,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -4129,6 +4130,172 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
             c, root, window_size=0, should_include=lambda _n: True
         )
         self.assertEqual(self._lru_order(lru), before)
+
+
+class TestUnifiedRadixPrefetchUnbackedParent(CustomTestCase):
+    """L3 refill must preserve the write-through parent-backup invariant."""
+
+    page_size = 16
+    cfg = CacheConfig(
+        page_size=page_size,
+        components=(ComponentType.FULL,),
+        kv_size=4096,
+        max_context_len=4096,
+    )
+
+    def _init_hicache(self, cache, *, write_policy="write_through"):
+        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+
+        orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
+
+        def get_mha_host_pool_cls_wrapper(device_pool):
+            host_pool_cls = orig_get_mha_host_pool_cls(device_pool)
+
+            def kv_host_pool_wrapper(*args, **kwargs):
+                kwargs["pin_memory"] = False
+                return host_pool_cls(*args, **kwargs)
+
+            return kv_host_pool_wrapper
+
+        patcher = mock.patch.object(
+            assembler,
+            "get_mha_host_pool_cls",
+            side_effect=get_mha_host_pool_cls_wrapper,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            page_size=self.page_size,
+            hicache_io_backend="direct",
+            hicache_write_policy=write_policy,
+        )
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.page_size)
+        set_global_server_args_for_scheduler(server_args)
+        cache.init_hicache(server_args, cache.cache_init_params)
+        cache.write_through_threshold = 1 << 30
+        cache.load_back_threshold = 0
+
+    def _insert_device_parent(self, cache, allocator):
+        tokens = list(range(1, 1 + 3 * self.page_size))
+        key = RadixKey(array("q", tokens)).page_aligned(self.page_size)
+        value = allocator.alloc(len(key))
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=key, value=value.to(dtype=torch.int64)))
+        parent = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        self.assertFalse(parent.backuped)
+        return parent
+
+    def _host_refill(self, cache, parent):
+        tokens = list(range(1000, 1000 + 2 * self.page_size))
+        key = RadixKey(array("q", tokens)).page_aligned(self.page_size)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(len(key))
+        self.assertIsNotNone(host_indices)
+        hashes = [f"h{i}" for i in range(len(key) // self.page_size)]
+        result = cache._insert_helper_host(
+            parent,
+            key,
+            host_indices.to(dtype=torch.int64),
+            hashes,
+        )
+        return result, host_indices
+
+    def test_refill_under_unbacked_parent_is_dropped(self):
+        for write_policy in ("write_through", "write_through_selective"):
+            with self.subTest(write_policy=write_policy):
+                cache, allocator, _ = build_fixture(self.cfg)
+                self._init_hicache(cache, write_policy=write_policy)
+                parent = self._insert_device_parent(cache, allocator)
+
+                result, host_indices = self._host_refill(cache, parent)
+
+                self.assertTrue(result.host_insert_dropped)
+                self.assertIsNone(result.inserted_host_node)
+                self.assertEqual(len(parent.children), 0)
+                cache.cache_controller.mem_pool_host.free(host_indices)
+                cache.sanity_check()
+
+    def test_refill_under_unbacked_parent_is_kept_in_write_back(self):
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        parent = self._insert_device_parent(cache, allocator)
+
+        result, _ = self._host_refill(cache, parent)
+
+        self.assertFalse(result.host_insert_dropped)
+        self.assertIsNotNone(result.inserted_host_node)
+        self.assertEqual(len(parent.children), 1)
+        cache.sanity_check()
+
+    def test_dropped_prefetch_releases_all_host_resources(self):
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        parent = self._insert_device_parent(cache, allocator)
+
+        tokens = list(range(1000, 1000 + 2 * self.page_size))
+        prefetch_key = RadixKey(array("q", tokens)).page_aligned(self.page_size)
+        completed_tokens = len(prefetch_key)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+
+        sidecar_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(self.page_size, dtype=torch.int64),
+        )
+        sidecar_component = mock.Mock()
+        cache.components[ComponentType.SWA] = sidecar_component
+        comp_xfers = {ComponentType.SWA: [sidecar_transfer]}
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        anchor_lock_params = cache.inc_host_lock_ref(parent).to_dec_params()
+        req_id = "drop-all-resources"
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            parent,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            comp_xfers,
+        )
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        hashes = [f"h{i}" for i in range(completed_tokens // self.page_size)]
+
+        with (
+            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            mock.patch.object(
+                cache,
+                "_sync_and_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            mock.patch.object(
+                cache.cache_controller, "append_host_mem_release"
+            ) as release,
+        ):
+            self.assertTrue(cache.check_prefetch_progress(req_id))
+
+        sidecar_component.commit_hicache_transfer.assert_not_called()
+        self.assertEqual(cache.pop_prefetch_loaded_tokens(req_id), 0)
+        self.assertEqual(len(parent.children), 0)
+        release.assert_called_once()
+        self.assertTrue(
+            torch.equal(
+                release.call_args.kwargs["host_indices"],
+                host_indices[:completed_tokens],
+            )
+        )
+        self.assertEqual(
+            release.call_args.kwargs["extra_pools"], [sidecar_transfer]
+        )
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+        self.assertNotIn(req_id, cache.ongoing_prefetch)
+        cache.sanity_check()
 
 
 class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
