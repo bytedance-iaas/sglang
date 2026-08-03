@@ -404,13 +404,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if mode == "legacy":
             return
 
-        from sglang.srt.distributed.parallel_state import get_world_group
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
         )
 
-        world_group = get_world_group()
-        expected_world_size = server_args.tp_size * server_args.pp_size
         checks = (
             (
                 isinstance(
@@ -428,10 +425,6 @@ class UnifiedRadixCache(BasePrefixCache):
             (not server_args.enable_eic_cache, "EIC enabled"),
             (not server_args.enable_dp_attention, "DP attention enabled"),
             (server_args.dp_size == 1, f"DP size {server_args.dp_size}"),
-            (
-                world_group.world_size == expected_world_size,
-                f"world size {world_group.world_size} != TP×PP {expected_world_size}",
-            ),
         )
         unsupported_reasons = [reason for supported, reason in checks if not supported]
 
@@ -442,19 +435,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 + "; ".join(unsupported_reasons)
             )
 
-        # Use a dedicated Gloo group. The world CPU group is also used by PP
-        # scheduler traffic, so inserting a new collective there could violate
-        # its point-to-point ordering.
-        self._hicache_pp_sync_group = torch.distributed.new_group(
-            ranks=world_group.ranks,
-            backend="gloo",
-        )
         self._hicache_pp_sync_counts = torch.zeros(
             2, dtype=torch.int32, device="cpu"
         )
         logger.info(
-            "Using batched HiCache PP completion synchronization across %d ranks",
-            world_group.world_size,
+            "Using batched HiCache completion synchronization across %d PP stages",
+            self.pp_size,
         )
 
     def _uses_batched_hicache_pp_sync(self) -> bool:
@@ -470,7 +456,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return finish_count
 
     def _sync_hicache_completion_counts(self) -> tuple[int, int]:
-        """Synchronize ready write/load ACK prefixes with one CPU collective."""
+        """Reduce write/load ACK prefixes once, then propagate along PP."""
         cc = self.cache_controller
         if cc is None:
             raise RuntimeError(
@@ -478,13 +464,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         counts = self._hicache_pp_sync_counts
-        counts[0] = self._count_ready_hicache_acks(cc.ack_write_queue)
-        counts[1] = self._count_ready_hicache_acks(cc.ack_load_queue)
-        torch.distributed.all_reduce(
-            counts,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self._hicache_pp_sync_group,
-        )
+        counts.zero_()
+        if self.pp_rank == 0:
+            counts[0] = self._count_ready_hicache_acks(cc.ack_write_queue)
+            counts[1] = self._count_ready_hicache_acks(cc.ack_load_queue)
+        self._all_reduce(counts, torch.distributed.ReduceOp.MIN)
         return int(counts[0].item()), int(counts[1].item())
 
     def reset(self) -> None:
@@ -2355,7 +2339,7 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_count: int,
         *,
         kind: str,
-    ) -> list[list[int]]:
+    ) -> list[tuple[Any, Any, list[int]]]:
         if len(queue) < finish_count:
             raise RuntimeError(
                 f"HiCache {kind} ACK queue diverged: pp_rank={self.pp_rank}, "
@@ -2363,20 +2347,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         ready_acks = queue[:finish_count]
-        for _, finish_event, ack_list in ready_acks:
-            if not finish_event.query():
-                raise RuntimeError(
-                    f"HiCache {kind} ACK readiness diverged: "
-                    f"pp_rank={self.pp_rank}, ack_ids={ack_list}"
-                )
-
+        for _, _, ack_list in ready_acks:
             missing_ids = [ack_id for ack_id in ack_list if ack_id not in ongoing]
             if missing_ids:
                 raise RuntimeError(
                     f"HiCache {kind} ACK IDs diverged: pp_rank={self.pp_rank}, "
                     f"missing_ids={missing_ids}, ongoing={len(ongoing)}"
                 )
-        return [ack_list for _, _, ack_list in ready_acks]
+        return ready_acks
 
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
@@ -2534,6 +2512,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self._uses_batched_hicache_pp_sync():
+            self._drain_async_work()
             write_count, load_count = self._sync_hicache_completion_counts()
             cc = self.cache_controller
             assert cc is not None
@@ -2549,13 +2528,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 load_count,
                 kind="load",
             )
+
+            # PP0 decides the common ACK prefix. A downstream stage may still
+            # be finishing its local transfer, so retain legacy's local event
+            # wait before releasing any device or host locks.
+            for _, finish_event, _ in write_acks:
+                finish_event.synchronize()
+            for _, finish_event, _ in load_acks:
+                finish_event.synchronize()
+
             del cc.ack_write_queue[:write_count]
             del cc.ack_load_queue[:load_count]
-            for ack_list in write_acks:
+            for _, _, ack_list in write_acks:
                 for ack_id in ack_list:
                     node, params = self.ongoing_write_through.pop(ack_id)
                     self.dec_lock_ref(node, params)
-            for ack_list in load_acks:
+            for _, _, ack_list in load_acks:
                 for ack_id in ack_list:
                     node, lock_params, host_lock_params = (
                         self.ongoing_load_back.pop(ack_id)
