@@ -611,6 +611,7 @@ class Envs:
 
     # Unified radix cache
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+    SGLANG_HICACHE_PP_SYNC_MODE = EnvStr("legacy")
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
