@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 import logging
 import os
 import random
-import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -897,7 +896,12 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
+        if self.enable_eic_cache:
+            # Load-back already folded into prefix_indices by the admission gate,
+            # so extend_input_len is exactly the recompute; do not re-subtract.
+            real_input_tokens = req.extend_input_len
+        else:
+            real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -937,47 +941,16 @@ class PrefillAdder:
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             eic_prefix_len = 0
-            if req.needs_host_load_back():
+            if self.enable_eic_cache:
+                # Load-back already resolved by the async admission gate.
+                eic_prefix_len = req.eic_loaded_len
+            elif req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
-                )
-                logger.debug(
-                    f"req {req.rid} init load back, last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
-                )
-                if self.enable_eic_cache:
-                    loading_check_start_ts = time.perf_counter()
-                    while not self.tree_cache.loading_complete(req.last_node):
-                        time.sleep(0.001)
-                    load_sucess = req.last_node.value is not None
-                    complete_token_num = len(new_indices)
-                    if not load_sucess:
-                        last_gpu_node = req.last_node
-                        while last_gpu_node.evicted:
-                            complete_token_num -= len(last_gpu_node.key)
-                            last_gpu_node = last_gpu_node.parent
-                        assert complete_token_num >= 0
-                        req.last_node = last_gpu_node
-                        logger.error(
-                            f"req {req.rid} after load back failed, last node:{last_gpu_node.id}, complete_token_num:{complete_token_num}"
-                        )
-                        if complete_token_num > 0:
-                            new_indices = new_indices[:complete_token_num]
-                        else:
-                            new_indices = torch.empty(
-                                (0,),
-                                dtype=torch.int64,
-                                device=req.prefix_indices.device,
-                            )
-                    loading_check_end_ts = time.perf_counter()
-                    logger.debug(
-                        f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
-                    )
-                logger.debug(
-                    f"after eic sync, req {req.rid} last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))

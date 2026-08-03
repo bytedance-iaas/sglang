@@ -1967,7 +1967,9 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             for page_id in range(len(page_hashes)):
                 start = page_id * self.page_chunk_count
                 end = start + self.page_chunk_count
-                page_mask.append(all(chunk_mask[start:end]))
+                chunk = chunk_mask[start:end]
+                # all([]) is True: a truncated reply would read as a full hit.
+                page_mask.append(len(chunk) == self.page_chunk_count and all(chunk))
             success_mask.extend(page_mask)
             if not all(page_mask):
                 break
