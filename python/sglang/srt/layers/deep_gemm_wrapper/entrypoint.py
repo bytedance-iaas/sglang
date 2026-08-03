@@ -87,7 +87,9 @@ def grouped_gemm_nt_f8fp4bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     gran_k_a: int = 128,
-    gran_k_b: int = 32,
+    gran_k_b: int = 128,
+    block_m_override: Optional[int] = None,
+    block_n_override: Optional[int] = None,
     masked_m_max_hint: Optional[int] = None,
     active_groups_hint: Optional[int] = None,
 ):
@@ -127,8 +129,87 @@ def grouped_gemm_nt_f8fp4bf16_masked(
             gran_k=gran_k_a,
             gran_k_a=gran_k_a,
             gran_k_b=gran_k_b,
+            block_m_override=block_m_override,
+            block_n_override=block_n_override,
             masked_m_max_hint=masked_m_max_hint,
             active_groups_hint=active_groups_hint,
+        )
+
+
+def _resolve_deepgemm_fp8fp4_contig_kernel():
+    for kernel_name in (
+        "m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma",
+        "m_grouped_fp8_fp4_gemm_nt_contiguous",
+        "m_grouped_fp8_fp4_gemm_nt_contig_sm90_fused_wgmma",
+        "m_grouped_fp8_fp4_gemm_nt_contig",
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contiguous",
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contig",
+    ):
+        kernel = getattr(deep_gemm, kernel_name, None)
+        if kernel is not None:
+            return kernel, ("sm90_fused" if "sm90" in kernel_name else "generic")
+    available = [
+        name
+        for name in dir(deep_gemm)
+        if "fp4" in name and ("contig" in name or "contiguous" in name)
+    ]
+    raise RuntimeError(
+        "DeepGEMM does not expose an SM90 FP8xFP4 contiguous grouped GEMM. "
+        "Expected one of: "
+        "m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma, "
+        "m_grouped_fp8_fp4_gemm_nt_contiguous, "
+        "m_grouped_fp8_fp4_gemm_nt_contig_sm90_fused_wgmma, "
+        "m_grouped_fp8_fp4_gemm_nt_contig, "
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contiguous, "
+        "m_grouped_gemm_fp8_fp4_bf16_nt_contig. "
+        f"Available DeepGEMM fp4 contig symbols: {available}"
+    )
+
+
+def grouped_gemm_nt_f8fp4bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    gran_k_a: int = 128,
+    gran_k_b: int = 128,
+    use_psum_layout: bool = False,
+    expected_m_for_psum_layout: Optional[int] = None,
+):
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG
+
+    if m == 0:
+        return
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    kernel, kernel_kind = _resolve_deepgemm_fp8fp4_contig_kernel()
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        if kernel_kind == "sm90_fused":
+            assert gran_k_a == gran_k_b
+            return kernel(
+                lhs,
+                rhs,
+                out,
+                m_indices,
+                gran_k=gran_k_a,
+                compiled_dims="nk",
+                use_psum_layout=use_psum_layout,
+                expected_m_for_psum_layout=expected_m_for_psum_layout,
+            )
+        return kernel(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            recipe_a=(1, gran_k_a),
+            recipe_b=(1, gran_k_b),
+            disable_ue8m0_cast=True,
+            use_psum_layout=use_psum_layout,
+            expected_m_for_psum_layout=expected_m_for_psum_layout,
         )
 
 

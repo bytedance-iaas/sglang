@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import einops
 import torch
 
+
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -66,17 +67,6 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
-def _fp4_e8m0_scale_supported(
-    _expected_m: int,
-    _num_groups: int,
-    _m: int,
-    _n: int,
-    _k: int,
-    _masked_m_max_hint: Optional[int] = None,
-) -> bool:
-    return deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
-
-
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -102,6 +92,37 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
+def _get_fp4_group128_masked_scale(
+    masked_scale: Optional[torch.Tensor],
+    *,
+    scale_name: str,
+    n: int,
+    k: int,
+) -> torch.Tensor:
+    if masked_scale is None:
+        raise RuntimeError(
+            f"{scale_name} missing BF16 MN-major FP4 masked scale cache; "
+            "DeepGEMM FP4 masked path must use group128 scale layout."
+        )
+    expected_k_groups = ceil_div(k, 128)
+    expected_stride_1 = ceil_div(n, 8) * 8
+    if (
+        masked_scale.dtype != torch.bfloat16
+        or masked_scale.dim() != 3
+        or masked_scale.shape[1] != n
+        or masked_scale.shape[2] != expected_k_groups
+        or masked_scale.stride(1) != 1
+        or masked_scale.stride(2) != expected_stride_1
+    ):
+        raise RuntimeError(
+            f"{scale_name} must be BF16 MN-major/TMA-aligned group128 scale, "
+            f"got shape={tuple(masked_scale.shape)}, stride={tuple(masked_scale.stride())}, "
+            f"dtype={masked_scale.dtype}, expected n={n}, k_groups={expected_k_groups}, "
+            f"stride[1]=1, stride[2]={expected_stride_1}"
+        )
+    return masked_scale
+
+
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -112,7 +133,11 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m_max_hint: Optional[int] = None
     masked_m_sum_hint: Optional[int] = None
     active_expert_count_hint: Optional[int] = None
+    fp4_block_m_override: Optional[int] = None
+    fp4_block_n_override: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    use_psum_layout: bool = False
+    expected_m_for_psum_layout: Optional[int] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -135,10 +160,10 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
-    w13_scale_e8m0: Optional[torch.Tensor] = None
-    w2_scale_e8m0: Optional[torch.Tensor] = None
+    w13_scale_fp4_masked: Optional[torch.Tensor] = None
+    w2_scale_fp4_masked: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
-    # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
+    # DSV4 mxfp4 layout flag; selects FP8xFP4 DeepGEMM kernels downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
 
@@ -209,7 +234,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
-        hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
 
@@ -221,12 +245,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )
 
-        w13_weight_fp8 = (
-            quant_info.w13_weight,
-            quant_info.w13_scale,
-        )
-        w2_weight_fp8 = (quant_info.w2_weight, quant_info.w2_scale)
-
         gateup_output = torch.empty(
             (all_tokens, N),
             device=hidden_states_device,
@@ -235,14 +253,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_fp4_experts:
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
+                (hidden_states, hidden_states_scale),
+                (quant_info.w13_weight, quant_info.w13_scale),
+                gateup_output,
+                m_indices,
+                gran_k_a=128,
+                gran_k_b=128,
+                use_psum_layout=runner_input.use_psum_layout,
+                expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                (quant_info.w13_weight, quant_info.w13_scale),
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -322,14 +352,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_fp4_experts:
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
+                (down_input_fp8, down_input_scale),
+                (quant_info.w2_weight, quant_info.w2_scale),
+                down_output,
+                m_indices,
+                gran_k_a=128,
+                gran_k_b=128,
+                use_psum_layout=runner_input.use_psum_layout,
+                expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                (quant_info.w2_weight, quant_info.w2_scale),
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         return down_output
 
@@ -443,7 +485,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             recipe_a = (quant_info.block_shape[0], gran_k_act)
         elif quant_info.is_fp4_experts:
-            recipe_a, recipe_b = (1, 128), (1, 32)
+            recipe_a, recipe_b = (1, 128), (1, 128)
         else:
             recipe_a, recipe_b = None, None
 
@@ -470,12 +512,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         if is_fp4_experts:
-            if quant_info.w13_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
-                gemm_expected_m, num_groups, m, n, k, runner_input.masked_m_max_hint
-            ):
-                w13_scale_for_gemm = quant_info.w13_scale_e8m0
-            else:
-                w13_scale_for_gemm = w13_scale
+            w13_scale_for_gemm = _get_fp4_group128_masked_scale(
+                quant_info.w13_scale_fp4_masked,
+                scale_name="w13_scale_fp4_masked",
+                n=n,
+                k=k,
+            )
+            # print(
+            #     "[g128-debug] gemm0-input",
+            #     "lhs_act=", tuple(hidden_states.shape),
+            #     "lhs_scale=", tuple(hidden_states_scale.shape) if hidden_states_scale is not None else None,
+            #     "rhs_weight=", tuple(w13_weight.shape),
+            #     "rhs_scale=", tuple(w13_scale_for_gemm.shape),
+            #     "expected_rhs_scale_kgroups=", (k + 128 - 1) // 128,
+            #     flush=True,
+            # )
+
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (hidden_states, hidden_states_scale),
                 (w13_weight, w13_scale_for_gemm),
@@ -483,7 +535,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 gemm_expected_m,
                 gran_k_a=128,
-                gran_k_b=32,
+                gran_k_b=128,
+                block_m_override=runner_input.fp4_block_m_override,
+                block_n_override=runner_input.fp4_block_n_override,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
@@ -606,18 +660,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             }
 
         if is_fp4_experts:
-            down_k = down_input.shape[2]
-            if quant_info.w2_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
-                gemm_expected_m,
-                num_groups,
-                m,
-                n,
-                down_k,
-                runner_input.masked_m_max_hint,
-            ):
-                w2_scale_for_gemm = quant_info.w2_scale_e8m0
-            else:
-                w2_scale_for_gemm = w2_scale
+            w2_scale_for_gemm = _get_fp4_group128_masked_scale(
+                quant_info.w2_scale_fp4_masked,
+                scale_name="w2_scale_fp4_masked",
+                n=n,
+                k=down_input.shape[2],
+            )
+            # print(
+            #     "[g128-debug] gemm1-input",
+            #     "lhs_act=", tuple(down_input.shape),
+            #     "lhs_scale=", tuple(down_input_scale.shape) if down_input_scale is not None else None,
+            #     "rhs_weight=", tuple(w2_weight.shape),
+            #     "rhs_scale=", tuple(w2_scale_for_gemm.shape),
+            #     "expected_rhs_scale_kgroups=", (down_input.shape[2] + 128 - 1) // 128,
+            #     flush=True,
+            # )
+
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (down_input, down_input_scale),
                 (w2_weight, w2_scale_for_gemm),
@@ -625,7 +683,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 gemm_expected_m,
                 gran_k_a=128,
-                gran_k_b=32,
+                gran_k_b=128,
+                block_m_override=runner_input.fp4_block_m_override,
+                block_n_override=runner_input.fp4_block_n_override,
                 masked_m_max_hint=runner_input.masked_m_max_hint,
                 active_groups_hint=runner_input.active_expert_count_hint,
             )
@@ -841,6 +901,13 @@ def pre_permute_deepep_ll_to_deep_gemm(
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
+    # DeepEP-LL uses floor(avg) + 1; FP4 layout selection needs the exact ceil.
+    if quant_info.is_fp4_experts:
+        assert runner_config.num_local_experts is not None
+        expected_m = max(
+            1,
+            ceil_div(topk_ids.numel(), runner_config.num_local_experts),
+        )
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -946,6 +1013,14 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device="cpu",
         ).cuda(non_blocking=True)
     expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+    use_psum_layout = (
+        quant_info.is_fp4_experts
+        and all_tokens > 0
+        and all(count % 128 == 0 for count in num_recv_tokens_per_expert)
+    )
+    expected_m_for_psum_layout = (
+        max(num_recv_tokens_per_expert) if use_psum_layout else None
+    )
 
     ep_scatter(
         hidden_states,
@@ -963,6 +1038,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
 
+    if use_psum_layout:
+        m_indices = torch.cumsum(
+            num_recv_tokens_per_expert_gpu, dim=0, dtype=torch.int32
+        ).contiguous()
+
     running_state["output_index"] = output_index
 
     return DeepGemmRunnerInput(
@@ -970,6 +1050,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states_scale=input_tensor_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
+        use_psum_layout=use_psum_layout,
+        expected_m_for_psum_layout=expected_m_for_psum_layout,
     )
 
 

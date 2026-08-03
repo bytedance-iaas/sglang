@@ -229,12 +229,14 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        fp4_group_size: int = 32,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        self.fp4_group_size = fp4_group_size
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -272,6 +274,9 @@ class Fp8Config(QuantizationConfig):
                 raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
         self.weight_block_size = weight_block_size
 
+        if self.fp4_group_size <= 0:
+            raise ValueError(f"fp4_group_size must be positive, got {self.fp4_group_size}")
+
     def get_name(self) -> str:
         return "mxfp8" if self.use_mxfp8 else "fp8"
 
@@ -300,7 +305,9 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        activation_scheme = cls.get_from_keys_or(
+            config, ["activation_scheme"], "dynamic"
+        )
         packed_modules_mapping = (
             cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
         )
@@ -315,6 +322,10 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(base)
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
+
+        fp4_group_size = cls.get_from_keys_or(
+            config, ["fp4_group_size", "expert_group_size", "group_size"], 32
+        )
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
@@ -324,6 +335,7 @@ class Fp8Config(QuantizationConfig):
                     weight_block_size,
                 )
             weight_block_size = [1, 32]
+
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
@@ -331,6 +343,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            fp4_group_size=fp4_group_size,
         )
 
     def get_quant_method(
@@ -1187,7 +1200,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_SCALES
         if self.is_fp4_expert:
-            fp4_block_k = 32
+            fp4_block_k = self.quant_config.fp4_group_size
+            if hidden_size % fp4_block_k != 0:
+                raise ValueError(
+                    f"hidden_size={hidden_size} must be divisible by "
+                    f"fp4_group_size={fp4_block_k}"
+                )
+            if intermediate_size_per_partition % fp4_block_k != 0:
+                raise ValueError(
+                    f"intermediate_size_per_partition="
+                    f"{intermediate_size_per_partition} must be divisible by "
+                    f"fp4_group_size={fp4_block_k}"
+                )
             if fp4_scale_dtype is None:
                 fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
             w13_weight_scale = torch.nn.Parameter(
@@ -1337,7 +1361,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.hidden_pad = 0
             if padded_inter != inter_per_part:
                 pad_amount = padded_inter - inter_per_part
-                fp4_block_k = 32
+                fp4_block_k = self.quant_config.fp4_group_size
 
                 # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
                 old_w13 = layer.w13_weight.data
@@ -1515,8 +1539,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
-            # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
-            from sglang.srt.layers import deep_gemm_wrapper
+            # For fp8 moe run with deepgemm, non-FP4 expert scales may need UE8M0
+            # requantization; FP4 expert scales stay in checkpoint group layout.
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
             # Check if MoE will actually use DeepGEMM runner
@@ -1567,46 +1591,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         build_mega_moe_experts_weights(layer)
                     return
 
-                if (
-                    will_use_deepgemm
-                    and deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
-                ):
-                    from deep_gemm import transform_sf_into_required_layout
+                if will_use_deepgemm:
+                    fp4_group_size = self.quant_config.fp4_group_size
 
                     for scale_param, weight_param in [
                         (layer.w13_weight_scale_inv, layer.w13_weight),
                         (layer.w2_weight_scale_inv, layer.w2_weight),
                     ]:
-                        num_experts, n, _ = scale_param.data.shape
+                        num_experts, n, k_groups_loaded = scale_param.data.shape
                         k = weight_param.shape[2] * 2
-                        tma_aligned_n_e8m0 = ((n + 15) // 16) * 16
-                        scale_data = transform_sf_into_required_layout(
-                            scale_param.data,
-                            mn=n,
-                            k=k,
-                            recipe=(1, 32),
-                            num_groups=num_experts,
-                            disable_ue8m0_cast=False,
-                        )
-                        e8m0_scale_data = torch.empty_strided(
-                            scale_data.shape,
-                            (
-                                tma_aligned_n_e8m0 * scale_data.shape[2],
-                                1,
-                                tma_aligned_n_e8m0,
-                            ),
-                            device=scale_data.device,
-                            dtype=torch.uint8,
-                        )
-                        e8m0_scale_data.copy_(
-                            (torch.floor(torch.log2(scale_data.float())) + 127).to(
-                                torch.uint8
+
+                        expected_loaded_k_groups = k // fp4_group_size
+                        if k_groups_loaded != expected_loaded_k_groups:
+                            raise ValueError(
+                                f"Loaded FP4 scale shape mismatch: got last dim={k_groups_loaded}, "
+                                f"expected {expected_loaded_k_groups} for k={k}, "
+                                f"fp4_group_size={fp4_group_size}"
                             )
+
+                        # DeepGEMM's gran_k_b=128 masked path has a BF16 SFB
+                        # fast path when scale B is MN-major and TMA aligned.
+                        # Keep the canonical checkpoint scale unchanged for
+                        # contig, and cache an optimized masked-only view.
+                        aligned_n = ((n + 7) // 8) * 8
+                        masked_scale = torch.empty_strided(
+                            (num_experts, n, k_groups_loaded),
+                            (aligned_n * k_groups_loaded, 1, aligned_n),
+                            dtype=torch.bfloat16,
+                            device=scale_param.data.device,
                         )
-                        scale_param.scale_e8m0_data = e8m0_scale_data
-                        scale_param.data = scale_data
-                    layer.w13_weight_scale_inv.format_ue8m0 = True
-                    layer.w2_weight_scale_inv.format_ue8m0 = True
+                        masked_scale.copy_(scale_param.data.to(torch.bfloat16))
+                        scale_param.fp4_masked_scale_data = masked_scale
 
             if (
                 not self.is_fp4_expert
@@ -2349,8 +2364,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                w13_scale_e8m0=getattr(w13_scale, "scale_e8m0_data", None),
-                w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
+                w13_scale_fp4_masked=getattr(
+                    w13_scale, "fp4_masked_scale_data", None
+                ),
+                w2_scale_fp4_masked=getattr(w2_scale, "fp4_masked_scale_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
