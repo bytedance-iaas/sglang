@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -39,12 +40,26 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_non_diffusers_pipeline_name,
+    is_known_non_diffusers_multimodal_model,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
+
+try:
+    from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+        MiniMaxH3Pipeline,
+    )
+except ImportError:
+    # The bytedance fork has not adopted the upstream MiniMax-H3 pipeline
+    # yet. Keep the detection-logic tests runnable by skipping the
+    # pipeline-specific ones.
+    MiniMaxH3Pipeline = None
 
 
 @contextmanager
@@ -685,6 +700,45 @@ class TestWarmupImageIsModelValid(unittest.TestCase):
         width, height = struct.unpack(">II", raw[16:24])
         self.assertGreaterEqual(width, 64)
         self.assertGreaterEqual(height, 64)
+
+
+class TestDiffusionModelDetection(unittest.TestCase):
+    def test_registered_local_model_path_is_detected_as_diffusion(self):
+        with tempfile.TemporaryDirectory() as root:
+            model_path = os.path.join(root, "Z-Image-Turbo")
+            os.mkdir(model_path)
+            self.assertTrue(get_is_diffusion_model(model_path))
+
+
+@unittest.skipIf(
+    MiniMaxH3Pipeline is None, "MiniMax-H3 pipeline not available on this base"
+)
+class TestMiniMaxH3Routing(unittest.TestCase):
+
+    def test_semantic_variants_map_to_checkpoint_partitions(self):
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
+        )
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("ref2va"), "Ref2VA"
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported MiniMax H3 model variant"):
+            MiniMaxH3Pipeline.model_subfolder_for_variant("v2v")
+
+    def test_modelscope_id_resolves_to_the_huggingface_config(self):
+        expected = _get_config_info("MiniMaxAI/MiniMax-H3")
+        actual = _get_config_info("MiniMax/MiniMax-H3")
+        self.assertIsNotNone(expected)
+        self.assertIs(actual, expected)
+        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("/models/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
 
 
 class TestOffloadDefaults(unittest.TestCase):
