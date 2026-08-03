@@ -35,6 +35,9 @@ def node0_print(msg):
         print(msg)
 
 
+SERVER_INFO_REQUEST_TIMEOUT = 30
+
+
 prompts = [
     "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
     "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
@@ -119,7 +122,9 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
     acc_length = results["accept_length"] or 1.0
     avg_output_token = results["total_output_tokens"] / results["completed"]
 
-    server_info = requests.get(base_url + "/server_info").json()
+    server_info = requests.get(
+        base_url + "/server_info", timeout=SERVER_INFO_REQUEST_TIMEOUT
+    ).json()
     # We use 20% percentile instead of median on purpose
     step_time = np.percentile(
         server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
@@ -229,18 +234,18 @@ def main(args, server_args):
             },
         )
 
-        if args.is_multimodal:
-            from transformers import AutoProcessor
-
-            processor = AutoProcessor.from_pretrained(
-                args.model_path, trust_remote_code=server_args.trust_remote_code
-            )
-        else:
-            processor = AutoTokenizer.from_pretrained(
-                args.model_path, trust_remote_code=server_args.trust_remote_code
-            )
-
         try:
+            if args.is_multimodal:
+                from transformers import AutoProcessor
+
+                processor = AutoProcessor.from_pretrained(
+                    args.model_path, trust_remote_code=server_args.trust_remote_code
+                )
+            else:
+                processor = AutoTokenizer.from_pretrained(
+                    args.model_path, trust_remote_code=server_args.trust_remote_code
+                )
+
             # Warmup
             send_one_batch(
                 base_url, batch_size, batch_size, processor, args.is_multimodal
