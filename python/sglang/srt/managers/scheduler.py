@@ -1382,15 +1382,23 @@ class Scheduler(
 
         if (
             self.spec_algorithm.carries_draft_hidden_states()
-            and self.draft_worker.draft_worker is not None
         ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes. Non-last PP
-            # ranks have no draft worker, so fall through to the default.
-            draft_runner = self.draft_worker.draft_worker.draft_runner
-            disagg_hidden_size, disagg_hidden_states_dtype = (
-                get_draft_recurrent_hidden_state_spec(draft_runner)
+            # worker, so a single accessor covers both shapes.
+            # Derive from the draft config, not the draft runner: the runner does
+            # not exist on ranks that do not host the draft (prefill-side PP builds
+            # it only on the last stage), and the PD metadata wire schema has to be
+            # identical on every rank.
+            from sglang.srt.configs.model_config import ModelConfig
+
+            _draft_model_config = ModelConfig.from_server_args(
+                self.server_args,
+                model_path=self.server_args.speculative_draft_model_path,
+                model_revision=self.server_args.speculative_draft_model_revision,
+                is_draft_model=True,
             )
+            disagg_hidden_size = _draft_model_config.spec_hidden_size
+            disagg_hidden_states_dtype = _draft_model_config.dtype
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
