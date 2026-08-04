@@ -262,6 +262,7 @@ class PDHiddenRowPool:
         self._free_intervals = [(0, self.size - 1)] if self.size else []
         self._free_count = self.size
         self.lock = threading.Lock()
+        self._credit_cv = threading.Condition(self.lock)
 
     def available_size(self) -> int:
         with self.lock:
@@ -272,37 +273,55 @@ class PDHiddenRowPool:
         if n <= 0:
             return []
         with self.lock:
-            if n > self._free_count:
+            return self._alloc_locked(n)
+
+    def alloc_wait(
+        self, n: int, timeout: Optional[float] = None
+    ) -> Optional[List[int]]:
+        """Wait for row credit instead of failing on transient exhaustion."""
+        n = int(n)
+        if n <= 0:
+            return []
+        with self._credit_cv:
+            if not self._credit_cv.wait_for(
+                lambda: n <= self._free_count,
+                timeout=None if timeout is None else float(timeout),
+            ):
                 return None
+            return self._alloc_locked(n)
 
-            for interval_idx, (start, end) in enumerate(self._free_intervals):
-                if end - start + 1 < n:
-                    continue
-                allocated_end = start + n - 1
-                if allocated_end == end:
-                    self._free_intervals.pop(interval_idx)
-                else:
-                    self._free_intervals[interval_idx] = (allocated_end + 1, end)
-                self._free_count -= n
-                return list(range(start, allocated_end + 1))
+    def _alloc_locked(self, n: int) -> Optional[List[int]]:
+        if n > self._free_count:
+            return None
 
-            # Preserve the previous fallback behavior when fragmentation leaves
-            # no contiguous run: consume the lowest free rows across intervals.
-            remaining = n
-            indices = []
-            updated_intervals = []
-            for start, end in self._free_intervals:
-                if remaining == 0:
-                    updated_intervals.append((start, end))
-                    continue
-                take = min(remaining, end - start + 1)
-                indices.extend(range(start, start + take))
-                remaining -= take
-                if start + take <= end:
-                    updated_intervals.append((start + take, end))
-            self._free_intervals = updated_intervals
+        for interval_idx, (start, end) in enumerate(self._free_intervals):
+            if end - start + 1 < n:
+                continue
+            allocated_end = start + n - 1
+            if allocated_end == end:
+                self._free_intervals.pop(interval_idx)
+            else:
+                self._free_intervals[interval_idx] = (allocated_end + 1, end)
             self._free_count -= n
-            return indices
+            return list(range(start, allocated_end + 1))
+
+        # Preserve the previous fallback behavior when fragmentation leaves
+        # no contiguous run: consume the lowest free rows across intervals.
+        remaining = n
+        indices = []
+        updated_intervals = []
+        for start, end in self._free_intervals:
+            if remaining == 0:
+                updated_intervals.append((start, end))
+                continue
+            take = min(remaining, end - start + 1)
+            indices.extend(range(start, start + take))
+            remaining -= take
+            if start + take <= end:
+                updated_intervals.append((start + take, end))
+        self._free_intervals = updated_intervals
+        self._free_count -= n
+        return indices
 
     def free(self, indices: Optional[List[int]]) -> None:
         if not indices:
@@ -370,6 +389,7 @@ class PDHiddenRowPool:
                     merged.append(interval)
             self._free_intervals = merged
             self._free_count += len(to_free)
+            self._credit_cv.notify_all()
 
     def write(self, indices: List[int], hidden: torch.Tensor) -> None:
         if not indices:

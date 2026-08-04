@@ -3197,6 +3197,13 @@ class MooncakeKVManager(CommonKVManager):
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
 
+    def _should_fail_sender_room_on_abort(self, room: int) -> bool:
+        if int(room) not in self.request_status:
+            return False
+        return self.check_status(int(room)) != KVPoll.Success or (
+            self.pd_hidden_events.request_active(int(room))
+        )
+
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -3267,11 +3274,11 @@ class MooncakeKVManager(CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    # No need to abort the room if it has already succeeded
-                    if (
-                        room_to_be_aborted in self.request_status
-                        and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    ):
+                    # KV completion and streaming-hidden completion have
+                    # independent lifetimes. A room whose KV status is already
+                    # Success must still be aborted while hidden chunks are
+                    # active; Decode has gone away and can no longer ACK them.
+                    if self._should_fail_sender_room_on_abort(room_to_be_aborted):
                         self.update_status(room_to_be_aborted, KVPoll.Failed)
                         self._wake_pd_hidden_ack_waiters(room_to_be_aborted)
                         logger.debug(

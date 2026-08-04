@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import torch
@@ -163,6 +164,34 @@ class TestPDHiddenRowPool(unittest.TestCase):
 
         self.assertEqual(pool.available_size(), 4)
         self.assertEqual(pool.alloc(4), [0, 1, 2, 3])
+
+    def test_waiting_allocation_wakes_when_rows_are_freed(self):
+        pool = PDHiddenRowPool(2, 1, torch.float32)
+        allocated = pool.alloc(2)
+        self.assertEqual(allocated, [0, 1])
+
+        started = threading.Event()
+        result = []
+
+        def allocate_after_credit():
+            started.set()
+            result.append(pool.alloc_wait(1, timeout=1.0))
+
+        waiter = threading.Thread(target=allocate_after_credit)
+        waiter.start()
+        self.assertTrue(started.wait(timeout=1.0))
+        self.assertTrue(waiter.is_alive())
+
+        pool.free([allocated[0]])
+        waiter.join(timeout=1.0)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result, [[0]])
+
+    def test_waiting_allocation_times_out_without_credit(self):
+        pool = PDHiddenRowPool(1, 1, torch.float32)
+        self.assertEqual(pool.alloc(1), [0])
+        self.assertIsNone(pool.alloc_wait(1, timeout=0.01))
 
 
 if __name__ == "__main__":

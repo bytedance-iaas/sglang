@@ -191,6 +191,22 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
         self.assertNotIn(9, manager.req_to_pd_hidden_meta)
         self.assertNotIn(9, manager.transfer_infos)
 
+    def test_abort_still_fails_kv_success_room_while_hidden_is_active(self):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.request_status = {9: KVPoll.Success}
+        manager.pd_hidden_events = PDHiddenEventManager(manager)
+
+        self.assertFalse(manager._should_fail_sender_room_on_abort(9))
+
+        manager.pd_hidden_events.begin_request(9)
+        self.assertTrue(manager._should_fail_sender_room_on_abort(9))
+
+        manager.request_status[9] = KVPoll.Transferring
+        manager.pd_hidden_events.end_request(9)
+        self.assertTrue(manager._should_fail_sender_room_on_abort(9))
+
+        self.assertFalse(manager._should_fail_sender_room_on_abort(10))
+
     def test_chunk_wakes_only_after_every_decode_session_grants_rows(self):
         owner = MagicMock()
         events = PDHiddenEventManager(owner)

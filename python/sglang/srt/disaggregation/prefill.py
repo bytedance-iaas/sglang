@@ -1352,14 +1352,25 @@ class SchedulerDisaggregationPrefillMixin:
             if streaming_hidden:
                 write_indices = pool.alloc(rows)
                 if write_indices is None:
-                    fail_pd_hidden_transfer(
-                        req,
-                        "PD streaming hidden source chunk allocation failed: "
-                        f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
-                        f"pool_rows={pool.size}. Streaming source rows are released "
-                        "only after the matching hidden chunk ACK.",
+                    logger.info(
+                        "PD streaming hidden source pool waiting for ACK credit: "
+                        "rid=%s rows=%d free_rows=%d pool_rows=%d",
+                        req.rid,
+                        rows,
+                        pool.available_size(),
+                        pool.size,
                     )
-                    continue
+                    write_indices = pool.alloc_wait(rows, timeout=300.0)
+                    if write_indices is None:
+                        fail_pd_hidden_transfer(
+                            req,
+                            "Timed out waiting for PD streaming hidden source "
+                            f"pool credit: rid={req.rid}, rows={rows}, "
+                            f"free_rows={pool.available_size()}, "
+                            f"pool_rows={pool.size}. Source rows are released "
+                            "after the matching hidden chunk ACK or abort.",
+                        )
+                        continue
                 pd_hidden_state(req).src_indices = write_indices
             pool.write(
                 write_indices,
