@@ -236,6 +236,26 @@ class TestDecodePDHiddenDynamicAllocator(CustomTestCase):
         self.assertEqual(len(manager.grants), 1)
         self.assertEqual(manager.grants[0][1], [0, 1, 2, 3])
 
+    def test_live_room_accepts_hidden_request_after_kv_success(self):
+        decode_req = _decode_req(room=1, hidden_end=8)
+        queue, manager = self._make_queue(4, [decode_req])
+        manager.request_status[1] = KVPoll.Success
+        manager.alloc_requests.append(
+            _alloc_request(1, 4, hidden_start=4, hidden_end=8)
+        )
+
+        queue._drain_pd_hidden_alloc_requests()
+
+        self.assertEqual(len(manager.grants), 1)
+        self.assertEqual(manager.grants[0][0]["hidden_start"], 4)
+        self.assertEqual(manager.grants[0][1], [0, 1, 2, 3])
+        self.assertEqual(
+            decode_req.pd_hidden_dynamic_allocations[(0, 4, "session-1")][
+                "dst_indices"
+            ],
+            [0, 1, 2, 3],
+        )
+
     def test_oldest_completed_prefill_chunk_cannot_be_bypassed(self):
         first_req = _decode_req(room=1, hidden_end=4)
         second_req = _decode_req(room=2, hidden_end=1)

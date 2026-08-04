@@ -2376,7 +2376,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     deferred.append(request)
                 continue
-            if request_status in (None, KVPoll.Failed, KVPoll.Success):
+            # KV completion can race ahead of a later hidden allocation request.
+            # Keep servicing the room while its decode request is still queued.
+            if request_status in (None, KVPoll.Failed):
                 continue
             if not decode_req.pd_hidden_dynamic_allocation:
                 error_message = (
