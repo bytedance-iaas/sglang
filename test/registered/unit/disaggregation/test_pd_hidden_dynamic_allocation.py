@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 from collections import defaultdict, deque
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.utils import PDHiddenRowPool
 from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
     resolve_hidden_bootstrap_plan,
@@ -85,6 +87,25 @@ class _FakeKVManager:
 
 
 class TestPDHiddenAllocationEvents(CustomTestCase):
+    def test_mooncake_control_send_supports_legacy_common_manager(self):
+        socket = MagicMock()
+        manager = SimpleNamespace(
+            _socket_lock=threading.Lock(),
+            _connect=MagicMock(return_value=socket),
+        )
+
+        MooncakeKVManager._send_multipart(
+            manager,
+            "tcp://127.0.0.1:12345",
+            [b"header", b"payload"],
+        )
+
+        manager._connect.assert_called_once_with(
+            "tcp://127.0.0.1:12345", is_ipv6=False
+        )
+        socket.send_multipart.assert_called_once_with([b"header", b"payload"])
+        self.assertIn("tcp://127.0.0.1:12345", manager._socket_send_locks)
+
     def test_allocation_requests_preserve_prefill_completion_order(self):
         events = PDHiddenEventManager(MagicMock())
         first = _alloc_request(1, 4)
