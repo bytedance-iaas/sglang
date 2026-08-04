@@ -205,24 +205,6 @@ class MooncakeKVManager(CommonKVManager):
     PD_HIDDEN_ALLOC_REQUEST_HEADER = b"PD_HIDDEN_ALLOC_REQUEST"
     PD_HIDDEN_ALLOC_GRANT_HEADER = b"PD_HIDDEN_ALLOC_GRANT"
 
-    def _send_multipart(
-        self, endpoint: str, frames: List[bytes], is_ipv6: bool = False
-    ) -> None:
-        """Send control frames safely across old and new CommonKVManager bases.
-
-        Some deployed images predate ``CommonKVManager._send_multipart``.  Keep the
-        endpoint-scoped send lock here as well so this feature can be backported
-        without sharing a ZMQ socket concurrently between transfer workers.
-        """
-        with self._socket_lock:
-            send_locks = getattr(self, "_socket_send_locks", None)
-            if send_locks is None:
-                send_locks = self._socket_send_locks = {}
-            send_lock = send_locks.setdefault(endpoint, threading.Lock())
-
-        with send_lock:
-            self._connect(endpoint, is_ipv6=is_ipv6).send_multipart(frames)
-
     def __init__(
         self,
         args: KVArgs,
@@ -350,6 +332,7 @@ class MooncakeKVManager(CommonKVManager):
             kv_chunk=kv_chunk,
             prefill_rank=prefill_rank,
             expected_session_ids=expected_session_ids,
+            timeout_s=float(getattr(self, "bootstrap_timeout", 300.0)),
         )
 
     def request_pd_hidden_rows(
@@ -432,8 +415,10 @@ class MooncakeKVManager(CommonKVManager):
         kv_chunk: TransferKVChunk,
         prefill_rank: int,
         expected_count: int,
-        timeout_s: float = 300.0,
+        timeout_s: Optional[float] = None,
     ) -> bool:
+        if timeout_s is None:
+            timeout_s = float(getattr(self, "bootstrap_timeout", 300.0))
         return self.pd_hidden_events.park_chunk_for_ack(
             transfer_queue=transfer_queue,
             kv_chunk=kv_chunk,

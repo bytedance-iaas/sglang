@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import unittest
 from collections import defaultdict, deque
 from types import SimpleNamespace
@@ -103,25 +102,6 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
         sender.kv_mgr._wake_pd_hidden_ack_waiters.assert_called_once_with(9)
         self.assertEqual(sender.conclude_state, KVPoll.Failed)
 
-    def test_mooncake_control_send_supports_legacy_common_manager(self):
-        socket = MagicMock()
-        manager = SimpleNamespace(
-            _socket_lock=threading.Lock(),
-            _connect=MagicMock(return_value=socket),
-        )
-
-        MooncakeKVManager._send_multipart(
-            manager,
-            "tcp://127.0.0.1:12345",
-            [b"header", b"payload"],
-        )
-
-        manager._connect.assert_called_once_with(
-            "tcp://127.0.0.1:12345", is_ipv6=False
-        )
-        socket.send_multipart.assert_called_once_with([b"header", b"payload"])
-        self.assertIn("tcp://127.0.0.1:12345", manager._socket_send_locks)
-
     def test_allocation_requests_preserve_prefill_completion_order(self):
         events = PDHiddenEventManager(MagicMock())
         first = _alloc_request(1, 4)
@@ -221,6 +201,8 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
             expected_session_ids={"decode-a", "decode-b"},
         )
         self.assertIsNone(grants)
+        key = (9, 3, 32)
+        timer = events.alloc_waiter_timers[key]
 
         events.handle_alloc_grant(
             room=9,
@@ -239,6 +221,11 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
             dst_indices=[8, 9],
         )
         self.assertIs(transfer_queue.get(), chunk)
+        self.assertTrue(timer.finished.is_set())
+        self.assertNotIn(key, events.alloc_waiter_timers)
+        # A callback that was already racing with cancel must not discard the
+        # completed grants before the transfer worker consumes them.
+        timer.function()
         self.assertEqual(
             events.take_alloc_grants_or_park(
                 transfer_queue=transfer_queue,
@@ -248,6 +235,29 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
             ),
             {"decode-a": [4, 5], "decode-b": [8, 9]},
         )
+
+    def test_abort_cancels_hidden_allocation_wait_timer(self):
+        events = PDHiddenEventManager(MagicMock())
+        transfer_queue = FastQueue()
+        chunk = SimpleNamespace(room=9, pd_hidden_start=32)
+        events.expect_alloc_grants(room=9, prefill_rank=3, hidden_start=32)
+
+        self.assertIsNone(
+            events.take_alloc_grants_or_park(
+                transfer_queue=transfer_queue,
+                kv_chunk=chunk,
+                prefill_rank=3,
+                expected_session_ids={"decode-a"},
+            )
+        )
+        key = (9, 3, 32)
+        timer = events.alloc_waiter_timers[key]
+
+        events.wake_ack_waiters(9)
+
+        self.assertTrue(timer.finished.is_set())
+        self.assertNotIn(key, events.alloc_waiter_timers)
+        self.assertIs(transfer_queue.get(), chunk)
 
 
 class TestPDHiddenDynamicBootstrap(CustomTestCase):

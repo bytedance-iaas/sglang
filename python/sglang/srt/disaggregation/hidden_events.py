@@ -52,6 +52,9 @@ class PDHiddenEventManager:
             defaultdict(dict)
         )
         self.alloc_waiters = {}
+        self.alloc_waiter_timers: Dict[
+            Tuple[int, int, int], threading.Timer
+        ] = {}
         self.expected_alloc_grants: Set[Tuple[int, int, int]] = set()
         self.alloc_grant_lock = threading.Lock()
         self.ack_wakeup_endpoint: Optional[str] = None
@@ -63,6 +66,8 @@ class PDHiddenEventManager:
         return True
 
     def init_prefill_state(self) -> None:
+        for timer in self.alloc_waiter_timers.values():
+            timer.cancel()
         self.done_rooms.clear()
         self.active_rooms.clear()
         self.deferred_clear_rooms.clear()
@@ -73,6 +78,7 @@ class PDHiddenEventManager:
         self.active_transfers.clear()
         self.alloc_grants.clear()
         self.alloc_waiters.clear()
+        self.alloc_waiter_timers.clear()
         self.expected_alloc_grants.clear()
 
     def init_decode_state(self) -> None:
@@ -230,6 +236,11 @@ class PDHiddenEventManager:
                 for key in list(self.alloc_waiters)
                 if key[0] == room
             ]
+            alloc_waiter_timers = [
+                self.alloc_waiter_timers.pop(key)
+                for key in list(self.alloc_waiter_timers)
+                if key[0] == room
+            ]
             for key in list(self.alloc_grants):
                 if key[0] == room:
                     self.alloc_grants.pop(key, None)
@@ -240,6 +251,8 @@ class PDHiddenEventManager:
             transfer_queue.put(kv_chunk)
         for transfer_queue, kv_chunk in room_waiters:
             transfer_queue.put(kv_chunk)
+        for timer in alloc_waiter_timers:
+            timer.cancel()
         for transfer_queue, kv_chunk, _ in alloc_waiters:
             transfer_queue.put(kv_chunk)
 
@@ -282,32 +295,15 @@ class PDHiddenEventManager:
         expected = {str(session_id) for session_id in expected_session_ids}
         if not expected:
             return {}
-        created_waiter = False
-        with self.alloc_grant_lock:
-            grants = self.alloc_grants.get(key, {})
-            if expected.issubset(grants):
-                result = {
-                    session_id: [int(x) for x in grants[session_id]]
-                    for session_id in expected
-                }
-                self.alloc_grants.pop(key, None)
-                self.alloc_waiters.pop(key, None)
-                self.expected_alloc_grants.discard(key)
-                return result
-            if key not in self.alloc_waiters:
-                self.alloc_waiters[key] = (transfer_queue, kv_chunk, expected)
-                created_waiter = True
-
-        if not created_waiter:
-            return None
 
         def on_timeout() -> None:
             with self.alloc_grant_lock:
                 waiter = self.alloc_waiters.pop(key, None)
+                self.alloc_waiter_timers.pop(key, None)
+                if waiter is None:
+                    return
                 self.alloc_grants.pop(key, None)
                 self.expected_alloc_grants.discard(key)
-            if waiter is None:
-                return
             _, timed_out_chunk, _ = waiter
             timed_out_chunk.pd_hidden_alloc_timed_out = True
             self.owner.record_failure(
@@ -319,9 +315,29 @@ class PDHiddenEventManager:
             transfer_queue.put(timed_out_chunk)
             self.wake_ack_waiters(key[0])
 
-        timer = threading.Timer(float(timeout_s), on_timeout)
-        timer.daemon = True
-        timer.start()
+        with self.alloc_grant_lock:
+            grants = self.alloc_grants.get(key, {})
+            if expected.issubset(grants):
+                result = {
+                    session_id: [int(x) for x in grants[session_id]]
+                    for session_id in expected
+                }
+                self.alloc_grants.pop(key, None)
+                self.alloc_waiters.pop(key, None)
+                timer = self.alloc_waiter_timers.pop(key, None)
+                if timer is not None:
+                    timer.cancel()
+                self.expected_alloc_grants.discard(key)
+                return result
+            if key in self.alloc_waiters:
+                return None
+            self.alloc_waiters[key] = (transfer_queue, kv_chunk, expected)
+            timer = threading.Timer(float(timeout_s), on_timeout)
+            timer.daemon = True
+            self.alloc_waiter_timers[key] = timer
+            # Start while holding the lock so a grant cannot arrive between
+            # waiter registration and timer registration.
+            timer.start()
         return None
 
     def expect_alloc_grants(
@@ -358,6 +374,7 @@ class PDHiddenEventManager:
     ) -> None:
         key = (int(room), int(prefill_rank), int(hidden_start))
         waiter_to_wake = None
+        timer_to_cancel = None
         with self.alloc_grant_lock:
             if key not in self.expected_alloc_grants:
                 return
@@ -369,6 +386,9 @@ class PDHiddenEventManager:
                 _, _, expected = waiter
                 if expected.issubset(self.alloc_grants[key]):
                     waiter_to_wake = self.alloc_waiters.pop(key)
+                    timer_to_cancel = self.alloc_waiter_timers.pop(key, None)
+        if timer_to_cancel is not None:
+            timer_to_cancel.cancel()
         if waiter_to_wake is not None:
             transfer_queue, kv_chunk, _ = waiter_to_wake
             transfer_queue.put(kv_chunk)

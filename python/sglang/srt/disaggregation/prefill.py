@@ -229,6 +229,7 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self._last_pd_hidden_credit_warning_time = 0.0
+        self._last_pd_hidden_source_credit_warning_time = 0.0
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
@@ -1352,15 +1353,28 @@ class SchedulerDisaggregationPrefillMixin:
             if streaming_hidden:
                 write_indices = pool.alloc(rows)
                 if write_indices is None:
-                    logger.info(
-                        "PD streaming hidden source pool waiting for ACK credit: "
-                        "rid=%s rows=%d free_rows=%d pool_rows=%d",
-                        req.rid,
-                        rows,
-                        pool.available_size(),
-                        pool.size,
+                    bootstrap_queue = self.disagg_prefill_bootstrap_queue
+                    now = time.monotonic()
+                    if (
+                        now
+                        - bootstrap_queue._last_pd_hidden_source_credit_warning_time
+                        > 30
+                    ):
+                        logger.warning(
+                            "PD streaming hidden source pool waiting for ACK credit: "
+                            "rid=%s rows=%d free_rows=%d pool_rows=%d",
+                            req.rid,
+                            rows,
+                            pool.available_size(),
+                            pool.size,
+                        )
+                        bootstrap_queue._last_pd_hidden_source_credit_warning_time = (
+                            now
+                        )
+                    timeout_s = float(
+                        getattr(bootstrap_queue.kv_manager, "bootstrap_timeout", 300.0)
                     )
-                    write_indices = pool.alloc_wait(rows, timeout=300.0)
+                    write_indices = pool.alloc_wait(rows, timeout=timeout_s)
                     if write_indices is None:
                         fail_pd_hidden_transfer(
                             req,
