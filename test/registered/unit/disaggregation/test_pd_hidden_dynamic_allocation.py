@@ -120,11 +120,67 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
         events.requeue_alloc_requests_front([first, second])
         self.assertEqual(events.pop_alloc_requests(), [first, second, third])
 
+    def test_prefill_accepts_expected_hidden_grant_after_kv_room_clear(self):
+        events = PDHiddenEventManager(MagicMock())
+        events.expect_alloc_grants(room=9, prefill_rank=3, hidden_start=32)
+
+        events.handle_alloc_grant(
+            room=9,
+            prefill_rank=3,
+            hidden_start=32,
+            session_id="decode-a",
+            dst_indices=[4, 5],
+        )
+
+        self.assertEqual(
+            events.take_alloc_grants_or_park(
+                transfer_queue=FastQueue(),
+                kv_chunk=SimpleNamespace(room=9, pd_hidden_start=32),
+                prefill_rank=3,
+                expected_session_ids={"decode-a"},
+            ),
+            {"decode-a": [4, 5]},
+        )
+
+    def test_prefill_drops_unexpected_stale_hidden_grant(self):
+        events = PDHiddenEventManager(MagicMock())
+
+        events.handle_alloc_grant(
+            room=9,
+            prefill_rank=3,
+            hidden_start=32,
+            session_id="decode-a",
+            dst_indices=[4, 5],
+        )
+
+        self.assertEqual(dict(events.alloc_grants), {})
+
+    def test_prefill_sender_cleanup_waits_for_active_hidden_room(self):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.request_status = {9: KVPoll.Success}
+        manager.req_to_decode_prefix_len = {9: 0}
+        manager.req_to_pd_hidden_meta = {9: {"streaming_hidden": True}}
+        manager.transfer_infos = {9: {"decode-a": MagicMock()}}
+        manager.pd_hidden_events = PDHiddenEventManager(manager)
+        manager.pd_hidden_events.begin_request(9)
+
+        self.assertFalse(manager.clear_sender_room(9))
+        self.assertIn(9, manager.request_status)
+        self.assertIn(9, manager.transfer_infos)
+
+        manager.pd_hidden_events.end_request(9)
+        self.assertTrue(manager.finish_deferred_sender_clear(9))
+        self.assertNotIn(9, manager.request_status)
+        self.assertNotIn(9, manager.req_to_decode_prefix_len)
+        self.assertNotIn(9, manager.req_to_pd_hidden_meta)
+        self.assertNotIn(9, manager.transfer_infos)
+
     def test_chunk_wakes_only_after_every_decode_session_grants_rows(self):
         owner = MagicMock()
         events = PDHiddenEventManager(owner)
         transfer_queue = FastQueue()
         chunk = SimpleNamespace(room=9, pd_hidden_start=32)
+        events.expect_alloc_grants(room=9, prefill_rank=3, hidden_start=32)
 
         grants = events.take_alloc_grants_or_park(
             transfer_queue=transfer_queue,

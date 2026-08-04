@@ -28,6 +28,9 @@ class PDHiddenEventManager:
         self.owner = owner
         self.done_rooms = set()
         self.done_lock = threading.Lock()
+        self.active_rooms = set()
+        self.deferred_clear_rooms = set()
+        self.active_room_lock = threading.Lock()
         self.chunk_acks = defaultdict(int)
         self.chunk_ack_cv = threading.Condition()
         self.ack_waiters = {}
@@ -49,6 +52,7 @@ class PDHiddenEventManager:
             defaultdict(dict)
         )
         self.alloc_waiters = {}
+        self.expected_alloc_grants: Set[Tuple[int, int, int]] = set()
         self.alloc_grant_lock = threading.Lock()
         self.ack_wakeup_endpoint: Optional[str] = None
         self.ack_wakeup_receiver = None
@@ -60,6 +64,8 @@ class PDHiddenEventManager:
 
     def init_prefill_state(self) -> None:
         self.done_rooms.clear()
+        self.active_rooms.clear()
+        self.deferred_clear_rooms.clear()
         self.chunk_acks.clear()
         self.ack_waiters.clear()
         self.room_waiters.clear()
@@ -67,6 +73,7 @@ class PDHiddenEventManager:
         self.active_transfers.clear()
         self.alloc_grants.clear()
         self.alloc_waiters.clear()
+        self.expected_alloc_grants.clear()
 
     def init_decode_state(self) -> None:
         self.ready_chunks.clear()
@@ -86,6 +93,7 @@ class PDHiddenEventManager:
         bootstrap_room: int,
         state_indices: Optional[List] = None,
     ) -> None:
+        self.end_request(bootstrap_room)
         with self.done_lock:
             room = int(bootstrap_room)
             if room in self.done_rooms:
@@ -109,6 +117,35 @@ class PDHiddenEventManager:
             if room not in self.done_rooms:
                 return False
             self.done_rooms.remove(room)
+            return True
+
+    def begin_request(self, bootstrap_room: int) -> None:
+        with self.active_room_lock:
+            self.active_rooms.add(int(bootstrap_room))
+
+    def end_request(self, bootstrap_room: int) -> None:
+        with self.active_room_lock:
+            self.active_rooms.discard(int(bootstrap_room))
+
+    def request_active(self, bootstrap_room: int) -> bool:
+        with self.active_room_lock:
+            return int(bootstrap_room) in self.active_rooms
+
+    def defer_clear_if_active(self, bootstrap_room: int) -> bool:
+        """Atomically defer sender cleanup while hidden transfer is live."""
+        room = int(bootstrap_room)
+        with self.active_room_lock:
+            if room not in self.active_rooms:
+                return False
+            self.deferred_clear_rooms.add(room)
+            return True
+
+    def take_deferred_clear(self, bootstrap_room: int) -> bool:
+        room = int(bootstrap_room)
+        with self.active_room_lock:
+            if room not in self.deferred_clear_rooms:
+                return False
+            self.deferred_clear_rooms.remove(room)
             return True
 
     def park_chunk_for_ack(
@@ -174,6 +211,12 @@ class PDHiddenEventManager:
 
     def wake_ack_waiters(self, room: int) -> None:
         room = int(room)
+        self.end_request(room)
+        finish_deferred_clear = getattr(
+            self.owner, "finish_deferred_sender_clear", None
+        )
+        if finish_deferred_clear is not None:
+            finish_deferred_clear(room)
         with self.chunk_ack_cv:
             waiters = [
                 self.ack_waiters.pop(key)
@@ -190,6 +233,9 @@ class PDHiddenEventManager:
             for key in list(self.alloc_grants):
                 if key[0] == room:
                     self.alloc_grants.pop(key, None)
+            self.expected_alloc_grants = {
+                key for key in self.expected_alloc_grants if key[0] != room
+            }
         for transfer_queue, kv_chunk in waiters:
             transfer_queue.put(kv_chunk)
         for transfer_queue, kv_chunk in room_waiters:
@@ -246,6 +292,7 @@ class PDHiddenEventManager:
                 }
                 self.alloc_grants.pop(key, None)
                 self.alloc_waiters.pop(key, None)
+                self.expected_alloc_grants.discard(key)
                 return result
             if key not in self.alloc_waiters:
                 self.alloc_waiters[key] = (transfer_queue, kv_chunk, expected)
@@ -258,6 +305,7 @@ class PDHiddenEventManager:
             with self.alloc_grant_lock:
                 waiter = self.alloc_waiters.pop(key, None)
                 self.alloc_grants.pop(key, None)
+                self.expected_alloc_grants.discard(key)
             if waiter is None:
                 return
             _, timed_out_chunk, _ = waiter
@@ -276,6 +324,29 @@ class PDHiddenEventManager:
         timer.start()
         return None
 
+    def expect_alloc_grants(
+        self,
+        *,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+    ) -> None:
+        """Register a hidden allocation independently of the KV room status."""
+        key = (int(room), int(prefill_rank), int(hidden_start))
+        with self.alloc_grant_lock:
+            self.expected_alloc_grants.add(key)
+
+    def expects_alloc_grant(
+        self,
+        *,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+    ) -> bool:
+        key = (int(room), int(prefill_rank), int(hidden_start))
+        with self.alloc_grant_lock:
+            return key in self.expected_alloc_grants
+
     def handle_alloc_grant(
         self,
         *,
@@ -288,6 +359,8 @@ class PDHiddenEventManager:
         key = (int(room), int(prefill_rank), int(hidden_start))
         waiter_to_wake = None
         with self.alloc_grant_lock:
+            if key not in self.expected_alloc_grants:
+                return
             self.alloc_grants[key][str(session_id)] = [
                 int(x) for x in dst_indices
             ]

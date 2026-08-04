@@ -411,6 +411,35 @@ class CommonKVManager(BaseKVManager):
                     self.request_status[bootstrap_room], status
                 )
 
+    def _clear_sender_room_state(self, bootstrap_room: int) -> None:
+        self.request_status.pop(bootstrap_room, None)
+        if hasattr(self, "req_to_decode_prefix_len"):
+            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
+        if hasattr(self, "req_to_pd_hidden_meta"):
+            self.req_to_pd_hidden_meta.pop(bootstrap_room, None)
+        if hasattr(self, "transfer_infos"):
+            self.transfer_infos.pop(bootstrap_room, None)
+
+    def clear_sender_room(self, bootstrap_room: int) -> bool:
+        hidden_events = getattr(self, "pd_hidden_events", None)
+        if (
+            hidden_events is not None
+            and self.request_status.get(bootstrap_room) != KVPoll.Failed
+            and hidden_events.defer_clear_if_active(bootstrap_room)
+        ):
+            return False
+        self._clear_sender_room_state(bootstrap_room)
+        return True
+
+    def finish_deferred_sender_clear(self, bootstrap_room: int) -> bool:
+        hidden_events = getattr(self, "pd_hidden_events", None)
+        if hidden_events is None or not hidden_events.take_deferred_clear(
+            bootstrap_room
+        ):
+            return False
+        self._clear_sender_room_state(bootstrap_room)
+        return True
+
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
@@ -1394,13 +1423,7 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
-            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_pd_hidden_meta"):
-            self.kv_mgr.req_to_pd_hidden_meta.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "transfer_infos"):
-            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        self.kv_mgr.clear_sender_room(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(

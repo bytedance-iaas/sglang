@@ -2757,6 +2757,9 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                             )
 
+                    if pd_hidden_expected > 0:
+                        self.pd_hidden_events.begin_request(kv_chunk.room)
+
                     waiting_for_ack = (
                         kv_chunk.pd_hidden_start is not None
                         and kv_chunk.pd_hidden_ready_sent
@@ -2785,6 +2788,11 @@ class MooncakeKVManager(CommonKVManager):
                         and not kv_chunk.pd_hidden_ready_sent
                     ):
                         if not kv_chunk.pd_hidden_alloc_requested:
+                            self.pd_hidden_events.expect_alloc_grants(
+                                room=kv_chunk.room,
+                                prefill_rank=prefill_unique_rank,
+                                hidden_start=int(kv_chunk.pd_hidden_start),
+                            )
                             for req in reqs_to_be_processed:
                                 if (
                                     req.is_dummy
@@ -3170,10 +3178,18 @@ class MooncakeKVManager(CommonKVManager):
                     continue
 
                 current_status = self.request_status.get(kv_chunk.room)
-                if kv_chunk.room not in self.request_status or current_status == KVPoll.Success:
+                hidden_request_active = self.pd_hidden_events.request_active(
+                    kv_chunk.room
+                )
+                if kv_chunk.room not in self.request_status:
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                elif current_status == KVPoll.Success and not hidden_request_active:
+                    if not self.finish_deferred_sender_clear(kv_chunk.room):
+                        if kv_chunk.room in self.transfer_infos:
+                            self.transfer_infos.pop(kv_chunk.room)
+                        self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -3203,14 +3219,14 @@ class MooncakeKVManager(CommonKVManager):
                     prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
                     hidden_start = int(waiting_req_bytes[3].decode("ascii"))
                     session_id = waiting_req_bytes[4].decode("utf-8")
-                    if self.request_status.get(room) in (
-                        None,
-                        KVPoll.Failed,
-                        KVPoll.Success,
+                    if not self.pd_hidden_events.expects_alloc_grant(
+                        room=room,
+                        prefill_rank=prefill_rank,
+                        hidden_start=hidden_start,
                     ):
-                        # A grant may race with request completion/abort. The
-                        # decode side owns and reclaims those rows; retaining a
-                        # prefill waiter here would only leak bookkeeping.
+                        # Hidden allocation has its own lifetime. Ignore a
+                        # grant only after that lifetime has ended, regardless
+                        # of whether the independent KV status is still live.
                         continue
                     dst_indices = (
                         list(
