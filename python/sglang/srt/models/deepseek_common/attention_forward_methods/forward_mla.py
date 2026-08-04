@@ -442,15 +442,18 @@ class DeepseekMLAForwardMixin:
             or forward_batch.forward_mode.is_target_verify()
         ):
             R = getattr(self, "_kvbit_qfht_R", None)
-            if R is None or R.shape[0] != self.kv_lora_rank:
+            if R is None or R.shape[0] != self.kv_lora_rank or R.dtype != torch.bfloat16:
                 from kvbit.rotation import build_hadamard
 
                 R = build_hadamard(
-                    self.kv_lora_rank, dtype=torch.float32, device=q_nope_out.device
+                    self.kv_lora_rank, dtype=torch.bfloat16, device=q_nope_out.device
                 )
                 self._kvbit_qfht_R = R
             # (n_tokens, n_heads, kv_lora_rank) @ (kv_lora_rank, kv_lora_rank)
-            q_nope_out = (q_nope_out.float() @ R).to(q_nope_out.dtype)
+            # BF16 GMMA tensor-core matmul (fp32 accumulate) — matches the
+            # decode out@R dtype in dsa_backend._forward_kvbit; ~1.8x faster
+            # than the fp32 sm80-XMMA CUDA-core path.
+            q_nope_out = (q_nope_out.to(torch.bfloat16) @ R).to(q_nope_out.dtype)
 
         return (
             q_pe,

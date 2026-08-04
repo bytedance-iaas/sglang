@@ -1923,17 +1923,21 @@ class DeepseekSparseAttnBackend(
         # the native latent, so undo the rotation: out @ R. R is symmetric
         # (R^T == R) and orthogonal (R @ R == I), so out @ R == attn_out_native.
         # This closes the Q-FHT round-trip (query folded in forward_absorb_prepare,
-        # decode-only) without touching fa3 / W_vc. fp32 matmul matches the query
-        # fold; cached on the backend (R is identical for every layer).
+        # decode-only) without touching fa3 / W_vc. Cached on the backend (R is
+        # identical for every layer). BF16 matmul runs on SM90 GMMA tensor cores
+        # (fp32 accumulate) instead of the fp32 sm80-XMMA CUDA-core path; ~1.8x
+        # faster for the (bs,512)@(512,512) GEMV and matches the query fold dtype.
+        # Precision: bf16 R breaks orthogonality to ~2e-4, but 4bit quantization
+        # error (~1e-2) dominates; gated on the 17*23=391 canary.
         R = getattr(self, "_kvbit_decode_R", None)
-        if R is None or R.shape[0] != pool.kv_lora_rank:
+        if R is None or R.shape[0] != pool.kv_lora_rank or R.dtype != torch.bfloat16:
             from kvbit.rotation import build_hadamard
 
             R = build_hadamard(
-                pool.kv_lora_rank, dtype=torch.float32, device=out.device
+                pool.kv_lora_rank, dtype=torch.bfloat16, device=out.device
             )
             self._kvbit_decode_R = R
-        out = (out.float() @ R).to(out.dtype)
+        out = (out.to(torch.bfloat16) @ R).to(out.dtype)
         return out
 
     def _forward_flashmla_sparse(
