@@ -45,6 +45,8 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,14 @@ class FunctionCallParser:
         self.detector = detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        try:
+            spec_algorithm = get_server_args().speculative_algorithm
+        except ValueError:
+            spec_algorithm = None
+        self._spec_needs_auto_structural_tag = (
+            SpeculativeAlgorithm.from_string(spec_algorithm).is_dflash_family()
+            and self.detector.get_structural_tag_name() is not None
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -243,6 +253,7 @@ class FunctionCallParser:
         should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+            or self._spec_needs_auto_structural_tag
         )
 
         # Highest priority: model-native structural_tag when available.
