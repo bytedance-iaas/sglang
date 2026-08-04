@@ -1431,6 +1431,12 @@ class CommonKVSender(BaseKVSender):
             "Aborted by AbortReq.",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        # Streaming PD hidden chunks can be parked behind destination-row
+        # allocation or ACK waiters.  Once the request is aborted no peer will
+        # complete those handshakes, so wake the parked chunks immediately.
+        # The transfer worker observes the Failed room and releases their
+        # source rows instead of holding the Prefill hidden pool until timeout.
+        self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.conclude_state = KVPoll.Failed
 
 

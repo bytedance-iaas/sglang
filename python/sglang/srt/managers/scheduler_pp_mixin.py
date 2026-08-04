@@ -245,6 +245,12 @@ class SchedulerPPMixin:
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
+                # The regular and non-PP disaggregated loops consume this
+                # marker at the top of every scheduling step.  PP disagg must
+                # do the same; otherwise AbortReq only records the chunked
+                # request and the remaining prompt chunks keep running.
+                self.process_pending_chunked_abort()
+
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 

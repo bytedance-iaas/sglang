@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     PDHiddenRequestState,
@@ -87,6 +88,21 @@ class _FakeKVManager:
 
 
 class TestPDHiddenAllocationEvents(CustomTestCase):
+    def test_sender_abort_wakes_hidden_waiters(self):
+        sender = CommonKVSender.__new__(CommonKVSender)
+        sender.bootstrap_room = 9
+        sender.conclude_state = None
+        sender.kv_mgr = MagicMock()
+
+        sender.abort()
+
+        sender.kv_mgr.record_failure.assert_called_once_with(
+            9, "Aborted by AbortReq."
+        )
+        sender.kv_mgr.update_status.assert_called_once_with(9, KVPoll.Failed)
+        sender.kv_mgr._wake_pd_hidden_ack_waiters.assert_called_once_with(9)
+        self.assertEqual(sender.conclude_state, KVPoll.Failed)
+
     def test_mooncake_control_send_supports_legacy_common_manager(self):
         socket = MagicMock()
         manager = SimpleNamespace(

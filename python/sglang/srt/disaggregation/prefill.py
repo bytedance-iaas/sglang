@@ -1218,7 +1218,9 @@ class SchedulerDisaggregationPrefillMixin:
             req
             for req in batch.reqs
             if (
-                (
+                not is_aborted(req)
+                and not is_pd_hidden_transfer_failed(req)
+                and (
                     pd_hidden_state(req).src_indices
                     or pd_hidden_state(req).capture_layer_ids
                 )
@@ -1267,6 +1269,13 @@ class SchedulerDisaggregationPrefillMixin:
             extend_len = int(extend_len)
             req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
             hidden_offset += extend_len
+
+            # An AbortReq can arrive while a PP microbatch is already in
+            # flight.  Drain that result without allocating/sending another
+            # hidden chunk; the sender abort path wakes older parked chunks so
+            # their source rows can be reclaimed.
+            if is_aborted(req) or is_pd_hidden_transfer_failed(req):
+                continue
 
             meta = pd_hidden_state(req).meta or {}
             streaming_hidden = bool(meta.get("streaming_hidden", False))
@@ -1374,7 +1383,11 @@ class SchedulerDisaggregationPrefillMixin:
         capture_reqs = [
             req
             for req in batch.reqs
-            if pd_hidden_state(req).capture_layer_ids
+            if (
+                pd_hidden_state(req).capture_layer_ids
+                and not is_aborted(req)
+                and not is_pd_hidden_transfer_failed(req)
+            )
         ]
         if not capture_reqs:
             return False
