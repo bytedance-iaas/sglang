@@ -202,6 +202,8 @@ class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     PD_HIDDEN_CHUNK_READY_HEADER = b"PD_HIDDEN_CHUNK_READY"
     PD_HIDDEN_CHUNK_ACK_HEADER = b"PD_HIDDEN_CHUNK_ACK"
+    PD_HIDDEN_ALLOC_REQUEST_HEADER = b"PD_HIDDEN_ALLOC_REQUEST"
+    PD_HIDDEN_ALLOC_GRANT_HEADER = b"PD_HIDDEN_ALLOC_GRANT"
 
     def __init__(
         self,
@@ -308,6 +310,80 @@ class MooncakeKVManager(CommonKVManager):
     def supports_pd_hidden_streaming(self) -> bool:
         return self.pd_hidden_events.supports_streaming()
 
+    def supports_pd_hidden_dynamic_allocation(self) -> bool:
+        return True
+
+    def pop_pd_hidden_alloc_requests(self) -> List[dict]:
+        return self.pd_hidden_events.pop_alloc_requests()
+
+    def requeue_pd_hidden_alloc_requests(self, requests: List[dict]) -> None:
+        self.pd_hidden_events.requeue_alloc_requests_front(requests)
+
+    def take_pd_hidden_alloc_grants_or_park(
+        self,
+        *,
+        transfer_queue: FastQueue,
+        kv_chunk: TransferKVChunk,
+        prefill_rank: int,
+        expected_session_ids: set[str],
+    ) -> Optional[dict[str, List[int]]]:
+        return self.pd_hidden_events.take_alloc_grants_or_park(
+            transfer_queue=transfer_queue,
+            kv_chunk=kv_chunk,
+            prefill_rank=prefill_rank,
+            expected_session_ids=expected_session_ids,
+        )
+
+    def request_pd_hidden_rows(
+        self,
+        *,
+        remote: str,
+        dst_port: int,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+        row_len: int,
+        is_last_hidden_chunk: bool,
+        session_id: str,
+    ) -> None:
+        na = NetworkAddress(remote, dst_port)
+        self._send_multipart(
+            na.to_tcp(),
+            [
+                self.PD_HIDDEN_ALLOC_REQUEST_HEADER,
+                str(room).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
+                str(hidden_start).encode("ascii"),
+                str(row_len).encode("ascii"),
+                b"1" if is_last_hidden_chunk else b"0",
+                str(session_id).encode("utf-8"),
+                self.local_ip.encode("ascii"),
+                str(self.rank_port).encode("ascii"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def grant_pd_hidden_rows(
+        self, request: dict, dst_indices: List[int]
+    ) -> None:
+        na = NetworkAddress(request["reply_host"], int(request["reply_port"]))
+        self._send_multipart(
+            na.to_tcp(),
+            [
+                self.PD_HIDDEN_ALLOC_GRANT_HEADER,
+                str(request["room"]).encode("ascii"),
+                str(request["prefill_rank"]).encode("ascii"),
+                str(request["hidden_start"]).encode("ascii"),
+                str(request["session_id"]).encode("utf-8"),
+                struct.pack(
+                    f"<{len(dst_indices)}i", *[int(x) for x in dst_indices]
+                )
+                if dst_indices
+                else b"",
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
     def mark_pd_hidden_request_done(
         self,
         bootstrap_room: int,
@@ -377,6 +453,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_rank: int,
         hidden_start: int,
         is_last_hidden_chunk: bool,
+        release_indices: Optional[List[int]] = None,
     ) -> None:
         self.pd_hidden_events.submit_chunk_ack(
             event=event,
@@ -386,6 +463,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_rank=prefill_rank,
             hidden_start=hidden_start,
             is_last_hidden_chunk=is_last_hidden_chunk,
+            release_indices=release_indices,
         )
 
     def _drain_pd_hidden_ack_completions(self) -> None:
@@ -2317,6 +2395,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         packet_idx: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_indices_override: Optional[List[int]] = None,
     ) -> Tuple[int, bool]:
         state_idx = self._pd_hidden_state_index()
         if state_idx is None or state_idx >= len(prefill_state_indices):
@@ -2325,6 +2404,33 @@ class MooncakeKVManager(CommonKVManager):
         if indices is None:
             return 0, True
         src_indices = np.asarray(indices, dtype=np.int32)
+        if dst_indices_override is not None:
+            dst_indices = np.asarray(dst_indices_override, dtype=np.int32)
+            if len(src_indices) != len(dst_indices):
+                raise RuntimeError(
+                    "Dynamic PD_HIDDEN state index length mismatch: "
+                    f"room={req.room}, prefill={len(src_indices)}, "
+                    f"dst={len(dst_indices)}"
+                )
+            target_rank_registration_info = self.decode_kv_args_table[
+                req.mooncake_session_id
+            ]
+            dst_data_ptrs = (
+                target_rank_registration_info.dst_state_data_ptrs[state_idx]
+                if state_idx < len(target_rank_registration_info.dst_state_data_ptrs)
+                else []
+            )
+            rc = self._send_kvcache_generic(
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=self.kv_args.state_data_ptrs[state_idx],
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=self.kv_args.state_item_lens[state_idx],
+                prefill_data_indices=src_indices,
+                dst_data_indices=dst_indices,
+                executor=executor,
+                state_type=StateType.PD_HIDDEN,
+            )
+            return rc, True
         dynamic_dst = (req.spec_metadata or {}).get("pp_slice", {}).get("dynamic_dst")
         if not dynamic_dst:
             if packet_idx > 0:
@@ -2604,6 +2710,8 @@ class MooncakeKVManager(CommonKVManager):
                 staging_deferred = False
                 pd_hidden_deferred = False
                 pd_hidden_failed = False
+                pd_hidden_dynamic_allocation = False
+                pd_hidden_expected_sessions = set()
                 if (
                     not kv_chunk.pd_hidden_sent
                     and kv_chunk.state_indices
@@ -2621,6 +2729,15 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         if not skip_state:
                             pd_hidden_expected += 1
+                            pd_hidden_expected_sessions.add(req.mooncake_session_id)
+                            pd_hidden_dynamic_allocation = (
+                                pd_hidden_dynamic_allocation
+                                or bool(
+                                    (req.spec_metadata or {}).get(
+                                        "dynamic_hidden_allocation", False
+                                    )
+                                )
+                            )
 
                     waiting_for_ack = (
                         kv_chunk.pd_hidden_start is not None
@@ -2644,6 +2761,42 @@ class MooncakeKVManager(CommonKVManager):
                                 queue, kv_chunk
                             )
                             continue
+                    if (
+                        pd_hidden_dynamic_allocation
+                        and kv_chunk.pd_hidden_start is not None
+                        and not kv_chunk.pd_hidden_ready_sent
+                    ):
+                        if not kv_chunk.pd_hidden_alloc_requested:
+                            for req in reqs_to_be_processed:
+                                if (
+                                    req.is_dummy
+                                    or req.mooncake_session_id
+                                    not in pd_hidden_expected_sessions
+                                ):
+                                    continue
+                                self.request_pd_hidden_rows(
+                                    remote=req.endpoint,
+                                    dst_port=req.dst_port,
+                                    room=req.room,
+                                    prefill_rank=prefill_unique_rank,
+                                    hidden_start=int(kv_chunk.pd_hidden_start),
+                                    row_len=int(kv_chunk.pd_hidden_row_len),
+                                    is_last_hidden_chunk=bool(
+                                        kv_chunk.pd_hidden_is_last_chunk
+                                    ),
+                                    session_id=req.mooncake_session_id,
+                                )
+                            kv_chunk.pd_hidden_alloc_requested = True
+                        if kv_chunk.pd_hidden_alloc_grants is None:
+                            grants = self.take_pd_hidden_alloc_grants_or_park(
+                                transfer_queue=queue,
+                                kv_chunk=kv_chunk,
+                                prefill_rank=prefill_unique_rank,
+                                expected_session_ids=pd_hidden_expected_sessions,
+                            )
+                            if grants is None:
+                                continue
+                            kv_chunk.pd_hidden_alloc_grants = grants
                     ack_ready = False
                     if waiting_for_ack:
                         ack_ready = kv_chunk.pd_hidden_ack_ready
@@ -2681,6 +2834,15 @@ class MooncakeKVManager(CommonKVManager):
                                         kv_chunk.state_indices,
                                         kv_chunk.pd_hidden_packet_idx,
                                         executor,
+                                        (
+                                            kv_chunk.pd_hidden_alloc_grants.get(
+                                                req.mooncake_session_id
+                                            )
+                                            if pd_hidden_dynamic_allocation
+                                            and kv_chunk.pd_hidden_alloc_grants
+                                            is not None
+                                            else None
+                                        ),
                                     )
                                 )
                             finally:
@@ -2713,15 +2875,23 @@ class MooncakeKVManager(CommonKVManager):
                                 and state_idx is not None
                                 and state_idx < len(kv_chunk.state_indices)
                             ):
-                                dst_indices = (
-                                    req.dst_state_indices[state_idx]
-                                    if state_idx < len(req.dst_state_indices)
-                                    else []
-                                )
                                 row_len = int(kv_chunk.pd_hidden_row_len)
-                                chunk_dst_indices = [
-                                    int(x) for x in dst_indices[:row_len]
-                                ]
+                                if pd_hidden_dynamic_allocation:
+                                    chunk_dst_indices = [
+                                        int(x)
+                                        for x in (
+                                            kv_chunk.pd_hidden_alloc_grants or {}
+                                        ).get(req.mooncake_session_id, [])
+                                    ]
+                                else:
+                                    dst_indices = (
+                                        req.dst_state_indices[state_idx]
+                                        if state_idx < len(req.dst_state_indices)
+                                        else []
+                                    )
+                                    chunk_dst_indices = [
+                                        int(x) for x in dst_indices[:row_len]
+                                    ]
                                 self.notify_pd_hidden_chunk_ready(
                                     remote=req.endpoint,
                                     dst_port=req.dst_port,
@@ -3007,6 +3177,40 @@ class MooncakeKVManager(CommonKVManager):
                         room, prefill_rank, hidden_start
                     )
                     continue
+                if (
+                    waiting_req_bytes[0]
+                    == MooncakeKVManager.PD_HIDDEN_ALLOC_GRANT_HEADER
+                ):
+                    room = int(waiting_req_bytes[1].decode("ascii"))
+                    prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
+                    hidden_start = int(waiting_req_bytes[3].decode("ascii"))
+                    session_id = waiting_req_bytes[4].decode("utf-8")
+                    if self.request_status.get(room) in (
+                        None,
+                        KVPoll.Failed,
+                        KVPoll.Success,
+                    ):
+                        # A grant may race with request completion/abort. The
+                        # decode side owns and reclaims those rows; retaining a
+                        # prefill waiter here would only leak bookkeeping.
+                        continue
+                    dst_indices = (
+                        list(
+                            np.frombuffer(
+                                waiting_req_bytes[5], dtype=np.int32
+                            ).astype(np.int64)
+                        )
+                        if waiting_req_bytes[5]
+                        else []
+                    )
+                    self.pd_hidden_events.handle_alloc_grant(
+                        room=room,
+                        prefill_rank=prefill_rank,
+                        hidden_start=hidden_start,
+                        session_id=session_id,
+                        dst_indices=dst_indices,
+                    )
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -3139,6 +3343,20 @@ class MooncakeKVManager(CommonKVManager):
                 if self.server_socket not in events:
                     continue
                 msg = self.server_socket.recv_multipart()
+                if msg[0] == MooncakeKVManager.PD_HIDDEN_ALLOC_REQUEST_HEADER:
+                    self.pd_hidden_events.append_alloc_request(
+                        {
+                            "room": int(msg[1].decode("ascii")),
+                            "prefill_rank": int(msg[2].decode("ascii")),
+                            "hidden_start": int(msg[3].decode("ascii")),
+                            "row_len": int(msg[4].decode("ascii")),
+                            "is_last_hidden_chunk": msg[5] == b"1",
+                            "session_id": msg[6].decode("utf-8"),
+                            "reply_host": msg[7].decode("ascii"),
+                            "reply_port": int(msg[8].decode("ascii")),
+                        }
+                    )
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue

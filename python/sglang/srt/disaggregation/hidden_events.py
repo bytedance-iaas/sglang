@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import zmq
@@ -43,6 +43,13 @@ class PDHiddenEventManager:
         self.ack_completion_cv = threading.Condition()
         self.acked_chunks: Dict[int, List[dict]] = defaultdict(list)
         self.acked_lock = threading.Lock()
+        self.alloc_requests = deque()
+        self.alloc_request_lock = threading.Lock()
+        self.alloc_grants: Dict[Tuple[int, int, int], Dict[str, List[int]]] = (
+            defaultdict(dict)
+        )
+        self.alloc_waiters = {}
+        self.alloc_grant_lock = threading.Lock()
         self.ack_wakeup_endpoint: Optional[str] = None
         self.ack_wakeup_receiver = None
         self.ack_wakeup_sender = None
@@ -58,12 +65,15 @@ class PDHiddenEventManager:
         self.room_waiters.clear()
         self.inflight_chunks.clear()
         self.active_transfers.clear()
+        self.alloc_grants.clear()
+        self.alloc_waiters.clear()
 
     def init_decode_state(self) -> None:
         self.ready_chunks.clear()
         self.ack_completions = queue.SimpleQueue()
         self.ack_pending_counts.clear()
         self.acked_chunks.clear()
+        self.alloc_requests.clear()
         self.ack_wakeup_endpoint = f"inproc://pd-hidden-ack-{id(self)}"
         self.ack_wakeup_receiver = self.owner._zmq_ctx.socket(zmq.PULL)
         self.ack_wakeup_receiver.bind(self.ack_wakeup_endpoint)
@@ -171,9 +181,123 @@ class PDHiddenEventManager:
                 if key[0] == room
             ]
             room_waiters = list(self.room_waiters.pop(room, []))
+        with self.alloc_grant_lock:
+            alloc_waiters = [
+                self.alloc_waiters.pop(key)
+                for key in list(self.alloc_waiters)
+                if key[0] == room
+            ]
+            for key in list(self.alloc_grants):
+                if key[0] == room:
+                    self.alloc_grants.pop(key, None)
         for transfer_queue, kv_chunk in waiters:
             transfer_queue.put(kv_chunk)
         for transfer_queue, kv_chunk in room_waiters:
+            transfer_queue.put(kv_chunk)
+        for transfer_queue, kv_chunk, _ in alloc_waiters:
+            transfer_queue.put(kv_chunk)
+
+    def append_alloc_request(self, request: dict) -> None:
+        """Queue a prefill-complete hidden chunk for decode-side row allocation."""
+        with self.alloc_request_lock:
+            self.alloc_requests.append(dict(request))
+
+    def pop_alloc_requests(self) -> List[dict]:
+        """Pop pending allocation requests in global prefill-completion order."""
+        with self.alloc_request_lock:
+            requests = list(self.alloc_requests)
+            self.alloc_requests.clear()
+        return requests
+
+    def requeue_alloc_requests_front(self, requests: List[dict]) -> None:
+        """Restore deferred requests without changing their FIFO order."""
+        if not requests:
+            return
+        with self.alloc_request_lock:
+            self.alloc_requests.extendleft(reversed(requests))
+
+    def take_alloc_grants_or_park(
+        self,
+        *,
+        transfer_queue: FastQueue,
+        kv_chunk: TransferKVChunk,
+        prefill_rank: int,
+        expected_session_ids: Set[str],
+        timeout_s: float = 300.0,
+    ) -> Optional[Dict[str, List[int]]]:
+        """Return all destination grants, or park the chunk until they arrive."""
+        if kv_chunk.pd_hidden_start is None:
+            return {}
+        key = (
+            int(kv_chunk.room),
+            int(prefill_rank),
+            int(kv_chunk.pd_hidden_start),
+        )
+        expected = {str(session_id) for session_id in expected_session_ids}
+        if not expected:
+            return {}
+        created_waiter = False
+        with self.alloc_grant_lock:
+            grants = self.alloc_grants.get(key, {})
+            if expected.issubset(grants):
+                result = {
+                    session_id: [int(x) for x in grants[session_id]]
+                    for session_id in expected
+                }
+                self.alloc_grants.pop(key, None)
+                self.alloc_waiters.pop(key, None)
+                return result
+            if key not in self.alloc_waiters:
+                self.alloc_waiters[key] = (transfer_queue, kv_chunk, expected)
+                created_waiter = True
+
+        if not created_waiter:
+            return None
+
+        def on_timeout() -> None:
+            with self.alloc_grant_lock:
+                waiter = self.alloc_waiters.pop(key, None)
+                self.alloc_grants.pop(key, None)
+            if waiter is None:
+                return
+            _, timed_out_chunk, _ = waiter
+            timed_out_chunk.pd_hidden_alloc_timed_out = True
+            self.owner.record_failure(
+                key[0],
+                "Timed out waiting for dynamic PD hidden row grants: "
+                f"prefill_rank={key[1]}, hidden_start={key[2]}",
+            )
+            self.owner.update_status(key[0], KVPoll.Failed)
+            transfer_queue.put(timed_out_chunk)
+            self.wake_ack_waiters(key[0])
+
+        timer = threading.Timer(float(timeout_s), on_timeout)
+        timer.daemon = True
+        timer.start()
+        return None
+
+    def handle_alloc_grant(
+        self,
+        *,
+        room: int,
+        prefill_rank: int,
+        hidden_start: int,
+        session_id: str,
+        dst_indices: List[int],
+    ) -> None:
+        key = (int(room), int(prefill_rank), int(hidden_start))
+        waiter_to_wake = None
+        with self.alloc_grant_lock:
+            self.alloc_grants[key][str(session_id)] = [
+                int(x) for x in dst_indices
+            ]
+            waiter = self.alloc_waiters.get(key)
+            if waiter is not None:
+                _, _, expected = waiter
+                if expected.issubset(self.alloc_grants[key]):
+                    waiter_to_wake = self.alloc_waiters.pop(key)
+        if waiter_to_wake is not None:
+            transfer_queue, kv_chunk, _ = waiter_to_wake
             transfer_queue.put(kv_chunk)
 
     def park_chunk_behind_room(
@@ -231,6 +355,7 @@ class PDHiddenEventManager:
         prefill_rank: int,
         hidden_start: int,
         is_last_hidden_chunk: bool,
+        release_indices: Optional[List[int]] = None,
     ) -> None:
         completion = {
             "remote": remote,
@@ -239,6 +364,9 @@ class PDHiddenEventManager:
             "prefill_rank": int(prefill_rank),
             "hidden_start": int(hidden_start),
             "is_last_hidden_chunk": bool(is_last_hidden_chunk),
+            "release_indices": (
+                [int(x) for x in release_indices] if release_indices else None
+            ),
         }
         with self.ack_completion_cv:
             self.ack_pending_counts[int(room)] += 1

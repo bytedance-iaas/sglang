@@ -277,6 +277,10 @@ class CommonKVManager(BaseKVManager):
     def supports_pd_hidden_streaming(self) -> bool:
         return False
 
+    def supports_pd_hidden_dynamic_allocation(self) -> bool:
+        """Whether receive rows can be granted after prefill produces a chunk."""
+        return False
+
     def mark_pd_hidden_request_done(
         self,
         bootstrap_room: int,
