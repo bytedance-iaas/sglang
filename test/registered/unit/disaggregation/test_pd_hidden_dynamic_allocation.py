@@ -290,6 +290,43 @@ class TestPDHiddenDynamicBootstrap(CustomTestCase):
         self.assertEqual(plan.source_window_rows, 4)
         self.assertIs(plan.pool, pool)
 
+    def test_dynamic_bootstrap_clamps_decode_window_to_prefill_pool(self):
+        pool = PDHiddenRowPool(2, hidden_size=4, dtype=torch.float32)
+        req = SimpleNamespace(rid="small-source-pool", origin_input_ids=list(range(8)))
+        metadata = {
+            "hidden_start": 0,
+            "hidden_len": 8,
+            "streaming_hidden": True,
+            "dynamic_hidden_allocation": True,
+            "streaming_window_rows": 6,
+            "target_layer_ids": [3, 5],
+            "pp_slices": {
+                "0": {
+                    "layer_ids": [3, 5],
+                    "slice_len": 4,
+                    "dst_indices": [],
+                }
+            },
+        }
+        model_config = SimpleNamespace(hidden_size=2)
+        model_runner = SimpleNamespace(
+            spec_aux_config=SimpleNamespace(dflash_target_layer_ids=[3, 5])
+        )
+
+        plan, error = resolve_hidden_bootstrap_plan(
+            req=req,
+            metadata=metadata,
+            decode_prefix_len=0,
+            pp_rank=0,
+            model_config=model_config,
+            model_runner=model_runner,
+            metadata_buffers=SimpleNamespace(pd_hidden_pool=pool),
+        )
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.source_window_rows, 2)
+
 
 class TestDecodePDHiddenDynamicAllocator(CustomTestCase):
     def _make_queue(self, pool_rows: int, decode_reqs):

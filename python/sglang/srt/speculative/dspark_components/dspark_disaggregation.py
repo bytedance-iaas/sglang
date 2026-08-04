@@ -253,14 +253,25 @@ def resolve_hidden_bootstrap_plan(
             f"pool: pp_rank={pp_rank}, local_layer_ids={local_layer_ids}"
         )
 
-    if dynamic_hidden_allocation:
+    if dynamic_hidden_allocation and streaming_hidden:
+        # Decode's streaming window describes its receive-side capacity. The
+        # Prefill source pool is an independent, ACK-recycled credit window and
+        # may intentionally be smaller. Bootstrap therefore only needs a
+        # non-empty local source window; each produced chunk is bounded against
+        # the source pool when it is captured.
         source_window_rows = min(
             hidden_len,
             int(metadata.get("streaming_window_rows", pool.size) or pool.size),
+            pool.size,
         )
     else:
         source_window_rows = (
             min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
+        )
+    if hidden_len > 0 and source_window_rows <= 0:
+        return None, (
+            "DSpark prefill hidden source pool has no streaming rows: "
+            f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}"
         )
     if source_window_rows > pool.size:
         return None, (

@@ -193,6 +193,10 @@ class TestPDHiddenRowPool(unittest.TestCase):
         self.assertEqual(pool.alloc(1), [0])
         self.assertIsNone(pool.alloc_wait(1, timeout=0.01))
 
+    def test_waiting_allocation_rejects_request_larger_than_pool(self):
+        pool = PDHiddenRowPool(1, 1, torch.float32)
+        self.assertIsNone(pool.alloc_wait(2, timeout=1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

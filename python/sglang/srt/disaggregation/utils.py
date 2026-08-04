@@ -282,6 +282,8 @@ class PDHiddenRowPool:
         n = int(n)
         if n <= 0:
             return []
+        if n > self.size:
+            return None
         with self._credit_cv:
             if not self._credit_cv.wait_for(
                 lambda: n <= self._free_count,
