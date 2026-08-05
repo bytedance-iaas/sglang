@@ -577,6 +577,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None
+    # Static token width selected by the prefill CUDA graph runner. Attention
+    # metadata that is token-shaped (for example FlashMLA-KV num_splits) must
+    # cover this width, not only the unpadded request tokens.
+    prefill_cuda_graph_num_tokens: Optional[int] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch

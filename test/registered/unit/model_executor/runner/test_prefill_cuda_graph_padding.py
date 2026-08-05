@@ -1,6 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+
+from sglang.srt.layers.attention.dsa.utils import pad_dsa_cache_seqlens
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -51,6 +55,20 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    @patch("sglang.srt.layers.attention.dsa.utils.get_parallel")
+    def test_dsa_metadata_covers_breakable_graph_token_bucket(self, get_parallel):
+        get_parallel.return_value = SimpleNamespace(attn_cp_size=1)
+        forward_batch = SimpleNamespace(
+            global_num_tokens_cpu=None,
+            prefill_cuda_graph_num_tokens=16,
+        )
+        raw_cache_seqlens = torch.arange(1, 14, dtype=torch.int32)
+
+        padded = pad_dsa_cache_seqlens(forward_batch, raw_cache_seqlens)
+
+        torch.testing.assert_close(padded[:13], raw_cache_seqlens)
+        torch.testing.assert_close(padded[13:], torch.zeros(3, dtype=torch.int32))
 
 
 if __name__ == "__main__":

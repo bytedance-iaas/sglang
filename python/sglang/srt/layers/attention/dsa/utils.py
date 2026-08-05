@@ -208,9 +208,17 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
         forward_batch
     )
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
-    if not needs_cp_pad and not needs_dp_pad:
+    graph_num_tokens = getattr(forward_batch, "prefill_cuda_graph_num_tokens", None)
+    needs_graph_pad = graph_num_tokens is not None
+    if not needs_cp_pad and not needs_dp_pad and not needs_graph_pad:
         return dsa_cache_seqlens
-    tokens = cal_padded_tokens(forward_batch)
+    tokens = (
+        cal_padded_tokens(forward_batch)
+        if needs_cp_pad or needs_dp_pad
+        else dsa_cache_seqlens.shape[0]
+    )
+    if graph_num_tokens is not None:
+        tokens = max(tokens, graph_num_tokens)
     pad_len = tokens - dsa_cache_seqlens.shape[0]
     if pad_len > 0:
         dsa_cache_seqlens = torch.cat(
