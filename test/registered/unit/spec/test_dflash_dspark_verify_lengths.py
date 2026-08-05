@@ -125,6 +125,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
 
         class FakeDraftRunner:
             device = "cpu"
+            decode_cuda_graph_runner = None
 
             def forward(self, forward_batch):
                 seen["seq_lens"] = forward_batch.seq_lens.clone()
@@ -143,6 +144,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             gamma=gamma,
             mask_token_id=0,
             draft_block_spec_info=SimpleNamespace(),
+            bonus_anchor=True,
         )
         batch = SimpleNamespace(
             seq_lens=torch.tensor([10, 20], dtype=torch.int32),
@@ -183,6 +185,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
 
         class FakeDraftRunner:
             device = "cpu"
+            decode_cuda_graph_runner = None
 
             def forward(self, forward_batch):
                 seen["seq_lens"] = forward_batch.seq_lens.clone()
@@ -201,6 +204,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             gamma=gamma,
             mask_token_id=0,
             draft_block_spec_info=SimpleNamespace(),
+            bonus_anchor=True,
         )
         batch = SimpleNamespace(
             seq_lens=torch.tensor([10, 20], dtype=torch.int32),

@@ -224,6 +224,7 @@ class TestDraftBlockWidth(CustomTestCase):
                     max_bs=4,
                     device="cpu",
                     bonus_anchor=bonus_anchor,
+                    folded_sampling=False,
                 )
                 self.assertEqual(sampler.draft_width, expected_width)
                 # The sampled-token output buffer stays gamma-wide regardless
