@@ -4251,10 +4251,11 @@ class ServerArgs:
         # Non-multiple-of-8 prefill buckets can hang DeepEP a2a capture under
         # breakable CUDA graph
         if self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
-            bs = self.cuda_graph_config.prefill.bs
+            prefill_config = self.cuda_graph_config.prefill
+            bs = prefill_config.bs
             if bs is None:
                 # 2048 = documented prefill default; max_bs unresolved here.
-                max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+                max_bs = prefill_config.max_bs or 2048
                 bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
             aligned = sorted({((b + 7) // 8) * 8 for b in bs})
             if aligned != sorted(bs):
@@ -4264,8 +4265,40 @@ class ServerArgs:
                     sorted(bs),
                     aligned,
                 )
-                self.cuda_graph_config.prefill.bs = aligned
-                self.cuda_graph_config.prefill.max_bs = aligned[-1]
+                prefill_config.bs = aligned
+                prefill_config.max_bs = aligned[-1]
+
+            # DeepEP low-latency preallocates dispatch buffers for a fixed
+            # per-rank token capacity. Capturing a larger aggregate-token BCG
+            # bucket is unsafe because one DP rank may receive the whole
+            # bucket. Keep only buckets that are valid even under that worst
+            # case; requests above max_bs then use the eager prefill path.
+            if self.deepep_mode == "low_latency":
+                max_dispatch_tokens = (
+                    envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                )
+                supported = [b for b in aligned if b <= max_dispatch_tokens]
+                if not supported:
+                    raise ValueError(
+                        "DeepEP low-latency breakable prefill CUDA graph has no "
+                        "capture bucket within "
+                        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{max_dispatch_tokens}; increase the DeepEP capacity or "
+                        "configure a smaller prefill CUDA graph bucket."
+                    )
+                dropped = [b for b in aligned if b > max_dispatch_tokens]
+                if dropped:
+                    logger.warning(
+                        "DeepEP low-latency prefill CUDA graph cannot capture "
+                        "buckets above the per-rank dispatch capacity %d; "
+                        "keeping %s and routing larger prefills to eager "
+                        "execution (dropped %s).",
+                        max_dispatch_tokens,
+                        supported,
+                        dropped,
+                    )
+                prefill_config.bs = supported
+                prefill_config.max_bs = supported[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase

@@ -1399,6 +1399,53 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
 
+class TestDeepEPPrefillCudaGraphAdjustments(CustomTestCase):
+    def _args(self, *, deepep_mode, prefill_bs):
+        args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            deepep_mode=deepep_mode,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, bs=[1, 4, 10, 16]),
+            prefill=PhaseConfig(
+                backend=Backend.BREAKABLE,
+                bs=prefill_bs,
+                max_bs=max(prefill_bs),
+            ),
+        )
+        return args
+
+    def test_low_latency_drops_prefill_buckets_above_dispatch_capacity(self):
+        args = self._args(deepep_mode="low_latency", prefill_bs=[4, 8, 144, 160])
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            args._apply_deepep_adjustments()
+
+        self.assertEqual(args.cuda_graph_config.prefill.bs, [8, 144])
+        self.assertEqual(args.cuda_graph_config.prefill.max_bs, 144)
+        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 4, 10, 16])
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+
+    def test_auto_mode_does_not_apply_low_latency_capacity(self):
+        args = self._args(deepep_mode="auto", prefill_bs=[8, 160])
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            args._apply_deepep_adjustments()
+
+        self.assertEqual(args.cuda_graph_config.prefill.bs, [8, 160])
+        self.assertEqual(args.cuda_graph_config.prefill.max_bs, 160)
+
+    def test_low_latency_rejects_when_no_prefill_bucket_fits(self):
+        args = self._args(deepep_mode="low_latency", prefill_bs=[8, 16])
+
+        with (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4),
+            self.assertRaisesRegex(ValueError, "has no capture bucket"),
+        ):
+            args._apply_deepep_adjustments()
+
+
 class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
     """LoRA no longer auto-disables the breakable prefill CUDA graph; guards
     test_bcg_with_lora.py against a rule re-disabling it (vacuous pass)."""
