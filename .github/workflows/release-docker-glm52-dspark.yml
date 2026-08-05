@@ -1,6 +1,12 @@
 name: Build GLM 5.2 DSpark Overlay Image
 
 on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Immutable task image tag
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       image_tag:
