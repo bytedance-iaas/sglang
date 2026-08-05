@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -37,6 +37,9 @@ class TransferKVChunk:
     pd_hidden_row_len: int = 0
     pd_hidden_is_last_chunk: bool = False
     pd_hidden_release_indices: Optional[List[int]] = None
+    pd_hidden_alloc_requested: bool = False
+    pd_hidden_alloc_grants: Optional[Dict[str, List[int]]] = None
+    pd_hidden_alloc_timed_out: bool = False
     enqueue_time: float = 0.0
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(

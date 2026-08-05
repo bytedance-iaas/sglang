@@ -167,9 +167,7 @@ def resolve_hidden_bootstrap_plan(
         [int(x) for x in local_pp_slice.get("layer_ids", [])]
         if local_pp_slice
         else (
-            []
-            if pp_slices
-            else [int(x) for x in metadata.get("target_layer_ids", [])]
+            [] if pp_slices else [int(x) for x in metadata.get("target_layer_ids", [])]
         )
     )
     local_slice_len = (
@@ -215,6 +213,7 @@ def resolve_hidden_bootstrap_plan(
         )
 
     streaming_hidden = bool(metadata.get("streaming_hidden", False))
+    dynamic_hidden_allocation = bool(metadata.get("dynamic_hidden_allocation", False))
     dst_indices = [
         int(x)
         for x in (
@@ -224,6 +223,8 @@ def resolve_hidden_bootstrap_plan(
         )
     ]
     dst_len_valid = (
+        dynamic_hidden_allocation and streaming_hidden and not dst_indices
+    ) or (
         0 < len(dst_indices) <= hidden_len
         if streaming_hidden
         else hidden_len == len(dst_indices)
@@ -248,9 +249,26 @@ def resolve_hidden_bootstrap_plan(
             f"pool: pp_rank={pp_rank}, local_layer_ids={local_layer_ids}"
         )
 
-    source_window_rows = (
-        min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
-    )
+    if dynamic_hidden_allocation and streaming_hidden:
+        # Decode's streaming window describes its receive-side capacity. The
+        # Prefill source pool is an independent, ACK-recycled credit window and
+        # may intentionally be smaller. Bootstrap therefore only needs a
+        # non-empty local source window; each produced chunk is bounded against
+        # the source pool when it is captured.
+        source_window_rows = min(
+            hidden_len,
+            int(metadata.get("streaming_window_rows", pool.size) or pool.size),
+            pool.size,
+        )
+    else:
+        source_window_rows = (
+            min(hidden_len, len(dst_indices)) if streaming_hidden else hidden_len
+        )
+    if hidden_len > 0 and source_window_rows <= 0:
+        return None, (
+            "DSpark prefill hidden source pool has no streaming rows: "
+            f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}"
+        )
     if source_window_rows > pool.size:
         return None, (
             "DSpark hidden rows exceed prefill hidden pool capacity: "

@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import torch
@@ -7,6 +8,10 @@ from sglang.srt.disaggregation.common.utils import (
     PDHiddenRequestState,
 )
 from sglang.srt.disaggregation.utils import PDHiddenRowPool
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _chunk(start: int, rows: int, is_last: bool = False) -> PDHiddenChunk:
@@ -20,7 +25,7 @@ def _chunk(start: int, rows: int, is_last: bool = False) -> PDHiddenChunk:
     )
 
 
-class TestPDHiddenRequestState(unittest.TestCase):
+class TestPDHiddenRequestState(CustomTestCase):
     def test_disabled_state_is_done_for_hidden_but_not_kv(self):
         state = PDHiddenRequestState.disabled()
 
@@ -134,7 +139,7 @@ class TestPDHiddenRequestState(unittest.TestCase):
         self.assertEqual(chunk.ack_port, 12345)
 
 
-class TestPDHiddenRowPool(unittest.TestCase):
+class TestPDHiddenRowPool(CustomTestCase):
     def test_alloc_prefers_contiguous_rows_and_merges_frees(self):
         pool = PDHiddenRowPool(8, 1, torch.float32)
 
@@ -163,6 +168,38 @@ class TestPDHiddenRowPool(unittest.TestCase):
 
         self.assertEqual(pool.available_size(), 4)
         self.assertEqual(pool.alloc(4), [0, 1, 2, 3])
+
+    def test_waiting_allocation_wakes_when_rows_are_freed(self):
+        pool = PDHiddenRowPool(2, 1, torch.float32)
+        allocated = pool.alloc(2)
+        self.assertEqual(allocated, [0, 1])
+
+        started = threading.Event()
+        result = []
+
+        def allocate_after_credit():
+            started.set()
+            result.append(pool.alloc_wait(1, timeout=1.0))
+
+        waiter = threading.Thread(target=allocate_after_credit)
+        waiter.start()
+        self.assertTrue(started.wait(timeout=1.0))
+        self.assertTrue(waiter.is_alive())
+
+        pool.free([allocated[0]])
+        waiter.join(timeout=1.0)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result, [[0]])
+
+    def test_waiting_allocation_times_out_without_credit(self):
+        pool = PDHiddenRowPool(1, 1, torch.float32)
+        self.assertEqual(pool.alloc(1), [0])
+        self.assertIsNone(pool.alloc_wait(1, timeout=0.01))
+
+    def test_waiting_allocation_rejects_request_larger_than_pool(self):
+        pool = PDHiddenRowPool(1, 1, torch.float32)
+        self.assertIsNone(pool.alloc_wait(2, timeout=1.0))
 
 
 if __name__ == "__main__":

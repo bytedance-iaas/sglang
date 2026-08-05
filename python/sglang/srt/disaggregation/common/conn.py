@@ -176,9 +176,7 @@ class CommonKVManager(BaseKVManager):
         # DeepSeek-V4 PCP -> DCP transfer must use a one-to-one rank mapping.
         # The generic all-CP fan-out cannot make forward progress in this
         # topology, so this is an invariant rather than a user-tunable option.
-        self.enable_pcp_dcp_rank_affinity = (
-            self._should_enable_pcp_dcp_rank_affinity()
-        )
+        self.enable_pcp_dcp_rank_affinity = self._should_enable_pcp_dcp_rank_affinity()
         self._check_pcp_dcp_rank_affinity_local_topology()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
@@ -277,6 +275,10 @@ class CommonKVManager(BaseKVManager):
     def supports_pd_hidden_streaming(self) -> bool:
         return False
 
+    def supports_pd_hidden_dynamic_allocation(self) -> bool:
+        """Whether receive rows can be granted after prefill produces a chunk."""
+        return False
+
     def mark_pd_hidden_request_done(
         self,
         bootstrap_room: int,
@@ -366,8 +368,7 @@ class CommonKVManager(BaseKVManager):
             )
         if self.server_args.enable_dsa_cache_layer_split:
             raise RuntimeError(
-                "PCP-DCP rank affinity is incompatible with "
-                "DSA cache layer split"
+                "PCP-DCP rank affinity is incompatible with " "DSA cache layer split"
             )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.dcp_size != 1:
@@ -406,6 +407,35 @@ class CommonKVManager(BaseKVManager):
                 self.request_status[bootstrap_room] = max(
                     self.request_status[bootstrap_room], status
                 )
+
+    def _clear_sender_room_state(self, bootstrap_room: int) -> None:
+        self.request_status.pop(bootstrap_room, None)
+        if hasattr(self, "req_to_decode_prefix_len"):
+            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
+        if hasattr(self, "req_to_pd_hidden_meta"):
+            self.req_to_pd_hidden_meta.pop(bootstrap_room, None)
+        if hasattr(self, "transfer_infos"):
+            self.transfer_infos.pop(bootstrap_room, None)
+
+    def clear_sender_room(self, bootstrap_room: int) -> bool:
+        hidden_events = getattr(self, "pd_hidden_events", None)
+        if (
+            hidden_events is not None
+            and self.request_status.get(bootstrap_room) != KVPoll.Failed
+            and hidden_events.defer_clear_if_active(bootstrap_room)
+        ):
+            return False
+        self._clear_sender_room_state(bootstrap_room)
+        return True
+
+    def finish_deferred_sender_clear(self, bootstrap_room: int) -> bool:
+        hidden_events = getattr(self, "pd_hidden_events", None)
+        if hidden_events is None or not hidden_events.take_deferred_clear(
+            bootstrap_room
+        ):
+            return False
+        self._clear_sender_room_state(bootstrap_room)
+        return True
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -1390,13 +1420,7 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
-            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_pd_hidden_meta"):
-            self.kv_mgr.req_to_pd_hidden_meta.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "transfer_infos"):
-            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        self.kv_mgr.clear_sender_room(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1404,6 +1428,12 @@ class CommonKVSender(BaseKVSender):
             "Aborted by AbortReq.",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        # Streaming PD hidden chunks can be parked behind destination-row
+        # allocation or ACK waiters.  Once the request is aborted no peer will
+        # complete those handshakes, so wake the parked chunks immediately.
+        # The transfer worker observes the Failed room and releases their
+        # source rows instead of holding the Prefill hidden pool until timeout.
+        self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.conclude_state = KVPoll.Failed
 
 

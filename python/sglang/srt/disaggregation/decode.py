@@ -79,6 +79,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -86,7 +87,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -99,8 +99,8 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -307,6 +307,10 @@ class DecodeRequest:
     pd_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
     pd_hidden_pp_slices: Optional[Dict[int, dict]] = None
     pd_hidden_start: int = 0
+    pd_hidden_dynamic_allocation: bool = False
+    pd_hidden_dynamic_allocations: Dict[Tuple[int, int, str], Dict[str, Any]] = field(
+        default_factory=dict
+    )
     pd_hidden_state: PDHiddenRequestState = field(
         default_factory=PDHiddenRequestState.disabled
     )
@@ -1298,12 +1302,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             pd_hidden_pp_slices = None
             pd_hidden_start = total_prefix_len
             pd_hidden_len = origin_input_len - total_prefix_len
+            pd_hidden_window_rows = 0
+            pd_hidden_dynamic_allocation = False
             state_types = self.kv_manager.kv_args.state_types
             if (
                 self.scheduler.spec_algorithm.is_dspark()
-                and not _is_fake_transfer(
-                    decode_req.req, self.scheduler.server_args
-                )
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
                 and StateType.PD_HIDDEN in state_types
                 and pd_hidden_len > 0
             ):
@@ -1485,42 +1489,49 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-                allocated_hidden_indices = dspark_pool.alloc(pd_hidden_window_rows)
-                if allocated_hidden_indices is None:
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    now = time.monotonic()
-                    if (
-                        now - self._last_pd_hidden_recv_credit_warning_time
-                        > 30
-                    ):
-                        logger.warning(
-                            "PD decode hidden pool blocked prealloc: "
-                            "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
-                            "prealloc_queue=%d transfer_queue=%d",
-                            decode_req.req.rid,
-                            pd_hidden_window_rows,
-                            pd_hidden_len,
-                            dspark_pool.available_size(),
-                            dspark_pool.size,
-                            len(self.queue),
-                            len(self.transfer_queue.queue),
-                        )
-                        self._last_pd_hidden_recv_credit_warning_time = now
-                    continue
-
                 pd_hidden_dst_indices_by_pp = {}
-                for pp_rank, pp_slice in pp_slices.items():
-                    if int(pp_slice.get("slice_len", 0)) <= 0:
+                pd_hidden_dynamic_allocation = bool(
+                    self.kv_manager.supports_pd_hidden_dynamic_allocation()
+                )
+                if pd_hidden_dynamic_allocation:
+                    # Bootstrap establishes the room, KV destination and hidden
+                    # layout only. Receive rows are granted later, in FIFO order,
+                    # after prefill has produced an actual hidden chunk.
+                    for pp_rank, pp_slice in pp_slices.items():
                         pp_slice["dst_indices"] = []
                         pd_hidden_dst_indices_by_pp[int(pp_rank)] = []
+                else:
+                    allocated_hidden_indices = dspark_pool.alloc(pd_hidden_window_rows)
+                    if allocated_hidden_indices is None:
+                        if prefix_len > 0:
+                            self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        now = time.monotonic()
+                        if now - self._last_pd_hidden_recv_credit_warning_time > 30:
+                            logger.warning(
+                                "PD decode hidden pool blocked prealloc: "
+                                "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
+                                "prealloc_queue=%d transfer_queue=%d",
+                                decode_req.req.rid,
+                                pd_hidden_window_rows,
+                                pd_hidden_len,
+                                dspark_pool.available_size(),
+                                dspark_pool.size,
+                                len(self.queue),
+                                len(self.transfer_queue.queue),
+                            )
+                            self._last_pd_hidden_recv_credit_warning_time = now
                         continue
-                    pp_slice["dst_indices"] = [
-                        int(x) for x in allocated_hidden_indices
-                    ]
-                    pd_hidden_dst_indices_by_pp[int(pp_rank)] = [
-                        int(x) for x in allocated_hidden_indices
-                    ]
+                    for pp_rank, pp_slice in pp_slices.items():
+                        if int(pp_slice.get("slice_len", 0)) <= 0:
+                            pp_slice["dst_indices"] = []
+                            pd_hidden_dst_indices_by_pp[int(pp_rank)] = []
+                            continue
+                        pp_slice["dst_indices"] = [
+                            int(x) for x in allocated_hidden_indices
+                        ]
+                        pd_hidden_dst_indices_by_pp[int(pp_rank)] = [
+                            int(x) for x in allocated_hidden_indices
+                        ]
                 pd_hidden_pp_slices = pp_slices
                 hidden_end = int(pd_hidden_start + pd_hidden_len)
                 decode_req.pd_hidden_state = (
@@ -1528,11 +1539,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         int(pd_hidden_start), hidden_end
                     )
                     if pd_hidden_streaming
-                    else PDHiddenRequestState.full(
-                        int(pd_hidden_start), hidden_end
-                    )
+                    else PDHiddenRequestState.full(int(pd_hidden_start), hidden_end)
                 )
-                if pp_size == 1:
+                if pp_size == 1 and not pd_hidden_dynamic_allocation:
                     pd_hidden_dst_indices = pd_hidden_dst_indices_by_pp.get(0)
 
             dst_kv_indices = self._pre_alloc(
@@ -1545,6 +1554,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.pd_hidden_dst_indices_by_pp = pd_hidden_dst_indices_by_pp
             decode_req.pd_hidden_pp_slices = pd_hidden_pp_slices
             decode_req.pd_hidden_start = pd_hidden_start
+            decode_req.pd_hidden_dynamic_allocation = pd_hidden_dynamic_allocation
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1593,9 +1603,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dsv4_dcp_transfer = (
                 isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 or isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-            ) and (
-                dcp_size_local > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get()
-            )
+            ) and (dcp_size_local > 1 or envs.SGLANG_DSV4_ENABLE_DCP.get())
             if dcp_size_local > 1 and not dsv4_dcp_transfer:
                 kv_indices = filter_kv_indices_for_dcp_rank(
                     kv_indices, dcp_size_local, dcp_rank_local
@@ -1635,9 +1643,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full.cpu().numpy(),
                         np.array([window_start], dtype=np.int32),
                     ]
-                return kv_to_page_indices(
-                    window_kv_indices_swa_np, page_size
-                )
+                return kv_to_page_indices(window_kv_indices_swa_np, page_size)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1710,8 +1716,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices = None
 
             metadata_state_indices = state_indices
-            if dsv4_dcp_transfer and state_indices and isinstance(
-                state_indices[0], (list, tuple)
+            if (
+                dsv4_dcp_transfer
+                and state_indices
+                and isinstance(state_indices[0], (list, tuple))
             ):
                 # DSV4 transfer carries an expanded SWA payload:
                 # [swa_locs, swa_pages, full_locs, position_offset].
@@ -1739,8 +1747,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 spec_metadata = {
                     "pd_hidden": True,
                     "streaming_hidden": bool(decode_req.pd_hidden_state.streaming),
+                    "dynamic_hidden_allocation": bool(pd_hidden_dynamic_allocation),
                     "streaming_window_rows": int(
-                        max(
+                        pd_hidden_window_rows
+                        if pd_hidden_dynamic_allocation
+                        else max(
                             (
                                 len(indices)
                                 for indices in (
@@ -1767,11 +1778,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                                 int(x) for x in pp_slice.get("dst_indices", [])
                             ],
                         }
-                        for pp_rank, pp_slice in (
-                            pd_hidden_pp_slices or {}
-                        ).items()
+                        for pp_rank, pp_slice in (pd_hidden_pp_slices or {}).items()
                     },
-                    "hidden_size": int(self.metadata_buffers.pd_hidden_pool.hidden_size),
+                    "hidden_size": int(
+                        self.metadata_buffers.pd_hidden_pool.hidden_size
+                    ),
                     "target_layer_ids": [int(x) for x in target_layer_ids],
                 }
 
@@ -2250,9 +2261,7 @@ def alloc_for_decode_prealloc(
                 prefix_lens=torch.tensor(
                     [total_prefix_len], dtype=torch.int64, device=device
                 ),
-                prefix_lens_cpu=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64
-                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
@@ -2301,6 +2310,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
         self.kv_manager = None
+        self._last_pd_hidden_dynamic_credit_warning_time = 0.0
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2314,6 +2324,151 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and dr.kv_receiver.require_staging
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
+
+    def _drain_pd_hidden_alloc_requests(self) -> None:
+        kv_manager = getattr(self, "kv_manager", None)
+        if kv_manager is None:
+            return
+        pop_requests = getattr(kv_manager, "pop_pd_hidden_alloc_requests", None)
+        requeue_requests = getattr(kv_manager, "requeue_pd_hidden_alloc_requests", None)
+        grant_rows = getattr(kv_manager, "grant_pd_hidden_rows", None)
+        if pop_requests is None or requeue_requests is None or grant_rows is None:
+            return
+
+        requests = pop_requests()
+        if not requests:
+            return
+        room_to_req = {
+            int(decode_req.req.bootstrap_room): decode_req for decode_req in self.queue
+        }
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        deferred = []
+        for request_index, request in enumerate(requests):
+            room = int(request["room"])
+            request_status = kv_manager.request_status.get(room)
+            decode_req = room_to_req.get(room)
+            if decode_req is None:
+                # A request can arrive just before the scheduler moves the room
+                # into this queue. Keep it only while the room is still live;
+                # late packets after clear/abort must not accumulate forever.
+                if request_status not in (
+                    None,
+                    KVPoll.Failed,
+                    KVPoll.Success,
+                ):
+                    deferred.append(request)
+                continue
+            # KV completion can race ahead of a later hidden allocation request.
+            # Keep servicing the room while its decode request is still queued.
+            if request_status in (None, KVPoll.Failed):
+                continue
+            if not decode_req.pd_hidden_dynamic_allocation:
+                error_message = (
+                    "Received dynamic PD hidden allocation request for a static "
+                    f"room: rid={decode_req.req.rid}, room={room}"
+                )
+                kv_manager.record_failure(room, error_message)
+                kv_manager.update_status(room, KVPoll.Failed)
+                continue
+            if pool is None:
+                kv_manager.record_failure(
+                    room, "PD hidden row pool disappeared during dynamic allocation."
+                )
+                kv_manager.update_status(room, KVPoll.Failed)
+                continue
+
+            row_len = int(request["row_len"])
+            hidden_start = int(request["hidden_start"])
+            hidden_state = decode_req.pd_hidden_state
+            if row_len <= 0 or row_len > pool.size:
+                kv_manager.record_failure(
+                    room,
+                    "Invalid dynamic PD hidden allocation size: "
+                    f"rows={row_len}, pool_rows={pool.size}",
+                )
+                kv_manager.update_status(room, KVPoll.Failed)
+                continue
+            if hidden_start < hidden_state.next_start:
+                # Duplicate/stale request after the corresponding chunk has
+                # already advanced. It was granted previously and needs no new
+                # allocation.
+                continue
+            first_chunk_can_advance = (
+                hidden_start > hidden_state.next_start
+                and hidden_state.next_start == hidden_state.start
+            )
+            if (
+                (
+                    hidden_start != hidden_state.next_start
+                    and not first_chunk_can_advance
+                )
+                or hidden_start + row_len > hidden_state.end
+                or bool(request["is_last_hidden_chunk"])
+                != (hidden_start + row_len == hidden_state.end)
+            ):
+                kv_manager.record_failure(
+                    room,
+                    "Invalid dynamic PD hidden allocation range: "
+                    f"start={hidden_start}, rows={row_len}, "
+                    f"expected_start={hidden_state.next_start}, "
+                    f"hidden_end={hidden_state.end}, "
+                    f"is_last={request['is_last_hidden_chunk']}",
+                )
+                kv_manager.update_status(room, KVPoll.Failed)
+                continue
+            key = (
+                int(request["prefill_rank"]),
+                hidden_start,
+                str(request["session_id"]),
+            )
+            allocation = decode_req.pd_hidden_dynamic_allocations.get(key)
+            if allocation is None:
+                dst_indices = pool.alloc(row_len)
+                if dst_indices is None:
+                    deferred.extend(requests[request_index:])
+                    now = time.monotonic()
+                    if now - self._last_pd_hidden_dynamic_credit_warning_time > 30:
+                        logger.warning(
+                            "PD decode hidden pool waiting for dynamic credit: "
+                            "rid=%s room=%s rows=%d free_rows=%d pool_rows=%d "
+                            "ready_requests=%d transfer_queue=%d",
+                            decode_req.req.rid,
+                            room,
+                            row_len,
+                            pool.available_size(),
+                            pool.size,
+                            len(requests) - request_index,
+                            len(self.queue),
+                        )
+                        self._last_pd_hidden_dynamic_credit_warning_time = now
+                    break
+                allocation = {
+                    "request": dict(request),
+                    "dst_indices": [int(x) for x in dst_indices],
+                }
+                decode_req.pd_hidden_dynamic_allocations[key] = allocation
+            elif len(allocation["dst_indices"]) != row_len:
+                kv_manager.record_failure(
+                    room,
+                    "Conflicting dynamic PD hidden allocation request: "
+                    f"key={key}, existing_rows={len(allocation['dst_indices'])}, "
+                    f"requested_rows={row_len}",
+                )
+                kv_manager.update_status(room, KVPoll.Failed)
+                continue
+
+            try:
+                grant_rows(request, allocation["dst_indices"])
+            except Exception:
+                logger.exception(
+                    "Failed to grant dynamic PD hidden rows: room=%s key=%s",
+                    room,
+                    key,
+                )
+                deferred.extend(requests[request_index:])
+                break
+
+        requeue_requests(deferred)
 
     def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req) -> None:
         if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
@@ -2412,11 +2567,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.cache_protected_len = old_cache_protected_len
 
     def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
-        wait_ack_completions = getattr(
-            self.kv_manager, "wait_pd_hidden_ack_completions", None
+        indices_by_pp = getattr(decode_req, "pd_hidden_dst_indices_by_pp", None)
+        indices = getattr(decode_req, "pd_hidden_dst_indices", None)
+        dynamic_allocations = getattr(decode_req, "pd_hidden_dynamic_allocations", {})
+        has_static_rows = bool(indices) or bool(
+            indices_by_pp
+            and any(bool(pp_indices) for pp_indices in indices_by_pp.values())
         )
-        if wait_ack_completions is not None and not wait_ack_completions(
-            decode_req.req.bootstrap_room
+        has_dynamic_rows = bool(dynamic_allocations)
+        kv_manager = getattr(self, "kv_manager", None)
+        wait_ack_completions = getattr(
+            kv_manager, "wait_pd_hidden_ack_completions", None
+        )
+        if (
+            (has_static_rows or has_dynamic_rows)
+            and wait_ack_completions is not None
+            and not wait_ack_completions(decode_req.req.bootstrap_room)
         ):
             logger.error(
                 "Timed out waiting for PD hidden ACK completion before "
@@ -2425,13 +2591,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.req.bootstrap_room,
             )
             return
-        pop_acked_chunks = getattr(
-            self.kv_manager, "pop_pd_hidden_acked_chunks", None
-        )
-        if pop_acked_chunks is not None:
-            pop_acked_chunks(decode_req.req.bootstrap_room)
-        indices_by_pp = decode_req.pd_hidden_dst_indices_by_pp
-        indices = decode_req.pd_hidden_dst_indices
+        self._consume_pd_hidden_acked_chunks(decode_req)
         pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if pool is not None:
             if indices_by_pp is not None:
@@ -2444,20 +2604,54 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     pool.free(pp_indices)
             elif indices is not None:
                 pool.free(indices)
+            seen_dynamic = set()
+            for allocation in dynamic_allocations.values():
+                dynamic_indices = allocation.get("dst_indices") or []
+                key = tuple(int(idx) for idx in dynamic_indices)
+                if not key or key in seen_dynamic:
+                    continue
+                seen_dynamic.add(key)
+                pool.free(dynamic_indices)
+        dynamic_allocations.clear()
         decode_req.pd_hidden_dst_indices = None
         decode_req.pd_hidden_dst_indices_by_pp = None
         decode_req.pd_hidden_pp_slices = None
-        decode_req.pd_hidden_state.reset()
+        hidden_state = getattr(decode_req, "pd_hidden_state", None)
+        if hidden_state is not None:
+            hidden_state.reset()
 
     def _consume_pd_hidden_acked_chunks(self, decode_req: DecodeRequest) -> None:
-        pop_acked_chunks = getattr(
-            self.kv_manager, "pop_pd_hidden_acked_chunks", None
-        )
+        kv_manager = getattr(self, "kv_manager", None)
+        if kv_manager is None:
+            return
+        pop_acked_chunks = getattr(kv_manager, "pop_pd_hidden_acked_chunks", None)
         if pop_acked_chunks is None:
             return
+        dynamic_allocations = getattr(decode_req, "pd_hidden_dynamic_allocations", {})
         for chunk in pop_acked_chunks(decode_req.req.bootstrap_room):
+            release_indices = chunk.get("release_indices") or []
+            if release_indices:
+                release_key = tuple(int(idx) for idx in release_indices)
+                allocation_key = next(
+                    (
+                        key
+                        for key, allocation in dynamic_allocations.items()
+                        if key[0] == int(chunk["prefill_rank"])
+                        and key[1] == int(chunk["hidden_start"])
+                        and tuple(int(idx) for idx in allocation.get("dst_indices", []))
+                        == release_key
+                    ),
+                    None,
+                )
+                if allocation_key is not None:
+                    pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+                    if pool is not None:
+                        pool.free(release_indices)
+                    dynamic_allocations.pop(allocation_key, None)
             if chunk.get("is_last_hidden_chunk"):
-                decode_req.pd_hidden_state.mark_hidden_done()
+                hidden_state = getattr(decode_req, "pd_hidden_state", None)
+                if hidden_state is not None:
+                    hidden_state.mark_hidden_done()
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2640,8 +2834,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _drain_pd_hidden_ready_chunks(self, decode_req: DecodeRequest) -> None:
-        hidden_state = decode_req.pd_hidden_state
-        if not hidden_state.streaming:
+        hidden_state = getattr(decode_req, "pd_hidden_state", None)
+        if hidden_state is None or not hidden_state.streaming:
             return
         pop_chunks = getattr(self.kv_manager, "pop_pd_hidden_ready_chunks", None)
         if pop_chunks is None:
@@ -2654,7 +2848,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if dspark_pool is None:
             raise RuntimeError("PD hidden row pool disappeared on decode.")
-        inject_chunk = getattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk", None)
+        inject_chunk = getattr(
+            self.scheduler.draft_worker, "inject_pd_hidden_chunk", None
+        )
         if inject_chunk is None:
             raise RuntimeError(
                 "PD streaming hidden requires draft_worker.inject_pd_hidden_chunk."
@@ -2711,9 +2907,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 hidden,
                 hidden_chunk.hidden_start,
             )
-            submit_ack = getattr(
-                self.kv_manager, "submit_pd_hidden_chunk_ack", None
-            )
+            submit_ack = getattr(self.kv_manager, "submit_pd_hidden_chunk_ack", None)
             if submit_ack is None:
                 raise RuntimeError(
                     "PD streaming hidden backend is missing ACK completion API."
@@ -2732,6 +2926,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prefill_rank=int(hidden_chunk.prefill_rank),
                 hidden_start=int(hidden_chunk.hidden_start),
                 is_last_hidden_chunk=hidden_chunk.is_last_hidden_chunk,
+                release_indices=(
+                    hidden_chunk.dst_indices
+                    if decode_req.pd_hidden_dynamic_allocation
+                    else None
+                ),
             )
 
     def _init_staging_handler(self, kv_manager):
@@ -2748,6 +2947,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
+
+        # Reclaim rows whose CUDA injection has completed before serving new
+        # allocation requests. This is the credit handoff that guarantees a
+        # completed chunk can unblock the oldest prefill-complete chunk.
+        for decode_req in self.queue:
+            try:
+                self._consume_pd_hidden_acked_chunks(decode_req)
+            except Exception as e:
+                room = decode_req.req.bootstrap_room
+                self.kv_manager.record_failure(
+                    room,
+                    "Failed to reclaim dynamically allocated PD hidden rows: "
+                    f"rid={decode_req.req.rid}, error={e}",
+                )
+                self.kv_manager.update_status(room, KVPoll.Failed)
+
+        # Allocation requests are emitted only after Prefill has materialized a
+        # hidden chunk. Grant rows before polling transfer completion so scarce
+        # receive credit follows prefill-completion order instead of bootstrap
+        # order.
+        self._drain_pd_hidden_alloc_requests()
 
         if self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(

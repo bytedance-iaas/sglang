@@ -16,6 +16,8 @@ from tqdm import tqdm
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
+)
+from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_req_state as pd_hidden_state,
 )
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
@@ -244,6 +246,12 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+
+                # The regular and non-PP disaggregated loops consume this
+                # marker at the top of every scheduling step.  PP disagg must
+                # do the same; otherwise AbortReq only records the chunked
+                # request and the remaining prompt chunks keep running.
+                self.process_pending_chunked_abort()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -1035,9 +1043,7 @@ class SchedulerPPMixin:
         if not batch or not get_pd_hidden_capture_layer_ids(batch.reqs):
             return False
         capture_reqs = [
-            req
-            for req in batch.reqs
-            if pd_hidden_state(req).capture_layer_ids
+            req for req in batch.reqs if pd_hidden_state(req).capture_layer_ids
         ]
         if not capture_reqs:
             return False
@@ -1055,9 +1061,7 @@ class SchedulerPPMixin:
         if proxy is None:
             return
         tensors = proxy.tensors
-        aux_keys = [
-            key for key in tensors if key.startswith("pd_aux_hidden_states_")
-        ]
+        aux_keys = [key for key in tensors if key.startswith("pd_aux_hidden_states_")]
         for key in aux_keys:
             tensors.pop(key, None)
 

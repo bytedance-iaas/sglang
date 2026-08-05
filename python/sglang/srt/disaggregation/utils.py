@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
-import logging
 import threading
 from collections import deque
 from contextlib import nullcontext
@@ -19,8 +19,8 @@ from typing import (
     overload,
 )
 
-import numpy as np
 import msgspec
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -262,6 +262,7 @@ class PDHiddenRowPool:
         self._free_intervals = [(0, self.size - 1)] if self.size else []
         self._free_count = self.size
         self.lock = threading.Lock()
+        self._credit_cv = threading.Condition(self.lock)
 
     def available_size(self) -> int:
         with self.lock:
@@ -272,37 +273,57 @@ class PDHiddenRowPool:
         if n <= 0:
             return []
         with self.lock:
-            if n > self._free_count:
+            return self._alloc_locked(n)
+
+    def alloc_wait(
+        self, n: int, timeout: Optional[float] = None
+    ) -> Optional[List[int]]:
+        """Wait for row credit instead of failing on transient exhaustion."""
+        n = int(n)
+        if n <= 0:
+            return []
+        if n > self.size:
+            return None
+        with self._credit_cv:
+            if not self._credit_cv.wait_for(
+                lambda: n <= self._free_count,
+                timeout=None if timeout is None else float(timeout),
+            ):
                 return None
+            return self._alloc_locked(n)
 
-            for interval_idx, (start, end) in enumerate(self._free_intervals):
-                if end - start + 1 < n:
-                    continue
-                allocated_end = start + n - 1
-                if allocated_end == end:
-                    self._free_intervals.pop(interval_idx)
-                else:
-                    self._free_intervals[interval_idx] = (allocated_end + 1, end)
-                self._free_count -= n
-                return list(range(start, allocated_end + 1))
+    def _alloc_locked(self, n: int) -> Optional[List[int]]:
+        if n > self._free_count:
+            return None
 
-            # Preserve the previous fallback behavior when fragmentation leaves
-            # no contiguous run: consume the lowest free rows across intervals.
-            remaining = n
-            indices = []
-            updated_intervals = []
-            for start, end in self._free_intervals:
-                if remaining == 0:
-                    updated_intervals.append((start, end))
-                    continue
-                take = min(remaining, end - start + 1)
-                indices.extend(range(start, start + take))
-                remaining -= take
-                if start + take <= end:
-                    updated_intervals.append((start + take, end))
-            self._free_intervals = updated_intervals
+        for interval_idx, (start, end) in enumerate(self._free_intervals):
+            if end - start + 1 < n:
+                continue
+            allocated_end = start + n - 1
+            if allocated_end == end:
+                self._free_intervals.pop(interval_idx)
+            else:
+                self._free_intervals[interval_idx] = (allocated_end + 1, end)
             self._free_count -= n
-            return indices
+            return list(range(start, allocated_end + 1))
+
+        # Preserve the previous fallback behavior when fragmentation leaves
+        # no contiguous run: consume the lowest free rows across intervals.
+        remaining = n
+        indices = []
+        updated_intervals = []
+        for start, end in self._free_intervals:
+            if remaining == 0:
+                updated_intervals.append((start, end))
+                continue
+            take = min(remaining, end - start + 1)
+            indices.extend(range(start, start + take))
+            remaining -= take
+            if start + take <= end:
+                updated_intervals.append((start + take, end))
+        self._free_intervals = updated_intervals
+        self._free_count -= n
+        return indices
 
     def free(self, indices: Optional[List[int]]) -> None:
         if not indices:
@@ -347,17 +368,13 @@ class PDHiddenRowPool:
 
             merged = []
             existing_idx = freed_idx = 0
-            while (
-                existing_idx < len(self._free_intervals)
-                or freed_idx < len(freed_intervals)
+            while existing_idx < len(self._free_intervals) or freed_idx < len(
+                freed_intervals
             ):
-                if (
-                    freed_idx == len(freed_intervals)
-                    or (
-                        existing_idx < len(self._free_intervals)
-                        and self._free_intervals[existing_idx][0]
-                        < freed_intervals[freed_idx][0]
-                    )
+                if freed_idx == len(freed_intervals) or (
+                    existing_idx < len(self._free_intervals)
+                    and self._free_intervals[existing_idx][0]
+                    < freed_intervals[freed_idx][0]
                 ):
                     interval = self._free_intervals[existing_idx]
                     existing_idx += 1
@@ -370,6 +387,7 @@ class PDHiddenRowPool:
                     merged.append(interval)
             self._free_intervals = merged
             self._free_count += len(to_free)
+            self._credit_cv.notify_all()
 
     def write(self, indices: List[int], hidden: torch.Tensor) -> None:
         if not indices:
@@ -431,7 +449,7 @@ class PDHiddenTransferPlan(msgspec.Struct):
     row_chunks: List[Dict[str, Any]]
 
     @classmethod
-    def build(cls, row_count: int, item_len: int) -> "PDHiddenTransferPlan":
+    def build(cls, row_count: int, item_len: int) -> PDHiddenTransferPlan:
         row_count = int(row_count)
         item_len = int(item_len)
         if row_count <= 0:
@@ -493,7 +511,9 @@ class PDHiddenTransferPlan(msgspec.Struct):
             return new_dynamic_dst
 
         if item_len > 0:
-            new_dynamic_dst["ptr"] = int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            new_dynamic_dst["ptr"] = (
+                int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            )
         plan = PDHiddenTransferPlan.build(new_row_count, item_len)
         new_dynamic_dst["row_chunks"] = plan.row_chunks
         return new_dynamic_dst
