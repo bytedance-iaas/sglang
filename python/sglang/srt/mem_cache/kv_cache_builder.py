@@ -62,15 +62,11 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
-    nested_draft_worker = draft_worker.draft_worker
-    if nested_draft_worker is None:
-        return None
-
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
-        draft_runner = nested_draft_worker.draft_runner_list[0]
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
-        draft_runner = nested_draft_worker.draft_runner
+        draft_runner = draft_worker.draft_worker.draft_runner
     return draft_runner.token_to_kv_pool
 
 
