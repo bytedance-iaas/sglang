@@ -23,8 +23,14 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+from sglang.srt.distributed.communication_op import (
+    cuda_graph_collective_break as communication_op_collective_break,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
+)
+from sglang.srt.distributed.parallel_state import (
+    cuda_graph_collective_break as parallel_state_collective_break,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
@@ -74,6 +80,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
+        self._enable_collective_break = (
+            getattr(cuda_graph_runner, "prefill_backend_name", None) == "breakable"
+            and cuda_graph_runner.model_runner.server_args.nnodes > 1
+        )
+        self._prewarmed_outputs: Dict[Any, Any] = {}
         self._shared_output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -96,13 +107,40 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._shared_output_buffer = None
         self.begin_cuda_graph_capture()
         try:
-            with self.replay_session():
+            with (
+                self.replay_session(),
+                communication_op_collective_break(self._enable_collective_break),
+                parallel_state_collective_break(self._enable_collective_break),
+            ):
                 yield
         finally:
             try:
                 self.end_cuda_graph_capture()
             finally:
                 self._capture_stream = None
+
+    def prewarm_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Warm a shape before the multi-node graph-capture communicator mode.
+
+        ``graph_capture()`` changes model-parallel groups to their graph-mode
+        communicators and capture stream. Multi-node BCG must compile and
+        autotune each shape before entering that context; the resulting output
+        is retained only until ``capture_one`` allocates or reuses its shared
+        output buffer.
+        """
+        warmup_out = None
+        for _ in range(2):
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            warmup_out = forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
+        self._prewarmed_outputs[shape_key] = warmup_out
 
     def capture_one(
         self,
@@ -111,13 +149,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        warmup_out = None
-        for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            warmup_out = forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        if shape_key in self._prewarmed_outputs:
+            warmup_out = self._prewarmed_outputs.pop(shape_key)
+        else:
+            warmup_out = None
+            for _ in range(2):
+                self._device_module.synchronize()
+                self._tp_group.barrier()
+                warmup_out = forward_fn()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
@@ -253,5 +294,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._capture_inputs.clear()
+        self._prewarmed_outputs.clear()
         self._pool = None
         self._shared_output_buffer = None

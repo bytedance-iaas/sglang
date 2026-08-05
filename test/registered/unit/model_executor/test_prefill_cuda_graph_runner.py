@@ -1,5 +1,6 @@
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -8,6 +9,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.distributed import communication_op
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -20,6 +22,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,17 +72,18 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
         runner.capture_num_tokens = [4, 2048, 128]
-        runner.device_module = SimpleNamespace(
-            synchronize=lambda: calls.append("synchronize")
-        )
+        runner._capture_chunked_prefix = False
+        runner._prefix_capture_variants = []
         runner.model_runner = SimpleNamespace(
             server_args=SimpleNamespace(nnodes=2),
-            tp_group=SimpleNamespace(barrier=lambda: calls.append("barrier")),
         )
-        forward_batch = object()
-        runner._prepare_capture_shape = lambda num_tokens: (
-            calls.append(("prepare", num_tokens)) or (forward_batch, object(), object())
-        )
+        batches = {num_tokens: object() for num_tokens in runner.capture_num_tokens}
+
+        def prepare(num_tokens, *, prefix_num_chunks=0):
+            calls.append(("prepare", num_tokens, prefix_num_chunks))
+            return batches[num_tokens], object(), ShapeKey(size=num_tokens)
+
+        runner._prepare_capture_shape = prepare
         runner._run_forward = lambda batch, num_tokens: calls.append(
             ("forward", batch, num_tokens)
         )
@@ -93,21 +97,97 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         runner.backend.replay_session = lambda: _ReplaySession()
 
+        def prewarm_one(shape_key, forward_fn):
+            calls.append(("prewarm", shape_key.size))
+            forward_fn()
+            forward_fn()
+
+        runner.backend.prewarm_one = prewarm_one
+
         runner._prewarm_multinode_breakable_capture()
 
         self.assertEqual(
             calls,
             [
-                "synchronize",
-                "barrier",
                 "replay_enter",
-                ("prepare", 2048),
-                ("forward", forward_batch, 2048),
+                ("prepare", 128, 0),
+                ("prewarm", 128),
+                ("forward", batches[128], 128),
+                ("forward", batches[128], 128),
+                ("prepare", 2048, 0),
+                ("prewarm", 2048),
+                ("forward", batches[2048], 2048),
+                ("forward", batches[2048], 2048),
+                ("prepare", 4, 0),
+                ("prewarm", 4),
+                ("forward", batches[4], 4),
+                ("forward", batches[4], 4),
                 "replay_exit",
-                "synchronize",
-                "barrier",
             ],
         )
+
+    def test_breakable_backend_prewarm_retains_last_output(self):
+        calls = []
+        backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        backend._device_module = SimpleNamespace(
+            synchronize=lambda: calls.append("synchronize")
+        )
+        backend._tp_group = SimpleNamespace(barrier=lambda: calls.append("barrier"))
+        backend._prewarmed_outputs = {}
+        outputs = iter(("first", "second"))
+        shape_key = ShapeKey(size=2048)
+
+        backend.prewarm_one(shape_key, lambda: next(outputs))
+
+        self.assertEqual(backend._prewarmed_outputs[shape_key], "second")
+        self.assertEqual(calls, ["synchronize", "barrier", "synchronize", "barrier"])
+
+    def test_collective_break_context_is_scoped(self):
+        tensor = object()
+        with (
+            patch.object(
+                communication_op,
+                "_tensor_model_parallel_all_reduce",
+                return_value="eager",
+            ) as eager,
+            patch.object(
+                communication_op,
+                "bcg_tensor_model_parallel_all_reduce",
+                return_value="break",
+            ) as graph_break,
+        ):
+            self.assertEqual(
+                communication_op.tensor_model_parallel_all_reduce(tensor), "eager"
+            )
+            with communication_op.cuda_graph_collective_break():
+                self.assertEqual(
+                    communication_op.tensor_model_parallel_all_reduce(tensor),
+                    "break",
+                )
+            self.assertEqual(
+                communication_op.tensor_model_parallel_all_reduce(tensor), "eager"
+            )
+
+        self.assertEqual(eager.call_count, 2)
+        graph_break.assert_called_once_with(tensor)
+
+    def test_multinode_prefill_bcg_sets_nccl_launch_order_only_for_prefill(self):
+        args = ServerArgs.__new__(ServerArgs)
+        args.nnodes = 2
+        args.cuda_graph_config = SimpleNamespace(
+            prefill=SimpleNamespace(backend=Backend.BREAKABLE)
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_LAUNCH_ORDER_IMPLICIT", None)
+            args._handle_multinode_prefill_bcg_collectives()
+            self.assertEqual(os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"], "1")
+
+        args.cuda_graph_config.prefill.backend = Backend.DISABLED
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_LAUNCH_ORDER_IMPLICIT", None)
+            args._handle_multinode_prefill_bcg_collectives()
+            self.assertNotIn("NCCL_LAUNCH_ORDER_IMPLICIT", os.environ)
 
     def test_capture_prewarm_skips_single_node_and_non_breakable(self):
         for backend, nnodes in (

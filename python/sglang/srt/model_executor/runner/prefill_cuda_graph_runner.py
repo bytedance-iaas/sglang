@@ -1308,43 +1308,62 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_one_stream()
 
     def _prewarm_multinode_breakable_capture(self) -> None:
-        """Run the largest BCG shape once before opening a capture session.
+        """Warm every BCG shape before graph-mode collectives are enabled.
 
-        A multi-node TP group can otherwise lazily initialize CUDA modules on
-        one rank while another rank already has cross-node NCCL work in flight
-        inside the first BCG warmup.  A device synchronization at that point
-        can deadlock the whole capture.  Running the exact BCG model path once
-        outside graph capture makes module loading and kernel initialization
-        finish before any capture stream owns collective work.
+        Multi-node ``graph_capture()`` changes TP collectives to graph-mode
+        communicators on a capture stream. A normal BCG ``capture_one`` first
+        runs two full-model warmups inside that context, which can deadlock
+        before segmented capture starts. Run those exact warmups here instead;
+        ``BreakableCudaGraphBackend.capture_one`` consumes the retained output
+        and proceeds directly to segmented capture, where collectives are
+        explicit eager graph breaks.
 
-        Keep this narrowly scoped to multi-node Breakable prefill graphs: the
-        other backends do not segment a forward around eager collectives, and
-        single-node capture does not cross the affected transport boundary.
+        This stays limited to multi-node Breakable prefill graphs. Decode Full
+        Graph, single-node graphs, and other prefill backends keep their current
+        warmup and capture lifecycle.
         """
         if not isinstance(self.backend, BreakableCudaGraphBackend):
             return
         if self.model_runner.server_args.nnodes <= 1:
             return
 
-        num_tokens = max(self.capture_num_tokens)
+        shape_specs = [
+            (num_tokens, prefix_num_chunks)
+            for num_tokens in reversed(self.capture_num_tokens)
+            for prefix_num_chunks in (
+                [0, *self._prefix_capture_variants]
+                if self._capture_chunked_prefix
+                else [0]
+            )
+        ]
         logger.info(
-            "Prewarming multi-node Breakable prefill CUDA graph before capture. "
-            "num_tokens=%d nnodes=%d",
-            num_tokens,
+            "Prewarming multi-node Breakable prefill CUDA graph shapes before "
+            "capture. num_shapes=%d nnodes=%d",
+            len(shape_specs),
             self.model_runner.server_args.nnodes,
         )
-        self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
         start = time.perf_counter()
         with self.backend.replay_session():
-            forward_batch, _, _ = self._prepare_capture_shape(num_tokens)
-            self._run_forward(forward_batch, num_tokens)
-        self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
+            for num_tokens, prefix_num_chunks in shape_specs:
+                if get_parallel().tp_rank == 0:
+                    logger.info(
+                        "Prewarming multi-node Breakable prefill CUDA graph shape. "
+                        "num_tokens=%d prefix_num_chunks=%d",
+                        num_tokens,
+                        prefix_num_chunks,
+                    )
+                forward_batch, _, shape_key = self._prepare_capture_shape(
+                    num_tokens, prefix_num_chunks=prefix_num_chunks
+                )
+
+                def run_once(forward_batch=forward_batch, num_tokens=num_tokens) -> Any:
+                    return self._run_forward(forward_batch, num_tokens)
+
+                self.backend.prewarm_one(shape_key, run_once)
         logger.info(
-            "Prewarmed multi-node Breakable prefill CUDA graph before capture. "
-            "num_tokens=%d elapsed=%.2f s",
-            num_tokens,
+            "Prewarmed multi-node Breakable prefill CUDA graph shapes before "
+            "capture. num_shapes=%d elapsed=%.2f s",
+            len(shape_specs),
             time.perf_counter() - start,
         )
 

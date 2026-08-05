@@ -2,10 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
-from typing import Any, Dict, Optional, Tuple, Union
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
 import torch
 import torch.distributed
+
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 
 from .parallel_state import (
     get_attn_tp_group,
@@ -14,10 +20,41 @@ from .parallel_state import (
     get_tp_group,
 )
 
+_enable_cuda_graph_collective_break: ContextVar[bool] = ContextVar(
+    "enable_cuda_graph_collective_break", default=False
+)
+
+
+@contextmanager
+def cuda_graph_collective_break(enabled: bool = True) -> Iterator[None]:
+    """Route model-parallel collectives through BCG eager break points.
+
+    The context is intentionally scoped to the owning Breakable-CUDA-Graph
+    capture session. Outside an active BCG capture, ``eager_on_graph`` calls
+    the underlying collective directly, so eager execution keeps its existing
+    behavior.
+    """
+    token = _enable_cuda_graph_collective_break.set(enabled)
+    try:
+        yield
+    finally:
+        _enable_cuda_graph_collective_break.reset(token)
+
+
+def _tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_tp_group().all_reduce(input_)
+
+
+bcg_tensor_model_parallel_all_reduce = eager_on_graph(True)(
+    _tensor_model_parallel_all_reduce
+)
+
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    if _enable_cuda_graph_collective_break.get():
+        return bcg_tensor_model_parallel_all_reduce(input_)
+    return _tensor_model_parallel_all_reduce(input_)
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -85,9 +122,20 @@ def broadcast_tensor_dict(
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
 
 
+def _attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_attn_tp_group().all_reduce(input_)
+
+
+bcg_attention_tensor_model_parallel_all_reduce = eager_on_graph(True)(
+    _attention_tensor_model_parallel_all_reduce
+)
+
+
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_)
+    if _enable_cuda_graph_collective_break.get():
+        return bcg_attention_tensor_model_parallel_all_reduce(input_)
+    return _attention_tensor_model_parallel_all_reduce(input_)
 
 
 def attention_tensor_model_parallel_quant_all_reduce(
@@ -97,11 +145,33 @@ def attention_tensor_model_parallel_quant_all_reduce(
     return get_attn_tp_group().quant_all_reduce(input_)
 
 
+def _moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_moe_tp_group().all_reduce(input_)
+
+
+bcg_moe_tensor_model_parallel_all_reduce = eager_on_graph(True)(
+    _moe_tensor_model_parallel_all_reduce
+)
+
+
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe parallel group."""
-    return get_moe_tp_group().all_reduce(input_)
+    if _enable_cuda_graph_collective_break.get():
+        return bcg_moe_tensor_model_parallel_all_reduce(input_)
+    return _moe_tensor_model_parallel_all_reduce(input_)
+
+
+def _moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_moe_ep_group().all_reduce(input_)
+
+
+bcg_moe_expert_parallel_all_reduce = eager_on_graph(True)(
+    _moe_expert_parallel_all_reduce
+)
 
 
 def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe expert parallel group."""
-    return get_moe_ep_group().all_reduce(input_)
+    if _enable_cuda_graph_collective_break.get():
+        return bcg_moe_expert_parallel_all_reduce(input_)
+    return _moe_expert_parallel_all_reduce(input_)

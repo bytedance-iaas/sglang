@@ -3631,6 +3631,36 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._handle_multinode_prefill_bcg_collectives()
+
+    def _handle_multinode_prefill_bcg_collectives(self):
+        """Preserve NCCL launch ordering for eager breaks between BCG segments.
+
+        The final resolved phase config is required here: Decode PD workers
+        disable their prefill graph, so this does not change Decode Full Graph
+        or its DeepEP path. The environment must be set before worker process
+        initialization creates NCCL communicators.
+        """
+        if not (
+            self.nnodes > 1
+            and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+        ):
+            return
+
+        launch_order = os.environ.get("NCCL_LAUNCH_ORDER_IMPLICIT")
+        if launch_order is None:
+            os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
+            logger.info(
+                "Set NCCL_LAUNCH_ORDER_IMPLICIT=1 for multi-node Breakable "
+                "prefill CUDA graph collective breaks."
+            )
+        elif launch_order != "1":
+            logger.warning(
+                "NCCL_LAUNCH_ORDER_IMPLICIT=%s may deadlock multi-node "
+                "Breakable prefill CUDA graph collective breaks; set it to 1 "
+                "unless this exact topology has been validated.",
+                launch_order,
+            )
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):

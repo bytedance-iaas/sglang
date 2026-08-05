@@ -32,10 +32,11 @@ import pickle
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from unittest.mock import patch
 
 import torch
@@ -46,6 +47,9 @@ from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -205,6 +209,24 @@ def reg_reduce_scatter_tensor(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._reduce_scatter_tensor(output, input)
+
+
+bcg_reg_all_gather_into_tensor = eager_on_graph(True)(reg_all_gather_into_tensor)
+bcg_reg_reduce_scatter_tensor = eager_on_graph(True)(reg_reduce_scatter_tensor)
+
+_enable_cuda_graph_collective_break: ContextVar[bool] = ContextVar(
+    "enable_parallel_state_cuda_graph_collective_break", default=False
+)
+
+
+@contextmanager
+def cuda_graph_collective_break(enabled: bool = True) -> Iterator[None]:
+    """Make gather/scatter collectives eager breaks during BCG capture."""
+    token = _enable_cuda_graph_collective_break.set(enabled)
+    try:
+        yield
+    finally:
+        _enable_cuda_graph_collective_break.reset(token)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -1034,6 +1056,8 @@ class GroupCoordinator:
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
+        elif _enable_cuda_graph_collective_break.get():
+            bcg_reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -1209,6 +1233,8 @@ class GroupCoordinator:
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._all_gather_into_tensor(output, input)
+        elif _enable_cuda_graph_collective_break.get():
+            bcg_reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
             # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
