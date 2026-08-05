@@ -1875,6 +1875,11 @@ class ServerArgs:
         "Enable debug/eager mode for CUDA graph using breakable CUDA graph. When enabled, graph breaks are inserted so every operation runs eagerly while still going through the CUDA graph capture / replay path. Useful for debugging CUDA graph capture / replay issues.",
         NS("exec.graph"),
     ] = False
+    enable_cuda_graph_collective_break: A[
+        bool,
+        "Run model-parallel collectives eagerly between Breakable CUDA graph segments. Intended for validated multi-node Prefill BCG deployments where recording collectives in graph segments can deadlock.",
+        NS("exec.graph"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Communication and kernels
@@ -3641,11 +3646,16 @@ class ServerArgs:
         or its DeepEP path. The environment must be set before worker process
         initialization creates NCCL communicators.
         """
+        if not self.enable_cuda_graph_collective_break:
+            return
         if not (
             self.nnodes > 1
             and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
         ):
-            return
+            raise ValueError(
+                "--enable-cuda-graph-collective-break requires nnodes > 1 and "
+                "cuda_graph_config[prefill].backend='breakable'."
+            )
 
         launch_order = os.environ.get("NCCL_LAUNCH_ORDER_IMPLICIT")
         if launch_order is None:

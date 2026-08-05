@@ -83,6 +83,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._enable_collective_break = (
             getattr(cuda_graph_runner, "prefill_backend_name", None) == "breakable"
             and cuda_graph_runner.model_runner.server_args.nnodes > 1
+            and cuda_graph_runner.model_runner.server_args.enable_cuda_graph_collective_break
         )
         self._prewarmed_outputs: Dict[Any, Any] = {}
         self._shared_output_buffer: Optional[Any] = None

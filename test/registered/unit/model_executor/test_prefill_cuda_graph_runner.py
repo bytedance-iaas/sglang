@@ -199,6 +199,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_multinode_prefill_bcg_sets_nccl_launch_order_only_for_prefill(self):
         args = ServerArgs.__new__(ServerArgs)
         args.nnodes = 2
+        args.enable_cuda_graph_collective_break = True
         args.cuda_graph_config = SimpleNamespace(
             prefill=SimpleNamespace(backend=Backend.BREAKABLE)
         )
@@ -208,7 +209,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             args._handle_multinode_prefill_bcg_collectives()
             self.assertEqual(os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"], "1")
 
-        args.cuda_graph_config.prefill.backend = Backend.DISABLED
+        args.enable_cuda_graph_collective_break = False
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("NCCL_LAUNCH_ORDER_IMPLICIT", None)
             args._handle_multinode_prefill_bcg_collectives()
