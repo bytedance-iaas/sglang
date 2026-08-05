@@ -12,8 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -46,15 +45,6 @@ if is_cuda() or is_musa():
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -155,7 +145,7 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    grammar_mask = getattr(sampling_info, "grammar_mask", None)
+    vocab_mask = getattr(sampling_info, "vocab_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
     logits_3d: Optional[torch.Tensor] = None
@@ -171,7 +161,7 @@ def apply_dflash_verify_logits_adjustments(
     # broadcast over the verify block without materializing a repeated buffer.
     if (
         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
+    ) or vocab_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
@@ -326,6 +316,21 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    
+    if sliding_window is None:
+        try:
+            import json
+            from pathlib import Path
+
+            model_path = _cfg_get(config, "_name_or_path")
+            if model_path:
+                config_path = Path(model_path) / "config.json"
+                if config_path.exists():
+                    raw_config = json.loads(config_path.read_text())
+                    sliding_window = raw_config.get("sliding_window")
+        except Exception:
+            sliding_window = None
+
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -595,43 +600,6 @@ def compute_dflash_correct_drafts_and_bonus(
     return correct_len, bonus.to(torch.int64)
 
 
-def apply_dflash_simulated_acceptance(
-    *,
-    candidates: torch.Tensor,
-    target_predict: Optional[torch.Tensor],
-    accept_len: torch.Tensor,
-    commit_lens: torch.Tensor,
-    bonus: torch.Tensor,
-    out_tokens: torch.Tensor,
-    simulate_acc_len: float,
-    simulate_acc_method: str,
-    simulate_acc_token_mode: str,
-    fixed_token_id: int = 100,
-) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
-    block_size = candidates.shape[1]
-
-    # _sample_simulated_acc_len clamps to [1, block_size].
-    forced_commit_len = _sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, block_size
-    )
-    forced_accept_len = forced_commit_len - 1
-
-    accept_len.fill_(forced_accept_len)
-    commit_lens.fill_(forced_commit_len)
-
-    if simulate_acc_token_mode != "real-draft-token":
-        bonus.fill_(fixed_token_id)
-        out_tokens.fill_(fixed_token_id)
-        return
-
-    out_tokens.zero_()
-    if forced_accept_len > 0:
-        out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
-    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
-    out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
-
-
 def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -681,13 +649,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.runtime_context import get_spec
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_single = get_spec().speculative_accept_threshold_single
+        threshold_single = get_server_args().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.runtime_context import get_spec
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_acc = get_spec().speculative_accept_threshold_acc
+        threshold_acc = get_server_args().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
@@ -846,5 +814,16 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
 
     return None

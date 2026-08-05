@@ -42,8 +42,7 @@ from sglang.srt.models.minimax_vl_common import (
     load_vision_weight,
     merge_vit_qkv_weights,
 )
-from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -55,15 +54,6 @@ _device_sm = get_device_sm()
 
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
-    )
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-
     def __init__(
         self,
         config,
@@ -75,7 +65,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         self.num_fused_shared_experts = 0
         self._determine_num_fused_shared_experts()
@@ -120,7 +110,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("language_model.lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -131,24 +121,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
+        self.capture_aux_hidden_states = False
 
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
         server_args = get_server_args()
-        if get_exec().moe.disable_shared_experts_fusion:
+        if server_args.disable_shared_experts_fusion:
             return
 
         disable_reason = None
         if not getattr(text_config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
-        elif (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "modelopt_mixed"
-        ):
-            disable_reason = (
-                "Shared and routed experts may use different quantization formats "
-                "in ModelOpt mixed-precision checkpoints."
-            )
         elif not _is_cuda:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif (_device_sm is not None) and (_device_sm < 80):
@@ -192,6 +175,19 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        for layer_id in self.model.layers_to_capture:
+            if self.model.start_layer <= layer_id < self.model.end_layer:
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
@@ -226,12 +222,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 
