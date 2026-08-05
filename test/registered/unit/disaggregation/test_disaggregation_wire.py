@@ -14,7 +14,9 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_transfer_entry_pairs,
     get_dsv4_c128_state_indices,
+    get_transfer_kv_layer_ids,
     setup_state_kv_args,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -23,6 +25,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -295,6 +298,34 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+
+class TestDSV4TransferLayerIds(CustomTestCase):
+    def test_compressed_entries_pair_pp_stage_with_full_decode_pool(self):
+        """Compressed bucket entries must not use the one-entry-per-layer heuristic."""
+        ratios = [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128]
+        prefill_pool = object.__new__(DeepSeekV4TokenToKVPool)
+        prefill_pool.compression_ratios = ratios
+        prefill_pool._stage_start = 0
+        prefill_pool._stage_end = 6
+        decode_pool = object.__new__(DeepSeekV4TokenToKVPool)
+        decode_pool.compression_ratios = ratios
+        decode_pool._stage_start = 0
+        decode_pool._stage_end = len(ratios)
+
+        prefill_layer_ids = get_transfer_kv_layer_ids(prefill_pool, num_entries=6)
+        decode_layer_ids = get_transfer_kv_layer_ids(
+            decode_pool, num_entries=len(decode_pool.get_kv_layer_ids())
+        )
+        pairs = build_transfer_entry_pairs(
+            prefill_layer_ids,
+            decode_layer_ids,
+            n_src=len(prefill_layer_ids),
+            n_dst=len(decode_layer_ids),
+        )
+
+        self.assertEqual(prefill_layer_ids, [2, 4, 2, 4, 3, 5])
+        self.assertEqual(pairs, [(0, 0), (1, 1), (2, 5), (3, 6), (4, 10), (5, 11)])
 
 
 if __name__ == "__main__":

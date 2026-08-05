@@ -1828,10 +1828,34 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                message = (
+                    f"Transfer thread failed because of {e}. "
+                    f"Prefill bootstrap_port={self.bootstrap_port}, room={kv_chunk.room}."
                 )
+                logger.exception(message)
+                self.record_failure(kv_chunk.room, message)
+                self.update_status(kv_chunk.room, KVPoll.Failed)
+                failure_prefill_rank = (
+                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                    + self.pp_rank * self.attn_cp_size
+                    + self.attn_cp_rank
+                )
+                for req in self.transfer_infos.get(kv_chunk.room, {}).values():
+                    if req.is_dummy:
+                        continue
+                    try:
+                        self.sync_status_to_decode_endpoint(
+                            req.endpoint,
+                            req.dst_port,
+                            req.room,
+                            KVPoll.Failed,
+                            failure_prefill_rank,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to propagate transfer failure for room=%s",
+                            kv_chunk.room,
+                        )
 
     def start_prefill_thread(self):
         def bootstrap_thread():
