@@ -1,0 +1,26 @@
+sgl-kernel/cmake/flashmla.cmake
+  s_deedc126f22ecb::t_3bc9bd1fdcf7ad 109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bfee5615e4210ee053b13599da77641fe95cc6f8",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_deedc126f22ecb": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a465851e127d6363e6f819a",
+        "model": "gpt-5.4__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

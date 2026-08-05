@@ -1,0 +1,21 @@
+python/sglang/srt/mem_cache/rotated_quant_dsv4_memory_pool.py
+  s_16dfd85b073934::t_8fbdec49e3733b 1339-1352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a6da10e89eaca4188c0922d4d8173f38e12ea238",
+  "prompts": {},
+  "sessions": {
+    "s_16dfd85b073934": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cb2e419d-3273-4708-9da4-35c52f383074",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

@@ -1,0 +1,14 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "69036c6f364090e35b52a046ed05245b9dc8b5e0",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

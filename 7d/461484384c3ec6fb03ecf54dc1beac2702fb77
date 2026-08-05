@@ -1,0 +1,21 @@
+test/manual/dsv4/run_dsv4_dcp_e2e_ab.py
+  s_3af354177588a3::t_c652c1f8ec20f1 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7d461484384c3ec6fb03ecf54dc1beac2702fb77",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

@@ -1,0 +1,21 @@
+python/sglang/jit_kernel/triton_rotated_quant_dsv4.py
+  s_16dfd85b073934::t_8694580d7d0e0c 38-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3c600007a3b64e00be0553eb1698b607bcb3dd9f",
+  "prompts": {},
+  "sessions": {
+    "s_16dfd85b073934": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cb2e419d-3273-4708-9da4-35c52f383074",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

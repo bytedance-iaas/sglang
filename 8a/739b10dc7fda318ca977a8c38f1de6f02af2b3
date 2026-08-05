@@ -1,0 +1,156 @@
+python/sglang/srt/layers/quantization/fp8.py
+  s_8517cfd3301c54::t_d343ebbd276a5b 1681 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a6314a4a9cf4e03972e36e7","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":1681}]}]}
+  s_8517cfd3301c54::t_dcf3155182856a 324-326,336,344,1201-1211 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a63145ba9cf4e03972e3668","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[324,326]},{"Single":336},{"Single":344},{"Range":[1201,1211]}]}]}
+python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+  s_8517cfd3301c54::t_dc1b598beed1c6 675-691 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a63149ea9cf4e03972e36b5","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[675,691]}]}]}
+  s_8517cfd3301c54::t_cfeaa77e9f6cf7 9-44 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a63144aa9cf4e03972e3636","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[9,44]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8a739b10dc7fda318ca977a8c38f1de6f02af2b3",
+  "prompts": {},
+  "sessions": {
+    "s_8517cfd3301c54": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5dd0b9a9cf4e03972dea48",
+        "model": "gpt-5.5__max"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/moe/moe_runner/deep_gemm.py": [
+      {
+        "hash": "s_8517cfd3301c54::t_dc1b598beed1c6",
+        "line_ranges": [
+          {
+            "Range": [
+              675,
+              691
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a63149ea9cf4e03972e36b5",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  675,
+                  691
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_8517cfd3301c54::t_cfeaa77e9f6cf7",
+        "line_ranges": [
+          {
+            "Range": [
+              9,
+              44
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a63144aa9cf4e03972e3636",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  9,
+                  44
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/fp8.py": [
+      {
+        "hash": "s_8517cfd3301c54::t_d343ebbd276a5b",
+        "line_ranges": [
+          {
+            "Single": 1681
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a6314a4a9cf4e03972e36e7",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 1681
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_8517cfd3301c54::t_dcf3155182856a",
+        "line_ranges": [
+          {
+            "Range": [
+              324,
+              326
+            ]
+          },
+          {
+            "Single": 336
+          },
+          {
+            "Single": 344
+          },
+          {
+            "Range": [
+              1201,
+              1211
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a63145ba9cf4e03972e3668",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  324,
+                  326
+                ]
+              },
+              {
+                "Single": 336
+              },
+              {
+                "Single": 344
+              },
+              {
+                "Range": [
+                  1201,
+                  1211
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {}
+}

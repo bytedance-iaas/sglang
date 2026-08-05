@@ -1,0 +1,105 @@
+python/sglang/jit_kernel/csrc/deepseek_v4/c128_online_v2.cuh
+  s_44bb987f53c03b::t_25c913119f22c1 735,750-753,773-774,806-807,924
+python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
+  s_44bb987f53c03b::t_da5c75d8b22fde 45,64,144,161-162,164,189,199-207,216-218,225,238-246,253-255,264-265,291-294,311,479-480,522-524,548,568,590,621,645
+python/sglang/jit_kernel/csrc/deepseek_v4/fused_norm_rope_v2.cuh
+  s_1b88656c3b4f2d::t_ac172f27a70073 52-53,61-71,114,121-122,425,432-433,559-561,603-604,618-619
+python/sglang/jit_kernel/csrc/deepseek_v4/online_c128_mtp.cuh
+  s_44bb987f53c03b::t_6c30833b4b8679 37,91,115,213,231,249-250,269-273,285,402-405
+python/sglang/jit_kernel/dsv4/compress.py
+  s_44bb987f53c03b::t_ca1b8ef0f4219e 41-52,70,109,125,237-238,254,294,349,374
+python/sglang/jit_kernel/dsv4/elementwise.py
+  s_44bb987f53c03b::t_3a7d3a31453e99 69-72,74
+python/sglang/jit_kernel/dsv4/online_c128_mtp.py
+  s_44bb987f53c03b::t_ee4113ca10e158 25,115-117,120,183
+python/sglang/srt/arg_groups/deepseek_v4_hook.py
+  s_44bb987f53c03b::t_4706c3c3343e53 65-109
+python/sglang/srt/disaggregation/base/conn.py
+  s_44bb987f53c03b::t_010fd0c07003b5 63-65,85-92,145
+python/sglang/srt/disaggregation/common/conn.py
+  s_44bb987f53c03b::t_50abd48ccea381 148-158,181,259-281,1151
+python/sglang/srt/disaggregation/common/utils.py
+  s_44bb987f53c03b::t_d51d6d3bbd24b4 27
+python/sglang/srt/disaggregation/fake/conn.py
+  s_44bb987f53c03b::t_0da3be8050e451 81
+python/sglang/srt/disaggregation/mori/conn.py
+  s_44bb987f53c03b::t_54310b351e63dc 1420
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_44bb987f53c03b::t_1143a98870de49 2483
+python/sglang/srt/disaggregation/prefill.py
+  s_44bb987f53c03b::t_2fe6a741547cb8 51,177-178,208,308-316,345-365,1094,1116-1138,1171-1182,1245-1255,1258-1262
+python/sglang/srt/disaggregation/utils.py
+  s_44bb987f53c03b::t_a0d9139b51bd5f 695-722
+python/sglang/srt/distributed/parallel_state.py
+  s_44bb987f53c03b::t_23cc1255091285 1754,2541-2543,2546-2549,2552-2554
+python/sglang/srt/environ.py
+  s_1b88656c3b4f2d::t_d0ad9e7236157d 997-1001
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_44bb987f53c03b::t_c6a89cb4a3fb7b 148-151
+python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py
+  s_44bb987f53c03b::t_2e0d3b26e10045 1378-1379,1387-1388
+python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py
+  s_44bb987f53c03b::t_30965262dca8ae 262,271,281,328-335,347,355,364,372,375-377
+python/sglang/srt/layers/attention/dsv4/compressor.py
+  s_1b88656c3b4f2d::t_008f4526a9b6b9 185,189-191,220,231
+python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+  s_44bb987f53c03b::t_98a097f753e613 29-35,499-503,509,565,572,593-599,608,614,618,637-639,641,645,649,651-653,665-666,673-674,684-685,689-695,720,740,773,800,827
+python/sglang/kernels/ops/attention/dsv4/index_buf_accessor.py
+  s_1b88656c3b4f2d::t_5090245fa255bc 36-54,57-67,71-89,97-99,133-140,154,172-174,184,202-204,207-210,213-222
+python/sglang/srt/layers/attention/dsv4/metadata.py
+  s_1b88656c3b4f2d::t_b7fa9695af7c27 15-60,130-133,220-236
+python/sglang/srt/mem_cache/allocator/__init__.py
+  s_44bb987f53c03b::t_d9f9dd00bcac03 4,13
+python/sglang/srt/mem_cache/allocator/dcp.py
+  s_44bb987f53c03b::t_d4d114356204d0 1-136
+python/sglang/srt/mem_cache/allocator/swa.py
+  s_44bb987f53c03b::t_21b163542c2f0c 4,33-34,62-78,80-99,372-377
+python/sglang/srt/model_executor/forward_batch_info.py
+  s_44bb987f53c03b::t_032b2e60984bbe 642-652,907-932,1425-1426,1526-1527
+python/sglang/srt/model_executor/model_runner.py
+  s_1b88656c3b4f2d::t_92d244ed85482a 265
+python/sglang/srt/model_executor/pool_configurator.py
+  s_44bb987f53c03b::t_49f6008981ad1b 58,314,572,719,725-726,778,788
+python/sglang/srt/server_args.py
+  s_44bb987f53c03b::t_c508893efd8c90 3158-3160,3169,3171-3176,7625-7648
+python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+  s_44bb987f53c03b::t_f464dda973702e 193-197,270,369-373,449,520,552-553,618-622,650-651,672-696,706-707
+python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+  s_44bb987f53c03b::t_f001e2ba6104b4 198-202,275,356-360,421,526-527,561-567,628-632
+python/sglang/srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py
+  s_44bb987f53c03b::t_5b0019605a3566 119,273-277,353,490-494,659-663,714,776-780
+python/sglang/srt/speculative/spec_utils.py
+  s_44bb987f53c03b::t_914a47e41b3fcf 657-667
+python/sglang/test/run_eval.py
+  s_1b88656c3b4f2d::t_f41610fe34f3d2 263-267
+scripts/playground/dcp_equivalence_check.py
+  s_1b88656c3b4f2d::t_d70d048760f431 1-541
+scripts/playground/dcp_equivalence_run.sh
+  s_1b88656c3b4f2d::t_8490f021d0f986 1-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0094505da74125a31ceb354f37ae7a1b6a97d3f5",
+  "prompts": {},
+  "sessions": {
+    "s_1b88656c3b4f2d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f26e2-e3f6-7f70-ab36-909afc5b9fef",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    },
+    "s_44bb987f53c03b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f26e0-ab87-7f00-9a53-d1c83988b0a5",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

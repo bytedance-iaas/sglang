@@ -1,0 +1,294 @@
+python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+  s_25f30d39e75a32::t_b408e3992e259a 843-849 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a32956e7cb3eaebe2eb9b91","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[843,849]}]}]}
+  s_25f30d39e75a32::t_c233a7bf6ef90e 865-875 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3295607cb3eaebe2eb9b8e","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[865,875]}]}]}
+  s_25f30d39e75a32::t_6b20b3edaaf628 705-721 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3294ed7cb3eaebe2eb9b6c","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[705,721]}]}]}
+python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py
+  s_25f30d39e75a32::t_92bc3e7d500471 245-285 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3295467cb3eaebe2eb9b85","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[245,285]}]}]}
+python/sglang/srt/models/minimax_m3.py
+  s_25f30d39e75a32::t_98ce53d3eca7b8 1847-1852,1875,1896-1906,1913-1916,1920-1937 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3295207cb3eaebe2eb9b78","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[1847,1852]},{"Single":1875},{"Range":[1896,1906]},{"Range":[1913,1916]},{"Range":[1920,1937]}]}]}
+  s_25f30d39e75a32::t_cdd12c9e2dc800 1783-1789 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3295067cb3eaebe2eb9b72","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[1783,1789]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "bd4555ef93b8a51e71f58b786bfbaf8451c1efe7",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_25f30d39e75a32": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3290da7cb3eaebe2eb9adc",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py": [
+      {
+        "hash": "s_25f30d39e75a32::t_b408e3992e259a",
+        "line_ranges": [
+          {
+            "Range": [
+              843,
+              849
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a32956e7cb3eaebe2eb9b91",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  843,
+                  849
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_25f30d39e75a32::t_c233a7bf6ef90e",
+        "line_ranges": [
+          {
+            "Range": [
+              865,
+              875
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3295607cb3eaebe2eb9b8e",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  865,
+                  875
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_25f30d39e75a32::t_6b20b3edaaf628",
+        "line_ranges": [
+          {
+            "Range": [
+              705,
+              721
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3294ed7cb3eaebe2eb9b6c",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  705,
+                  721
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py": [
+      {
+        "hash": "s_25f30d39e75a32::t_92bc3e7d500471",
+        "line_ranges": [
+          {
+            "Range": [
+              245,
+              285
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3295467cb3eaebe2eb9b85",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  245,
+                  285
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/models/minimax_m3.py": [
+      {
+        "hash": "s_25f30d39e75a32::t_98ce53d3eca7b8",
+        "line_ranges": [
+          {
+            "Range": [
+              1847,
+              1852
+            ]
+          },
+          {
+            "Single": 1875
+          },
+          {
+            "Range": [
+              1896,
+              1906
+            ]
+          },
+          {
+            "Range": [
+              1913,
+              1916
+            ]
+          },
+          {
+            "Range": [
+              1920,
+              1937
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3295207cb3eaebe2eb9b78",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  1847,
+                  1852
+                ]
+              },
+              {
+                "Single": 1875
+              },
+              {
+                "Range": [
+                  1896,
+                  1906
+                ]
+              },
+              {
+                "Range": [
+                  1913,
+                  1916
+                ]
+              },
+              {
+                "Range": [
+                  1920,
+                  1937
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_25f30d39e75a32::t_cdd12c9e2dc800",
+        "line_ranges": [
+          {
+            "Range": [
+              1783,
+              1789
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3295067cb3eaebe2eb9b72",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  1783,
+                  1789
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_25f30d39e75a32": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_6b20b3edaaf628": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_92bc3e7d500471": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_98ce53d3eca7b8": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_b408e3992e259a": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_c233a7bf6ef90e": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_25f30d39e75a32::t_cdd12c9e2dc800": {
+      "tool": "trae",
+      "conversation_id": "6a3290da7cb3eaebe2eb9adc",
+      "session_id": "6a3290da7cb3eaebe2eb9adc",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
