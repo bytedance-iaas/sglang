@@ -62,7 +62,11 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        _handle_dspark(server_args)
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_config.draft_is_deepseek_v4",
+            return_value=True,
+        ):
+            _handle_dspark(server_args)
         self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
 
@@ -78,7 +82,11 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         server_args.speculative_draft_model_path = "deepseek-ai/some-other-dspark-draft"
-        _handle_dspark(server_args)
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_config.draft_is_deepseek_v4",
+            return_value=False,
+        ):
+            _handle_dspark(server_args)
         self.assertEqual(
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
