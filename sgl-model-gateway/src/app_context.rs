@@ -378,7 +378,7 @@ impl AppContextBuilder {
             n => {
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
+                    .filter(|&t| t >= 0)
                     .unwrap_or(n);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
@@ -528,5 +528,33 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_zero_refill_rate_enables_pure_concurrency_limiting() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec!["http://worker:8000".to_string()])
+            .max_concurrent_requests(100)
+            .rate_limit_tokens_per_second(0)
+            .build()
+            .unwrap();
+        let builder = AppContextBuilder::new().maybe_rate_limiter(&config);
+        let limiter = builder.rate_limiter.unwrap();
+
+        for _ in 0..100 {
+            assert!(limiter.try_acquire(1.0).await.is_ok());
+        }
+        assert!(limiter.try_acquire(1.0).await.is_err());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(limiter.try_acquire(1.0).await.is_err());
+
+        limiter.return_tokens(1.0).await;
+        assert!(limiter.try_acquire(1.0).await.is_ok());
     }
 }

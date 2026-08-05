@@ -297,7 +297,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         n => {
             let rate_limit_tokens = config
                 .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
+                .filter(|&t| t >= 0)
                 .unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
@@ -416,7 +416,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         n => {
             let rate_limit_tokens = config
                 .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
+                .filter(|&t| t >= 0)
                 .unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
@@ -545,7 +545,7 @@ pub async fn create_test_context_with_mcp_config(
         n => {
             let rate_limit_tokens = config
                 .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
+                .filter(|&t| t >= 0)
                 .unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
