@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
+    prepare_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -1005,12 +1006,12 @@ class DeepseekSparseAttnBackend(
             forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
-        dsa_cache_seqlens_int32 = compute_dsa_seqlens(
+        raw_dsa_cache_seqlens_int32 = compute_dsa_seqlens(
             original_seq_lens=seqlens_expanded,
             dsa_index_topk=self.dsa_index_topk,
         )
-        dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
-            forward_batch, dsa_cache_seqlens_int32
+        flashmla_cache_seqlens_int32, dsa_cache_seqlens_int32 = (
+            prepare_dsa_cache_seqlens(forward_batch, raw_dsa_cache_seqlens_int32)
         )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
@@ -1047,7 +1048,7 @@ class DeepseekSparseAttnBackend(
             page_table_1_flattened=page_table_1_flattened,
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens_int32,
+                    cache_seqlens=flashmla_cache_seqlens_int32,
                     seq_len_q=1,
                 )
                 if use_flashmla_kv
@@ -2801,8 +2802,14 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-        cache_seqlens = metadata.dsa_cache_seqlens_int32
+        live_num_tokens = q_all.shape[0]
+        cache_seqlens = metadata.dsa_cache_seqlens_int32[:live_num_tokens]
         assert metadata.flashmla_metadata is not None
+        num_splits = metadata.flashmla_metadata.num_splits
+        assert num_splits.shape[0] == live_num_tokens + 1, (
+            "FlashMLA num_splits must match the live BCG query axis: "
+            f"q_tokens={live_num_tokens}, num_splits={num_splits.shape[0]}"
+        )
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
@@ -2835,7 +2842,7 @@ class DeepseekSparseAttnBackend(
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
             tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            num_splits=num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error

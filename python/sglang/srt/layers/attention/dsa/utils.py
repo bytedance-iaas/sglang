@@ -208,17 +208,9 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
         forward_batch
     )
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
-    graph_num_tokens = getattr(forward_batch, "prefill_cuda_graph_num_tokens", None)
-    needs_graph_pad = graph_num_tokens is not None
-    if not needs_cp_pad and not needs_dp_pad and not needs_graph_pad:
+    if not needs_cp_pad and not needs_dp_pad:
         return dsa_cache_seqlens
-    tokens = (
-        cal_padded_tokens(forward_batch)
-        if needs_cp_pad or needs_dp_pad
-        else dsa_cache_seqlens.shape[0]
-    )
-    if graph_num_tokens is not None:
-        tokens = max(tokens, graph_num_tokens)
+    tokens = cal_padded_tokens(forward_batch)
     pad_len = tokens - dsa_cache_seqlens.shape[0]
     if pad_len > 0:
         dsa_cache_seqlens = torch.cat(
@@ -228,6 +220,19 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
             ]
         )
     return dsa_cache_seqlens
+
+
+def prepare_dsa_cache_seqlens(forward_batch: "ForwardBatch", raw_cache_seqlens):
+    """Keep FlashMLA on the live query axis while padding indexer metadata.
+
+    DP/CP padding happens after sparse attention and is consumed by the
+    indexer/MLP synchronization path. Breakable CUDA graph attention remains a
+    break operation over the live token count, so its FlashMLA scheduler must
+    not inherit that padding.
+    """
+    return raw_cache_seqlens, pad_dsa_cache_seqlens(
+        forward_batch, raw_cache_seqlens
+    )
 
 
 def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):

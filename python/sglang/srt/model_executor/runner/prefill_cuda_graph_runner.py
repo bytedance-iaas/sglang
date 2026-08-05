@@ -1518,11 +1518,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
-            prefill_cuda_graph_num_tokens=(
-                static_num_tokens
-                if isinstance(self.backend, BreakableCudaGraphBackend)
-                else None
-            ),
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
@@ -1592,12 +1587,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
-        if isinstance(self.backend, BreakableCudaGraphBackend):
-            # BCG captures a token bucket but keeps the live request axis. Use a
-            # shallow view so token-shaped attention metadata can be padded to
-            # the captured width without changing user-facing request metadata.
-            metadata_forward_batch = copy.copy(forward_batch)
-            metadata_forward_batch.prefill_cuda_graph_num_tokens = static_num_tokens
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
