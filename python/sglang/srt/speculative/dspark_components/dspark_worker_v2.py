@@ -146,7 +146,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # eager (DraftBlockProposer) and CUDA-graph-folded (DsparkDraftSampler)
         # draft-sampling paths below.
         self._bonus_anchor = runtime_config.bonus_anchor
-        if self.tp_rank == 0 and self._bonus_anchor:
+        if self.ps.tp_rank == 0 and self._bonus_anchor:
             logger.info(
                 "DSpark draft checkpoint uses the bonus-anchor "
                 "convention (gamma+1-wide draft block, anchor excluded from "
