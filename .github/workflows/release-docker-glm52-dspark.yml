@@ -12,7 +12,7 @@ on:
       image_tag:
         description: Immutable task image tag
         required: true
-        default: glm52-dspark-deepep-ac2b79fd4-eic1.5.2
+        default: glm52-dspark-deepep-780449f1a-eic1.5.2
 
 concurrency:
   group: glm52-dspark-overlay-${{ github.ref }}
@@ -59,7 +59,7 @@ jobs:
               sha256sum | awk '{print $1}'
           )"
           test "$source_python_sha256" = \
-            '189fb9071bc3efd13feaba142254c761de21c7432c93d1e2b388703a1e0a87a8'
+            '25730ba2c220c0cdb9955807515e16e2bcdefc13e0c826b4097f49a4bb5f380f'
           echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
           echo "source_tree=${source_tree}" >> "$GITHUB_OUTPUT"
           echo "source_python_sha256=${source_python_sha256}" >> "$GITHUB_OUTPUT"
