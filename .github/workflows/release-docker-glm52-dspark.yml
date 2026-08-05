@@ -12,7 +12,7 @@ on:
       image_tag:
         description: Immutable task image tag
         required: true
-        default: glm52-dspark-deepep-780449f1a-eic1.5.2
+        default: glm52-dspark-deepep-780449f1a-r2-eic1.5.2
 
 concurrency:
   group: glm52-dspark-overlay-${{ github.ref }}
@@ -100,6 +100,7 @@ jobs:
             --build-arg SOURCE_COMMIT="$SOURCE_COMMIT" \
             --build-arg SOURCE_TREE="$SOURCE_TREE" \
             --build-arg SOURCE_PYTHON_SHA256="$SOURCE_PYTHON_SHA256" \
+            --build-arg SOURCE_STACK_ID=glm52-dspark-deepep-780449f1a \
             --build-arg HTTP_PROXY=http://100.68.162.211:3128 \
             --build-arg HTTPS_PROXY=http://100.68.162.211:3128 \
             --build-arg NO_PROXY=localhost,127.0.0.1,.ivolces.com,.volceapi.com,.byted.org,iaas-gpu-cn-beijing.cr.volces.com \

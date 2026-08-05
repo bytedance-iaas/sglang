@@ -5,6 +5,7 @@ ARG BASE_IMAGE
 ARG SOURCE_COMMIT
 ARG SOURCE_TREE
 ARG SOURCE_PYTHON_SHA256
+ARG SOURCE_STACK_ID
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
@@ -21,6 +22,7 @@ RUN set -eux; \
     test -n "${SOURCE_COMMIT}"; \
     test -n "${SOURCE_TREE}"; \
     test -n "${SOURCE_PYTHON_SHA256}"; \
+    test -n "${SOURCE_STACK_ID}"; \
     cd /tmp/glm52-dspark-source; \
     actual_python_sha256="$( \
       while IFS= read -r source_file; do \
@@ -45,7 +47,7 @@ RUN set -eux; \
     python3 -c 'import importlib.metadata as m; version=m.version("sglang-kernel"); print(f"SGLANG_KERNEL_VERSION={version}"); assert version == "0.4.5"'; \
     rm -rf /tmp/glm52-dspark-source
 
-ENV SGLANG_SOURCE_STACK_ID=glm52-dspark-deepep-ac2b79fd4 \
+ENV SGLANG_SOURCE_STACK_ID=${SOURCE_STACK_ID} \
     SGLANG_SOURCE_COMMIT=${SOURCE_COMMIT} \
     SGLANG_SOURCE_TREE=${SOURCE_TREE} \
     SGLANG_SOURCE_PYTHON_SHA256=${SOURCE_PYTHON_SHA256} \
