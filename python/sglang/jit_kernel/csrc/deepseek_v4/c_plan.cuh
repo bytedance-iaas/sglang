@@ -308,8 +308,8 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
         const auto state_loc_1 = params.f2s_ptr[raw_loc_1];
         plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
         plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
-        params.plan_c[idx] = plan_c;
       }
+      params.plan_c[idx] = plan_c;
     }
   } else if (idx < params.num_c_padded) {
     params.plan_c[idx] = PlanC::invalid();

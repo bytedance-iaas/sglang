@@ -226,6 +226,31 @@ def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> Non
         )
 
 
+def test_prefill_plan_resolves_speculative_c128_ring_pages() -> None:
+    """GPU prefill planning must replace batch-id placeholders with C128 pages."""
+    ctx = make_paged_context(
+        bs=2,
+        compress_ratio=RATIO,
+        head_dim=HEAD_DIM,
+        ring_size=256,
+    )
+    ctx.req_pool_indices.copy_(
+        torch.tensor([5, 2], dtype=torch.int64, device=get_device())
+    )
+
+    seq_lens = torch.tensor([128, 256], dtype=torch.int64, device=get_device())
+    extend_lens = torch.full((2,), 3, dtype=torch.int64, device=get_device())
+    plan = ctx.make_prefill_plan(seq_lens, extend_lens, num_q_tokens=6)
+
+    plan_raw = plan.plan_c.view(torch.int32)
+    valid_plans = plan_raw[plan_raw[:, 0] > 0].cpu()
+    valid_plans = valid_plans[torch.argsort(valid_plans[:, 0])]
+
+    assert valid_plans[:, 0].tolist() == [128, 256]
+    assert valid_plans[:, 2].tolist() == [10, 4]
+    assert valid_plans[:, 3].tolist() == [10, 5]
+
+
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 def test_prefill_multibatch(mode: str) -> None:
     """Multi-batch prefill, each batch ending at a different chunk count."""
