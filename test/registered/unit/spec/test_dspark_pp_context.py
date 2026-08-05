@@ -12,11 +12,43 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
+from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
+    DeepseekV4ForCausalLMDSpark,
+)
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
+    _is_context_only_pp_prefill_rank,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+class _TupleLinear(torch.nn.Module):
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_size, output_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor):
+        return self.linear(hidden_states), None
+
+
+def _make_deepseek_v4_dspark_projection_model(
+    *, hidden_size: int, num_target_features: int
+) -> DeepseekV4ForCausalLMDSpark:
+    model = DeepseekV4ForCausalLMDSpark.__new__(DeepseekV4ForCausalLMDSpark)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=hidden_size)
+    model.num_target_features = num_target_features
+    stage = torch.nn.Module()
+    stage.main_proj = _TupleLinear(hidden_size * num_target_features, hidden_size)
+    stage.main_norm = RMSNorm(hidden_size, eps=1e-6)
+    model.stages = torch.nn.ModuleList([stage])
+    model.markov_head = torch.nn.Identity()
+    model.confidence_head = torch.nn.Identity()
+    model.embed_tokens = None
+    model.lm_head = None
+    return model
 
 
 class TestDSparkPPContext(CustomTestCase):
@@ -46,12 +78,92 @@ class TestDSparkPPContext(CustomTestCase):
 
         torch.testing.assert_close(pp_projected, full_projected)
 
+    def test_deepseek_v4_partial_projection_survives_context_only_pruning(self):
+        """Cross-rank contributions must retain full projection math after pruning."""
+        torch.manual_seed(1)
+        hidden_size = 4
+        model = _make_deepseek_v4_dspark_projection_model(
+            hidden_size=hidden_size, num_target_features=3
+        )
+        features = [torch.randn(5, hidden_size, dtype=torch.float32) for _ in range(3)]
+        full_projected = model.project_target_hidden(torch.cat(features, dim=-1))
+
+        stage_0 = model.project_target_hidden_partial(
+            torch.cat([features[0], features[2]], dim=-1),
+            [0, 2],
+        )
+        model.prune_to_ctx_projection()
+        stage_1 = model.project_target_hidden_partial(features[1], [1])
+        pp_projected = model.stages[0].main_norm(stage_0 + stage_1)
+        write_context_hidden_kv = Mock()
+        model._write_context_hidden_kv = write_context_hidden_kv
+        model.write_projected_context_kv(
+            projected_context=stage_0 + stage_1,
+            swa_loc=torch.arange(5),
+            positions=torch.arange(5),
+            pool=object(),
+        )
+
+        self.assertEqual(list(model.stages[0]._modules), ["main_proj", "main_norm"])
+        torch.testing.assert_close(pp_projected, full_projected)
+        torch.testing.assert_close(
+            write_context_hidden_kv.call_args.kwargs["main_x"],
+            full_projected,
+        )
+
+    def test_deepseek_v4_capture_is_local_to_each_pp_rank(self):
+        """A target feature on a non-last rank must not disappear from ctx_acc."""
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(is_last_rank=False)
+        model.model = SimpleNamespace(
+            start_layer=10,
+            end_layer=20,
+            dspark_layers_to_capture=None,
+        )
+        model.capture_aux_hidden_states = False
+
+        model.set_dspark_layers_to_capture([5, 12, 18, 25])
+
+        self.assertTrue(model.capture_aux_hidden_states)
+        self.assertEqual(model.model.dspark_layers_to_capture, [12, 18])
+
+    def test_non_last_pp_prefill_does_not_require_target_lm_head(self):
+        """PP0-PP(N-2) must initialize without the last rank's lm_head."""
+        self.assertTrue(
+            _is_context_only_pp_prefill_rank(
+                disaggregation_mode="prefill",
+                pp_rank=0,
+                pp_size=8,
+            )
+        )
+        self.assertFalse(
+            _is_context_only_pp_prefill_rank(
+                disaggregation_mode="prefill",
+                pp_rank=7,
+                pp_size=8,
+            )
+        )
+
+    def test_context_only_rank_does_not_require_draft_attention_backend(self):
+        """Projection-only ranks must initialize overlap state without draft attention."""
+        target_backend = object()
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._is_context_only_pp_prefill_rank = True
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=target_backend)
+        )
+        worker.draft_model_runner = SimpleNamespace()
+
+        self.assertEqual(worker.spec_v2_attn_backends, (target_backend,))
+
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
         """A context-only PP rank must not reserve the full draft KV capacity."""
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
-        worker._draft_is_moe = False
+        worker._draft_is_moe = True
+        worker._is_context_only_pp_prefill_rank = True
         worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
         worker.page_size = 64
         full_config = MemoryPoolConfig(
@@ -72,7 +184,8 @@ class TestDSparkPPContext(CustomTestCase):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
-        worker._draft_is_moe = False
+        worker._draft_is_moe = True
+        worker._is_context_only_pp_prefill_rank = False
         worker.ps = SimpleNamespace(pp_rank=1, pp_size=2)
         worker.page_size = 64
         full_config = MemoryPoolConfig(

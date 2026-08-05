@@ -641,10 +641,62 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=lm_head)
 
-    def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
+    def prune_to_ctx_projection(self) -> None:
         stage0 = self.stages[0]
-        projected, _ = stage0.main_proj(main_hidden)
-        return stage0.main_norm(projected)
+        projection_stage = nn.Module()
+        projection_stage.main_proj = stage0.main_proj
+        projection_stage.main_norm = stage0.main_norm
+        # Preserve stages.0.main_proj parameter names for online weight updates.
+        self.stages = nn.ModuleList([projection_stage])
+        self.markov_head = None
+        self.confidence_head = None
+        self.embed_tokens = None
+        self.lm_head = None
+        del stage0
+        torch.cuda.empty_cache()
+
+    def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        projected, _ = self.stages[0].main_proj(main_hidden)
+        return self.stages[0].main_norm(projected)
+
+    def project_target_hidden_partial(
+        self, main_hidden: torch.Tensor, feature_indices: list[int]
+    ) -> torch.Tensor:
+        """Project PP-local target features into an additive pre-norm context."""
+        if not feature_indices:
+            raise ValueError("feature_indices must be non-empty.")
+        feature_indices = [int(index) for index in feature_indices]
+        if min(feature_indices) < 0 or max(feature_indices) >= self.num_target_features:
+            raise ValueError(
+                "DeepSeek-V4 DSpark feature_indices out of range: "
+                f"{feature_indices=} {self.num_target_features=}."
+            )
+
+        hidden_size = int(self.config.hidden_size)
+        expected = len(feature_indices) * hidden_size
+        if main_hidden.ndim != 2 or int(main_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "DeepSeek-V4 DSpark partial main_hidden feature dim mismatch. "
+                f"Expected shape [N, {expected}] for {feature_indices=}, "
+                f"but got shape={tuple(main_hidden.shape)}."
+            )
+
+        local_features = main_hidden.view(
+            main_hidden.shape[0], len(feature_indices), hidden_size
+        )
+        full_features = main_hidden.new_zeros(
+            main_hidden.shape[0], self.num_target_features, hidden_size
+        )
+        # Reuse ReplicatedLinear.forward so FP8 weights and scales follow the
+        # same quantization path as the full, non-PP projection.
+        feature_index = torch.tensor(
+            feature_indices, dtype=torch.long, device=main_hidden.device
+        )
+        full_features.index_copy_(1, feature_index, local_features)
+        projected, _ = self.stages[0].main_proj(
+            full_features.view(main_hidden.shape[0], -1)
+        )
+        return projected
 
     def write_target_hidden_kv(
         self,
@@ -655,6 +707,37 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
         main_x = self.project_target_hidden(main_hidden)
+        self._write_context_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def write_projected_context_kv(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        main_x = self.stages[0].main_norm(projected_context)
+        self._write_context_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def _write_context_hidden_kv(
+        self,
+        *,
+        main_x: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
         swa_loc = swa_loc.to(torch.int32)
         kvs = CommitKvProj.execute(
             main_x=main_x,

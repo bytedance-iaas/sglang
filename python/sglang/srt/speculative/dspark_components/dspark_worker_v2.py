@@ -67,6 +67,12 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 logger = logging.getLogger(__name__)
 
 
+def _is_context_only_pp_prefill_rank(
+    *, disaggregation_mode: str, pp_rank: int, pp_size: int
+) -> bool:
+    return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -93,6 +99,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention and not self._draft_is_moe
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._is_context_only_pp_prefill_rank = _is_context_only_pp_prefill_rank(
+            disaggregation_mode=server_args.disaggregation_mode,
+            pp_rank=ps.pp_rank,
+            pp_size=ps.pp_size,
+        )
         self._decode_graph_allowed = (
             not server_args.disable_cuda_graph and not self._is_pd_prefill
         )
@@ -159,20 +170,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        needs_lm_head = not (
-            self._is_pd_prefill
-            and self.ps.pp_size > 1
-            and self.ps.pp_rank + 1 < self.ps.pp_size
-            and not self._draft_is_moe
-        )
+        needs_lm_head = not self._is_context_only_pp_prefill_rank
         if needs_lm_head and (lm_head is None or not hasattr(lm_head, "weight")):
             raise RuntimeError(
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
-        self.draft_model.attach_shared_modules(
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
-            lm_head=lm_head,
-        )
+        if needs_lm_head:
+            self.draft_model.attach_shared_modules(
+                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                lm_head=lm_head,
+            )
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -276,8 +283,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
-        if self._is_pd_prefill and not self._draft_is_moe:
-            self.draft_model.prune_to_ctx_kv_injection()
+        if self._is_pd_prefill:
+            if self._draft_is_moe and self._is_context_only_pp_prefill_rank:
+                self.draft_model.prune_to_ctx_projection()
+            elif not self._draft_is_moe:
+                self.draft_model.prune_to_ctx_kv_injection()
             self._init_pp_context_feature_indices()
 
     def _resolve_target_embed_tokens(self, target_model):
@@ -329,6 +339,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
+        if self._is_context_only_pp_prefill_rank:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -350,12 +362,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        if (
-            memory_pool_config is not None
-            and self._is_pd_prefill
-            and not self._draft_is_moe
-            and self.ps.pp_rank < self.ps.pp_size - 1
-        ):
+        if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
             page_size = int(self.page_size)
 
             def _minimal_capacity(capacity):
@@ -381,6 +388,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if self._is_context_only_pp_prefill_rank:
+            self._need_mamba_verify_commit = False
+            return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
@@ -391,6 +401,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if self._is_context_only_pp_prefill_rank:
+            return
         capture_decode_cuda_graph = self._decode_graph_allowed
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -504,9 +516,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             on_publish(batch_output.new_seq_lens)
 
         if target_hidden is None and self.ps.pp_size > 1:
-            target_hidden = torch.empty(
-                (0, 0), dtype=torch.float16, device=self.device
-            )
+            target_hidden = torch.empty((0, 0), dtype=torch.float16, device=self.device)
         if target_hidden is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
@@ -570,7 +580,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
             )
-        elif has_local_target_hidden and not (self.ps.pp_size > 1 and not self._draft_is_moe):
+        elif has_local_target_hidden and not (
+            self.ps.pp_size > 1 and not self._draft_is_moe
+        ):
             self._kv_injector.inject_target_hidden(
                 target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,

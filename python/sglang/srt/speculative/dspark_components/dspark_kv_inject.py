@@ -7,6 +7,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -105,6 +106,17 @@ class TargetHiddenKvInjector:
             )
 
         pool = self.draft_model_runner.token_to_kv_pool
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            self._inject_projected_mla(
+                pool=pool,
+                projected_context=projected_context,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+            )
+            return
+
         with torch.inference_mode():
             self.draft_model.write_projected_context_kv(
                 projected_context=projected_context,
@@ -125,13 +137,12 @@ class TargetHiddenKvInjector:
         cache_loc_2d: Optional[torch.Tensor],
         commit_lens: Optional[torch.Tensor],
     ) -> None:
-        swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
-        if commit_lens is not None and cache_loc_2d is not None:
-            bs, verify_len = cache_loc_2d.shape
-            col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
-            committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
-            swa_loc = torch.where(committed_mask, swa_loc, torch.full_like(swa_loc, -1))
-
+        swa_loc = self._resolve_mla_swa_loc(
+            pool=pool,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 main_hidden=target_hidden,
@@ -139,6 +150,46 @@ class TargetHiddenKvInjector:
                 positions=positions,
                 pool=pool,
             )
+
+    def _inject_projected_mla(
+        self,
+        *,
+        pool: DeepSeekV4TokenToKVPool,
+        projected_context: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor],
+        commit_lens: Optional[torch.Tensor],
+    ) -> None:
+        swa_loc = self._resolve_mla_swa_loc(
+            pool=pool,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+        with torch.inference_mode():
+            self.draft_model.write_projected_context_kv(
+                projected_context=projected_context,
+                swa_loc=swa_loc,
+                positions=positions,
+                pool=pool,
+            )
+
+    @staticmethod
+    def _resolve_mla_swa_loc(
+        *,
+        pool: DeepSeekV4TokenToKVPool,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor],
+        commit_lens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+        if commit_lens is not None and cache_loc_2d is not None:
+            bs, verify_len = cache_loc_2d.shape
+            col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+            committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+            swa_loc = torch.where(committed_mask, swa_loc, torch.full_like(swa_loc, -1))
+        return swa_loc
 
     def inject_ragged(
         self,
