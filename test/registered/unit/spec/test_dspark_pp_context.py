@@ -16,6 +16,12 @@ from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
 from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
 )
+from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
+    _allocate_decode_buffers,
+)
+from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: E402
+    DecodeInputBuffers,
+)
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
     _is_context_only_pp_prefill_rank,
@@ -52,6 +58,43 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_pp_spec_verify_buffers_use_token_axis(self):
+        """PP verify buffers must cover bs times speculative token width."""
+        max_bs = 64
+        num_tokens_per_req = 6
+        max_num_token = max_bs * num_tokens_per_req
+        common_kwargs = dict(
+            device=torch.device("cpu"),
+            max_bs=max_bs,
+            max_num_token=max_num_token,
+            hidden_size=4,
+            dtype=torch.float32,
+            dp_size=1,
+            pp_size=8,
+            is_encoder_decoder=False,
+            require_mlp_tp_gather=False,
+            seq_len_fill_value=1,
+            encoder_len_fill_value=0,
+            num_tokens_per_req=num_tokens_per_req,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+            hc_hidden_size=16,
+        )
+        eager_buffers = _allocate_decode_buffers(vocab_size=8, **common_kwargs)
+        graph_buffers = DecodeInputBuffers.create(
+            next_token_logits_buffer=torch.zeros((max_num_token, 8)),
+            **common_kwargs,
+        )
+
+        self.assertEqual(
+            eager_buffers.pp_proxy_tensors["hidden_states"].shape,
+            (max_num_token, 16),
+        )
+        self.assertEqual(
+            graph_buffers.pp_proxy_tensors["hidden_states"].shape,
+            (max_num_token, 16),
+        )
+
     def test_partial_projection_sum_matches_full_projection(self):
         """PP partial projections must preserve the full pre-norm FC result."""
         torch.manual_seed(0)
