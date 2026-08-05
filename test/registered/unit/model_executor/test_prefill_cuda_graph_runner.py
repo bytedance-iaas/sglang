@@ -9,7 +9,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
-from sglang.srt.distributed import communication_op
+from sglang.srt.distributed import communication_op, parallel_state
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -173,6 +173,28 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertEqual(eager.call_count, 2)
         graph_break.assert_called_once_with(tensor)
+
+    def test_gather_collective_break_context_is_scoped(self):
+        coordinator = parallel_state.GroupCoordinator.__new__(
+            parallel_state.GroupCoordinator
+        )
+        coordinator.unique_name = "test"
+        output = object()
+        input_ = object()
+        with (
+            patch.object(parallel_state, "_is_npu", False),
+            patch.object(parallel_state, "reg_all_gather_into_tensor") as eager_gather,
+            patch.object(
+                parallel_state, "bcg_reg_all_gather_into_tensor"
+            ) as graph_break_gather,
+        ):
+            coordinator.all_gather_into_tensor(output, input_)
+            with parallel_state.cuda_graph_collective_break():
+                coordinator.all_gather_into_tensor(output, input_)
+            coordinator.all_gather_into_tensor(output, input_)
+
+        self.assertEqual(eager_gather.call_count, 2)
+        graph_break_gather.assert_called_once_with(output, input_, group_name="test")
 
     def test_multinode_prefill_bcg_sets_nccl_launch_order_only_for_prefill(self):
         args = ServerArgs.__new__(ServerArgs)
