@@ -34,6 +34,7 @@ class PDHiddenEventManager:
         self.chunk_acks = defaultdict(int)
         self.chunk_ack_cv = threading.Condition()
         self.ack_waiters = {}
+        self.ack_waiter_timers: Dict[Tuple[int, int, int], threading.Timer] = {}
         self.room_waiters = defaultdict(deque)
         self.inflight_chunks = {}
         self.inflight_lock = threading.Lock()
@@ -64,6 +65,8 @@ class PDHiddenEventManager:
         return True
 
     def init_prefill_state(self) -> None:
+        for timer in self.ack_waiter_timers.values():
+            timer.cancel()
         for timer in self.alloc_waiter_timers.values():
             timer.cancel()
         self.done_rooms.clear()
@@ -71,6 +74,7 @@ class PDHiddenEventManager:
         self.deferred_clear_rooms.clear()
         self.chunk_acks.clear()
         self.ack_waiters.clear()
+        self.ack_waiter_timers.clear()
         self.room_waiters.clear()
         self.inflight_chunks.clear()
         self.active_transfers.clear()
@@ -177,6 +181,24 @@ class PDHiddenEventManager:
         if expected_count <= 0:
             kv_chunk.pd_hidden_ack_ready = True
             return False
+
+        def on_timeout() -> None:
+            with self.chunk_ack_cv:
+                waiter = self.ack_waiters.pop(key, None)
+                self.ack_waiter_timers.pop(key, None)
+            if waiter is None:
+                return
+            _, timed_out_chunk = waiter
+            timed_out_chunk.pd_hidden_ack_timed_out = True
+            self.owner.record_failure(
+                key[0],
+                "Timed out waiting for PD hidden chunk ACK: "
+                f"prefill_rank={key[1]}, hidden_start={key[2]}",
+            )
+            self.owner.update_status(key[0], KVPoll.Failed)
+            transfer_queue.put(timed_out_chunk)
+            self.wake_ack_waiters(key[0])
+
         with self.chunk_ack_cv:
             if self.chunk_acks.get(key, 0) >= expected_count:
                 self.chunk_acks[key] -= expected_count
@@ -191,26 +213,17 @@ class PDHiddenEventManager:
                 )
             kv_chunk.pd_hidden_ack_expected_count = expected_count
             self.ack_waiters[key] = (transfer_queue, kv_chunk)
-
-        def on_timeout() -> None:
-            with self.chunk_ack_cv:
-                waiter = self.ack_waiters.pop(key, None)
-            if waiter is None:
-                return
-            _, timed_out_chunk = waiter
-            timed_out_chunk.pd_hidden_ack_timed_out = True
-            self.owner.record_failure(
-                key[0],
-                "Timed out waiting for PD hidden chunk ACK: "
-                f"prefill_rank={key[1]}, hidden_start={key[2]}",
-            )
-            self.owner.update_status(key[0], KVPoll.Failed)
-            transfer_queue.put(timed_out_chunk)
-            self.wake_ack_waiters(key[0])
-
-        timer = threading.Timer(float(timeout_s), on_timeout)
-        timer.daemon = True
-        timer.start()
+            timer = threading.Timer(float(timeout_s), on_timeout)
+            timer.daemon = True
+            self.ack_waiter_timers[key] = timer
+            # Start while holding the lock so an ACK cannot arrive between
+            # waiter registration and timer registration.
+            try:
+                timer.start()
+            except Exception:
+                self.ack_waiters.pop(key, None)
+                self.ack_waiter_timers.pop(key, None)
+                raise
         return True
 
     def wake_ack_waiters(self, room: int) -> None:
@@ -222,10 +235,12 @@ class PDHiddenEventManager:
         if finish_deferred_clear is not None:
             finish_deferred_clear(room)
         with self.chunk_ack_cv:
-            waiters = [
-                self.ack_waiters.pop(key)
-                for key in list(self.ack_waiters)
-                if key[0] == room
+            ack_keys = [key for key in self.ack_waiters if key[0] == room]
+            waiters = [self.ack_waiters.pop(key) for key in ack_keys]
+            ack_waiter_timers = [
+                timer
+                for key in ack_keys
+                if (timer := self.ack_waiter_timers.pop(key, None)) is not None
             ]
             room_waiters = list(self.room_waiters.pop(room, []))
         with self.alloc_grant_lock:
@@ -249,6 +264,8 @@ class PDHiddenEventManager:
             transfer_queue.put(kv_chunk)
         for transfer_queue, kv_chunk in room_waiters:
             transfer_queue.put(kv_chunk)
+        for timer in ack_waiter_timers:
+            timer.cancel()
         for timer in alloc_waiter_timers:
             timer.cancel()
         for transfer_queue, kv_chunk, _ in alloc_waiters:
@@ -408,6 +425,7 @@ class PDHiddenEventManager:
     def handle_chunk_ack(self, room: int, prefill_rank: int, hidden_start: int) -> None:
         key = (int(room), int(prefill_rank), int(hidden_start))
         waiter_to_wake = None
+        timer_to_cancel = None
         with self.chunk_ack_cv:
             self.chunk_acks[key] += 1
             waiter = self.ack_waiters.get(key)
@@ -419,9 +437,12 @@ class PDHiddenEventManager:
                     if self.chunk_acks[key] <= 0:
                         self.chunk_acks.pop(key, None)
                     self.ack_waiters.pop(key, None)
+                    timer_to_cancel = self.ack_waiter_timers.pop(key, None)
                     kv_chunk.pd_hidden_ack_ready = True
                     waiter_to_wake = waiter
             self.chunk_ack_cv.notify_all()
+        if timer_to_cancel is not None:
+            timer_to_cancel.cancel()
         if waiter_to_wake is not None:
             transfer_queue, kv_chunk = waiter_to_wake
             transfer_queue.put(kv_chunk)
