@@ -248,10 +248,20 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        # DP attention may temporarily turn an idle/decode rank into EXTEND so
+        # it can join a MAX_LEN breakable-prefill graph and its collectives.
+        # The DP lm-head removes those dummy rows again, so logits pruning must
+        # use the original request semantics rather than indexing the empty
+        # local output as if it still contained a fabricated prefill request.
+        forward_mode = (
+            forward_batch._original_forward_mode
+            if forward_batch._original_forward_mode is not None
+            else forward_batch.forward_mode
+        )
         if (
-            forward_batch.forward_mode.is_extend()
+            forward_mode.is_extend()
             and forward_batch.return_logprob
-            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_mode.is_target_verify()
         ):
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums
@@ -279,7 +289,7 @@ class LogitsMetadata:
             draft_extend_select_index = None
 
         return cls(
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,

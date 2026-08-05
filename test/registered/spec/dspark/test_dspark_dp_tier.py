@@ -6,9 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardMode,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
@@ -191,6 +193,17 @@ class TestPartialDpPrefillIdleNormalization(CustomTestCase):
         self.assertEqual(result.next_token_ids.numel(), 0)
         self.assertEqual(result.new_seq_lens.numel(), 0)
         on_publish.assert_called_once()
+
+    def test_logits_restore_idle_semantics_after_dp_prefill_padding(self):
+        forward_batch = MagicMock()
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        forward_batch._original_forward_mode = ForwardMode.IDLE
+        forward_batch.return_logprob = False
+        forward_batch.spec_info = None
+
+        metadata = LogitsMetadata.from_forward_batch(forward_batch)
+
+        self.assertEqual(metadata.forward_mode, ForwardMode.IDLE)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):
