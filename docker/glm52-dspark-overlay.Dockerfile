@@ -45,7 +45,8 @@ RUN set -eux; \
     python3 -c 'import importlib.metadata as m; version=m.version("sglang-kernel"); print(f"SGLANG_KERNEL_VERSION={version}"); assert version == "0.4.5"'; \
     rm -rf /tmp/glm52-dspark-source
 
-ENV SGLANG_SOURCE_STACK_ID=glm52-dspark-deepep-baked \
+ENV SGLANG_SOURCE_STACK_ID=glm52-dspark-deepep-ac2b79fd4 \
     SGLANG_SOURCE_COMMIT=${SOURCE_COMMIT} \
     SGLANG_SOURCE_TREE=${SOURCE_TREE} \
+    SGLANG_SOURCE_PYTHON_SHA256=${SOURCE_PYTHON_SHA256} \
     SGLANG_SOURCE_TRACKED_PYTHON_MANIFEST_SHA256=${SOURCE_PYTHON_SHA256}
