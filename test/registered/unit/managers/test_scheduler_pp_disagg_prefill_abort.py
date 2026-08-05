@@ -24,13 +24,9 @@ class TestPPDisaggPrefillAbort(CustomTestCase):
             ps=SimpleNamespace(pp_size=1),
             running_mbs=[MagicMock()],
             last_mbs=[None],
-            request_receiver=SimpleNamespace(
-                recv_requests=MagicMock(return_value=[])
-            ),
+            request_receiver=SimpleNamespace(recv_requests=MagicMock(return_value=[])),
             process_input_requests=MagicMock(),
-            process_pending_chunked_abort=MagicMock(
-                side_effect=AbortConsumed
-            ),
+            process_pending_chunked_abort=MagicMock(side_effect=AbortConsumed),
             init_pp_loop_state=MagicMock(),
         )
 

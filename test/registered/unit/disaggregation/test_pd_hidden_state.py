@@ -8,6 +8,10 @@ from sglang.srt.disaggregation.common.utils import (
     PDHiddenRequestState,
 )
 from sglang.srt.disaggregation.utils import PDHiddenRowPool
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _chunk(start: int, rows: int, is_last: bool = False) -> PDHiddenChunk:
@@ -21,7 +25,7 @@ def _chunk(start: int, rows: int, is_last: bool = False) -> PDHiddenChunk:
     )
 
 
-class TestPDHiddenRequestState(unittest.TestCase):
+class TestPDHiddenRequestState(CustomTestCase):
     def test_disabled_state_is_done_for_hidden_but_not_kv(self):
         state = PDHiddenRequestState.disabled()
 
@@ -135,7 +139,7 @@ class TestPDHiddenRequestState(unittest.TestCase):
         self.assertEqual(chunk.ack_port, 12345)
 
 
-class TestPDHiddenRowPool(unittest.TestCase):
+class TestPDHiddenRowPool(CustomTestCase):
     def test_alloc_prefers_contiguous_rows_and_merges_frees(self):
         pool = PDHiddenRowPool(8, 1, torch.float32)
 

@@ -95,9 +95,7 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
 
         sender.abort()
 
-        sender.kv_mgr.record_failure.assert_called_once_with(
-            9, "Aborted by AbortReq."
-        )
+        sender.kv_mgr.record_failure.assert_called_once_with(9, "Aborted by AbortReq.")
         sender.kv_mgr.update_status.assert_called_once_with(9, KVPoll.Failed)
         sender.kv_mgr._wake_pd_hidden_ack_waiters.assert_called_once_with(9)
         self.assertEqual(sender.conclude_state, KVPoll.Failed)
@@ -342,10 +340,7 @@ class TestDecodePDHiddenDynamicAllocator(CustomTestCase):
     def _make_queue(self, pool_rows: int, decode_reqs):
         manager = _FakeKVManager()
         manager.request_status.update(
-            {
-                req.req.bootstrap_room: KVPoll.Transferring
-                for req in decode_reqs
-            }
+            {req.req.bootstrap_room: KVPoll.Transferring for req in decode_reqs}
         )
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = list(decode_reqs)
@@ -431,9 +426,7 @@ class TestDecodePDHiddenDynamicAllocator(CustomTestCase):
         self.assertEqual(pool.available_size(), 4)
 
         queue._drain_pd_hidden_alloc_requests()
-        self.assertEqual(
-            [grant[0]["room"] for grant in manager.grants], [1, 2]
-        )
+        self.assertEqual([grant[0]["room"] for grant in manager.grants], [1, 2])
         self.assertEqual(pool.available_size(), 0)
 
     def test_late_request_for_terminal_room_is_dropped(self):

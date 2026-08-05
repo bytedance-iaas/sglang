@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
-import logging
 import threading
 from collections import deque
 from contextlib import nullcontext
@@ -19,8 +19,8 @@ from typing import (
     overload,
 )
 
-import numpy as np
 import msgspec
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -368,17 +368,13 @@ class PDHiddenRowPool:
 
             merged = []
             existing_idx = freed_idx = 0
-            while (
-                existing_idx < len(self._free_intervals)
-                or freed_idx < len(freed_intervals)
+            while existing_idx < len(self._free_intervals) or freed_idx < len(
+                freed_intervals
             ):
-                if (
-                    freed_idx == len(freed_intervals)
-                    or (
-                        existing_idx < len(self._free_intervals)
-                        and self._free_intervals[existing_idx][0]
-                        < freed_intervals[freed_idx][0]
-                    )
+                if freed_idx == len(freed_intervals) or (
+                    existing_idx < len(self._free_intervals)
+                    and self._free_intervals[existing_idx][0]
+                    < freed_intervals[freed_idx][0]
                 ):
                     interval = self._free_intervals[existing_idx]
                     existing_idx += 1
@@ -453,7 +449,7 @@ class PDHiddenTransferPlan(msgspec.Struct):
     row_chunks: List[Dict[str, Any]]
 
     @classmethod
-    def build(cls, row_count: int, item_len: int) -> "PDHiddenTransferPlan":
+    def build(cls, row_count: int, item_len: int) -> PDHiddenTransferPlan:
         row_count = int(row_count)
         item_len = int(item_len)
         if row_count <= 0:
@@ -515,7 +511,9 @@ class PDHiddenTransferPlan(msgspec.Struct):
             return new_dynamic_dst
 
         if item_len > 0:
-            new_dynamic_dst["ptr"] = int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            new_dynamic_dst["ptr"] = (
+                int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            )
         plan = PDHiddenTransferPlan.build(new_row_count, item_len)
         new_dynamic_dst["row_chunks"] = plan.row_chunks
         return new_dynamic_dst

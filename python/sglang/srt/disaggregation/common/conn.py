@@ -176,9 +176,7 @@ class CommonKVManager(BaseKVManager):
         # DeepSeek-V4 PCP -> DCP transfer must use a one-to-one rank mapping.
         # The generic all-CP fan-out cannot make forward progress in this
         # topology, so this is an invariant rather than a user-tunable option.
-        self.enable_pcp_dcp_rank_affinity = (
-            self._should_enable_pcp_dcp_rank_affinity()
-        )
+        self.enable_pcp_dcp_rank_affinity = self._should_enable_pcp_dcp_rank_affinity()
         self._check_pcp_dcp_rank_affinity_local_topology()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
@@ -370,8 +368,7 @@ class CommonKVManager(BaseKVManager):
             )
         if self.server_args.enable_dsa_cache_layer_split:
             raise RuntimeError(
-                "PCP-DCP rank affinity is incompatible with "
-                "DSA cache layer split"
+                "PCP-DCP rank affinity is incompatible with " "DSA cache layer split"
             )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.dcp_size != 1:

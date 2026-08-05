@@ -167,9 +167,7 @@ def resolve_hidden_bootstrap_plan(
         [int(x) for x in local_pp_slice.get("layer_ids", [])]
         if local_pp_slice
         else (
-            []
-            if pp_slices
-            else [int(x) for x in metadata.get("target_layer_ids", [])]
+            [] if pp_slices else [int(x) for x in metadata.get("target_layer_ids", [])]
         )
     )
     local_slice_len = (
@@ -215,9 +213,7 @@ def resolve_hidden_bootstrap_plan(
         )
 
     streaming_hidden = bool(metadata.get("streaming_hidden", False))
-    dynamic_hidden_allocation = bool(
-        metadata.get("dynamic_hidden_allocation", False)
-    )
+    dynamic_hidden_allocation = bool(metadata.get("dynamic_hidden_allocation", False))
     dst_indices = [
         int(x)
         for x in (

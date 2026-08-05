@@ -52,9 +52,7 @@ class PDHiddenEventManager:
             defaultdict(dict)
         )
         self.alloc_waiters = {}
-        self.alloc_waiter_timers: Dict[
-            Tuple[int, int, int], threading.Timer
-        ] = {}
+        self.alloc_waiter_timers: Dict[Tuple[int, int, int], threading.Timer] = {}
         self.expected_alloc_grants: Set[Tuple[int, int, int]] = set()
         self.alloc_grant_lock = threading.Lock()
         self.ack_wakeup_endpoint: Optional[str] = None
@@ -378,9 +376,7 @@ class PDHiddenEventManager:
         with self.alloc_grant_lock:
             if key not in self.expected_alloc_grants:
                 return
-            self.alloc_grants[key][str(session_id)] = [
-                int(x) for x in dst_indices
-            ]
+            self.alloc_grants[key][str(session_id)] = [int(x) for x in dst_indices]
             waiter = self.alloc_waiters.get(key)
             if waiter is not None:
                 _, _, expected = waiter
@@ -612,7 +608,11 @@ class PDHiddenEventManager:
         if not release_indices:
             return kv_chunk.state_indices
         idx = self.state_index()
-        if idx is None or not kv_chunk.state_indices or idx >= len(kv_chunk.state_indices):
+        if (
+            idx is None
+            or not kv_chunk.state_indices
+            or idx >= len(kv_chunk.state_indices)
+        ):
             return kv_chunk.state_indices
         ret = list(kv_chunk.state_indices)
         ret[idx] = [int(x) for x in release_indices]
