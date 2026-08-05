@@ -1,11 +1,18 @@
 import random
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+)
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
@@ -85,6 +92,78 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         self.assertEqual(forward_batch.num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
         self.assertTrue(forward_batch.can_run_dp_cuda_graph)
+
+    def test_target_verify_scales_request_counts_to_verify_tokens(self):
+        forward_batch = ForwardBatch.__new__(ForwardBatch)
+        forward_batch.spec_info = DFlashVerifyInput(
+            draft_token=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int64),
+            draft_token_num=8,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        batch = SimpleNamespace(
+            global_num_tokens=[1, 3, 0, 2],
+            global_num_tokens_for_logprob=[1, 3, 0, 2],
+            can_run_dp_cuda_graph=True,
+        )
+
+        forward_batch.init_mlp_sync_metadata(batch, device="cpu")
+
+        self.assertEqual(forward_batch.original_global_num_tokens_cpu, [1, 3, 0, 2])
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [8, 24, 0, 16])
+        self.assertEqual(
+            forward_batch.global_num_tokens_for_logprob_cpu, [8, 24, 0, 16]
+        )
+        self.assertTrue(forward_batch.can_run_dp_cuda_graph)
+
+
+class TestDenseDraftBackendIsolation(CustomTestCase):
+    def test_dense_dp_draft_enters_tp_and_speculative_backend_contexts(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._draft_dp_context_enabled = True
+        worker._draft_is_moe = False
+        entered = []
+
+        def recording_context(name):
+            @contextmanager
+            def context():
+                entered.append(f"enter:{name}")
+                try:
+                    yield
+                finally:
+                    entered.append(f"exit:{name}")
+
+            return context()
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+            return_value=SimpleNamespace(attn_tp_group="attn-tp"),
+        ), patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.draft_tp_context",
+            side_effect=lambda group: recording_context(f"tp:{group}"),
+        ), patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.speculative_moe_backend_context",
+            side_effect=lambda: recording_context("moe"),
+        ), patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.speculative_moe_a2a_backend_context",
+            side_effect=lambda: recording_context("a2a"),
+        ):
+            with worker._draft_context():
+                self.assertEqual(
+                    entered, ["enter:tp:attn-tp", "enter:moe", "enter:a2a"]
+                )
+
+        self.assertEqual(
+            entered,
+            [
+                "enter:tp:attn-tp",
+                "enter:moe",
+                "enter:a2a",
+                "exit:a2a",
+                "exit:moe",
+                "exit:tp:attn-tp",
+            ],
+        )
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

@@ -279,34 +279,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
 
-    if server_args.enable_dp_attention:
-        if not server_args.enable_dp_lm_head:
-            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if server_args.moe_a2a_backend != "none":
-            raise ValueError(
-                "DSpark with dp attention only supports the built-in TP MoE "
-                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
-            )
-        if server_args.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={server_args.attn_cp_size})."
-            )
-        if (
-            server_args.speculative_moe_a2a_backend is not None
-            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
-        ):
-            raise ValueError(
-                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
-                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
-                f"(got {server_args.speculative_moe_a2a_backend!r})."
-            )
-
-    if server_args.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
-
     if server_args.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
             server_args.speculative_draft_model_path = server_args.model_path
@@ -321,6 +293,60 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark dense speculative decoding requires setting "
                 "--speculative-draft-model-path."
             )
+
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        draft_is_deepseek_v4,
+    )
+
+    draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
+    if not draft_is_moe:
+        # A standalone dense draft has no MoE collectives and must not inherit
+        # the target's DeepEP backend.  DSparkWorkerV2 enters the speculative
+        # backend context for every dense-draft build/forward operation.
+        if server_args.speculative_moe_a2a_backend is None:
+            server_args.speculative_moe_a2a_backend = "none"
+        elif server_args.speculative_moe_a2a_backend != "none":
+            raise ValueError(
+                "A standalone dense DSpark draft requires "
+                "--speculative-moe-a2a-backend=none; got "
+                f"{server_args.speculative_moe_a2a_backend!r}."
+            )
+
+    if server_args.enable_dp_attention:
+        if not server_args.enable_dp_lm_head:
+            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+        if server_args.moe_a2a_backend not in ("none", "deepep"):
+            raise ValueError(
+                "DSpark with dp attention supports target moe_a2a_backend "
+                f"'none' or 'deepep', got {server_args.moe_a2a_backend!r}."
+            )
+        if draft_is_moe and server_args.moe_a2a_backend != "none":
+            raise ValueError(
+                "DSpark with dp attention and a DeepSeek-V4 MoE draft still "
+                "requires target moe_a2a_backend='none'; target DeepEP is "
+                "currently enabled only for standalone dense drafts."
+            )
+        if server_args.attn_cp_size > 1:
+            raise ValueError(
+                "DSpark with dp attention does not support context parallel "
+                f"(attn_cp_size={server_args.attn_cp_size})."
+            )
+        if (
+            server_args.speculative_moe_a2a_backend is not None
+            and draft_is_moe
+            and server_args.speculative_moe_a2a_backend
+            != server_args.moe_a2a_backend
+        ):
+            raise ValueError(
+                "A DSpark MoE draft must match the target "
+                f"moe_a2a_backend={server_args.moe_a2a_backend!r} "
+                f"(got {server_args.speculative_moe_a2a_backend!r})."
+            )
+
+    if server_args.pp_size != 1:
+        raise ValueError(
+            "Currently DSpark speculative decoding only supports pp_size == 1."
+        )
 
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = 1

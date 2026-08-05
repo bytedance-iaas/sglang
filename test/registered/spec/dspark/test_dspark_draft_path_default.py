@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -82,6 +83,50 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
+
+    def test_dense_draft_allows_target_deepep_with_dp_attention(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_draft_model_path = "internal/glm52-dspark"
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.moe_a2a_backend = "deepep"
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_config.draft_is_deepseek_v4",
+            return_value=False,
+        ):
+            _handle_dspark(server_args)
+
+        self.assertEqual(server_args.speculative_moe_a2a_backend, "none")
+
+    def test_dense_draft_rejects_speculative_deepep(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_draft_model_path = "internal/glm52-dspark"
+        server_args.speculative_moe_a2a_backend = "deepep"
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_config.draft_is_deepseek_v4",
+            return_value=False,
+        ), self.assertRaisesRegex(ValueError, "standalone dense DSpark draft"):
+            _handle_dspark(server_args)
+
+    def test_moe_draft_still_rejects_target_deepep(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.moe_a2a_backend = "deepep"
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_config.draft_is_deepseek_v4",
+            return_value=True,
+        ), self.assertRaisesRegex(ValueError, "DeepSeek-V4 MoE draft"):
+            _handle_dspark(server_args)
 
 
 if __name__ == "__main__":
