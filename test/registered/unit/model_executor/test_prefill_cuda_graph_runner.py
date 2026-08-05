@@ -100,31 +100,18 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         def prewarm_one(shape_key, forward_fn):
             calls.append(("prewarm", shape_key.size))
             forward_fn()
-            forward_fn()
 
         runner.backend.prewarm_one = prewarm_one
 
-        with patch.object(
-            runner_module, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-        ):
-            runner._prewarm_multinode_breakable_capture()
+        runner._prewarm_multinode_breakable_capture()
 
         self.assertEqual(
             calls,
             [
                 "replay_enter",
-                ("prepare", 128, 0),
-                ("prewarm", 128),
-                ("forward", batches[128], 128),
-                ("forward", batches[128], 128),
                 ("prepare", 2048, 0),
                 ("prewarm", 2048),
                 ("forward", batches[2048], 2048),
-                ("forward", batches[2048], 2048),
-                ("prepare", 4, 0),
-                ("prewarm", 4),
-                ("forward", batches[4], 4),
-                ("forward", batches[4], 4),
                 "replay_exit",
             ],
         )
@@ -137,13 +124,29 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         backend._tp_group = SimpleNamespace(barrier=lambda: calls.append("barrier"))
         backend._prewarmed_outputs = {}
-        outputs = iter(("first", "second"))
         shape_key = ShapeKey(size=2048)
 
-        backend.prewarm_one(shape_key, lambda: next(outputs))
+        backend.prewarm_one(shape_key, lambda: "output")
 
-        self.assertEqual(backend._prewarmed_outputs[shape_key], "second")
-        self.assertEqual(calls, ["synchronize", "barrier", "synchronize", "barrier"])
+        self.assertEqual(backend._prewarmed_outputs[shape_key], "output")
+        self.assertEqual(calls, ["synchronize", "barrier"])
+
+    def test_collective_break_skips_capture_session_warmup_after_largest_shape(self):
+        backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        backend._enable_collective_break = True
+        backend._prewarmed_outputs = {ShapeKey(size=2048): "largest"}
+        backend._shared_output_buffer = None
+        forward_fn = Mock()
+
+        self.assertEqual(
+            backend._warmup_capture_one(ShapeKey(size=2048), forward_fn, None),
+            "largest",
+        )
+        backend._shared_output_buffer = object()
+        self.assertIsNone(
+            backend._warmup_capture_one(ShapeKey(size=1792), forward_fn, None)
+        )
+        forward_fn.assert_not_called()
 
     def test_collective_break_context_is_scoped(self):
         tensor = object()

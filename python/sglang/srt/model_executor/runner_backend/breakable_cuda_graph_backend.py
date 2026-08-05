@@ -129,11 +129,33 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         """Warm a shape before the multi-node graph-capture communicator mode.
 
         ``graph_capture()`` changes model-parallel groups to their graph-mode
-        communicators and capture stream. Multi-node BCG must compile and
-        autotune each shape before entering that context; the resulting output
-        is retained only until ``capture_one`` allocates or reuses its shared
-        output buffer.
+        communicators and capture stream. Multi-node BCG runs one largest-shape
+        forward before entering that context; the resulting output is retained
+        only until ``capture_one`` allocates its shared output buffer.
         """
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+        warmup_out = forward_fn()
+        if post_warmup_hook is not None:
+            post_warmup_hook()
+        self._prewarmed_outputs[shape_key] = warmup_out
+
+    def _warmup_capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        post_warmup_hook: Optional[Callable[[], None]],
+    ) -> Any:
+        if shape_key in self._prewarmed_outputs:
+            return self._prewarmed_outputs.pop(shape_key)
+        if self._enable_collective_break:
+            if self._shared_output_buffer is None:
+                raise RuntimeError(
+                    "Multi-node BCG collective-break capture requires the "
+                    "largest shape to be prewarmed before capture_session."
+                )
+            return None
+
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
@@ -141,7 +163,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             warmup_out = forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
-        self._prewarmed_outputs[shape_key] = warmup_out
+        return warmup_out
 
     def capture_one(
         self,
@@ -150,16 +172,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        if shape_key in self._prewarmed_outputs:
-            warmup_out = self._prewarmed_outputs.pop(shape_key)
-        else:
-            warmup_out = None
-            for _ in range(2):
-                self._device_module.synchronize()
-                self._tp_group.barrier()
-                warmup_out = forward_fn()
-                if post_warmup_hook is not None:
-                    post_warmup_hook()
+        warmup_out = self._warmup_capture_one(shape_key, forward_fn, post_warmup_hook)
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
@@ -167,6 +180,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         )
         size = shape_key.size
         if self._shared_output_buffer is None:
+            assert warmup_out is not None
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
