@@ -104,7 +104,10 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         runner.backend.prewarm_one = prewarm_one
 
-        runner._prewarm_multinode_breakable_capture()
+        with patch.object(
+            runner_module, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+        ):
+            runner._prewarm_multinode_breakable_capture()
 
         self.assertEqual(
             calls,
