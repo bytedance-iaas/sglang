@@ -40,6 +40,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
@@ -1299,11 +1300,53 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
+        self._prewarm_multinode_breakable_capture()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
                 with self.backend.capture_session(self.stream):
                     self._capture_one_stream()
+
+    def _prewarm_multinode_breakable_capture(self) -> None:
+        """Run the largest BCG shape once before opening a capture session.
+
+        A multi-node TP group can otherwise lazily initialize CUDA modules on
+        one rank while another rank already has cross-node NCCL work in flight
+        inside the first BCG warmup.  A device synchronization at that point
+        can deadlock the whole capture.  Running the exact BCG model path once
+        outside graph capture makes module loading and kernel initialization
+        finish before any capture stream owns collective work.
+
+        Keep this narrowly scoped to multi-node Breakable prefill graphs: the
+        other backends do not segment a forward around eager collectives, and
+        single-node capture does not cross the affected transport boundary.
+        """
+        if not isinstance(self.backend, BreakableCudaGraphBackend):
+            return
+        if self.model_runner.server_args.nnodes <= 1:
+            return
+
+        num_tokens = max(self.capture_num_tokens)
+        logger.info(
+            "Prewarming multi-node Breakable prefill CUDA graph before capture. "
+            "num_tokens=%d nnodes=%d",
+            num_tokens,
+            self.model_runner.server_args.nnodes,
+        )
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        start = time.perf_counter()
+        with self.backend.replay_session():
+            forward_batch, _, _ = self._prepare_capture_shape(num_tokens)
+            self._run_forward(forward_batch, num_tokens)
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        logger.info(
+            "Prewarmed multi-node Breakable prefill CUDA graph before capture. "
+            "num_tokens=%d elapsed=%.2f s",
+            num_tokens,
+            time.perf_counter() - start,
+        )
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1331,10 +1374,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
-        """Per-shape capture: build dummy ForwardBatch + run_once,
-        delegate to backend. size is the prefill token count.
-        """
+    def _prepare_capture_shape(
+        self, size: int, *, prefix_num_chunks: int = 0
+    ) -> tuple[ForwardBatch, AttentionBackend, ShapeKey]:
+        """Build and initialize one dummy prefill shape for graph capture."""
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
         if self.enable_cp_v2_bcg_capture:
@@ -1378,6 +1421,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # this path incompatible with the OSS FlashAttention backend.
         else:
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+
+        return forward_batch, attn_backend, shape_key
+
+    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+        """Per-shape capture: build dummy ForwardBatch + run_once,
+        delegate to backend. size is the prefill token count.
+        """
+        num_tokens = size
+        forward_batch, attn_backend, shape_key = self._prepare_capture_shape(
+            num_tokens, prefix_num_chunks=prefix_num_chunks
+        )
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)

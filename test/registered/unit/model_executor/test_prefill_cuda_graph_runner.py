@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -17,6 +17,9 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -61,6 +64,68 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_multinode_breakable_capture_prewarm_order(self):
+        calls = []
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        runner.capture_num_tokens = [4, 2048, 128]
+        runner.device_module = SimpleNamespace(
+            synchronize=lambda: calls.append("synchronize")
+        )
+        runner.model_runner = SimpleNamespace(
+            server_args=SimpleNamespace(nnodes=2),
+            tp_group=SimpleNamespace(barrier=lambda: calls.append("barrier")),
+        )
+        forward_batch = object()
+        runner._prepare_capture_shape = lambda num_tokens: (
+            calls.append(("prepare", num_tokens)) or (forward_batch, object(), object())
+        )
+        runner._run_forward = lambda batch, num_tokens: calls.append(
+            ("forward", batch, num_tokens)
+        )
+
+        class _ReplaySession:
+            def __enter__(self):
+                calls.append("replay_enter")
+
+            def __exit__(self, *args):
+                calls.append("replay_exit")
+
+        runner.backend.replay_session = lambda: _ReplaySession()
+
+        runner._prewarm_multinode_breakable_capture()
+
+        self.assertEqual(
+            calls,
+            [
+                "synchronize",
+                "barrier",
+                "replay_enter",
+                ("prepare", 2048),
+                ("forward", forward_batch, 2048),
+                "replay_exit",
+                "synchronize",
+                "barrier",
+            ],
+        )
+
+    def test_capture_prewarm_skips_single_node_and_non_breakable(self):
+        for backend, nnodes in (
+            (BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend), 1),
+            (SimpleNamespace(), 2),
+        ):
+            with self.subTest(backend=type(backend).__name__, nnodes=nnodes):
+                runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                runner.backend = backend
+                runner.model_runner = SimpleNamespace(
+                    server_args=SimpleNamespace(nnodes=nnodes)
+                )
+                runner._prepare_capture_shape = Mock()
+
+                runner._prewarm_multinode_breakable_capture()
+
+                runner._prepare_capture_shape.assert_not_called()
+
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
         model_runner = SimpleNamespace(
