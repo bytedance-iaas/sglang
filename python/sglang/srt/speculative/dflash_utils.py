@@ -423,6 +423,29 @@ class DFlashDraftConfig:
     def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.block_size if self.block_size is not None else default
 
+    def resolve_num_context_features(self, *, draft_num_layers: int) -> int:
+        """Resolve the number of target hidden-state features in the checkpoint.
+
+        Explicit target layer ids describe layers in the target model, so their
+        values cannot be range-checked against the (usually much smaller) draft
+        model here.  The runtime target-model setup validates those ids against
+        the real target layer count via ``resolve_target_layer_ids``.
+        """
+        if self.target_layer_ids is not None:
+            return len(self.target_layer_ids)
+
+        target_num_layers = (
+            int(self.num_target_layers)
+            if self.num_target_layers is not None
+            else int(draft_num_layers)
+        )
+        return len(
+            self.resolve_target_layer_ids(
+                target_num_layers=target_num_layers,
+                draft_num_layers=draft_num_layers,
+            )
+        )
+
     def resolve_target_layer_ids(
         self,
         *,

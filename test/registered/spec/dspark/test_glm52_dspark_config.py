@@ -70,6 +70,15 @@ class TestGLM52DSparkConfig(CustomTestCase):
         self.assertEqual(parsed.target_layer_ids, [8, 23, 39, 55, 70])
         self.assertIsNone(parsed.num_target_layers)
 
+    def test_explicit_aux_layers_determine_projection_feature_count(self):
+        parsed = parse_dflash_draft_config(
+            draft_hf_config=_glm52_dspark_config()
+        )
+
+        # The ids belong to the 78-layer target model.  Only their count, not
+        # their numeric range, determines the 5-way draft projection shape.
+        self.assertEqual(parsed.resolve_num_context_features(draft_num_layers=5), 5)
+
     def test_dspark_parser_prefers_speculators_tokens_for_gamma(self):
         parsed = parse_dspark_draft_config(
             draft_hf_config=_glm52_dspark_config()
