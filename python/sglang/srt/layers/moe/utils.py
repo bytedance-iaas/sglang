@@ -84,6 +84,7 @@ class MoeRunnerBackend(Enum):
     MARLIN = "marlin"
     AITER = "aiter"
     ASYM_GEMM = "asym_gemm"
+    HYBRIDGEMM = "hybridgemm"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -122,7 +123,16 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.AITER
 
     def is_asym_gemm(self):
-        return self == MoeRunnerBackend.ASYM_GEMM
+        # hybridgemm is an asym_gemm variant: same INT8 grouped-GEMM runner
+        # core, weight residency and unified-MoE wiring — it only differs in
+        # which AsymGEMM kernel the unified layer launches (see
+        # is_hybridgemm() / ASYMGEMM_HYBRID_KERNEL). Every is_asym_gemm()
+        # call site (weight loading, runner selection, unified-layer
+        # creation) is meant to cover it too.
+        return self in (MoeRunnerBackend.ASYM_GEMM, MoeRunnerBackend.HYBRIDGEMM)
+
+    def is_hybridgemm(self):
+        return self == MoeRunnerBackend.HYBRIDGEMM
 
 
 class DeepEPMode(Enum):
