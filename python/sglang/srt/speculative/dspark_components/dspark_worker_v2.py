@@ -426,7 +426,16 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
-        if batch.forward_mode.is_idle():
+        # DP attention can hand non-owner ranks an empty local prefill batch
+        # while is_extend_in_batch is true globally. Normalize it to the idle
+        # contract before target logits processing; an EXTEND batch with zero
+        # hidden states would otherwise try to select its nonexistent last
+        # token. The target forward still runs so DeepEP/MLP collectives match
+        # the rank that owns the real prefill.
+        if batch.batch_size() == 0 and not batch.forward_mode.is_idle():
+            batch.prepare_for_idle()
+
+        if batch.forward_mode.is_idle() or batch.batch_size() == 0:
             if get_parallel().enable_dp_attention:
                 self.target_worker.forward_batch_generation(
                     batch, capture_hidden_mode=CaptureHiddenMode.FULL

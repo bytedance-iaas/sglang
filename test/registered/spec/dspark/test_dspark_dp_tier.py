@@ -2,7 +2,7 @@ import random
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -164,6 +164,33 @@ class TestDenseDraftBackendIsolation(CustomTestCase):
                 "exit:tp:attn-tp",
             ],
         )
+
+
+class TestPartialDpPrefillIdleNormalization(CustomTestCase):
+    def test_empty_local_prefill_uses_idle_target_forward(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._target_worker = MagicMock()
+        worker.device = "cpu"
+        worker.verify_num_draft_tokens = 8
+
+        batch = MagicMock()
+        batch.batch_size.return_value = 0
+        batch.forward_mode.is_idle.return_value = False
+        on_publish = MagicMock()
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+            return_value=SimpleNamespace(enable_dp_attention=True),
+        ):
+            result = worker._forward_prefill(batch, on_publish)
+
+        batch.prepare_for_idle.assert_called_once_with()
+        worker.target_worker.forward_batch_generation.assert_called_once_with(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        self.assertEqual(result.next_token_ids.numel(), 0)
+        self.assertEqual(result.new_seq_lens.numel(), 0)
+        on_publish.assert_called_once()
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):
