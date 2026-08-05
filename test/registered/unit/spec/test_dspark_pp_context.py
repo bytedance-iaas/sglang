@@ -1,6 +1,7 @@
+import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -25,6 +26,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
     _is_context_only_pp_prefill_rank,
+    _resolve_single_owner_pp_rank,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -58,6 +60,28 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_full_projection_fast_path_requires_final_pp_owner(self):
+        """Only final-rank ownership can bypass the ctx_acc handoff."""
+        with patch.dict(
+            os.environ,
+            {"SGLANG_PP_LAYER_PARTITION": "6,5,6,5,6,5,5,5"},
+        ):
+            self.assertEqual(
+                _resolve_single_owner_pp_rank(
+                    target_layer_ids=[40, 41, 42],
+                    num_hidden_layers=43,
+                    pp_size=8,
+                ),
+                7,
+            )
+            self.assertIsNone(
+                _resolve_single_owner_pp_rank(
+                    target_layer_ids=[35, 40],
+                    num_hidden_layers=43,
+                    pp_size=8,
+                )
+            )
+
     def test_pp_spec_verify_buffers_use_token_axis(self):
         """PP verify buffers must cover bs times speculative token width."""
         max_bs = 64

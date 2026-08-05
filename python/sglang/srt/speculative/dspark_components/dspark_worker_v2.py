@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -73,6 +74,22 @@ def _is_context_only_pp_prefill_rank(
     return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
 
 
+def _resolve_single_owner_pp_rank(
+    *, target_layer_ids: list[int], num_hidden_layers: int, pp_size: int
+) -> Optional[int]:
+    if not target_layer_ids:
+        return None
+    for pp_rank in range(pp_size):
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers=num_hidden_layers,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
+        if all(start_layer <= layer_id < end_layer for layer_id in target_layer_ids):
+            return pp_rank
+    return None
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -104,6 +121,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             pp_rank=ps.pp_rank,
             pp_size=ps.pp_size,
         )
+        self._use_full_projection_prefill = False
+        if self._is_pd_prefill and self._draft_is_moe and ps.pp_size > 1:
+            target_layer_ids = [
+                int(layer_id)
+                for layer_id in (
+                    self.model_runner.spec_aux_config.dflash_target_layer_ids or []
+                )
+            ]
+            owner_pp_rank = _resolve_single_owner_pp_rank(
+                target_layer_ids=target_layer_ids,
+                num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
+                pp_size=ps.pp_size,
+            )
+            self._use_full_projection_prefill = (
+                owner_pp_rank == ps.pp_size - 1 and ps.pp_rank == owner_pp_rank
+            )
         self._decode_graph_allowed = (
             not server_args.disable_cuda_graph and not self._is_pd_prefill
         )
@@ -546,48 +579,60 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        incoming_ctx = (
-            pp_proxy_tensors.tensors.get("dspark_ctx_acc")
-            if pp_proxy_tensors is not None
-            else None
-        )
-        local_ctx = None
-        if (
-            self.ps.pp_size > 1
-            and has_local_target_hidden
-            and self._pp_context_feature_indices is not None
-        ):
-            local_ctx = self.draft_model.project_target_hidden_partial(
-                target_hidden, self._pp_context_feature_indices
-            )
-        ctx_acc = None
-        if incoming_ctx is not None and local_ctx is not None:
-            ctx_acc = (
-                incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
-                + local_ctx
-            )
-        elif incoming_ctx is not None:
-            ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
-        elif local_ctx is not None:
-            ctx_acc = local_ctx
-
-        if output_pp_proxy_tensors is not None:
-            if ctx_acc is not None:
-                output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
-        elif ctx_acc is not None:
-            self._kv_injector.inject_projected_context(
-                projected_context=ctx_acc,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
-        elif has_local_target_hidden and not (
-            self.ps.pp_size > 1 and not self._draft_is_moe
-        ):
+        if self._use_full_projection_prefill:
+            if not has_local_target_hidden or output_pp_proxy_tensors is not None:
+                raise RuntimeError(
+                    "Single-owner DSpark prefill requires target hidden states "
+                    "on the final PP rank."
+                )
             self._kv_injector.inject_target_hidden(
                 target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
             )
+        else:
+            incoming_ctx = (
+                pp_proxy_tensors.tensors.get("dspark_ctx_acc")
+                if pp_proxy_tensors is not None
+                else None
+            )
+            local_ctx = None
+            if (
+                self.ps.pp_size > 1
+                and has_local_target_hidden
+                and self._pp_context_feature_indices is not None
+            ):
+                local_ctx = self.draft_model.project_target_hidden_partial(
+                    target_hidden, self._pp_context_feature_indices
+                )
+            ctx_acc = None
+            if incoming_ctx is not None and local_ctx is not None:
+                ctx_acc = (
+                    incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
+                    + local_ctx
+                )
+            elif incoming_ctx is not None:
+                ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
+            elif local_ctx is not None:
+                ctx_acc = local_ctx
+
+            if output_pp_proxy_tensors is not None:
+                if ctx_acc is not None:
+                    output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
+            elif ctx_acc is not None:
+                self._kv_injector.inject_projected_context(
+                    projected_context=ctx_acc,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                )
+            elif has_local_target_hidden and not (
+                self.ps.pp_size > 1 and not self._draft_is_moe
+            ):
+                self._kv_injector.inject_target_hidden(
+                    target_hidden=target_hidden,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         if logits_output is not None:
             logits_output.hidden_states = None
