@@ -257,6 +257,76 @@ class TestPDHiddenAllocationEvents(CustomTestCase):
         self.assertNotIn(key, events.alloc_waiter_timers)
         self.assertIs(transfer_queue.get(), chunk)
 
+    def test_successful_chunk_ack_cancels_timeout_timer(self):
+        owner = MagicMock()
+        events = PDHiddenEventManager(owner)
+        transfer_queue = FastQueue()
+        chunk = SimpleNamespace(
+            room=9,
+            pd_hidden_start=32,
+            pd_hidden_ack_ready=False,
+            pd_hidden_ack_expected_count=0,
+            pd_hidden_ack_timed_out=False,
+        )
+
+        self.assertTrue(
+            events.park_chunk_for_ack(
+                transfer_queue=transfer_queue,
+                kv_chunk=chunk,
+                prefill_rank=3,
+                expected_count=2,
+            )
+        )
+        key = (9, 3, 32)
+        timer = events.ack_waiter_timers[key]
+
+        events.handle_chunk_ack(room=9, prefill_rank=3, hidden_start=32)
+        self.assertFalse(timer.finished.is_set())
+        self.assertEqual(len(transfer_queue._buf), 0)
+
+        events.handle_chunk_ack(room=9, prefill_rank=3, hidden_start=32)
+
+        self.assertTrue(timer.finished.is_set())
+        self.assertNotIn(key, events.ack_waiter_timers)
+        self.assertNotIn(key, events.ack_waiters)
+        self.assertTrue(chunk.pd_hidden_ack_ready)
+        self.assertIs(transfer_queue.get(), chunk)
+
+        # A timeout callback already racing with cancel must be a no-op.
+        timer.function()
+        owner.record_failure.assert_not_called()
+        owner.update_status.assert_not_called()
+        self.assertEqual(len(transfer_queue._buf), 0)
+
+    def test_abort_cancels_chunk_ack_timeout_timer(self):
+        events = PDHiddenEventManager(MagicMock())
+        transfer_queue = FastQueue()
+        chunk = SimpleNamespace(
+            room=9,
+            pd_hidden_start=32,
+            pd_hidden_ack_ready=False,
+            pd_hidden_ack_expected_count=0,
+            pd_hidden_ack_timed_out=False,
+        )
+
+        self.assertTrue(
+            events.park_chunk_for_ack(
+                transfer_queue=transfer_queue,
+                kv_chunk=chunk,
+                prefill_rank=3,
+                expected_count=1,
+            )
+        )
+        key = (9, 3, 32)
+        timer = events.ack_waiter_timers[key]
+
+        events.wake_ack_waiters(9)
+
+        self.assertTrue(timer.finished.is_set())
+        self.assertNotIn(key, events.ack_waiter_timers)
+        self.assertNotIn(key, events.ack_waiters)
+        self.assertIs(transfer_queue.get(), chunk)
+
 
 class TestPDHiddenDynamicBootstrap(CustomTestCase):
     def test_dynamic_bootstrap_accepts_layout_without_reserved_dst_rows(self):
