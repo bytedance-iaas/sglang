@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
+from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
@@ -26,7 +27,10 @@ from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
     _is_context_only_pp_prefill_rank,
-    _resolve_single_owner_pp_rank,
+)
+from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
+    resolve_single_owner_pp_rank,
+    use_lifecycle_only_draft_model,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -67,7 +71,7 @@ class TestDSparkPPContext(CustomTestCase):
             {"SGLANG_PP_LAYER_PARTITION": "6,5,6,5,6,5,5,5"},
         ):
             self.assertEqual(
-                _resolve_single_owner_pp_rank(
+                resolve_single_owner_pp_rank(
                     target_layer_ids=[40, 41, 42],
                     num_hidden_layers=43,
                     pp_size=8,
@@ -75,12 +79,40 @@ class TestDSparkPPContext(CustomTestCase):
                 7,
             )
             self.assertIsNone(
-                _resolve_single_owner_pp_rank(
+                resolve_single_owner_pp_rank(
                     target_layer_ids=[35, 40],
                     num_hidden_layers=43,
                     pp_size=8,
                 )
             )
+
+    def test_lifecycle_only_draft_model_is_limited_to_non_owner_ranks(self):
+        common = dict(
+            disaggregation_mode="prefill",
+            pp_size=8,
+            target_layer_ids=[40, 41, 42],
+            num_hidden_layers=43,
+        )
+        for pp_rank in range(7):
+            self.assertTrue(use_lifecycle_only_draft_model(pp_rank=pp_rank, **common))
+        self.assertFalse(use_lifecycle_only_draft_model(pp_rank=7, **common))
+        self.assertFalse(
+            use_lifecycle_only_draft_model(
+                pp_rank=0,
+                **{**common, "target_layer_ids": [35, 40]},
+            )
+        )
+
+    def test_lifecycle_only_model_does_not_consume_checkpoint_weights(self):
+        model = DeepseekV4ForCausalLMDSpark.__new__(DeepseekV4ForCausalLMDSpark)
+        torch.nn.Module.__init__(model)
+        model.is_lifecycle_only = True
+
+        def weights():
+            raise AssertionError("lifecycle-only model consumed checkpoint weights")
+            yield
+
+        model.load_weights(weights())
 
     def test_pp_spec_verify_buffers_use_token_axis(self):
         """PP verify buffers must cover bs times speculative token width."""
@@ -224,6 +256,30 @@ class TestDSparkPPContext(CustomTestCase):
 
         self.assertEqual(worker.spec_v2_attn_backends, (target_backend,))
 
+    def test_lifecycle_only_rank_does_not_allocate_draft_pool(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._draft_worker = Mock()
+        worker._is_lifecycle_only_pp_prefill_rank = True
+
+        worker.alloc_memory_pool(memory_pool_config=Mock())
+
+        worker._draft_worker.alloc_memory_pool.assert_not_called()
+
+    def test_lifecycle_only_rank_does_not_publish_draft_pool(self):
+        worker = SimpleNamespace(is_lifecycle_only_pp_prefill_rank=True)
+        spec_algorithm = SimpleNamespace(
+            is_ngram=lambda: False,
+            is_dspark=lambda: True,
+        )
+
+        self.assertIsNone(
+            get_draft_kv_pool(
+                draft_worker=worker,
+                spec_algorithm=spec_algorithm,
+                server_args=SimpleNamespace(enable_multi_layer_eagle=False),
+            )
+        )
+
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
         """A context-only PP rank must not reserve the full draft KV capacity."""
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
@@ -231,6 +287,7 @@ class TestDSparkPPContext(CustomTestCase):
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
         worker._is_context_only_pp_prefill_rank = True
+        worker._is_lifecycle_only_pp_prefill_rank = False
         worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
         worker.page_size = 64
         full_config = MemoryPoolConfig(
@@ -253,6 +310,7 @@ class TestDSparkPPContext(CustomTestCase):
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
         worker._is_context_only_pp_prefill_rank = False
+        worker._is_lifecycle_only_pp_prefill_rank = False
         worker.ps = SimpleNamespace(pp_rank=1, pp_size=2)
         worker.page_size = 64
         full_config = MemoryPoolConfig(

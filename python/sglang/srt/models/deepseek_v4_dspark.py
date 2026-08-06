@@ -40,9 +40,10 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
+    use_lifecycle_only_draft_model,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -591,6 +592,37 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self.start_layer = 0
         self.end_layer = self.num_stages
+        parallel = get_parallel()
+        self.is_lifecycle_only = use_lifecycle_only_draft_model(
+            disaggregation_mode=get_disagg().disaggregation_mode,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
+            target_layer_ids=[
+                int(layer_id) for layer_id in (dspark_config.target_layer_ids or [])
+            ],
+            num_hidden_layers=target_num_layers,
+        )
+        self.hc_mult = int(config.hc_mult)
+        self.norm_eps = float(config.rms_norm_eps)
+        self.hc_eps = float(config.hc_eps)
+        self.embed_tokens: Optional[nn.Module] = None
+        self.lm_head: Optional[nn.Module] = None
+        self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
+        self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        if self.is_lifecycle_only:
+            # Keep ModelRunner's distributed lifecycle aligned without building
+            # draft compute modules on PP ranks that cannot contribute context.
+            self.stages = nn.ModuleList()
+            self.markov_head = None
+            self.confidence_head = None
+            logger.info(
+                "DSpark PP rank %s uses a lifecycle-only draft model; all target "
+                "features are owned by final PP rank %s.",
+                parallel.pp_rank,
+                parallel.pp_size - 1,
+            )
+            return
+
         use_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
@@ -621,14 +653,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
         )
-        self.hc_mult = int(config.hc_mult)
-        self.norm_eps = float(config.rms_norm_eps)
-        self.hc_eps = float(config.hc_eps)
-
-        self.embed_tokens: Optional[nn.Module] = None
-        self.lm_head: Optional[nn.Module] = None
-        self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
-        self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -642,6 +666,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head.configure_tp_shard(lm_head=lm_head)
 
     def prune_to_ctx_projection(self) -> None:
+        if self.is_lifecycle_only:
+            return
         stage0 = self.stages[0]
         projection_stage = nn.Module()
         projection_stage.main_proj = stage0.main_proj
@@ -841,6 +867,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        if self.is_lifecycle_only:
+            return
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 

@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -29,6 +28,7 @@ from sglang.srt.speculative.draft_worker_common import (
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
+    resolve_single_owner_pp_rank,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -74,22 +74,6 @@ def _is_context_only_pp_prefill_rank(
     return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
 
 
-def _resolve_single_owner_pp_rank(
-    *, target_layer_ids: list[int], num_hidden_layers: int, pp_size: int
-) -> Optional[int]:
-    if not target_layer_ids:
-        return None
-    for pp_rank in range(pp_size):
-        start_layer, end_layer = get_pp_indices(
-            num_hidden_layers=num_hidden_layers,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-        )
-        if all(start_layer <= layer_id < end_layer for layer_id in target_layer_ids):
-            return pp_rank
-    return None
-
-
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -129,7 +113,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self.model_runner.spec_aux_config.dflash_target_layer_ids or []
                 )
             ]
-            owner_pp_rank = _resolve_single_owner_pp_rank(
+            owner_pp_rank = resolve_single_owner_pp_rank(
                 target_layer_ids=target_layer_ids,
                 num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
                 pp_size=ps.pp_size,
@@ -167,6 +151,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._is_lifecycle_only_pp_prefill_rank = (
+            self._draft_is_moe and self.draft_model.is_lifecycle_only
+        )
 
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
@@ -180,6 +167,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
         self._pp_context_feature_indices: Optional[list[int]] = None
+
+        if self._is_lifecycle_only_pp_prefill_rank:
+            self._init_lifecycle_only_prefill()
+            return
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -323,6 +314,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.draft_model.prune_to_ctx_kv_injection()
             self._init_pp_context_feature_indices()
 
+    def _init_lifecycle_only_prefill(self) -> None:
+        self._verify_planner = None
+        self._kv_injector = None
+        self._proposer = None
+        self._verify_epilogue = None
+        self._verify_executor = None
+        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._forced_budget_frac = None
+        self._need_mamba_verify_commit = False
+        self._observers = None
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -368,7 +370,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return False
         return self._verify_planner.carries_confidence
+
+    @property
+    def is_lifecycle_only_pp_prefill_rank(self) -> bool:
+        return self._is_lifecycle_only_pp_prefill_rank
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -395,6 +403,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return
         if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
             page_size = int(self.page_size)
 
@@ -482,18 +492,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return
         self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
@@ -508,12 +528,47 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark speculative decoding does not support return_logprob yet."
             )
 
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return self._forward_lifecycle_only_prefill(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
+
+    def _forward_lifecycle_only_prefill(
+        self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_idle():
+            if get_parallel().enable_dp_attention:
+                self.target_worker.forward_batch_generation(
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                )
+            return self._decode_idle_result(on_publish=on_publish)
+        if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
+            raise RuntimeError(
+                "Lifecycle-only DSpark worker only supports prefill batches."
+            )
+
+        batch_output = self.target_worker.forward_batch_generation(
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        batch_output.new_seq_lens = batch.seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        if batch_output.logits_output is not None:
+            batch_output.logits_output.hidden_states = None
+        return batch_output
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
@@ -972,4 +1027,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return None
         return self._verify_planner.confidence_budget_prepare()
