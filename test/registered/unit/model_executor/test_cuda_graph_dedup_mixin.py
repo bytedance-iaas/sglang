@@ -25,6 +25,7 @@ class TestDedupedCudaGraphRegistry(CustomTestCase):
     def test_compat_exec_is_lazy_until_a_duplicate_graph_arrives(self):
         registry = DedupedCudaGraphRegistry()
         registry.instantiate = Mock(side_effect=[1001, 1002])
+        registry.log_new_signature = Mock()
 
         with (
             patch.object(dedup_module, "graph_signature", return_value=("same",)),
@@ -46,10 +47,12 @@ class TestDedupedCudaGraphRegistry(CustomTestCase):
         )
         self.assertEqual(first.group.compat_exec, 1002)
         update.assert_called_once_with(1002, 102)
+        registry.log_new_signature.assert_called_once_with(("same",))
 
     def test_unique_signatures_never_allocate_compat_execs(self):
         registry = DedupedCudaGraphRegistry()
         registry.instantiate = Mock(side_effect=[1001, 1002])
+        registry.log_new_signature = Mock()
 
         with patch.object(
             dedup_module,
@@ -65,6 +68,7 @@ class TestDedupedCudaGraphRegistry(CustomTestCase):
         )
         self.assertIsNone(first.group.compat_exec)
         self.assertIsNone(second.group.compat_exec)
+        self.assertEqual(registry.log_new_signature.call_count, 2)
 
 
 if __name__ == "__main__":

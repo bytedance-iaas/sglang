@@ -212,6 +212,26 @@ class DedupedCudaGraphRegistry:
         )
         return graph_exec
 
+    def log_new_signature(self, signature) -> None:
+        kernel_names = [
+            payload[0]
+            for node_type, payload in signature[0]
+            if node_type == "CU_GRAPH_NODE_TYPE_KERNEL" and payload
+        ]
+        kernel_sample = kernel_names[:3]
+        if len(kernel_names) > 4:
+            kernel_sample.append("...")
+        if len(kernel_names) > 3:
+            kernel_sample.append(kernel_names[-1])
+        logger.info(
+            "[CudaGraph][dedup] instantiating signature=%d nodes=%d edges=%d "
+            "kernels=%s",
+            len(self.groups),
+            len(signature[0]),
+            len(signature[1]),
+            kernel_sample,
+        )
+
     def destroy_exec(self, graph_exec: int) -> None:
         assert cuda_rt is not None
         checkCudaErrors(cuda_rt.cudaGraphExecDestroy(graph_exec))
@@ -236,6 +256,7 @@ class DedupedCudaGraphRegistry:
             group.graphs.append(graph)
             return graph
 
+        self.log_new_signature(signature)
         group = GraphExecGroup(
             graph_exec=self.instantiate(graph.raw_graph),
             current_raw_graph=graph.raw_graph,
