@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -8,11 +8,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
-from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue  # noqa: E402
+from sglang.srt.disaggregation.prefill import (  # noqa: E402
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.disaggregation.utils import (  # noqa: E402
     _DRAFT_KV_LAYER_ID_BASE,
     build_transfer_entry_pairs,
 )
+from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     _pp_merge_transfer_status,
 )
@@ -127,6 +131,117 @@ class TestPPPDConsensus(CustomTestCase):
             [req.metadata_buffer_index for req in queue.queue],
             [-1, -1, -1],
         )
+
+    def test_bootstrap_probe_reports_failures_after_metadata_backpressure(self):
+        """Admission backpressure must not hide terminal failures later in FIFO."""
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue = [
+            SimpleNamespace(
+                rid="req-blocked",
+                metadata_buffer_index=-1,
+                disagg_kv_sender=object(),
+            ),
+            SimpleNamespace(
+                rid="req-failed",
+                metadata_buffer_index=-1,
+                disagg_kv_sender=object(),
+            ),
+            SimpleNamespace(
+                rid="req-ready-after-block",
+                metadata_buffer_index=0,
+                disagg_kv_sender=object(),
+            ),
+        ]
+        queue.scheduler = SimpleNamespace(
+            attn_cp_cpu_group=object(),
+            attn_tp_cpu_group=object(),
+        )
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=lambda: 0
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.prefill."
+            "poll_and_all_reduce_attn_cp_tp_group",
+            return_value=[
+                KVPoll.WaitingForInput,
+                KVPoll.Failed,
+                KVPoll.WaitingForInput,
+            ],
+        ):
+            good_rids, failed_rids = queue.get_ready_bootstrapped_rids_for_pp()
+
+        self.assertEqual(good_rids, [])
+        self.assertEqual(failed_rids, ["req-failed"])
+
+    def test_remote_failure_waits_for_local_transfer_terminal_state(self):
+        """Do not release source KV while the local Mooncake worker is reading it."""
+        sender = SimpleNamespace()
+        req = SimpleNamespace(
+            rid="req-race",
+            disagg_kv_sender=sender,
+            finished_reason=None,
+            pending_bootstrap=False,
+            return_logprob=False,
+            time_stats=SimpleNamespace(set_completion_time=Mock()),
+        )
+        handle_failure = Mock()
+        scheduler = SimpleNamespace(
+            disagg_prefill_inflight_queue=[req],
+            attn_cp_cpu_group=object(),
+            attn_tp_cpu_group=object(),
+            ps=SimpleNamespace(pp_rank=1),
+            handle_inflight_transfer_failure=handle_failure,
+            output_streamer=SimpleNamespace(stream_output=Mock()),
+            req_to_metadata_buffer_idx_allocator=object(),
+        )
+
+        def mark_abort(target_req, message, status_code):
+            del message, status_code
+            target_req.finished_reason = FINISH_ABORT("remote PP failure")
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill."
+                "poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Transferring],
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.prepare_abort",
+                side_effect=mark_abort,
+            ),
+        ):
+            done_reqs = (
+                SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                    scheduler,
+                    transfer_status=([], ["req-race"]),
+                )
+            )
+
+        self.assertEqual(done_reqs, [])
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+        handle_failure.assert_not_called()
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill."
+                "poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Success],
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
+            ),
+        ):
+            done_reqs = (
+                SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                    scheduler,
+                    transfer_status=([], []),
+                )
+            )
+
+        self.assertEqual(done_reqs, [req])
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        handle_failure.assert_called_once_with(req)
 
     def test_only_last_pp_registers_draft_kv_for_transfer(self):
         """Draft KV has one prefill owner even though every PP rank has a worker."""

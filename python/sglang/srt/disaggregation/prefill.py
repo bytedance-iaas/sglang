@@ -477,14 +477,18 @@ class PrefillBootstrapQueue:
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
         )
+        admission_blocked = False
 
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
                 failed_rids.append(req.rid)
             elif poll == KVPoll.WaitingForInput:
+                if admission_blocked:
+                    continue
                 metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
                 if metadata_cost > metadata_credits:
-                    break
+                    admission_blocked = True
+                    continue
                 metadata_credits -= metadata_cost
                 good_rids.append(req.rid)
             elif poll == KVPoll.Bootstrapping:
@@ -876,7 +880,26 @@ class SchedulerDisaggregationPrefillMixin:
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if transfer_status is not None:
-                if req.rid in failed_rids:
+                consensus_failed = req.rid in failed_rids
+                failure_pending = isinstance(req.finished_reason, FINISH_ABORT)
+                if consensus_failed or failure_pending:
+                    if consensus_failed and not failure_pending:
+                        prepare_abort(
+                            req,
+                            (
+                                "Prefill transfer failed on another PP rank; "
+                                "waiting for the local transfer to stop"
+                            ),
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    local_transfer_stopped = req.pending_bootstrap or poll in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    )
+                    if not local_transfer_stopped:
+                        undone_reqs.append(req)
+                        continue
+
                     self.handle_inflight_transfer_failure(req)
                     done_reqs.append(req)
                     continue
