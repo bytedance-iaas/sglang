@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -18,6 +19,10 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+_LONG_SPEC_FUSED_TOPK_THRESHOLD = int(
+    os.environ.get("SGLANG_DSA_FUSED_TOPK_MAX_SPEC_SEQ_LEN", "131072")
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -45,6 +50,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
+    should_use_dsa_fused_topk,
 )
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
@@ -63,6 +69,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
+    print_warning_once,
 )
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
@@ -350,6 +357,7 @@ class DeepseekSparseAttnBackend(
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
         self.forward_metadata: DSAMetadata
@@ -443,6 +451,13 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self.use_fused_topk = should_use_dsa_fused_topk(
+            model_runner.server_args, seed_dsa_topk_from_draft_extend
+        )
+        if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
+            print_warning_once(
+                "Disabling fused DSA top-k for IndexShare under PD disaggregation."
+            )
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -1117,7 +1132,7 @@ class DeepseekSparseAttnBackend(
             and self.real_page_size > 1
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
-            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and self.use_fused_topk
             and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and self.dsa_index_topk is not None
             and self.dsa_index_topk <= 2048
@@ -1907,7 +1922,11 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        use_fused_topk_transform = (
+            self.use_fused_topk
+            and not self._disable_fused_topk_for_long_spec(forward_batch)
+        )
+        if use_fused_topk_transform:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1931,12 +1950,33 @@ class DeepseekSparseAttnBackend(
                     page_size=1,
                 )
 
-        # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                num_reqs = forward_batch.req_pool_indices.shape[0]
+                num_steps = self.speculative_num_draft_tokens
+                assert topk_indices is not None
+                expected_shape = (num_reqs * num_steps, self.dsa_index_topk)
+                assert topk_indices.shape == expected_shape, (
+                    f"HiSparse speculative top-k shape mismatch: "
+                    f"{topk_indices.shape} != {expected_shape}; "
+                    f"mode={forward_batch.forward_mode}"
+                )
+                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                    forward_batch.req_pool_indices,
+                    metadata.dsa_seqlens_expanded[: num_reqs * num_steps],
+                    topk_indices.view(num_reqs, num_steps, -1),
+                    layer.layer_id,
+                    token_position_space="full",
+                    num_steps=num_steps,
+                ).view(num_reqs * num_steps, -1)
+            else:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2121,8 +2161,9 @@ class DeepseekSparseAttnBackend(
                 forward_batch.seq_lens,
                 topk_indices,
                 layer.layer_id,
+                token_position_space="full",
             )
-        elif envs.SGLANG_DSA_FUSE_TOPK.get():
+        elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -2679,7 +2720,11 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        use_fused_topk_transform = (
+            self.use_fused_topk
+            and not self._disable_fused_topk_for_long_spec(forward_batch)
+        )
+        if use_fused_topk_transform:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2842,13 +2887,53 @@ class DeepseekSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
 
+    def _disable_fused_topk_for_long_spec(self, forward_batch: ForwardBatch) -> bool:
+        forward_mode = forward_batch.forward_mode
+        is_target_verify = forward_mode.is_target_verify()
+        is_draft_extend = False
+        if hasattr(forward_mode, "is_draft_extend"):
+            try:
+                is_draft_extend = forward_mode.is_draft_extend(include_v2=True)
+            except TypeError:
+                is_draft_extend = forward_mode.is_draft_extend()
+        if not is_draft_extend and hasattr(forward_mode, "is_draft_extend_v2"):
+            is_draft_extend = forward_mode.is_draft_extend_v2()
+        if not (is_target_verify or is_draft_extend):
+            return False
+        if self.hisparse_coordinator is not None:
+            # HiSparse needs raw token positions so the swap-in kernel can
+            # resolve graph-stable newest/draft slots before page-table
+            # transformation.  Fusing the transform would lose that space.
+            return True
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+            return False
+
+        max_seq_len = (
+            int(seq_lens_cpu.max().item())
+            if hasattr(seq_lens_cpu, "max")
+            else max(int(x) for x in seq_lens_cpu)
+        )
+        if max_seq_len < _LONG_SPEC_FUSED_TOPK_THRESHOLD:
+            return False
+
+        logger.warning_once(
+            "Disable DSA fused topk transform for long speculative batch: "
+            "mode=%s max_seq_len=%s threshold=%s",
+            forward_batch.forward_mode,
+            max_seq_len,
+            _LONG_SPEC_FUSED_TOPK_THRESHOLD,
+        )
+        return True
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = (
+        force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
-        )
+        ) or self._disable_fused_topk_for_long_spec(forward_batch)
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
@@ -2889,7 +2974,11 @@ class DeepseekSparseAttnMultiStepBackend:
     needs_cpu_seq_lens: bool = False
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -2901,6 +2990,7 @@ class DeepseekSparseAttnMultiStepBackend:
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    seed_dsa_topk_from_draft_extend=seed_dsa_topk_from_draft_extend,
                 )
             )
 

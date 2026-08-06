@@ -64,7 +64,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
     host_to_device_ratio (2), swap_in_block_size (960).
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
-    page_size. All remaining fields go to sparse_extra_config.
+    page_size. Dynamic residency is opt-in and uses conservative defaults.
+    All remaining fields go to sparse_extra_config.
     """
     extra_config_str = server_args.hisparse_config
     if extra_config_str is not None:
@@ -97,6 +98,86 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     backend = extra_config.pop("backend", None)
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
+    dynamic_residency = extra_config.pop("dynamic_residency", False)
+    dynamic_residency_mode = extra_config.pop(
+        "dynamic_residency_mode", "adaptive"
+    )
+    dynamic_residency_max_tokens = extra_config.pop(
+        "dynamic_residency_max_tokens", 32768
+    )
+    dynamic_residency_max_requests = extra_config.pop(
+        "dynamic_residency_max_requests", 1
+    )
+    dynamic_residency_min_remaining_tokens = extra_config.pop(
+        "dynamic_residency_min_remaining_tokens", 256
+    )
+    dynamic_residency_promote_watermark = extra_config.pop(
+        "dynamic_residency_promote_watermark", 0.20
+    )
+    dynamic_residency_demote_watermark = extra_config.pop(
+        "dynamic_residency_demote_watermark", 0.10
+    )
+    dynamic_residency_cooldown_steps = extra_config.pop(
+        "dynamic_residency_cooldown_steps", 16
+    )
+    dynamic_residency_admission_window_seconds = extra_config.pop(
+        "dynamic_residency_admission_window_seconds", 1800
+    )
+
+    if not isinstance(dynamic_residency, bool):
+        raise ValueError(
+            f"dynamic_residency must be a boolean, got {dynamic_residency!r}"
+        )
+    valid_dynamic_residency_modes = {
+        "adaptive",
+        "forced_resident",
+        "forced_host_backed",
+        "admission_once",
+        "admission_window",
+    }
+    if dynamic_residency_mode not in valid_dynamic_residency_modes:
+        raise ValueError(
+            "dynamic_residency_mode must be one of "
+            f"{sorted(valid_dynamic_residency_modes)}, got "
+            f"{dynamic_residency_mode!r}"
+        )
+    integer_fields = {
+        "dynamic_residency_max_tokens": dynamic_residency_max_tokens,
+        "dynamic_residency_max_requests": dynamic_residency_max_requests,
+        "dynamic_residency_min_remaining_tokens": (
+            dynamic_residency_min_remaining_tokens
+        ),
+        "dynamic_residency_cooldown_steps": dynamic_residency_cooldown_steps,
+        "dynamic_residency_admission_window_seconds": (
+            dynamic_residency_admission_window_seconds
+        ),
+    }
+    for field_name, value in integer_fields.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(
+                f"{field_name} must be a non-negative integer, got {value!r}"
+            )
+    if dynamic_residency_max_tokens == 0:
+        raise ValueError("dynamic_residency_max_tokens must be greater than zero")
+    if dynamic_residency_max_requests == 0:
+        raise ValueError("dynamic_residency_max_requests must be greater than zero")
+
+    watermark_fields = {
+        "dynamic_residency_promote_watermark": dynamic_residency_promote_watermark,
+        "dynamic_residency_demote_watermark": dynamic_residency_demote_watermark,
+    }
+    for field_name, value in watermark_fields.items():
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not 0.0 <= float(value) <= 1.0
+        ):
+            raise ValueError(f"{field_name} must be in [0, 1], got {value!r}")
+    if dynamic_residency_demote_watermark >= dynamic_residency_promote_watermark:
+        raise ValueError(
+            "dynamic_residency_demote_watermark must be smaller than "
+            "dynamic_residency_promote_watermark"
+        )
 
     return SparseConfig(
         top_k=top_k,
@@ -107,6 +188,17 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         backend=backend,
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
+        dynamic_residency=dynamic_residency,
+        dynamic_residency_mode=dynamic_residency_mode,
+        dynamic_residency_max_tokens=dynamic_residency_max_tokens,
+        dynamic_residency_max_requests=dynamic_residency_max_requests,
+        dynamic_residency_min_remaining_tokens=(dynamic_residency_min_remaining_tokens),
+        dynamic_residency_promote_watermark=float(dynamic_residency_promote_watermark),
+        dynamic_residency_demote_watermark=float(dynamic_residency_demote_watermark),
+        dynamic_residency_cooldown_steps=dynamic_residency_cooldown_steps,
+        dynamic_residency_admission_window_seconds=(
+            dynamic_residency_admission_window_seconds
+        ),
         sparse_extra_config=extra_config,
     )
 

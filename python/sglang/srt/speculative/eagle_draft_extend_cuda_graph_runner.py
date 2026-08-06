@@ -80,6 +80,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     replay, can_run_graph for EAGLE-specific draft-extend semantics.
     """
 
+    def _attach_hisparse_coordinator(
+        self, forward_batch: ForwardBatch, num_real_reqs: int
+    ) -> None:
+        """Publish the raw request count before a padded draft-extend replay."""
+        coordinator = getattr(self.model_runner, "hisparse_coordinator", None)
+        if coordinator is None:
+            return
+        forward_batch.hisparse_coordinator = coordinator
+        coordinator.wait_for_pending_backup()
+        coordinator.num_real_reqs.fill_(num_real_reqs)
+
     def __init__(
         self,
         eagle_worker: EagleDraftWorker,
@@ -107,6 +118,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
             if speculative_num_steps is None
@@ -285,6 +297,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self._is_long_context_cuda_graph_disabled(forward_batch):
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -443,6 +457,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend)
         ):
+            self._attach_hisparse_coordinator(forward_batch, bs)
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
@@ -576,6 +591,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         seq_lens_sum = forward_batch.seq_lens_sum
         if seq_lens_sum is not None:
             seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        self._attach_hisparse_coordinator(forward_batch, raw_bs)
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
@@ -588,6 +604,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
+            hisparse_coordinator=getattr(forward_batch, "hisparse_coordinator", None),
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 

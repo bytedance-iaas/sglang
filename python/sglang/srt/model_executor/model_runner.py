@@ -141,6 +141,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -381,6 +382,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # PP+spec: the draft runner exists only on the last PP stage, so its
+        # memory profiling must stay rank-local (world-group reduces would
+        # deadlock against stages without a draft worker).
+        self.pp_spec_draft_local = (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and server_args.pp_size > 1
+        )
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -605,9 +614,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self._model_update_group = {}
@@ -773,14 +783,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
+        if not envs.SGLANG_ENABLE_PP_SPEC.get():
+            assert (
+                (not model_has_mtp_layers)
+                or (self.spec_algorithm.is_none())
+                or (
+                    (not self.spec_algorithm.is_none())
+                    and (self.num_effective_layers == model_num_layers)
+                )
+            ), "PP is not compatible with MTP models."
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -883,6 +894,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 swap_in_block_size=hisparse_cfg.swap_in_block_size,
+                max_num_steps=self.server_args.speculative_num_draft_tokens or 1,
+                # Draft workers share the target logical allocator but own a
+                # distinct physical KV tensor. Bind the coordinator to the
+                # runner-local tensor instead of allocator.get_kvcache().
+                mem_pool_device_override=(
+                    self.token_to_kv_pool
+                    if isinstance(self.token_to_kv_pool, HiSparseDSATokenToKVPool)
+                    else None
+                ),
+                dynamic_residency=hisparse_cfg.dynamic_residency,
+                dynamic_residency_mode=hisparse_cfg.dynamic_residency_mode,
+                dynamic_residency_max_tokens=hisparse_cfg.dynamic_residency_max_tokens,
+                dynamic_residency_max_requests=(
+                    hisparse_cfg.dynamic_residency_max_requests
+                ),
+                dynamic_residency_min_remaining_tokens=(
+                    hisparse_cfg.dynamic_residency_min_remaining_tokens
+                ),
+                dynamic_residency_promote_watermark=(
+                    hisparse_cfg.dynamic_residency_promote_watermark
+                ),
+                dynamic_residency_demote_watermark=(
+                    hisparse_cfg.dynamic_residency_demote_watermark
+                ),
+                dynamic_residency_cooldown_steps=(
+                    hisparse_cfg.dynamic_residency_cooldown_steps
+                ),
+                dynamic_residency_admission_window_seconds=(
+                    hisparse_cfg.dynamic_residency_admission_window_seconds
+                ),
             )
 
         self.init_routed_experts_capturer()
@@ -1291,7 +1332,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
@@ -2339,6 +2381,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
+        if self.enable_hisparse:
+            # HiSparse keeps only a physical working set on device while its
+            # allocator owns a larger logical token space backed by host KV.
+            # Request-length admission must use that logical space, not the
+            # device pool profiled by max_total_num_tokens.
+            return self.token_to_kv_pool_allocator.size
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:

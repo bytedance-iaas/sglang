@@ -78,6 +78,16 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    def _finish_hisparse_request(self, req: Req) -> None:
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.request_finished(req)
+        if (
+            self.draft_hisparse_coordinator is not None
+            and self.draft_hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            self.draft_hisparse_coordinator.request_finished(req)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -90,7 +100,7 @@ class SchedulerBatchResultProcessor:
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
+                    self._finish_hisparse_request(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -175,6 +185,17 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _stash_hisparse_spec_info(
+        self, batch: ScheduleBatch, batch_index: int, req: Req
+    ) -> None:
+        if not self.server_args.enable_hisparse or batch.spec_info is None:
+            return
+        if not hasattr(batch.spec_info, "slice_single"):
+            raise RuntimeError(
+                f"HiSparse cannot stash speculative state for {type(batch.spec_info).__name__}"
+            )
+        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -203,6 +224,12 @@ class SchedulerBatchResultProcessor:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+            if (
+                self.server_args.enable_hisparse
+                and batch.spec_info is None
+                and result.next_draft_input is not None
+            ):
+                batch.spec_info = result.next_draft_input
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -241,6 +268,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
+                            self._stash_hisparse_spec_info(batch, i, req)
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
@@ -840,7 +868,7 @@ class SchedulerBatchResultProcessor:
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 if self.server_args.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
+                    self._finish_hisparse_request(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

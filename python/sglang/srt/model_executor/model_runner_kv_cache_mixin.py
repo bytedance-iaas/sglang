@@ -108,7 +108,8 @@ class ModelRunnerKVCacheMixin:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
 
@@ -972,6 +973,28 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
             else:
                 PoolCls = DSATokenToKVPool
+
+            if (
+                not self.enable_hisparse
+                and dsa_cp_layer_shard_rank is None
+                and PoolCls is DSATokenToKVPool
+            ):
+                # Compact only the regular target DSA pool. HiSparse has a
+                # different host/device layout, CP layer-split owns a subset of
+                # layers per rank, and NEXTN draft layers own real indexer state.
+                from sglang.srt.mem_cache.memory_pool import (
+                    dsa_compact_indexer_layer_mask,
+                )
+
+                compact_mask = dsa_compact_indexer_layer_mask(
+                    self.model_config.hf_config,
+                    self.num_effective_layers,
+                    self.start_layer,
+                    self.end_layer,
+                    is_draft_worker=self.is_draft_worker,
+                )
+                if compact_mask is not None:
+                    pool_kwargs["indexer_layer_mask"] = compact_mask
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1286,6 +1309,16 @@ class ModelRunnerKVCacheMixin:
 
         else:
             assert self.is_draft_worker
+            if self.enable_hisparse and isinstance(
+                self.token_to_kv_pool, HiSparseDSATokenToKVPool
+            ):
+                assert isinstance(
+                    self.token_to_kv_pool_allocator,
+                    HiSparseTokenToKVPoolAllocator,
+                )
+                self.token_to_kv_pool.register_mapping(
+                    self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                )
             if self.is_hybrid_swa:
                 swa_allocator = getattr(
                     self.token_to_kv_pool_allocator,
@@ -1296,6 +1329,18 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.register_mapping(
                     swa_allocator.full_to_swa_index_mapping
                 )
+            if self.enable_hisparse:
+                if isinstance(
+                    self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+                ):
+                    self.token_to_kv_pool.full_to_hisparse_device_index_mapping = (
+                        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                    )
+                else:
+                    assert isinstance(
+                        self.token_to_kv_pool_allocator,
+                        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                    )
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so

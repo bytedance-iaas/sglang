@@ -106,6 +106,20 @@ class SchedulerStats:
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
 
+    # HiSparse dynamic residency
+    hisparse_resident_requests: int = 0
+    hisparse_device_buffered_requests: int = 0
+    hisparse_promotions_total: int = 0
+    hisparse_demotions_total: int = 0
+    hisparse_promotion_failures_total: int = 0
+    hisparse_promotion_migrated_bytes_total: int = 0
+    hisparse_promotion_migration_seconds_total: float = 0.0
+    hisparse_demotion_reclaimed_bytes_total: int = 0
+    hisparse_demotion_transition_seconds_total: float = 0.0
+    hisparse_repromotion_suppressed_total: int = 0
+    hisparse_projected_resident_tokens: int = 0
+    hisparse_resident_time_ratio: float = 0.0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -389,6 +403,101 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.mamba_used_tokens = Gauge(
             name="sglang:mamba_used_tokens",
             documentation="Number of actively used state slots in the mamba SSM pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_resident_requests = Gauge(
+            name="sglang:hisparse_resident_requests",
+            documentation="Number of active HiSparse requests fully resident in HBM.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_device_buffered_requests = Gauge(
+            name="sglang:hisparse_device_buffered_requests",
+            documentation="Number of active HiSparse requests using host-backed swap.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_promotions_total = Gauge(
+            name="sglang:hisparse_promotions_total",
+            documentation="Cumulative HiSparse swap-to-resident transitions.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_demotions_total = Gauge(
+            name="sglang:hisparse_demotions_total",
+            documentation="Cumulative HiSparse resident-to-swap transitions.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_promotion_failures_total = Gauge(
+            name="sglang:hisparse_promotion_failures_total",
+            documentation="Cumulative failed transactional HiSparse promotions.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_promotion_migrated_bytes_total = Gauge(
+            name="sglang:hisparse_promotion_migrated_bytes_total",
+            documentation=(
+                "Cumulative target-plus-draft KV payload bytes copied from host "
+                "to device by dynamic HiSparse promotions."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_promotion_migration_seconds_total = Gauge(
+            name="sglang:hisparse_promotion_migration_seconds_total",
+            documentation=(
+                "Cumulative CUDA time spent copying host-backed KV into resident "
+                "HiSparse slots during dynamic promotions."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_demotion_reclaimed_bytes_total = Gauge(
+            name="sglang:hisparse_demotion_reclaimed_bytes_total",
+            documentation=(
+                "Cumulative target-plus-draft KV payload bytes made reusable in "
+                "the preallocated HiSparse pool by dynamic demotions; this is not "
+                "physical HBM returned to the CUDA allocator."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_demotion_transition_seconds_total = Gauge(
+            name="sglang:hisparse_demotion_transition_seconds_total",
+            documentation=(
+                "Cumulative host dispatch time for dynamic HiSparse demotion state "
+                "transitions. Host KV is maintained continuously, so demotion does "
+                "not perform a bulk device-to-host migration."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_repromotion_suppressed_total = Gauge(
+            name="sglang:hisparse_repromotion_suppressed_total",
+            documentation=(
+                "Cumulative requests whose repeated host-to-resident promotion "
+                "was suppressed by the admission-once residency policy."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_projected_resident_tokens = Gauge(
+            name="sglang:hisparse_projected_resident_tokens",
+            documentation=(
+                "Projected resident HiSparse slots through active requests' "
+                "declared output budgets, including speculative slack."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hisparse_resident_time_ratio = Gauge(
+            name="sglang:hisparse_resident_time_ratio",
+            documentation=(
+                "Cumulative fraction of active request decode steps spent on "
+                "the fully resident HiSparse path."
+            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1283,6 +1392,47 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.mamba_available_tokens, stats.mamba_available_tokens)
         self._log_gauge(self.mamba_evictable_tokens, stats.mamba_evictable_tokens)
         self._log_gauge(self.mamba_used_tokens, stats.mamba_used_tokens)
+        self._log_gauge(
+            self.hisparse_resident_requests, stats.hisparse_resident_requests
+        )
+        self._log_gauge(
+            self.hisparse_device_buffered_requests,
+            stats.hisparse_device_buffered_requests,
+        )
+        self._log_gauge(self.hisparse_promotions_total, stats.hisparse_promotions_total)
+        self._log_gauge(self.hisparse_demotions_total, stats.hisparse_demotions_total)
+        self._log_gauge(
+            self.hisparse_promotion_failures_total,
+            stats.hisparse_promotion_failures_total,
+        )
+        self._log_gauge(
+            self.hisparse_promotion_migrated_bytes_total,
+            stats.hisparse_promotion_migrated_bytes_total,
+        )
+        self._log_gauge(
+            self.hisparse_promotion_migration_seconds_total,
+            stats.hisparse_promotion_migration_seconds_total,
+        )
+        self._log_gauge(
+            self.hisparse_demotion_reclaimed_bytes_total,
+            stats.hisparse_demotion_reclaimed_bytes_total,
+        )
+        self._log_gauge(
+            self.hisparse_demotion_transition_seconds_total,
+            stats.hisparse_demotion_transition_seconds_total,
+        )
+        self._log_gauge(
+            self.hisparse_repromotion_suppressed_total,
+            stats.hisparse_repromotion_suppressed_total,
+        )
+        self._log_gauge(
+            self.hisparse_projected_resident_tokens,
+            stats.hisparse_projected_resident_tokens,
+        )
+        self._log_gauge(
+            self.hisparse_resident_time_ratio,
+            stats.hisparse_resident_time_ratio,
+        )
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

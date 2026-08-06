@@ -262,6 +262,7 @@ class Envs:
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DSA_COMPACT_INDEXER = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
@@ -376,6 +377,12 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
+    # Diagnostic only: force the decode-side EAGLE worker to recompute the
+    # first DSA seed instead of consuming the seed transferred by prefill.
+    SGLANG_TEST_IGNORE_PD_DSA_TOPK_SEED = EnvBool(False)
+    # Diagnostic only: trace request/row identity and a compact fingerprint for
+    # the DSA Top-K seed at prefill capture, PD commit, and draft consumption.
+    SGLANG_TEST_TRACE_PD_DSA_TOPK_SEED = EnvBool(False)
 
     SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
     SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
@@ -704,6 +711,10 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (topk=1 chains, non-overlap schedule).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift

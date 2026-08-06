@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
+    summarize_dsa_topk_seed,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -671,8 +672,24 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
+                    dsa_topk_indices = batch.spec_info.dsa_topk_indices
+                    if dsa_topk_indices is not None:
+                        req.output_dsa_topk_indices = dsa_topk_indices[i].cpu().clone()
+                        if envs.SGLANG_TEST_TRACE_PD_DSA_TOPK_SEED.get():
+                            logger.info(
+                                "PD_DSA_SEED_TRACE stage=prefill_capture "
+                                f"rid={req.rid} batch_row={i} "
+                                f"batch_size={len(batch.reqs)} "
+                                f"req_pool_idx={getattr(req, 'req_pool_idx', None)} "
+                                f"metadata_idx={req.metadata_buffer_index} "
+                                f"seq_len={len(req.origin_input_ids) + len(req.output_ids)} "
+                                f"{summarize_dsa_topk_seed(req.output_dsa_topk_indices)}"
+                            )
+                    else:
+                        req.output_dsa_topk_indices = None
                 else:
                     req.hidden_states_tensor = None
+                    req.output_dsa_topk_indices = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
@@ -1150,6 +1167,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = 0
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None
+        req.output_dsa_topk_indices = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         if req.time_stats.prefill_retry_count >= max_retries:

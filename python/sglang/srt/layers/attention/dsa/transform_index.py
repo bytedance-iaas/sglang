@@ -1,8 +1,11 @@
+import logging
 from typing import List, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 def transform_index_page_table_prefill(**kwargs):
@@ -120,7 +123,33 @@ def transform_index_page_table_prefill_ref(
 ) -> torch.Tensor:
     assert page_size == 1
     result = torch.empty_like(topk_indices, dtype=torch.int32)
-    assert len(extend_lens_cpu) == page_table.shape[0]
+    if len(extend_lens_cpu) != page_table.shape[0]:
+        # CUDA-graph replay can pass a fixed-size page table buffer whose
+        # leading rows are already expanded per query token. In that case the
+        # per-token page table rows align directly with topk_indices.
+        if page_table.shape[0] >= topk_indices.shape[0]:
+            logger.warning_once(
+                "DSA prefill page table row mismatch; using query-token "
+                "aligned prefix. page_table_shape=%s topk_indices_shape=%s "
+                "extend_lens_len=%s extend_lens_sum=%s",
+                tuple(page_table.shape),
+                tuple(topk_indices.shape),
+                len(extend_lens_cpu),
+                sum(extend_lens_cpu),
+            )
+            return transform_index_page_table_decode_ref(
+                page_table[: topk_indices.shape[0]],
+                topk_indices,
+                result=result,
+                page_size=page_size,
+            )
+        raise AssertionError(
+            "DSA prefill page table row mismatch: "
+            f"page_table_shape={tuple(page_table.shape)} "
+            f"topk_indices_shape={tuple(topk_indices.shape)} "
+            f"extend_lens_len={len(extend_lens_cpu)} "
+            f"extend_lens_sum={sum(extend_lens_cpu)}"
+        )
     offset = 0
     for i, l in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_ref(

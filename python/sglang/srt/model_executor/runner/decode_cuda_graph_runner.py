@@ -204,6 +204,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -404,6 +405,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+        if self._is_long_context_cuda_graph_disabled(forward_batch):
             return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
@@ -900,6 +903,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                # PP + spec verify: the pre-planned load ran without the proxy
+                # (eagle_prepare_for_verify has no access to it), so the
+                # graph's proxy input buffers must be refreshed here -- the
+                # captured graph reads these rows (mirrors fill_from's
+                # side-slot copy).
+                for k, v in pp_proxy_tensors.tensors.items():
+                    buf = self.buffers.pp_proxy_tensors.get(k)
+                    if buf is not None:  # skip markers like __msg_type__
+                        buf[: v.shape[0]].copy_(v)
+            if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
@@ -1043,7 +1059,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # Slice in token rows, not request rows: under speculative verify
+            # each request carries num_tokens_per_bs tokens (identical for
+            # plain decode, where num_tokens_per_bs == 1).
+            return PPProxyTensors(
+                {
+                    k: v[: self.bs * self.num_tokens_per_bs]
+                    for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

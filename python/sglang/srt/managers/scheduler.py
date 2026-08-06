@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_seed_metadata_dim,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -72,9 +73,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.layers.dp_attention import (
-    compute_dp_attention_world_info,
-)
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -772,6 +771,17 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        if (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and self.server_args.pp_size > 1
+            and self.ps.pp_rank != self.server_args.pp_size - 1
+        ):
+            # PP+spec: the draft model (MTP layer) needs final hidden states and
+            # the lm_head, both of which live on the last PP stage only.
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -858,7 +868,9 @@ class Scheduler(
             model_runner.post_capture_resize_kv_pool()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
+            # PP+spec: non-last stages have no draft worker; they run the
+            # verify-shaped target forward through the plain tp_worker.
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -952,12 +964,92 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
         if not self.enable_hisparse:
             return
 
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        draft_runner = kv_cache_builder.get_draft_model_runner(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+        if draft_runner is not None:
+            self.draft_hisparse_coordinator = draft_runner.hisparse_coordinator
+            if self.draft_hisparse_coordinator is not None:
+                self.draft_hisparse_coordinator.set_decode_producer_stream(
+                    self.forward_stream
+                )
+                if self.draft_hisparse_coordinator is not self.hisparse_coordinator:
+                    self.hisparse_coordinator.register_device_slot_mirror(
+                        self.draft_hisparse_coordinator
+                    )
+
+    def iter_hisparse_coordinators(self):
+        """Yield target and draft HiSparse coordinators without duplicates."""
+        if self.hisparse_coordinator is not None:
+            yield self.hisparse_coordinator
+        if (
+            self.draft_hisparse_coordinator is not None
+            and self.draft_hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            yield self.draft_hisparse_coordinator
+
+    def admit_hisparse_request_direct(self, req: Req) -> None:
+        if self.hisparse_coordinator is None:
+            return
+        self.hisparse_coordinator.admit_request_direct(req)
+        if (
+            self.draft_hisparse_coordinator is not None
+            and self.draft_hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            self.draft_hisparse_coordinator.admit_request_direct(
+                req, device_slot_owner=self.hisparse_coordinator
+            )
+
+    def hisparse_direct_admission_capacity(self) -> int:
+        """Return the number of direct-to-host requests that can be admitted now.
+
+        A PD request is not runnable until both the target and draft HiSparse
+        coordinators own a full per-request device buffer.  Target and draft
+        runners may share the same physical HiSparse allocator, so capacity must
+        be computed per allocator using the sum of all per-request demands on
+        that allocator.  Treating the coordinators independently overcommits a
+        shared pool by the number of coordinators and fails on the later
+        ``alloc_device_buffer`` call.
+
+        The transfer queue may contain more completed requests than those
+        physical pools can hold, so the smallest live capacity across unique
+        allocators is the direct-admission budget.
+        """
+        allocator_budgets = {}
+        for coordinator in self.iter_hisparse_coordinators():
+            hisparse_allocator = (
+                coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator
+            )
+            allocator_id = id(hisparse_allocator)
+            if allocator_id not in allocator_budgets:
+                allocator_budgets[allocator_id] = [hisparse_allocator, 0]
+            # Coordinators sharing an allocator mirror one numerical device
+            # buffer across their distinct physical KV tensors.
+            allocator_budgets[allocator_id][1] = max(
+                allocator_budgets[allocator_id][1], coordinator.padded_buffer_size
+            )
+
+        return min(
+            (
+                allocator.available_size() // per_request_demand
+                for allocator, per_request_demand in allocator_budgets.values()
+            ),
+            default=0,
+        )
+
+    def finish_hisparse_request(self, req: Req) -> None:
+        for coordinator in self.iter_hisparse_coordinators():
+            coordinator.request_finished(req)
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
@@ -1126,7 +1218,10 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and self.draft_worker is not None
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1136,6 +1231,12 @@ class Scheduler(
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
+
+        # The PD metadata wire schema must match on P and D even when only D
+        # enables spec decoding; a seedless prefill writes the invalid sentinel.
+        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
+            self.model_config.hf_config
+        )
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1152,6 +1253,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1197,6 +1299,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1491,8 +1594,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.destroy()
+        for coordinator in self.iter_hisparse_coordinators():
+            coordinator.destroy()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1886,6 +1989,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            draft_hisparse_coordinator=self.draft_hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
@@ -1907,6 +2011,11 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        token_capacity = (
+            self.token_to_kv_pool_allocator.size
+            if self.enable_hisparse
+            else self.max_total_num_tokens
+        )
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -1916,7 +2025,7 @@ class Scheduler(
                     else 1 << 30
                 ),
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                token_capacity - paged_input_len - self.page_size - 1,
             ),
         )
 
@@ -2657,6 +2766,9 @@ class Scheduler(
                 else:
                     running_batch.merge_batch(new_batch)
                 running_batch.hisparse_coordinator = self.hisparse_coordinator
+                running_batch.draft_hisparse_coordinator = (
+                    self.draft_hisparse_coordinator
+                )
             # Reset batch_is_full so the scheduler can schedule more prefills.
             running_batch.batch_is_full = False
 
@@ -3323,6 +3435,9 @@ class Scheduler(
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info.future_dsa_topk_indices_available = (
+                        batch.spec_info.dsa_topk_indices is not None
+                    )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
@@ -3330,27 +3445,90 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
-                resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
+                is_verify_round = self.server_args.pp_size > 1 and not (
+                    batch.forward_mode.is_extend() or batch.is_extend_in_batch
                 )
+                if is_verify_round:
+                    # PP+spec decode: every stage rebuilds the same verify
+                    # input from relayed per-req state (draft lives on the
+                    # last stage only).
+                    self._pp_spec_rebuild_verify_input(batch)
+                if not self.pp_group.is_last_rank:
+                    # PP+spec: non-last stages run only their model chunk on
+                    # the verify-shaped batch; sampling, accept and draft all
+                    # live on the last stage. The plain tp_worker path already
+                    # returns pp_hidden_states_proxy_tensors for relay.
+                    resolve_forward_inputs(batch, self.future_map)
+                    if is_verify_round:
+                        from sglang.srt.speculative.eagle_utils import (
+                            eagle_prepare_for_verify,
+                        )
+
+                        # Isolation is load-bearing: eagle_prepare_for_verify
+                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
+                        # input_ids, out_cache_loc); without the restore the
+                        # next get_next_batch_to_run treats this decode batch
+                        # as extend and re-merges it (duplicate reqs).
+                        with self._forward_isolation(batch, overlap=False):
+                            verify_forward_batch, can_run_cuda_graph = (
+                                eagle_prepare_for_verify(
+                                    batch.spec_info,
+                                    self.req_to_token_pool,
+                                    batch,
+                                    self.tp_worker,
+                                )
+                            )
+                            batch_result = self.tp_worker.forward_batch_generation(
+                                batch=None,
+                                forward_batch=verify_forward_batch,
+                                pp_proxy_tensors=pp_proxy_tensors,
+                                is_verify=True,
+                            )
+                        batch_result.can_run_cuda_graph = can_run_cuda_graph
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    # The verify input is per-round; between iterations
+                    # spec_info must be merge/filter-safe (None on stages
+                    # without a draft worker).
+                    batch.spec_info = None
+                else:
+                    # Non-overlap: drive the V2 worker synchronously (no
+                    # future_map relay / on_publish). Only the PP+spec worker
+                    # takes pp_proxy_tensors; other spec workers keep their
+                    # signature (and pp_size == 1 has nothing to relay).
+                    kwargs = (
+                        {"pp_proxy_tensors": pp_proxy_tensors}
+                        if self.server_args.pp_size > 1
+                        else {}
+                    )
+                    resolve_forward_inputs(batch, self.future_map)
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **kwargs
+                        )
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    if self.server_args.pp_size == 1:
+                        # Sync D2H so the result processor can read CPU tensors.
+                        # Under PP this local result is only relayed (GPU send);
+                        # processing consumes the round-tripped copy, which
+                        # _pp_prep_batch_result already lands on CPU.
+                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

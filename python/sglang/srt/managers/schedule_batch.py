@@ -922,6 +922,7 @@ class Req(ReqDllmMixin):
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        self.output_dsa_topk_indices = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
@@ -1026,6 +1027,11 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_spec_info = None
+        # Meaningful only after the request enters HiSparse decode. True means
+        # full device KV is still resident; False means inactive/staging or
+        # demoted to the host-backed swap path.
+        self.hisparse_resident = False
 
     @property
     def seqlen(self) -> int:
@@ -1496,6 +1502,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.hisparse_spec_info = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1771,6 +1778,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip

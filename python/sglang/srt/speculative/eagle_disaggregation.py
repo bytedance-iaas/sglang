@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import (
+    summarize_dsa_topk_seed,
+    summarize_pd_bootstrap_tensor,
+)
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -12,6 +18,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 def build_eagle_disagg_draft_input(
@@ -51,15 +59,47 @@ def build_eagle_disagg_draft_input(
         [req.hidden_states_tensor for req in batch.reqs], dim=0
     ).to(batch.device)
 
+    if envs.SGLANG_TEST_TRACE_PD_DSA_TOPK_SEED.get():
+        for row, req in enumerate(batch.reqs):
+            logger.info(
+                "PD_EAGLE_BOOTSTRAP_TRACE stage=draft_consume "
+                f"rid={req.rid} batch_row={row} batch_size={len(batch.reqs)} "
+                f"topk_p=({summarize_pd_bootstrap_tensor(req.output_topk_p)}) "
+                f"topk_index=({summarize_pd_bootstrap_tensor(req.output_topk_index)}) "
+                f"hidden_states=({summarize_pd_bootstrap_tensor(req.hidden_states_tensor)})"
+            )
+
+    dsa_topk_indices = None
+    if not envs.SGLANG_TEST_IGNORE_PD_DSA_TOPK_SEED.get():
+        dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
+        if dsa_indices_list and all(t is not None for t in dsa_indices_list):
+            if envs.SGLANG_TEST_TRACE_PD_DSA_TOPK_SEED.get():
+                for row, (req, seed) in enumerate(
+                    zip(batch.reqs, dsa_indices_list)
+                ):
+                    logger.info(
+                        "PD_DSA_SEED_TRACE stage=draft_consume "
+                        f"rid={req.rid} batch_row={row} "
+                        f"batch_size={len(batch.reqs)} "
+                        f"req_pool_idx={getattr(req, 'req_pool_idx', None)} "
+                        f"seq_len={len(req.origin_input_ids) + len(req.output_ids)} "
+                        f"{summarize_dsa_topk_seed(seed)}"
+                    )
+            dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
+            if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
+                dsa_topk_indices = None
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
+        dsa_topk_indices=dsa_topk_indices,
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
     if batch.enable_overlap:
+        spec_info.future_dsa_topk_indices_available = dsa_topk_indices is not None
         spec_info.future_indices = batch.req_pool_indices
         # Seed the relay buf with the known seq_lens; publish's chained record
         # keeps the in-flight forward's fence intact (see FutureMap.publish).

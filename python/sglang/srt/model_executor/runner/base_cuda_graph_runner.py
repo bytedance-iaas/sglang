@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import os
 from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
@@ -130,6 +131,56 @@ class BaseCudaGraphRunner(BaseRunner):
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
+
+    def _init_long_context_cuda_graph_guard(self) -> None:
+        self.disable_graph_max_seq_len = int(
+            os.environ.get("SGLANG_DISABLE_CUDA_GRAPH_MAX_SEQ_LEN", "0") or "0"
+        )
+        self._disable_graph_log_count = 0
+
+    @staticmethod
+    def _max_runtime_sequence_depth(value: Any) -> int | None:
+        if value is None:
+            return None
+        if hasattr(value, "numel"):
+            return int(value.max().item()) if value.numel() else None
+        try:
+            items = [int(item) for item in value]
+        except TypeError:
+            return int(value)
+        return max(items) if items else None
+
+    def _is_long_context_cuda_graph_disabled(self, forward_batch: Any) -> bool:
+        threshold = getattr(self, "disable_graph_max_seq_len", 0)
+        if threshold <= 0:
+            return False
+
+        candidates = {
+            name: depth
+            for name in ("seq_lens_cpu", "seq_lens", "orig_seq_lens")
+            if (
+                depth := self._max_runtime_sequence_depth(
+                    getattr(forward_batch, name, None)
+                )
+            )
+            is not None
+        }
+        if not candidates or max(candidates.values()) <= threshold:
+            return False
+
+        warning_count = getattr(self, "_disable_graph_log_count", 0)
+        if warning_count < 8:
+            logger.warning(
+                "Disable %s CUDA graph for long context: threshold=%s "
+                "sequence_depths=%s forward_mode=%s batch_size=%s",
+                type(self).__name__,
+                threshold,
+                candidates,
+                getattr(forward_batch, "forward_mode", None),
+                getattr(forward_batch, "batch_size", None),
+            )
+            self._disable_graph_log_count = warning_count + 1
+        return True
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:

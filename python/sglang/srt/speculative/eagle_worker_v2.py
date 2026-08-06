@@ -41,7 +41,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -131,6 +135,43 @@ def _get_plan_stream(
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
+
+
+# Embedding weight names across checkpoint layouts (GLM/DeepSeek-V3 style
+# vs DeepSeek-V4 style).
+_EMBED_TENSOR_NAMES = ("model.embed_tokens.weight", "embed.weight")
+
+
+def _load_checkpoint_tensor(model_path: str, tensor_names: tuple) -> torch.Tensor:
+    """Load one tensor from a local safetensors checkpoint (PP+spec path)."""
+    import glob
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    # The standard loader may have resolved a HF hub id into its own cache;
+    # this simplified reader only handles local checkpoint directories.
+    assert os.path.isdir(model_path), (
+        "PP+spec draft embedding loading requires --model-path to be a local "
+        f"checkpoint directory, got {model_path!r}"
+    )
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        for tensor_name in tensor_names:
+            if tensor_name in weight_map:
+                shard_path = os.path.join(model_path, weight_map[tensor_name])
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    return f.get_tensor(tensor_name)
+    else:
+        for shard_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    if tensor_name in f.keys():
+                        return f.get_tensor(tensor_name)
+    raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -333,6 +374,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
+            # This branch skips the hot-token-map / EAGLE3 head wiring below.
+            assert self.hot_token_id is None and not (
+                self.speculative_algorithm.is_eagle3()
+            ), "PP+spec does not support --speculative-token-map or EAGLE3 drafts yet"
+            # PP+spec: the target's embedding lives on the first PP stage
+            # (PPMissingLayer here on the last stage) and NextN/MTP layers
+            # carry no embedding of their own in the checkpoint, so the
+            # draft's embedding must be loaded from the checkpoint directly
+            # — otherwise it stays randomly initialized and accept_length
+            # collapses to ~1.
+            embed = self.draft_runner.model.model.embed_tokens.weight
+            if self.server_args.load_format != "dummy":
+                loaded_embed = _load_checkpoint_tensor(
+                    model_path=self.draft_runner.model_config.model_path,
+                    tensor_names=_EMBED_TENSOR_NAMES,
+                )
+                embed.weight_loader(embed, loaded_embed)
+            head = self.target_worker.model_runner.model.lm_head.weight
+            self.draft_runner.model.set_embed_and_head(embed, head)
+            return
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
 
@@ -383,6 +445,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
         # Initialize decode attention backend
@@ -529,6 +592,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            can_cuda_graph
+            and not forward_batch.forward_mode.is_idle()
+            and self.seed_dsa_topk_from_draft_extend
+            and draft_input.dsa_topk_indices is None
+        ):
+            can_cuda_graph = False
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -1047,6 +1117,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            # Draft-extend is the last consumer of accepted verify slots. Only
+            # now may their deferred host backup and mapping detach complete.
+            # This runs outside the captured graph; graph replay itself keeps
+            # using coordinator-owned, shape-stable physical slot tensors.
+            hisparse_coordinator.finish_pending_draft_extend_backup()
+            draft_hisparse_coordinator = batch.draft_hisparse_coordinator
+            if (
+                draft_hisparse_coordinator is not None
+                and draft_hisparse_coordinator is not hisparse_coordinator
+            ):
+                draft_hisparse_coordinator.finish_pending_draft_extend_backup()
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
@@ -1184,7 +1271,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
+    ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1193,7 +1282,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1240,7 +1331,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
+            if batch.spec_info is not None and batch.spec_info.is_verify_input():
+                # PP+spec: the scheduler pre-built this round's verify input
+                # from relayed per-req chains — it must match what earlier
+                # stages already ran, so do not re-draft here.
+                verify_input = batch.spec_info
+            elif self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
@@ -1256,7 +1352,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            batch_output = self.verify(batch, pp_proxy_tensors=pp_proxy_tensors)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1275,6 +1371,39 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            if (
+                self.server_args.pp_size > 1
+                and not batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 0
+            ):
+                # PP tail-draft: draft the NEXT round's chain now — earlier
+                # stages must have the tokens before running their half of the
+                # next verify forward, so drafting cannot wait for the next
+                # iteration. Mimic the head-of-iteration state draft() expects;
+                # the scheduler's forward isolation reverts these SB edits, and
+                # the chain rides out on batch_output.
+                batch.spec_info = batch_output.next_draft_input
+                batch.seq_lens = batch_output.new_seq_lens
+                batch.forward_mode = ForwardMode.DECODE
+                # eagle_prepare_for_verify left the verify tokens here; the
+                # head-of-iteration draft always sees None (the scheduler
+                # clears it), so mirror that state.
+                batch.input_ids = None
+                # Attention metadata planning reads the CPU copies; one D2H
+                # per round (TODO: async or upper-bound estimate).
+                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    next_verify_input = self.draft_worker.draft(batch)
+                batch_output.next_verify_chain = next_verify_input.draft_token
 
             return batch_output
 
@@ -1559,7 +1688,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch):
+    def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -1627,6 +1756,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = forward_batch_output.logits_output
 
@@ -1670,6 +1800,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens,
                 accept_lens,
                 self.speculative_num_draft_tokens,
+            )
+
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and not batch.forward_mode.is_idle()
+        ):
+            draft_hisparse_coordinator = batch.draft_hisparse_coordinator
+            hisparse_coordinator.finalize_accepted_tokens_spec_v2(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                verify_cache_locs=batch.out_cache_loc,
+                accept_index=accept_index,
+                mirror=(
+                    draft_hisparse_coordinator
+                    if draft_hisparse_coordinator is not hisparse_coordinator
+                    else None
+                ),
             )
 
         # Update mamba state for hybrid GDN models after verification
