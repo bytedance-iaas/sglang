@@ -1354,18 +1354,20 @@ def _deepgemm_q_b_proj_forward(attention, q_lora: torch.Tensor) -> torch.Tensor:
     return attention.q_b_proj_forward(q_lora)
 
 
-# DeepGEMM q_b_proj can produce a pathologically expensive graph executable on
-# only a subset of TP ranks.  It is a single large GEMM, so keep it as an eager
-# BCG split op while preserving the surrounding fragmented attention compute in
-# captured segments.  This is non-collective and must not join the rank barrier.
+# q_b_proj can dispatch to DeepGEMM through either the small-M fused path or the
+# regular FP8 linear backend.  The latter is used by GLM-5.2 under TP16 because
+# its local (1024, 2048) weight is outside the fused path's verified shapes.
+# Both routes can produce a pathologically expensive graph executable on only a
+# subset of TP ranks.  q_b_proj is a single large GEMM, so keep the whole
+# projection as an eager BCG split op while preserving the surrounding
+# fragmented attention compute in captured segments.  This is non-collective
+# and must not join the rank barrier.
 bcg_deepgemm_q_b_proj_forward = eager_on_graph(True, synchronize_ranks=False)(
     _deepgemm_q_b_proj_forward
 )
 
 
 def _q_b_proj_forward(attention, q_lora: torch.Tensor) -> torch.Tensor:
-    if is_in_breakable_cuda_graph() and getattr(
-        attention, "_use_min_latency_q_b_gemm", False
-    ):
+    if is_in_breakable_cuda_graph():
         return bcg_deepgemm_q_b_proj_forward(attention, q_lora)
     return attention.q_b_proj_forward(q_lora)
