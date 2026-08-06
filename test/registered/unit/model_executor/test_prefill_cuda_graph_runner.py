@@ -190,6 +190,47 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         empty.assert_not_called()
 
+    def test_multinode_collective_break_prewarms_router_gemm_on_capture_stream(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        runner.backend._enable_collective_break = True
+        runner.capture_num_tokens = [4, 8]
+        runner.device = torch.device("cpu")
+        runner.device_module = SimpleNamespace(synchronize=Mock())
+        runner.model_runner = SimpleNamespace(dtype=torch.bfloat16)
+        runner.moe_layers = [
+            SimpleNamespace(
+                moe_runner_config=SimpleNamespace(
+                    num_experts=3,
+                    hidden_size=4,
+                    params_dtype=torch.bfloat16,
+                )
+            ),
+            None,
+        ]
+
+        with patch.object(torch, "mm") as mm:
+            runner._prewarm_multinode_breakable_capture_stream_gemm()
+
+        mm.assert_called_once()
+        hidden_states, router_weight_t = mm.call_args.args
+        self.assertEqual(hidden_states.shape, torch.Size((8, 4)))
+        self.assertEqual(router_weight_t.shape, torch.Size((4, 3)))
+        self.assertEqual(mm.call_args.kwargs, {"out_dtype": torch.float32})
+        runner.device_module.synchronize.assert_called_once_with()
+
+    def test_capture_stream_router_gemm_prewarm_is_collective_break_only(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        runner.backend._enable_collective_break = False
+        runner.capture_num_tokens = [8]
+        runner.moe_layers = []
+
+        with patch.object(torch, "empty") as empty:
+            runner._prewarm_multinode_breakable_capture_stream_gemm()
+
+        empty.assert_not_called()
+
     def test_collective_break_skips_capture_session_warmup_after_largest_shape(self):
         backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
         backend._enable_collective_break = True

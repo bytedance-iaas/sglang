@@ -1305,8 +1305,73 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
+                self._prewarm_multinode_breakable_capture_stream_gemm()
                 with self.backend.capture_session(self.stream):
                     self._capture_one_stream()
+
+    def _prewarm_multinode_breakable_capture_stream_gemm(self) -> None:
+        """Initialize the router cuBLAS path on the BCG capture stream.
+
+        ``graph_capture()`` switches to a fresh stream before segmented BCG
+        capture begins.  The normal largest-shape model prewarm runs before
+        that context and therefore initializes cuBLAS only on the eager
+        stream.  On multi-node H20, the first BF16->FP32 router GEMM on the
+        fresh stream can otherwise enter cuBLAS kernel setup after a graph
+        break while capture is active and never complete.  Warm the exact
+        largest-token router shapes on that stream before any segment starts.
+
+        This is a kernel-only warmup: it does not run another model forward,
+        mutate attention metadata, or exercise a collective.  Decode and
+        non-collective-break capture lifecycles remain unchanged.
+        """
+        if not isinstance(self.backend, BreakableCudaGraphBackend):
+            return
+        if not self.backend._enable_collective_break:
+            return
+
+        num_tokens = max(self.capture_num_tokens)
+        configs = {
+            (
+                layer.moe_runner_config.num_experts,
+                layer.moe_runner_config.hidden_size,
+                layer.moe_runner_config.params_dtype or self.model_runner.dtype,
+            )
+            for layer in self.moe_layers
+            if layer is not None
+            and layer.moe_runner_config.num_experts is not None
+            and layer.moe_runner_config.hidden_size is not None
+        }
+        bf16_configs = sorted(
+            (num_experts, hidden_size)
+            for num_experts, hidden_size, dtype in configs
+            if dtype == torch.bfloat16
+        )
+        if not bf16_configs:
+            return
+
+        logger.info(
+            "Prewarming router cuBLAS GEMMs on the multi-node Breakable "
+            "prefill CUDA graph capture stream. num_tokens=%d layouts=%s",
+            num_tokens,
+            bf16_configs,
+        )
+        for num_experts, hidden_size in bf16_configs:
+            hidden_states = torch.empty(
+                (num_tokens, hidden_size),
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            router_weight = torch.empty(
+                (num_experts, hidden_size),
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            torch.mm(hidden_states, router_weight.t(), out_dtype=torch.float32)
+        self.device_module.synchronize()
+        logger.info(
+            "Prewarmed router cuBLAS GEMMs on the multi-node Breakable "
+            "prefill CUDA graph capture stream."
+        )
 
     def _precompile_multinode_breakable_moe_reduce(self) -> None:
         """Initialize small-token MoE fusion before BCG graph capture.
