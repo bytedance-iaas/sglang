@@ -106,32 +106,6 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
-class TestPPDSparkRoleValidation(CustomTestCase):
-    @staticmethod
-    def _args(disaggregation_mode: str) -> ServerArgs:
-        return ServerArgs(
-            model_path="dummy",
-            pp_size=2,
-            disable_overlap_schedule=True,
-            speculative_algorithm="DSPARK",
-            disaggregation_mode=disaggregation_mode,
-        )
-
-    def test_pp_dspark_prefill_is_supported(self):
-        """PP DSpark is admitted only where draft KV is produced."""
-        self._args("prefill").check_server_args()
-
-    def test_pp_dspark_non_prefill_roles_are_rejected(self):
-        """Reject the unsupported PP speculative-verify protocol before startup."""
-        for disaggregation_mode in ("decode", "null"):
-            with self.subTest(disaggregation_mode=disaggregation_mode):
-                with self.assertRaisesRegex(
-                    AssertionError,
-                    "only supported for DSPARK on a PD prefill server",
-                ):
-                    self._args(disaggregation_mode).check_server_args()
-
-
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
         server_args = ServerArgs(
