@@ -41,6 +41,11 @@ def cuda_graph_collective_break(enabled: bool = True) -> Iterator[None]:
         _enable_cuda_graph_collective_break.reset(token)
 
 
+def is_cuda_graph_collective_break_enabled() -> bool:
+    """Whether the current execution is capturing BCG collective breaks."""
+    return _enable_cuda_graph_collective_break.get()
+
+
 def _tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 

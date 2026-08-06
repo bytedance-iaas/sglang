@@ -1300,80 +1300,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        self._precompile_multinode_breakable_moe_reduce()
         self._prewarm_multinode_breakable_capture()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
                 with self.backend.capture_session(self.stream):
                     self._capture_one_stream()
-
-    def _precompile_multinode_breakable_moe_reduce(self) -> None:
-        """Compile small-token MoE reductions before BCG graph capture.
-
-        The Triton MoE runner uses a local ``torch.compile`` fusion for token
-        counts up to 32.  Multi-node collective-break capture intentionally
-        skips per-shape full-model warmups because those warmups mutate DSA
-        attention metadata.  Without an explicit kernel-only warmup, the first
-        small bucket asks Inductor to compile while CUDA graph capture is
-        active, which is unsupported.  Compile the exact shapes and MoE
-        layouts without running another model forward or any collective.
-        """
-        if not isinstance(self.backend, BreakableCudaGraphBackend):
-            return
-        if not self.backend._enable_collective_break:
-            return
-
-        small_shapes = sorted({n for n in self.capture_num_tokens if n <= 32})
-        if not small_shapes:
-            return
-
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-            moe_sum_reduce_torch_compile,
-        )
-
-        configs = {
-            (
-                layer.moe_runner_config.top_k,
-                layer.moe_runner_config.hidden_size,
-                (
-                    layer.moe_runner_config.routed_scaling_factor
-                    if layer.moe_runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-            )
-            for layer in self.moe_layers
-            if layer is not None and not layer.moe_runner_config.no_combine
-        }
-        if not configs:
-            return
-
-        logger.info(
-            "Precompiling small-token MoE reductions before multi-node "
-            "Breakable prefill CUDA graph capture. num_tokens=%s layouts=%s",
-            small_shapes,
-            sorted(configs),
-        )
-        for top_k, hidden_size, routed_scaling_factor in sorted(configs):
-            for num_tokens in small_shapes:
-                intermediate = torch.empty(
-                    (num_tokens, top_k, hidden_size),
-                    device=self.device,
-                    dtype=self.model_runner.dtype,
-                )
-                output = torch.empty(
-                    (num_tokens, hidden_size),
-                    device=self.device,
-                    dtype=self.model_runner.dtype,
-                )
-                moe_sum_reduce_torch_compile(
-                    intermediate, output, routed_scaling_factor
-                )
-        self.device_module.synchronize()
-        logger.info(
-            "Precompiled small-token MoE reductions before multi-node "
-            "Breakable prefill CUDA graph capture."
-        )
 
     def _prewarm_multinode_breakable_capture(self) -> None:
         """Warm the largest BCG shape before graph-mode collectives are enabled.

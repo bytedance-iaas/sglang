@@ -10,6 +10,7 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.distributed import communication_op, parallel_state
+from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -131,54 +132,14 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(backend._prewarmed_outputs[shape_key], "output")
         self.assertEqual(calls, ["synchronize", "barrier"])
 
-    def test_multinode_collective_break_precompiles_small_moe_reductions(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
-        runner.backend._enable_collective_break = True
-        runner.capture_num_tokens = [4, 16, 32, 48]
-        runner.device = torch.device("cpu")
-        runner.device_module = SimpleNamespace(synchronize=Mock())
-        runner.model_runner = SimpleNamespace(dtype=torch.float32)
-        runner.moe_layers = [
-            SimpleNamespace(
-                moe_runner_config=SimpleNamespace(
-                    top_k=9,
-                    hidden_size=8,
-                    routed_scaling_factor=2.5,
-                    no_combine=False,
-                )
-            ),
-            None,
-        ]
-
-        target = (
-            "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe."
-            "moe_sum_reduce_torch_compile"
-        )
-        with patch(target) as compiled_reduce:
-            runner._precompile_multinode_breakable_moe_reduce()
-
-        self.assertEqual(compiled_reduce.call_count, 3)
-        self.assertEqual(
-            [call.args[0].shape for call in compiled_reduce.call_args_list],
-            [torch.Size((4, 9, 8)), torch.Size((16, 9, 8)), torch.Size((32, 9, 8))],
-        )
-        self.assertTrue(
-            all(call.args[2] == 2.5 for call in compiled_reduce.call_args_list)
-        )
-        runner.device_module.synchronize.assert_called_once_with()
-
-    def test_moe_reduce_precompile_is_collective_break_only(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
-        runner.backend._enable_collective_break = False
-        runner.capture_num_tokens = [4]
-        runner.moe_layers = []
-
-        with patch.object(torch, "empty") as empty:
-            runner._precompile_multinode_breakable_moe_reduce()
-
-        empty.assert_not_called()
+    def test_collective_break_uses_capture_safe_small_moe_reduce(self):
+        with patch.object(
+            fused_moe, "is_batch_invariant_mode_enabled", return_value=False
+        ):
+            self.assertTrue(fused_moe._use_moe_sum_reduce_torch_compile(32))
+            with communication_op.cuda_graph_collective_break():
+                self.assertFalse(fused_moe._use_moe_sum_reduce_torch_compile(32))
+            self.assertTrue(fused_moe._use_moe_sum_reduce_torch_compile(32))
 
     def test_collective_break_skips_capture_session_warmup_after_largest_shape(self):
         backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)

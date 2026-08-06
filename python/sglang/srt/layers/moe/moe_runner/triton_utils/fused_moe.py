@@ -21,6 +21,9 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.communication_op import (
+    is_cuda_graph_collective_break_enabled,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -95,7 +98,11 @@ padding_size = get_moe_padding_size(_use_aiter)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
-    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+    return (
+        num_tokens <= 32
+        and not is_batch_invariant_mode_enabled()
+        and not is_cuda_graph_collective_break_enabled()
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
