@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -429,6 +430,10 @@ class DSparkWorkerV2(BaseSpecWorker):
     @property
     def owner_only_prefill_enabled(self) -> bool:
         return self._owner_only_prefill_enabled
+
+    def sync_owner_only_prefill_ranks(self) -> None:
+        if self._owner_only_prefill_enabled:
+            torch.distributed.barrier(group=get_world_group().cpu_group)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
