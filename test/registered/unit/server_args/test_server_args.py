@@ -121,19 +121,15 @@ class TestPPDSparkRoleValidation(CustomTestCase):
         """PP DSpark is admitted only where draft KV is produced."""
         self._args("prefill").check_server_args()
 
-    def test_pp_dspark_decode_is_rejected(self):
+    def test_pp_dspark_non_prefill_roles_are_rejected(self):
         """Reject the unsupported PP speculative-verify protocol before startup."""
-        with self.assertRaisesRegex(
-            AssertionError, "only supported for DSPARK on a PD prefill server"
-        ):
-            self._args("decode").check_server_args()
-
-    def test_pp_dspark_without_pd_is_rejected(self):
-        """Do not extend the prefill-only exception to unified mode."""
-        with self.assertRaisesRegex(
-            AssertionError, "only supported for DSPARK on a PD prefill server"
-        ):
-            self._args("null").check_server_args()
+        for disaggregation_mode in ("decode", "null"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "only supported for DSPARK on a PD prefill server",
+                ):
+                    self._args(disaggregation_mode).check_server_args()
 
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
