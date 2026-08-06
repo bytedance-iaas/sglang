@@ -224,7 +224,12 @@ class DedupedCudaGraphRegistry:
 
         group = self.groups.get(signature)
         if group is not None:
-            assert group.compat_exec is not None
+            # A compatibility exec is only needed once a second graph joins
+            # the group.  Instantiating it with the first graph eagerly doubles
+            # the peak graph-exec footprint for every new signature and can
+            # exhaust HBM before dedup has a chance to save any memory.
+            if group.compat_exec is None:
+                group.compat_exec = self.instantiate(group.current_raw_graph)
             ok, detail = dedup_update(group.compat_exec, graph.raw_graph)
             assert ok, f"CUDA graph dedup register update failed ({detail})"
             graph.group = group
@@ -234,7 +239,7 @@ class DedupedCudaGraphRegistry:
         group = GraphExecGroup(
             graph_exec=self.instantiate(graph.raw_graph),
             current_raw_graph=graph.raw_graph,
-            compat_exec=self.instantiate(graph.raw_graph),
+            compat_exec=None,
             graphs=[graph],
         )
         graph.group = group
