@@ -282,6 +282,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dspark_disaggregation import dspark_pp_forward_kwargs
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -3674,14 +3675,8 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    fwd_kwargs = {}
-                    if (
-                        pp_proxy_tensors is not None
-                        and batch.spec_algorithm.is_dspark()
-                    ):
-                        fwd_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                     batch_result = self.model_worker.forward_batch_generation(
-                        batch, **fwd_kwargs
+                        batch, **dspark_pp_forward_kwargs(batch, pp_proxy_tensors)
                     )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
