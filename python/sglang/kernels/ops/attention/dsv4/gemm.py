@@ -20,6 +20,10 @@ if _use_aiter:
     from aiter.tuned_gemm import tgemm
 
 _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
+_GLM52_ROUTER_K = 6144
+_GLM52_ROUTER_N = 256
+_BCG_DEEP_GEMM_ROUTER_MIN_M = 17
+_BCG_DEEP_GEMM_ROUTER_MAX_M = 32
 _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
 # The HPC-Ops bf16xfp32 GEMM consumes the fp32 weight decomposed into two
 # bf16 halves: w_high = w.bf16 and w_low = ((w - w_high) / scale).bf16 with
@@ -124,6 +128,45 @@ def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.mm(x.float(), y.float().t())
 
 
+def _linear_bf16_fp32_deep_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
+    deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
+    return z
+
+
+def _can_use_bcg_deep_gemm_moe_gate(x: torch.Tensor, y: torch.Tensor) -> bool:
+    """Whether the GLM-5.2 medium-token router should avoid cuBLAS in BCG.
+
+    SGLang's low-latency router kernel is intentionally limited to at most 16
+    tokens.  On multi-node H20, the resulting cuBLAS fallback for the 28-token
+    Prefill capture bucket does not complete even after the gate is moved to a
+    non-collective BCG break.  Keep the workaround exact to the affected
+    GLM-5.2 router shape and the first fallback bucket range; all other GEMMs
+    retain their existing dispatch.
+    """
+    if _is_hip or x.dim() != 2 or y.dim() != 2:
+        return False
+    if not (x.is_cuda and y.is_cuda):
+        return False
+    if x.dtype != torch.bfloat16 or y.dtype != torch.bfloat16:
+        return False
+    if not (x.is_contiguous() and y.is_contiguous()):
+        return False
+    if x.shape[1] != _GLM52_ROUTER_K or y.shape != (
+        _GLM52_ROUTER_N,
+        _GLM52_ROUTER_K,
+    ):
+        return False
+    if not (_BCG_DEEP_GEMM_ROUTER_MIN_M <= x.shape[0] <= _BCG_DEEP_GEMM_ROUTER_MAX_M):
+        return False
+
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+
 def _linear_bf16_fp32_hpc(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -166,16 +209,20 @@ def linear_bf16_fp32(
             return output
         return _linear_bf16_fp32_cublas(x, y)
     elif _linear_bf16_fp32_algo == "deep_gemm" and y.dtype == torch.bfloat16:
-        from sglang.srt.layers import deep_gemm_wrapper
-
-        z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
-        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
-        return z
+        return _linear_bf16_fp32_deep_gemm(x, y)
     else:
         return _linear_bf16_fp32_cublas(x, y)
 
 
-bcg_linear_bf16_fp32 = eager_on_graph(True, synchronize_ranks=False)(linear_bf16_fp32)
+def _linear_bf16_fp32_moe_gate_bcg(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if _can_use_bcg_deep_gemm_moe_gate(x, y):
+        return _linear_bf16_fp32_deep_gemm(x, y)
+    return linear_bf16_fp32(x, y)
+
+
+bcg_linear_bf16_fp32 = eager_on_graph(True, synchronize_ranks=False)(
+    _linear_bf16_fp32_moe_gate_bcg
+)
 
 
 def linear_bf16_fp32_moe_gate(

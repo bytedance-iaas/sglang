@@ -216,6 +216,84 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(eager.call_count, 2)
         graph_break.assert_called_once_with(hidden_states, weight)
 
+    def test_bcg_moe_gate_uses_deep_gemm_for_glm52_medium_token_shape(self):
+        hidden_states = object()
+        weight = object()
+        with (
+            patch.object(
+                dsv4_gemm,
+                "_can_use_bcg_deep_gemm_moe_gate",
+                return_value=True,
+            ),
+            patch.object(
+                dsv4_gemm,
+                "_linear_bf16_fp32_deep_gemm",
+                return_value="deep_gemm",
+            ) as deep_gemm,
+            patch.object(dsv4_gemm, "linear_bf16_fp32") as fallback,
+        ):
+            self.assertEqual(
+                dsv4_gemm._linear_bf16_fp32_moe_gate_bcg(hidden_states, weight),
+                "deep_gemm",
+            )
+
+        deep_gemm.assert_called_once_with(hidden_states, weight)
+        fallback.assert_not_called()
+
+    def test_bcg_deep_gemm_moe_gate_shape_is_exact_and_bounded(self):
+        def tensor(shape):
+            return SimpleNamespace(
+                dim=lambda: 2,
+                is_cuda=True,
+                dtype=torch.bfloat16,
+                is_contiguous=lambda: True,
+                shape=shape,
+            )
+
+        weight = tensor((256, 6144))
+        with patch("sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", True):
+            self.assertTrue(
+                dsv4_gemm._can_use_bcg_deep_gemm_moe_gate(tensor((28, 6144)), weight)
+            )
+            for num_tokens in (16, 33):
+                self.assertFalse(
+                    dsv4_gemm._can_use_bcg_deep_gemm_moe_gate(
+                        tensor((num_tokens, 6144)), weight
+                    )
+                )
+            self.assertFalse(
+                dsv4_gemm._can_use_bcg_deep_gemm_moe_gate(
+                    tensor((28, 7168)), tensor((256, 7168))
+                )
+            )
+            self.assertFalse(
+                dsv4_gemm._can_use_bcg_deep_gemm_moe_gate(
+                    tensor((28, 6144)), tensor((257, 6144))
+                )
+            )
+
+    def test_bcg_moe_gate_preserves_existing_fallback_dispatch(self):
+        hidden_states = object()
+        weight = object()
+        with (
+            patch.object(
+                dsv4_gemm,
+                "_can_use_bcg_deep_gemm_moe_gate",
+                return_value=False,
+            ),
+            patch.object(
+                dsv4_gemm, "linear_bf16_fp32", return_value="fallback"
+            ) as fallback,
+            patch.object(dsv4_gemm, "_linear_bf16_fp32_deep_gemm") as deep_gemm,
+        ):
+            self.assertEqual(
+                dsv4_gemm._linear_bf16_fp32_moe_gate_bcg(hidden_states, weight),
+                "fallback",
+            )
+
+        fallback.assert_called_once_with(hidden_states, weight)
+        deep_gemm.assert_not_called()
+
     def test_non_collective_bcg_break_skips_capture_barrier(self):
         calls = []
         capture = SimpleNamespace(
