@@ -11,12 +11,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
 from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
 from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
+    _BlockFp8LinearSlice,
 )
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
@@ -60,6 +62,8 @@ def _make_deepseek_v4_dspark_projection_model(
     model.confidence_head = torch.nn.Identity()
     model.embed_tokens = None
     model.lm_head = None
+    model._partial_feature_indices = ()
+    model._partial_main_proj = None
     return model
 
 
@@ -113,6 +117,59 @@ class TestDSparkPPContext(CustomTestCase):
             yield
 
         model.load_weights(weights())
+
+    def test_block_fp8_projection_slice_selects_matching_weight_and_scale_blocks(self):
+        feature_width = 128
+        output_size = 2
+        quant_method = Fp8LinearMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+            )
+        )
+        weight = torch.arange(
+            output_size * feature_width * 3, dtype=torch.float32
+        ).reshape(output_size, feature_width * 3)
+        weight_scale = torch.tensor([[11.0, 22.0, 33.0]])
+        source = SimpleNamespace(
+            quant_method=quant_method,
+            weight=torch.nn.Parameter(weight, requires_grad=False),
+            weight_scale_inv=torch.nn.Parameter(weight_scale, requires_grad=False),
+        )
+        source.weight_scale_inv.format_ue8m0 = False
+
+        projection_slice = _BlockFp8LinearSlice(
+            source=source,
+            feature_indices=[0, 2],
+            feature_width=feature_width,
+        )
+
+        expected_weight = torch.cat(
+            [weight[:, :feature_width], weight[:, 2 * feature_width :]], dim=1
+        )
+        self.assertTrue(torch.equal(projection_slice.weight, expected_weight))
+        self.assertTrue(
+            torch.equal(
+                projection_slice.weight_scale_inv,
+                torch.tensor([[11.0, 33.0]]),
+            )
+        )
+
+    def test_partial_projection_uses_prepared_quantized_slice(self):
+        model = _make_deepseek_v4_dspark_projection_model(
+            hidden_size=4, num_target_features=3
+        )
+        expected = torch.randn(2, 4)
+        projection_slice = Mock(return_value=expected)
+        model._partial_feature_indices = (1,)
+        model._partial_main_proj = projection_slice
+        local_hidden = torch.randn(2, 4)
+
+        actual = model.project_target_hidden_partial(local_hidden, [1])
+
+        projection_slice.assert_called_once_with(local_hidden)
+        self.assertIs(actual, expected)
 
     def test_pp_spec_verify_buffers_use_token_axis(self):
         """PP verify buffers must cover bs times speculative token width."""

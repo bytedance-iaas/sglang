@@ -18,6 +18,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    inverse_transform_scale_ue8m0,
+    transform_scale_ue8m0,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -60,6 +65,83 @@ _PAD_NUM_HEADS = 64
 _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
 )
+
+
+class _BlockFp8LinearSlice(nn.Module):
+    """Persistent K-block slice of a loaded block-FP8 ReplicatedLinear."""
+
+    def __init__(
+        self,
+        *,
+        source: ReplicatedLinear,
+        feature_indices: List[int],
+        feature_width: int,
+    ) -> None:
+        super().__init__()
+        quant_method = source.quant_method
+        if not (
+            isinstance(quant_method, Fp8LinearMethod)
+            and quant_method.block_quant
+            and not quant_method.use_mxfp8
+            and not quant_method.use_marlin
+        ):
+            raise ValueError(
+                "DSpark block-FP8 projection slice requires a non-MXFP8 "
+                "block-quantized Fp8LinearMethod."
+            )
+
+        block_k = int(quant_method.weight_block_size[1])
+        if feature_width % block_k != 0:
+            raise ValueError(
+                f"DSpark feature width {feature_width} must align to FP8 "
+                f"block_k={block_k}."
+            )
+        blocks_per_feature = feature_width // block_k
+        device = source.weight.device
+        weight_columns = torch.cat(
+            [
+                torch.arange(
+                    feature_index * feature_width,
+                    (feature_index + 1) * feature_width,
+                    device=device,
+                )
+                for feature_index in feature_indices
+            ]
+        )
+        scale_columns = torch.cat(
+            [
+                torch.arange(
+                    feature_index * blocks_per_feature,
+                    (feature_index + 1) * blocks_per_feature,
+                    device=device,
+                )
+                for feature_index in feature_indices
+            ]
+        )
+
+        self.quant_method = quant_method
+        self.weight = nn.Parameter(
+            source.weight.detach().index_select(1, weight_columns).contiguous(),
+            requires_grad=False,
+        )
+        source_scale = source.weight_scale_inv.detach()
+        scale_is_ue8m0 = source.weight_scale_inv.format_ue8m0
+        if scale_is_ue8m0:
+            source_scale = inverse_transform_scale_ue8m0(
+                source_scale, mn=source.weight.shape[0]
+            )
+        local_scale = source_scale.index_select(1, scale_columns).contiguous()
+        if scale_is_ue8m0:
+            local_scale = transform_scale_ue8m0(local_scale, mn=source.weight.shape[0])
+        self.weight_scale_inv = nn.Parameter(
+            local_scale,
+            requires_grad=False,
+        )
+        self.weight_scale_inv.format_ue8m0 = scale_is_ue8m0
+        self.register_parameter("bias", None)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply(self, hidden_states, bias=None)
 
 
 def apply_rotary_emb(
@@ -607,6 +689,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.hc_eps = float(config.hc_eps)
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
+        self._partial_feature_indices: tuple[int, ...] = ()
+        self._partial_main_proj: Optional[_BlockFp8LinearSlice] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.is_lifecycle_only:
@@ -685,6 +769,37 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projected, _ = self.stages[0].main_proj(main_hidden)
         return self.stages[0].main_norm(projected)
 
+    def prepare_target_hidden_partial(self, feature_indices: List[int]) -> None:
+        feature_indices = [int(index) for index in feature_indices]
+        main_proj = self.stages[0].main_proj
+        quant_method = main_proj.quant_method
+        self._partial_feature_indices = tuple(feature_indices)
+        if not (
+            isinstance(quant_method, Fp8LinearMethod)
+            and quant_method.block_quant
+            and not quant_method.use_mxfp8
+            and not quant_method.use_marlin
+        ):
+            self._partial_main_proj = None
+            logger.warning(
+                "DSpark partial projection cannot slice quant method %s; "
+                "falling back to the full-K projection.",
+                type(quant_method).__name__,
+            )
+            return
+        self._partial_main_proj = _BlockFp8LinearSlice(
+            source=main_proj,
+            feature_indices=feature_indices,
+            feature_width=int(self.config.hidden_size),
+        )
+        logger.info(
+            "DSpark block-FP8 partial projection uses feature columns %s "
+            "(local K=%s, full K=%s).",
+            feature_indices,
+            len(feature_indices) * int(self.config.hidden_size),
+            int(main_proj.weight.shape[1]),
+        )
+
     def project_target_hidden_partial(
         self, main_hidden: torch.Tensor, feature_indices: list[int]
     ) -> torch.Tensor:
@@ -706,6 +821,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"Expected shape [N, {expected}] for {feature_indices=}, "
                 f"but got shape={tuple(main_hidden.shape)}."
             )
+
+        if (
+            self._partial_main_proj is not None
+            and tuple(feature_indices) == self._partial_feature_indices
+        ):
+            return self._partial_main_proj(main_hidden)
 
         local_features = main_hidden.view(
             main_hidden.shape[0], len(feature_indices), hidden_size

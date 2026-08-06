@@ -363,6 +363,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._pp_context_feature_indices = local_feature_indices
+        if self._draft_is_moe and not self._use_full_projection_prefill:
+            self.draft_model.prepare_target_hidden_partial(local_feature_indices)
         if self.ps.tp_rank == 0:
             logger.info(
                 "DSpark PP-local context projection will accumulate feature indices %s "
@@ -495,6 +497,29 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def clear_cache_pool(self):
         pass
+
+    def _refresh_partial_projection(self) -> None:
+        if (
+            self._draft_is_moe
+            and not self._is_lifecycle_only_pp_prefill_rank
+            and not self._use_full_projection_prefill
+            and self._pp_context_feature_indices is not None
+        ):
+            self.draft_model.prepare_target_hidden_partial(
+                self._pp_context_feature_indices
+            )
+
+    def update_weights_from_disk(self, recv_req):
+        success, message = super().update_weights_from_disk(recv_req)
+        if success:
+            self._refresh_partial_projection()
+        return success, message
+
+    def update_weights_from_ipc(self, recv_req):
+        success, message = super().update_weights_from_ipc(recv_req)
+        if success:
+            self._refresh_partial_projection()
+        return success, message
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
