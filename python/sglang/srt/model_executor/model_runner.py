@@ -291,6 +291,14 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # PP+spec: the draft runner exists only on the last PP stage, so its
+        # memory profiling must stay rank-local (world-group reduces would
+        # deadlock against stages without a draft worker).
+        self.pp_spec_draft_local = (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and server_args.pp_size > 1
+        )
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -1190,6 +1198,12 @@ class ModelRunner:
     @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
+        if self.enable_hisparse:
+            # HiSparse keeps only a physical working set on device while its
+            # allocator owns a larger logical token space backed by host KV.
+            # Request-length admission must use that logical space, not the
+            # device pool profiled by max_total_num_tokens.
+            return self.token_to_kv_pool_allocator.size
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:

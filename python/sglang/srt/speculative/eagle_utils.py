@@ -525,6 +525,21 @@ def eagle_prepare_for_verify(
             draft_token_num=verify_input.draft_token_num,
             device=device,
         )
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.prepare_verify_slots_spec_v2(
+                req_pool_indices=batch.req_pool_indices,
+                verify_cache_locs=batch.out_cache_loc,
+                num_tokens_per_req=verify_input.draft_token_num,
+                start_positions_cpu=(
+                    batch.seq_lens_cpu
+                    if batch.seq_lens_cpu is not None
+                    else batch.seq_lens.cpu()
+                ),
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num

@@ -1048,6 +1048,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            # Draft-extend is the last consumer of accepted verify slots. Only
+            # now may their deferred host backup and mapping detach complete.
+            # This runs outside the captured graph; graph replay itself keeps
+            # using coordinator-owned, shape-stable physical slot tensors.
+            hisparse_coordinator.finish_pending_draft_extend_backup()
+            draft_hisparse_coordinator = batch.draft_hisparse_coordinator
+            if (
+                draft_hisparse_coordinator is not None
+                and draft_hisparse_coordinator is not hisparse_coordinator
+            ):
+                draft_hisparse_coordinator.finish_pending_draft_extend_backup()
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
@@ -1258,7 +1275,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
+            if batch.spec_info is not None and batch.spec_info.is_verify_input():
+                # PP+spec: the scheduler pre-built this round's verify input
+                # from relayed per-req chains — it must match what earlier
+                # stages already ran, so do not re-draft here.
+                verify_input = batch.spec_info
+            elif self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)

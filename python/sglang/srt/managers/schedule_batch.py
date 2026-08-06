@@ -1153,6 +1153,11 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_spec_info = None
+        # Meaningful only after the request enters HiSparse decode. True means
+        # full device KV is still resident; False means inactive/staging or
+        # demoted to the host-backed swap path.
+        self.hisparse_resident = False
 
     @property
     def seqlen(self) -> int:
@@ -1941,6 +1946,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip

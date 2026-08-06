@@ -1,3 +1,4 @@
+import os
 import weakref
 
 import torch
@@ -12,7 +13,40 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
 
-class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class HiSparseDemotionMixin:
+    def set_demote_until_hisparse_available(self, callback):
+        self._demote_until_hisparse_available = weakref.WeakMethod(callback)
+
+    def set_schedulable_hisparse_available(self, callback):
+        self._schedulable_hisparse_available = weakref.WeakMethod(callback)
+
+    def _get_schedulable_hisparse_available(self) -> int:
+        callback_ref = getattr(self, "_schedulable_hisparse_available", None)
+        if callback_ref is None:
+            return self.hisparse_attn_allocator.available_size()
+
+        callback = callback_ref()
+        if callback is None:
+            return self.hisparse_attn_allocator.available_size()
+        return callback()
+
+    def _ensure_hisparse_available(self, need_tokens: int) -> bool:
+        if self.hisparse_attn_allocator.available_size() >= need_tokens:
+            return True
+
+        callback_ref = getattr(self, "_demote_until_hisparse_available", None)
+        if callback_ref is None:
+            return False
+
+        callback = callback_ref()
+        return (
+            callback is not None
+            and callback(need_tokens)
+            and self.hisparse_attn_allocator.available_size() >= need_tokens
+        )
+
+
+class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         size: int,
@@ -31,6 +65,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
         self.need_sort = need_sort
+        self.debug_validate_lifecycle = (
+            os.environ.get("SGLANG_HISPARSE_DEBUG_LIFECYCLE", "0") == "1"
+        )
 
         self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_full,
@@ -79,7 +116,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def available_size(self) -> int:
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
+            self._get_schedulable_hisparse_available(),
         )
 
     def get_kvcache(self):
@@ -91,6 +128,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 "HiSparse generic allocation is only supported for page_size=1. "
                 "Use alloc_extend for paged allocation."
             )
+        if not self._ensure_hisparse_available(need_size):
+            return None
 
         logical_indices = self.logical_attn_allocator.alloc(need_size)
         if logical_indices is None:
@@ -136,9 +175,39 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        if hisparse_indices.numel() > 0:
+            # A speculative over-allocation can keep a logical mapping alive
+            # beyond the request span handled by an earlier residency
+            # transition. When that span becomes visible on a later demotion,
+            # its physical page may already have been returned by the previous
+            # transition. The mapping has just been detached above, so discard
+            # these stale references before transferring ownership to the
+            # fixed device buffer or releasing surplus pages. Otherwise the
+            # surplus free below returns the same page twice; if the stale slot
+            # falls in the retained prefix it becomes a use-after-free instead.
+            mapped_pages = hisparse_indices // self.page_size
+            stale = torch.isin(
+                mapped_pages, self.hisparse_attn_allocator.free_pages
+            )
+            if torch.any(stale):
+                hisparse_indices = hisparse_indices[~stale]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
+            surplus = hisparse_indices[need_size:]
+            if surplus.numel() > 0:
+                # ``PagedTokenToKVPoolAllocator.free`` releases whole pages.
+                # A detached speculative mapping can leave holes in
+                # ``hisparse_indices``, so a slot-count cut may split one
+                # physical page between the retained buffer and the surplus.
+                # Keep every page touched by the buffer alive and release only
+                # pages owned exclusively by the surplus.
+                buffer_pages = torch.unique(buffer_indices // self.page_size)
+                surplus_pages = torch.unique(surplus // self.page_size)
+                pure_surplus = surplus_pages[
+                    ~torch.isin(surplus_pages, buffer_pages)
+                ]
+                if pure_surplus.numel() > 0:
+                    self.free_hisparse_indices(pure_surplus * self.page_size)
         else:
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
@@ -168,13 +237,92 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         # disable free group mechanism for device buffer free
         self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        buffer_indices = buffer_indices[buffer_indices > 0]
+        if buffer_indices.numel() == 0:
+            return
+        if self.debug_validate_lifecycle:
+            pages = torch.unique(buffer_indices // self.page_size)
+            already_free = pages[
+                torch.isin(pages, self.hisparse_attn_allocator.free_pages)
+            ]
+            if already_free.numel() > 0:
+                raise RuntimeError(
+                    "HiSparse physical page double-free detected: "
+                    f"pages={already_free.tolist()} "
+                    f"available={self.hisparse_attn_allocator.available_size()} "
+                    f"capacity={self.hisparse_attn_allocator.size}"
+                )
+        self.hisparse_attn_allocator.free(buffer_indices)
+        if self.debug_validate_lifecycle:
+            free_pages = self.hisparse_attn_allocator.free_pages
+            if torch.unique(free_pages).numel() != free_pages.numel():
+                raise RuntimeError(
+                    "HiSparse physical free list contains duplicate pages after free"
+                )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
+
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical tokens and bind them to coordinator-owned device slots.
+
+        Speculative verification writes into the per-request HiSparse extra page.
+        Those physical slots are owned by ``HiSparseCoordinator`` and must not be
+        allocated or freed by the ordinary logical allocator lifecycle.
+        """
+        available = self.logical_attn_allocator.available_size()
+        if available < extend_num_tokens:
+            raise RuntimeError(
+                "HiSparse logical allocation is exhausted: "
+                f"need={extend_num_tokens}, available={available}"
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        logical_indices = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if logical_indices is None:
+            raise RuntimeError(
+                "HiSparse logical alloc_extend failed for coordinator-owned "
+                f"draft slots: need={extend_num_tokens}"
+            )
+        if logical_indices.numel() != device_slots.numel():
+            if logical_state is not None:
+                self.logical_attn_allocator.restore_state(logical_state)
+            raise RuntimeError(
+                "HiSparse draft-slot mapping size mismatch: "
+                f"logical={logical_indices.numel()}, device={device_slots.numel()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[logical_indices] = device_slots
+        if backup_state:
+            return logical_indices, (logical_state, logical_indices.clone())
+        return logical_indices
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor) -> None:
+        """Detach coordinator-owned slots before logical token release."""
+        if logical_indices.numel() > 0:
+            self.full_to_hisparse_device_index_mapping[logical_indices] = 0
 
     def alloc_extend(
         self,
@@ -197,7 +345,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_new_pages
             > self.hisparse_attn_allocator.available_size() // self.page_size
         ):
-            return None
+            if not self._ensure_hisparse_available(num_new_pages * self.page_size):
+                return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
@@ -272,8 +421,37 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             <= self.hisparse_attn_allocator.size
         )
 
+    def backup_state(self):
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.hisparse_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
 
-class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    def restore_state(self, state):
+        if len(state) == 2:
+            # ``alloc_extend_with_device_mapping(..., backup_state=True)`` owns
+            # the physical extra-page slots outside the allocator. Roll back
+            # only the logical allocation and keep the mapping live until
+            # accepted-token finalization clears it transactionally.
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        logical_state, hisparse_state, mapping_snapshot = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        self.hisparse_attn_allocator.restore_state(hisparse_state)
+        self.full_to_hisparse_device_index_mapping[
+            : mapping_snapshot.shape[0]
+        ].copy_(mapping_snapshot)
+        if mapping_snapshot.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            self.full_to_hisparse_device_index_mapping[
+                mapping_snapshot.shape[0] :
+            ] = 0
+
+
+class DeepSeekV4HiSparseTokenToKVPoolAllocator(
+    HiSparseDemotionMixin, BaseTokenToKVPoolAllocator
+):
 
     def __init__(
         self,
@@ -365,6 +543,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
 
+    def schedulable_full_available_size(self):
+        return min(
+            self.logical_attn_allocator.full_available_size(),
+            self._get_schedulable_hisparse_available() * self.compress_ratio,
+        )
+
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
@@ -444,8 +628,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 surplus_pages = torch.unique(surplus // self.hisparse_page_size)
                 pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
                 if pure_surplus.numel() > 0:
-                    self.hisparse_attn_allocator.is_not_in_free_group = True
-                    self.hisparse_attn_allocator.free(
+                    self.free_hisparse_indices(
                         pure_surplus * self.hisparse_page_size
                     )
         else:
@@ -513,7 +696,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_new_pages_hisparse
             > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         ):
-            return None
+            if not self._ensure_hisparse_available(
+                num_new_pages_hisparse * self.hisparse_page_size
+            ):
+                return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,

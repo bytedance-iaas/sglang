@@ -94,6 +94,16 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    def _finish_hisparse_request(self, req: Req) -> None:
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.request_finished(req)
+        if (
+            self.draft_hisparse_coordinator is not None
+            and self.draft_hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            self.draft_hisparse_coordinator.request_finished(req)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -191,6 +201,17 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _stash_hisparse_spec_info(
+        self, batch: ScheduleBatch, batch_index: int, req: Req
+    ) -> None:
+        if not self.server_args.enable_hisparse or batch.spec_info is None:
+            return
+        if not hasattr(batch.spec_info, "slice_single"):
+            raise RuntimeError(
+                f"HiSparse cannot stash speculative state for {type(batch.spec_info).__name__}"
+            )
+        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -219,6 +240,12 @@ class SchedulerBatchResultProcessor:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+            if (
+                self.server_args.enable_hisparse
+                and batch.spec_info is None
+                and result.next_draft_input is not None
+            ):
+                batch.spec_info = result.next_draft_input
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()

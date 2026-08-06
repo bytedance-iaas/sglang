@@ -463,6 +463,12 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
+    # Diagnostic only: force the decode-side EAGLE worker to recompute the
+    # first DSA seed instead of consuming the seed transferred by prefill.
+    SGLANG_TEST_IGNORE_PD_DSA_TOPK_SEED = EnvBool(False)
+    # Diagnostic only: trace request/row identity and a compact fingerprint for
+    # the DSA Top-K seed at prefill capture, PD commit, and draft consumption.
+    SGLANG_TEST_TRACE_PD_DSA_TOPK_SEED = EnvBool(False)
 
     SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
     SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)

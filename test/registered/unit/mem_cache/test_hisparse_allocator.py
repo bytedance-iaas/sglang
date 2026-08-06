@@ -132,6 +132,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
             hisparse_coordinator=coordinator,
+            draft_hisparse_coordinator=None,
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)

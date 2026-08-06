@@ -51,6 +51,22 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def get_draft_model_runner(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the model runner that owns speculative draft state."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        return draft_worker.draft_worker.draft_runner_list[0]
+    return draft_worker.draft_worker.draft_runner
+
+
 def get_draft_kv_pool(
     *,
     draft_worker: BaseTpWorker,
