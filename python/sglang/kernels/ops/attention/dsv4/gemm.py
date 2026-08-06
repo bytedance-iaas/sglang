@@ -175,7 +175,7 @@ def linear_bf16_fp32(
         return _linear_bf16_fp32_cublas(x, y)
 
 
-bcg_linear_bf16_fp32 = eager_on_graph(True)(linear_bf16_fp32)
+bcg_linear_bf16_fp32 = eager_on_graph(True, synchronize_ranks=False)(linear_bf16_fp32)
 
 
 def linear_bf16_fp32_moe_gate(

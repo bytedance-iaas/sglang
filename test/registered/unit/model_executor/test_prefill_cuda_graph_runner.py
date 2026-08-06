@@ -9,6 +9,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+import sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph as bcg_module
 from sglang.kernels.ops.attention.dsv4 import gemm as dsv4_gemm
 from sglang.srt.distributed import communication_op, parallel_state
 from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
@@ -214,6 +215,28 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertEqual(eager.call_count, 2)
         graph_break.assert_called_once_with(hidden_states, weight)
+
+    def test_non_collective_bcg_break_skips_capture_barrier(self):
+        calls = []
+        capture = SimpleNamespace(
+            _barrier_fn=Mock(),
+            _end_current_segment=lambda: calls.append("end"),
+            _begin_new_segment=lambda: calls.append("begin"),
+            cuda_graph=SimpleNamespace(_break_fns=[]),
+        )
+
+        wrapped = bcg_module.eager_on_graph(True, synchronize_ranks=False)(
+            lambda value: value
+        )
+        token = bcg_module._current_capture_var.set(capture)
+        try:
+            self.assertEqual(wrapped("output"), "output")
+        finally:
+            bcg_module._current_capture_var.reset(token)
+
+        self.assertEqual(calls, ["end", "begin"])
+        capture._barrier_fn.assert_not_called()
+        self.assertEqual(len(capture.cuda_graph._break_fns), 1)
 
     def test_collective_break_skips_capture_session_warmup_after_largest_shape(self):
         backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)

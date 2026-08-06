@@ -216,7 +216,12 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
+def eager_on_graph(
+    enable: bool,
+    capture_stub: Optional[Callable] = None,
+    *,
+    synchronize_ranks: bool = True,
+):
     def decorator(inner: Callable):
         if not enable:
             return inner
@@ -235,7 +240,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # step) before break fns with rank-coupled collectives and hard
             # timeouts (DeepEP NORMAL: 100s). Capture-only; replay bypasses
             # this wrapper.
-            if capture._barrier_fn is not None:
+            if synchronize_ranks and capture._barrier_fn is not None:
                 capture._barrier_fn()
 
             # Run the break once so its outputs are allocated and their
