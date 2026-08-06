@@ -102,23 +102,6 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertTrue(_supports_owner_only_draft_load("auto"))
         self.assertFalse(_supports_owner_only_draft_load("presharded"))
 
-    def test_owner_only_rendezvous_uses_initialized_global_cpu_group(self):
-        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
-        worker._owner_only_prefill_enabled = True
-        cpu_group = object()
-
-        with (
-            patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2."
-                "get_world_group",
-                return_value=SimpleNamespace(cpu_group=cpu_group),
-            ),
-            patch("torch.distributed.barrier") as barrier,
-        ):
-            worker.sync_owner_only_prefill_ranks()
-
-        barrier.assert_called_once_with(group=cpu_group)
-
     def test_pp_spec_verify_buffers_use_token_axis(self):
         """PP verify buffers must cover bs times speculative token width."""
         max_bs = 64

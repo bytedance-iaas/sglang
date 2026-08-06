@@ -975,8 +975,11 @@ class Scheduler(
         # Load model weights.
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
-        if self.spec_algorithm.is_dspark():
-            self.draft_worker.sync_owner_only_prefill_ranks()
+        if (
+            self.spec_algorithm.is_dspark()
+            and self.draft_worker.owner_only_prefill_enabled
+        ):
+            torch.distributed.barrier(group=self.world_group.cpu_group)
 
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()
