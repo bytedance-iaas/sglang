@@ -12,7 +12,7 @@ on:
       image_tag:
         description: Immutable task image tag
         required: true
-        default: glm52-dspark-deepep-780449f1a-r2-eic1.5.2
+        default: glm52-dspark-deepep-1d87d2c94-graphoff-eic1.5.2
 
 concurrency:
   group: glm52-dspark-overlay-${{ github.ref }}
@@ -59,7 +59,7 @@ jobs:
               sha256sum | awk '{print $1}'
           )"
           test "$source_python_sha256" = \
-            '25730ba2c220c0cdb9955807515e16e2bcdefc13e0c826b4097f49a4bb5f380f'
+            '604a80bee2d3fbc5b059ce5912bc770bffb8c4edf7b962e9f20fc8d179ed823f'
           echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
           echo "source_tree=${source_tree}" >> "$GITHUB_OUTPUT"
           echo "source_python_sha256=${source_python_sha256}" >> "$GITHUB_OUTPUT"
@@ -100,7 +100,7 @@ jobs:
             --build-arg SOURCE_COMMIT="$SOURCE_COMMIT" \
             --build-arg SOURCE_TREE="$SOURCE_TREE" \
             --build-arg SOURCE_PYTHON_SHA256="$SOURCE_PYTHON_SHA256" \
-            --build-arg SOURCE_STACK_ID=glm52-dspark-deepep-780449f1a \
+            --build-arg SOURCE_STACK_ID=glm52-dspark-deepep-1d87d2c94-graphoff \
             --build-arg HTTP_PROXY=http://100.68.162.211:3128 \
             --build-arg HTTPS_PROXY=http://100.68.162.211:3128 \
             --build-arg NO_PROXY=localhost,127.0.0.1,.ivolces.com,.volceapi.com,.byted.org,iaas-gpu-cn-beijing.cr.volces.com \
