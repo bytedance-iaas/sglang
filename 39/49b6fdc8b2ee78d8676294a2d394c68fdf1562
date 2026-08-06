@@ -1,0 +1,57 @@
+python/sglang/srt/disaggregation/prefill.py
+  s_8517cfd3301c54::t_0beb5959757c62 127,129-130 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5f1e77a9cf4e03972e0fbd","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":127},{"Range":[129,130]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3949b6fdc8b2ee78d8676294a2d394c68fdf1562",
+  "prompts": {},
+  "sessions": {
+    "s_8517cfd3301c54": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5dd0b9a9cf4e03972dea48",
+        "model": "gpt-5.5__max"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/disaggregation/prefill.py": [
+      {
+        "hash": "s_8517cfd3301c54::t_0beb5959757c62",
+        "line_ranges": [
+          {
+            "Single": 127
+          },
+          {
+            "Range": [
+              129,
+              130
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5f1e77a9cf4e03972e0fbd",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 127
+              },
+              {
+                "Range": [
+                  129,
+                  130
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {}
+}

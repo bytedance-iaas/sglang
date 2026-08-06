@@ -1,0 +1,25 @@
+python/sglang/srt/managers/schedule_batch.py
+  s_f4344a6fcff611::t_917836763fa4a9 2686-2689
+python/sglang/srt/mem_cache/base_prefix_cache.py
+  s_f4344a6fcff611::t_40cb7a6b647791 322-324
+python/sglang/srt/mem_cache/eic_hiradix_cache.py
+  s_f4344a6fcff611::t_58a31644ef0f31 547-551
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "de57e0beb3de222cb52591350ce9ee1e1300da86",
+  "prompts": {},
+  "sessions": {
+    "s_f4344a6fcff611": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59e1c3a9-0db7-4f6f-bde8-669075b3db07",
+        "model": "unknown"
+      },
+      "human_author": "chenkailun.c <chenkailun.c@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

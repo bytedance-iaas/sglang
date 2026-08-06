@@ -1,0 +1,27 @@
+python/sglang/srt/environ.py
+  s_3af354177588a3::t_8b05edf4c3e438 1008-1010
+python/sglang/srt/layers/attention/deepseek_v4_backend.py
+  s_3af354177588a3::t_60543c4d7cc4cb 61,2022-2025
+python/sglang/kernels/ops/attention/utils.py
+  s_3af354177588a3::t_c9fb5493c22e34 286-315
+test/manual/dsv4/bench_dcp_lse_merge.py
+  s_3af354177588a3::t_3687c6db9a10ca 10-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a05bca9f3b8cecf073b132d81aca70ee20b993e1",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

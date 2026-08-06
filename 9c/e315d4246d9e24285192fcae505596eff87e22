@@ -1,0 +1,25 @@
+python/sglang/srt/disaggregation/common/conn.py
+  s_037c7961a16a95::t_b4641dd65c6654 903-904,908-909,912-913,924-932,935-941,944-950,952
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_037c7961a16a95::t_57bd0f8cd5a29b 2664-2665
+test/registered/unit/disaggregation/test_cp_transfer_position_offset.py
+  s_037c7961a16a95::t_0bff4b369bf1e1 1-94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9ce315d4246d9e24285192fcae505596eff87e22",
+  "prompts": {},
+  "sessions": {
+    "s_037c7961a16a95": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8897-f3be-7172-b26c-0b063a2ac676",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
