@@ -231,9 +231,7 @@ def prepare_dsa_cache_seqlens(forward_batch: "ForwardBatch", raw_cache_seqlens):
     on ForwardBatch because metadata planning runs before the graph context is
     entered. Indexer/MLP metadata remains padded in both cases.
     """
-    padded_cache_seqlens = pad_dsa_cache_seqlens(
-        forward_batch, raw_cache_seqlens
-    )
+    padded_cache_seqlens = pad_dsa_cache_seqlens(forward_batch, raw_cache_seqlens)
     flashmla_cache_seqlens = (
         raw_cache_seqlens
         if forward_batch.dsa_flashmla_use_live_query_axis
