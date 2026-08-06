@@ -223,16 +223,23 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
 
 
 def prepare_dsa_cache_seqlens(forward_batch: "ForwardBatch", raw_cache_seqlens):
-    """Keep FlashMLA on the live query axis while padding indexer metadata.
+    """Match FlashMLA metadata to its physical query axis.
 
-    DP/CP padding happens after sparse attention and is consumed by the
-    indexer/MLP synchronization path. Breakable CUDA graph attention remains a
-    break operation over the live token count, so its FlashMLA scheduler must
-    not inherit that padding.
+    Eager attention consumes the same DP/TP-padded rows as the query tensor.
+    Breakable/tc-piecewise prefill graph attention instead executes as an eager
+    split over only the live rows. The graph runner publishes that distinction
+    on ForwardBatch because metadata planning runs before the graph context is
+    entered. Indexer/MLP metadata remains padded in both cases.
     """
-    return raw_cache_seqlens, pad_dsa_cache_seqlens(
+    padded_cache_seqlens = pad_dsa_cache_seqlens(
         forward_batch, raw_cache_seqlens
     )
+    flashmla_cache_seqlens = (
+        raw_cache_seqlens
+        if forward_batch.dsa_flashmla_use_live_query_axis
+        else padded_cache_seqlens
+    )
+    return flashmla_cache_seqlens, padded_cache_seqlens
 
 
 def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):

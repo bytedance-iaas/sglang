@@ -577,6 +577,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None
+    # Prefill graph runners set this when DSA attention executes over the live
+    # query rows even though the surrounding MLP path uses padded token rows.
+    # Eager and full-graph paths leave it false and use the physical padded
+    # query axis for FlashMLA metadata.
+    dsa_flashmla_use_live_query_axis: bool = False
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch

@@ -62,7 +62,9 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         self, get_parallel, _cal_padded_tokens
     ):
         get_parallel.return_value = SimpleNamespace(attn_cp_size=1)
-        forward_batch = SimpleNamespace(global_num_tokens_cpu=[13])
+        forward_batch = SimpleNamespace(
+            global_num_tokens_cpu=[13], dsa_flashmla_use_live_query_axis=True
+        )
         raw_cache_seqlens = torch.arange(1, 14, dtype=torch.int32)
 
         flashmla_seqlens, indexer_seqlens = prepare_dsa_cache_seqlens(
@@ -75,6 +77,28 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         torch.testing.assert_close(indexer_seqlens[:13], raw_cache_seqlens)
         torch.testing.assert_close(
             indexer_seqlens[13:], torch.zeros(3, dtype=torch.int32)
+        )
+
+    @patch("sglang.srt.layers.attention.dsa.utils.cal_padded_tokens", return_value=16)
+    @patch("sglang.srt.layers.attention.dsa.utils.get_parallel")
+    def test_dsa_flashmla_uses_padded_axis_for_eager_attention(
+        self, get_parallel, _cal_padded_tokens
+    ):
+        get_parallel.return_value = SimpleNamespace(attn_cp_size=1)
+        forward_batch = SimpleNamespace(
+            global_num_tokens_cpu=[13], dsa_flashmla_use_live_query_axis=False
+        )
+        raw_cache_seqlens = torch.arange(1, 14, dtype=torch.int32)
+
+        flashmla_seqlens, indexer_seqlens = prepare_dsa_cache_seqlens(
+            forward_batch, raw_cache_seqlens
+        )
+
+        self.assertIs(flashmla_seqlens, indexer_seqlens)
+        self.assertEqual(flashmla_seqlens.shape[0], 16)
+        torch.testing.assert_close(flashmla_seqlens[:13], raw_cache_seqlens)
+        torch.testing.assert_close(
+            flashmla_seqlens[13:], torch.zeros(3, dtype=torch.int32)
         )
 
 if __name__ == "__main__":

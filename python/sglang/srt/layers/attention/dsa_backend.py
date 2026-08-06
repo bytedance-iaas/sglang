@@ -2807,7 +2807,7 @@ class DeepseekSparseAttnBackend(
         assert metadata.flashmla_metadata is not None
         num_splits = metadata.flashmla_metadata.num_splits
         assert num_splits.shape[0] == live_num_tokens + 1, (
-            "FlashMLA num_splits must match the live BCG query axis: "
+            "FlashMLA num_splits must match the physical query axis: "
             f"q_tokens={live_num_tokens}, num_splits={num_splits.shape[0]}"
         )
 

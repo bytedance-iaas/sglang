@@ -1273,6 +1273,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
                 global_num_tokens_cpu=global_num_tokens_cpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+                dsa_flashmla_use_live_query_axis=not self._is_full_backend,
                 global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=(
                     _slot("mrope_positions")
@@ -1745,6 +1746,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
+            dsa_flashmla_use_live_query_axis=not self._is_full_backend,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
@@ -1814,6 +1816,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
+        if not self._is_full_backend:
+            # BCG/tc-piecewise attention is an eager split over the live query
+            # rows. Metadata planning happens before entering the graph forward
+            # context, so carry that runner-owned contract explicitly instead
+            # of inferring it from a context variable that is not active yet.
+            metadata_forward_batch = copy.copy(forward_batch)
+            metadata_forward_batch.dsa_flashmla_use_live_query_axis = True
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
