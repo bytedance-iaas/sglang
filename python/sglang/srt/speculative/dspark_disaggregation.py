@@ -9,7 +9,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import make_next_draf
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.pp_proxy_tensors import PPProxyTensors
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpecInput
@@ -33,12 +32,3 @@ def build_dspark_disagg_draft_input(
             spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
         )
     return spec_info
-
-
-def dspark_pp_forward_kwargs(
-    batch: ScheduleBatch,
-    pp_proxy_tensors: PPProxyTensors | None,
-) -> dict:
-    if pp_proxy_tensors is None or not batch.spec_algorithm.is_dspark():
-        return {}
-    return {"pp_proxy_tensors": pp_proxy_tensors}

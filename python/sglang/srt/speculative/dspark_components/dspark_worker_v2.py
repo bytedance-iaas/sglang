@@ -173,6 +173,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
         self._pp_context_feature_indices: Optional[list[int]] = None
+        self._next_pp_proxy_tensors = None
 
         if self._is_lifecycle_only_pp_prefill_rank:
             self._init_lifecycle_only_prefill()
@@ -547,6 +548,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def set_pp_proxy_tensors_for_next_forward(self, pp_proxy_tensors) -> None:
+        self._next_pp_proxy_tensors = pp_proxy_tensors
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -554,6 +558,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        if pp_proxy_tensors is None:
+            pp_proxy_tensors = self._next_pp_proxy_tensors
+        self._next_pp_proxy_tensors = None
+
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "DSpark speculative decoding does not support return_logprob yet."

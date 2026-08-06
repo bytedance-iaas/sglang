@@ -1335,7 +1335,15 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if cur_batch.spec_algorithm.is_dspark():
+                    self.model_worker.set_pp_proxy_tensors_for_next_forward(
+                        pp_proxy_tensors
+                    )
+                try:
+                    result = self.run_batch(cur_batch, pp_proxy_tensors)
+                finally:
+                    if cur_batch.spec_algorithm.is_dspark():
+                        self.model_worker.set_pp_proxy_tensors_for_next_forward(None)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
