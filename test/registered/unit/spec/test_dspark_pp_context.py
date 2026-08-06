@@ -23,12 +23,10 @@ from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
 from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: E402
     DecodeInputBuffers,
 )
-from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
     _is_context_only_pp_prefill_rank,
     _resolve_single_owner_pp_rank,
-    _supports_owner_only_draft_load,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -62,8 +60,8 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
-    def test_single_owner_fast_path_requires_final_pp_rank(self):
-        """Only a final-rank owner may bypass the ctx_acc handoff."""
+    def test_full_projection_fast_path_requires_final_pp_owner(self):
+        """Only final-rank ownership can bypass the ctx_acc handoff."""
         with patch.dict(
             os.environ,
             {"SGLANG_PP_LAYER_PARTITION": "6,5,6,5,6,5,5,5"},
@@ -83,24 +81,6 @@ class TestDSparkPPContext(CustomTestCase):
                     pp_size=8,
                 )
             )
-
-    def test_target_only_rank_has_no_draft_pool(self):
-        """Non-owner ranks must not recreate a draft pool through the accessor."""
-        outer_worker = SimpleNamespace(draft_worker=None)
-        spec_algorithm = SimpleNamespace(is_ngram=lambda: False)
-        server_args = SimpleNamespace(enable_multi_layer_eagle=False)
-
-        self.assertIsNone(
-            get_draft_kv_pool(
-                draft_worker=outer_worker,
-                spec_algorithm=spec_algorithm,
-                server_args=server_args,
-            )
-        )
-
-    def test_owner_only_load_format_excludes_world_barrier_loader(self):
-        self.assertTrue(_supports_owner_only_draft_load("auto"))
-        self.assertFalse(_supports_owner_only_draft_load("presharded"))
 
     def test_pp_spec_verify_buffers_use_token_axis(self):
         """PP verify buffers must cover bs times speculative token width."""
@@ -251,7 +231,6 @@ class TestDSparkPPContext(CustomTestCase):
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
         worker._is_context_only_pp_prefill_rank = True
-        worker._is_target_only_prefill_rank = False
         worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
         worker.page_size = 64
         full_config = MemoryPoolConfig(
@@ -273,7 +252,6 @@ class TestDSparkPPContext(CustomTestCase):
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
-        worker._is_target_only_prefill_rank = False
         worker._is_context_only_pp_prefill_rank = False
         worker.ps = SimpleNamespace(pp_rank=1, pp_size=2)
         worker.page_size = 64

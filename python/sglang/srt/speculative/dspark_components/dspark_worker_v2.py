@@ -90,10 +90,6 @@ def _resolve_single_owner_pp_rank(
     return None
 
 
-def _supports_owner_only_draft_load(load_format: str) -> bool:
-    return load_format in ("auto", "safetensors", "fastsafetensors", "pt")
-
-
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -125,9 +121,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             pp_rank=ps.pp_rank,
             pp_size=ps.pp_size,
         )
-        self._single_owner_pp_rank: Optional[int] = None
-        self._owner_only_prefill_enabled = False
-        self._is_target_only_prefill_rank = False
         self._use_full_projection_prefill = False
         if self._is_pd_prefill and self._draft_is_moe and ps.pp_size > 1:
             target_layer_ids = [
@@ -136,24 +129,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self.model_runner.spec_aux_config.dflash_target_layer_ids or []
                 )
             ]
-            self._single_owner_pp_rank = _resolve_single_owner_pp_rank(
+            owner_pp_rank = _resolve_single_owner_pp_rank(
                 target_layer_ids=target_layer_ids,
                 num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
                 pp_size=ps.pp_size,
             )
-            if self._single_owner_pp_rank == ps.pp_size - 1:
-                self._owner_only_prefill_enabled = _supports_owner_only_draft_load(
-                    server_args.load_format
-                )
-                if self._owner_only_prefill_enabled:
-                    self._is_target_only_prefill_rank = ps.pp_rank < ps.pp_size - 1
-                    self._use_full_projection_prefill = ps.pp_rank == ps.pp_size - 1
-                elif self.ps.tp_rank == 0:
-                    logger.warning(
-                        "DSpark owner-only prefill is disabled for load_format=%s; "
-                        "falling back to draft initialization on every PP rank.",
-                        server_args.load_format,
-                    )
+            self._use_full_projection_prefill = (
+                owner_pp_rank == ps.pp_size - 1 and ps.pp_rank == owner_pp_rank
+            )
         self._decode_graph_allowed = (
             not server_args.disable_cuda_graph and not self._is_pd_prefill
         )
@@ -161,29 +144,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
-            and not self._is_target_only_prefill_rank
         ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
                 "MoE-under-DP all-reduce."
             )
-
-        if self._is_target_only_prefill_rank:
-            runtime_config = resolve_runtime_config(
-                draft_hf_config=self.model_runner.model_config.hf_config,
-                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-                target_vocab_size=int(self.model_runner.model_config.vocab_size),
-            )
-            self._init_target_only_prefill(runtime_config)
-            if self.ps.tp_rank == 0:
-                logger.info(
-                    "DSpark PP rank %s uses target-only prefill; all target "
-                    "features are owned by final PP rank %s.",
-                    self.ps.pp_rank,
-                    self._single_owner_pp_rank,
-                )
-            return
 
         with self._draft_context():
             bundle = build_draft_tp_worker(
@@ -357,26 +323,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.draft_model.prune_to_ctx_kv_injection()
             self._init_pp_context_feature_indices()
 
-    def _init_target_only_prefill(self, runtime_config) -> None:
-        self._draft_worker = None
-        self.draft_model_runner = None
-        self.draft_model = None
-        self._draft_sampler = None
-        self.gamma = runtime_config.gamma
-        self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
-        self.speculative_num_draft_tokens = self.verify_num_draft_tokens
-        self._mask_token_id = runtime_config.mask_token_id
-        self._pp_context_feature_indices = None
-        self._verify_planner = None
-        self._kv_injector = None
-        self._proposer = None
-        self._verify_epilogue = None
-        self._verify_executor = None
-        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
-        self._forced_budget_frac = None
-        self._need_mamba_verify_commit = False
-        self._observers = None
-
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -422,13 +368,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
-        if self._is_target_only_prefill_rank:
-            return False
         return self._verify_planner.carries_confidence
-
-    @property
-    def owner_only_prefill_enabled(self) -> bool:
-        return self._owner_only_prefill_enabled
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -455,10 +395,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        if self._is_target_only_prefill_rank:
-            self.req_to_token_pool = req_to_token_pool
-            self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-            return
         if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
             page_size = int(self.page_size)
 
@@ -544,40 +480,20 @@ class DSparkWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         pass
 
-    def update_weights_from_disk(self, recv_req):
-        if self._is_target_only_prefill_rank:
-            return True, "Target-only prefill rank has no draft weights."
-        return super().update_weights_from_disk(recv_req)
-
-    def update_weights_from_ipc(self, recv_req):
-        if self._is_target_only_prefill_rank:
-            return True, "Target-only prefill rank has no draft weights."
-        return super().update_weights_from_ipc(recv_req)
-
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
-        if self._is_target_only_prefill_rank:
-            return
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
-        if self._is_target_only_prefill_rank:
-            return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
-        if self._is_target_only_prefill_rank:
-            return
         self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
-        if self._is_target_only_prefill_rank:
-            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        if self._is_target_only_prefill_rank:
-            return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
@@ -592,47 +508,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark speculative decoding does not support return_logprob yet."
             )
 
-        if self._is_target_only_prefill_rank:
-            return self._forward_target_only_prefill(
-                batch=batch,
-                on_publish=on_publish,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
-
-    def _forward_target_only_prefill(
-        self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
-    ) -> GenerationBatchResult:
-        if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
-                self.target_worker.forward_batch_generation(
-                    batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    capture_hidden_mode=CaptureHiddenMode.NULL,
-                )
-            return self._decode_idle_result(on_publish=on_publish)
-        if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
-            raise RuntimeError(
-                "Target-only DSpark worker only supports prefill batches."
-            )
-
-        batch_output = self.target_worker.forward_batch_generation(
-            batch,
-            pp_proxy_tensors=pp_proxy_tensors,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-        batch_output.new_seq_lens = batch.seq_lens
-        if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
-        if batch_output.logits_output is not None:
-            batch_output.logits_output.hidden_states = None
-        return batch_output
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
@@ -1091,6 +972,4 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
-        if self._is_target_only_prefill_rank:
-            return None
         return self._verify_planner.confidence_budget_prepare()
