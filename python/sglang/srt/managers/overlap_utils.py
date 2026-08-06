@@ -498,14 +498,6 @@ class FutureMap:
                 publish_ready=self.publish_ready,
             )
 
-    @staticmethod
-    def _to_buffer(tensor: torch.Tensor, buffer: torch.Tensor) -> torch.Tensor:
-        return tensor.to(
-            device=buffer.device,
-            dtype=buffer.dtype,
-            non_blocking=True,
-        )
-
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -517,29 +509,25 @@ class FutureMap:
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
-        self.output_tokens_buf[indices] = self._to_buffer(
-            payload.bonus_tokens, self.output_tokens_buf
+        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
+            self.output_tokens_buf.dtype
         )
 
         if self.need_topk:
-            self.topk_p_buf[indices] = self._to_buffer(
-                payload.topk_p, self.topk_p_buf
-            )
-            self.topk_index_buf[indices] = self._to_buffer(
-                payload.topk_index, self.topk_index_buf
+            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
+            self.topk_index_buf[indices] = payload.topk_index.to(
+                self.topk_index_buf.dtype
             )
         if self.need_hidden_states:
-            self.hidden_states_buf[indices] = self._to_buffer(
-                payload.hidden_states, self.hidden_states_buf
+            self.hidden_states_buf[indices] = payload.hidden_states.to(
+                self.hidden_states_buf.dtype
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
-            self.draft_probs_buf[indices] = self._to_buffer(
-                payload.draft_probs, self.draft_probs_buf
-            )
+            self.draft_probs_buf[indices] = payload.draft_probs
         if (
             self.dsa_topk_indices_buf is not None
             and payload.dsa_topk_indices is not None
         ):
-            self.dsa_topk_indices_buf[indices] = self._to_buffer(
-                payload.dsa_topk_indices, self.dsa_topk_indices_buf
+            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
+                self.dsa_topk_indices_buf.dtype
             )
