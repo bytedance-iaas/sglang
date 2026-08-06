@@ -9,6 +9,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.kernels.ops.attention.dsv4 import gemm as dsv4_gemm
 from sglang.srt.distributed import communication_op, parallel_state
 from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -190,46 +191,29 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         empty.assert_not_called()
 
-    def test_multinode_collective_break_prewarms_router_gemm_on_capture_stream(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
-        runner.backend._enable_collective_break = True
-        runner.capture_num_tokens = [4, 8]
-        runner.device = torch.device("cpu")
-        runner.device_module = SimpleNamespace(synchronize=Mock())
-        runner.model_runner = SimpleNamespace(dtype=torch.bfloat16)
-        runner.moe_layers = [
-            SimpleNamespace(
-                moe_runner_config=SimpleNamespace(
-                    num_experts=3,
-                    hidden_size=4,
-                    params_dtype=torch.bfloat16,
+    def test_collective_break_routes_moe_gate_gemm_through_bcg_break(self):
+        hidden_states = object()
+        weight = object()
+        with (
+            patch.object(dsv4_gemm, "linear_bf16_fp32", return_value="eager") as eager,
+            patch.object(
+                dsv4_gemm, "bcg_linear_bf16_fp32", return_value="break"
+            ) as graph_break,
+        ):
+            self.assertEqual(
+                dsv4_gemm.linear_bf16_fp32_moe_gate(hidden_states, weight), "eager"
+            )
+            with communication_op.cuda_graph_collective_break():
+                self.assertEqual(
+                    dsv4_gemm.linear_bf16_fp32_moe_gate(hidden_states, weight),
+                    "break",
                 )
-            ),
-            None,
-        ]
+            self.assertEqual(
+                dsv4_gemm.linear_bf16_fp32_moe_gate(hidden_states, weight), "eager"
+            )
 
-        with patch.object(torch, "mm") as mm:
-            runner._prewarm_multinode_breakable_capture_stream_gemm()
-
-        mm.assert_called_once()
-        hidden_states, router_weight_t = mm.call_args.args
-        self.assertEqual(hidden_states.shape, torch.Size((8, 4)))
-        self.assertEqual(router_weight_t.shape, torch.Size((4, 3)))
-        self.assertEqual(mm.call_args.kwargs, {"out_dtype": torch.float32})
-        runner.device_module.synchronize.assert_called_once_with()
-
-    def test_capture_stream_router_gemm_prewarm_is_collective_break_only(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
-        runner.backend._enable_collective_break = False
-        runner.capture_num_tokens = [8]
-        runner.moe_layers = []
-
-        with patch.object(torch, "empty") as empty:
-            runner._prewarm_multinode_breakable_capture_stream_gemm()
-
-        empty.assert_not_called()
+        self.assertEqual(eager.call_count, 2)
+        graph_break.assert_called_once_with(hidden_states, weight)
 
     def test_collective_break_skips_capture_session_warmup_after_largest_shape(self):
         backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)

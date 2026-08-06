@@ -4,7 +4,13 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.distributed.communication_op import (
+    is_cuda_graph_collective_break_enabled,
+)
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
@@ -167,3 +173,23 @@ def linear_bf16_fp32(
         return z
     else:
         return _linear_bf16_fp32_cublas(x, y)
+
+
+bcg_linear_bf16_fp32 = eager_on_graph(True)(linear_bf16_fp32)
+
+
+def linear_bf16_fp32_moe_gate(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Run the MoE router GEMM outside active collective-break BCG segments.
+
+    CUDA 13 cuBLAS BF16->FP32 router GEMMs do not complete when invoked inside
+    the first segmented capture on multi-node H20.  BCG already models eager
+    operations as explicit breaks; scope this one to the collective-break
+    capture context so eager execution, other graph backends, and Decode keep
+    the original path.
+    """
+    if is_cuda_graph_collective_break_enabled():
+        return bcg_linear_bf16_fp32(x, y)
+    return linear_bf16_fp32(x, y)

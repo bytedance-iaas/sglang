@@ -541,9 +541,11 @@ class MoEGate(nn.Module):
                 logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import (
+                    linear_bf16_fp32_moe_gate,
+                )
 
-                logits = linear_bf16_fp32(hidden_states, self.weight)
+                logits = linear_bf16_fp32_moe_gate(hidden_states, self.weight)
 
         return logits
 
