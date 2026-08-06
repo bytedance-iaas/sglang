@@ -406,7 +406,10 @@ class DFlashDraftModel(nn.Module):
         if not feature_indices:
             raise ValueError("feature_indices must be non-empty.")
         feature_indices = [int(i) for i in feature_indices]
-        if min(feature_indices) < 0 or max(feature_indices) >= self.num_context_features:
+        if (
+            min(feature_indices) < 0
+            or max(feature_indices) >= self.num_context_features
+        ):
             raise ValueError(
                 "feature_indices out of range for DFLASH context projection: "
                 f"{feature_indices=} {self.num_context_features=}."

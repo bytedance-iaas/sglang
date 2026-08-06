@@ -68,9 +68,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
         queue.token_to_kv_pool = FakePool()
         queue.draft_token_to_kv_pool = FakeDraftPool()
-        queue.metadata_buffers = SimpleNamespace(
-            get_buf_infos=lambda: ([], [], [])
-        )
+        queue.metadata_buffers = SimpleNamespace(get_buf_infos=lambda: ([], [], []))
         queue.is_mla_backend = False
         return queue, FakeKVArgs, FakeManager
 
@@ -115,8 +113,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill."
-            "poll_and_all_reduce_attn_cp_tp_group",
+            "sglang.srt.disaggregation.prefill." "poll_and_all_reduce_attn_cp_tp_group",
             return_value=[
                 KVPoll.Failed,
                 KVPoll.WaitingForInput,
@@ -161,8 +158,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill."
-            "poll_and_all_reduce_attn_cp_tp_group",
+            "sglang.srt.disaggregation.prefill." "poll_and_all_reduce_attn_cp_tp_group",
             return_value=[
                 KVPoll.WaitingForInput,
                 KVPoll.Failed,
@@ -211,11 +207,9 @@ class TestPPPDConsensus(CustomTestCase):
                 side_effect=mark_abort,
             ),
         ):
-            done_reqs = (
-                SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
-                    scheduler,
-                    transfer_status=([], ["req-race"]),
-                )
+            done_reqs = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                scheduler,
+                transfer_status=([], ["req-race"]),
             )
 
         self.assertEqual(done_reqs, [])
@@ -228,15 +222,11 @@ class TestPPPDConsensus(CustomTestCase):
                 "poll_and_all_reduce_attn_cp_tp_group",
                 return_value=[KVPoll.Success],
             ),
-            patch(
-                "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
-            ),
+            patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
         ):
-            done_reqs = (
-                SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
-                    scheduler,
-                    transfer_status=([], []),
-                )
+            done_reqs = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                scheduler,
+                transfer_status=([], []),
             )
 
         self.assertEqual(done_reqs, [req])

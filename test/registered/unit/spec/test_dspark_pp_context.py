@@ -13,26 +13,26 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
 from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
-from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
-from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
-    DeepseekV4ForCausalLMDSpark,
-    _BlockFp8LinearSlice,
-)
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
 )
 from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: E402
     DecodeInputBuffers,
 )
-from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
-    DSparkWorkerV2,
-    _is_context_only_pp_prefill_rank,
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
+from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
+    DeepseekV4ForCausalLMDSpark,
+    _BlockFp8LinearSlice,
 )
+from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
     resolve_single_owner_pp_rank,
     use_lifecycle_only_draft_model,
+)
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
+    DSparkWorkerV2,
+    _is_context_only_pp_prefill_rank,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")

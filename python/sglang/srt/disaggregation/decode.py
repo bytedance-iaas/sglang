@@ -471,7 +471,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        kv_args.kv_layer_ids = (
+            kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size

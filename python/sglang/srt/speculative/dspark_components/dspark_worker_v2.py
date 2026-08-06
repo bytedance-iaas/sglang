@@ -28,8 +28,8 @@ from sglang.srt.speculative.draft_worker_common import (
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
-    resolve_single_owner_pp_rank,
     resolve_runtime_config,
+    resolve_single_owner_pp_rank,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
