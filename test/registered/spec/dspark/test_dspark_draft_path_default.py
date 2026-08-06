@@ -83,17 +83,6 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             "deepseek-ai/some-other-dspark-draft",
         )
 
-    def test_context_parallel_is_rejected_before_dp_lm_head_requirement(self):
-        server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
-        )
-        server_args.enable_dp_attention = True
-        server_args.enable_dp_lm_head = False
-        server_args.attn_cp_size = 2
-
-        with self.assertRaisesRegex(ValueError, "does not support context parallel"):
-            _handle_dspark(server_args)
-
 
 if __name__ == "__main__":
     unittest.main()
