@@ -13,6 +13,7 @@ import sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.break
 from sglang.kernels.ops.attention.dsv4 import gemm as dsv4_gemm
 from sglang.srt.distributed import communication_op, parallel_state
 from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -191,6 +192,68 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             runner._precompile_multinode_breakable_moe_reduce()
 
         empty.assert_not_called()
+
+    def test_multinode_collective_break_prewarms_fused_shared_moe_gate(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        runner.backend._enable_collective_break = True
+        runner.capture_num_tokens = [8, 16, 24, 28, 32, 48]
+        runner.device = torch.device("cpu")
+        runner.device_module = SimpleNamespace(synchronize=Mock())
+        runner.moe_layers = [
+            SimpleNamespace(
+                moe_runner_config=SimpleNamespace(
+                    num_experts=257,
+                    top_k=9,
+                    num_fused_shared_experts=1,
+                    routed_scaling_factor=2.5,
+                    routing_method_type=RoutingMethodType.DeepSeekV3,
+                )
+            ),
+            None,
+        ]
+
+        target = "sglang.kernels.ops.moe.moe_fused_gate.moe_fused_gate"
+        with patch(target) as fused_gate:
+            runner._prewarm_multinode_breakable_moe_gate()
+
+        self.assertEqual(fused_gate.call_count, 4)
+        scores, bias = fused_gate.call_args.args
+        self.assertEqual(scores.shape, torch.Size((32, 256)))
+        self.assertEqual(bias.shape, torch.Size((256,)))
+        variants = {
+            (
+                call.kwargs["renormalize"],
+                call.kwargs["apply_routed_scaling_factor_on_output"],
+            )
+            for call in fused_gate.call_args_list
+        }
+        self.assertEqual(
+            variants,
+            {(False, False), (False, True), (True, False), (True, True)},
+        )
+        self.assertTrue(
+            all(call.kwargs["topk"] == 9 for call in fused_gate.call_args_list)
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["num_fused_shared_experts"] == 1
+                for call in fused_gate.call_args_list
+            )
+        )
+        runner.device_module.synchronize.assert_called_once_with()
+
+    def test_moe_gate_prewarm_is_collective_break_only(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        runner.backend._enable_collective_break = False
+        runner.capture_num_tokens = [28]
+        runner.moe_layers = []
+
+        with patch.object(torch, "zeros") as zeros:
+            runner._prewarm_multinode_breakable_moe_gate()
+
+        zeros.assert_not_called()
 
     def test_collective_break_routes_moe_gate_gemm_through_bcg_break(self):
         hidden_states = object()

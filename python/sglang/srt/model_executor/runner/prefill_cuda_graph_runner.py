@@ -1301,6 +1301,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
         self._precompile_multinode_breakable_moe_reduce()
+        self._prewarm_multinode_breakable_moe_gate()
         self._prewarm_multinode_breakable_capture()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
@@ -1371,6 +1372,106 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.device_module.synchronize()
         logger.info(
             "Precompiled small-token MoE reductions before multi-node "
+            "Breakable prefill CUDA graph capture."
+        )
+
+    def _prewarm_multinode_breakable_moe_gate(self) -> None:
+        """Load the fused-shared Triton router before BCG capture.
+
+        GLM-5.2 uses a fused shared expert, so its nine-slot sigmoid router
+        dispatches to ``moe_fused_gate`` rather than the radix fast path.  M is
+        runtime-dynamic in that Triton kernel, but its routing flags are compile
+        constants.  Load each possible renormalize/scale variant before the
+        capture session so a small Prefill bucket never calls ``cuModuleLoad``
+        while BCG is recording a model segment.
+
+        This is a kernel-only startup warmup.  It neither changes production
+        top-k dispatch nor runs a model forward or collective, and remains
+        scoped to explicitly enabled multi-node Prefill collective breaks.
+        """
+        if not isinstance(self.backend, BreakableCudaGraphBackend):
+            return
+        if not self.backend._enable_collective_break:
+            return
+
+        from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+        from sglang.srt.layers.moe.utils import RoutingMethodType
+
+        small_shapes = sorted({n for n in self.capture_num_tokens if n <= 32})
+        if not small_shapes:
+            return
+
+        configs = set()
+        for layer in self.moe_layers:
+            if layer is None:
+                continue
+            config = layer.moe_runner_config
+            num_fused_shared_experts = config.num_fused_shared_experts or 0
+            if (
+                config.routing_method_type != RoutingMethodType.DeepSeekV3
+                or num_fused_shared_experts <= 0
+                or config.num_experts is None
+                or config.top_k is None
+            ):
+                continue
+            num_routed_experts = config.num_experts - num_fused_shared_experts
+            if num_routed_experts <= 0:
+                continue
+            configs.add(
+                (
+                    num_routed_experts,
+                    config.top_k,
+                    num_fused_shared_experts,
+                    (
+                        config.routed_scaling_factor
+                        if config.routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                )
+            )
+        if not configs:
+            return
+
+        num_tokens = max(small_shapes)
+        logger.info(
+            "Prewarming fused-shared MoE Triton routers before multi-node "
+            "Breakable prefill CUDA graph capture. num_tokens=%d layouts=%s",
+            num_tokens,
+            sorted(configs),
+        )
+        for (
+            num_routed_experts,
+            top_k,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+        ) in sorted(configs):
+            scores = torch.zeros(
+                (num_tokens, num_routed_experts),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            bias = torch.zeros(
+                num_routed_experts,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for renormalize in (False, True):
+                for apply_scale in (False, True):
+                    moe_fused_gate(
+                        scores,
+                        bias,
+                        topk=top_k,
+                        scoring_func="sigmoid",
+                        num_fused_shared_experts=num_fused_shared_experts,
+                        renormalize=renormalize,
+                        routed_scaling_factor=routed_scaling_factor,
+                        apply_routed_scaling_factor_on_output=apply_scale,
+                        num_expert_group=1,
+                        topk_group=1,
+                    )
+        self.device_module.synchronize()
+        logger.info(
+            "Prewarmed fused-shared MoE Triton routers before multi-node "
             "Breakable prefill CUDA graph capture."
         )
 
