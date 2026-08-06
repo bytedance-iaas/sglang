@@ -119,6 +119,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
             if speculative_num_steps is None
@@ -284,9 +285,50 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _attach_hisparse_coordinator(
+        self, forward_batch: ForwardBatch, num_real_reqs: int
+    ) -> None:
+        """Publish the raw request count before a padded draft graph replay."""
+        coordinator = getattr(self.model_runner, "hisparse_coordinator", None)
+        if coordinator is None:
+            return
+        forward_batch.hisparse_coordinator = coordinator
+        coordinator.wait_for_pending_backup()
+        coordinator.num_real_reqs.fill_(num_real_reqs)
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         # EAGLE doesn't use stream_idx / lora variants.
         return ShapeKey(size=bs)
+
+    def _validate_dsa_seed_topk(self, forward_batch: ForwardBatch, raw_bs: int) -> None:
+        buffer = self.buffers.dsa_seed_topk
+        if buffer is None:
+            return
+        seed = forward_batch.spec_info.dsa_topk_indices
+        if seed is None:
+            return
+
+        target = buffer[:raw_bs]
+        seed_shape = tuple(seed.shape)
+        target_shape = tuple(target.shape)
+        buffer_shape = tuple(buffer.shape)
+        # PD disaggregation warmup intentionally reuses one shared DSA seed row
+        # for every request in the synthetic batch.  ``copy_`` supports that
+        # singleton broadcast.  Other mismatched batch axes are stale/non-
+        # broadcastable and must still be rejected before replay state mutates.
+        if not seed_shape or seed_shape[0] not in (1, raw_bs):
+            raise RuntimeError(
+                "EAGLEDraftCudaGraphRunner.replay dsa_seed_topk batch mismatch: "
+                f"raw_bs={raw_bs}, seed_shape={seed_shape}, "
+                f"target_shape={target_shape}, buffer_shape={buffer_shape}"
+            )
+        if seed_shape[1:] != target_shape[1:]:
+            raise RuntimeError(
+                "EAGLEDraftCudaGraphRunner.replay dsa_seed_topk "
+                "trailing shape mismatch: "
+                f"raw_bs={raw_bs}, seed_shape={seed_shape}, "
+                f"target_shape={target_shape}, buffer_shape={buffer_shape}"
+            )
 
     # -----------------------------------------------------------------
     # can_run_graph
@@ -464,6 +506,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             return ret
 
         with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+            self._attach_hisparse_coordinator(forward_batch, num_seqs)
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
@@ -499,7 +542,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
         buffers = self.buffers
 
         raw_bs = forward_batch.batch_size
@@ -647,6 +689,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         # forward_batch.batch_size was overwritten to bs above when padding.
+        self._attach_hisparse_coordinator(forward_batch, raw_bs)
         self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs

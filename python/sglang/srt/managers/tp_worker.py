@@ -80,6 +80,12 @@ class BaseTpWorker(ABC):
     def model_runner(self) -> ModelRunner:
         pass
 
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
+
     @property
     def war_fastpath_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --

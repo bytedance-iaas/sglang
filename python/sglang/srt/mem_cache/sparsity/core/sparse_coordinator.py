@@ -63,6 +63,15 @@ class SparseConfig:
     backend: Optional[str] = None
     page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
+    dynamic_residency: bool = False
+    dynamic_residency_mode: str = "adaptive"
+    dynamic_residency_max_tokens: int = 32768
+    dynamic_residency_max_requests: int = 1
+    dynamic_residency_min_remaining_tokens: int = 256
+    dynamic_residency_promote_watermark: float = 0.20
+    dynamic_residency_demote_watermark: float = 0.10
+    dynamic_residency_cooldown_steps: int = 16
+    dynamic_residency_admission_window_seconds: int = 1800
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm

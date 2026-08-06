@@ -49,6 +49,18 @@ class PoolStats:
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
+    hisparse_resident_requests: int = 0
+    hisparse_device_buffered_requests: int = 0
+    hisparse_promotions_total: int = 0
+    hisparse_demotions_total: int = 0
+    hisparse_promotion_failures_total: int = 0
+    hisparse_promotion_migrated_bytes_total: int = 0
+    hisparse_promotion_migration_seconds_total: float = 0.0
+    hisparse_demotion_reclaimed_bytes_total: int = 0
+    hisparse_demotion_transition_seconds_total: float = 0.0
+    hisparse_repromotion_suppressed_total: int = 0
+    hisparse_projected_resident_tokens: int = 0
+    hisparse_resident_time_ratio: float = 0.0
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -110,6 +122,24 @@ class PoolStats:
                 f"gpu token usage: {self.hisparse_device_token_usage:.2f}",
                 f"#cpu token: {self.hisparse_host_tokens}",
                 f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
+                f"#resident req: {self.hisparse_resident_requests}",
+                f"#swap req: {self.hisparse_device_buffered_requests}",
+                f"promotions: {self.hisparse_promotions_total}",
+                f"demotions: {self.hisparse_demotions_total}",
+                f"promotion failures: {self.hisparse_promotion_failures_total}",
+                "promotion migrated bytes: "
+                f"{self.hisparse_promotion_migrated_bytes_total}",
+                "promotion migration seconds: "
+                f"{self.hisparse_promotion_migration_seconds_total:.4f}",
+                "demotion reclaimed bytes: "
+                f"{self.hisparse_demotion_reclaimed_bytes_total}",
+                "demotion transition seconds: "
+                f"{self.hisparse_demotion_transition_seconds_total:.4f}",
+                "re-promotion suppressed: "
+                f"{self.hisparse_repromotion_suppressed_total}",
+                "projected resident tokens: "
+                f"{self.hisparse_projected_resident_tokens}",
+                f"resident time ratio: {self.hisparse_resident_time_ratio:.4f}",
             ]
         if not parts:
             parts.append(
@@ -136,6 +166,30 @@ class PoolStats:
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
+        stats.hisparse_resident_requests = self.hisparse_resident_requests
+        stats.hisparse_device_buffered_requests = self.hisparse_device_buffered_requests
+        stats.hisparse_promotions_total = self.hisparse_promotions_total
+        stats.hisparse_demotions_total = self.hisparse_demotions_total
+        stats.hisparse_promotion_failures_total = self.hisparse_promotion_failures_total
+        stats.hisparse_promotion_migrated_bytes_total = (
+            self.hisparse_promotion_migrated_bytes_total
+        )
+        stats.hisparse_promotion_migration_seconds_total = (
+            self.hisparse_promotion_migration_seconds_total
+        )
+        stats.hisparse_demotion_reclaimed_bytes_total = (
+            self.hisparse_demotion_reclaimed_bytes_total
+        )
+        stats.hisparse_demotion_transition_seconds_total = (
+            self.hisparse_demotion_transition_seconds_total
+        )
+        stats.hisparse_repromotion_suppressed_total = (
+            self.hisparse_repromotion_suppressed_total
+        )
+        stats.hisparse_projected_resident_tokens = (
+            self.hisparse_projected_resident_tokens
+        )
+        stats.hisparse_resident_time_ratio = self.hisparse_resident_time_ratio
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -235,6 +289,22 @@ class SchedulerPoolStatsObserver:
                 hisparse_device_token_usage=h.device_token_usage,
                 hisparse_host_tokens=h.host_tokens,
                 hisparse_host_token_usage=h.host_token_usage,
+                hisparse_resident_requests=h.resident_requests,
+                hisparse_device_buffered_requests=h.device_buffered_requests,
+                hisparse_promotions_total=h.promotions,
+                hisparse_demotions_total=h.demotions,
+                hisparse_promotion_failures_total=h.promotion_failures,
+                hisparse_promotion_migrated_bytes_total=h.promotion_migrated_bytes,
+                hisparse_promotion_migration_seconds_total=(
+                    h.promotion_migration_seconds
+                ),
+                hisparse_demotion_reclaimed_bytes_total=h.demotion_reclaimed_bytes,
+                hisparse_demotion_transition_seconds_total=(
+                    h.demotion_transition_seconds
+                ),
+                hisparse_repromotion_suppressed_total=h.repromotion_suppressed,
+                hisparse_projected_resident_tokens=h.projected_resident_tokens,
+                hisparse_resident_time_ratio=h.resident_time_ratio,
             )
         return pool_stats
 

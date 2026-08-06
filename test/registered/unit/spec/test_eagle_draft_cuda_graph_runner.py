@@ -22,6 +22,9 @@ import torch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -185,6 +188,116 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             )
         self.assertEqual(forward_batch.seq_lens_sum, sum(seq_lens))
 
+    def test_padded_replay_publishes_raw_batch_size_to_hisparse(self):
+        """HiSparse must ignore CUDA-graph padding rows during draft replay."""
+
+        raw_seq_lens = [10, 11]
+        backend = _RecordingDraftBackend()
+        runner = self._build_runner(backend)
+        coordinator = SimpleNamespace(
+            num_real_reqs=torch.tensor([CAPTURE_BS], dtype=torch.int32),
+            wait_for_pending_backup=lambda: None,
+        )
+        runner.model_runner.hisparse_coordinator = coordinator
+        forward_batch = self._build_forward_batch(raw_seq_lens, sum(raw_seq_lens))
+
+        runner.execute(forward_batch)
+
+        self.assertEqual(coordinator.num_real_reqs.item(), len(raw_seq_lens))
+        self.assertIs(forward_batch.hisparse_coordinator, coordinator)
+
+    def test_padded_draft_extend_publishes_raw_batch_size_to_hisparse(self):
+        """Draft-extend must also exclude CUDA-graph padding rows from HiSparse."""
+
+        raw_bs = 2
+        tokens_per_req = NUM_STEPS
+        num_tokens = raw_bs * tokens_per_req
+        coordinator = SimpleNamespace(
+            num_real_reqs=torch.tensor([CAPTURE_BS], dtype=torch.int32),
+            wait_for_pending_backup=lambda: None,
+        )
+        runner = EAGLEDraftExtendCudaGraphRunner.__new__(
+            EAGLEDraftExtendCudaGraphRunner
+        )
+        runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+        runner.capture_bs = [1, CAPTURE_BS]
+        runner.num_tokens_per_bs = tokens_per_req
+        runner.seq_len_fill_value = SEQ_LEN_FILL_VALUE
+        runner.require_mlp_tp_gather = False
+        runner.require_gathered_buffer = False
+        runner.forward_mode = SimpleNamespace()
+        runner.extend_seq_lens_cpu = [tokens_per_req] * CAPTURE_BS
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.empty(CAPTURE_BS * tokens_per_req, dtype=torch.int64),
+            seq_lens=torch.empty(CAPTURE_BS, dtype=torch.int32),
+            out_cache_loc=torch.empty(CAPTURE_BS * tokens_per_req, dtype=torch.int64),
+            positions=torch.empty(CAPTURE_BS * tokens_per_req, dtype=torch.int64),
+            req_pool_indices=torch.empty(CAPTURE_BS, dtype=torch.int32),
+            num_correct_drafts=torch.empty(CAPTURE_BS, dtype=torch.int32),
+            num_accept_tokens=torch.empty(CAPTURE_BS, dtype=torch.int32),
+            extend_seq_lens=torch.empty(CAPTURE_BS, dtype=torch.int32),
+            hidden_states=torch.empty(
+                CAPTURE_BS * tokens_per_req, 2, dtype=torch.float32
+            ),
+            seq_lens_cpu=torch.empty(CAPTURE_BS, dtype=torch.int32),
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+        )
+        runner.model_runner = SimpleNamespace(
+            device_timer=None,
+            hisparse_coordinator=coordinator,
+        )
+
+        class _Backend:
+            def init_forward_metadata_out_graph(self, forward_batch):
+                return None
+
+        class _Event:
+            def record(self):
+                return None
+
+        runner.draft_extend_attn_backend = _Backend()
+        runner.device_module = SimpleNamespace(Event=_Event)
+        runner._make_graph_key = lambda bs: bs
+        runner._replay_graph = lambda shape_key, forward_batch: SimpleNamespace(
+            next_token_logits=torch.zeros(
+                CAPTURE_BS * tokens_per_req, 8, dtype=torch.float32
+            ),
+            hidden_states=torch.zeros(
+                CAPTURE_BS * tokens_per_req, 2, dtype=torch.float32
+            ),
+        )
+
+        forward_batch = SimpleNamespace(
+            batch_size=raw_bs,
+            input_ids=torch.arange(num_tokens, dtype=torch.int64),
+            seq_lens=torch.tensor([10, 11], dtype=torch.int32),
+            seq_lens_cpu=None,
+            seq_lens_sum=21,
+            out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+            positions=torch.arange(num_tokens, dtype=torch.int64),
+            req_pool_indices=torch.arange(raw_bs, dtype=torch.int32),
+            extend_seq_lens=torch.full((raw_bs,), tokens_per_req, dtype=torch.int32),
+            extend_seq_lens_cpu=None,
+            global_num_tokens_cpu=None,
+            forward_mode=SimpleNamespace(),
+            spec_info=SimpleNamespace(
+                hidden_states=torch.zeros(num_tokens, 2, dtype=torch.float32),
+                num_correct_drafts=torch.full(
+                    (raw_bs,), tokens_per_req, dtype=torch.int32
+                ),
+                num_accept_tokens=torch.full(
+                    (raw_bs,), tokens_per_req, dtype=torch.int32
+                ),
+            ),
+        )
+
+        runner.execute(forward_batch)
+
+        self.assertEqual(coordinator.num_real_reqs.item(), raw_bs)
+        self.assertIs(forward_batch.hisparse_coordinator, coordinator)
+
     def test_none_seq_lens_sum_is_preserved(self):
         # seq_lens_sum may be intentionally absent; padding must keep it None
         # rather than coerce it into an int.
@@ -193,6 +306,77 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_singleton_dsa_seed_broadcasts_to_raw_batch(self):
+        """PD warmup may provide one shared seed row for every decode request."""
+
+        raw_seq_lens = [10, 11]
+        raw_bs = len(raw_seq_lens)
+        backend = _RecordingDraftBackend()
+        runner = self._build_runner(backend)
+        runner.buffers.dsa_seed_topk = torch.full(
+            (CAPTURE_BS, 2), -1, dtype=torch.int64
+        )
+        forward_batch = self._build_forward_batch(raw_seq_lens, sum(raw_seq_lens))
+        seed = torch.tensor([[7, 8]], dtype=torch.int64)
+        forward_batch.spec_info.dsa_topk_indices = seed
+
+        runner.execute(forward_batch)
+
+        self.assertTrue(
+            torch.equal(runner.buffers.dsa_seed_topk[:raw_bs], seed.expand(raw_bs, -1))
+        )
+        self.assertTrue(
+            torch.equal(
+                runner.buffers.dsa_seed_topk[raw_bs:],
+                torch.zeros(CAPTURE_BS - raw_bs, 2, dtype=torch.int64),
+            ),
+            msg="capture-only padding rows must remain zero",
+        )
+        self.assertEqual(
+            [observation.phase for observation in backend.observations],
+            ["metadata_build", "graph_replay"],
+        )
+
+    def test_non_broadcastable_dsa_seed_batch_is_rejected(self):
+        """A stale multi-row seed is invalid; replay must not crop or zero-pad it."""
+
+        raw_seq_lens = [10, 11, 12]
+        raw_bs = len(raw_seq_lens)
+        for seed_bs in (raw_bs + 1, raw_bs - 1):
+            with self.subTest(seed_bs=seed_bs):
+                backend = _RecordingDraftBackend()
+                runner = self._build_runner(backend)
+                runner.buffers.dsa_seed_topk = torch.full(
+                    (CAPTURE_BS, 2), -1, dtype=torch.int64
+                )
+                original_buffer = runner.buffers.dsa_seed_topk.clone()
+                forward_batch = self._build_forward_batch(
+                    raw_seq_lens, sum(raw_seq_lens)
+                )
+                forward_batch.spec_info.dsa_topk_indices = torch.arange(
+                    seed_bs * 2, dtype=torch.int64
+                ).reshape(seed_bs, 2)
+
+                expected = (
+                    r"EAGLEDraftCudaGraphRunner\.replay dsa_seed_topk "
+                    rf"batch mismatch: raw_bs={raw_bs}, "
+                    rf"seed_shape=\({seed_bs}, 2\), "
+                    rf"target_shape=\({raw_bs}, 2\), "
+                    rf"buffer_shape=\({CAPTURE_BS}, 2\)"
+                )
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    runner.execute(forward_batch)
+
+                self.assertTrue(
+                    torch.equal(runner.buffers.dsa_seed_topk, original_buffer),
+                    msg="invalid seed must be rejected before mutating replay buffers",
+                )
+                self.assertEqual(
+                    backend.observations,
+                    [],
+                    msg="invalid seed must be rejected before graph metadata/replay",
+                )
 
 
 if __name__ == "__main__":

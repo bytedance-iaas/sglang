@@ -62,6 +62,11 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    # PP+spec: forward-time snapshot of the microbatch (ScheduleBatch.copy()).
+    # The live mb object can be merged/filtered in place before its relayed
+    # result arrives, so relayed tensors must be applied against the
+    # composition that actually ran the forward.
+    fwd_batch: Optional[ScheduleBatch] = None
 
 
 class SchedulerPPMixin:
@@ -148,9 +153,15 @@ class SchedulerPPMixin:
                     )
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    process_target = self.mbs[next_mb_id]
+                    next_md = self.mb_metadata[next_mb_id]
+                    if next_md is not None and next_md.fwd_batch is not None:
+                        # PP+spec: process against the forward-time snapshot;
+                        # the live mb may have been recomposed since launch.
+                        process_target = next_md.fwd_batch
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            process_target,
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
@@ -571,6 +582,8 @@ class SchedulerPPMixin:
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        # PP+spec: per-rid chain rows seeding the next verify round.
+        self._pp_spec_chain_by_rid: Dict[str, torch.Tensor] = {}
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1018,6 +1031,17 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        if not batch.spec_algorithm.is_none() and result.accept_lens is not None:
+            # PP+spec verify round: earlier stages need the accept results to
+            # mirror seq_lens/KV bookkeeping and the bonus token to root the
+            # next round's verify chain.
+            tensor_dict["spec_accept_lens"] = result.accept_lens
+            tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
+            tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
+            if result.next_verify_chain is not None:
+                # Tail-drafted chain for the next verify round (root = bonus).
+                tensor_dict["spec_next_chain"] = result.next_verify_chain
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
@@ -1217,6 +1241,137 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+        # Chains are stored before finish flags are set (at result prep), so
+        # finished requests must be dropped here or the dict grows per request.
+        if self._pp_spec_chain_by_rid:
+            for req in batch.reqs:
+                if req.finished():
+                    self._pp_spec_chain_by_rid.pop(req.rid, None)
+
+    def _pp_spec_store_bonus(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        bonus_tokens: torch.Tensor,
+        chain_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Stash the per-request chain row (root = bonus token) that seeds the
+        next verify round.
+
+        chain_tokens is the last stage's tail-drafted chain (flat bs*dtn);
+        without it (prefill rounds) a degenerate row [bonus, 0, ...] is stored
+        — the zero drafts just get rejected, costing acceptance not
+        correctness. Keyed by rid (not batch position): the microbatch
+        composition can change between rounds (finish / retract / merge)."""
+        num_draft_tokens = self.server_args.speculative_num_draft_tokens
+        if chain_tokens is not None:
+            rows = chain_tokens.to(torch.int64).reshape(
+                len(batch.reqs), num_draft_tokens
+            )
+        else:
+            rows = torch.zeros(
+                (len(batch.reqs), num_draft_tokens),
+                dtype=torch.int64,
+                device=bonus_tokens.device,
+            )
+            rows[:, 0] = bonus_tokens.to(torch.int64)
+        for i, req in enumerate(batch.reqs):
+            if req.finished():
+                self._pp_spec_chain_by_rid.pop(req.rid, None)
+            else:
+                self._pp_spec_chain_by_rid[req.rid] = rows[i]
+
+    def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
+        state, without a draft model.
+
+        Phase 1 (correctness bring-up): degenerate topk=1 chains — the root is
+        the relayed bonus token (always accepted by the verify kernel), padded
+        with zero draft tokens that simply get rejected. Verify is sound for
+        arbitrary proposals, so this costs acceptance rate, not correctness.
+        Phase 2 relays the last stage's tail-drafted real chains instead."""
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+        from sglang.srt.speculative.eagle_utils import (
+            TreeMaskMode,
+            build_tree_kernel_efficient,
+        )
+
+        sa = self.server_args
+        steps = sa.speculative_num_steps
+        num_draft_tokens = sa.speculative_num_draft_tokens
+        bs = batch.batch_size()
+        device = self.device
+
+        if batch.forward_mode.is_idle() or bs == 0:
+            batch.spec_info = EagleVerifyInput.create_idle_input(
+                topk=sa.speculative_eagle_topk,
+                spec_steps=steps,
+                num_verify_tokens=num_draft_tokens,
+            )
+            return
+
+        chain_rows = torch.stack(
+            [self._pp_spec_chain_by_rid[req.rid] for req in batch.reqs]
+        ).to(device=device, dtype=torch.int64)
+        bonus_tokens = chain_rows[:, 0].contiguous()
+        draft_tokens = chain_rows[:, 1:].contiguous()
+        # topk=1 chain constants (mirrors EagleDraftWorker._rebuild_topk1_chain_buffers)
+        parent_width = steps if steps > 1 else 0
+        parent_list = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=device
+        ).repeat(bs, 1)
+        top_scores_index = torch.arange(steps, dtype=torch.long, device=device).repeat(
+            bs, 1
+        )
+
+        attn_backend = self.tp_worker.model_runner.attn_backend
+        tree_mask_buf, position_buf = (
+            attn_backend.get_verify_buffers_to_fill_after_draft()
+        )
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                # Conservative upper bound; backend-agnostic (not every
+                # attention backend exposes max_context_len).
+                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
+            else:
+                seq_lens_sum = 0  # preallocated buf -> kernel ignores it
+
+        (
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            flat_draft_tokens,
+        ) = build_tree_kernel_efficient(
+            bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            sa.speculative_eagle_topk,
+            steps,
+            num_draft_tokens,
+            TreeMaskMode.FULL_MASK,
+            tree_mask_buf,
+            position_buf,
+        )
+        batch.spec_info = EagleVerifyInput(
+            draft_token=flat_draft_tokens,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=steps,
+            topk=sa.speculative_eagle_topk,
+            draft_token_num=num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
@@ -1347,6 +1502,11 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    fwd_batch=(
+                        cur_batch.copy()
+                        if not cur_batch.spec_algorithm.is_none()
+                        else None
+                    ),
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
@@ -1519,7 +1679,7 @@ class SchedulerPPMixin:
             )
             if self.enable_hisparse:
                 for req in released_reqs:
-                    self.hisparse_coordinator.admit_request_direct(req)
+                    self.admit_hisparse_request_direct(req)
             self.waiting_queue.extend(released_reqs)
             return [req.rid for req in released_reqs]
         return None

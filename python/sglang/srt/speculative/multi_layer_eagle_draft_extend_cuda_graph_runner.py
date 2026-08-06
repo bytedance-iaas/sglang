@@ -165,6 +165,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._init_long_context_cuda_graph_guard()
         self.attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
         self.metadata_captured_in_graph = (
             self.attn_backend.draft_extend_metadata_captured_in_graph()

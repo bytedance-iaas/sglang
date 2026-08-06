@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
+    summarize_pd_bootstrap_tensor,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -28,6 +29,22 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_pd_bootstrap_summary_preserves_bytes_and_metadata(self):
+        value = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+        summary = summarize_pd_bootstrap_tensor(value)
+
+        self.assertEqual(summarize_pd_bootstrap_tensor(None), "none")
+        self.assertIn("shape=(1, 2)", summary)
+        self.assertIn("dtype=torch.float32", summary)
+        self.assertIn("nbytes=8", summary)
+        self.assertEqual(summary, summarize_pd_bootstrap_tensor(value.clone()))
+        self.assertNotEqual(
+            summary,
+            summarize_pd_bootstrap_tensor(
+                torch.tensor([[1.0, 3.0]], dtype=torch.float32)
+            ),
+        )
+
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),
