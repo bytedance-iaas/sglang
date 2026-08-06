@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   glm52-dspark-overlay:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.tag == 'glm52-dspark-deepep-1d87d2c94-graphoff-eic1.5.2' }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.tag == 'glm52-dspark-deepep-bb2806bd0-axisfix-graphoff-eic1.5.2' }}
     uses: ./.github/workflows/release-docker-glm52-dspark.yml
     with:
       image_tag: ${{ inputs.tag }}
