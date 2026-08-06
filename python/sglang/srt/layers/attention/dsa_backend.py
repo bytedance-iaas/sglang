@@ -55,7 +55,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
-    pad_dsa_cache_seqlens,
     prepare_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
