@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import time
+from collections import OrderedDict
 from enum import IntEnum
 from typing import List, Optional, Tuple
 
@@ -32,6 +33,7 @@ REMOTE_EIC_YAML_ENV_VAR = "REMOTE_EIC_YAML"
 # GDR Bounce Buffer
 G_GDRBounceBufferSize = 1 * 1024 * 1024 * 1024
 G_GDRBounceTensorCount = 128  # calculated by G_GDRBounceBufferSize / kvcache_size
+MISSING_KEY_CAP = 1 << 15
 
 # gpu direct rdma for kv set
 G_EnableKVSetGPUDirect = False
@@ -214,8 +216,13 @@ class EICKVClient:
         eic_instance_id = config.get("eic_instance_id", "")
         logger.info(f"eic instance_id: {eic_instance_id}")
 
-        eic_thread_num = config.get("eic_thread_num", 1)
-        logger.info(f"eic thread_num: {eic_thread_num}")
+        if "eic_thread_num" in config:
+            # The sdk takes the io thread count from InitAdvancedOption, which
+            # Client.init does not accept, so this key never reaches the client.
+            logger.warning(
+                "eic_thread_num is ignored; set --eic_client_default_io_thread_num "
+                "in eic_flag_file instead (it defaults to 3)"
+            )
 
         eic_log_dir = config.get("eic_log_dir", "/tmp/eic-client-log")
         logger.info(f"eic log_dir: {eic_log_dir}")
@@ -326,6 +333,7 @@ class EICKVClient:
             exit(1)
 
         self.device = device
+        self.missing_keys = OrderedDict()
         self.trans_type = eic.TransportType(eic_trans_type)
         self.kv_cache_shape = kv_cache_shape
         self.kv_cache_dtype = kv_cache_dtype
@@ -488,9 +496,25 @@ class EICKVClient:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
             return [False] * len(keys)
         res = []
-        for err_code in exist_outcome.status_codes:
-            res.append(err_code == eic.StatusCode.SUCCESS)
+        for key, err_code in zip(keys, exist_outcome.status_codes):
+            hit = err_code == eic.StatusCode.SUCCESS
+            res.append(hit and key not in self.missing_keys)
         return res
+
+    def mark_missing(self, keys: List[str]) -> None:
+        # A value is stored as independently evicted slices and mexist only probes
+        # the first one, so a key whose head slice survived keeps reporting a hit
+        # while the value can no longer be assembled. Remember what the read
+        # actually found so the next exists stops handing out that phantom.
+        for key in keys:
+            self.missing_keys.pop(key, None)
+            self.missing_keys[key] = None
+        while len(self.missing_keys) > MISSING_KEY_CAP:
+            self.missing_keys.popitem(last=False)
+
+    def clear_missing(self, keys: List[str]) -> None:
+        for key in keys:
+            self.missing_keys.pop(key, None)
 
     def allocate_eic_read_buffer(self, count):
         registered = True
@@ -552,6 +576,7 @@ class EICKVClient:
             device_copy = True
 
         fail_count = 0
+        stale_keys = []
         if status_code != eic.StatusCode.SUCCESS:
             if status_code == eic.StatusCode.PARTIAL_FAILED:
                 for i, err_code in enumerate(get_outcome.status_codes):
@@ -564,6 +589,8 @@ class EICKVClient:
                         )
                         success_mask[i] = False
                         fail_count += 1
+                        if err_code == eic.StatusCode.KEY_NOT_EXIST:
+                            stale_keys.append(keys[i])
             else:
                 logger.error(
                     f"eic mget {len(keys)} keys failed, status_code {status_code}"
@@ -577,6 +604,8 @@ class EICKVClient:
             logger.warning(
                 f"eic mget {len(keys)} keys failed, fail count {fail_count}, success count {count - fail_count}"
             )
+        if stale_keys:
+            self.mark_missing(stale_keys)
         if device_copy:
             suc_count = 0
             for mask in success_mask:
@@ -703,6 +732,7 @@ class EICKVClient:
             )
             return False
 
+        self.clear_missing(keys)
         logger.debug(f"set data key {len(keys)} success")
         return True
 
@@ -750,6 +780,7 @@ class EICKVClient:
                 failed[0],
             )
             return False
+        self.clear_missing(keys)
         return status_code == eic.StatusCode.SUCCESS
 
 
