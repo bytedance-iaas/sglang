@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.kv_cache_builder import (
+    get_draft_kv_pool,
     maybe_register_hicache_draft,
     prepare_hicache_draft_plan,
 )
@@ -30,6 +31,64 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDSV4Eagle3HiCache(unittest.TestCase):
+    def test_pd_draft_pool_resolution_without_draft_worker(self):
+        pool, model_config = get_draft_kv_pool(
+            draft_worker=None,
+            spec_algorithm=SimpleNamespace(is_ngram=mock.Mock(return_value=False)),
+            server_args=SimpleNamespace(enable_multi_layer_eagle=False),
+            enable_overlap=False,
+        )
+
+        self.assertIsNone(pool)
+        self.assertIsNone(model_config)
+
+    def test_pd_draft_pool_resolution_for_spec_v2_overlap(self):
+        draft_pool = object()
+        draft_model_config = object()
+        draft_runner = SimpleNamespace(
+            token_to_kv_pool=draft_pool,
+            model_config=draft_model_config,
+        )
+        draft_worker = SimpleNamespace(
+            draft_worker=SimpleNamespace(draft_runner=draft_runner)
+        )
+        spec_algorithm = SimpleNamespace(
+            is_ngram=mock.Mock(return_value=False),
+            supports_spec_v2=mock.Mock(return_value=True),
+        )
+
+        pool, model_config = get_draft_kv_pool(
+            draft_worker=draft_worker,
+            spec_algorithm=spec_algorithm,
+            server_args=SimpleNamespace(enable_multi_layer_eagle=False),
+            enable_overlap=True,
+        )
+
+        self.assertIs(pool, draft_pool)
+        self.assertIs(model_config, draft_model_config)
+
+    def test_pd_draft_pool_resolution_for_legacy_worker(self):
+        draft_pool = object()
+        draft_model_config = object()
+        draft_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(token_to_kv_pool=draft_pool),
+            model_config=draft_model_config,
+        )
+        spec_algorithm = SimpleNamespace(
+            is_ngram=mock.Mock(return_value=False),
+            supports_spec_v2=mock.Mock(return_value=True),
+        )
+
+        pool, model_config = get_draft_kv_pool(
+            draft_worker=draft_worker,
+            spec_algorithm=spec_algorithm,
+            server_args=SimpleNamespace(enable_multi_layer_eagle=False),
+            enable_overlap=False,
+        )
+
+        self.assertIs(pool, draft_pool)
+        self.assertIs(model_config, draft_model_config)
+
     def test_builtin_dsv4_nextn_uses_packed_hicache_plan(self):
         draft_pool = object()
         draft_runner = SimpleNamespace(
