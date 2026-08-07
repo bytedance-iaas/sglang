@@ -3408,6 +3408,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Replay cuda graph if applicable
         if can_run_graph:
+            from sglang.srt.layers.moe.moe_runner.asym_gemm_unified import (
+                maybe_refresh_gpu_caches,
+            )
+
+            maybe_refresh_gpu_caches()
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

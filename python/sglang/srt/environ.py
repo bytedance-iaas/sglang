@@ -430,6 +430,30 @@ class Envs:
     # Empty = always quantize online. On any missing file or shape mismatch the
     # affected layer transparently falls back to online quantization.
     SGLANG_ASYMGEMM_UNIFIED_INT8_PATH = EnvStr("")
+    # Phase-1 live VRAM expert-cache refresh (asym_gemm.unified_moe.runtime.
+    # refresh_gpu_caches): every N replayed decode steps, re-pick each
+    # unified-MoE layer's cached experts from live routing counts, taking a
+    # blocking barrier only if a residency actually changes. <= 0 (default)
+    # disables this — the cache stays exactly as built at layer-construction
+    # time. N counts *replayed decode steps only* — the passes this hook
+    # actually sees. Eager passes (prefill, or a decode batch not yet
+    # graph-captured) still accumulate routing counts inside Layer.forward(),
+    # but never trigger a refresh, so the cadence does not drift with the
+    # workload's prefill:decode mix.
+    #
+    # This var arms the *trigger*, and is the only one whose *value* sets the
+    # cadence. AsymGEMM-side ASYMGEMM_CACHE_TRACK_ROUTING arms the *counters*
+    # (a boolean: Layer.__init__ allocates _live_counts only when it is set).
+    # A third, pre-existing var is required too: ASYMGEMM_GPU_CACHED_EXPERTS
+    # must be strictly between 0 and num_experts, since with no VRAM cache
+    # there is no residency to re-pick. All three are needed; any one missing
+    # silently yields static residency.
+    #
+    # Use a value in the hundreds, not single digits. Evicting one expert
+    # costs real PCIe bytes (4.5 MiB at Qwen3-30B-A3B shapes), and the live
+    # counters need enough routed tokens to be more than noise. AsymGEMM-side
+    # ASYMGEMM_CACHE_{MAX_SWAP,SWAP_MARGIN,COUNT_DECAY} bound the churn.
+    SGLANG_ASYMGEMM_CACHE_REFRESH_INTERVAL = EnvInt(0)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)

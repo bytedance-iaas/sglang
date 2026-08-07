@@ -76,6 +76,50 @@ def has_unified_asym_gemm_layer(layer: torch.nn.Module) -> bool:
     return getattr(layer, _UNIFIED_LAYER_ATTR, None) is not None
 
 
+_refresh_replay_steps = 0
+
+
+def maybe_refresh_gpu_caches() -> None:
+    """Pre-graph-replay hook for AsymGEMM's Phase-1 live VRAM-cache refresh.
+
+    Call only from the can_run_graph branch of ModelRunner._forward_raw,
+    immediately before graph_runner.replay(). No-op unless the unified MoE path is
+    enabled and SGLANG_ASYMGEMM_CACHE_REFRESH_INTERVAL > 0.
+    """
+    global _refresh_replay_steps
+
+    if not unified_asym_gemm_enabled():
+        return
+    interval = envs.SGLANG_ASYMGEMM_CACHE_REFRESH_INTERVAL.get()
+    if interval <= 0:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    # Cadence is counted in *replayed decode steps*, which is what this hook
+    # sees -- not in forward_pass_id. forward_pass_id also advances on eager
+    # prefill passes, which never reach here, so `forward_pass_id % interval`
+    # samples the id space sparsely and can miss every multiple of it: on a
+    # prefill-heavy workload the refresh silently never fired at all. Counting
+    # our own calls makes the env var mean what it says, one refresh per
+    # `interval` replayed decode steps, independent of the prefill:decode mix.
+    _refresh_replay_steps += 1
+    if _refresh_replay_steps % interval != 0:
+        return
+
+    from asym_gemm.unified_moe.runtime import refresh_gpu_caches
+
+    # Coarse Phase-1 barrier: block for in-flight GPU work before mutating
+    # cache tensors the upcoming graph replay will read. sync_before_mutate
+    # makes refresh_gpu_caches take it *lazily* — at most once, and only if
+    # some layer's residency actually changes. Syncing here unconditionally
+    # (the original form) stalled the pipeline on every interval boundary
+    # even when the refresh turned out to be a no-op, which is the common
+    # case once the counters settle. A non-blocking event-gated version is
+    # still deferred to a later phase.
+    refresh_gpu_caches(sync_before_mutate=True)
+
+
 # --------------------------------------------------------------------------- #
 # INT8 preload: when an offline INT8 slab covers a layer, its BF16 expert
 # master weights are pure waste — they would be allocated (pinned), read from
