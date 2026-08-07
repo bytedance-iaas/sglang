@@ -45,3 +45,5 @@ class CacheInitParams:
     cache_ttl_seconds: Optional[float] = None
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
+
+    mtp_draft_device_pools: tuple[object, ...] = ()

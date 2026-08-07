@@ -429,6 +429,13 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        hicache_draft_plan = kv_cache_builder.prepare_hicache_draft_plan(
+            target_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
@@ -450,6 +457,7 @@ class Scheduler(
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             enable_eic_cache=self.enable_eic_cache,
+            hicache_draft_plan=hicache_draft_plan,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -484,16 +492,13 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            enable_overlap=self.enable_overlap,
-            page_size=self.page_size,
-        )
+        if self.enable_hierarchical_cache and hicache_draft_plan is not None:
+            kv_cache_builder.maybe_register_hicache_draft(
+                tree_cache=self.tree_cache,
+                draft_plan=hicache_draft_plan,
+                server_args=self.server_args,
+                page_size=self.page_size,
+            )
 
         # Init running status
         self.init_running_status()

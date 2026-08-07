@@ -42,64 +42,26 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-
-def get_draft_kv_pool(
-    *,
-    draft_worker: "BaseTpWorker",
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-    enable_overlap: bool,
-):
-    """Return (draft_token_to_kv_pool, draft_model_config) for the current
-    draft worker, or (None, None) when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None, None
-
-    if spec_algorithm.supports_spec_v2() and enable_overlap:
-        if server_args.enable_multi_layer_eagle:
-            draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-        else:
-            draft_runner = draft_worker.draft_worker.draft_runner
-        return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-    return (
-        draft_worker.model_runner.token_to_kv_pool,
-        draft_worker.model_config,
-    )
 
 
 def maybe_register_hicache_draft(
     *,
     tree_cache: "BasePrefixCache",
-    draft_worker: "BaseTpWorker",
-    spec_algorithm: SpeculativeAlgorithm,
+    draft_plan: "HiCacheDraftPlan",
     server_args: ServerArgs,
-    enable_hierarchical_cache: bool,
-    enable_overlap: bool,
     page_size: int,
 ) -> None:
-    """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-    if not enable_hierarchical_cache:
-        return
+    """Register non-packed draft pools after the target cache is constructed."""
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
-    draft_kv_pool, _ = get_draft_kv_pool(
-        draft_worker=draft_worker,
-        spec_algorithm=spec_algorithm,
-        server_args=server_args,
-        enable_overlap=enable_overlap,
-    )
-    if draft_kv_pool is None:
+    if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    # #30393 uses sidecars for standalone EAGLE/EAGLE3 draft models, while
-    # built-in NextN/EAGLE models use its separate packed path.  This fork does
-    # not have the packed-plan infrastructure yet, so keep its existing EAGLE
-    # registration unchanged and enable the sidecar path only for EAGLE3.
-    if isinstance(tree_cache, UnifiedRadixCache) and spec_algorithm.is_eagle3():
+    if isinstance(tree_cache, UnifiedRadixCache):
         if server_args.hicache_storage_backend is not None:
             raise NotImplementedError(
                 "This DeepSeek-V4 backport supports external EAGLE/EAGLE3 "
@@ -111,7 +73,7 @@ def maybe_register_hicache_draft(
         )
 
         specs, entries = build_hicache_draft_sidecars(
-            draft_device_pools=(draft_kv_pool,),
+            draft_device_pools=draft_plan.device_pools,
             tree_cache=tree_cache,
             server_args=server_args,
         )
@@ -128,7 +90,7 @@ def maybe_register_hicache_draft(
         MLATokenToKVPoolHost,
     )
 
-    pool = draft_kv_pool
+    pool = draft_plan.device_pools[0]
     if isinstance(pool, HybridLinearKVPool):
         pool = pool.full_kv_pool
 
@@ -153,6 +115,42 @@ def maybe_register_hicache_draft(
         return
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+
+def prepare_hicache_draft_plan(
+    *,
+    target_worker: "BaseTpWorker",
+    draft_worker: "BaseTpWorker",
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+) -> "HiCacheDraftPlan":
+    from sglang.srt.speculative.base_spec_worker import (
+        HiCacheDraftPlan,
+        build_hicache_draft_plan,
+    )
+
+    if (
+        draft_worker is None
+        or not spec_algorithm.is_eagle()
+        or spec_algorithm.is_frozen_kv_mtp()
+    ):
+        target_worker.model_runner.mtp_draft_device_pools = ()
+        return HiCacheDraftPlan()
+
+    if hasattr(draft_worker, "init_hicache_draft_plan"):
+        draft_worker.init_hicache_draft_plan()
+        return draft_worker.hicache_draft_plan
+
+    draft_runners = tuple(
+        draft_worker.model_runner_list
+        if server_args.enable_multi_layer_eagle
+        else [draft_worker.model_runner]
+    )
+    return build_hicache_draft_plan(
+        target_model_runner=target_worker.model_runner,
+        draft_runners=draft_runners,
+        server_args=server_args,
+    )
 
 
 def is_supported_dsv4_decode_radix_mtp(
@@ -185,6 +183,7 @@ def build_kv_cache(
     pp_group: "GroupCoordinator",
     enable_hierarchical_cache: bool,
     enable_eic_cache: bool = False,
+    hicache_draft_plan: Optional["HiCacheDraftPlan"] = None,
 ) -> "KVCacheBuildResult":
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -296,6 +295,12 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        mtp_draft_device_pools=(
+            hicache_draft_plan.device_pools
+            if hicache_draft_plan is not None
+            and hicache_draft_plan.mode.value == "packed"
+            else ()
+        ),
     )
 
     if effective_chunked_prefill_size is not None and disable_radix_cache:

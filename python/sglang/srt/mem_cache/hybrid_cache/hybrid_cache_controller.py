@@ -199,6 +199,9 @@ class HybridCacheController(BaseHiCacheController):
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
 
+        self.has_mtp_draft = False
+        self.mtp_draft_device_pools = ()
+
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -207,6 +210,10 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
+
+    def set_mtp_draft_pools(self, device_pools) -> None:
+        self.mtp_draft_device_pools = tuple(device_pools)
+        self.has_mtp_draft = bool(self.mtp_draft_device_pools)
 
     def _start_storage_threads(self):
         super()._start_storage_threads()
@@ -494,6 +501,16 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mtp_draft_device_pools[i],
+                        host_indices,
+                        device_indices,
+                        self.layer_num + i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                        is_draft=True,
+                    )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,

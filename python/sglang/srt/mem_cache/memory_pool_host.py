@@ -2018,7 +2018,14 @@ class DeepSeekV4PagedHostPool(HostKVCache):
             )
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         if host_indices is None or device_indices is None:
             return
@@ -2585,17 +2592,21 @@ class HostPoolGroup:
         layer_id,
         io_backend,
         pool_transfers: Optional[list] = None,
+        *,
+        is_draft: bool = False,
     ) -> None:
         # 1. Anchor (KV) transfer
         anchor = self.anchor_entry
         local_layer_id = anchor.layer_mapper(layer_id)
         if local_layer_id is not None and host_indices.numel() > 0:
+            kwargs = {"is_draft": True} if is_draft else {}
             anchor.host_pool.load_to_device_per_layer(
-                anchor.device_pool,
+                device_pool if is_draft else anchor.device_pool,
                 host_indices,
                 device_indices,
                 local_layer_id,
                 io_backend,
+                **kwargs,
             )
 
         # 2. Extra pool transfers
@@ -2606,12 +2617,14 @@ class HostPoolGroup:
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
                 continue
+            kwargs = {"is_draft": True} if is_draft else {}
             entry.host_pool.load_to_device_per_layer(
-                entry.device_pool,
+                device_pool if is_draft else entry.device_pool,
                 transfer.host_indices,
                 transfer.device_indices,
                 local_layer_id,
                 io_backend,
+                **kwargs,
             )
 
     def backup_from_device_all_layer(
