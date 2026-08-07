@@ -1,0 +1,21 @@
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_ad2f633ba377a9::t_404ace7b966a70 9-10,140,328,468,601
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a3e462ebf0fc77c830a614e9ab2752496abb7409",
+  "prompts": {},
+  "sessions": {
+    "s_ad2f633ba377a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63b9d051-085a-4f60-9710-44bcb032c157",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
