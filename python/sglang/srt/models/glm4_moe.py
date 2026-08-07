@@ -77,9 +77,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    MXFP4_PACK_QUANTIZED_FORMAT,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
@@ -1463,8 +1467,37 @@ class Glm4MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
+def _glm_mxfp4_packed_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """True for GLM mxfp4-pack-quantized checkpoints.
+
+    These store routed experts as packed `weight_packed` / `weight_scale`
+    tensors while shared experts stay as loose gate/up/down weights (listed in
+    the quantization `ignore` patterns). Fusing the shared expert into the MoE
+    layer would make the loader expect the shared weights in the same packed
+    parameter layout, silently mis-loading them -- so shared-experts fusion
+    must be disabled for this checkpoint family.
+    """
+    if quant_config is None:
+        return False
+    if quant_config.get_name() not in {"compressed-tensors", "compressed_tensors"}:
+        return False
+    quantization_config = getattr(quant_config, "config", None)
+    if not isinstance(quantization_config, dict):
+        return False
+    quant_format = quantization_config.get("format")
+    return (
+        isinstance(quant_format, str)
+        and quant_format.endswith("pack-quantized")
+        and quant_format == MXFP4_PACK_QUANTIZED_FORMAT
+    )
+
+
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     def determine_num_fused_shared_experts(self):
+        if _glm_mxfp4_packed_quant_config(self.quant_config):
+            get_global_server_args().disable_shared_experts_fusion = True
         super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
 
 

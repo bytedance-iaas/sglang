@@ -1,7 +1,15 @@
 """MXFP4 MoE scheme: packed E2M1 weights + per-32 UE8M0 scales, FP8 activations.
 
 Loads `mxfp4-pack-quantized` compressed-tensors checkpoints (e.g. GLM-5.2
-DataFree-WMXFP4AFP8-GS32) and hands the weights to DeepGEMM's mega-MoE kernel.
+DataFree-WMXFP4AFP8-GS32). Two execution backends are supported:
+
+* Marlin (`--moe-runner-backend marlin`): the packed E2M1 bytes are repacked
+  into the Marlin MoE layout (`prepare_moe_mxfp4_layer_for_marlin`) and the
+  E8M0 scales are normalized to `float8_e8m0fnu`, which the
+  `moe_wna16_marlin` kernel consumes natively (bf16 activations).
+* Mega-MoE (DeepGEMM SM90 FP4, `--moe-a2a-backend megamoe`): weights are
+  transformed via `transform_weights_for_mega_moe_sm90_fp4` and the scales
+  ride in an fp32 container (the kernel packs UE8M0 itself).
 
 Checkpoint layout (per expert, before stacking):
     gate/up_proj.weight_packed  uint8  [I, H//2]    two E2M1 nibbles per byte
@@ -12,12 +20,13 @@ Checkpoint layout (per expert, before stacking):
 The nibble order (low nibble = even K index) and the E2M1 encoding match
 DeepGEMM's `per_token_cast_to_fp4`, so the packed bytes are handed over
 untouched -- `MXFP4PackedCompressor` subclasses `NVFP4PackedCompressor` and
-reuses its `pack_fp4_to_uint8`. Only the scales need converting: the kernel
-consumes UE8M0 values carried in an fp32 container, not the raw E8M0 bytes.
+reuses its `pack_fp4_to_uint8`. Only the scales need converting: the mega-MoE
+kernel consumes UE8M0 values carried in an fp32 container, not the raw E8M0
+bytes.
 
-This scheme only serves the mega-MoE path: SGLang has no SM90 MXFP4 grouped
-GEMM to fall back on, so both weight preparation and `apply_weights` fail loudly
-rather than silently producing garbage.
+The loaded w13 row order is `[gate; up]` (MergedColumnParallelLinear), which
+is exactly the layout the Marlin `silu_and_mul` expects -- no deinterleave is
+needed.
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -105,6 +115,16 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # Un-padded partition hidden size. Marlin repacks/pads the intermediate
+        # dim in `process_weights_after_loading`, so the buffer created here must
+        # stay in checkpoint layout for the loader's narrow-copy fast path.
+        self.hidden_size = hidden_size
+
+        # `prepare_moe_mxfp4_layer_for_marlin` derives the activation dtype from
+        # `layer.orig_dtype`; the GLM-5.2 family is bf16.
+        layer.params_dtype = params_dtype
+        layer.orig_dtype = params_dtype
 
         # `num_experts` is already EP-local and `intermediate_size_per_partition`
         # already TP-sharded; both shard sizes must stay group/pack aligned or the
@@ -232,7 +252,42 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
 
         layer.is_mxfp4_converted = True
 
-        self._build_mega_moe_weights(layer)
+        if get_moe_runner_backend().is_marlin():
+            self._build_marlin_weights(layer)
+        else:
+            self._build_mega_moe_weights(layer)
+
+    def _build_marlin_weights(self, layer: torch.nn.Module) -> None:
+        """Repack the checkpoint-layout weights into the Marlin MoE layout.
+
+        `prepare_moe_mxfp4_layer_for_marlin` reads `w13_weight` / `w2_weight`
+        (packed int8) plus `w13_weight_scale_inv` / `w2_weight_scale_inv`
+        (fp32 per-32 scales) and produces the repacked qweight + permuted
+        `float8_e8m0fnu` scales. The loaded row order is `[gate; up]`, which
+        is exactly what Marlin's `silu_and_mul` expects, so no deinterleave is
+        applied (that helper is only for interleaved GPT-OSS checkpoints).
+
+        When Marlin is selected the mega-MoE weights are never built, so
+        `should_use_mega_moe` stays False and the standard FusedMoE path
+        (routed through `apply_weights`) is used at inference time.
+        """
+        from sglang.srt.layers.quantization.marlin_utils import (
+            check_moe_marlin_supports_layer,
+        )
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            prepare_moe_mxfp4_layer_for_marlin,
+        )
+
+        if not is_sm90_supported() and not is_sm100_supported():
+            raise RuntimeError("MXFP4 Marlin requires SM90 or SM100.")
+
+        if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
+            raise RuntimeError(
+                "Current MXFP4 MoE layer is not supported by Marlin."
+            )
+
+        prepare_moe_mxfp4_layer_for_marlin(layer)
+        layer._mxfp4_backend = "marlin"
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
         """Hand the weights to DeepGEMM's mega-MoE transform.
@@ -259,6 +314,13 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if get_moe_runner_backend().is_marlin():
+            from sglang.srt.layers.moe.moe_runner import MoeRunner
+            from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        # The mega-MoE path bypasses the runner entirely (DeepseekV2MoE.forward
+        # routes straight into forward_mega_moe), so no runner is built there.
 
     def apply(
         self,
@@ -272,6 +334,47 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if get_moe_runner_backend().is_marlin():
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+            assert TopKOutputChecker.format_is_standard(dispatch_output.topk_output)
+            hidden_states = dispatch_output.hidden_states
+            if hidden_states.shape[-1] != self.hidden_size:
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states,
+                    (0, self.hidden_size - hidden_states.shape[-1]),
+                    mode="constant",
+                    value=0.0,
+                )
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                is_k_full=True,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            combine_input = self.runner.run(
+                dispatch_output._replace(hidden_states=hidden_states),
+                quant_info,
+            )
+            hidden_states = combine_input.hidden_states
+            # The MXFP4 Marlin kernel sums the top-k expert outputs without
+            # applying the routed scaling factor (unlike the non-MXFP4 path,
+            # which folds it into moe_sum_reduce). The mega-MoE path applies it
+            # explicitly too (`forward_mega_moe`), so match that here.
+            scale = self.moe_runner_config.routed_scaling_factor
+            if scale is not None:
+                hidden_states = hidden_states * scale
+            return StandardCombineInput(hidden_states=hidden_states)
+
         # Reaching here means the mega-MoE path declined this batch (e.g. the
         # token count exceeded its cap). There is no SM90 MXFP4 grouped GEMM to
         # fall back on, and the weights are already in mega layout, so failing
