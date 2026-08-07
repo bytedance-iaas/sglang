@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -626,6 +630,156 @@ def build_anchor_sidecar_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
+
+
+def _build_draft_host_pool(
+    *,
+    pool: Any,
+    host_to_device_ratio: float,
+    page_size: int,
+    layout: str,
+    allocator_type: Optional[str],
+):
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    kwargs = dict(
+        host_to_device_ratio=host_to_device_ratio,
+        host_size=0,
+        page_size=page_size,
+        layout=layout,
+        allocator_type=allocator_type,
+    )
+    if isinstance(pool, MHATokenToKVPool):
+        return MHATokenToKVPoolHost(pool, **kwargs)
+    return MLATokenToKVPoolHost(
+        pool,
+        override_kv_cache_dim=pool.kv_cache_dim,
+        **kwargs,
+    )
+
+
+def build_full_draft_pools(
+    *,
+    draft_kv_pool: Any,
+    tree_cache: Any,
+    server_args: ServerArgs,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build a draft KV sidecar whose indices follow target full KV."""
+    pool = draft_kv_pool
+    if pool.layer_num == 0:
+        return [], []
+
+    controller = tree_cache.cache_controller
+    host_pool_group = controller.mem_pool_host
+    draft_host_pool = _build_draft_host_pool(
+        pool=pool,
+        host_to_device_ratio=host_pool_group.size / pool.size,
+        page_size=controller.page_size,
+        layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+    layer_mapping = {i: i for i in range(pool.layer_num)}
+    return (
+        [
+            SidecarPoolSpec(
+                pool_name=PoolName.DRAFT,
+                indices_from_pool=PoolName.KV,
+            )
+        ],
+        [
+            build_pool_entry(
+                name=PoolName.DRAFT,
+                host_pool=draft_host_pool,
+                device_pool=pool,
+                layer_mapping=layer_mapping,
+                transfer_layer_num=draft_host_pool.layer_num,
+            )
+        ],
+    )
+
+
+def build_swa_draft_pools(
+    *,
+    draft_kv_pool: Any,
+    tree_cache: Any,
+    server_args: ServerArgs,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build a draft SWA sidecar whose indices follow target SWA."""
+    draft_swa_pool = draft_kv_pool.swa_kv_pool
+    if draft_swa_pool is None:
+        raise NotImplementedError(
+            "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
+        )
+    if draft_swa_pool.layer_num == 0:
+        return [], []
+
+    controller = tree_cache.cache_controller
+    target_swa_host_pool = controller.mem_pool_host.entry_map[PoolName.SWA].host_pool
+    if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+        draft_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DRAFT_SWA),
+            device_buffers=draft_swa_pool.kv_buffer,
+            item_bytes=draft_swa_pool.bytes_per_page_padded,
+            num_host_pages=target_swa_host_pool.num_host_pages,
+            slot_page_size=draft_swa_pool.page_size,
+            layout=target_swa_host_pool.layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+    else:
+        draft_host_pool = _build_draft_host_pool(
+            pool=draft_swa_pool,
+            host_to_device_ratio=target_swa_host_pool.size / draft_swa_pool.size,
+            page_size=target_swa_host_pool.page_size,
+            layout=target_swa_host_pool.layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+
+    layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
+    return (
+        [
+            SidecarPoolSpec(
+                pool_name=PoolName.DRAFT_SWA,
+                indices_from_pool=PoolName.SWA,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ],
+        [
+            build_pool_entry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=draft_host_pool,
+                device_pool=draft_swa_pool,
+                layer_mapping=layer_mapping,
+                transfer_layer_num=draft_host_pool.layer_num,
+            )
+        ],
+    )
+
+
+def build_hicache_draft_sidecars(
+    *,
+    draft_device_pools: tuple[Any, ...],
+    tree_cache: Any,
+    server_args: ServerArgs,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build the upstream sidecar path for an external EAGLE/EAGLE3 draft."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+    if len(draft_device_pools) != 1:
+        raise ValueError(
+            "HiCache sidecar mode expects exactly one primary draft KV pool, "
+            f"got {len(draft_device_pools)}."
+        )
+    draft_kv_pool = draft_device_pools[0]
+    builder = (
+        build_swa_draft_pools
+        if isinstance(draft_kv_pool, BaseSWAKVPool)
+        else build_full_draft_pools
+    )
+    return builder(
+        draft_kv_pool=draft_kv_pool,
+        tree_cache=tree_cache,
+        server_args=server_args,
+    )
 
 
 def attach_hybrid_pool_to_unified_cache(

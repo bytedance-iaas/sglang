@@ -2516,6 +2516,12 @@ class HostPoolGroup:
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
 
+    def add_entry(self, entry: PoolEntry) -> None:
+        if entry.name in self.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered.")
+        self.entries.append(entry)
+        self.entry_map[entry.name] = entry
+
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer

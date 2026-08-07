@@ -65,6 +65,11 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
 
+    # Draft KV pools attached to the target HiCache operation.
+    DRAFT = "draft"
+    DRAFT_INDEXER = "draft_indexer"
+    DRAFT_SWA = "draft_swa"
+
     def __str__(self) -> str:
         return self.value
 

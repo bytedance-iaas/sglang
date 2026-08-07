@@ -93,6 +93,31 @@ def maybe_register_hicache_draft(
     if draft_kv_pool is None:
         return
 
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    # #30393 uses sidecars for standalone EAGLE/EAGLE3 draft models, while
+    # built-in NextN/EAGLE models use its separate packed path.  This fork does
+    # not have the packed-plan infrastructure yet, so keep its existing EAGLE
+    # registration unchanged and enable the sidecar path only for EAGLE3.
+    if isinstance(tree_cache, UnifiedRadixCache) and spec_algorithm.is_eagle3():
+        if server_args.hicache_storage_backend is not None:
+            raise NotImplementedError(
+                "This DeepSeek-V4 backport supports external EAGLE/EAGLE3 "
+                "draft sidecars for HiCache L2 only; L3 draft storage requires "
+                "the remaining upstream #30393 storage-backend changes."
+            )
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_hicache_draft_sidecars,
+        )
+
+        specs, entries = build_hicache_draft_sidecars(
+            draft_device_pools=(draft_kv_pool,),
+            tree_cache=tree_cache,
+            server_args=server_args,
+        )
+        tree_cache.register_hicache_draft_pools(specs, entries)
+        return
+
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MHATokenToKVPool,
