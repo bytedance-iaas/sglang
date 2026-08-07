@@ -2232,6 +2232,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.warning(
                 f"Overriding draft attention backend to {draft_attn_backend}."
             )
+            draft_attn_backend = self._fallback_dsv4_backend_for_draft(
+                draft_attn_backend
+            )
             return self._get_attention_backend_from_str(
                 draft_attn_backend,
                 init_new_workspace=init_new_workspace,
@@ -2241,6 +2244,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_attention_backend_str,
             self.decode_attention_backend_str,
         ) = self.server_args.get_attention_backends()
+        if self.is_draft_worker:
+            self.prefill_attention_backend_str = (
+                self._fallback_dsv4_backend_for_draft(
+                    self.prefill_attention_backend_str
+                )
+            )
+            self.decode_attention_backend_str = self._fallback_dsv4_backend_for_draft(
+                self.decode_attention_backend_str
+            )
 
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
@@ -2278,6 +2290,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_global_server_args().decode_attention_backend,
         ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
+
+    def _fallback_dsv4_backend_for_draft(self, backend: str) -> str:
+        """Keep DSV4's fixed-shape backend away from other draft models."""
+        if backend != "dsv4":
+            return backend
+
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if is_deepseek_v4(self.model_config.hf_config):
+            return backend
+
+        fallback = self.server_args._get_default_attn_backend(
+            use_mla_backend=self.use_mla_backend,
+            model_config=self.model_config,
+        )
+        logger.warning(
+            "Draft model is not DeepSeekV4, falling back attention backend "
+            "from 'dsv4' to '%s'.",
+            fallback,
+        )
+        return fallback
 
     def _get_attention_backend_from_str(
         self, backend_str: str, init_new_workspace: bool = False

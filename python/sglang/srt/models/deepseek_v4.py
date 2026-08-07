@@ -1000,6 +1000,7 @@ class DeepseekV4Model(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
+        self.layers_to_capture: List[int] = []
 
     def hc_head(
         self,
@@ -1061,6 +1062,12 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if nsa_use_prefill_cp(forward_batch):
+            if self.layers_to_capture:
+                raise NotImplementedError(
+                    "EAGLE3 auxiliary hidden-state capture is not supported "
+                    "together with DeepSeek-V4 prefill context parallelism "
+                    "(attn_cp_size > 1)."
+                )
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -1073,7 +1080,17 @@ class DeepseekV4Model(nn.Module):
         # forks alt-streams; later per-layer calls become no-ops.
         forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
+        eagle3_aux_hidden_states: List[torch.Tensor] = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                eagle3_aux_hidden_states.append(
+                    self.hc_head(
+                        hidden_states,
+                        self.hc_head_fn,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                    )
+                )
             layer = self.layers[i]
             hidden_states = layer(
                 positions=positions,
@@ -1103,6 +1120,8 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if self.layers_to_capture:
+            return (hidden_states, pre_hc_head), eagle3_aux_hidden_states
         return hidden_states, pre_hc_head
 
 
@@ -1173,6 +1192,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             "DeepSeek V4 requires different clamping for shared and routed experts. "
             "Shared experts fusion optimization is disabled.",
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            # Capture runs before layer(i), so capture output of layer N at N+1.
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @torch.no_grad()
     def forward(
