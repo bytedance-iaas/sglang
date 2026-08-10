@@ -416,6 +416,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dspark_use_aux_hidden_state = False
+        self.dspark_target_layer_ids = None
+        self.dspark_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -486,6 +489,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+
+        if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                parse_dspark_draft_config,
+            )
+
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=server_args.speculative_draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            dflash_config = parse_dflash_draft_config(
+                draft_hf_config=draft_model_config.hf_config
+            )
+            dspark_config = parse_dspark_draft_config(
+                draft_hf_config=draft_model_config.hf_config
+            )
+            draft_num_layers = dflash_config.require_num_layers()
+            target_num_layers = int(
+                getattr(self.model_config.hf_text_config, "num_hidden_layers")
+            )
+            target_layer_ids = dflash_config.resolve_target_layer_ids(
+                target_num_layers=target_num_layers,
+                draft_num_layers=int(draft_num_layers),
+            )
+            if dspark_config.target_layer_ids is not None:
+                target_layer_ids = list(dspark_config.target_layer_ids)
+            if not dspark_config.require_markov():
+                raise ValueError(
+                    "DSPARK requires markov_rank > 0 in the bundled draft config."
+                )
+            self.dspark_use_aux_hidden_state = True
+            self.dspark_target_layer_ids = target_layer_ids
+            self.dspark_draft_num_layers = int(draft_num_layers)
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -903,6 +942,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "set_dflash_layers_to_capture, which is required for DFLASH."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        if self.dspark_use_aux_hidden_state:
+            if not hasattr(self.model, "set_dspark_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} does not implement "
+                    "set_dspark_layers_to_capture, which is required for DSPARK."
+                )
+            self.model.set_dspark_layers_to_capture(self.dspark_target_layer_ids)
 
     def remote_instance_init_transfer_engine(self):
         try:

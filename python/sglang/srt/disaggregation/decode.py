@@ -144,6 +144,10 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
+        # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
+        # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
+        # inheriting ReqToTokenPool.alloc, which bumps it.
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -172,6 +176,7 @@ class DecodeReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -182,6 +187,7 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):

@@ -168,6 +168,7 @@ class Envs:
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
@@ -201,6 +202,22 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
+    SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
+    SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
+    SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
+    SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
+    SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
+    SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
+    SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
+    SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
+    SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
+    SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -476,6 +493,30 @@ class Envs:
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
     SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
+    SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
+    # Saves the per-step draft forward, but the draft KV goes stale: an upshift
+    # back to steps>0 starts from a cold draft state (low accept until it recovers).
+    SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
+    # eager. Escape hatch for setups where the capture's memory pool costs more
+    # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
+    # capacity).
+    SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
+    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
+    # extend_attention_fwd for unsupported cases or when set false (e.g. for
+    # debugging). Correctness is unaffected; this only changes performance.
+    SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
+    # page alignment). Off in prod; tests turn it on to fail-fast on
+    # numerical / index violations instead of getting silent NaN cascades.
+    SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Sanitize NaN logits before sampling kernels and log a throttled warning
+    # (see sanitize_nan_logits).
+    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

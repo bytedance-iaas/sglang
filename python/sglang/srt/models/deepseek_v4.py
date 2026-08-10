@@ -1000,6 +1000,10 @@ class DeepseekV4Model(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
+        self.dspark_layers_to_capture: Optional[List[int]] = None
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
 
     def hc_head(
         self,
@@ -1073,15 +1077,62 @@ class DeepseekV4Model(nn.Module):
         # forks alt-streams; later per-layer calls become no-ops.
         forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(
+        capture_dspark = self.dspark_layers_to_capture is not None
+        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture is not supported together with "
+                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
+                "of them: DSpark static-verify is CP-off for v1."
+            )
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        # execution cannot expose per-layer completed hidden states), so skip
+        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        if self._can_run_tbo(forward_batch) and not capture_dspark:
+            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
+            # disabled here (each layer self-contained), so no trailing hc_post.
+            hidden_states = self._forward_layers_tbo(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
+        else:
+            use_fused = self.use_fused_mhc_post_pre
+            prev_residual, prev_post, prev_comb = None, None, None
+            last_layer = None
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                last_layer = layer
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
+                    hidden_states, prev_residual, prev_post, prev_comb = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        prev_residual=prev_residual,
+                        prev_post=prev_post,
+                        prev_comb=prev_comb,
+                    )
+                if capture_dspark and i in self.dspark_layers_to_capture:
+                    if use_fused:
+                        completed = layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                    else:
+                        completed = hidden_states
+                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+            if use_fused and last_layer is not None:
+                hidden_states = last_layer.hc_post(
+                    hidden_states, prev_residual, prev_post, prev_comb
+                )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
@@ -1102,6 +1153,9 @@ class DeepseekV4Model(nn.Module):
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
+
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -1162,6 +1216,19 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
+
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
         if get_global_server_args().disable_shared_experts_fusion:
@@ -1220,7 +1287,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

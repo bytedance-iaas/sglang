@@ -58,6 +58,12 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_dspark(self) -> bool:
+        return False
+
+    def is_dflash_family(self) -> bool:
+        return False
+
     def is_standalone(self) -> bool:
         return False
 
@@ -66,6 +72,16 @@ class CustomSpecAlgo:
 
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
+
+    def supports_target_verify_for_draft(self) -> bool:
+        return False
+
+    def supports_ragged_verify(self) -> bool:
+        return False
+
+    def has_draft_kv(self) -> bool:
+        # Conservative default: the larger KV reserve.
+        return True
 
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
@@ -79,7 +95,7 @@ _REGISTRY: Dict[str, CustomSpecAlgo] = {}
 
 # Builtin enum members + the NEXTN alias; plugins cannot shadow these.
 _RESERVED_NAMES = frozenset(
-    {"DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "NONE"}
+    {"DFLASH", "DSPARK", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "NONE"}
 )
 
 

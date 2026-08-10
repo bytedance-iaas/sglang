@@ -554,6 +554,10 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dspark_block_size: Optional[int] = None
+    speculative_dspark_sps_table_path: Optional[str] = None
+    speculative_dspark_confidence_sts_path: Optional[str] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -5446,7 +5450,7 @@ class ServerArgs:
             type=str,
             help=(
                 "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
-                "NGRAM, DFLASH. Or any name registered via "
+                "NGRAM, DFLASH, DSPARK. Or any name registered via "
                 "`SpeculativeAlgorithm.register`."
             ),
         )
@@ -5496,6 +5500,36 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-block-size",
+            type=int,
+            help=(
+                "DSPARK only. Draft block size gamma. The verify window is "
+                "gamma + 1. Omit to infer it from the bundled draft config."
+            ),
+            default=ServerArgs.speculative_dspark_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-sps-table-path",
+            type=str,
+            help="DSPARK only. Path to a pre-profiled SPS cost table.",
+            default=ServerArgs.speculative_dspark_sps_table_path,
+        )
+        parser.add_argument(
+            "--speculative-dspark-confidence-sts-path",
+            type=str,
+            help="DSPARK only. Optional confidence-head STS calibration file.",
+            default=ServerArgs.speculative_dspark_confidence_sts_path,
+        )
+        parser.add_argument(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier",
+            action="store_true",
+            help=(
+                "DSPARK compact ragged verify only. Fill verify lengths to the "
+                "captured CUDA graph tier."
+            ),
+            default=ServerArgs.speculative_dspark_align_verify_tokens_to_graph_tier,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
