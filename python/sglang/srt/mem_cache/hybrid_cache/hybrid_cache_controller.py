@@ -199,6 +199,8 @@ class HybridCacheController(BaseHiCacheController):
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
 
+        self.mtp_draft_device_pools = ()
+
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -207,6 +209,17 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
+
+    def set_mtp_draft_pools(self, device_pools) -> None:
+        """Register packed DSV4 draft SWA buffers for L2 load-back."""
+
+        pools = tuple(device_pools)
+        if len(pools) > self.layer_num:
+            raise ValueError(
+                "Packed DSpark draft SWA layers cannot exceed the local target "
+                f"layer count ({len(pools)} > {self.layer_num})."
+            )
+        self.mtp_draft_device_pools = pools
 
     def _start_storage_threads(self):
         super()._start_storage_threads()
@@ -485,6 +498,19 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                if i < len(self.mtp_draft_device_pools):
+                    # The packed draft SWA layer lives after every target SWA
+                    # layer in the same host-pool entry. Restoring it before
+                    # publishing target layer i's completion preserves the
+                    # existing per-layer wait contract without another ACK.
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        self.layer_num + i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                    )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,

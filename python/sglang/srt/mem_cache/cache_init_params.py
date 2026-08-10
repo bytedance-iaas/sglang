@@ -45,3 +45,7 @@ class CacheInitParams:
     cache_ttl_seconds: Optional[float] = None
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
+
+    # DSV4 bundled DSpark packs its final-stage draft SWA layers into the
+    # target SWA host pool. Empty on every non-final PP stage.
+    mtp_draft_device_pools: tuple[object, ...] = ()

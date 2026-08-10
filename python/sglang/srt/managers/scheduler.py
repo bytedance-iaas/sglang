@@ -429,6 +429,13 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        hicache_draft_plan = kv_cache_builder.prepare_dspark_hicache_draft_plan(
+            target_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
@@ -450,6 +457,7 @@ class Scheduler(
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             enable_eic_cache=self.enable_eic_cache,
+            hicache_draft_plan=hicache_draft_plan,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -484,16 +492,17 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            enable_overlap=self.enable_overlap,
-            page_size=self.page_size,
-        )
+        if not self.spec_algorithm.is_dspark():
+            # Keep the fork's existing EAGLE/DFLASH draft registration path.
+            kv_cache_builder.maybe_register_hicache_draft(
+                tree_cache=self.tree_cache,
+                draft_worker=self.draft_worker,
+                spec_algorithm=self.spec_algorithm,
+                server_args=self.server_args,
+                enable_hierarchical_cache=self.enable_hierarchical_cache,
+                enable_overlap=self.enable_overlap,
+                page_size=self.page_size,
+            )
 
         # Init running status
         self.init_running_status()
@@ -888,6 +897,17 @@ class Scheduler(
             attn_cp_rank=self.ps.attn_cp_rank,
             moe_dp_rank=self.ps.moe_dp_rank,
         )
+        if self.spec_algorithm.is_dspark():
+            # DSpark's PP implementation consumes the already-resolved
+            # ParallelState. Keep the fork's legacy kwargs for every other
+            # speculative worker.
+            draft_worker_kwargs = dict(
+                server_args=self.server_args,
+                gpu_id=self.ps.gpu_id,
+                ps=self.ps,
+                nccl_port=self.nccl_port,
+                target_worker=self.tp_worker,
+            )
 
         if self.server_args.speculative_draft_load_format is not None:
             self.server_args.load_format = (

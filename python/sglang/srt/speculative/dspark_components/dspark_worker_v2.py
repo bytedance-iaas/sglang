@@ -387,10 +387,24 @@ class DSparkWorkerV2(BaseSpecWorker):
     def is_lifecycle_only_pp_prefill_rank(self) -> bool:
         return self._is_lifecycle_only_pp_prefill_rank
 
+    @property
+    def target_worker(self) -> TpModelWorker:
+        return self._target_worker
+
+    @property
+    def draft_worker(self):
+        return self._draft_worker
+
+    @property
+    def primary_draft_kv_pool(self):
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return None
+        return self.draft_model_runner.token_to_kv_pool
+
     def _draft_model_runners(self) -> tuple:
         if self._is_lifecycle_only_pp_prefill_rank:
             return ()
-        return super()._draft_model_runners()
+        return (self.draft_model_runner,)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
