@@ -1176,8 +1176,20 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
-        assert N % 4 == 0 and G % 4 == 0
+    # Match upstream's trait-driven dispatch: the DSV4 JIT kernel is required
+    # only for activation semantics that the generic masked quantizer cannot
+    # express.  A plain SiLU path must remain usable even when the environment
+    # enables JIT activation globally; in particular, TP8 gives DSV4 only two
+    # FP8 scale groups per rank and does not satisfy the JIT kernel geometry.
+    if swiglu_limit is not None or swizzle:
+        assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get(), (
+            "swiglu_limit / swizzle require "
+            "SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        )
+        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
+            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
+            f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
+        )
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
@@ -1199,12 +1211,6 @@ def _varlen_deep_gemm_silu_mul_quant(
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        assert (
-            not swizzle
-        ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         down_input_scale = torch.empty(
             (E, N, G),
             device=hidden_states_device,

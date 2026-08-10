@@ -117,3 +117,38 @@ def test_standard_dispatch_auto_capture_without_budget_uses_compact(monkeypatch)
     )
     with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
         assert not _should_use_masked_standard_layout(**common)
+
+
+def test_plain_silu_uses_compatible_quantizer_when_jit_is_enabled(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        deep_gemm_runner,
+        "silu_and_mul_masked_post_quant",
+        lambda *args, **kwargs: pytest.fail(
+            "plain SiLU must not use the geometry-restricted DSV4 JIT kernel"
+        ),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.ep_moe.kernels."
+        "silu_and_mul_masked_post_quant_fwd",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    # D=256 and group_size=128 gives G=2, the TP8 DSV4 geometry that cannot
+    # satisfy the specialized JIT kernel's G % 4 requirement.
+    gateup = torch.empty((2, 4, 512), dtype=torch.bfloat16)
+    masked_m = torch.tensor([1, 1], dtype=torch.int32)
+    with envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.override(True):
+        output, output_scale = deep_gemm_runner._varlen_deep_gemm_silu_mul_quant(
+            gateup,
+            masked_m,
+            group_size=128,
+            topk=8,
+            swiglu_limit=None,
+            swizzle=False,
+        )
+
+    assert len(calls) == 1
+    assert output.shape == (2, 4, 256)
+    assert output_scale.shape == (2, 4, 2)
