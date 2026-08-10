@@ -1,6 +1,11 @@
 import random
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
@@ -46,6 +51,42 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
         self.assertIsNone(
             dp_global_verify_tier_num_tokens(global_tier_num_tokens=[100, -1, 50, 0])
         )
+
+
+class TestDsparkDpMoeMetadata(CustomTestCase):
+    def test_preserves_unscaled_and_non_padded_token_counts(self):
+        class _SpecInfo:
+            @staticmethod
+            def get_spec_adjusted_global_num_tokens(batch):
+                return [18, 12], [0, 0]
+
+        proposer = SimpleNamespace(
+            _dp_moe_sync=True,
+            _draft_block_spec_info=_SpecInfo(),
+            draft_model_runner=SimpleNamespace(device="cpu"),
+        )
+        forward_batch = SimpleNamespace(input_ids=torch.zeros(15, dtype=torch.int64))
+        batch = SimpleNamespace(
+            global_num_tokens=[3, 2],
+            global_num_tokens_for_logprob=[0, 0],
+            can_run_dp_cuda_graph=True,
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft."
+            "enable_num_token_non_padded",
+            return_value=True,
+        ):
+            DraftBlockProposer._fill_dp_moe_sync_metadata(
+                proposer, forward_batch, batch
+            )
+
+        self.assertEqual(forward_batch.original_global_num_tokens_cpu, [3, 2])
+        self.assertEqual(forward_batch.num_token_non_padded_cpu, 15)
+        self.assertEqual(forward_batch.num_token_non_padded.item(), 15)
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [18, 12])
+        self.assertEqual(forward_batch.global_num_tokens_for_logprob_cpu, [0, 0])
+        self.assertTrue(forward_batch.can_run_dp_cuda_graph)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

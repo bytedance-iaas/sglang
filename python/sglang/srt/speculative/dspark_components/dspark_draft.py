@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    enable_num_token_non_padded,
 )
 from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -418,6 +419,13 @@ class DraftBlockProposer:
             self._draft_block_spec_info.get_spec_adjusted_global_num_tokens(batch)
         )
         device = self.draft_model_runner.device
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        num_tokens = forward_batch.input_ids.numel()
+        if enable_num_token_non_padded():
+            forward_batch.num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=device
+            )
+        forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
