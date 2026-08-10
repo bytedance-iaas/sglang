@@ -895,20 +895,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
+        *,
         layer_id: int,
-        raw_loc: torch.Tensor,
         kv: torch.Tensor,
         kv_weight: torch.Tensor,
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        raw_loc: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
-        if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
-                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
-        else:
-            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if (raw_loc is None) == (swa_loc is None):
+            raise ValueError("Exactly one of raw_loc or swa_loc must be provided")
+        if swa_loc is None:
+            assert raw_loc is not None
+            if self._should_cache_swa:
+                if layer_id == self.start_layer or self.cached_loc is None:
+                    self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
+                swa_loc = self.cached_loc
+            else:
+                swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

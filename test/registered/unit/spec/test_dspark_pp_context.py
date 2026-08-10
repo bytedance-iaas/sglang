@@ -17,8 +17,13 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (  # noqa: E402
     DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
+from sglang.srt.models.deepseek_v4 import (  # noqa: E402
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+)
 from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
+    DSparkAttention,
+    DSparkV4Stage,
     DeepseekV4ForCausalLMDSpark,
     _BlockFp8LinearSlice,
 )
@@ -44,6 +49,14 @@ class _TupleLinear(torch.nn.Module):
         return self.linear(hidden_states), None
 
 
+class _AttentionWithoutDecodeTpHook(torch.nn.Module):
+    """The fork's CP1 attention contract has no CP-decode context hook."""
+
+    def forward(self, positions, hidden_states, forward_batch):
+        del positions, forward_batch
+        return hidden_states + 1
+
+
 def _make_deepseek_v4_dspark_projection_model(
     *, hidden_size: int, num_target_features: int
 ) -> DeepseekV4ForCausalLMDSpark:
@@ -65,6 +78,130 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_decoder_constructor_uses_overridable_attention_factory(self):
+        custom_attention = torch.nn.Identity()
+
+        class _DecoderWithCustomAttention(DeepseekV4DecoderLayer):
+            def _build_self_attn(self, **kwargs):
+                self.attention_factory_kwargs = kwargs
+                return custom_attention
+
+        config = SimpleNamespace(
+            hidden_size=8,
+            rms_norm_eps=1e-6,
+            hc_mult=2,
+            hc_sinkhorn_iters=1,
+            hc_eps=1e-6,
+        )
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.deepseek_v2.DeepseekV2MoE",
+                return_value=torch.nn.Identity(),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.is_nsa_enable_prefill_cp",
+                return_value=False,
+            ),
+        ):
+            layer = _DecoderWithCustomAttention(config=config, layer_id=3)
+
+        self.assertIs(layer.self_attn, custom_attention)
+        self.assertEqual(layer.attention_factory_kwargs["layer_id"], 3)
+
+    def test_dspark_stage_cp1_forward_does_not_require_cp_decode_tp_hook(self):
+        stage = DSparkV4Stage.__new__(DSparkV4Stage)
+        torch.nn.Module.__init__(stage)
+        stage.self_attn = _AttentionWithoutDecodeTpHook()
+        stage.input_layernorm = torch.nn.Identity()
+        stage.post_attention_layernorm = torch.nn.Identity()
+        stage.hc_attn_fn = None
+        stage.hc_attn_scale = None
+        stage.hc_attn_base = None
+        stage.hc_ffn_fn = None
+        stage.hc_ffn_scale = None
+        stage.hc_ffn_base = None
+        stage._hc_pre_block = Mock(side_effect=lambda x, *_: (x, None, None))
+        stage._hc_post_block = Mock(side_effect=lambda x, *_: x)
+        stage._run_ffn = Mock(side_effect=lambda x, _: x)
+
+        hidden_states = torch.zeros(2, 3)
+        actual = stage.forward(
+            positions=torch.arange(2),
+            hidden_states=hidden_states,
+            forward_batch=object(),
+        )
+
+        torch.testing.assert_close(actual, hidden_states + 1)
+
+    def test_dspark_stage_reuses_target_moe_dp_sync_helper(self):
+        self.assertIs(
+            DSparkV4Stage._run_moe_ffn_dp_sync,
+            DeepseekV4DecoderLayer._run_moe_ffn_dp_sync,
+        )
+
+    def test_swa_fused_write_accepts_target_and_dspark_locations(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._should_cache_swa = False
+        pool.translate_loc_from_full_to_swa = Mock(return_value="mapped-swa-loc")
+        pool._swa_local_layer_id = Mock(return_value=0)
+        pool.swa_kv_pool = SimpleNamespace(kv_buffer=["buffer"], page_size=256)
+        common = dict(
+            layer_id=0,
+            kv="kv",
+            kv_weight="weight",
+            eps=1e-6,
+            freqs_cis="freqs",
+            positions="positions",
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool."
+            "fused_k_norm_rope_flashmla"
+        ) as fused_write:
+            pool.set_swa_key_buffer_radix_fused_norm_rope(
+                raw_loc="full-loc", **common
+            )
+            self.assertEqual(fused_write.call_args.kwargs["out_loc"], "mapped-swa-loc")
+
+            pool.set_swa_key_buffer_radix_fused_norm_rope(
+                swa_loc="direct-swa-loc", **common
+            )
+            self.assertEqual(fused_write.call_args.kwargs["out_loc"], "direct-swa-loc")
+
+        pool.translate_loc_from_full_to_swa.assert_called_once_with("full-loc")
+
+        with self.assertRaisesRegex(ValueError, "Exactly one"):
+            pool.set_swa_key_buffer_radix_fused_norm_rope(**common)
+
+    def test_dspark_attention_uses_fork_full_to_swa_translation_contract(self):
+        attention = DSparkAttention.__new__(DSparkAttention)
+        torch.nn.Module.__init__(attention)
+        attention.layer_id = 7
+        attention.kv_norm = SimpleNamespace(
+            weight=SimpleNamespace(data="kv-weight")
+        )
+        attention.eps = 1e-6
+        attention.freqs_cis = "freqs"
+        pool = Mock()
+        forward_batch = SimpleNamespace(out_cache_loc="full-loc")
+
+        attention._store_block_kv(
+            kv="kv",
+            positions="positions",
+            forward_batch=forward_batch,
+            pool=pool,
+        )
+
+        pool.set_swa_key_buffer_radix_fused_norm_rope.assert_called_once_with(
+            layer_id=7,
+            raw_loc="full-loc",
+            kv="kv",
+            kv_weight="kv-weight",
+            eps=1e-6,
+            freqs_cis="freqs",
+            positions="positions",
+        )
+
     def test_dspark_pd_state_layer_ids_follow_pp_local_buffer_order(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool._stage_start = 10

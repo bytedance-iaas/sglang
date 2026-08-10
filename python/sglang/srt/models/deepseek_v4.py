@@ -833,7 +833,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
-        self.self_attn = MQALayer(
+        self.self_attn = self._build_self_attn(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -869,6 +869,25 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+
+    def _build_self_attn(
+        self,
+        *,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        alt_streams: Optional[List[torch.cuda.Stream]],
+        compress_ratio_override: Optional[int],
+    ) -> nn.Module:
+        return MQALayer(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            alt_streams=alt_streams,
+            compress_ratio_override=compress_ratio_override,
+        )
 
     def hc_pre(
         self,
@@ -1043,6 +1062,30 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
+        hidden_states = self._run_moe_ffn_dp_sync(
+            hidden_states,
+            forward_batch,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+        )
+
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+
+        return hidden_states
+
+    def _run_moe_ffn_dp_sync(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        input_ids: Optional[torch.Tensor],
+        input_ids_global: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the fork's existing MoE/DP synchronization around the FFN.
+
+        Kept as a shared helper so the target and bundled DSpark decoder layers
+        use exactly the same attention-DP gather/scatter contract.
+        """
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -1107,9 +1150,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
-
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-
         return hidden_states
 
 

@@ -213,12 +213,11 @@ class DSparkAttention(MqaAttentionBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
         pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
-            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            raw_loc=forward_batch.out_cache_loc,
             kv=kv,
             kv_weight=self.kv_norm.weight.data,
             eps=self.eps,
@@ -285,7 +284,6 @@ class DSparkAttention(MqaAttentionBase):
                     kv=kv,
                     positions=positions,
                     forward_batch=forward_batch,
-                    attn_backend=attn_backend,
                     pool=pool,
                 )
             q = self._compute_q(hidden_states, positions, q_out=q_out)
@@ -296,7 +294,6 @@ class DSparkAttention(MqaAttentionBase):
                 kv=kv,
                 positions=positions,
                 forward_batch=forward_batch,
-                attn_backend=attn_backend,
                 pool=pool,
             )
             q = self._compute_q(hidden_states, positions, q_out=q_out)
@@ -609,8 +606,10 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.input_layernorm(x)
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
+        # This fork intentionally limits bundled DSpark to attn_cp_size == 1.
+        # The upstream CP-decode attention-TP context is therefore a no-op for
+        # every supported DSpark configuration and is not part of this backport.
+        x = self.self_attn(positions, x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
 
         residual = x
