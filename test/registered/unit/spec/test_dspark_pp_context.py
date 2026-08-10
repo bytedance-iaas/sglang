@@ -334,6 +334,7 @@ class TestDSparkPPContext(CustomTestCase):
                 draft_worker=worker,
                 spec_algorithm=spec_algorithm,
                 server_args=SimpleNamespace(enable_multi_layer_eagle=False),
+                enable_overlap=False,
             )
         )
 

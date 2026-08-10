@@ -536,6 +536,128 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def build_transfer_entry_pairs(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+    allow_positional_fallback: bool = False,
+) -> List[Tuple[int, int]]:
+    """Pair PP-local transfer entries with decode entries by stable layer id."""
+    if n_src == 0:
+        return []
+    if bool(src_layer_ids) != bool(dst_layer_ids):
+        if not allow_positional_fallback:
+            raise RuntimeError(
+                "Layer metadata must be provided by both PD peers or neither"
+            )
+        src_layer_ids = []
+        dst_layer_ids = []
+    if src_layer_ids:
+        if len(src_layer_ids) != n_src or len(dst_layer_ids) != n_dst:
+            raise RuntimeError(
+                "Layer metadata length must match transfer entries: "
+                f"src metadata={len(src_layer_ids)} entries={n_src}, "
+                f"dst metadata={len(dst_layer_ids)} entries={n_dst}"
+            )
+        dst_positions = {}
+        for dst_index, layer_id in enumerate(dst_layer_ids):
+            dst_positions.setdefault(layer_id, deque()).append(dst_index)
+        pairs = []
+        for src_index, layer_id in enumerate(src_layer_ids):
+            if not dst_positions.get(layer_id):
+                raise RuntimeError(
+                    "Decode peer is missing a transfer entry for model layer "
+                    f"{layer_id}"
+                )
+            pairs.append((src_index, dst_positions[layer_id].popleft()))
+        return pairs
+    if n_dst < n_src or (n_src != n_dst and not allow_positional_fallback):
+        raise RuntimeError(
+            "PP-heterogeneous transfer requires layer ids on both peers; "
+            f"got src={n_src} dst={n_dst} entries"
+        )
+    return [(index, index) for index in range(n_src)]
+
+
+_DRAFT_KV_LAYER_ID_BASE = 1_000_000
+
+
+def get_transfer_kv_layer_ids(kv_pool, num_entries: int) -> List[int]:
+    """Return global layer ids aligned with get_contiguous_buf_infos()."""
+    if kv_pool is None or num_entries <= 0:
+        return []
+    if hasattr(kv_pool, "get_kv_layer_ids"):
+        layer_ids = list(kv_pool.get_kv_layer_ids())
+        if len(layer_ids) == num_entries:
+            return layer_ids
+    start_layer = int(getattr(kv_pool, "start_layer", 0) or 0)
+    end_layer = getattr(kv_pool, "end_layer", None)
+    if end_layer is not None:
+        layer_ids = list(range(start_layer, int(end_layer)))
+        if len(layer_ids) == num_entries:
+            return layer_ids
+        if len(layer_ids) * 2 == num_entries:
+            return layer_ids * 2
+    return []
+
+
+def get_transfer_draft_kv_layer_ids(num_entries: int) -> List[int]:
+    if num_entries <= 0:
+        return []
+    return [_DRAFT_KV_LAYER_ID_BASE + index for index in range(num_entries)]
+
+
+def pack_state_types(state_types) -> bytes:
+    return ",".join(
+        state_type.value if hasattr(state_type, "value") else str(state_type)
+        for state_type in (state_types or [])
+    ).encode("ascii")
+
+
+def unpack_state_types(data: bytes):
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if not data:
+        return []
+    return [StateType(value) for value in data.decode("ascii").split(",") if value]
+
+
+def resolve_state_component_dst_index(
+    src_state_types, dst_state_types, src_index: int
+) -> int:
+    """Match state components by ``(StateType, occurrence)``.
+
+    Registrations from older peers omit state types and retain positional
+    behavior for wire compatibility.
+    """
+    if not dst_state_types:
+        return src_index
+    if not src_state_types:
+        raise RuntimeError(
+            "Destination state_types are present but source state_types are empty."
+        )
+    if src_index >= len(src_state_types):
+        raise RuntimeError(
+            f"Source state component index {src_index} exceeds "
+            f"state_types length {len(src_state_types)}."
+        )
+    state_type = src_state_types[src_index]
+    occurrence = sum(
+        item == state_type for item in src_state_types[: src_index + 1]
+    )
+    seen = 0
+    for dst_index, dst_state_type in enumerate(dst_state_types):
+        if dst_state_type == state_type:
+            seen += 1
+            if seen == occurrence:
+                return dst_index
+    raise RuntimeError(
+        f"Decode peer is missing state component {state_type!s} "
+        f"occurrence {occurrence}."
+    )
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -543,6 +665,7 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    layer_ids: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -551,6 +674,7 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_layer_ids.append(layer_ids or [])
 
 
 def setup_state_kv_args(
@@ -567,6 +691,7 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 
     kv_args.state_types = []
@@ -574,6 +699,7 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_layer_ids = []
 
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
@@ -614,6 +740,55 @@ def setup_state_kv_args(
                 append_state_component(
                     kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
                 )
+
+    # Bundled DSV4 DSpark stores draft KV in a SWA-only DSV4 pool that shares
+    # the target allocator and Full -> SWA mapping. Keep it as a second SWA
+    # component so heterogeneous target state cannot shift the draft payload.
+    if (
+        not is_npu()
+        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    ):
+        if not draft_token_to_kv_pool.compression_ratios or not all(
+            ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
+        ):
+            raise RuntimeError(
+                "DSV4 DSpark draft state transfer expects SWA-only draft layers"
+            )
+        if (
+            token_to_kv_pool.full_to_swa_index_mapping
+            is not draft_token_to_kv_pool.full_to_swa_index_mapping
+        ):
+            raise RuntimeError(
+                "DSV4 target and DSpark draft pools must share the SWA index mapping"
+            )
+        target_geometry = (
+            token_to_kv_pool.page_size,
+            token_to_kv_pool.swa_page_size,
+            token_to_kv_pool.swa_window_size,
+        )
+        draft_geometry = (
+            draft_token_to_kv_pool.page_size,
+            draft_token_to_kv_pool.swa_page_size,
+            draft_token_to_kv_pool.swa_window_size,
+        )
+        if target_geometry != draft_geometry:
+            raise RuntimeError(
+                "DSV4 target and DSpark draft pools must share paged SWA "
+                f"geometry: target={target_geometry}, draft={draft_geometry}"
+            )
+        draft_ptrs, draft_lens, draft_item_lens = (
+            draft_token_to_kv_pool.get_state_buf_infos()
+        )
+        if draft_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.SWA,
+                draft_ptrs,
+                draft_lens,
+                draft_item_lens,
+                layer_ids=get_transfer_draft_kv_layer_ids(len(draft_ptrs)),
+            )
 
     if (
         StateType.MAMBA not in kv_args.state_types

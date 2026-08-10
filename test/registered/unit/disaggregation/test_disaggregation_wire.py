@@ -2,11 +2,17 @@ import unittest
 
 import numpy as np
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     pack_list_of_buffers,
     unpack_int_lists,
     unpack_list_of_buffers,
+)
+from sglang.srt.disaggregation.utils import (
+    pack_state_types,
+    resolve_state_component_dst_index,
+    unpack_state_types,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -43,6 +49,23 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+    def test_state_component_matching_uses_type_occurrence(self):
+        src_state_types = [StateType.SWA, StateType.SWA]
+        dst_state_types = [StateType.SWA, StateType.MAMBA, StateType.SWA]
+
+        self.assertEqual(
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 0),
+            0,
+        )
+        self.assertEqual(
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 1),
+            2,
+        )
+
+    def test_state_types_roundtrip(self):
+        state_types = [StateType.SWA, StateType.MAMBA, StateType.SWA]
+        self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
 
 
 if __name__ == "__main__":

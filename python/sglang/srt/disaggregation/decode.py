@@ -44,6 +44,8 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_transfer_draft_kv_layer_ids,
+    get_transfer_kv_layer_ids,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce,
@@ -504,12 +506,16 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+        kv_layer_ids = get_transfer_kv_layer_ids(
+            self.token_to_kv_pool, len(kv_data_ptrs)
+        )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            kv_layer_ids += get_transfer_draft_kv_layer_ids(len(draft_kv_data_ptrs))
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -517,6 +523,9 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        )
         # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size

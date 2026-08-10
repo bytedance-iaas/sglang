@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -36,6 +36,8 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_transfer_draft_kv_layer_ids,
+    get_transfer_kv_layer_ids,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -147,13 +149,23 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_layer_ids = get_transfer_kv_layer_ids(
+            self.token_to_kv_pool, len(kv_data_ptrs)
+        )
 
-        if self.draft_token_to_kv_pool is not None:
+        transfer_draft_cache = (
+            self.pp_size <= 1 or self.pp_rank == self.pp_size - 1
+        )
+        draft_pool_for_transfer = (
+            self.draft_token_to_kv_pool if transfer_draft_cache else None
+        )
+        if draft_pool_for_transfer is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_pool_for_transfer.get_contiguous_buf_infos()
             )
+            kv_layer_ids += get_transfer_draft_kv_layer_ids(len(draft_kv_data_ptrs))
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -161,6 +173,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -178,7 +193,7 @@ class PrefillBootstrapQueue:
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
+            draft_pool_for_transfer,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
@@ -261,6 +276,8 @@ class PrefillBootstrapQueue:
         self,
         return_failed_reqs: bool = False,
         rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> List[Req]:
         """
         pop the reqs which has finished bootstrapping
@@ -279,6 +296,14 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
+        is_pp_consensus = pp_good_rids is not None or pp_bad_rids is not None
+        if is_pp_consensus and (pp_good_rids is None or pp_bad_rids is None):
+            raise ValueError("Both PP good and bad request ids are required")
+        if is_pp_consensus and rids_to_check is not None:
+            raise ValueError("rids_to_check cannot be combined with PP consensus")
+        pp_good_set = set(pp_good_rids or [])
+        pp_bad_set = set(pp_bad_rids or [])
+
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
@@ -286,6 +311,16 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+            if is_pp_consensus:
+                if req.rid not in pp_good_set and req.rid not in pp_bad_set:
+                    continue
+                if req.rid in pp_bad_set and poll != KVPoll.Failed:
+                    prepare_abort(
+                        req,
+                        "Prefill bootstrap failed on another PP rank",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    poll = KVPoll.Failed
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
@@ -348,6 +383,43 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs
         else:
             return bootstrapped_reqs, failed_reqs
+
+    def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
+        """Probe ordered PP candidates without reserving metadata credit."""
+        good_rids: List[str] = []
+        failed_rids: List[str] = []
+        if not self.queue:
+            return good_rids, failed_rids
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+        metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
+        admission_blocked = False
+
+        for req, poll in zip(self.queue, polls):
+            if poll == KVPoll.Failed:
+                failed_rids.append(req.rid)
+            elif poll == KVPoll.WaitingForInput:
+                if admission_blocked:
+                    continue
+                metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+                if metadata_cost > metadata_credits:
+                    admission_blocked = True
+                    continue
+                metadata_credits -= metadata_cost
+                good_rids.append(req.rid)
+            elif poll == KVPoll.Bootstrapping:
+                continue
+            else:
+                raise RuntimeError(
+                    f"Unexpected poll state {poll} for req {req.rid} in "
+                    "get_ready_bootstrapped_rids_for_pp"
+                )
+
+        return good_rids, failed_rids
 
 
 class SchedulerDisaggregationPrefillMixin:
@@ -590,16 +662,19 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler,
+        transfer_status: Optional[Tuple[List[str], List[str]]] = None,
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        transfer_status: In PP mode, globally successful and failed request ids.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
         done_reqs = []
+        success_rids = set(transfer_status[0]) if transfer_status is not None else set()
+        failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -610,24 +685,47 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if transfer_status is not None:
+                consensus_failed = req.rid in failed_rids
+                if consensus_failed:
+                    if not isinstance(req.finished_reason, FINISH_ABORT):
+                        prepare_abort(
+                            req,
+                            "Prefill transfer failed on another PP rank; "
+                            "waiting for the local transfer to stop",
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    if poll not in (KVPoll.Success, KVPoll.Failed):
+                        undone_reqs.append(req)
+                        continue
 
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
+                    if poll == KVPoll.Failed:
+                        try:
+                            req.disagg_kv_sender.failure_exception()
+                        except Exception as exc:
+                            logger.warning(
+                                "Prefill transfer failed for request rank=%s "
+                                "rid=%s after PP consensus: %s",
+                                self.ps.tp_rank,
+                                req.rid,
+                                exc,
+                            )
+                    release_kv_cache(req, self.tree_cache)
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.increment_transfer_failed_reqs()
+                    continue
+
+                if req.rid not in success_rids:
                     undone_reqs.append(req)
                     continue
 
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
                 if poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
-                    logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
-                    )
                     undone_reqs.append(req)
                     continue
 
@@ -701,7 +799,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
-    def get_transferred_rids(self: Scheduler) -> List[str]:
+    def get_transferred_rids(
+        self: Scheduler,
+    ) -> Tuple[List[str], List[str]]:
         """
         Used by PP, get the transferred rids but **do not pop**
         """
@@ -711,13 +811,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
-        transferred_rids: List[str] = []
+        success_rids: List[str] = []
+        failed_rids: List[str] = []
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
-                transferred_rids.append(req.rid)
+            if poll == KVPoll.Success:
+                success_rids.append(req.rid)
+            elif poll == KVPoll.Failed:
+                failed_rids.append(req.rid)
 
-        return transferred_rids
+        return success_rids, failed_rids
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
