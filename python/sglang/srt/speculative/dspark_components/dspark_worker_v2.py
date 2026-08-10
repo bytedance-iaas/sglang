@@ -12,6 +12,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     compute_position,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
@@ -64,6 +65,106 @@ def _is_context_only_pp_prefill_rank(
     *, disaggregation_mode: str, pp_rank: int, pp_size: int
 ) -> bool:
     return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
+
+
+def _dspark_decode_contract_details(
+    *,
+    batch: ScheduleBatch,
+    draft_input: Optional[DFlashDraftInputV2],
+    dp_rank: Optional[int],
+    tp_rank: int,
+) -> str:
+    def shape(value) -> object:
+        return None if value is None else tuple(value.shape)
+
+    seq_lens = getattr(batch, "seq_lens", None)
+    local_bs = int(seq_lens.numel()) if seq_lens is not None else -1
+    return (
+        f"dp_rank={dp_rank}, tp_rank={tp_rank}, "
+        f"forward_mode={getattr(batch, 'forward_mode', None)}, "
+        f"local_bs={local_bs}, "
+        f"bonus_tokens_shape={shape(getattr(draft_input, 'bonus_tokens', None))}, "
+        f"new_seq_lens_shape={shape(getattr(draft_input, 'new_seq_lens', None))}, "
+        f"seq_lens_shape={shape(seq_lens)}, "
+        f"req_pool_indices_shape={shape(getattr(batch, 'req_pool_indices', None))}, "
+        f"out_cache_loc_shape={shape(getattr(batch, 'out_cache_loc', None))}, "
+        f"global_num_tokens={getattr(batch, 'global_num_tokens', None)}, "
+        f"global_num_tokens_for_logprob="
+        f"{getattr(batch, 'global_num_tokens_for_logprob', None)}"
+    )
+
+
+def validate_dspark_decode_input(
+    *,
+    batch: ScheduleBatch,
+    draft_input: DFlashDraftInputV2,
+    dp_rank: Optional[int],
+    tp_rank: int,
+    enable_dp_attention: bool,
+) -> None:
+    """Validate active/idle DSpark state before proposal or DP collectives."""
+
+    details = _dspark_decode_contract_details(
+        batch=batch,
+        draft_input=draft_input,
+        dp_rank=dp_rank,
+        tp_rank=tp_rank,
+    )
+
+    def fail(reason: str) -> None:
+        raise RuntimeError(f"Invalid DSpark decode contract ({reason}): {details}")
+
+    if not isinstance(draft_input, DFlashDraftInputV2):
+        fail(f"unexpected spec_info type {type(draft_input).__name__}")
+
+    if batch.forward_mode.is_idle():
+        allowed_local_bs = 0
+    elif batch.forward_mode in (ForwardMode.DECODE, ForwardMode.PREBUILT):
+        allowed_local_bs = None
+    else:
+        fail("unsupported forward mode")
+
+    seq_lens = batch.seq_lens
+    local_bs = int(seq_lens.numel())
+    if allowed_local_bs == 0 and local_bs != 0:
+        fail("idle batch contains local requests")
+    if allowed_local_bs is None and local_bs <= 0:
+        fail("active batch has no local requests")
+
+    expected_shape = (local_bs,)
+    tensor_contracts = (
+        ("bonus_tokens", draft_input.bonus_tokens, torch.int64),
+        ("new_seq_lens", draft_input.new_seq_lens, torch.int64),
+        ("seq_lens", seq_lens, torch.int64),
+        ("req_pool_indices", batch.req_pool_indices, torch.int64),
+    )
+    for name, tensor, expected_dtype in tensor_contracts:
+        if tensor is None:
+            fail(f"{name} is None")
+        if tuple(tensor.shape) != expected_shape:
+            fail(f"{name} shape must be {expected_shape}")
+        if tensor.dtype != expected_dtype:
+            fail(f"{name} dtype must be {expected_dtype}")
+        if tensor.device != seq_lens.device:
+            fail(f"{name} must be on {seq_lens.device}")
+
+    out_cache_loc = batch.out_cache_loc
+    if out_cache_loc is None:
+        fail("out_cache_loc is None")
+    if out_cache_loc.ndim != 1 or out_cache_loc.dtype != torch.int64:
+        fail("out_cache_loc must be a one-dimensional int64 tensor")
+    if out_cache_loc.device != seq_lens.device:
+        fail(f"out_cache_loc must be on {seq_lens.device}")
+
+    if enable_dp_attention:
+        global_num_tokens = batch.global_num_tokens
+        global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+        if not global_num_tokens:
+            fail("missing global_num_tokens for DP attention")
+        if global_num_tokens_for_logprob is None:
+            fail("missing global_num_tokens_for_logprob for DP attention")
+        if len(global_num_tokens) != len(global_num_tokens_for_logprob):
+            fail("global token metadata lengths differ")
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -879,12 +980,26 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "decoding in this backport."
             )
         if batch.spec_info is None:
+            if not batch.forward_mode.is_idle():
+                details = _dspark_decode_contract_details(
+                    batch=batch,
+                    draft_input=None,
+                    dp_rank=self.ps.dp_rank,
+                    tp_rank=self.ps.tp_rank,
+                )
+                raise RuntimeError(
+                    "Invalid DSpark decode contract (active batch has "
+                    f"spec_info=None): {details}"
+                )
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
-            raise RuntimeError(
-                "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
-            )
+        validate_dspark_decode_input(
+            batch=batch,
+            draft_input=draft_input,
+            dp_rank=self.ps.dp_rank,
+            tp_rank=self.ps.tp_rank,
+            enable_dp_attention=self.server_args.enable_dp_attention,
+        )
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
@@ -915,6 +1030,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
+        expected_verify_tokens = bs * self.verify_num_draft_tokens
+        if verify_window.verify_cache_loc.numel() != expected_verify_tokens:
+            raise RuntimeError(
+                "Invalid DSpark verify window: "
+                f"dp_rank={self.ps.dp_rank}, tp_rank={self.ps.tp_rank}, "
+                f"forward_mode={batch.forward_mode}, local_bs={bs}, "
+                f"expected_out_cache_loc={expected_verify_tokens}, "
+                f"out_cache_loc_shape="
+                f"{tuple(verify_window.verify_cache_loc.shape)}"
+            )
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):

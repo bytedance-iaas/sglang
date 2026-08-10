@@ -277,6 +277,74 @@ class DFlashVerifyInput(SpecInput):
         ``skip_attn_backend_init=True``.
         """
 
+        local_bs = int(batch.seq_lens.numel())
+        dp_rank = getattr(target_worker, "dp_rank", None)
+        tp_rank = getattr(target_worker, "tp_rank", None)
+
+        def shape(value) -> object:
+            return None if value is None else tuple(value.shape)
+
+        details = (
+            f"dp_rank={dp_rank}, tp_rank={tp_rank}, "
+            f"forward_mode={batch.forward_mode}, local_bs={local_bs}, "
+            f"draft_token_shape={shape(self.draft_token)}, "
+            f"seq_lens_shape={shape(batch.seq_lens)}, "
+            f"req_pool_indices_shape={shape(batch.req_pool_indices)}, "
+            f"out_cache_loc_shape={shape(batch.out_cache_loc)}, "
+            f"global_num_tokens={batch.global_num_tokens}, "
+            f"global_num_tokens_for_logprob="
+            f"{batch.global_num_tokens_for_logprob}"
+        )
+
+        def fail(reason: str) -> None:
+            raise RuntimeError(
+                f"Invalid DSpark target-verify contract ({reason}): {details}"
+            )
+
+        if not (
+            batch.forward_mode.is_idle()
+            or batch.forward_mode
+            in (ForwardMode.DECODE, ForwardMode.PREBUILT, ForwardMode.TARGET_VERIFY)
+        ):
+            fail("unsupported forward mode")
+        if batch.req_pool_indices is None or tuple(batch.req_pool_indices.shape) != (
+            local_bs,
+        ):
+            fail("req_pool_indices shape does not match local_bs")
+        if batch.req_pool_indices.dtype != torch.int64:
+            fail("req_pool_indices dtype must be int64")
+        if batch.out_cache_loc is None:
+            fail("out_cache_loc is None")
+        if self.draft_token.ndim != 1 or batch.out_cache_loc.ndim != 1:
+            fail("draft_token and out_cache_loc must be one-dimensional")
+        if self.draft_token.numel() != batch.out_cache_loc.numel():
+            fail("draft_token and out_cache_loc lengths differ")
+        if self.draft_token.dtype != torch.int64:
+            fail("draft_token dtype must be int64")
+        if batch.out_cache_loc.dtype != torch.int64:
+            fail("out_cache_loc dtype must be int64")
+        if not (
+            self.draft_token.device
+            == batch.out_cache_loc.device
+            == batch.seq_lens.device
+            == batch.req_pool_indices.device
+        ):
+            fail("verify tensors are on different devices")
+        if self.ragged_verify_layout is None:
+            expected_tokens = local_bs * int(self.draft_token_num)
+            if self.draft_token.numel() != expected_tokens:
+                fail(f"static verify requires {expected_tokens} tokens")
+
+        if target_worker.model_runner.server_args.enable_dp_attention:
+            if not batch.global_num_tokens:
+                fail("missing global_num_tokens for DP attention")
+            if batch.global_num_tokens_for_logprob is None:
+                fail("missing global_num_tokens_for_logprob for DP attention")
+            if len(batch.global_num_tokens) != len(
+                batch.global_num_tokens_for_logprob
+            ):
+                fail("global token metadata lengths differ")
+
         batch.input_ids = self.draft_token
         batch.spec_info = self
         batch.forward_mode = (
@@ -285,6 +353,7 @@ class DFlashVerifyInput(SpecInput):
             else ForwardMode.TARGET_VERIFY
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
+        batch.return_hidden_states_before_norm = False
         verify_forward_batch = ForwardBatch.init_new(
             batch, target_worker.model_runner
         )
