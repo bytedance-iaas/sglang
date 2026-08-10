@@ -1171,6 +1171,7 @@ class CudaGraphRunner:
                 self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
                 and "input_embeds" in inspect.signature(forward).parameters
+                and not hasattr(self.model_runner.model, "forward_embed")
             ):
                 kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
 
