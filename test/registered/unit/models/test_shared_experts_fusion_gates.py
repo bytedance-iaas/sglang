@@ -118,6 +118,20 @@ class TestDeepseekV2Gate(_FusionGateCase):
         )
 
 
+class TestDeepseekV4DSparkGate(_FusionGateCase):
+    def test_dspark_draft_cannot_fuse_shared_experts(self):
+        from sglang.srt.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        self._seed(enforce_shared_experts_fusion=True)
+        reason = self._reason(
+            DeepseekV4ForCausalLMDSpark,
+            SimpleNamespace(n_shared_experts=1),
+        )
+        self.assertIn("DSpark draft requires separate shared experts", reason)
+
+
 class TestGlmMoeLiteGate(_FusionGateCase):
     def _config(self, **kw):
         base = dict(architectures=["Glm4MoeLiteForCausalLM"], n_shared_experts=1)
