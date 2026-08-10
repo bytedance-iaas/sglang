@@ -9,6 +9,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.model_executor.model_runner import (  # noqa: E402
     _assert_pp_mtp_compat,
     _compute_model_num_layers,
+    _resolve_dspark_draft_num_layers,
 )
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -24,6 +25,24 @@ def _model_config(*, num_nextn_predict_layers=1):
 
 
 class TestModelRunnerLayerSetup(CustomTestCase):
+    def test_dspark_stage_count_matches_explicit_target_layers(self):
+        self.assertEqual(
+            _resolve_dspark_draft_num_layers(
+                draft_hf_config=SimpleNamespace(num_nextn_predict_layers=1),
+                target_layer_ids=[10, 20, 30],
+            ),
+            3,
+        )
+
+    def test_dspark_stage_count_falls_back_to_checkpoint_mtp_count(self):
+        self.assertEqual(
+            _resolve_dspark_draft_num_layers(
+                draft_hf_config=SimpleNamespace(num_nextn_predict_layers=2),
+                target_layer_ids=None,
+            ),
+            2,
+        )
+
     def test_multistage_dspark_uses_loaded_model_stage_count(self):
         self.assertEqual(
             _compute_model_num_layers(

@@ -291,6 +291,24 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+def _resolve_dspark_draft_num_layers(
+    *, draft_hf_config: Any, target_layer_ids: Optional[list[int]]
+) -> int:
+    """Match the stage count constructed by DeepseekV4ForCausalLMDSpark."""
+
+    if target_layer_ids is not None:
+        num_layers = len(target_layer_ids)
+    else:
+        num_layers = int(
+            getattr(draft_hf_config, "num_nextn_predict_layers", 1) or 1
+        )
+    if num_layers <= 0:
+        raise ValueError(
+            f"DSpark draft stage count must be positive, got {num_layers}."
+        )
+    return num_layers
+
+
 def _compute_model_num_layers(
     *, model: Any, model_config: ModelConfig, is_draft_worker: bool
 ) -> int:
@@ -461,6 +479,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dspark_use_aux_hidden_state = False
         self.dspark_target_layer_ids = None
         self.dspark_draft_num_layers = None
+        self.dspark_draft_cell_size_per_token = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -550,7 +569,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dspark_config = parse_dspark_draft_config(
                 draft_hf_config=draft_model_config.hf_config
             )
-            draft_num_layers = dflash_config.require_num_layers()
+            draft_num_layers = _resolve_dspark_draft_num_layers(
+                draft_hf_config=draft_model_config.hf_config,
+                target_layer_ids=dspark_config.target_layer_ids,
+            )
             target_num_layers = int(
                 getattr(self.model_config.hf_text_config, "num_hidden_layers")
             )
@@ -567,6 +589,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.dspark_use_aux_hidden_state = True
             self.dspark_target_layer_ids = target_layer_ids
             self.dspark_draft_num_layers = int(draft_num_layers)
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                get_dsv4_kv_bytes_per_token,
+            )
+
+            self.dspark_draft_cell_size_per_token = get_dsv4_kv_bytes_per_token(
+                qk_nope_head_dim=draft_model_config.qk_nope_head_dim,
+                qk_rope_head_dim=draft_model_config.qk_rope_head_dim,
+            )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:

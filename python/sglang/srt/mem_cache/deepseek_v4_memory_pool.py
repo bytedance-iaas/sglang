@@ -27,6 +27,22 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_kv_bytes_per_token(
+    *, qk_nope_head_dim: int, qk_rope_head_dim: int
+) -> int:
+    """Bytes/token in the packed DSV4 SWA/compressed KV page layout."""
+
+    rope_storage_bytes = torch.bfloat16.itemsize
+    quantize_block_size = 64
+    scale_pad = 1
+    return (
+        int(qk_nope_head_dim)
+        + int(qk_rope_head_dim) * rope_storage_bytes
+        + int(qk_nope_head_dim) // quantize_block_size
+        + scale_pad
+    )
+
+
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
@@ -103,13 +119,10 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
-        dim_per_token = (
-            self.qk_nope_head_dim
-            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
-            + self.qk_nope_head_dim // self.quantize_block_size
-            + self.scale_pad
+        return get_dsv4_kv_bytes_per_token(
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
