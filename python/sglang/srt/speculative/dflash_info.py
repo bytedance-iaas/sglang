@@ -14,7 +14,11 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -147,6 +151,7 @@ class DFlashDraftInput(SpecInput):
 
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -256,6 +261,48 @@ class DFlashVerifyInput(SpecInput):
             if mask_chunks
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
+
+    def prepare_for_dspark_verify(
+        self,
+        batch: ScheduleBatch,
+        target_worker: TpModelWorker,
+    ) -> tuple[ForwardBatch, bool]:
+        """Package a DSpark target verify with the fork's graph interfaces.
+
+        DSpark reserves and publishes ``batch.out_cache_loc`` before reaching
+        this adapter.  Unlike the legacy DFLASH helper above, this method must
+        not allocate cache slots or rewrite the request mapping.  It only
+        builds the ForwardBatch and prepares either graph replay or eager
+        attention metadata so the caller can forward with
+        ``skip_attn_backend_init=True``.
+        """
+
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(
+            batch, target_worker.model_runner
+        )
+
+        graph_runner = target_worker.model_runner.graph_runner
+        can_run_cuda_graph = bool(
+            verify_forward_batch.forward_mode.is_cuda_graph()
+            and graph_runner
+            and graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            graph_runner.replay_prepare(verify_forward_batch)
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+
+        return verify_forward_batch, can_run_cuda_graph
 
     def generate_attn_arg_prefill(
         self,

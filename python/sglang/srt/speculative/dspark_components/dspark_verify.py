@@ -198,7 +198,7 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        verify_forward_batch, _ = verify_input.prepare_for_dspark_verify(
             batch, self.target_worker
         )
         self.target_worker.forward_batch_generation(
@@ -263,7 +263,7 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        verify_forward_batch, _ = verify_input.prepare_for_dspark_verify(
             batch, self.target_worker
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
