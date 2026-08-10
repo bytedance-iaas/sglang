@@ -571,6 +571,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The DSpark loader maps routed experts only. A fused shared expert
+        # would allocate an extra MoE slot without loading its weights.
+        return "DeepSeek-V4 DSpark draft requires separate shared experts."
+
     def __init__(
         self,
         config: DeepSeekV4Config,

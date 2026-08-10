@@ -98,14 +98,26 @@ class TestFusionDecisionFlag(CustomTestCase):
         # The draft's decision stays inspectable on the twin leaf.
         self.assertTrue(get_flags().moe.speculative_disable_shared_experts_fusion)
 
-    def test_a_gateless_draft_inherits_the_active_decision(self):
+    def test_a_gateless_draft_follows_the_config_intent(self):
         self._seed(disable_shared_experts_fusion=False)
         _install(_AlwaysDisables)  # the target's build
         with draft_model_build_scope():
-            # A draft whose family has no gate follows the intent, which is what
-            # the target's own build already resolved to here.
+            _install(_NoGate)
+            self.assertFalse(is_shared_experts_fusion_disabled())
+        self.assertTrue(is_shared_experts_fusion_disabled())
+
+    def test_dspark_draft_keeps_shared_experts_separate(self):
+        from sglang.srt.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        self._seed(disable_shared_experts_fusion=False)
+        _install(_AlwaysDisables)  # DeepSeek-V4 target's build
+        with draft_model_build_scope():
+            _install(DeepseekV4ForCausalLMDSpark)
             self.assertTrue(is_shared_experts_fusion_disabled())
         self.assertTrue(is_shared_experts_fusion_disabled())
+        self.assertTrue(get_flags().moe.speculative_disable_shared_experts_fusion)
 
     def test_post_build_scopes_do_not_clobber_the_draft_leaf(self):
         # init_attention_backends / cuda-graph capture / draft forwards enter
