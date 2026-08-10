@@ -291,6 +291,48 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+def _compute_model_num_layers(
+    *, model: Any, model_config: ModelConfig, is_draft_worker: bool
+) -> int:
+    """Resolve the logical layer count used by PP and KV-pool setup.
+
+    Multi-stage draft models such as bundled DeepSeek-V4 DSpark expose their
+    actual stage count on the loaded model. The target checkpoint's
+    ``num_nextn_predict_layers`` only indicates that an MTP/draft model exists;
+    it is not necessarily the number of stages in that draft model.
+    """
+    num_nextn_predict_layers = model_config.num_nextn_predict_layers
+    model_has_mtp_layers = (
+        num_nextn_predict_layers is not None and num_nextn_predict_layers > 0
+    )
+    model_num_layers = (
+        getattr(model, "num_stages", num_nextn_predict_layers)
+        if is_draft_worker and model_has_mtp_layers
+        else max(
+            model_config.num_hidden_layers,
+            model_config.num_attention_layers,
+        )
+    )
+    architecture = model_config.hf_config.architectures[0]
+    if architecture in ("MiMoV2MTP", "Step3p5MTP"):
+        model_num_layers = 1
+    return model_num_layers
+
+
+def _assert_pp_mtp_compat(
+    *,
+    model_has_mtp_layers: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    num_effective_layers: int,
+    model_num_layers: int,
+) -> None:
+    assert (
+        (not model_has_mtp_layers)
+        or spec_algorithm.is_none()
+        or num_effective_layers == model_num_layers
+    ), "PP is not compatible with MTP models."
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -710,19 +752,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
-                self.model_config.num_hidden_layers,
-                self.model_config.num_attention_layers,
-            )
+        num_nextn_predict_layers = self.model_config.num_nextn_predict_layers
+        model_has_mtp_layers = (
+            num_nextn_predict_layers is not None and num_nextn_predict_layers > 0
         )
-        if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
-            model_num_layers = 1
-        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
-            model_num_layers = 1
+        model_num_layers = _compute_model_num_layers(
+            model=self.model,
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
+        )
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
@@ -734,14 +772,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
+        _assert_pp_mtp_compat(
+            model_has_mtp_layers=model_has_mtp_layers,
+            spec_algorithm=self.spec_algorithm,
+            num_effective_layers=self.num_effective_layers,
+            model_num_layers=model_num_layers,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
