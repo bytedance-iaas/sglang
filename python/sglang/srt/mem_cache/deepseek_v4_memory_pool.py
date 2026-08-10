@@ -44,6 +44,17 @@ def get_compress_state_ring_size(
         return 8 if compress_ratio == 4 else 128
 
 
+def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    """Return the largest draft-token count this ring can serve.
+
+    This mirrors ``mtp_pad`` in ``c_plan.cuh``. The bound is derived there. A
+    non-speculative ring is exactly one compression window wide, so its pad is
+    zero.
+    """
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return ring_size - window_size + 2 if ring_size > window_size else 0
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,

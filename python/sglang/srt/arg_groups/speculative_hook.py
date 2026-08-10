@@ -378,11 +378,6 @@ def _handle_dspark(server_args: "ServerArgs") -> None:
             )
 
     if gamma is not None:
-        if gamma > 3:
-            raise ValueError(
-                "This backport supports --speculative-dspark-block-size <= 3; "
-                f"got {gamma}."
-            )
         verify_window = int(gamma) + 1
         if (
             server_args.speculative_num_draft_tokens is not None
