@@ -130,7 +130,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+        self.output_ids = torch.tensor(
+            self.output_ids, dtype=torch.int64, device=self.device
+        )
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
@@ -183,3 +185,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     spec_info.future_indices, spec_info
                 )
             self.spec_info = spec_info
+        elif self.spec_algorithm.is_dspark():
+            # Local import to avoid importing the DSpark runtime for non-DSpark
+            # serving paths.
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            self.spec_info = build_dspark_disagg_draft_input(
+                self,
+                server_args,
+                self.output_ids,
+                future_map,
+            )
