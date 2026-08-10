@@ -1,7 +1,11 @@
 import pytest
+import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+    DeepGemmMoeQuantInfo,
     _get_compact_all_tokens,
     _should_use_masked_standard_layout,
 )
@@ -22,20 +26,94 @@ def test_compact_all_tokens_is_graph_static_and_tightly_bounded(
     assert _get_compact_all_tokens(num_assignments, num_experts) == expected
 
 
-def test_standard_dispatch_layout_uses_masked_only_for_small_ep_partition():
-    common = dict(
+def _runner_config(num_experts=256, num_local_experts=256):
+    return MoeRunnerConfig(
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
         hidden_size=4096,
         intermediate_size_per_partition=2048,
         top_k=8,
         activation="silu",
         is_gated=True,
     )
-    assert _should_use_masked_standard_layout(
-        MoeRunnerConfig(num_experts=256, num_local_experts=32, **common)
+
+
+def _quant_info():
+    return DeepGemmMoeQuantInfo(
+        w13_weight=torch.empty((1, 512, 1), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((1, 4096, 1), dtype=torch.float8_e4m3fn),
+        use_fp8=True,
+        block_shape=[128, 128],
     )
-    assert not _should_use_masked_standard_layout(
-        MoeRunnerConfig(num_experts=256, num_local_experts=64, **common)
+
+
+def test_standard_dispatch_explicit_layout_override():
+    config = _runner_config()
+    quant_info = _quant_info()
+    hidden_states = torch.empty((8, 4096), device="meta")
+
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("masked"):
+        assert _should_use_masked_standard_layout(config, quant_info, hidden_states)
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("compact"):
+        assert not _should_use_masked_standard_layout(
+            config, quant_info, hidden_states
+        )
+
+
+def test_standard_dispatch_auto_layout_uses_memory_budget(monkeypatch):
+    config = _runner_config(num_experts=512, num_local_experts=512)
+    quant_info = _quant_info()
+    monkeypatch.setattr(
+        deep_gemm_runner,
+        "_masked_standard_layout_memory_budget_bytes",
+        int(42.5 * (1 << 30)),
     )
-    assert not _should_use_masked_standard_layout(
-        MoeRunnerConfig(num_experts=256, num_local_experts=256, **common)
+
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
+        for num_tokens, expected in ((8192, True), (16384, False)):
+            hidden_states = torch.empty((num_tokens, 4096), device="meta")
+            assert (
+                _should_use_masked_standard_layout(
+                    config, quant_info, hidden_states
+                )
+                is expected
+            )
+
+
+def test_standard_dispatch_rejects_invalid_layout():
+    config = _runner_config()
+    quant_info = _quant_info()
+    hidden_states = torch.empty((8, 4096), device="meta")
+
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("invalid"):
+        with pytest.raises(ValueError, match="auto, masked, compact"):
+            _should_use_masked_standard_layout(config, quant_info, hidden_states)
+
+
+def test_masked_layout_budget_fraction_is_validated(monkeypatch):
+    monkeypatch.setattr(
+        deep_gemm_runner, "_masked_standard_layout_memory_budget_bytes", None
     )
+    with envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION.override(0.5):
+        assert deep_gemm_runner.set_masked_standard_layout_memory_budget(100) == 50
+
+    with envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION.override(0.0):
+        with pytest.raises(ValueError, match="must be in"):
+            deep_gemm_runner.set_masked_standard_layout_memory_budget(100)
+
+
+def test_standard_dispatch_auto_capture_without_budget_uses_compact(monkeypatch):
+    common = dict(
+        config=_runner_config(num_experts=256, num_local_experts=32),
+        quant_info=_quant_info(),
+        hidden_states=torch.empty((8, 4096), device="meta"),
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner, "_masked_standard_layout_memory_budget_bytes", None
+    )
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.cuda_graph_runner.get_is_capture_mode",
+        lambda: True,
+    )
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
+        assert not _should_use_masked_standard_layout(**common)
