@@ -1046,7 +1046,25 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.output_ids = pp_outputs["next_token_ids"]
+        next_token_ids = pp_outputs["next_token_ids"].to(
+            device=batch.device,
+            dtype=torch.int64,
+            non_blocking=True,
+        )
+        batch.output_ids = next_token_ids
+
+        next_draft_input = None
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1054,6 +1072,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
         return output_result
 
@@ -1171,7 +1190,15 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                if self.cur_batch.spec_algorithm.is_dspark():
+                    self.model_worker.set_pp_proxy_tensors_for_next_forward(
+                        pp_proxy_tensors
+                    )
+                try:
+                    result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                finally:
+                    if self.cur_batch.spec_algorithm.is_dspark():
+                        self.model_worker.set_pp_proxy_tensors_for_next_forward(None)
                 set_time_batch(
                     self.cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
