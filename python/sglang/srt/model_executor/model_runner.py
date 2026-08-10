@@ -408,6 +408,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        defer_device_graph_init: bool = False,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -433,6 +434,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        if defer_device_graph_init and not is_draft_worker:
+            raise ValueError(
+                "Deferred device graph initialization is only valid for a draft worker."
+            )
+        self._device_graph_init_deferred = defer_device_graph_init
+        self.graph_runner = None
+        self.graph_mem_usage = 0
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -885,10 +893,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
-            self.init_device_graphs()
+            if not self._device_graph_init_deferred:
+                self.init_device_graphs()
         elif self.device == "cpu":
             self.init_attention_backend()
-            self.init_device_graphs()
+            if not self._device_graph_init_deferred:
+                self.init_device_graphs()
         elif self.device == "npu":
             self.init_attention_backend()
             # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
@@ -902,17 +912,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
-            self.init_device_graphs()
+            if not self._device_graph_init_deferred:
+                self.init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
-            if current_platform.support_cuda_graph():
+            if (
+                current_platform.support_cuda_graph()
+                and not self._device_graph_init_deferred
+            ):
                 self.init_device_graphs()
-            else:
-                self.graph_runner = None
-                self.graph_mem_usage = 0
         else:
-            self.graph_runner = None
-            self.graph_mem_usage = 0
             self.init_attention_backend()
 
         if server_args.forward_hooks:
@@ -2899,6 +2908,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def finish_deferred_device_graph_init(self, *, capture: bool) -> None:
+        """Complete a graph init intentionally deferred during construction.
+
+        DSpark's draft model shares the target embedding and LM head.  Its model
+        runner must therefore finish loading and return to DSparkWorkerV2 before
+        graph capture can safely execute a draft forward.
+        """
+        if not self._device_graph_init_deferred:
+            raise RuntimeError("Device graph initialization was not deferred.")
+
+        self._device_graph_init_deferred = False
+        if capture:
+            self.init_device_graphs()
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""

@@ -234,6 +234,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        defer_device_graph_init: bool = False,
     ):
         # Parse args
         self.server_args = server_args
@@ -248,6 +249,7 @@ class TpModelWorker(BaseTpWorker):
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
         self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.defer_device_graph_init = defer_device_graph_init
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.attn_cp_rank = attn_cp_rank
@@ -362,6 +364,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            defer_device_graph_init=self.defer_device_graph_init,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -388,6 +391,7 @@ class TpModelWorker(BaseTpWorker):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
+                    defer_device_graph_init=self.defer_device_graph_init,
                 )
             )
 

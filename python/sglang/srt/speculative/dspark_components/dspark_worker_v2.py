@@ -136,6 +136,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
+                # DeepSeek-V4 DSpark attaches the target embedding and LM head
+                # only after the draft worker constructor returns.
+                defer_device_graph_init=True,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -316,6 +319,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             elif not self._draft_is_moe:
                 self.draft_model.prune_to_ctx_kv_injection()
             self._init_pp_context_feature_indices()
+
+        # The legacy fork captures graphs from ModelRunner.__init__.  DSpark
+        # deliberately defers that one capture until the target embedding/LM
+        # head and all draft graph metadata/hooks above are ready.
+        self.init_cuda_graphs()
 
     def _init_lifecycle_only_prefill(self) -> None:
         self._verify_planner = None
@@ -503,6 +511,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
+        if capture_decode_cuda_graph and self._draft_is_moe:
+            if (
+                getattr(self.draft_model, "embed_tokens", None) is None
+                or getattr(self.draft_model, "lm_head", None) is None
+            ):
+                raise RuntimeError(
+                    "DSpark draft CUDA graph capture requires target shared "
+                    "modules to be attached first."
+                )
         with self._draft_context():
             if capture_decode_cuda_graph:
                 self._draft_sampler = self._maybe_build_draft_sampler()
@@ -513,15 +530,31 @@ class DSparkWorkerV2(BaseSpecWorker):
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                 elif self._draft_sampler is not None:
-                    # This fork captures graphs during ModelRunner construction,
-                    # before DSparkWorkerV2 exists. Keep the correctness-preserving
-                    # unfused sampling path instead of attaching an ineffective hook.
+                    # This legacy fork has no capture-tail hook API. Keep the
+                    # correctness-preserving unfused sampling path instead of
+                    # attaching a sampler that graph replay cannot publish.
                     self._draft_sampler = None
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             init_cuda_graphs = getattr(self._draft_worker, "init_cuda_graphs", None)
             if init_cuda_graphs is not None:
                 init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
-            elif capture_decode_cuda_graph and getattr(
+            else:
+                finish_deferred_graph_init = getattr(
+                    self.draft_model_runner,
+                    "finish_deferred_device_graph_init",
+                    None,
+                )
+                if finish_deferred_graph_init is None:
+                    if capture_decode_cuda_graph and getattr(
+                        self.draft_model_runner, "graph_runner", None
+                    ) is None:
+                        raise RuntimeError(
+                            "DSpark draft CUDA graph was not initialized."
+                        )
+                else:
+                    finish_deferred_graph_init(capture=capture_decode_cuda_graph)
+
+            if capture_decode_cuda_graph and getattr(
                 self.draft_model_runner, "graph_runner", None
             ) is None:
                 raise RuntimeError("DSpark draft CUDA graph was not initialized.")

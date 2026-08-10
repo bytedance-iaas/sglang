@@ -73,6 +73,7 @@ def build_draft_tp_worker(
     target_worker: TpModelWorker,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    defer_device_graph_init: bool = False,
 ) -> DraftWorkerBundle:
     """Build a draft worker against the fork's legacy TpModelWorker API."""
 
@@ -106,6 +107,7 @@ def build_draft_tp_worker(
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=target_allocator,
             memory_pool_config=target_worker.model_runner.memory_pool_config,
+            defer_device_graph_init=defer_device_graph_init,
         )
     finally:
         set_global_server_args_for_scheduler(saved_server_args)
