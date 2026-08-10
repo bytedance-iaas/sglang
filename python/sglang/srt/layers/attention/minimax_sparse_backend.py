@@ -408,12 +408,35 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
             else:
                 prefix_lens = torch.zeros_like(seq_lens)
-        else:
-            raise RuntimeError(
-                "MiniMax sparse TARGET_VERIFY requires ForwardBatch extend metadata "
-                "or a RaggedVerifyLayout; the attention backend must not synthesize "
-                "per-request verify geometry."
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = int(forward_batch.seq_lens.shape[0])
+            verify_len = self._target_verify_q_cap(forward_batch)
+            expected_num_tokens = bs * verify_len
+            if bs <= 0 or q.shape[0] != expected_num_tokens:
+                raise RuntimeError(
+                    "MiniMax sparse non-ragged TARGET_VERIFY requires the fixed "
+                    "verify width from spec_info; refusing to infer a layout from "
+                    f"q.shape. Got q.shape[0]={q.shape[0]}, bs={bs}, "
+                    f"verify_cap={verify_len}, expected={expected_num_tokens}."
+                )
+            uniform_verify_lens = torch.full(
+                (bs,),
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
             )
+            cu_seqlens = torch.arange(
+                0,
+                expected_num_tokens + 1,
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            seq_lens = (forward_batch.seq_lens + uniform_verify_lens).to(torch.int32)
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = [verify_len] * bs
+        else:
+            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
 
         # DP attention pads q beyond the real token count for collective alignment;
         # trim to actual tokens so the sparse kernel sees consistent shapes.
