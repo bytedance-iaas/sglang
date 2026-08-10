@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_full_indexed_c128_state_indices,
     get_transfer_draft_kv_layer_ids,
     get_transfer_kv_layer_ids,
     get_kv_class,
@@ -154,7 +155,9 @@ class PrefillBootstrapQueue:
         )
 
         transfer_draft_cache = (
-            self.pp_size <= 1 or self.pp_rank == self.pp_size - 1
+            not self.scheduler.spec_algorithm.is_dspark()
+            or self.pp_size <= 1
+            or self.pp_rank == self.pp_size - 1
         )
         draft_pool_for_transfer = (
             self.draft_token_to_kv_pool if transfer_draft_cache else None
@@ -922,6 +925,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
+            def _c128_state_payload():
+                return get_dsv4_full_indexed_c128_state_indices(
+                    self.req_to_token_pool.req_to_token,
+                    req.req_pool_idx,
+                    seq_len,
+                )
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -933,6 +943,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 

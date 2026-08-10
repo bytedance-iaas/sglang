@@ -100,6 +100,8 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_algorithm == "DFLASH":
         _handle_dflash(server_args)
+    elif server_args.speculative_algorithm == "DSPARK":
+        _handle_dspark(server_args)
     elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
         _handle_frozen_kv_mtp(server_args)
     elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -230,7 +232,7 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
 
-def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
+def _target_checkpoint_bundles_dspark_draft(server_args: "ServerArgs") -> bool:
     from sglang.srt.speculative.dspark_components.dspark_config import (
         checkpoint_bundles_dspark_draft,
     )
@@ -238,9 +240,49 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
 
 
-def _handle_dspark(server_args: ServerArgs) -> None:
+def _handle_dspark(server_args: "ServerArgs") -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
+
+    if server_args.disaggregation_mode not in ("prefill", "decode"):
+        raise ValueError(
+            "This DeepSeek-V4 DSpark backport supports PD disaggregation only."
+        )
+    if server_args.disaggregation_transfer_backend != "mooncake":
+        raise ValueError(
+            "DeepSeek-V4 DSpark PD currently supports Mooncake only; "
+            f"got {server_args.disaggregation_transfer_backend!r}."
+        )
+    if server_args.attn_cp_size != 1:
+        raise ValueError(
+            "DeepSeek-V4 DSpark does not support context parallel in this "
+            f"backport (attn_cp_size={server_args.attn_cp_size})."
+        )
+    if server_args.disaggregation_mode == "decode" and server_args.pp_size != 1:
+        raise ValueError("DeepSeek-V4 DSpark decode requires pp_size == 1.")
+    if server_args.moe_a2a_backend != "none":
+        raise ValueError(
+            "DeepSeek-V4 DSpark currently requires --moe-a2a-backend none."
+        )
+    if server_args.speculative_moe_a2a_backend not in (None, "none"):
+        raise ValueError(
+            "DeepSeek-V4 DSpark does not support a separate MoE A2A backend."
+        )
+    if server_args.enable_eic_cache:
+        raise ValueError("DeepSeek-V4 DSpark does not support EIC in this backport.")
+    if server_args.enable_hierarchical_cache:
+        if server_args.disaggregation_mode != "prefill":
+            raise ValueError("DSpark HiCache L2 is supported on the prefill node only.")
+        if server_args.hicache_storage_backend is not None:
+            raise ValueError("DeepSeek-V4 DSpark supports HiCache L2 only, not L3.")
+        if server_args.hicache_write_policy != "write_through":
+            raise ValueError(
+                "DeepSeek-V4 DSpark HiCache requires write_through policy."
+            )
+
+    if not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning("Overlap scheduling is disabled for DSpark.")
 
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
@@ -249,11 +291,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             raise ValueError(
                 "DSpark with dp attention only supports the built-in TP MoE "
                 f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
-            )
-        if server_args.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={server_args.attn_cp_size})."
             )
         if (
             server_args.speculative_moe_a2a_backend is not None
@@ -265,13 +302,14 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if server_args.pp_size != 1:
+    bundles_dspark = _target_checkpoint_bundles_dspark_draft(server_args)
+    if not bundles_dspark:
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "This backport supports only the DSpark draft bundled in the "
+            "DeepSeek-V4-Flash-0731 checkpoint."
         )
-
     if server_args.speculative_draft_model_path is None:
-        if _target_checkpoint_bundles_dspark_draft(server_args):
+        if bundles_dspark:
             server_args.speculative_draft_model_path = server_args.model_path
             server_args.speculative_draft_model_revision = server_args.revision
             logger.info(
@@ -279,11 +317,18 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
                 server_args.model_path,
             )
-        else:
-            raise ValueError(
-                "DSpark dense speculative decoding requires setting "
-                "--speculative-draft-model-path."
-            )
+    elif server_args.speculative_draft_model_path != server_args.model_path:
+        raise ValueError(
+            "Bundled DeepSeek-V4 DSpark must use the target checkpoint; do not "
+            "set a different --speculative-draft-model-path."
+        )
+    elif server_args.speculative_draft_model_revision not in (
+        None,
+        server_args.revision,
+    ):
+        raise ValueError(
+            "Bundled DeepSeek-V4 DSpark draft and target revisions must match."
+        )
 
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = 1
@@ -333,6 +378,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if gamma is not None:
+        if gamma > 3:
+            raise ValueError(
+                "This backport supports --speculative-dspark-block-size <= 3; "
+                f"got {gamma}."
+            )
         verify_window = int(gamma) + 1
         if (
             server_args.speculative_num_draft_tokens is not None
@@ -374,6 +424,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     )
 
     ragged_mode = read_ragged_verify_mode()
+    if ragged_mode is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "DeepSeek-V4 DSpark currently requires "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
+        )
     if (
         server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT
@@ -395,51 +450,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
-def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
-    """Resolve `speculative_draft_attention_backend` to a final, supported value.
-
-    Consumed by ModelRunner's `is_draft_worker` override (one backend for all
-    draft modes).
-    """
-    from sglang.srt.utils import is_hip
-
-    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if is_hip() else "flashinfer"
-
-    draft_backend = server_args.speculative_draft_attention_backend
-    if draft_backend is None:
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-            resolved_view,
-        )
-
-        draft_backend, _ = attention_backends_of(resolved_view(server_args))
-    if draft_backend is None:
-        draft_backend = fallback_backend
-    elif draft_backend == "trtllm_mha":
-        logger.warning(
-            "DFLASH draft worker does not support 'trtllm_mha' because the "
-            "draft path requires per-layer DFlash attention. Falling back to "
-            "'%s'.",
-            fallback_backend,
-        )
-        draft_backend = fallback_backend
-    elif draft_backend not in supported_draft_backends:
-        logger.warning(
-            "DFLASH draft worker only supports attention_backend in %s for now, "
-            "but got %r. Falling back to '%s'.",
-            supported_draft_backends,
-            draft_backend,
-            fallback_backend,
-        )
-        draft_backend = fallback_backend
-    # FIXME: avoid overriding server args directly; pass the resolved draft
-    # backend to the draft worker explicitly instead.
-    server_args.speculative_draft_attention_backend = draft_backend
-
-
-def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
+def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(

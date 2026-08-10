@@ -556,6 +556,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Return the legacy heterogeneous DSV4 state component.
+
+        Keep C128 in this list for existing non-DSpark PD peers.  Bundled
+        DSpark uses ``get_dspark_pd_state_buf_infos`` below so C128 can be
+        matched by StateType without changing the baseline wire layout.
+        """
+        return self._get_state_buf_infos(include_c128=True)
+
+    def _get_state_buf_infos(
+        self, *, include_c128: bool
+    ) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
@@ -573,6 +584,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if pool.ratio == 128 and not include_c128:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
@@ -580,6 +593,50 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_dspark_pd_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Target SWA/C4 state for bundled DSpark PD, excluding C128."""
+        return self._get_state_buf_infos(include_c128=False)
+
+    def get_dspark_pd_state_layer_ids(self) -> List[int]:
+        """Global layer IDs aligned with ``get_dspark_pd_state_buf_infos``."""
+        stage_layer_ids = list(range(self._stage_start, self._stage_end))
+        c4_layer_ids = [
+            layer_id
+            for layer_id in stage_layer_ids
+            if self.compression_ratios[layer_id] == 4
+        ]
+        # Buffer order is target SWA, C4 attention state, C4 indexer state.
+        # Repeated IDs are intentional; Mooncake pairs occurrences in order.
+        return stage_layer_ids + c4_layer_ids + c4_layer_ids
+
+    def get_c128_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return Full-indexed C128 state as a separate PD component."""
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            tensor = pool.kv_score_buffer.kv_score
+            assert tensor.ndim == 2, f"expected 2D buffer, got {tensor.ndim}D"
+            data_ptrs.append(tensor.data_ptr())
+            data_lens.append(tensor.nbytes)
+            item_lens.append(
+                tensor[0].nbytes if pool.ring_size == 1 else tensor[0].nbytes * 128
+            )
+        return data_ptrs, data_lens, item_lens
+
+    def get_c128_state_layer_ids(self) -> List[int]:
+        return [
+            layer_id
+            for layer_id in range(self._stage_start, self._stage_end)
+            if self.compression_ratios[layer_id] == 128
+        ]
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size

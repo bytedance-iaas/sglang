@@ -728,7 +728,7 @@ class CudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dflash_family()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1103,7 +1103,7 @@ class CudaGraphRunner:
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
                 and "input_embeds" in inspect.signature(forward).parameters
             ):
@@ -1195,7 +1195,7 @@ class CudaGraphRunner:
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dflash_family()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1217,7 +1217,7 @@ class CudaGraphRunner:
         )
 
         if (
-            self.model_runner.spec_algorithm.is_dflash()
+            self.model_runner.spec_algorithm.is_dflash_family()
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
@@ -1277,7 +1277,7 @@ class CudaGraphRunner:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
@@ -1366,7 +1366,7 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash():
+        elif self.model_runner.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,

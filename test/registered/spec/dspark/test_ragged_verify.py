@@ -14,11 +14,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
 
-# The backend capability checks (supports_ragged_verify_graph) live in
-# test_ragged_verify_backend_capability.py: importing the backend modules
-# pulls GPU-only wheels, which fail to import on the CPU runners.
-
-
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
     def test_mixed_verify_lens_geometry(self):
         layout = RaggedVerifyLayout.from_verify_lens(

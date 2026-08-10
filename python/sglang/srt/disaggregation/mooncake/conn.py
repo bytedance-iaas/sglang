@@ -1108,7 +1108,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (StateType.SWA, StateType.NSA, StateType.C128_STATE):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1120,6 +1120,15 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.C128_STATE:
+                    if len(src_indices) != len(dst_indices_local):
+                        raise RuntimeError(
+                            "C128 state index length mismatch: "
+                            f"prefill={len(src_indices)}, "
+                            f"decode={len(dst_indices_local)}"
+                        )
+                    if not src_indices:
+                        continue
                 if len(src_indices) > len(dst_indices_local):
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"

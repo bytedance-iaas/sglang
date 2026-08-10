@@ -14,7 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -238,7 +238,7 @@ class DraftBlockProposer:
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
-            return draft_tp_context(get_parallel().attn_tp_group)
+            return draft_tp_context(get_attn_tp_group())
         return nullcontext()
 
     def propose(

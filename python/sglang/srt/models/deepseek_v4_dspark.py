@@ -8,12 +8,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+from sglang.jit_kernel.deepseek_v4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import (
+    get_attn_tp_group,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -26,9 +31,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
@@ -45,7 +49,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
     use_lifecycle_only_draft_model,
@@ -55,17 +59,11 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported
-from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
+from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
-
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
-
 
 class _BlockFp8LinearSlice(nn.Module):
     """Persistent K-block slice of a loaded block-FP8 ReplicatedLinear."""
@@ -175,8 +173,8 @@ class DSparkAttention(MqaAttentionBase):
             layer_id,
             quant_config,
             prefix,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            attn_tp_size=get_parallel().attn_tp_size,
+            attn_tp_rank=get_attn_tp_group().rank_in_group,
+            attn_tp_size=get_attn_tp_group().world_size,
             compress_ratio=0,
             fuse_wqa_wkv=False,
             wo_a_fp8=False,
@@ -259,10 +257,8 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        from sglang.srt.model_executor.forward_context import get_attn_backend
-
-        pool = _resolve_dspark_pool()
-        attn_backend = get_attn_backend()
+        pool = _resolve_dspark_pool(forward_batch)
+        attn_backend = forward_batch.attn_backend
         rd = self.rope_head_dim
 
         enable_multi_stream = (
@@ -343,8 +339,8 @@ class DSparkAttention(MqaAttentionBase):
         return out
 
 
-def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
-    pool = get_token_to_kv_pool()
+def _resolve_dspark_pool(forward_batch: ForwardBatch) -> DeepSeekV4TokenToKVPool:
+    pool = forward_batch.token_to_kv_pool
     assert isinstance(pool, DeepSeekV4TokenToKVPool), (
         "DSpark draft attention requires a DeepSeekV4TokenToKVPool, "
         f"got {type(pool).__name__}."
@@ -402,7 +398,7 @@ class DSparkV4MarkovHead(nn.Module):
                 f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
                 f"num_embeddings_padded({num_padded})."
             )
-        attn_tp_size = get_parallel().attn_tp_group.world_size
+        attn_tp_size = get_attn_tp_group().world_size
         if attn_tp_size != tp_size:
             raise ValueError(
                 "DSpark markov_w2 TP-shard needs the attn-TP group (used for the per-step "
@@ -464,7 +460,7 @@ class DSparkV4MarkovHead(nn.Module):
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
         if shard.tp_size > 1:
-            full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
+            full = get_attn_tp_group().all_gather(step_local, dim=-1)
         else:
             full = step_local
         return full[..., : self.vocab_size]
@@ -674,11 +670,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self.start_layer = 0
         self.end_layer = self.num_stages
-        parallel = get_parallel()
+        pp_rank = get_pipeline_model_parallel_rank()
+        pp_size = get_pipeline_model_parallel_world_size()
         self.is_lifecycle_only = use_lifecycle_only_draft_model(
-            disaggregation_mode=get_disagg().disaggregation_mode,
-            pp_rank=parallel.pp_rank,
-            pp_size=parallel.pp_size,
+            disaggregation_mode=get_global_server_args().disaggregation_mode,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
             target_layer_ids=[
                 int(layer_id) for layer_id in (dspark_config.target_layer_ids or [])
             ],
@@ -702,8 +699,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             logger.info(
                 "DSpark PP rank %s uses a lifecycle-only draft model; all target "
                 "features are owned by final PP rank %s.",
-                parallel.pp_rank,
-                parallel.pp_size - 1,
+                pp_rank,
+                pp_size - 1,
             )
             return
 
@@ -984,7 +981,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_embed_stack = None
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
         confidence = confidence_head.apply_sts(confidence_raw)
-        expect(_CONFIDENCE, confidence)
+        maybe_detect_in_closed_range(
+            confidence, 0.0, 1.0, "DSpark model confidence"
+        )
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:

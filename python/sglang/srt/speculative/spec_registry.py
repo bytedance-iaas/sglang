@@ -76,13 +76,6 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def supports_ragged_verify(self) -> bool:
-        return False
-
-    def has_draft_kv(self) -> bool:
-        # Conservative default: the larger KV reserve.
-        return True
-
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

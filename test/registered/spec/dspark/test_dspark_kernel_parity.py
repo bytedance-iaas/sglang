@@ -12,7 +12,6 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4 import attn_metadata_kernels
 from sglang.srt.speculative import ragged_verify_kernels
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
@@ -167,31 +166,6 @@ def _case_cap_correct_len(tc):
         tc._parity(dspark_accept.CapCorrectLen, correct_len=cl, verify_lens=verify_lens)
 
 
-def _case_causal_swa_page_indices(tc):
-    swa, num_pool, pool_len, num_q = 128, 64, 600, 40
-    g = torch.Generator(device=DEVICE).manual_seed(7)
-    kw = dict(
-        req_to_token=_ri(0, 40000, (num_pool, pool_len), torch.int32, g),
-        full_to_swa_mapping=_ri(0, 1 << 20, (40000,), torch.int64, g),
-        req_pool_indices_repeated=_ri(0, num_pool, (num_q,), torch.int32, g),
-        swa_window=swa,
-        page_index_aligned_size=96,
-    )
-    # Lens short of / straddling / beyond the SWA window boundary.
-    for lo, hi in ((1, swa), (swa - 4, swa + 4), (swa + 1, pool_len)):
-        lens = _ri(lo, hi, (num_q,), torch.int32, g)
-        cls = attn_metadata_kernels.BuildCausalSwaPageIndices
-        ref = cls.torch(seq_lens_casual=lens, **kw)
-        got = cls.triton(seq_lens_casual=lens, **kw)
-        tc.assertEqual(got.shape, ref.shape)
-        tc.assertEqual(got.dtype, ref.dtype)
-        # Parity holds on the attended region; padding slots must be -1.
-        col = torch.arange(ref.shape[1], device=DEVICE).view(1, -1)
-        attended = col < torch.clamp(lens, max=swa).view(-1, 1)
-        tc.assertTrue(torch.equal(got[attended], ref[attended]))
-        tc.assertTrue(bool((got[~attended] == -1).all()))
-
-
 def _case_commit_inject_layout(tc):
     stride, num_pool, pool_len, n_full, bs = 7, 300, 400, 50000, 64
     g = torch.Generator(device=DEVICE).manual_seed(8)
@@ -299,40 +273,6 @@ def _case_swa_page_indices(tc):
     )
 
 
-def _case_expand_prefill_causally(tc):
-    torch.manual_seed(12)
-    # Vectorized branch: ragged extends with padded token count.
-    bs = 64
-    extend = _ri(1, 8, (bs,))
-    num_tokens = int(extend.sum())
-    req_pool_indices = torch.randperm(512, device=DEVICE)[:bs]
-    seq_lens = _ri(8, 500, (bs,))
-    tc._parity(
-        attn_metadata_kernels.ExpandPrefillCausally,
-        req_pool_indices=req_pool_indices,
-        seq_lens=seq_lens,
-        extend_seq_lens=extend,
-        extend_start_loc=torch.cumsum(extend, dim=0) - extend,
-        seq_lens_cpu=None,
-        extend_seq_lens_cpu=None,
-        num_tokens=num_tokens,
-        padded_num_tokens=num_tokens + 5,
-    )
-    # Loop branch: uniform extend with CPU lens and no padding.
-    bs2, block = 8, 6
-    tc._parity(
-        attn_metadata_kernels.ExpandPrefillCausally,
-        req_pool_indices=req_pool_indices[:bs2],
-        seq_lens=seq_lens[:bs2],
-        extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
-        extend_start_loc=None,
-        seq_lens_cpu=[int(x) for x in seq_lens[:bs2].tolist()],
-        extend_seq_lens_cpu=[block] * bs2,
-        num_tokens=bs2 * block,
-        padded_num_tokens=None,
-    )
-
-
 def _case_finalize_accept_lens(tc):
     torch.manual_seed(13)
     bs = 64
@@ -378,23 +318,6 @@ def _case_padded_to_bucket(tc):
         tc.assertEqual(int(got.to(torch.int64).sum()), graph_num_tokens)
         if padded_bs > bs:
             tc.assertTrue(torch.equal(got[:bs], verify_lens))
-
-
-def _case_page_table_positions(tc):
-    num_pool, pool_len = 128, 4096
-    g = torch.Generator(device=DEVICE).manual_seed(16)
-    req_to_token = _ri(0, 1 << 20, (num_pool, pool_len), torch.int32, g)
-    # Large page + non-pool-aligned max_seq_len, then page_size 1.
-    for num_q, page_size, max_seq_len in ((300, 64, 4000), (56, 1, 4096)):
-        tc._parity(
-            attn_metadata_kernels.BuildPageTablePositions,
-            req_to_token=req_to_token,
-            req_pool_indices_repeated=_ri(0, num_pool, (num_q,), torch.int32, g),
-            seq_lens_casual=_ri(1, pool_len, (num_q,), torch.int64, g),
-            max_seq_len=max_seq_len,
-            page_size=page_size,
-            swa_window=128,
-        )
 
 
 def _case_qo_indptr(tc):
@@ -514,16 +437,13 @@ _CASES = [
     ("build_ragged_verify_window", _case_build_ragged_verify_window),
     ("build_step_local", _case_build_step_local),
     ("cap_correct_len", _case_cap_correct_len),
-    ("causal_swa_page_indices", _case_causal_swa_page_indices),
     ("commit_inject_layout", _case_commit_inject_layout),
     ("commit_kv_proj", _case_commit_kv_proj),
     ("compact_layout", _case_compact_layout),
     ("swa_page_indices", _case_swa_page_indices),
-    ("expand_prefill_causally", _case_expand_prefill_causally),
     ("finalize_accept_lens", _case_finalize_accept_lens),
     ("mixed_accept_select", _case_mixed_accept_select),
     ("padded_to_bucket", _case_padded_to_bucket),
-    ("page_table_positions", _case_page_table_positions),
     ("qo_indptr", _case_qo_indptr),
     ("sample_step_tokens", _case_sample_step_tokens),
     ("scatter_compact_to_strided", _case_scatter_compact_to_strided),

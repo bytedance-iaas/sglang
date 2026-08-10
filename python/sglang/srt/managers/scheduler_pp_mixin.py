@@ -1085,11 +1085,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        next_token_ids = pp_outputs["next_token_ids"].to(
-            device=batch.device,
-            dtype=torch.int64,
-            non_blocking=True,
-        )
+        next_token_ids = pp_outputs["next_token_ids"]
         batch.output_ids = next_token_ids
 
         next_draft_input = None
@@ -1098,6 +1094,12 @@ class SchedulerPPMixin:
                 make_next_draft_input,
             )
 
+            next_token_ids = next_token_ids.to(
+                device=batch.device,
+                dtype=torch.int64,
+                non_blocking=True,
+            )
+            batch.output_ids = next_token_ids
             next_draft_input = make_next_draft_input(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,

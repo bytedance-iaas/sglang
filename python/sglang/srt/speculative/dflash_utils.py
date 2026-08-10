@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
@@ -99,6 +100,129 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+
+
+def apply_dflash_verify_logits_adjustments(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+) -> None:
+    """Apply the target sampling adjustments to every DSpark verify row."""
+
+    if sampling_info is None:
+        return
+    if next_token_logits.ndim != 2 or draft_token_num <= 0:
+        raise ValueError("Invalid DSpark verify-logits shape or draft width")
+    bs = len(sampling_info)
+    if next_token_logits.shape[0] != bs * draft_token_num:
+        raise ValueError(
+            "DSpark verify-logits row count mismatch: expected "
+            f"{bs * draft_token_num}, got {next_token_logits.shape[0]}."
+        )
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+
+    penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    grammar_mask = getattr(sampling_info, "grammar_mask", None)
+    logit_bias = getattr(sampling_info, "logit_bias", None)
+    logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+    if (
+        penalizer is not None and penalizer.is_required and penalties is None
+    ) or grammar_mask is not None:
+        linear_penalty = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=torch.float32,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_logits_bias(linear_penalty)
+        logits_3d.add_(linear_penalty[:, None, :].to(next_token_logits.dtype))
+        return
+    for adjustment in (penalties, logit_bias):
+        if adjustment is None:
+            continue
+        adjustment = adjustment.to(
+            device=next_token_logits.device, dtype=next_token_logits.dtype
+        )
+        logits_3d.add_(adjustment[:, None, :])
+
+
+def build_dflash_verify_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    bs: int,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    use_sparse_topk: bool = True,
+) -> torch.Tensor:
+    """Build target probabilities for DSpark's chain accept kernel."""
+
+    device = next_token_logits.device
+    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
+    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    temperatures = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    scaled_logits = next_token_logits / temperatures
+    sparse_topk_applied = False
+    if use_sparse_topk and need_top_k:
+        repeated_top_ks = torch.repeat_interleave(
+            sampling_info.top_ks, draft_token_num, dim=0
+        ).to(dtype=torch.int64)
+        vocab_size = int(scaled_logits.shape[-1])
+        repeated_top_ks.clamp_(min=1, max=vocab_size)
+        max_top_k = (
+            int(repeated_top_ks.max().item())
+            if max_top_k is None
+            else int(max_top_k)
+        )
+        max_top_k = min(max(max_top_k, 1), vocab_size)
+        if max_top_k < vocab_size:
+            topk_logits, topk_indices = torch.topk(
+                scaled_logits, k=max_top_k, dim=-1
+            )
+            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
+                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
+                    None, :
+                ]
+                topk_logits.masked_fill_(
+                    ranks >= repeated_top_ks.unsqueeze(1), float("-inf")
+                )
+            topk_probs = F.softmax(topk_logits, dim=-1)
+            if need_top_p:
+                topk_probs = top_p_renorm_prob(
+                    topk_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, draft_token_num, dim=0
+                    ),
+                )
+            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
+            target_probs.scatter_(1, topk_indices, topk_probs)
+            sparse_topk_applied = True
+    if not sparse_topk_applied:
+        target_probs = F.softmax(scaled_logits, dim=-1)
+        if need_top_k:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, draft_token_num, dim=0
+                ),
+            )
+        if need_top_p:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, draft_token_num, dim=0
+                ),
+            )
+    return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
 def _get_or_create_chain_verify_buffers(

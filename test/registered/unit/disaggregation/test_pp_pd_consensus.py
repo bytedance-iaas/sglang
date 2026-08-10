@@ -59,6 +59,7 @@ class TestPPPDConsensus(CustomTestCase):
         queue.pp_size = 2
         queue.scheduler = SimpleNamespace(
             ps=SimpleNamespace(dp_rank=0, gpu_id=0),
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
             server_args=SimpleNamespace(disaggregation_ib_device=None),
             model_config=SimpleNamespace(
                 num_hidden_layers=8,

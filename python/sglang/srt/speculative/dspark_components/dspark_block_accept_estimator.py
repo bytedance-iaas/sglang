@@ -11,7 +11,9 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
+from sglang.srt.speculative.dspark_components.async_host import (
+    DelayedDeviceHostHandler,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)

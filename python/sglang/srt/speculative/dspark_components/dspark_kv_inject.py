@@ -2,8 +2,8 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
+from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch

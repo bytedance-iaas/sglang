@@ -13,8 +13,8 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
+from sglang.srt.speculative.dspark_components.async_host import FutureTensors
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
@@ -754,7 +754,7 @@ class DsparkStepObservers:
             components=resolve_enabled_components(),
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
-            attn_tp_rank=get_parallel().attn_tp_rank,
+            attn_tp_rank=get_attn_tp_group().rank_in_group,
             device=device,
             mode_value=planner.mode_value,
             sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),

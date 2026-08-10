@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_full_indexed_c128_state_indices,
     get_transfer_draft_kv_layer_ids,
     get_transfer_kv_layer_ids,
     get_kv_class,
@@ -146,10 +147,6 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
-        # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
-        # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
-        # inheriting ReqToTokenPool.alloc, which bumps it.
-        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -178,7 +175,6 @@ class DecodeReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -189,7 +185,6 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -1156,6 +1151,13 @@ class DecodePreallocQueue:
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _c128_state_payload():
+                return get_dsv4_full_indexed_c128_state_indices(
+                    self.req_to_token_pool.req_to_token,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1165,6 +1167,8 @@ class DecodePreallocQueue:
                     state_indices.append(_swa_payload())
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 

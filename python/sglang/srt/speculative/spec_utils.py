@@ -103,9 +103,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
+    # multi_layer_eagle and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    if server_args.speculative_algorithm in ("STANDALONE", "DSPARK"):
         return False
     return not server_args.enable_multi_layer_eagle
 
@@ -859,13 +859,3 @@ def get_last_loc_large_page_size_large_top_k(
         extend_lens,
         last_page_lens,
     )
-
-
-def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
-    """Dispatch decode preparation to the active speculative algorithm."""
-    if batch.spec_algorithm.is_dflash_family():
-        batch.spec_info.prepare_for_decode(batch)
-    else:
-        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
-
-        eagle_prepare_for_decode(batch)

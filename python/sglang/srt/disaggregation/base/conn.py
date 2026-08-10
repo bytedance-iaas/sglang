@@ -18,6 +18,11 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
+    # DSV4 C128 compression state is transferred separately from SWA for
+    # bundled DSpark PD serving.  The fork keeps #601's Full-indexed state
+    # addressing, so this component must not be matched positionally with a
+    # request-scoped or draft SWA component.
+    C128_STATE = "c128_state"
 
 
 @dataclasses.dataclass

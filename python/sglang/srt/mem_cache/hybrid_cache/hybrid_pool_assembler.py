@@ -500,7 +500,7 @@ def build_deepseek_v4_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     if mtp_swa_device_buffers:
-        cache_controller.set_mtp_draft_pools(mtp_swa_device_buffers)
+        cache_controller.set_mtp_draft_buffers(mtp_swa_device_buffers)
     return host_pool_group, cache_controller
 
 

@@ -30,6 +30,33 @@ if TYPE_CHECKING:
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
+def get_dsv4_full_indexed_c128_state_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    seq_len: int,
+) -> np.ndarray:
+    """Return the C128 state page used by this fork's Full-indexed planner.
+
+    A completed 128-token chunk has no running state to transfer.  Otherwise
+    the compressor reads/writes the state page derived from the Full physical
+    slot at the beginning of the current chunk.
+    """
+    if seq_len <= 0 or seq_len % 128 == 0:
+        return np.empty((0,), dtype=np.int32)
+    chunk_start = ((seq_len - 1) // 128) * 128
+    full_loc = int(req_to_token[int(req_pool_idx), chunk_start].item())
+    # KV slot/page 0 is reserved for padded writes by both token and paged
+    # allocators.  A zero here therefore means that req_to_token has not been
+    # populated for this logical position; it is not a transferable state row.
+    if full_loc <= 0:
+        raise RuntimeError(
+            "DSV4 C128 state payload references an unallocated Full KV slot: "
+            f"req_pool_idx={req_pool_idx}, chunk_start={chunk_start}, "
+            f"full_loc={full_loc}"
+        )
+    return np.array([full_loc // 128], dtype=np.int32)
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -701,15 +728,52 @@ def setup_state_kv_args(
     kv_args.state_dim_per_tensor = []
     kv_args.state_layer_ids = []
 
+    from sglang.srt.server_args import get_global_server_args
+
+    is_dsv4_dspark = (
+        get_global_server_args().speculative_algorithm == "DSPARK"
+        and not is_npu()
+        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    )
+
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
-        data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
+        if is_dsv4_dspark:
+            data_ptrs, data_lens, item_lens = (
+                token_to_kv_pool.get_dspark_pd_state_buf_infos()
+            )
+        else:
+            data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
-            append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+            layer_ids = (
+                token_to_kv_pool.get_dspark_pd_state_layer_ids()
+                if is_dsv4_dspark
+                else None
             )
+            append_state_component(
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=layer_ids,
+            )
+            if is_dsv4_dspark:
+                c128_ptrs, c128_lens, c128_item_lens = (
+                    token_to_kv_pool.get_c128_state_buf_infos()
+                )
+                if c128_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.C128_STATE,
+                        c128_ptrs,
+                        c128_lens,
+                        c128_item_lens,
+                        layer_ids=token_to_kv_pool.get_c128_state_layer_ids(),
+                    )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
@@ -745,9 +809,7 @@ def setup_state_kv_args(
     # the target allocator and Full -> SWA mapping. Keep it as a second SWA
     # component so heterogeneous target state cannot shift the draft payload.
     if (
-        not is_npu()
-        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        is_dsv4_dspark
     ):
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios

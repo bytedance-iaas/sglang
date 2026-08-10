@@ -44,9 +44,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
@@ -833,12 +830,6 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            if resolve_ragged_verify_layout(forward_batch) is not None:
-                raise NotImplementedError(
-                    "DSV4 ragged verify is not supported on the HIP backend "
-                    "(DeepseekV4HipRadixBackend) cuda-graph path; disable "
-                    "SGLANG_RAGGED_VERIFY_MODE or use a CUDA device."
-                )
             assert out_cache_loc is not None
             num_tokens = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
@@ -869,107 +860,6 @@ class DeepseekV4HipRadixBackend(
 
         self.replay_cuda_graph_metadata_from(
             bs=bs, temp_metadata=temp_metadata, bucket=bucket
-        )
-
-        if in_capture:
-            metadata = self.forward_metadata
-            self._current_capture_raw = (
-                metadata
-                if isinstance(
-                    metadata,
-                    (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata),
-                )
-                else None
-            )
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return
-
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert self.req_to_token_pool.req_to_token is self.req_to_token
-
-        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
-        assert seq_lens_cpu is not None
-        max_seq_len = int(seq_lens_cpu.max().item())
-
-        if forward_batch.forward_mode.is_decode_or_idle():
-            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
-            # so slice the shared multi-step out_cache_loc now, not at forward time.
-            out_cache_loc = forward_batch.out_cache_loc
-            if self.topk > 0 and self.speculative_num_steps > 1:
-                out_cache_loc = per_step_draft_out_cache_loc(
-                    out_cache_loc,
-                    forward_batch.batch_size,
-                    self.topk,
-                    self.speculative_num_steps,
-                )[self.speculative_step_id]
-            metadata = self.init_forward_metadata_decode(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-            )
-        elif forward_batch.forward_mode.is_target_verify():
-            if resolve_ragged_verify_layout(forward_batch) is not None:
-                raise NotImplementedError(
-                    "DSV4 ragged verify is not supported on the HIP backend "
-                    "(DeepseekV4HipRadixBackend); disable SGLANG_RAGGED_VERIFY_MODE "
-                    "or use a CUDA device."
-                )
-            metadata = self.init_forward_metadata_target_verify(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
-                extend_seq_lens=forward_batch.extend_seq_lens,
-                seq_lens_cpu=(
-                    seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
-                ),
-            )
-        elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            extend_seq_lens = forward_batch.extend_seq_lens
-            assert (
-                seq_lens is not None
-                and seq_lens_cpu is not None
-                and extend_seq_lens is not None
-                and extend_seq_lens_cpu is not None
-            )
-            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
-            metadata = self.init_forward_metadata_prefill(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=forward_batch.out_cache_loc,
-                num_tokens=sum(extend_seq_lens_cpu),
-                extend_seq_lens=extend_seq_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                need_compress=not is_draft,
-            )
-        else:
-            raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
-
-        self.forward_metadata = metadata
-        self.init_forward_metadata_in_graph(forward_batch)
-
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
-        self.cuda_graph_metadata_of_bucket_and_bs: Dict[
-            _GraphBucket,
-            Dict[
-                int,
-                Union[
-                    DSV4Metadata,
-                    DSV4RawDecodeMetadata,
-                    DSV4RawVerifyMetadata,
-                ],
-            ],
-        ] = {bucket: {} for bucket in _GraphBucket}
-        self.draft_extend_num_tokens_per_bs = (
-            max_num_tokens // max_bs if max_bs > 0 else 1
         )
 
     def replay_cuda_graph_metadata_from(

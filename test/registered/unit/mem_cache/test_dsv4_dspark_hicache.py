@@ -45,7 +45,6 @@ def _runner(pool, *, pp_rank, pp_size):
                 architectures=["DeepseekV4ForCausalLMDSpark"]
             )
         ),
-        mtp_draft_device_pools=(),
     )
 
 
@@ -76,10 +75,7 @@ class TestDeepSeekV4DSparkHiCachePlan(CustomTestCase):
             )
 
             self.assertEqual(plan.mode, expected)
-            self.assertEqual(
-                target_runner.mtp_draft_device_pools,
-                (draft_pool,) if pp_rank == 3 else (),
-            )
+            self.assertEqual(plan.device_pools, (draft_pool,) if pp_rank == 3 else ())
 
     def test_lifecycle_only_rank_has_no_draft_pool(self):
         worker = SimpleNamespace(

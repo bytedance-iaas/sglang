@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.managers.overlap_utils import (
-    CONFIDENCE_RELAY_RING_LAG,
-    FutureMap,
-    ResolvedConfidence,
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -48,6 +46,14 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
+
+CONFIDENCE_RELAY_RING_LAG = 2
+FutureMap = Any
+
+
+class ResolvedConfidence(msgspec.Struct):
+    confidence: torch.Tensor
+    generation: torch.Tensor
 
 
 class VerifyWindow(msgspec.Struct, frozen=True):
@@ -159,8 +165,8 @@ class DSparkVerifyPlanner:
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
-                and get_parallel().attn_tp_size == 1
-                and get_parallel().attn_cp_size == 1
+                and get_attention_tp_size() == 1
+                and self.server_args.attn_cp_size == 1
                 and require_mlp_tp_gather(self.server_args)
                 and not self.server_args.disable_overlap_schedule
                 and not self.server_args.speculative_skip_dp_mlp_sync
@@ -346,10 +352,17 @@ class DSparkVerifyPlanner:
         del prefix_lens
         if self._budget_planner is None:
             return None
+        req_generation = getattr(
+            self.model_runner.req_to_token_pool, "req_generation", None
+        )
+        if req_generation is None:
+            raise RuntimeError(
+                "This DeepSeek-V4 DSpark backport supports static ragged verify "
+                "only; request-generation tracking for compact verify is not "
+                "installed."
+            )
         req_pool_indices_cpu = req_pool_indices.to("cpu").to(torch.int64)
-        generation = self.model_runner.req_to_token_pool.req_generation[
-            req_pool_indices_cpu
-        ].clone()
+        generation = req_generation[req_pool_indices_cpu].clone()
         resolved = ResolvedConfidence(
             confidence=confidence.to("cpu"),
             generation=generation,
@@ -392,9 +405,16 @@ class DSparkVerifyPlanner:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
             return None
-        current_generation = self.model_runner.req_to_token_pool.req_generation[
-            req_pool_indices_cpu.to(torch.int64)
-        ]
+        req_generation = getattr(
+            self.model_runner.req_to_token_pool, "req_generation", None
+        )
+        if req_generation is None:
+            raise RuntimeError(
+                "This DeepSeek-V4 DSpark backport supports static ragged verify "
+                "only; request-generation tracking for compact verify is not "
+                "installed."
+            )
+        current_generation = req_generation[req_pool_indices_cpu.to(torch.int64)]
         return int(
             self._budget_planner.compute_budget(
                 confidence=resolved.confidence,
@@ -741,7 +761,8 @@ def uniform_ragged_layout(
 
 def verify_lens_broadcast_group(*, tp_size: int) -> tuple:
     if is_dp_attention_enabled():
-        return get_parallel().attn_tp_group, get_parallel().attn_tp_size
+        group = get_attn_tp_group()
+        return group, group.world_size
     return get_tp_group(), tp_size
 
 
@@ -779,15 +800,19 @@ def verify_layout_graph_num_tokens_floor(
 
 
 def ragged_capture_num_tokens(*, model_runner) -> Optional[list[int]]:
-    runner = model_runner.decode_cuda_graph_runner
-    if runner is None or not runner.ragged_verify_mode:
+    runner = getattr(model_runner, "decode_cuda_graph_runner", None)
+    if runner is None:
+        runner = getattr(model_runner, "graph_runner", None)
+    if runner is None or not getattr(runner, "ragged_verify_mode", False):
         return None
     return runner.capture_num_tokens
 
 
 def ragged_capture_max_slots(*, model_runner) -> Optional[int]:
-    runner = model_runner.decode_cuda_graph_runner
-    if runner is None or not runner.ragged_verify_mode:
+    runner = getattr(model_runner, "decode_cuda_graph_runner", None)
+    if runner is None:
+        runner = getattr(model_runner, "graph_runner", None)
+    if runner is None or not getattr(runner, "ragged_verify_mode", False):
         return None
     return runner.max_bs
 

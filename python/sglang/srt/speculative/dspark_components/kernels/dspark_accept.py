@@ -14,7 +14,9 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
-from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+from sglang.srt.speculative.dspark_components.kernels.reject_sampling import (
+    chain_speculative_sampling_triton,
+)
 
 
 class AcceptSampling:
@@ -393,7 +395,7 @@ def softmax_temp_flashinfer(
             "softmax_temp_flashinfer requires flashinfer.sampling.softmax, "
             "which is unavailable in this environment"
         )
-    num_rows, vocab = logits.shape[0], logits.shape[-1]
+    num_rows = logits.shape[0]
     bs = num_rows // rows_per_request
     assert (
         bs * rows_per_request == num_rows

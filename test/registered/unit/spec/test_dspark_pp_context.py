@@ -13,13 +13,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
 from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (  # noqa: E402
+    DeepSeekV4TokenToKVPool,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
-from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
-    _allocate_decode_buffers,
-)
-from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: E402
-    DecodeInputBuffers,
-)
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
 from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
@@ -68,6 +65,18 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_dspark_pd_state_layer_ids_follow_pp_local_buffer_order(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._stage_start = 10
+        pool._stage_end = 14
+        pool.compression_ratios = [0] * 10 + [0, 4, 128, 4]
+
+        self.assertEqual(
+            pool.get_dspark_pd_state_layer_ids(),
+            [10, 11, 12, 13, 11, 13, 11, 13],
+        )
+        self.assertEqual(pool.get_c128_state_layer_ids(), [12])
+
     def test_full_projection_fast_path_requires_final_pp_owner(self):
         """Only final-rank ownership can bypass the ctx_acc handoff."""
         with patch.dict(
@@ -170,43 +179,6 @@ class TestDSparkPPContext(CustomTestCase):
 
         projection_slice.assert_called_once_with(local_hidden)
         self.assertIs(actual, expected)
-
-    def test_pp_spec_verify_buffers_use_token_axis(self):
-        """PP verify buffers must cover bs times speculative token width."""
-        max_bs = 64
-        num_tokens_per_req = 6
-        max_num_token = max_bs * num_tokens_per_req
-        common_kwargs = dict(
-            device=torch.device("cpu"),
-            max_bs=max_bs,
-            max_num_token=max_num_token,
-            hidden_size=4,
-            dtype=torch.float32,
-            dp_size=1,
-            pp_size=8,
-            is_encoder_decoder=False,
-            require_mlp_tp_gather=False,
-            seq_len_fill_value=1,
-            encoder_len_fill_value=0,
-            num_tokens_per_req=num_tokens_per_req,
-            cache_loc_dtype=torch.int64,
-            enable_mamba_track=False,
-            hc_hidden_size=16,
-        )
-        eager_buffers = _allocate_decode_buffers(vocab_size=8, **common_kwargs)
-        graph_buffers = DecodeInputBuffers.create(
-            next_token_logits_buffer=torch.zeros((max_num_token, 8)),
-            **common_kwargs,
-        )
-
-        self.assertEqual(
-            eager_buffers.pp_proxy_tensors["hidden_states"].shape,
-            (max_num_token, 16),
-        )
-        self.assertEqual(
-            graph_buffers.pp_proxy_tensors["hidden_states"].shape,
-            (max_num_token, 16),
-        )
 
     def test_partial_projection_sum_matches_full_projection(self):
         """PP partial projections must preserve the full pre-norm FC result."""
@@ -313,6 +285,29 @@ class TestDSparkPPContext(CustomTestCase):
 
         self.assertEqual(worker.spec_v2_attn_backends, (target_backend,))
 
+    def test_pp_context_uses_fork_dspark_capture_config(self):
+        """The fork stores DSpark capture ids directly on ModelRunner."""
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.ps = SimpleNamespace(pp_rank=1, pp_size=4, tp_rank=0)
+        worker.model_runner = SimpleNamespace(dspark_target_layer_ids=[2, 5, 9])
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(start_layer=4, end_layer=8)
+            )
+        )
+        worker.draft_model = SimpleNamespace(
+            project_target_hidden_partial=Mock(),
+            prepare_target_hidden_partial=Mock(),
+        )
+        worker._draft_is_moe = True
+        worker._use_full_projection_prefill = False
+        worker._pp_context_feature_indices = None
+
+        worker._init_pp_context_feature_indices()
+
+        self.assertEqual(worker._pp_context_feature_indices, [1])
+        worker.draft_model.prepare_target_hidden_partial.assert_called_once_with([1])
+
     def test_lifecycle_only_rank_does_not_allocate_draft_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
@@ -329,13 +324,14 @@ class TestDSparkPPContext(CustomTestCase):
             is_dspark=lambda: True,
         )
 
-        self.assertIsNone(
+        self.assertEqual(
             get_draft_kv_pool(
                 draft_worker=worker,
                 spec_algorithm=spec_algorithm,
                 server_args=SimpleNamespace(enable_multi_layer_eagle=False),
                 enable_overlap=False,
-            )
+            ),
+            (None, None),
         )
 
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):

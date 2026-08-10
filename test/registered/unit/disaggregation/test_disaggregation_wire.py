@@ -1,6 +1,7 @@
 import unittest
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import (
@@ -10,6 +11,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.utils import (
+    get_dsv4_full_indexed_c128_state_indices,
     pack_state_types,
     resolve_state_component_dst_index,
     unpack_state_types,
@@ -51,21 +53,42 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
     def test_state_component_matching_uses_type_occurrence(self):
-        src_state_types = [StateType.SWA, StateType.SWA]
-        dst_state_types = [StateType.SWA, StateType.MAMBA, StateType.SWA]
+        src_state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
+        dst_state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
 
         self.assertEqual(
             resolve_state_component_dst_index(src_state_types, dst_state_types, 0),
             0,
         )
         self.assertEqual(
-            resolve_state_component_dst_index(src_state_types, dst_state_types, 1),
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 2),
             2,
         )
 
     def test_state_types_roundtrip(self):
-        state_types = [StateType.SWA, StateType.MAMBA, StateType.SWA]
+        state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
         self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
+
+    def test_full_indexed_c128_state_uses_current_chunk_page(self):
+        req_to_token = torch.zeros((2, 512), dtype=torch.int32)
+        req_to_token[1, 128] = 640
+
+        np.testing.assert_array_equal(
+            get_dsv4_full_indexed_c128_state_indices(req_to_token, 1, 129),
+            np.array([5], dtype=np.int32),
+        )
+
+    def test_full_indexed_c128_state_skips_closed_chunk(self):
+        req_to_token = torch.zeros((1, 256), dtype=torch.int32)
+        self.assertEqual(
+            get_dsv4_full_indexed_c128_state_indices(req_to_token, 0, 256).size,
+            0,
+        )
+
+    def test_full_indexed_c128_state_rejects_padding_slot_zero(self):
+        req_to_token = torch.zeros((1, 256), dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "unallocated Full KV slot"):
+            get_dsv4_full_indexed_c128_state_indices(req_to_token, 0, 129)
 
 
 if __name__ == "__main__":

@@ -106,7 +106,6 @@ def prepare_dspark_hicache_draft_plan(
     """
 
     target_runner = target_worker.model_runner
-    target_runner.mtp_draft_device_pools = ()
     if (
         not spec_algorithm.is_dspark()
         or not server_args.enable_hierarchical_cache
@@ -145,7 +144,6 @@ def prepare_dspark_hicache_draft_plan(
             "Full-to-SWA mapping."
         )
 
-    target_runner.mtp_draft_device_pools = (draft_pool,)
     return HiCacheDraftPlan(
         mode=HiCacheDraftMode.PACKED,
         device_pools=(draft_pool,),
