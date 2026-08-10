@@ -1218,6 +1218,36 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     weight_scale_inv.data = new_weight_scale_inv
 
 
+def requant_block_scale_ue8m0_for_deepgemm(
+    weight: torch.nn.Parameter,
+    weight_scale: torch.nn.Parameter,
+    weight_block_size: Optional[List[int]],
+    use_deepgemm_runner: bool,
+    output_dtype: Optional[torch.dtype] = None,
+    weight_shape=None,
+) -> bool:
+    """Requantize a supported block-FP8 weight scale for DeepGEMM."""
+    from sglang.srt.model_loader.utils import (
+        should_deepgemm_weight_requant_ue8m0,
+    )
+
+    if (
+        not use_deepgemm_runner
+        or weight_block_size != [128, 128]
+        or getattr(weight_scale, "format_ue8m0", False)
+        or not should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=weight_block_size,
+            output_dtype=output_dtype,
+            weight_shape=weight_shape,
+        )
+    ):
+        return False
+
+    requant_weight_ue8m0_inplace(weight, weight_scale, weight_block_size)
+    weight_scale.format_ue8m0 = True
+    return True
+
+
 def requant_weight_ue8m0(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
