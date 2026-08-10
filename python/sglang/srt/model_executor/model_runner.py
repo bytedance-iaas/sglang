@@ -2537,7 +2537,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if not self.spec_algorithm.is_dflash_family():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens,
+                    self.is_draft_worker,
+                )
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2688,7 +2693,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 spec_info = DFlashVerifyInput(
                     draft_token=None,
                     positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    draft_token_num=num_tokens_per_bs,
                     custom_mask=None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL

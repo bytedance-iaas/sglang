@@ -76,6 +76,11 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
+    def get_num_tokens_per_req_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        return num_draft_tokens
+
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

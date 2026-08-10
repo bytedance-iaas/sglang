@@ -6,6 +6,7 @@ from sglang.srt.arg_groups.speculative_hook import (
     _target_checkpoint_bundles_dspark_draft,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +63,31 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
 
 
 class TestDsparkDraftPathDefaulting(CustomTestCase):
+    def test_draft_and_target_cuda_graph_widths_are_distinct(self):
+        algo = SpeculativeAlgorithm.DSPARK
+        verify_num_draft_tokens = 6
+
+        self.assertEqual(
+            algo.get_num_tokens_per_req_for_target_verify(
+                verify_num_draft_tokens, is_draft_worker=True
+            ),
+            5,
+        )
+        self.assertEqual(
+            algo.get_num_tokens_per_req_for_target_verify(
+                verify_num_draft_tokens, is_draft_worker=False
+            ),
+            6,
+        )
+
+    def test_non_dspark_graph_width_is_unchanged(self):
+        self.assertEqual(
+            SpeculativeAlgorithm.DFLASH.get_num_tokens_per_req_for_target_verify(
+                6, is_draft_worker=True
+            ),
+            6,
+        )
+
     def test_bundled_checkpoint_defaults_draft_path_to_model_path(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()

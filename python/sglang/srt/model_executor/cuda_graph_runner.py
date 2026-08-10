@@ -617,7 +617,12 @@ class CudaGraphRunner:
                 ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = self.speculative_num_draft_tokens
+            self.num_tokens_per_bs = (
+                self.model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                    self.speculative_num_draft_tokens,
+                    self.model_runner.is_draft_worker,
+                )
+            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -1440,7 +1445,7 @@ class CudaGraphRunner:
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
