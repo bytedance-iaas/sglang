@@ -384,6 +384,11 @@ def compact_row_index_triton(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
     bs = verify_lens.shape[0]
+    # The fixed-width binary search converges only up to this batch size.
+    # Larger inputs would otherwise silently map compact rows to wrong requests.
+    assert bs <= 1 << (
+        _SEARCH_NBITS - 1
+    ), f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
     incl = torch.cumsum(verify_lens, dim=0).contiguous()
     req = torch.empty(padded_total, dtype=torch.int64, device=device)
     within = torch.empty(padded_total, dtype=torch.int64, device=device)

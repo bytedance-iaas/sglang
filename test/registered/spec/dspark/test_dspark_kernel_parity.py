@@ -23,6 +23,9 @@ from sglang.srt.speculative.dspark_components.kernels import (
     dspark_schedule,
     dspark_verify_window,
 )
+from sglang.srt.speculative.dspark_components.kernels.reject_sampling import (
+    chain_speculative_sampling_triton,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -247,6 +250,18 @@ def _case_compact_layout(tc):
             device=DEVICE,
         )
 
+    too_many_rows = torch.ones(
+        (1 << (dspark_verify_window._SEARCH_NBITS - 1)) + 1,
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    with tc.assertRaisesRegex(AssertionError, "row-index search capacity"):
+        dspark_verify_window.compact_row_index_triton(
+            verify_lens=too_many_rows,
+            padded_total=too_many_rows.numel(),
+            device=DEVICE,
+        )
+
 
 def _case_swa_page_indices(tc):
     torch.manual_seed(11)
@@ -358,6 +373,15 @@ def _case_sample_step_tokens(tc):
         exp_noise=torch.ones(1, 2050, device=DEVICE),
     )
     tc.assertEqual(tokens.item(), 1000)
+    # All-sentinel combine rows must clamp to a valid token id.
+    degenerate = torch.full((1, 2050), float("-inf"), device=DEVICE)
+    tokens = cls.triton(
+        step_logits=degenerate,
+        temperatures=torch.tensor([1.0], device=DEVICE),
+        greedy_mask=torch.tensor([True], device=DEVICE),
+        exp_noise=torch.ones(1, 2050, device=DEVICE),
+    )
+    tc.assertEqual(tokens.item(), 0)
     # Non-contiguous strided cropped view must match its contiguous copy.
     view = (torch.randn(2, 129536, device=DEVICE) * 4.0)[:, :VOCAB]
     tc.assertFalse(view.is_contiguous())
@@ -429,6 +453,35 @@ def _case_softmax_temp(tc):
     torch.testing.assert_close(got2, ref2, rtol=1e-5, atol=1e-7)
 
 
+def _case_nan_draft_probability_falls_back_to_target(tc):
+    vocab = 16
+    predicts = torch.full((2,), -1, dtype=torch.int64, device=DEVICE)
+    accept_index = torch.full((1, 2), -1, dtype=torch.int64, device=DEVICE)
+    accept_token_num = torch.zeros((1,), dtype=torch.int32, device=DEVICE)
+    candidates = torch.tensor([[0, 1]], dtype=torch.int64, device=DEVICE)
+    retrieve_index = torch.tensor([[0, 1]], dtype=torch.int64, device=DEVICE)
+    target_probs = torch.zeros((1, 2, vocab), device=DEVICE)
+    target_probs[:, :, 2] = 1.0
+
+    chain_speculative_sampling_triton(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        retrive_next_token=torch.zeros_like(retrieve_index),
+        retrive_next_sibling=torch.zeros_like(retrieve_index),
+        uniform_samples=torch.full((1, 1), 0.5, device=DEVICE),
+        uniform_samples_for_final_sampling=torch.full((1,), 0.5, device=DEVICE),
+        target_probs=target_probs,
+        draft_probs=torch.full((1, 1, vocab), float("nan"), device=DEVICE),
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+    tc.assertEqual(predicts[0].item(), 2)
+
+
 _CASES = [
     ("accept_greedy", _case_accept_greedy),
     ("accept_sampling", _case_accept_sampling),
@@ -449,6 +502,10 @@ _CASES = [
     ("scatter_compact_to_strided", _case_scatter_compact_to_strided),
     ("schedule_verify_lens_topk", _case_schedule_verify_lens_topk),
     ("softmax_temp", _case_softmax_temp),
+    (
+        "nan_draft_probability_falls_back_to_target",
+        _case_nan_draft_probability_falls_back_to_target,
+    ),
 ]
 
 
