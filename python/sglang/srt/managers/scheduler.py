@@ -1697,6 +1697,19 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        max_context_new_tokens = self.max_req_len - input_len - 1
+        if self.spec_algorithm.is_dspark():
+            # Until the context-boundary verifier fixes are backported, keep the
+            # two speculative windows used by target verify inside the model
+            # context.  This mirrors the req_to_token reservation headroom but
+            # protects model-visible positions rather than allocator storage.
+            max_draft_tokens = int(
+                self.server_args.max_speculative_num_draft_tokens or 0
+            )
+            max_context_new_tokens = (
+                self.max_req_len - input_len - 2 * max_draft_tokens
+            )
+
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -1705,7 +1718,7 @@ class Scheduler(
                     if req.sampling_params.max_new_tokens is not None
                     else 1 << 30
                 ),
-                self.max_req_len - input_len - 1,
+                max_context_new_tokens,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
@@ -1935,8 +1948,9 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req)
+        if self.spec_algorithm.is_dflash_family():
+            algorithm = "DSPARK" if self.spec_algorithm.is_dspark() else "DFLASH"
+            error_msg = validate_dflash_request(req, algorithm=algorithm)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)

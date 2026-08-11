@@ -763,9 +763,15 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def validate_dflash_request(req: Req) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, *, algorithm: str = "DFLASH"
+) -> Optional[str]:
+    algorithm = algorithm.upper()
     if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+        return (
+            f"{algorithm} speculative decoding does not support "
+            "return_logprob yet."
+        )
 
     if (
         req.sampling_params.json_schema is not None
@@ -774,7 +780,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         or req.sampling_params.structural_tag is not None
     ):
         return (
-            "DFLASH speculative decoding does not support "
+            f"{algorithm} speculative decoding does not support "
             "grammar-constrained decoding yet."
         )
 

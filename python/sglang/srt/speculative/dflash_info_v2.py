@@ -58,6 +58,27 @@ class DFlashDraftInputV2(SpecInput):
         if bs == 0:
             return
 
+        # Result-based speculative decoding bypasses ScheduleBatch's ordinary
+        # decode preparation.  Accumulate the tokens committed by the previous
+        # verify step here so frequency/presence/repetition penalties observe
+        # the same request history as non-speculative decoding.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            output_ids = torch.tensor(
+                [
+                    (
+                        req.output_ids[-1]
+                        if req.output_ids
+                        else req.origin_input_ids[-1]
+                    )
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                output_ids
+            )
+
         block_size = int(get_global_server_args().speculative_num_draft_tokens)
         if block_size <= 0:
             raise ValueError(

@@ -268,6 +268,11 @@ def _handle_dspark(server_args: "ServerArgs") -> None:
         raise ValueError(
             "DeepSeek-V4 DSpark does not support a separate MoE A2A backend."
         )
+    if server_args.enforce_shared_experts_fusion:
+        raise ValueError(
+            "DeepSeek-V4 DSpark uses separate shared experts in this backport; "
+            "--enforce-shared-experts-fusion is not supported."
+        )
     if server_args.enable_eic_cache:
         raise ValueError("DeepSeek-V4 DSpark does not support EIC in this backport.")
     if server_args.enable_hierarchical_cache:
