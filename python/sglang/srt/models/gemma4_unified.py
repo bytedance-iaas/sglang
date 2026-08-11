@@ -256,17 +256,40 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     def _embed_patches(
         self, items: List[MultimodalDataItem], position_attr: str
     ) -> torch.Tensor:
-        all_embeds = []
-        for item in items:
+        modality = "video" if position_attr == "video_position_ids" else "image"
+        logger.info(
+            "[Gemma4VisionPackTrace] stage=embed_begin modality=%s items=%d "
+            "execution=batched_shape_groups",
+            modality,
+            len(items),
+        )
+
+        device = self.language_model.device
+        dtype = self.language_model.dtype()
+
+        # Pass 1: flatten every (item, tensor) unit into an ordered slot list.
+        # Each slot is either a pre-embedded passthrough (filled immediately) or a
+        # projectable patch tensor that we defer so same-shaped units can be packed
+        # into a single vision_embedder/embed_vision call. The vision projection is
+        # row-independent (LN/RMSNorm/Linear/per-position posemb gather), so packing
+        # units along the batch dim and splitting the output back is numerically
+        # equivalent to projecting each unit separately.
+        results: List[Optional[torch.Tensor]] = []
+        # group key (num_patches, patch_dim) -> list of (slot, pv (B,P,D), pp (B,P,2))
+        groups: dict = {}
+        for item_index, item in enumerate(items):
             all_pixel_values = flatten_nested_list([item.feature])
             all_position_ids = flatten_nested_list([getattr(item, position_attr, None)])
             for pv_idx, pv in enumerate(all_pixel_values):
+                slot = len(results)
+                results.append(None)
+
                 # Pre-embedded passthrough (already at text hidden size).
                 if (
                     pv.dim() in (2, 3)
                     and pv.shape[-1] == self.config.text_config.hidden_size
                 ):
-                    all_embeds.append(pv.to(self.language_model.device))
+                    results[slot] = pv.to(device)
                     continue
 
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
@@ -287,19 +310,93 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 if pp.dim() == 2:
                     pp = pp.unsqueeze(0)
 
-                pv = pv.to(
-                    device=self.language_model.device, dtype=self.language_model.dtype()
-                )
-                pp = pp.to(device=self.language_model.device)
+                pv = pv.to(device=device, dtype=dtype)
+                pp = pp.to(device=device)
+                if modality == "video":
+                    logger.info(
+                        "[Gemma4VideoTrace] stage=model_input_ready item_index=%d "
+                        "pixel_values_shape=%s pixel_values_dtype=%s device=%s "
+                        "position_ids_device=%s",
+                        item_index,
+                        tuple(pv.shape),
+                        pv.dtype,
+                        pv.device,
+                        pp.device,
+                    )
 
-                embedded = self.vision_embedder(pv, pp)  # (B, P, mm_embed_dim)
-                projected = self.embed_vision(embedded)  # (B, P, hidden)
+                # Group by (num_patches, patch_dim); the batch dim (frames) may
+                # differ across units and is what we pack along.
+                key = (int(pv.shape[-2]), int(pv.shape[-1]))
+                groups.setdefault(key, []).append((slot, pv, pp))
 
-                # Drop padding patches (position_ids == -1 on both axes).
+        # Pass 2: one packed vision_embedder/embed_vision call per shape group.
+        projection_calls = 0
+        packed_batch_units = 0
+        for key, units in groups.items():
+            pv_cat = torch.cat([pv for _, pv, _ in units], dim=0)  # (sumB, P, D)
+            pp_cat = torch.cat([pp for _, _, pp in units], dim=0)  # (sumB, P, 2)
+
+            logger.info(
+                "[Gemma4VisionPackTrace] stage=projection_input modality=%s "
+                "call_index=%d group_key=%s units=%d input_shape=%s position_shape=%s "
+                "source_device=%s batch_units=%d",
+                modality,
+                projection_calls,
+                key,
+                len(units),
+                tuple(pv_cat.shape),
+                tuple(pp_cat.shape),
+                pv_cat.device,
+                pv_cat.shape[0],
+            )
+
+            embedded = self.vision_embedder(pv_cat, pp_cat)  # (sumB, P, mm_embed_dim)
+            projected = self.embed_vision(embedded)  # (sumB, P, hidden)
+            projection_calls += 1
+            packed_batch_units += int(pv_cat.shape[0])
+
+            # Split the packed output back per unit (by each unit's batch size),
+            # then drop padding patches (position_ids == -1 on both axes) per unit.
+            split_sizes = [int(pv.shape[0]) for _, pv, _ in units]
+            projected_units = torch.split(projected, split_sizes, dim=0)
+            valid_tokens = 0
+            for (slot, _, pp), proj_unit in zip(units, projected_units):
                 padding_mask = (pp == -1).all(dim=-1)  # (B, P)
-                all_embeds.append(projected[~padding_mask])
+                kept = proj_unit[~padding_mask]
+                results[slot] = kept
+                valid_tokens += int(kept.shape[0])
 
-        return torch.cat(all_embeds, dim=0) if all_embeds else self._empty_embeds()
+            logger.info(
+                "[Gemma4VisionPackTrace] stage=projection_output modality=%s "
+                "call_index=%d group_key=%s embedded_shape=%s projected_shape=%s "
+                "valid_tokens=%d",
+                modality,
+                projection_calls - 1,
+                key,
+                tuple(embedded.shape),
+                tuple(projected.shape),
+                valid_tokens,
+            )
+
+        logger.info(
+            "[Gemma4VisionPackTrace] stage=embed_pack modality=%s groups=%d "
+            "packed_batch_units=%d projection_calls=%d",
+            modality,
+            len(groups),
+            packed_batch_units,
+            projection_calls,
+        )
+
+        all_embeds = [r for r in results if r is not None]
+        output = torch.cat(all_embeds, dim=0) if all_embeds else self._empty_embeds()
+        logger.info(
+            "[Gemma4VisionPackTrace] stage=embed_end modality=%s projection_calls=%d "
+            "output_shape=%s",
+            modality,
+            projection_calls,
+            tuple(output.shape),
+        )
+        return output
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return self._embed_patches(items, "image_position_ids")

@@ -201,6 +201,10 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    # Cross-request vision packing for Gemma4 Unified: batch all cache-miss mm
+    # items of a prefill batch into one embedding call before the per-request
+    # chunk loop. Default off; the per-request path is byte-identical when unset.
+    SGLANG_GEMMA4_MM_BATCH_PACK = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.

@@ -8,7 +8,7 @@ import pickle
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -514,6 +514,7 @@ def _get_chunked_embedding_full(
     extend_seq_len: int,
     input_ids: torch.Tensor,
     device: torch.device,
+    precomputed_map: Optional[Dict[int, torch.Tensor]] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """
     Fallback: encode all items at once, cache combined result, extract chunk.
@@ -522,6 +523,20 @@ def _get_chunked_embedding_full(
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
+
+    # Cross-request precompute shortcut: only when every item was precomputed.
+    # The precompute pass never fills EVS items, so concatenation here is safe
+    # (EVS's stateful input_ids redistribution below is reached only on miss).
+    if (
+        embedding_per_req is None
+        and precomputed_map is not None
+        and embedding_items_per_req
+        and all(id(item) in precomputed_map for item in embedding_items_per_req)
+    ):
+        combined = torch.cat(
+            [precomputed_map[id(item)] for item in embedding_items_per_req], dim=0
+        )
+        embedding_per_req = EmbeddingResult(embedding=combined)
 
     if embedding_per_req is None:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
@@ -562,6 +577,7 @@ def _get_chunked_embedding_by_item(
     extend_prefix_len: int,
     extend_seq_len: int,
     device: torch.device,
+    precomputed_map: Optional[Dict[int, torch.Tensor]] = None,
 ) -> Optional[torch.Tensor]:
     """
     Per-image chunk-aware encoding: only encode images overlapping with the
@@ -585,10 +601,17 @@ def _get_chunked_embedding_by_item(
     if not overlapping:
         return None
 
-    # 2. Check per-image cache for each overlapping item
+    # 2. Resolve each overlapping item: cross-request precompute map first, then
+    # per-image cache; anything still missing is encoded in step 3.
     cached_embeddings = {}  # idx -> tensor
     miss_items = []  # (idx, item, start, end)
     for idx, item, start, end in overlapping:
+        precomputed = (
+            precomputed_map.get(id(item)) if precomputed_map is not None else None
+        )
+        if precomputed is not None:
+            cached_embeddings[idx] = precomputed
+            continue
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
@@ -626,6 +649,118 @@ def _get_chunked_embedding_by_item(
     return torch.cat(chunk_slices, dim=0)
 
 
+def _batch_precompute_miss_embeddings(
+    data_embedding_func: DataEmbeddingFunc,
+    embedding_items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """Cross-request vision packing (opt-in via SGLANG_GEMMA4_MM_BATCH_PACK).
+
+    Collects every cache-miss item that overlaps its request's current chunk
+    across ALL requests in the prefill batch, runs a SINGLE ``data_embedding_func``
+    call on the deduplicated set, and splits the packed output back per item by
+    each item's placeholder-token count. Returns ``{id(item): embedding}`` for the
+    per-request chunk loop to consume, avoiding one embedding call per request.
+
+    Only cache-miss items that the per-request loop will actually consume are
+    collected. Per-image (single-offset) items take the by_item path (encode only
+    chunk-overlapping items); multi-offset items (e.g. Gemma4 video: one token-run
+    per frame) take the full path (encode the whole request). Any non-Tensor result
+    (EVS) makes the whole map fall back to empty, i.e. the original behavior.
+    """
+    precomputed_map: Dict[int, torch.Tensor] = {}
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+
+    miss_items: List[MultimodalDataItem] = []
+    seen: Set[int] = set()
+    num_requests = 0
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+        items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        items_offset = items_offset_list[i]
+
+        chunk_start = prefix_length[i]
+        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+        chunk_end = chunk_start + extend_seq_len
+        if extend_seq_len <= 0:
+            continue
+        # Skip requests whose mm items are entirely before this chunk.
+        if all(offset_end < chunk_start for _, offset_end in items_offset):
+            continue
+
+        is_per_image = all(len(item.offsets) == 1 for item in items_per_req)
+        num_requests += 1
+
+        if is_per_image:
+            # by_item path: encode only items overlapping this chunk, using the
+            # per-item cache. items_offset is 1:1 with items here.
+            for item, offset in zip(items_per_req, items_offset):
+                start, end = offset
+                if not (end >= chunk_start and start < chunk_end):
+                    continue
+                if embedding_cache.get_single(item.hash) is not None:
+                    continue
+                key = id(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                miss_items.append(item)
+        else:
+            # full path: computes the whole request in one call and slices per
+            # chunk. Only precompute on a combined-hash miss, then collect every
+            # item so the full-path shortcut can consume them all.
+            if embedding_cache.get([it.hash for it in items_per_req]) is not None:
+                continue
+            for item in items_per_req:
+                key = id(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                miss_items.append(item)
+
+    if not miss_items:
+        return precomputed_map
+
+    _move_items_to_device(miss_items, device)
+    all_embedding = data_embedding_func(miss_items)
+    if not isinstance(all_embedding, torch.Tensor):
+        # EVS / structured result: not safe to split per-item here.
+        return {}
+    all_embedding = all_embedding.reshape(-1, all_embedding.shape[-1])
+
+    token_counts = [
+        sum(end - start + 1 for start, end in (item.offsets or []))
+        for item in miss_items
+    ]
+    if sum(token_counts) != all_embedding.shape[0]:
+        logger.warning(
+            "[Gemma4VisionPackTrace] stage=batch_precompute_fallback "
+            "reason=token_count_mismatch expected=%d got=%d",
+            sum(token_counts),
+            all_embedding.shape[0],
+        )
+        return {}
+
+    split_embeddings = torch.split(all_embedding, token_counts, dim=0)
+    for item, emb in zip(miss_items, split_embeddings):
+        precomputed_map[id(item)] = emb
+
+    logger.info(
+        "[Gemma4VisionPackTrace] stage=batch_precompute requests=%d miss_items=%d "
+        "packed_output_shape=%s token_counts=%s",
+        num_requests,
+        len(miss_items),
+        tuple(all_embedding.shape),
+        token_counts,
+    )
+    return precomputed_map
+
+
 def _get_chunked_prefill_embedding(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -643,6 +778,22 @@ def _get_chunked_prefill_embedding(
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
+
+    # Opt-in cross-request vision packing: precompute all cache-miss items of the
+    # whole prefill batch in a single embedding call, keyed by id(item). The
+    # per-request loop below reads this map first, so the underlying model's
+    # embedding function is invoked once for the batch instead of once per request.
+    precomputed_map: Optional[Dict[int, torch.Tensor]] = None
+    if envs.SGLANG_GEMMA4_MM_BATCH_PACK.get():
+        precomputed_map = _batch_precompute_miss_embeddings(
+            data_embedding_func,
+            embedding_items,
+            items_size,
+            prefix_length,
+            extend_length,
+            items_offset_list,
+            device,
+        )
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -671,6 +822,7 @@ def _get_chunked_prefill_embedding(
                 extend_prefix_len,
                 extend_seq_len,
                 device,
+                precomputed_map,
             )
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
@@ -683,6 +835,7 @@ def _get_chunked_prefill_embedding(
                 extend_seq_len,
                 input_ids,
                 device,
+                precomputed_map,
             )
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)

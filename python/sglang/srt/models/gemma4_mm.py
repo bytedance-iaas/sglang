@@ -641,6 +641,30 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 mask_dtype=torch.bool,
             )
 
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.contains_mm_inputs()
+        ):
+            per_request_items = []
+            for request_index, mm_inputs in enumerate(forward_batch.mm_inputs):
+                if mm_inputs is None:
+                    continue
+                per_request_items.append(
+                    {
+                        "request_index": request_index,
+                        "image_items": sum(item.is_image() for item in mm_inputs.mm_items),
+                        "video_items": sum(item.is_video() for item in mm_inputs.mm_items),
+                        "audio_items": sum(item.is_audio() for item in mm_inputs.mm_items),
+                    }
+                )
+            logger.info(
+                "[Gemma4VisionPackTrace] stage=prefill_batch batch_size=%d "
+                "mm_requests=%d items_per_request=%s dispatcher=request_serial",
+                forward_batch.batch_size,
+                len(per_request_items),
+                per_request_items,
+            )
+
         # general_mm_embed_routine already handles PP: it skips the embedding
         # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.
         hidden_states = general_mm_embed_routine(
