@@ -108,7 +108,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
         speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
+            get_global_server_args().effective_speculative_algorithm
         )
         if MOE_NVFP4_DISPATCH and not speculative_algo.is_eagle():
             total_dispatch_payload_size_per_token = (

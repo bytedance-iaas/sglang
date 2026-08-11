@@ -16,6 +16,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 def _args(*, page_size, draft_tokens, algorithm="DSPARK", steps=1, topk=1):
     return SimpleNamespace(
         speculative_algorithm=algorithm,
+        effective_speculative_algorithm=algorithm,
         speculative_num_steps=steps,
         speculative_eagle_topk=topk,
         max_speculative_num_draft_tokens=draft_tokens,
@@ -42,6 +43,11 @@ class TestReqToTokenRowHeadroom(unittest.TestCase):
     def test_non_spec_headroom_is_unchanged(self):
         args = _args(page_size=256, draft_tokens=None, algorithm=None)
         self.assertEqual(get_req_to_token_extra_context_len(args), 4)
+
+    def test_prefill_peer_dspark_uses_speculative_headroom(self):
+        args = _args(page_size=256, draft_tokens=6, algorithm=None)
+        args.effective_speculative_algorithm = "DSPARK"
+        self.assertEqual(get_req_to_token_extra_context_len(args), 267)
 
 
 if __name__ == "__main__":

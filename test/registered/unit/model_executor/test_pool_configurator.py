@@ -383,6 +383,7 @@ class TestDSV4DSparkDraftKvBudget(unittest.TestCase):
             server_args=SimpleNamespace(
                 swa_full_tokens_ratio=0.1,
                 speculative_algorithm="DSPARK",
+                effective_speculative_algorithm="DSPARK",
                 max_speculative_num_draft_tokens=6,
             ),
             enable_hisparse=False,

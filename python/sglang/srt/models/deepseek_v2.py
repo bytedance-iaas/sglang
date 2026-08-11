@@ -1806,7 +1806,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
+            get_global_server_args().effective_speculative_algorithm
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.layer_id = layer_id

@@ -355,7 +355,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
-        self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.is_speculative = (
+            mr.server_args.effective_speculative_algorithm is not None
+        )
         self.online_c128_mtp_max_draft_tokens = (
             mr.server_args.max_speculative_num_draft_tokens or 0
         )

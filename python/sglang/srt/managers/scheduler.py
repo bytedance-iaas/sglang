@@ -345,7 +345,7 @@ class Scheduler(
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            server_args.effective_speculative_algorithm
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache

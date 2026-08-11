@@ -530,7 +530,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
+        is_speculative = server_args.effective_speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):

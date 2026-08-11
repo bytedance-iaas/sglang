@@ -65,6 +65,7 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
     )
+    effective_algorithm = server_args.effective_speculative_algorithm
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
@@ -75,18 +76,18 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if effective_algorithm not in ("EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
                 "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
-                server_args.speculative_algorithm,
+                effective_algorithm,
             )
 
-    if server_args.speculative_algorithm is not None:
+    if effective_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
-        algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+        algo = SpeculativeAlgorithm.from_string(effective_algorithm)
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
@@ -98,15 +99,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
-    if server_args.speculative_algorithm == "DFLASH":
+    if effective_algorithm == "DFLASH":
         _handle_dflash(server_args)
-    elif server_args.speculative_algorithm == "DSPARK":
+    elif effective_algorithm == "DSPARK":
         _handle_dspark(server_args)
-    elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
+    elif effective_algorithm == "FROZEN_KV_MTP":
         _handle_frozen_kv_mtp(server_args)
-    elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+    elif effective_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
         _handle_eagle_family(server_args)
-    elif server_args.speculative_algorithm == "NGRAM":
+    elif effective_algorithm == "NGRAM":
         _handle_ngram(server_args)
 
     if server_args.speculative_adaptive:

@@ -577,7 +577,9 @@ class CudaGraphRunner:
             hf_config = model_runner.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.speculative_algorithm = (
+            model_runner.server_args.effective_speculative_algorithm
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )

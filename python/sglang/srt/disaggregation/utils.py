@@ -739,7 +739,7 @@ def setup_state_kv_args(
     from sglang.srt.server_args import get_global_server_args
 
     is_dsv4_dspark = (
-        get_global_server_args().speculative_algorithm == "DSPARK"
+        get_global_server_args().uses_dspark_pd_state_layout()
         and not is_npu()
         and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
     )

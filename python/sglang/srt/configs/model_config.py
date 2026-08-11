@@ -416,7 +416,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
-            speculative_algorithm=server_args.speculative_algorithm,
+            speculative_algorithm=server_args.effective_speculative_algorithm,
             **kwargs,
         )
 

@@ -948,7 +948,7 @@ class Req(ReqDllmMixin):
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        spec_alg = get_global_server_args().speculative_algorithm
+        spec_alg = get_global_server_args().effective_speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property

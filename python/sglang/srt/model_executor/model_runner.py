@@ -448,7 +448,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_config.is_multimodal_chunked_prefill_supported
         )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            server_args.effective_speculative_algorithm
         )
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool

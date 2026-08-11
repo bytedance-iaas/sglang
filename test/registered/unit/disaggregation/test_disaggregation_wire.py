@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
     unpack_state_types,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -123,6 +124,7 @@ class TestDisaggregationWire(unittest.TestCase):
         target.swa_page_size = 256
         target.swa_window_size = 4096
         target.full_to_swa_index_mapping = mapping
+        target.get_state_buf_infos = lambda: ([10, 40], [20, 50], [30, 60])
         target.get_dspark_pd_state_buf_infos = lambda: ([10], [20], [30])
         target.get_dspark_pd_state_layer_ids = lambda: [7]
         target.get_c128_state_buf_infos = lambda: ([40], [50], [60])
@@ -136,14 +138,33 @@ class TestDisaggregationWire(unittest.TestCase):
         draft.full_to_swa_index_mapping = mapping
         draft.get_state_buf_infos = lambda: ([70], [80], [90])
 
+        prefill_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_peer_speculative_algorithm="DSPARK",
+        )
+        self.assertIsNone(prefill_args.speculative_algorithm)
+
         with patch(
             "sglang.srt.server_args.get_global_server_args",
-            return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            return_value=prefill_args,
         ):
             nonfinal = SimpleNamespace()
             setup_state_kv_args(nonfinal, target, draft_token_to_kv_pool=None)
             final = SimpleNamespace()
             setup_state_kv_args(final, target, draft_token_to_kv_pool=draft)
+
+        decode_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            speculative_algorithm="DSPARK",
+        )
+        with patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=decode_args,
+        ):
+            decode = SimpleNamespace()
+            setup_state_kv_args(decode, target, draft_token_to_kv_pool=draft)
 
         self.assertEqual(
             nonfinal.state_types,
@@ -155,6 +176,22 @@ class TestDisaggregationWire(unittest.TestCase):
             [StateType.SWA, StateType.C128_STATE, StateType.SWA],
         )
         self.assertEqual(final.state_layer_ids[-1], [1_000_000])
+        self.assertEqual(final.state_types, decode.state_types)
+        self.assertEqual(final.state_layer_ids, decode.state_layer_ids)
+
+        legacy_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+        )
+        with patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=legacy_args,
+        ):
+            legacy = SimpleNamespace()
+            setup_state_kv_args(legacy, target, draft_token_to_kv_pool=None)
+
+        self.assertEqual(legacy.state_types, [StateType.SWA])
+        self.assertEqual(legacy.state_layer_ids, [[]])
 
 
 if __name__ == "__main__":

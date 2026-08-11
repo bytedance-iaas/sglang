@@ -654,7 +654,8 @@ class ModelRunnerKVCacheMixin:
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
+                            self.server_args.effective_speculative_algorithm
+                            is not None
                         ),
                     )
                 else:
@@ -679,7 +680,8 @@ class ModelRunnerKVCacheMixin:
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
+                            self.server_args.effective_speculative_algorithm
+                            is not None
                         ),
                     )
 

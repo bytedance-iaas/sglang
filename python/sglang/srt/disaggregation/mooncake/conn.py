@@ -1033,7 +1033,7 @@ class MooncakeKVManager(CommonKVManager):
                     target_rank_registration_info.dst_state_types,
                     i,
                     require_metadata=(
-                        self.server_args.speculative_algorithm == "DSPARK"
+                        self.server_args.uses_dspark_pd_state_layout()
                     ),
                 )
                 dst_data_ptrs = (

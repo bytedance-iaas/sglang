@@ -10,7 +10,7 @@ def get_alloc_len_per_decode(
     *,
     max_draft_tokens: Optional[int] = None,
 ) -> int:
-    if server_args.speculative_algorithm is None:
+    if server_args.effective_speculative_algorithm is None:
         return 1
 
     spec_steps = int(server_args.speculative_num_steps or 1)
@@ -51,7 +51,7 @@ def get_alloc_reserve_per_decode(
 def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """Headroom required beyond the model context in each request row."""
 
-    if server_args.speculative_algorithm is None:
+    if server_args.effective_speculative_algorithm is None:
         return 4
     max_draft_tokens = int(server_args.max_speculative_num_draft_tokens or 0)
     return max(
