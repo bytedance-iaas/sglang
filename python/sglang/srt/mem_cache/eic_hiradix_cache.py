@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
+from sglang.srt.mem_cache.common import swa_retained_tail
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
@@ -301,6 +302,14 @@ class EICHiRadixCache(RadixCache):
             if reason is not None:
                 raise ValueError(f"EIC host load-back under PP: {reason}")
         super().__init__(params)
+
+        # Scheme B: SWA isn't persisted to L2; init_next_round_input drops this
+        # many trailing tokens from the match so they re-prefill locally.
+        self.swa_l2_recompute_tail = (
+            swa_retained_tail(self.sliding_window_size, self.page_size)
+            if self.sliding_window_size is not None
+            else 0
+        )
 
         self.save_decode_cache = True
         config_file = get_eic_config_file_path()

@@ -1046,6 +1046,14 @@ class Req(ReqDllmMixin):
 
         token_ids_to_match = self.fill_ids[: self._compute_max_prefix_len(input_len)]
 
+        # SWA KV isn't in L2; drop the last recompute_tail tokens from the match
+        # so they re-prefill and rebuild their SWA window locally.
+        recompute_tail = getattr(tree_cache, "swa_l2_recompute_tail", 0)
+        if recompute_tail:
+            token_ids_to_match = token_ids_to_match[
+                : max(0, len(token_ids_to_match) - recompute_tail)
+            ]
+
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
