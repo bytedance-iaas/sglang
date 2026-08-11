@@ -344,9 +344,13 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    # DSPARK uses a separate draft worker even when the target config bundles
+    # MTP layers, so its target and draft stages can follow the PP-local
+    # lifecycle implemented by the DSpark worker.
     assert (
         (not model_has_mtp_layers)
         or spec_algorithm.is_none()
+        or spec_algorithm.is_dspark()
         or num_effective_layers == model_num_layers
     ), "PP is not compatible with MTP models."
 

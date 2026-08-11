@@ -74,7 +74,10 @@ class TestModelRunnerLayerSetup(CustomTestCase):
         )
 
     def test_partial_mtp_pp_remains_rejected(self):
-        spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        spec_algorithm = SimpleNamespace(
+            is_none=lambda: False,
+            is_dspark=lambda: False,
+        )
         _assert_pp_mtp_compat(
             model_has_mtp_layers=True,
             spec_algorithm=spec_algorithm,
@@ -88,6 +91,18 @@ class TestModelRunnerLayerSetup(CustomTestCase):
                 num_effective_layers=2,
                 model_num_layers=3,
             )
+
+    def test_partial_dspark_pp_is_allowed(self):
+        spec_algorithm = SimpleNamespace(
+            is_none=lambda: False,
+            is_dspark=lambda: True,
+        )
+        _assert_pp_mtp_compat(
+            model_has_mtp_layers=True,
+            spec_algorithm=spec_algorithm,
+            num_effective_layers=6,
+            model_num_layers=43,
+        )
 
 
 if __name__ == "__main__":
