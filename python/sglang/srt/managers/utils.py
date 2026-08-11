@@ -31,6 +31,8 @@ class GenerationBatchResult:
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    num_block_accept_tokens: int = 0
+    num_cap_tokens: int = 0
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -46,6 +48,13 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+
+    block_accept_lens: Optional[torch.Tensor] = None
+
+    cap_lens: Optional[torch.Tensor] = None
+
+    # Next-iteration sequence lengths produced by result-based spec workers.
+    new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -95,14 +104,27 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
+        if (
+            return_hidden_states
+            and self.logits_output is not None
+            and self.logits_output.hidden_states is not None
+        ):
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        if torch.is_tensor(self.next_token_ids):
+            self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = self.block_accept_lens.to(
+                "cpu", non_blocking=True
+            )
+
+        if self.cap_lens is not None:
+            self.cap_lens = self.cap_lens.to("cpu", non_blocking=True)
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()

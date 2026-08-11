@@ -2216,7 +2216,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
-        if self.is_spec_v2:
+        if self.uses_result_based_spec:
             return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
         server_args = get_global_server_args()
@@ -2370,6 +2370,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    @property
+    def uses_result_based_spec(self) -> bool:
+        """Whether accepted tokens and next state are returned to the scheduler.
+
+        This fork still runs EAGLE/DFLASH through the legacy worker-owned result
+        path. Bundled DSpark is deliberately non-overlap, but its worker follows
+        the newer result-based contract used by upstream spec-v2 workers.
+        """
+        return self.is_spec_v2 or self.spec_algorithm.is_dspark()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2381,9 +2391,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if self.is_spec_v2:
+        if self.uses_result_based_spec:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
+            if draft_input is None:
+                raise RuntimeError(
+                    "Result-based speculative decode requires draft state before "
+                    f"prepare_for_decode ({self.spec_algorithm=})."
+                )
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2551,7 +2566,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
+        has_been_filtered = (
+            v1_spec_info_filtered and not self.uses_result_based_spec
+        )
 
         if self.spec_info:
             self.spec_info.filter_batch(
