@@ -6,6 +6,10 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_draft import (

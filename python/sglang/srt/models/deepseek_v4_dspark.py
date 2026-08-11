@@ -88,7 +88,13 @@ class _BlockFp8LinearSlice(nn.Module):
                 "block-quantized Fp8LinearMethod."
             )
 
-        block_k = int(quant_method.weight_block_size[1])
+        weight_block_size = quant_method.quant_config.weight_block_size
+        if weight_block_size is None or len(weight_block_size) != 2:
+            raise ValueError(
+                "DSpark block-FP8 projection slice requires a two-dimensional "
+                "weight_block_size."
+            )
+        block_k = int(weight_block_size[1])
         if feature_width % block_k != 0:
             raise ValueError(
                 f"DSpark feature width {feature_width} must align to FP8 "

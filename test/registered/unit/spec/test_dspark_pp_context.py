@@ -27,7 +27,6 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
     _BlockFp8LinearSlice,
 )
-from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
     resolve_single_owner_pp_rank,
     use_lifecycle_only_draft_model,
@@ -72,6 +71,7 @@ def _make_deepseek_v4_dspark_projection_model(
     model.confidence_head = torch.nn.Identity()
     model.embed_tokens = None
     model.lm_head = None
+    model.is_lifecycle_only = False
     model._partial_feature_indices = ()
     model._partial_main_proj = None
     return model
@@ -345,12 +345,9 @@ class TestDSparkPPContext(CustomTestCase):
         """PP partial projections must preserve the full pre-norm FC result."""
         torch.manual_seed(0)
         hidden_size = 4
-        model = DFlashDraftModel.__new__(DFlashDraftModel)
-        torch.nn.Module.__init__(model)
-        model.config = SimpleNamespace(hidden_size=hidden_size)
-        model.num_context_features = 3
-        model.fc = torch.nn.Linear(3 * hidden_size, hidden_size, bias=False)
-        model.hidden_norm = RMSNorm(hidden_size, eps=1e-6)
+        model = _make_deepseek_v4_dspark_projection_model(
+            hidden_size=hidden_size, num_target_features=3
+        )
 
         feature_hidden = [
             torch.randn(5, hidden_size, dtype=torch.float32) for _ in range(3)
@@ -363,7 +360,7 @@ class TestDSparkPPContext(CustomTestCase):
             [0, 2],
         )
         stage_1 = model.project_target_hidden_partial(feature_hidden[1], [1])
-        pp_projected = model.hidden_norm(stage_0 + stage_1)
+        pp_projected = model.stages[0].main_norm(stage_0 + stage_1)
 
         torch.testing.assert_close(pp_projected, full_projected)
 
