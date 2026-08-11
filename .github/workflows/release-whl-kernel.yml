@@ -114,6 +114,13 @@ jobs:
           BUILD_JOBS: ${{ inputs.build_jobs }}
           NVCC_THREADS: ${{ inputs.nvcc_threads }}
           USE_CCACHE: ${{ inputs.use_ccache }}
+          RESET_BUILDER: ${{ github.repository == 'bytedance-iaas/sglang' && '1' || '0' }}
+          HTTP_PROXY: ${{ github.repository == 'bytedance-iaas/sglang' && 'http://100.68.162.211:3128' || '' }}
+          HTTPS_PROXY: ${{ github.repository == 'bytedance-iaas/sglang' && 'http://100.68.162.211:3128' || '' }}
+          http_proxy: ${{ github.repository == 'bytedance-iaas/sglang' && 'http://100.68.162.211:3128' || '' }}
+          https_proxy: ${{ github.repository == 'bytedance-iaas/sglang' && 'http://100.68.162.211:3128' || '' }}
+          NO_PROXY: ${{ github.repository == 'bytedance-iaas/sglang' && 'localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com' || '' }}
+          no_proxy: ${{ github.repository == 'bytedance-iaas/sglang' && 'localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com' || '' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

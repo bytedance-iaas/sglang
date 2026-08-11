@@ -25,6 +25,20 @@ mkdir -p "${BUILDX_CACHE_DIR}" "${CCACHE_HOST_DIR}"
 
 # Ensure a buildx builder with docker-container driver (required for cache export)
 BUILDER_NAME="sgl-kernel-builder"
+BUILDER_DRIVER_OPTS=(--driver-opt network=host)
+BUILD_ARGS=()
+RUNTIME_PROXY_ENVS=()
+PROXY_ENV_COUNT=0
+for proxy_var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+  proxy_value="${!proxy_var:-}"
+  if [ -n "${proxy_value}" ]; then
+    BUILDER_DRIVER_OPTS+=(--driver-opt "env.${proxy_var}=${proxy_value}")
+    BUILD_ARGS+=(--build-arg "${proxy_var}=${proxy_value}")
+    RUNTIME_PROXY_ENVS+=(-e "${proxy_var}=${proxy_value}")
+    PROXY_ENV_COUNT=$((PROXY_ENV_COUNT + 1))
+  fi
+done
+
 # RESET_BUILDER=1 removes and recreates the builder to clear corrupted internal
 # state (e.g. stale containerd snapshots from base image layer GC).
 if [ "${RESET_BUILDER:-0}" = "1" ]; then
@@ -34,7 +48,7 @@ if [ "${RESET_BUILDER:-0}" = "1" ]; then
   mkdir -p "${BUILDX_CACHE_DIR}"
 fi
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap
+  docker buildx create --name "${BUILDER_NAME}" --driver docker-container "${BUILDER_DRIVER_OPTS[@]}" --use --bootstrap
 else
   docker buildx use "${BUILDER_NAME}"
 fi
@@ -60,10 +74,10 @@ echo "BUILD_JOBS:     ${BUILD_JOBS:-auto}"
 echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
+echo "Proxy envs:     ${PROXY_ENV_COUNT}"
 echo "----------------------------------------"
 
 # Optional build-args (empty string disables)
-BUILD_ARGS=()
 [ -n "${ENABLE_CMAKE_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE}")
 [ -n "${ENABLE_BUILD_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE}")
 [ -n "${USE_CCACHE:-}" ]           && BUILD_ARGS+=(--build-arg USE_CCACHE="${USE_CCACHE}")
@@ -102,6 +116,7 @@ docker run --rm \
   -v "$(pwd):/sgl-kernel" \
   -v "${CCACHE_HOST_DIR}:/ccache" \
   -w /sgl-kernel \
+  "${RUNTIME_PROXY_ENVS[@]}" \
   -e ARCH="${ARCH}" \
   "${DEPS_TAG}" \
   bash -c '
