@@ -651,7 +651,11 @@ def unpack_state_types(data: bytes):
 
 
 def resolve_state_component_dst_index(
-    src_state_types, dst_state_types, src_index: int
+    src_state_types,
+    dst_state_types,
+    src_index: int,
+    *,
+    require_metadata: bool = False,
 ) -> int:
     """Match state components by ``(StateType, occurrence)``.
 
@@ -659,6 +663,10 @@ def resolve_state_component_dst_index(
     behavior for wire compatibility.
     """
     if not dst_state_types:
+        if require_metadata:
+            raise RuntimeError(
+                "Destination state_types metadata is required for this transfer."
+            )
         return src_index
     if not src_state_types:
         raise RuntimeError(
@@ -734,7 +742,6 @@ def setup_state_kv_args(
         get_global_server_args().speculative_algorithm == "DSPARK"
         and not is_npu()
         and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
     )
 
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
@@ -808,9 +815,12 @@ def setup_state_kv_args(
     # Bundled DSV4 DSpark stores draft KV in a SWA-only DSV4 pool that shares
     # the target allocator and Full -> SWA mapping. Keep it as a second SWA
     # component so heterogeneous target state cannot shift the draft payload.
-    if (
-        is_dsv4_dspark
-    ):
+    if is_dsv4_dspark and draft_token_to_kv_pool is not None:
+        if not isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            raise RuntimeError(
+                "DSV4 DSpark draft state transfer requires a "
+                "DeepSeekV4TokenToKVPool draft pool"
+            )
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
         ):

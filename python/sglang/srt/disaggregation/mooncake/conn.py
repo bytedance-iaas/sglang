@@ -1032,6 +1032,9 @@ class MooncakeKVManager(CommonKVManager):
                     state_types,
                     target_rank_registration_info.dst_state_types,
                     i,
+                    require_metadata=(
+                        self.server_args.speculative_algorithm == "DSPARK"
+                    ),
                 )
                 dst_data_ptrs = (
                     target_rank_registration_info.dst_state_data_ptrs[
