@@ -102,7 +102,11 @@ def validate_dspark_decode_input(
     tp_rank: int,
     enable_dp_attention: bool,
 ) -> None:
-    """Validate active/idle DSpark state before proposal or DP collectives."""
+    """Validate DSpark state before allocating the target verify window.
+
+    ``batch.out_cache_loc`` is intentionally not an input contract here. The
+    verify window allocator creates those locations later in ``_forward_decode``.
+    """
 
     details = _dspark_decode_contract_details(
         batch=batch,
@@ -147,14 +151,6 @@ def validate_dspark_decode_input(
             fail(f"{name} dtype must be {expected_dtype}")
         if tensor.device != seq_lens.device:
             fail(f"{name} must be on {seq_lens.device}")
-
-    out_cache_loc = batch.out_cache_loc
-    if out_cache_loc is None:
-        fail("out_cache_loc is None")
-    if out_cache_loc.ndim != 1 or out_cache_loc.dtype != torch.int64:
-        fail("out_cache_loc must be a one-dimensional int64 tensor")
-    if out_cache_loc.device != seq_lens.device:
-        fail(f"out_cache_loc must be on {seq_lens.device}")
 
     if enable_dp_attention:
         global_num_tokens = batch.global_num_tokens

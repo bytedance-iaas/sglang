@@ -37,7 +37,7 @@ def _decode_batch(bs: int, *, idle: bool = False):
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.DECODE,
         seq_lens=torch.arange(10, 10 + bs, dtype=torch.int64),
         req_pool_indices=torch.arange(bs, dtype=torch.int64),
-        out_cache_loc=torch.arange(bs, dtype=torch.int64),
+        out_cache_loc=None,
         global_num_tokens=[bs, 0],
         global_num_tokens_for_logprob=[0, 0],
     )
@@ -144,7 +144,7 @@ class TestDSparkPDBuilder(unittest.TestCase):
 
 
 class TestDSparkDecodeContract(unittest.TestCase):
-    def test_active_and_idle_contracts(self):
+    def test_active_and_idle_contracts_allow_unallocated_verify_window(self):
         validate_dspark_decode_input(
             batch=_decode_batch(1),
             draft_input=_draft_input(1),
@@ -157,6 +157,17 @@ class TestDSparkDecodeContract(unittest.TestCase):
             draft_input=DFlashDraftInputV2.create_idle_input(torch.device("cpu")),
             dp_rank=1,
             tp_rank=1,
+            enable_dp_attention=True,
+        )
+
+    def test_prebuilt_contract_allows_unallocated_verify_window(self):
+        batch = _decode_batch(8)
+        batch.forward_mode = ForwardMode.PREBUILT
+        validate_dspark_decode_input(
+            batch=batch,
+            draft_input=_draft_input(8),
+            dp_rank=0,
+            tp_rank=0,
             enable_dp_attention=True,
         )
 

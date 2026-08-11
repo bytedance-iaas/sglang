@@ -54,9 +54,9 @@ def _run_dp_rank(rank: int, port: int, result_queue) -> None:
                 req_pool_indices=torch.arange(
                     local_bs, dtype=torch.int64, device=device
                 ),
-                out_cache_loc=torch.arange(
-                    local_bs, dtype=torch.int64, device=device
-                ),
+                # The target verify window is allocated after this entry
+                # contract is checked, so no cache locations exist yet.
+                out_cache_loc=None,
                 global_num_tokens=[
                     1 if dp_rank in active_ranks else 0
                     for dp_rank in range(_WORLD_SIZE)
