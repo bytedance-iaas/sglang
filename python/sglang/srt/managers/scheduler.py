@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -238,7 +239,12 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -885,9 +891,22 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # Draft workers resolve model, loader, context-length, and attention
+        # settings independently from the target.  Never apply draft overrides
+        # to the target's ServerArgs instance.
+        draft_server_args = deepcopy(self.server_args)
+        if draft_server_args.speculative_draft_load_format is not None:
+            draft_server_args.load_format = (
+                draft_server_args.speculative_draft_load_format
+            )
+            logger.info(
+                "Using draft model load_format: %r",
+                draft_server_args.speculative_draft_load_format,
+            )
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
-            server_args=self.server_args,
+            server_args=draft_server_args,
             gpu_id=self.ps.gpu_id,
             tp_rank=self.ps.tp_rank,
             moe_ep_rank=self.ps.moe_ep_rank,
@@ -902,23 +921,20 @@ class Scheduler(
             # ParallelState. Keep the fork's legacy kwargs for every other
             # speculative worker.
             draft_worker_kwargs = dict(
-                server_args=self.server_args,
+                server_args=draft_server_args,
                 gpu_id=self.ps.gpu_id,
                 ps=self.ps,
                 nccl_port=self.nccl_port,
                 target_worker=self.tp_worker,
             )
 
-        if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.load_format = (
-                self.server_args.speculative_draft_load_format
-            )
-            logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
-            )
-
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
+        saved_server_args = get_global_server_args()
+        try:
+            set_global_server_args_for_scheduler(draft_server_args)
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        finally:
+            set_global_server_args_for_scheduler(saved_server_args)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
