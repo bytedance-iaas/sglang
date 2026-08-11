@@ -73,6 +73,8 @@ class DFlashDraftInputV2(SpecInput):
         max_top_k = 1
         uniform_top_k = None
         is_uniform = True
+        max_reserved_len = 0
+        max_reserved_req = None
         for index, req in enumerate(batch.reqs):
             committed = int(req.kv_committed_len)
             current = int(req.kv_allocated_len)
@@ -81,6 +83,14 @@ class DFlashDraftInputV2(SpecInput):
             committed_lens[index] = committed
             current_lens[index] = current
             reserved_lens[index] = reserved
+            if reserved > max_reserved_len:
+                max_reserved_len = reserved
+                max_reserved_req = (
+                    getattr(req, "rid", None),
+                    committed,
+                    current,
+                    reserved,
+                )
             committed_sum += committed
             reserved_sum += reserved
             needed += reserved - current
@@ -92,6 +102,18 @@ class DFlashDraftInputV2(SpecInput):
 
         self.max_top_k = max_top_k
         self.uniform_top_k_value = uniform_top_k if is_uniform else None
+
+        row_width = int(batch.req_to_token_pool.req_to_token.shape[1])
+        if max_reserved_len > row_width:
+            rid, committed, allocated, reserved = max_reserved_req
+            raise RuntimeError(
+                "DFLASH decode reservation exceeds the req_to_token row before "
+                "KV allocation: "
+                f"rid={rid!r}, committed={committed}, allocated={allocated}, "
+                f"reserved={reserved}, row_width={row_width}, "
+                f"page_size={batch.token_to_kv_pool_allocator.page_size}, "
+                f"max_draft_tokens={block_size}."
+            )
 
         current_gpu = current_lens.to(batch.device, non_blocking=True)
         reserved_gpu = reserved_lens.to(batch.device, non_blocking=True)

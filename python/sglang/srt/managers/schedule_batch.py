@@ -2238,9 +2238,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
-        from sglang.srt.managers.utils import get_alloc_len_per_decode
+        from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 
-        alloc_len = get_alloc_len_per_decode()
+        alloc_len = get_alloc_len_per_decode(get_global_server_args())
         total = 0
         for r in requests:
             x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
