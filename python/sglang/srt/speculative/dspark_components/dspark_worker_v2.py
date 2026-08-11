@@ -460,12 +460,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
-        # thread the per-token state_slot + the req's final position so the
-        # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
+        # Request-scoped draft rings are keyed by (draft req slot, position).
+        # Keep only the last SWA window because older prefill tokens wrap onto
+        # the same rows during a long chunk.
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        draft_pool = self.draft_model_runner.token_to_kv_pool
+        if is_unified_kv_triton() or draft_pool.uses_draft_swa_ring:
             repeats = ctx_lens.to(torch.int64)
             state_slot = torch.repeat_interleave(
                 batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats

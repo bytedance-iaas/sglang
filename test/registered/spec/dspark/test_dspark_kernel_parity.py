@@ -194,6 +194,25 @@ def _case_causal_swa_page_indices(tc):
         tc.assertTrue(bool((got[~attended] == -1).all()))
 
 
+def _case_causal_swa_ring_indices(tc):
+    swa, ring_stride, num_pool, num_q = 128, 256, 64, 40
+    g = torch.Generator(device=DEVICE).manual_seed(71)
+    kw = dict(
+        req_pool_indices_repeated=_ri(
+            0, num_pool, (num_q,), torch.int32, g
+        ),
+        swa_window=swa,
+        ring_stride=ring_stride,
+        page_index_aligned_size=96,
+    )
+    for lo, hi in ((1, swa), (swa - 4, swa + 4), (swa + 1, 600)):
+        tc._parity(
+            attn_metadata_kernels.BuildCausalSwaRingIndices,
+            seq_lens_casual=_ri(lo, hi, (num_q,), torch.int32, g),
+            **kw,
+        )
+
+
 def _case_commit_inject_layout(tc):
     stride, num_pool, pool_len, n_full, bs = 7, 300, 400, 50000, 64
     g = torch.Generator(device=DEVICE).manual_seed(8)
@@ -297,6 +316,18 @@ def _case_swa_page_indices(tc):
         context_lens=gather.context_lens,
         block_size=block_size,
         swa_window=128,
+        page_index_aligned_size=64,
+    )
+    tc._parity(
+        dspark_attn_metadata.BuildDsparkSwaRingIndices,
+        req_pool_indices_per_request=gather.req_pool_indices_per_request,
+        offsets=gather.offsets,
+        invalid=gather.invalid,
+        prefix_lens=gather.prefix_lens,
+        context_lens=gather.context_lens,
+        block_size=block_size,
+        swa_window=128,
+        ring_stride=256,
         page_index_aligned_size=64,
     )
 
@@ -517,6 +548,7 @@ _CASES = [
     ("build_step_local", _case_build_step_local),
     ("cap_correct_len", _case_cap_correct_len),
     ("causal_swa_page_indices", _case_causal_swa_page_indices),
+    ("causal_swa_ring_indices", _case_causal_swa_ring_indices),
     ("commit_inject_layout", _case_commit_inject_layout),
     ("commit_kv_proj", _case_commit_kv_proj),
     ("compact_layout", _case_compact_layout),

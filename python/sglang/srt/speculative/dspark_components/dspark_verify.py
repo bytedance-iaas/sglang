@@ -322,11 +322,10 @@ class TargetVerifyExecutor:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
         state_slot = None
-        if is_unified_kv_triton():
-            # unified_kv needs the per-token draft req slot to address the SWA ring
-            # (state_slot * ring + pos % ring). Verify tokens are the latest in each
-            # req so they always fall in the window; the commit gate (via commit_lens
-            # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
+        pool = self.kv_injector.draft_model_runner.token_to_kv_pool
+        if is_unified_kv_triton() or pool.uses_draft_swa_ring:
+            # Request-scoped rings need the per-token draft req slot. Verify
+            # tokens are the latest in each request; commit_lens drops rejects.
             vlen = verify_window.verify_cache_loc_2d.shape[1]
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
@@ -660,14 +659,19 @@ class DsparkVerifyEpilogue:
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
-        if is_unified_kv_triton():
+        if is_unified_kv_triton() or pool.uses_draft_swa_ring:
+            ring_stride = (
+                pool.draft_swa_ring_stride
+                if pool.uses_draft_swa_ring
+                else pool.unified_swa_ring_size
+            )
             inject_layout = build_unified_commit_inject_layout(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=seq_lens[:bs],
                 block_pos_offsets=ctx.block_pos_offsets[: self.stride],
                 commit_lens=gated_commit_lens,
                 stride=self.stride,
-                ring_stride=pool.unified_swa_ring_size,
+                ring_stride=ring_stride,
             )
         else:
             inject_layout = BuildCommitInjectLayout.execute(

@@ -737,7 +737,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
-    def test_dsv4_budget_uses_resolved_dspark_stage_count(self):
+    def test_dsv4_dspark_draft_uses_fixed_request_ring_budget(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         mr = _make_model_runner(
@@ -759,12 +759,28 @@ class TestDflashDraftKvBudget(unittest.TestCase):
             dflash_draft_num_layers=3,
             dflash_draft_cell_size_per_token=None,
         )
+        mr.spec_algorithm.is_dspark.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
 
         with mock_cpu_env():
             configurator = DSV4PoolConfigurator(mr)
 
         target_only_bytes = configurator._get_bytes_per_full_token()
-        self.assertEqual(configurator.bytes_per_full_token, target_only_bytes * 2)
+        self.assertEqual(configurator.bytes_per_full_token, target_only_bytes)
+        self.assertEqual(
+            configurator._get_draft_swa_ring_fixed_bytes(8),
+            10 * 149760 * 3,
+        )
+
+        available_bytes = 1 << 30
+        config = configurator.calculate_pool_sizes(available_bytes, page_size=256)
+        fixed_bytes = configurator._get_c128_state_fixed_bytes(8)
+        fixed_bytes += configurator._get_draft_swa_ring_fixed_bytes(8)
+        expected_tokens = int(
+            (available_bytes - fixed_bytes) / configurator.bytes_per_full_token
+        )
+        expected_tokens = expected_tokens // 256 * 256
+        self.assertEqual(config.full_max_total_num_tokens, expected_tokens)
 
 
 if __name__ == "__main__":

@@ -1089,6 +1089,16 @@ class KVCacheConfigurator:
             c4_state_pool_size = c4_state_pool_size
             c128_state_pool_size = c128_state_pool_size
 
+        draft_swa_verify_width = (
+            max_speculative_num_draft_tokens() or 0
+            if (
+                self.is_draft_worker
+                and self.spec_algorithm.is_dspark()
+                and not _is_npu
+                and not _is_hip
+            )
+            else 0
+        )
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -1116,6 +1126,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            draft_swa_verify_width=draft_swa_verify_width,
         )
         return token_to_kv_pool
 
@@ -1684,7 +1695,12 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                if self.draft_swa_full_capacity:
+                if (
+                    isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and token_to_kv_pool.uses_draft_swa_ring
+                ):
+                    pass
+                elif self.draft_swa_full_capacity:
                     # Banded depth: the SWA ring is full draft capacity, so use
                     # an IDENTITY full->swa mapping — store and read locs both
                     # equal out_cache_loc, and a slot is never evicted before

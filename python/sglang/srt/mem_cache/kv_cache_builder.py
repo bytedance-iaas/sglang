@@ -30,13 +30,18 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelImpl,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
 
@@ -178,10 +183,24 @@ def build_kv_cache(
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
-    disable_radix_cache = server_args.disable_radix_cache or (
-        model_config.is_multimodal and uses_transformers_backend
+    uses_dsv4_dspark_draft_ring = (
+        spec_algorithm.is_dspark()
+        and is_deepseek_v4(model_config.hf_config)
+        and not is_hip()
+        and not is_npu()
     )
-    if disable_radix_cache and not server_args.disable_radix_cache:
+    disable_radix_cache = (
+        server_args.disable_radix_cache
+        or (model_config.is_multimodal and uses_transformers_backend)
+        or uses_dsv4_dspark_draft_ring
+    )
+    if uses_dsv4_dspark_draft_ring and not server_args.disable_radix_cache:
+        logger.warning(
+            "Radix cache is disabled for CUDA DSV4 DSpark because the compact "
+            "draft SWA pool is request-scoped. Prefix reuse requires rebuilding "
+            "the draft SWA tail and is not supported yet."
+        )
+    elif disable_radix_cache and not server_args.disable_radix_cache:
         logger.warning(
             "Radix cache is disabled for multimodal models with the "
             "Transformers backend to avoid multimodal prefix-cache mismatches."

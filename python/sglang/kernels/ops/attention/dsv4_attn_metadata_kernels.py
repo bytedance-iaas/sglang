@@ -430,6 +430,133 @@ class BuildCausalSwaPageIndices:
         )
 
 
+class BuildCausalSwaRingIndices:
+    @classmethod
+    def execute(cls, *args, **kwargs) -> torch.Tensor:
+        if _inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def torch(
+        cls,
+        *,
+        req_pool_indices_repeated: torch.Tensor,
+        seq_lens_casual: torch.Tensor,
+        swa_window: int,
+        ring_stride: int,
+        page_index_aligned_size: int,
+    ) -> torch.Tensor:
+        return build_causal_swa_ring_indices(
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            seq_lens_casual=seq_lens_casual,
+            swa_window=swa_window,
+            ring_stride=ring_stride,
+            page_index_aligned_size=page_index_aligned_size,
+        )
+
+    @classmethod
+    def triton(
+        cls,
+        *,
+        req_pool_indices_repeated: torch.Tensor,
+        seq_lens_casual: torch.Tensor,
+        swa_window: int,
+        ring_stride: int,
+        page_index_aligned_size: int,
+    ) -> torch.Tensor:
+        return build_causal_swa_ring_indices_triton(
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            seq_lens_casual=seq_lens_casual,
+            swa_window=swa_window,
+            ring_stride=ring_stride,
+            page_index_aligned_size=page_index_aligned_size,
+        )
+
+
+def build_causal_swa_ring_indices(
+    *,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    swa_window: int,
+    ring_stride: int,
+    page_index_aligned_size: int,
+) -> torch.Tensor:
+    device = seq_lens_casual.device
+    positions = seq_lens_casual.to(torch.int64).unsqueeze(1) - 1 - torch.arange(
+        swa_window, dtype=torch.int64, device=device
+    ).unsqueeze(0)
+    valid = positions >= 0
+    indices = (
+        req_pool_indices_repeated.to(torch.int64).unsqueeze(1) * ring_stride
+        + positions.clamp_min(0) % ring_stride
+    ).to(torch.int32)
+    indices.masked_fill_(~valid, -1)
+
+    padded_width = (
+        (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
+    ) * page_index_aligned_size
+    if padded_width == swa_window:
+        return indices
+    return torch.nn.functional.pad(
+        indices, (0, padded_width - swa_window), value=-1
+    )
+
+
+@triton.jit
+def _causal_swa_ring_indices_kernel(
+    req_pool_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    swa_window,
+    ring_stride,
+    padded_width,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pos = tl.load(seq_lens_ptr + row).to(tl.int64) - 1
+    req_pool_idx = tl.load(req_pool_ptr + row).to(tl.int64)
+    out_base = out_ptr + row.to(tl.int64) * padded_width
+
+    for k0 in range(0, padded_width, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask = k < padded_width
+        token_pos = pos - k.to(tl.int64)
+        valid = (k < swa_window) & (token_pos >= 0) & mask
+        ring_loc = req_pool_idx * ring_stride + token_pos % ring_stride
+        tl.store(out_base + k, tl.where(valid, ring_loc, -1), mask=mask)
+
+
+def build_causal_swa_ring_indices_triton(
+    *,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    swa_window: int,
+    ring_stride: int,
+    page_index_aligned_size: int,
+) -> torch.Tensor:
+    num_qo_tokens = seq_lens_casual.size(0)
+    padded_width = (
+        (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
+    ) * page_index_aligned_size
+    out = torch.empty(
+        (num_qo_tokens, padded_width),
+        dtype=torch.int32,
+        device=seq_lens_casual.device,
+    )
+    block_k = 256
+    _causal_swa_ring_indices_kernel[(num_qo_tokens,)](
+        req_pool_indices_repeated,
+        seq_lens_casual,
+        out,
+        swa_window,
+        ring_stride,
+        padded_width,
+        BLOCK_K=block_k,
+    )
+    return out
+
+
 def build_causal_swa_page_indices(
     *,
     req_to_token: torch.Tensor,
