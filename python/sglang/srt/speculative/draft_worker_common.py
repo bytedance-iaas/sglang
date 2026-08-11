@@ -93,6 +93,11 @@ def build_draft_tp_worker(
     req_to_token_pool, target_allocator = target_worker.get_memory_pool()
     saved_server_args = get_global_server_args()
     try:
+        # Some loaders and layer constructors still read the fork's process-
+        # global ServerArgs.  Publish the exact inner draft copy that carries
+        # the resolved attention backend and target context length while the
+        # TpModelWorker is being built, then restore the scheduler's copy.
+        set_global_server_args_for_scheduler(draft_server_args)
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,

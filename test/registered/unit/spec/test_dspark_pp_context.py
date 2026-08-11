@@ -264,6 +264,30 @@ class TestDSparkPPContext(CustomTestCase):
 
         model.load_weights(weights())
 
+    def test_all_separate_shared_expert_weights_and_scales_must_load(self):
+        model = DeepseekV4ForCausalLMDSpark.__new__(
+            DeepseekV4ForCausalLMDSpark
+        )
+        torch.nn.Module.__init__(model)
+        model.num_stages = 1
+        params = {
+            "stages.0.mlp.shared_experts.gate_up_proj.weight": object(),
+            "stages.0.mlp.shared_experts.gate_up_proj.weight_scale_inv": object(),
+        }
+
+        with self.assertRaisesRegex(ValueError, "missing.*weights or scales"):
+            model._assert_shared_experts_loaded(
+                params_dict=params,
+                loaded_params={
+                    "stages.0.mlp.shared_experts.gate_up_proj.weight"
+                },
+            )
+
+        model._assert_shared_experts_loaded(
+            params_dict=params,
+            loaded_params=set(params),
+        )
+
     def test_block_fp8_projection_slice_selects_matching_weight_and_scale_blocks(self):
         feature_width = 128
         output_size = 2

@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -11,6 +11,8 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -185,6 +187,131 @@ class TestDSparkResultContract(unittest.TestCase):
         )
 
         self.assertEqual(req.kv_committed_len, 10)
+
+    def test_request_validation_is_algorithm_specific(self):
+        req = SimpleNamespace(
+            return_logprob=True,
+            sampling_params=SimpleNamespace(
+                json_schema=None,
+                regex=None,
+                ebnf=None,
+                structural_tag=None,
+            ),
+        )
+        self.assertIn(
+            "DSPARK",
+            validate_dflash_request(req, algorithm="DSPARK"),
+        )
+
+    def test_dspark_request_length_keeps_two_verify_windows(self):
+        scheduler = SimpleNamespace(
+            page_size=1,
+            max_req_len=100,
+            max_total_num_tokens=1000,
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+            server_args=SimpleNamespace(max_speculative_num_draft_tokens=6),
+        )
+        req = SimpleNamespace(
+            origin_input_ids=list(range(10)),
+            sampling_params=SimpleNamespace(max_new_tokens=100),
+        )
+
+        Scheduler.init_req_max_new_tokens(scheduler, req)
+
+        self.assertEqual(req.sampling_params.max_new_tokens, 78)
+
+    def test_dflash_reservation_fails_before_allocator_or_mapping_write(self):
+        draft_input = DFlashDraftInputV2(
+            topk_p=torch.empty((1, 0)),
+            topk_index=torch.empty((1, 0), dtype=torch.int64),
+            bonus_tokens=torch.zeros((1,), dtype=torch.int64),
+            new_seq_lens=torch.tensor([10], dtype=torch.int64),
+            hidden_states=torch.empty((1, 0)),
+        )
+        req = SimpleNamespace(
+            rid="overflow",
+            kv_committed_len=10,
+            kv_allocated_len=10,
+            output_ids=[1],
+            origin_input_ids=[0],
+            sampling_params=SimpleNamespace(top_k=1),
+        )
+        batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            reqs=[req],
+            sampling_info=SimpleNamespace(
+                penalizer_orchestrator=SimpleNamespace(is_required=False)
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((1, 15), dtype=torch.int32)
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+            device=torch.device("cpu"),
+            tree_cache=object(),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.dflash_info_v2.get_global_server_args",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=6),
+            ),
+            patch(
+                "sglang.srt.speculative.dflash_info_v2.alloc_token_slots"
+            ) as alloc,
+            patch(
+                "sglang.srt.speculative.dflash_info_v2."
+                "assign_req_to_token_pool_func"
+            ) as assign,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before KV allocation"):
+                draft_input.prepare_for_decode(batch)
+
+        alloc.assert_not_called()
+        assign.assert_not_called()
+        self.assertEqual(req.kv_allocated_len, 10)
+
+    def test_dspark_prepare_accumulates_penalty_token(self):
+        draft_input = DFlashDraftInputV2(
+            topk_p=torch.empty((1, 0)),
+            topk_index=torch.empty((1, 0), dtype=torch.int64),
+            bonus_tokens=torch.zeros((1,), dtype=torch.int64),
+            new_seq_lens=torch.tensor([10], dtype=torch.int64),
+            hidden_states=torch.empty((1, 0)),
+        )
+        req = SimpleNamespace(
+            rid="penalty",
+            kv_committed_len=10,
+            kv_allocated_len=22,
+            output_ids=[7],
+            origin_input_ids=[3],
+            sampling_params=SimpleNamespace(top_k=1),
+        )
+        penalizer = SimpleNamespace(
+            is_required=True,
+            cumulate_output_tokens=Mock(),
+        )
+        batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            reqs=[req],
+            sampling_info=SimpleNamespace(penalizer_orchestrator=penalizer),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((1, 64), dtype=torch.int32)
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+            device=torch.device("cpu"),
+            seq_lens_cpu=None,
+            seq_lens_sum=0,
+        )
+
+        with patch(
+            "sglang.srt.speculative.dflash_info_v2.get_global_server_args",
+            return_value=SimpleNamespace(speculative_num_draft_tokens=6),
+        ):
+            draft_input.prepare_for_decode(batch)
+
+        penalty_tokens = penalizer.cumulate_output_tokens.call_args.args[0]
+        self.assertEqual(penalty_tokens.tolist(), [7])
 
 
 if __name__ == "__main__":

@@ -1092,6 +1092,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DSpark V4 draft expected separate shared-expert parameters, "
                 "but the constructed model has none."
             )
+        missing = shared_params - loaded_params
+        if missing:
+            raise ValueError(
+                "DSpark V4 draft checkpoint is missing separate shared-expert "
+                f"weights or scales: {sorted(missing)}."
+            )
         for stage_id in range(self.num_stages):
             prefix = f"stages.{stage_id}.mlp.shared_experts."
             if not any(name.startswith(prefix) for name in loaded_params):

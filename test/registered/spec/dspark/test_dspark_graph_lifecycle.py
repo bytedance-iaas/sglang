@@ -2,8 +2,9 @@ import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.draft_worker_common import build_draft_tp_worker
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
@@ -103,7 +104,64 @@ class TestDsparkGraphLifecycle(CustomTestCase):
         )
 
         self.assertTrue(tp_worker_cls.call_args.kwargs["defer_device_graph_init"])
-        set_global_args.assert_called_once_with(get_global_args.return_value)
+        inner_draft_args = tp_worker_cls.call_args.kwargs["server_args"]
+        self.assertEqual(
+            set_global_args.call_args_list,
+            [
+                call(inner_draft_args),
+                call(get_global_args.return_value),
+            ],
+        )
+
+    @patch("sglang.srt.speculative.draft_worker_common.TpModelWorker")
+    @patch("sglang.srt.speculative.draft_worker_common.get_global_server_args")
+    @patch(
+        "sglang.srt.speculative.draft_worker_common."
+        "set_global_server_args_for_scheduler"
+    )
+    def test_inner_draft_args_restore_after_worker_failure(
+        self, set_global_args, get_global_args, tp_worker_cls
+    ):
+        saved_args = object()
+        get_global_args.return_value = saved_args
+        tp_worker_cls.side_effect = RuntimeError("draft worker failed")
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(context_len=131072),
+                memory_pool_config=object(),
+            ),
+            get_memory_pool=Mock(return_value=(object(), object())),
+        )
+        server_args = SimpleNamespace(
+            speculative_draft_attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            attention_backend="dsv4",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "draft worker failed"):
+            build_draft_tp_worker(
+                server_args=server_args,
+                gpu_id=0,
+                ps=SimpleNamespace(
+                    tp_rank=0,
+                    moe_ep_rank=0,
+                    pp_rank=0,
+                    attn_cp_rank=0,
+                    moe_dp_rank=0,
+                    dp_rank=0,
+                ),
+                nccl_port=12345,
+                target_worker=target_worker,
+                algo_label="DSPARK",
+                attention_backend_override="dsv4",
+            )
+
+        inner_draft_args = tp_worker_cls.call_args.kwargs["server_args"]
+        self.assertEqual(
+            set_global_args.call_args_list,
+            [call(inner_draft_args), call(saved_args)],
+        )
 
     @patch(
         "sglang.srt.speculative.dspark_components.dspark_worker_v2.is_cuda",
@@ -179,6 +237,95 @@ class TestDsparkGraphLifecycle(CustomTestCase):
         worker.init_cuda_graphs()
 
         runner.finish_deferred_device_graph_init.assert_called_once_with(capture=False)
+
+
+class TestDraftServerArgsIsolation(CustomTestCase):
+    def _scheduler(self, draft_worker_cls):
+        target_args = SimpleNamespace(
+            speculative_draft_load_format="draft-format",
+            load_format="target-format",
+            context_length=131072,
+            attention_backend="dsv4",
+        )
+        algorithm = SimpleNamespace(
+            is_none=lambda: False,
+            is_dspark=lambda: True,
+            is_ngram=lambda: False,
+            create_worker=Mock(return_value=draft_worker_cls),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = target_args
+        scheduler.spec_algorithm = algorithm
+        scheduler.ps = SimpleNamespace(
+            gpu_id=0,
+            tp_rank=0,
+            moe_ep_rank=0,
+            dp_rank=0,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+        )
+        scheduler.nccl_port = 12345
+        scheduler.tp_worker = object()
+        return scheduler, target_args, algorithm
+
+    def test_draft_overrides_do_not_mutate_target_args(self):
+        def build_worker(**kwargs):
+            draft_args = kwargs["server_args"]
+            draft_args.context_length = 4096
+            draft_args.attention_backend = "draft-backend"
+            return object()
+
+        draft_worker_cls = Mock(side_effect=build_worker)
+        scheduler, target_args, algorithm = self._scheduler(draft_worker_cls)
+        saved_args = object()
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_global_server_args",
+                return_value=saved_args,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler."
+                "set_global_server_args_for_scheduler"
+            ) as set_global,
+        ):
+            scheduler.maybe_init_draft_worker()
+
+        draft_args = algorithm.create_worker.call_args.args[0]
+        self.assertIsNot(draft_args, target_args)
+        self.assertIs(draft_worker_cls.call_args.kwargs["server_args"], draft_args)
+        self.assertEqual(draft_args.load_format, "draft-format")
+        self.assertEqual(target_args.load_format, "target-format")
+        self.assertEqual(target_args.context_length, 131072)
+        self.assertEqual(target_args.attention_backend, "dsv4")
+        self.assertEqual(
+            set_global.call_args_list,
+            [call(draft_args), call(saved_args)],
+        )
+
+    def test_global_target_args_are_restored_when_draft_init_fails(self):
+        draft_worker_cls = Mock(side_effect=RuntimeError("draft init failed"))
+        scheduler, _, algorithm = self._scheduler(draft_worker_cls)
+        saved_args = object()
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_global_server_args",
+                return_value=saved_args,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler."
+                "set_global_server_args_for_scheduler"
+            ) as set_global,
+            self.assertRaisesRegex(RuntimeError, "draft init failed"),
+        ):
+            scheduler.maybe_init_draft_worker()
+
+        draft_args = algorithm.create_worker.call_args.args[0]
+        self.assertEqual(
+            set_global.call_args_list,
+            [call(draft_args), call(saved_args)],
+        )
 
 
 if __name__ == "__main__":
