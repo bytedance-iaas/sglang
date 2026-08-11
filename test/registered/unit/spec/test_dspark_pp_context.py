@@ -1,3 +1,4 @@
+import inspect
 import os
 import unittest
 from types import SimpleNamespace
@@ -12,10 +13,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
+from sglang.srt.managers.tp_worker import TpModelWorker  # noqa: E402
 from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (  # noqa: E402
     DeepSeekV4TokenToKVPool,
 )
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
 from sglang.srt.models.deepseek_v4 import (  # noqa: E402
     DeepseekV4DecoderLayer,
@@ -78,6 +81,105 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_target_worker_accepts_explicit_hidden_capture_mode(self):
+        parameter = inspect.signature(
+            TpModelWorker.forward_batch_generation
+        ).parameters["capture_hidden_mode"]
+
+        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
+
+    def test_target_worker_forwards_explicit_hidden_capture_mode(self):
+        worker = TpModelWorker.__new__(TpModelWorker)
+        forward_batch = object()
+        model_output = SimpleNamespace(
+            logits_output="pp-proxy",
+            can_run_graph=False,
+            expert_distribution_metrics=None,
+        )
+        worker._model_runner = SimpleNamespace(
+            forward=Mock(return_value=model_output)
+        )
+        worker.pp_group = SimpleNamespace(is_last_rank=False)
+        worker.set_hicache_consumer = Mock()
+        worker.is_dllm = Mock(return_value=False)
+        batch = SimpleNamespace(hicache_consumer_index=3)
+
+        with patch(
+            "sglang.srt.managers.tp_worker.ForwardBatch.init_new",
+            return_value=forward_batch,
+        ) as init_new:
+            result = worker.forward_batch_generation(
+                batch,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+
+        init_new.assert_called_once_with(
+            batch,
+            worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        worker.model_runner.forward.assert_called_once_with(
+            forward_batch,
+            pp_proxy_tensors=None,
+            skip_attn_backend_init=False,
+        )
+        self.assertEqual(result.pp_hidden_states_proxy_tensors, "pp-proxy")
+
+    def test_lifecycle_only_prefill_requests_no_hidden_capture(self):
+        batch_output = SimpleNamespace(logits_output=None, new_seq_lens=None)
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(enable_dp_attention=False)
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=Mock(return_value=batch_output)
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_idle=lambda: False,
+                is_extend=lambda: True,
+            ),
+            is_extend_in_batch=False,
+            seq_lens="seq-lens",
+        )
+
+        result = worker._forward_lifecycle_only_prefill(
+            batch=batch,
+            on_publish=None,
+            pp_proxy_tensors="pp-proxy",
+        )
+
+        worker.target_worker.forward_batch_generation.assert_called_once_with(
+            batch,
+            pp_proxy_tensors="pp-proxy",
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        self.assertIs(result, batch_output)
+        self.assertEqual(result.new_seq_lens, "seq-lens")
+
+    def test_active_prefill_idle_participation_requests_full_hidden_capture(self):
+        idle_result = object()
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(enable_dp_attention=True)
+        worker._target_worker = SimpleNamespace(forward_batch_generation=Mock())
+        worker._decode_idle_result = Mock(return_value=idle_result)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+        )
+
+        result = worker._forward_prefill(
+            batch,
+            on_publish=None,
+            pp_proxy_tensors="pp-proxy",
+        )
+
+        worker.target_worker.forward_batch_generation.assert_called_once_with(
+            batch,
+            pp_proxy_tensors="pp-proxy",
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        worker._decode_idle_result.assert_called_once_with(on_publish=None)
+        self.assertIs(result, idle_result)
+
     def test_decoder_constructor_uses_overridable_attention_factory(self):
         custom_attention = torch.nn.Identity()
 
