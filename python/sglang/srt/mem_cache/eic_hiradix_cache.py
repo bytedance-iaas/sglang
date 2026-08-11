@@ -1484,8 +1484,12 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
     def init_hyper_params(self, config):
         super().init_hyper_params(config)
+        # EIC lookup (batch_exist_page + TP/PP reduce) costs ~1s even on a miss.
+        # Recompute runs at ~16K tokens/s, so loading fewer than that from EIC
+        # is never faster than recomputing. Floor the threshold accordingly.
+        floor = 1 << 14  # 16K tokens
         self.load_remote_threshold = max(
-            config.get("load_remote_threshold", 100), self.page_size
+            config.get("load_remote_threshold", floor), floor
         )
         logger.info(
             f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold}"
@@ -1728,7 +1732,9 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n
-        self._reduce_min(len_tensor)
+            # TP ranks share tree state, so an empty fetches list is rank-uniform
+            # and the reduce below would be a no-op on an all-zero tensor.
+            self._reduce_min(len_tensor)
 
         for slot, last_node, evict_len, compute_key, _ in fetches:
             eic_len = int(len_tensor[slot])
