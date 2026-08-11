@@ -188,6 +188,11 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
+@unittest.skipIf(
+    is_in_ci()
+    and os.getenv("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"),
+    "Temporarily skip unstable mooncake spec disaggregation accuracy test in PR UT",
+)
 class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

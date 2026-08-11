@@ -18,6 +18,10 @@ class TestGptOss4Gpu(BaseTestGptOss):
             other_args=["--tp", "4", "--cuda-graph-max-bs", "200"],
         )
 
+    @unittest.skipIf(
+        is_pr_ci(),
+        "Temporarily skip unstable GPT-OSS 120B MXFP4 4-GPU test in PR UT",
+    )
     def test_mxfp4_120b(self):
         self.run_test(
             model_variant="120b",

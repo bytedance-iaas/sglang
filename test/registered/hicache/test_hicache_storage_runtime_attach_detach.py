@@ -42,6 +42,8 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
 
         cls.other_args = [
             "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel",
             "--mem-fraction-static",
             "0.6",
             "--hicache-ratio",

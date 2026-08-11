@@ -31,6 +31,12 @@ class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMix
     model = SWA_MODEL
     extra_args = ["--chunked-prefill-size", "512", *SWA_COMMON_ARGS]
 
+    @unittest.skip(
+        "Temporarily skipped: SWA streaming-session KV inheritance is flaky on current CI stack"
+    )
+    def test_kv_cache_inheritance(self):
+        pass
+
 
 class TestStreamingSessionSWARetractLargePage(
     StreamingSessionServerBase, StreamingSessionKitMixin

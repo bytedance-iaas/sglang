@@ -67,6 +67,8 @@ class TestHiCacheSpecFileStorage(CustomTestCase):
             "0.3",
             "--hicache-ratio",
             "1.5",
+            "--hicache-io-backend",
+            "kernel",
             "--disable-cuda-graph",
             "--page-size",
             str(cls.page_size),

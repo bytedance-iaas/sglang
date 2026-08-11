@@ -25,6 +25,8 @@ class TestEnableThinking(
     ReasoningTokenUsageMixin, SeparateReasoningMixin, CustomTestCase
 ):
     reasoning_parser_name = "qwen3"
+    prompt = "What is 1+3?"
+    max_tokens = 1024
 
     @classmethod
     def setUpClass(cls):
@@ -55,7 +57,8 @@ class TestEnableThinking(
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": "Hello"}],
+                "messages": [{"role": "user", "content": self.prompt}],
+                "max_tokens": self.max_tokens,
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
@@ -79,7 +82,8 @@ class TestEnableThinking(
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": "Hello"}],
+                "messages": [{"role": "user", "content": self.prompt}],
+                "max_tokens": self.max_tokens,
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": False},
@@ -104,7 +108,8 @@ class TestEnableThinking(
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": "Hello"}],
+                "messages": [{"role": "user", "content": self.prompt}],
+                "max_tokens": self.max_tokens,
                 "temperature": 0,
                 "separate_reasoning": True,
                 "stream": True,
@@ -148,7 +153,8 @@ class TestEnableThinking(
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": "Hello"}],
+                "messages": [{"role": "user", "content": self.prompt}],
+                "max_tokens": self.max_tokens,
                 "temperature": 0,
                 "separate_reasoning": True,
                 "stream": True,
