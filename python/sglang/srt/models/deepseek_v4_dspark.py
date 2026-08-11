@@ -641,6 +641,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        server_args = get_global_server_args()
+        if server_args.enforce_shared_experts_fusion:
+            raise ValueError(
+                "Bundled DeepSeek-V4 DSpark in this fork requires separate "
+                "shared experts; --enforce-shared-experts-fusion is unsupported."
+            )
+        # The fork predates the per-runner fusion decision introduced by
+        # upstream #33889.  Install the supported draft layout before any
+        # DSpark stage constructs its MoE module, and retain it for loading.
+        server_args.disable_shared_experts_fusion = True
+        self.num_fused_shared_experts = 0
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -1000,7 +1011,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=(
+                self.config.n_routed_experts + self.num_fused_shared_experts
+            ),
         )
 
         for name, loaded_weight in weights:
@@ -1044,6 +1057,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     break
                 else:
                     if mapped not in params_dict:
+                        if ".mlp.shared_experts." in mapped:
+                            raise ValueError(
+                                "DSpark V4 draft failed to resolve a separate "
+                                f"shared-expert checkpoint tensor: {name!r} -> "
+                                f"{mapped!r}."
+                            )
                         logger.warning(
                             "DSpark V4 draft: unexpected weight %r -> %r", name, mapped
                         )
@@ -1058,6 +1077,28 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        self._assert_shared_experts_loaded(
+            params_dict=params_dict, loaded_params=loaded_params
+        )
+
+    def _assert_shared_experts_loaded(
+        self, *, params_dict: dict, loaded_params: set
+    ) -> None:
+        shared_params = {
+            name for name in params_dict if ".mlp.shared_experts." in name
+        }
+        if not shared_params:
+            raise ValueError(
+                "DSpark V4 draft expected separate shared-expert parameters, "
+                "but the constructed model has none."
+            )
+        for stage_id in range(self.num_stages):
+            prefix = f"stages.{stage_id}.mlp.shared_experts."
+            if not any(name.startswith(prefix) for name in loaded_params):
+                raise ValueError(
+                    "DSpark V4 draft did not load shared-expert tensors for "
+                    f"stage {stage_id}."
+                )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
